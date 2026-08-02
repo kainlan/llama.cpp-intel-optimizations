@@ -1,0 +1,812 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 1867381361
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: kimi-linear (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.01.309.742 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=147456
+[NAN-CHECK] NaN after node 18/90: op=SET_ROWS name=cache_k_l0 (view) type=1 ne=[576,256,1,1] sample=147456 first_idx=73742 value=-nan nan=539 inf=2
+[NAN-CHECK]   src(src0): name=Kcur-0 (view) op=VIEW type=0 ne=[576,64,1,1] sample=36864 nan=0 inf=0 min=-0.0348393 max=0.026597
+[NAN-CHECK] NaN after node 23/90: op=CONT name=v_cont-0 type=1 ne=[256,512,1,1] sample=131072 first_idx=141 value=-nan nan=480 inf=1
+[NAN-CHECK]   src(src0): name=cache_k_l0 (view) (view) (permuted) (transposed) op=TRANSPOSE type=1 ne=[256,512,1,1] sample=131072 nan=539 inf=2 min=-65184 max=65344
+[NAN-CHECK] NaN after node 27/90: op=MUL_MAT name=kq-0 type=0 ne=[256,64,1,1] sample=16384 first_idx=128 value=-nan nan=3904 inf=0
+[NAN-CHECK]   src(src0): name=cache_k_l0 (view) (permuted) op=PERMUTE type=1 ne=[576,256,1,1] sample=147456 nan=539 inf=2 min=-65184 max=65344
+[NAN-CHECK]   src(src1): name=Qcur-0 (view) (permuted) op=PERMUTE type=0 ne=[576,64,1,1] sample=36864 nan=0 inf=0 min=-0.00445012 max=0.00429303
+[NAN-CHECK] NaN after node 28/90: op=SOFT_MAX name=kq_soft_max-0 type=0 ne=[256,64,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=kq-0 op=MUL_MAT type=0 ne=[256,64,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=attn_inp_kq_mask op=NONE type=0 ne=[256,64,1,1] sample=16384 nan=0 inf=10208 min=0 max=0
+[NAN-CHECK] NaN after node 29/90: op=MUL_MAT name=kqv-0 type=0 ne=[512,64,1,1] sample=32768 first_idx=0 value=-nan nan=32768 inf=0
+[NAN-CHECK]   src(src0): name=v_cont-0 op=CONT type=1 ne=[256,512,1,1] sample=131072 nan=480 inf=1 min=-65184 max=65344
+[NAN-CHECK]   src(src1): name=kq_soft_max-0 op=SOFT_MAX type=0 ne=[256,64,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/90: op=MUL_MAT name=kqv_mla-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.attn_v_b.weight op=NONE type=0 ne=[512,128,1,1] sample=65536 nan=0 inf=0 min=-0.0405223 max=0.0395959
+[NAN-CHECK]   src(src1): name=kqv-0 op=MUL_MAT type=0 ne=[512,64,1,1] sample=32768 nan=32768 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/90: op=CONT name=kqv_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kqv_mla-0 (permuted) op=PERMUTE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 33/90: op=MUL_MAT name=node_33 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.attn_output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.039273 max=0.0400885
+[NAN-CHECK]   src(src1): name=kqv_out-0 op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/90: op=MUL name=mla_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_33 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.0.attn_output.scale op=NONE type=0 ne=[1,1,1,1] sample=1 nan=0 inf=0 min=-0.00134158 max=-0.00134158
+[NAN-CHECK] NaN after node 37/90: op=MUL name=ffn_norm-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-0 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.0.ffn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0257043 max=0.020354
+[NAN-CHECK] NaN after node 38/90: op=MUL_MAT name=ffn_gate-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_gate.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0389799 max=0.0398364
+[NAN-CHECK]   src(src1): name=ffn_norm-0 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 39/90: op=MUL_MAT name=ffn_up-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_up.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0445854 max=0.0403439
+[NAN-CHECK]   src(src1): name=ffn_norm-0 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/90: op=GLU name=ffn_swiglu-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_gate-0 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_up-0 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 41/90: op=MUL_MAT name=ffn_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_down.weight op=NONE type=0 ne=[192,128,1,1] sample=24576 nan=0 inf=0 min=-0.0419387 max=0.0404527
+[NAN-CHECK]   src(src1): name=ffn_swiglu-0 op=GLU type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/90: op=MUL name=attn_norm-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-1 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.attn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0250385 max=0.0267931
+[NAN-CHECK] NaN after node 55/90: op=MUL_MAT name=node_55 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_q.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0462289 max=0.0374796
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 58/90: op=CONCAT name=node_58 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.0031009 max=0.00321641
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00115415 max=0.00179985
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 63/90: op=MUL_MAT name=node_63 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_k.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0410698 max=0.0407037
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 66/90: op=CONCAT name=node_66 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.00279268 max=0.00338658
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 69/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00171185 max=0.00195571
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 71/90: op=MUL_MAT name=node_71 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_v.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0384188 max=0.0441913
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 74/90: op=CONCAT name=node_74 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.00305855 max=0.00347371
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 77/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00305855 max=0.00135221
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 87/90: op=MUL_MAT name=node_87 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_f_a.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0421988 max=0.0356874
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 88/90: op=MUL_MAT name=g1 f_b(f_a(cur))-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_f_b.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.038899 max=0.0406683
+[NAN-CHECK]   src(src1): name=node_87 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 89/90: op=ADD name=node_89 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g1 f_b(f_a(cur))-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ssm_dt.bias op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0247485 max=0.0222953
+[NAN-CHECK] NaN after node 0/7: op=MUL name=kda_g1-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ssm_a (reshaped) op=RESHAPE type=0 ne=[1,1,1,1] sample=1 nan=0 inf=0 min=0.00350114 max=0.00350114
+[NAN-CHECK] NaN after node 3/7: op=PAD name=node_96 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/7: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/43: op=CONT name=g_last-1 (cont) type=0 ne=[1,128,4,1] sample=512 first_idx=0 value=-nan nan=512 inf=0
+[NAN-CHECK]   src(src0): name=g_last-1 op=VIEW type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 1/43: op=UNARY name=node_103 type=0 ne=[1,128,4,1] sample=512 first_idx=0 value=-nan nan=512 inf=0
+[NAN-CHECK]   src(src0): name=g_last-1 (cont) op=CONT type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 4/43: op=MUL name=node_106 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/43: op=SSM_CONV name=node_108 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_66 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.00279268 max=0.00338658
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_k.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0275464 max=0.0328224
+[NAN-CHECK] NaN after node 8/43: op=UNARY name=node_110 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 10/43: op=L2_NORM name=k_in-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 12/43: op=PAD name=node_114 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/43: op=SUB name=node_116 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 op=CUMSUM type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last-1 (cont) op=CONT type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 15/43: op=UNARY name=g_diff-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_116 op=SUB type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/43: op=UNARY name=node_118 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_diff-1 op=UNARY type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 18/43: op=CONT name= (transposed) (cont) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 19/43: op=MUL name=key_gdiff-1 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (transposed) (cont) op=CONT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 21/43: op=CONT name=key_gdiff_t-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff-1 (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 24/43: op=SSM_CONV name=node_126 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_74 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.00305855 max=0.00347371
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_v.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0255531 max=0.0272146
+[NAN-CHECK] NaN after node 26/43: op=UNARY name=node_128 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/43: op=PAD name=node_131 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/43: op=MUL_MAT name=node_132 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_beta.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0309069 max=0.0232873
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/43: op=UNARY name=b_in-1 type=0 ne=[1,1,64,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=kda_beta-1 op=RESHAPE type=0 ne=[1,1,64,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/43: op=PAD name=node_136 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=b_in-1 (permuted) op=PERMUTE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 35/43: op=MUL name=v_b-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_131 op=PAD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_136 op=PAD type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 38/43: op=CONT name=v_b-1 (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_b-1 (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/43: op=REPEAT name=node_142 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 (reshaped) op=RESHAPE type=0 ne=[1,16,128,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 42/43: op=SUB name=node_144 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=node_142 op=REPEAT type=0 ne=[16,16,128,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_cs-1 (reshaped) op=RESHAPE type=0 ne=[16,1,128,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/12: op=UNARY name=decay_mask-1 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=node_145 op=TRI type=0 ne=[16,16,128,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 0/12: op=UNARY name=decay_mask-1 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=node_145 op=TRI type=0 ne=[16,16,128,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 2/12: op=CONT name=decay_mask-1 (permuted) (cont) type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) op=PERMUTE type=0 ne=[128,16,16,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 3/12: op=MUL name=k_b-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_114 op=PAD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_136 op=PAD type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/12: op=MUL name=node_152 type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) (cont) op=CONT type=0 ne=[128,16,16,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK]   src(src1): name=k_b-1 (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,16,1,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/12: op=MUL_MAT name=node_154 type=0 ne=[16,1,16,4] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name=node_152 op=MUL type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,1,16,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 11/12: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,16,4,1] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,16,4,1] sample=1024 nan=1024 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/2: op=ADD name=dnet_add_ch_lhs-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=-nan nan=480 inf=0
+[NAN-CHECK]   src(src0): name=attn-1 op=TRI type=0 ne=[16,16,4,1] sample=1024 nan=480 inf=0 min=0 max=0
+[NAN-CHECK]   src(src1): name=node_161 op=DIAG type=0 ne=[16,16,1,1] sample=256 nan=0 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 1/2: op=UNARY name=attn_pre_solve-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=-nan nan=480 inf=0
+[NAN-CHECK]   src(src0): name=attn-1 op=TRI type=0 ne=[16,16,4,1] sample=1024 nan=480 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 0/66: op=ADD name=dnet_add_ch_attn_solved-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=nan nan=960 inf=0
+[NAN-CHECK]   src(src0): name=node_164 op=SOLVE_TRI type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK]   src(src1): name=node_161 op=DIAG type=0 ne=[16,16,1,1] sample=256 nan=0 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 1/66: op=MUL_MAT name=node_166 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_b-1 (reshaped) (transposed) (cont) op=CONT type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_solved-1 op=ADD type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 3/66: op=CONT name= (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/66: op=CONT name=k_b-1 (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_b-1 (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 7/66: op=UNARY name=node_172 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 op=CUMSUM type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/66: op=MUL name=k_beta_g_exp-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_b-1 (reshaped) (transposed) (cont) op=CONT type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_172 op=UNARY type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 9/66: op=MUL_MAT name=k_cumdecay-1 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_beta_g_exp-1 op=MUL type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_solved-1 op=ADD type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 11/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK] NaN after node 12/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 13/66: op=MUL_MAT name=node_178 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_106 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_178 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/66: op=MUL name=node_181 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 20/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 21/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 22/66: op=MUL_MAT name=node_187 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 23/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_181 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_187 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 25/66: op=MUL name=node_190 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 31/66: op=MUL_MAT name=node_196 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_190 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_196 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/66: op=MUL name=node_199 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 38/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 39/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/66: op=MUL_MAT name=node_205 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 41/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_199 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_205 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/66: op=CPY name=cache_s_l1 (view) (copy of new_state-1) type=0 ne=[16384,1,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=new_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=cache_s_l1 (view) op=VIEW type=0 ne=[16384,1,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 46/66: op=SSM_CONV name=node_211 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_58 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.0031009 max=0.00321641
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_q.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0327068 max=0.0349182
+[NAN-CHECK] NaN after node 48/66: op=UNARY name=node_213 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 50/66: op=L2_NORM name=node_215 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 51/66: op=SCALE name=q_in-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_215 op=L2_NORM type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 53/66: op=PAD name=node_218 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=q_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 56/66: op=CONT name= (transposed) (cont) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 57/66: op=MUL name=node_222 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (transposed) (cont) op=CONT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 59/66: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/66: op=MUL name=node_226 type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) (cont) op=CONT type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,16,1,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 62/66: op=MUL_MAT name=node_227 type=0 ne=[16,1,16,4] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name=node_226 op=MUL type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,1,16,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 65/66: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,16,4,1] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,16,4,1] sample=1024 nan=1024 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 1/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 2/70: op=SET name= (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_166 op=MUL_MAT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 4/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 7/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/70: op=SET name= (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 10/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 12/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 13/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/70: op=SET name= (view) (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 18/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 19/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 20/70: op=SET name= (view) (view) (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 23/70: op=CONT name=attn_output-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) (view) (view) (view) (permuted) op=PERMUTE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/70: op=MUL_MAT name=node_262 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_g_a.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.041881 max=0.0375646
+[NAN-CHECK]   src(src1): name=attn_norm-1 (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/70: op=MUL_MAT name=g2 g_b(g_a(cur_2d))-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_g_b.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0357934 max=0.0366958
+[NAN-CHECK]   src(src1): name=node_262 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/70: op=UNARY name=node_265 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g2 g_b(g_a(cur_2d))-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 33/70: op=MUL name=node_266 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kda_normed-1 op=MUL type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_265 op=UNARY type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/70: op=CONT name= (cont) type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_266 op=MUL type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 35/70: op=MUL_MAT name=kda_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0456654 max=0.0418282
+[NAN-CHECK]   src(src1): name= (cont) op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 36/70: op=GET_ROWS name=node_269 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kda_out-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 37/70: op=GET_ROWS name=node_270 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=l_out-0 op=ADD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/70: op=MUL name=ffn_norm-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-1 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ffn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0242168 max=0.0200801
+[NAN-CHECK] NaN after node 41/70: op=MUL_MAT name=ffn_moe_logits-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_inp.weight op=NONE type=0 ne=[128,2,1,1] sample=256 nan=0 inf=0 min=-0.0277197 max=0.0270318
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 42/70: op=UNARY name=ffn_moe_probs-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_logits-1 op=MUL_MAT type=0 ne=[2,64,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/70: op=ADD name=ffn_moe_probs_biased-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_probs-1 op=UNARY type=0 ne=[2,64,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.exp_probs_b.bias op=NONE type=0 ne=[2,1,1,1] sample=2 nan=0 inf=0 min=-0.00207518 max=0.0140823
+[NAN-CHECK] NaN after node 47/70: op=GET_ROWS name=ffn_moe_weights-1 type=0 ne=[1,1,64,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_probs-1 (reshaped) op=RESHAPE type=0 ne=[1,2,64,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 49/70: op=SUM_ROWS name=ffn_moe_weights_sum-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights-1 (reshaped) op=RESHAPE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 50/70: op=CLAMP name=ffn_moe_weights_sum_clamped-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights_sum-1 op=SUM_ROWS type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 51/70: op=DIV name=ffn_moe_weights_norm-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights-1 (reshaped) op=RESHAPE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_weights_sum_clamped-1 op=CLAMP type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 54/70: op=MUL_MAT_ID name=ffn_moe_gate-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_exps.weight op=NONE type=0 ne=[128,192,2,1] sample=49152 nan=0 inf=0 min=-0.0500775 max=0.0394129
+[NAN-CHECK]   src(src1): name=ffn_norm-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 55/70: op=MUL_MAT_ID name=ffn_moe_up-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_up_exps.weight op=NONE type=0 ne=[128,192,2,1] sample=49152 nan=0 inf=0 min=-0.0410627 max=0.0421255
+[NAN-CHECK]   src(src1): name=ffn_norm-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 56/70: op=GLU name=ffn_moe_swiglu-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_gate-1 op=MUL_MAT_ID type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_up-1 op=MUL_MAT_ID type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 57/70: op=MUL_MAT_ID name=ffn_moe_down-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_down_exps.weight op=NONE type=0 ne=[192,128,2,1] sample=49152 nan=0 inf=0 min=-0.0421661 max=0.0411998
+[NAN-CHECK]   src(src1): name=ffn_moe_swiglu-1 op=GLU type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 58/70: op=MUL name=ffn_moe_weighted-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_down-1 op=MUL_MAT_ID type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_weights_norm-1 (reshaped) op=RESHAPE type=0 ne=[1,1,64,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 60/70: op=CONT name=ffn_moe_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weighted-1 (view) op=VIEW type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/70: op=MUL_MAT name=ffn_gate-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_shexp.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0371845 max=0.0383716
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 62/70: op=MUL_MAT name=ffn_up-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_up_shexp.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0391654 max=0.0414343
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 63/70: op=GLU name=ffn_swiglu-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_gate-1 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_up-1 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 64/70: op=MUL_MAT name=ffn_shexp-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_down_shexp.weight op=NONE type=0 ne=[192,128,1,1] sample=24576 nan=0 inf=0 min=-0.0448355 max=0.0418502
+[NAN-CHECK]   src(src1): name=ffn_swiglu-1 op=GLU type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 65/70: op=ADD name=ffn_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_out-1 op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_shexp-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 68/70: op=MUL name=result_norm type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=output_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0285071 max=0.0245657
+[NAN-CHECK] NaN after node 69/70: op=MUL_MAT name=result_output type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0378705 max=0.0416902
+[NAN-CHECK]   src(src1): name=result_norm op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+
+kimi-linear (Intel(R) Arc(TM) Pro B70 Graphics, MoE): non-finite NMSE: n=16384, non-finite CPU logits=0, non-finite device logits=8192, CPU reference energy=0.0183548
+  device non-finite token positions: 64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,... (64 rows total)
+0.02.690.483 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=147456
+[NAN-CHECK] NaN after node 18/90: op=SET_ROWS name=cache_k_l0 (view) type=1 ne=[576,256,1,1] sample=147456 first_idx=73742 value=-nan nan=539 inf=2
+[NAN-CHECK]   src(src0): name=Kcur-0 (view) op=VIEW type=0 ne=[576,64,1,1] sample=36864 nan=0 inf=0 min=-0.0348393 max=0.026597
+[NAN-CHECK] NaN after node 23/90: op=CONT name=v_cont-0 type=1 ne=[256,512,1,1] sample=131072 first_idx=141 value=-nan nan=480 inf=1
+[NAN-CHECK]   src(src0): name=cache_k_l0 (view) (view) (permuted) (transposed) op=TRANSPOSE type=1 ne=[256,512,1,1] sample=131072 nan=539 inf=2 min=-65184 max=65344
+[NAN-CHECK] NaN after node 27/90: op=MUL_MAT name=kq-0 type=0 ne=[256,64,1,1] sample=16384 first_idx=128 value=-nan nan=3904 inf=0
+[NAN-CHECK]   src(src0): name=cache_k_l0 (view) (permuted) op=PERMUTE type=1 ne=[576,256,1,1] sample=147456 nan=539 inf=2 min=-65184 max=65344
+[NAN-CHECK]   src(src1): name=Qcur-0 (view) (permuted) op=PERMUTE type=0 ne=[576,64,1,1] sample=36864 nan=0 inf=0 min=-0.00445012 max=0.00429303
+[NAN-CHECK] NaN after node 28/90: op=SOFT_MAX name=kq_soft_max-0 type=0 ne=[256,64,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=kq-0 op=MUL_MAT type=0 ne=[256,64,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=attn_inp_kq_mask op=NONE type=0 ne=[256,64,1,1] sample=16384 nan=0 inf=10208 min=0 max=0
+[NAN-CHECK] NaN after node 29/90: op=MUL_MAT name=kqv-0 type=0 ne=[512,64,1,1] sample=32768 first_idx=0 value=-nan nan=32768 inf=0
+[NAN-CHECK]   src(src0): name=v_cont-0 op=CONT type=1 ne=[256,512,1,1] sample=131072 nan=480 inf=1 min=-65184 max=65344
+[NAN-CHECK]   src(src1): name=kq_soft_max-0 op=SOFT_MAX type=0 ne=[256,64,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/90: op=MUL_MAT name=kqv_mla-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.attn_v_b.weight op=NONE type=0 ne=[512,128,1,1] sample=65536 nan=0 inf=0 min=-0.0405223 max=0.0395959
+[NAN-CHECK]   src(src1): name=kqv-0 op=MUL_MAT type=0 ne=[512,64,1,1] sample=32768 nan=32768 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/90: op=CONT name=kqv_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kqv_mla-0 (permuted) op=PERMUTE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 33/90: op=MUL_MAT name=node_33 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.attn_output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.039273 max=0.0400885
+[NAN-CHECK]   src(src1): name=kqv_out-0 op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/90: op=MUL name=mla_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_33 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.0.attn_output.scale op=NONE type=0 ne=[1,1,1,1] sample=1 nan=0 inf=0 min=-0.00134158 max=-0.00134158
+[NAN-CHECK] NaN after node 37/90: op=MUL name=ffn_norm-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-0 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.0.ffn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0257043 max=0.020354
+[NAN-CHECK] NaN after node 38/90: op=MUL_MAT name=ffn_gate-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_gate.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0389799 max=0.0398364
+[NAN-CHECK]   src(src1): name=ffn_norm-0 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 39/90: op=MUL_MAT name=ffn_up-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_up.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0445854 max=0.0403439
+[NAN-CHECK]   src(src1): name=ffn_norm-0 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/90: op=GLU name=ffn_swiglu-0 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_gate-0 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_up-0 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 41/90: op=MUL_MAT name=ffn_out-0 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.0.ffn_down.weight op=NONE type=0 ne=[192,128,1,1] sample=24576 nan=0 inf=0 min=-0.0419387 max=0.0404527
+[NAN-CHECK]   src(src1): name=ffn_swiglu-0 op=GLU type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/90: op=MUL name=attn_norm-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-1 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.attn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0250385 max=0.0267931
+[NAN-CHECK] NaN after node 55/90: op=MUL_MAT name=node_55 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_q.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0462289 max=0.0374796
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 58/90: op=CONCAT name=node_58 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.0031009 max=0.00321641
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00115415 max=0.00179985
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 63/90: op=MUL_MAT name=node_63 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_k.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0410698 max=0.0407037
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 66/90: op=CONCAT name=node_66 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.00279268 max=0.00338658
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 69/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00171185 max=0.00195571
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 71/90: op=MUL_MAT name=node_71 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_v.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0384188 max=0.0441913
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 74/90: op=CONCAT name=node_74 type=0 ne=[67,128,1,1] sample=8576 first_idx=3 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_49 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=0 inf=0 min=-0.00305855 max=0.00347371
+[NAN-CHECK]   src(src1): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[64,128,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 77/90: op=CPY name=conv_states_all-1 (view) (copy of  (view)) type=0 ne=[3,128,1,1] sample=384 first_idx=0 value=-nan nan=384 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=366 inf=0 min=-0.00305855 max=0.00135221
+[NAN-CHECK]   src(src1): name=conv_states_all-1 (view) op=VIEW type=0 ne=[3,128,1,1] sample=384 nan=384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 87/90: op=MUL_MAT name=node_87 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_f_a.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0421988 max=0.0356874
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 88/90: op=MUL_MAT name=g1 f_b(f_a(cur))-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_f_b.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.038899 max=0.0406683
+[NAN-CHECK]   src(src1): name=node_87 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 89/90: op=ADD name=node_89 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g1 f_b(f_a(cur))-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ssm_dt.bias op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0247485 max=0.0222953
+[NAN-CHECK] NaN after node 0/7: op=MUL name=kda_g1-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ssm_a (reshaped) op=RESHAPE type=0 ne=[1,1,1,1] sample=1 nan=0 inf=0 min=0.00350114 max=0.00350114
+[NAN-CHECK] NaN after node 3/7: op=PAD name=node_96 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/7: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/43: op=CONT name=g_last-1 (cont) type=0 ne=[1,128,4,1] sample=512 first_idx=0 value=-nan nan=512 inf=0
+[NAN-CHECK]   src(src0): name=g_last-1 op=VIEW type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 1/43: op=UNARY name=node_103 type=0 ne=[1,128,4,1] sample=512 first_idx=0 value=-nan nan=512 inf=0
+[NAN-CHECK]   src(src0): name=g_last-1 (cont) op=CONT type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 4/43: op=MUL name=node_106 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/43: op=SSM_CONV name=node_108 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_66 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.00279268 max=0.00338658
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_k.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0275464 max=0.0328224
+[NAN-CHECK] NaN after node 8/43: op=UNARY name=node_110 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 10/43: op=L2_NORM name=k_in-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 12/43: op=PAD name=node_114 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/43: op=SUB name=node_116 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 op=CUMSUM type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last-1 (cont) op=CONT type=0 ne=[1,128,4,1] sample=512 nan=512 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 15/43: op=UNARY name=g_diff-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_116 op=SUB type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/43: op=UNARY name=node_118 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_diff-1 op=UNARY type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 18/43: op=CONT name= (transposed) (cont) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 19/43: op=MUL name=key_gdiff-1 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (transposed) (cont) op=CONT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 21/43: op=CONT name=key_gdiff_t-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff-1 (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 24/43: op=SSM_CONV name=node_126 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_74 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.00305855 max=0.00347371
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_v.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0255531 max=0.0272146
+[NAN-CHECK] NaN after node 26/43: op=UNARY name=node_128 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/43: op=PAD name=node_131 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/43: op=MUL_MAT name=node_132 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_beta.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0309069 max=0.0232873
+[NAN-CHECK]   src(src1): name=attn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/43: op=UNARY name=b_in-1 type=0 ne=[1,1,64,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=kda_beta-1 op=RESHAPE type=0 ne=[1,1,64,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/43: op=PAD name=node_136 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=b_in-1 (permuted) op=PERMUTE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 35/43: op=MUL name=v_b-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_131 op=PAD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_136 op=PAD type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 38/43: op=CONT name=v_b-1 (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_b-1 (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/43: op=REPEAT name=node_142 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 (reshaped) op=RESHAPE type=0 ne=[1,16,128,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 42/43: op=SUB name=node_144 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=node_142 op=REPEAT type=0 ne=[16,16,128,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_cs-1 (reshaped) op=RESHAPE type=0 ne=[16,1,128,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/12: op=UNARY name=decay_mask-1 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=node_145 op=TRI type=0 ne=[16,16,128,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 0/12: op=UNARY name=decay_mask-1 type=0 ne=[16,16,128,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=node_145 op=TRI type=0 ne=[16,16,128,4] sample=131072 nan=69632 inf=0 min=1 max=1
+[NAN-CHECK] NaN after node 2/12: op=CONT name=decay_mask-1 (permuted) (cont) type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=69632 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) op=PERMUTE type=0 ne=[128,16,16,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 3/12: op=MUL name=k_b-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_114 op=PAD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_136 op=PAD type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/12: op=MUL name=node_152 type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) (cont) op=CONT type=0 ne=[128,16,16,4] sample=131072 nan=69632 inf=0 min=0 max=0
+[NAN-CHECK]   src(src1): name=k_b-1 (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,16,1,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/12: op=MUL_MAT name=node_154 type=0 ne=[16,1,16,4] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name=node_152 op=MUL type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,1,16,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 11/12: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,16,4,1] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,16,4,1] sample=1024 nan=1024 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/2: op=ADD name=dnet_add_ch_lhs-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=-nan nan=480 inf=0
+[NAN-CHECK]   src(src0): name=attn-1 op=TRI type=0 ne=[16,16,4,1] sample=1024 nan=480 inf=0 min=0 max=0
+[NAN-CHECK]   src(src1): name=node_161 op=DIAG type=0 ne=[16,16,1,1] sample=256 nan=0 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 1/2: op=UNARY name=attn_pre_solve-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=-nan nan=480 inf=0
+[NAN-CHECK]   src(src0): name=attn-1 op=TRI type=0 ne=[16,16,4,1] sample=1024 nan=480 inf=0 min=-0 max=-0
+[NAN-CHECK] NaN after node 0/66: op=ADD name=dnet_add_ch_attn_solved-1 type=0 ne=[16,16,4,1] sample=1024 first_idx=16 value=nan nan=960 inf=0
+[NAN-CHECK]   src(src0): name=node_164 op=SOLVE_TRI type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK]   src(src1): name=node_161 op=DIAG type=0 ne=[16,16,1,1] sample=256 nan=0 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 1/66: op=MUL_MAT name=node_166 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=v_b-1 (reshaped) (transposed) (cont) op=CONT type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_solved-1 op=ADD type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 3/66: op=CONT name= (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/66: op=CONT name=k_b-1 (reshaped) (transposed) (cont) type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_b-1 (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 7/66: op=UNARY name=node_172 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g_cs-1 op=CUMSUM type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/66: op=MUL name=k_beta_g_exp-1 type=0 ne=[16,128,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_b-1 (reshaped) (transposed) (cont) op=CONT type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_172 op=UNARY type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 9/66: op=MUL_MAT name=k_cumdecay-1 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=k_beta_g_exp-1 op=MUL type=0 ne=[16,128,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_solved-1 op=ADD type=0 ne=[16,16,4,1] sample=1024 nan=960 inf=0 min=0 max=1
+[NAN-CHECK] NaN after node 11/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK] NaN after node 12/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 13/66: op=MUL_MAT name=node_178 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_106 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_178 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/66: op=MUL name=node_181 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 20/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 21/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 22/66: op=MUL_MAT name=node_187 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 23/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_181 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_187 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 25/66: op=MUL name=node_190 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 31/66: op=MUL_MAT name=node_196 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_190 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_196 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/66: op=MUL name=node_199 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=g_last_exp_t-1 (view) op=VIEW type=0 ne=[128,1,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 38/66: op=MUL_MAT name=v_prime-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=k_cumdecay-1 (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 39/66: op=SUB name=v_t_new-1 type=0 ne=[16,128,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) (cont) (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_prime-1 op=MUL_MAT type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/66: op=MUL_MAT name=node_205 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=key_gdiff_t-1 (view) op=VIEW type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 41/66: op=ADD name=dnet_add_ch_state-1 type=0 ne=[128,128,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=node_199 op=MUL type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_205 op=MUL_MAT type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/66: op=CPY name=cache_s_l1 (view) (copy of new_state-1) type=0 ne=[16384,1,1,1] sample=16384 first_idx=0 value=-nan nan=16384 inf=0
+[NAN-CHECK]   src(src0): name=new_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=cache_s_l1 (view) op=VIEW type=0 ne=[16384,1,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 46/66: op=SSM_CONV name=node_211 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_58 op=CONCAT type=0 ne=[67,128,1,1] sample=8576 nan=8192 inf=0 min=-0.0031009 max=0.00321641
+[NAN-CHECK]   src(src1): name=blk.1.ssm_conv1d_q.weight (reshaped) op=RESHAPE type=0 ne=[4,128,1,1] sample=512 nan=0 inf=0 min=-0.0327068 max=0.0349182
+[NAN-CHECK] NaN after node 48/66: op=UNARY name=node_213 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 50/66: op=L2_NORM name=node_215 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 51/66: op=SCALE name=q_in-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_215 op=L2_NORM type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 53/66: op=PAD name=node_218 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=q_in-1 (permuted) op=PERMUTE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 56/66: op=CONT name= (transposed) (cont) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (transposed) op=TRANSPOSE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 57/66: op=MUL name=node_222 type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) op=RESHAPE type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (transposed) (cont) op=CONT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 59/66: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=RESHAPE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-3.50212e-05 max=3.45938e-05
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/66: op=MUL name=node_226 type=0 ne=[128,16,16,4] sample=131072 first_idx=0 value=-nan nan=131072 inf=0
+[NAN-CHECK]   src(src0): name=decay_mask-1 (permuted) (cont) op=CONT type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,16,1,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 62/66: op=MUL_MAT name=node_227 type=0 ne=[16,1,16,4] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name=node_226 op=MUL type=0 ne=[128,16,16,4] sample=131072 nan=131072 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,1,16,4] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 65/66: op=CONT name= (reshaped) (transposed) (cont) type=0 ne=[16,16,4,1] sample=1024 first_idx=0 value=-nan nan=1024 inf=0
+[NAN-CHECK]   src(src0): name= (reshaped) (transposed) op=TRANSPOSE type=0 ne=[16,16,4,1] sample=1024 nan=1024 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 0/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 1/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 2/70: op=SET name= (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_166 op=MUL_MAT type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 4/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 6/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 7/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 8/70: op=SET name= (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 10/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 12/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 13/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 14/70: op=SET name= (view) (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 16/70: op=MUL_MAT name=attn_inter-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=dnet_add_ch_state-1 op=ADD type=0 ne=[128,128,1,1] sample=16384 nan=16384 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name= (view) op=VIEW type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 18/70: op=MUL_MAT name=v_attn-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=v_t_new-1 op=SUB type=0 ne=[16,128,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=kq-1 (view) op=VIEW type=0 ne=[16,16,1,1] sample=256 nan=136 inf=0 min=0 max=0
+[NAN-CHECK] NaN after node 19/70: op=ADD name=dnet_add_ch_attn_out-1 type=0 ne=[128,16,1,1] sample=2048 first_idx=0 value=-nan nan=2048 inf=0
+[NAN-CHECK]   src(src0): name=attn_inter-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=v_attn-1 op=MUL_MAT type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 20/70: op=SET name= (view) (view) (view) (view) type=0 ne=[128,16,4,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) (view) op=SET type=0 ne=[128,16,4,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=dnet_add_ch_attn_out-1 op=ADD type=0 ne=[128,16,1,1] sample=2048 nan=2048 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 23/70: op=CONT name=attn_output-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name= (view) (view) (view) (view) (view) (permuted) op=PERMUTE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 29/70: op=MUL_MAT name=node_262 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_g_a.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.041881 max=0.0375646
+[NAN-CHECK]   src(src1): name=attn_norm-1 (reshaped) (reshaped) op=RESHAPE type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 30/70: op=MUL_MAT name=g2 g_b(g_a(cur_2d))-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ssm_g_b.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0357934 max=0.0366958
+[NAN-CHECK]   src(src1): name=node_262 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 32/70: op=UNARY name=node_265 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=g2 g_b(g_a(cur_2d))-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 33/70: op=MUL name=node_266 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kda_normed-1 op=MUL type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=node_265 op=UNARY type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 34/70: op=CONT name= (cont) type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=node_266 op=MUL type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 35/70: op=MUL_MAT name=kda_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.attn_output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0456654 max=0.0418282
+[NAN-CHECK]   src(src1): name= (cont) op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 36/70: op=GET_ROWS name=node_269 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=kda_out-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 37/70: op=GET_ROWS name=node_270 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=l_out-0 op=ADD type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 40/70: op=MUL name=ffn_norm-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm-1 op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.ffn_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0242168 max=0.0200801
+[NAN-CHECK] NaN after node 41/70: op=MUL_MAT name=ffn_moe_logits-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_inp.weight op=NONE type=0 ne=[128,2,1,1] sample=256 nan=0 inf=0 min=-0.0277197 max=0.0270318
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 42/70: op=UNARY name=ffn_moe_probs-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_logits-1 op=MUL_MAT type=0 ne=[2,64,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 44/70: op=ADD name=ffn_moe_probs_biased-1 type=0 ne=[2,64,1,1] sample=128 first_idx=0 value=-nan nan=128 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_probs-1 op=UNARY type=0 ne=[2,64,1,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=blk.1.exp_probs_b.bias op=NONE type=0 ne=[2,1,1,1] sample=2 nan=0 inf=0 min=-0.00207518 max=0.0140823
+[NAN-CHECK] NaN after node 47/70: op=GET_ROWS name=ffn_moe_weights-1 type=0 ne=[1,1,64,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_probs-1 (reshaped) op=RESHAPE type=0 ne=[1,2,64,1] sample=128 nan=128 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 49/70: op=SUM_ROWS name=ffn_moe_weights_sum-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights-1 (reshaped) op=RESHAPE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 50/70: op=CLAMP name=ffn_moe_weights_sum_clamped-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights_sum-1 op=SUM_ROWS type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 51/70: op=DIV name=ffn_moe_weights_norm-1 type=0 ne=[1,64,1,1] sample=64 first_idx=0 value=-nan nan=64 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weights-1 (reshaped) op=RESHAPE type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_weights_sum_clamped-1 op=CLAMP type=0 ne=[1,64,1,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 54/70: op=MUL_MAT_ID name=ffn_moe_gate-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_exps.weight op=NONE type=0 ne=[128,192,2,1] sample=49152 nan=0 inf=0 min=-0.0500775 max=0.0394129
+[NAN-CHECK]   src(src1): name=ffn_norm-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 55/70: op=MUL_MAT_ID name=ffn_moe_up-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_up_exps.weight op=NONE type=0 ne=[128,192,2,1] sample=49152 nan=0 inf=0 min=-0.0410627 max=0.0421255
+[NAN-CHECK]   src(src1): name=ffn_norm-1 (reshaped) op=RESHAPE type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 56/70: op=GLU name=ffn_moe_swiglu-1 type=0 ne=[192,1,64,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_gate-1 op=MUL_MAT_ID type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_up-1 op=MUL_MAT_ID type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 57/70: op=MUL_MAT_ID name=ffn_moe_down-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_down_exps.weight op=NONE type=0 ne=[192,128,2,1] sample=49152 nan=0 inf=0 min=-0.0421661 max=0.0411998
+[NAN-CHECK]   src(src1): name=ffn_moe_swiglu-1 op=GLU type=0 ne=[192,1,64,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 58/70: op=MUL name=ffn_moe_weighted-1 type=0 ne=[128,1,64,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_down-1 op=MUL_MAT_ID type=0 ne=[128,1,64,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_moe_weights_norm-1 (reshaped) op=RESHAPE type=0 ne=[1,1,64,1] sample=64 nan=64 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 60/70: op=CONT name=ffn_moe_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_weighted-1 (view) op=VIEW type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 61/70: op=MUL_MAT name=ffn_gate-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_gate_shexp.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0371845 max=0.0383716
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 62/70: op=MUL_MAT name=ffn_up-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_up_shexp.weight op=NONE type=0 ne=[128,192,1,1] sample=24576 nan=0 inf=0 min=-0.0391654 max=0.0414343
+[NAN-CHECK]   src(src1): name=ffn_norm-1 op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 63/70: op=GLU name=ffn_swiglu-1 type=0 ne=[192,64,1,1] sample=12288 first_idx=0 value=-nan nan=12288 inf=0
+[NAN-CHECK]   src(src0): name=ffn_gate-1 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_up-1 op=MUL_MAT type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 64/70: op=MUL_MAT name=ffn_shexp-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=blk.1.ffn_down_shexp.weight op=NONE type=0 ne=[192,128,1,1] sample=24576 nan=0 inf=0 min=-0.0448355 max=0.0418502
+[NAN-CHECK]   src(src1): name=ffn_swiglu-1 op=GLU type=0 ne=[192,64,1,1] sample=12288 nan=12288 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 65/70: op=ADD name=ffn_out-1 type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=ffn_moe_out-1 op=CONT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=ffn_shexp-1 op=MUL_MAT type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK] NaN after node 68/70: op=MUL name=result_norm type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=norm op=RMS_NORM type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+[NAN-CHECK]   src(src1): name=output_norm.weight op=NONE type=0 ne=[128,1,1,1] sample=128 nan=0 inf=0 min=-0.0285071 max=0.0245657
+[NAN-CHECK] NaN after node 69/70: op=MUL_MAT name=result_output type=0 ne=[128,64,1,1] sample=8192 first_idx=0 value=-nan nan=8192 inf=0
+[NAN-CHECK]   src(src0): name=output.weight op=NONE type=0 ne=[128,128,1,1] sample=16384 nan=0 inf=0 min=-0.0378705 max=0.0416902
+[NAN-CHECK]   src(src1): name=result_norm op=MUL type=0 ne=[128,64,1,1] sample=8192 nan=8192 inf=0 min=inf max=-inf
+
+kimi-linear (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [FAIL]
+  save/reload vs device: 8192/16384 logits differ, max abs 0.000e+00, max rel 0.000e+00
+  first difference:      token 64 of 128, vocab 0 of 128 (flat index 8192)
+  token rows affected:   64 of 128, from 64 to 127 -- exactly n_ubatch, so every token of the FIRST ubatch is bit-identical and divergence begins at the first token of the SECOND
+  gate NMSE(dev,reload): -nan vs threshold 1.0e-04 -- EXCEEDED: the reloaded model computes something else; the save/reload lost data
+  NMSE vs CPU:           device -nan, reloaded -nan
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|     kimi-linear|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|[1;31mFAIL[0m      (nan)|     [1;31mFAIL[0m|
+test case: kimi-linear (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|     kimi-linear|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: kimi-linear (Meta, MoE)
+|     kimi-linear|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+Roundtrip gate: NMSE(device, reloaded) <= 1e-04, not bit-equality. 0 row(s) round-tripped within tolerance but not bit-for-bit.
