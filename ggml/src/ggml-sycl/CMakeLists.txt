@@ -1768,7 +1768,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-weight-key-stability COMMAND test-sycl-weight-key-stability)
 set_tests_properties(test-sycl-weight-key-stability PROPERTIES
-    LABELS "sycl;moe;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1794,7 +1794,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-tensor-classification COMMAND test-tensor-classification)
 set_tests_properties(test-tensor-classification PROPERTIES
-    LABELS "sycl;moe;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1820,7 +1820,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
-    LABELS "sycl;kv;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1846,7 +1846,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-moe-q8-scratch COMMAND test-sycl-moe-q8-scratch)
 set_tests_properties(test-sycl-moe-q8-scratch PROPERTIES
-    LABELS "sycl;moe;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1872,7 +1872,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-onednn-packed-cache COMMAND test-sycl-onednn-packed-cache)
 set_tests_properties(test-sycl-onednn-packed-cache PROPERTIES
-    LABELS "sycl;onednn;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;onednn;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1898,7 +1898,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-weight-key-uniqueness COMMAND test-sycl-weight-key-uniqueness)
 set_tests_properties(test-sycl-weight-key-uniqueness PROPERTIES
-    LABELS "sycl;moe;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -1924,7 +1924,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-unified-cache-integrity COMMAND test-unified-cache-integrity)
 set_tests_properties(test-unified-cache-integrity PROPERTIES
-    LABELS "sycl;cache-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -2054,7 +2054,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-unified-cache-concurrent COMMAND test-unified-cache-concurrent)
 set_tests_properties(test-unified-cache-concurrent PROPERTIES
-    LABELS "sycl;cache-hostonly;concurrency;tdd;0igs-batch1"
+    LABELS "sycl;hostonly;concurrency;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -2080,7 +2080,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
-    LABELS "sycl;moe;mem-handle-hostonly;tdd;0igs-batch1"
+    LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -2399,6 +2399,9 @@ target_compile_definitions(test-onednn-woq PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
 target_link_libraries(test-onednn-woq PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (GGML_SYCL_DNNL)
+    target_link_libraries(test-onednn-woq PRIVATE DNNL::dnnl)
+endif()
 if (IntelSYCL_FOUND)
     target_link_libraries(test-onednn-woq PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -2638,7 +2641,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-unified-cache COMMAND test-sycl-unified-cache)
 set_tests_properties(test-sycl-unified-cache PROPERTIES
-    LABELS "sycl;cache-hostonly;tdd;0igs-batch2"
+    LABELS "sycl;hostonly;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
@@ -2664,7 +2667,7 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-unified-memory-e2e COMMAND test-sycl-unified-memory-e2e)
 set_tests_properties(test-sycl-unified-memory-e2e PROPERTIES
-    LABELS "sycl;cache-hostonly;tdd;0igs-batch2"
+    LABELS "sycl;hostonly;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
