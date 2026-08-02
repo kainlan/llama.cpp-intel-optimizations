@@ -507,6 +507,13 @@ void drain_retained_handles(bool wait_all = false);
 // intentionally does not touch them.
 void release_graph_retained_handles();
 
+// How many handles are currently parked for command-graph lifetime. Exposed so a
+// test can assert WHERE retain_handles_until_event() routed a handle: a handle
+// parked here is invisible to drain_retained_handles() and is released by
+// whichever context next invalidates a graph, so a non-recording thread's
+// transient scratch must never land in it. See test-sycl-graph-retention-scope.
+size_t graph_retained_handle_count();
+
 }  // namespace ggml_sycl
 
 namespace std {
