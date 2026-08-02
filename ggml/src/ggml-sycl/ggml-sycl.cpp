@@ -79650,6 +79650,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // construction; this prints what it actually saw at each match so it can be
     // hand-counted against gemma3n.cpp's real consumers for the same tensor.
     static const bool fusion_use_count_debug = getenv("GGML_SYCL_FUSION_USE_COUNT_DEBUG") != nullptr;
+    // Diagnostic (llama.cpp-81gx): the use_count instrumentation above showed bit1 firing
+    // on FIVE distinct chains in gemma3n, not the two (laurel_post_norm, per_layer_proj_norm)
+    // originally identified from source, all with correct use_count=1. This lets one chain
+    // be excluded from bit1 fusion at a time (falling through to unfused RMS_NORM/MUL/ADD) to
+    // bisect which chain is actually wrong, without touching disable_fusion or the mask.
+    // Matched against BOTH the MUL and ADD node names, because not every chain names its MUL
+    // node distinctly -- laurel_post_norm's build_norm() call has mb=NULL, so its own internal
+    // cb("norm_w", il) never fires and the MUL keeps ggml's default (unhelpful) name; only the
+    // ADD gets an explicit cb(tmp, "laurel_out", il) downstream in gemma3n.cpp. So
+    // GGML_SYCL_FUSION_SKIP_MUL=laurel_out is the way to target that chain specifically.
+    static const char * fusion_skip_mul_prefix = getenv("GGML_SYCL_FUSION_SKIP_MUL");
+    static int          fusion_skip_count      = 0;
     // Track nodes that have been executed via fusion (to skip later)
 
     std::unordered_set<const ggml_tensor *> fused_nodes;
@@ -80080,8 +80092,41 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
 #endif
             if (!disable_fusion && node->op == GGML_OP_RMS_NORM) {
+                // Diagnostic (llama.cpp-81gx): decide ONCE, before any of the fusion attempts
+                // below, whether this RMS_NORM's chain matches GGML_SYCL_FUSION_SKIP_MUL. Bit1
+                // (3-way) is not the only site that can fuse this chain's MUL -- bit4 (2-way,
+                // below) independently satisfies its own use_count==1 check on the *same* MUL
+                // whenever bit1 declines, because bit1 declining doesn't change the MUL's real
+                // use count. Gating only bit1 would silently let bit4 partially re-fuse a chain
+                // this flag is meant to leave fully unfused, and the surviving fusion would use a
+                // kernel (rms_norm_mul_f32) this ticket's discriminator test never validated --
+                // exactly the kind of false green the skip counter below exists to catch, just one
+                // fusion site over. So the same skip_chain decision gates both bit1 and bit4.
+                bool skip_chain = false;
+                if (fusion_skip_mul_prefix && fusion_skip_mul_prefix[0] && i + 1 < cgraph->n_nodes) {
+                    const size_t        plen               = strlen(fusion_skip_mul_prefix);
+                    const ggml_tensor * candidate_mul_node = cgraph->nodes[i + 1];
+                    const bool          mul_matches        = candidate_mul_node->name &&
+                                             strncmp(candidate_mul_node->name, fusion_skip_mul_prefix, plen) == 0;
+                    bool add_matches = false;
+                    if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
+                        const ggml_tensor * candidate_add_node = cgraph->nodes[i + 2];
+                        add_matches                            = candidate_add_node->name &&
+                                      strncmp(candidate_add_node->name, fusion_skip_mul_prefix, plen) == 0;
+                    }
+                    skip_chain = mul_matches || add_matches;
+                }
+                if (skip_chain) {
+                    fusion_skip_count++;
+                    fprintf(stderr,
+                            "[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=%s, bit1+bit4 both "
+                            "declined: rms=%s mul=%s (total_skipped=%d)\n",
+                            fusion_skip_mul_prefix, node->name ? node->name : "?",
+                            (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->name) ? cgraph->nodes[i + 1]->name : "?",
+                            fusion_skip_count);
+                }
                 // Try 3-way kernel fusion: RMS_NORM + MUL + ADD
-                if (fusion_site_on(1) &&
+                if (!skip_chain && fusion_site_on(1) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 3) && ggml_is_contiguous(cgraph->nodes[i + 2]) &&
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
@@ -80160,7 +80205,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     }
                 }
                 // Try 2-way kernel fusion: RMS_NORM + MUL
-                if (fusion_site_on(4) &&
+                if (!skip_chain && fusion_site_on(4) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 2) &&
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
