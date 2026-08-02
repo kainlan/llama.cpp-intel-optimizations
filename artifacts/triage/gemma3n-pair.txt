@@ -1,0 +1,182 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 3968073366
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+|            clip|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+|           llama|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.74e-11)|       [1;32mOK[0m|
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           llama|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llama (Meta, Dense)
+|           llama|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.02.003.413 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=267 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.011.941 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=273 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.022.398 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=279 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.034.565 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.042.341 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=295 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.048.788 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=301 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.054.523 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=267 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.057.246 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=273 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.059.994 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=279 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.066.526 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.066.843 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=295 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.068.220 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=301 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.135.324 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=267 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.135.809 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=273 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.136.240 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=279 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.137.342 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.137.665 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=295 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.137.995 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=301 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.139.083 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=267 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.139.289 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=273 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.139.523 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=279 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.140.753 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.140.970 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=295 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.141.193 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=301 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|           llama|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.73e-11)|       [1;32mOK[0m|
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|           llama|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llama (Meta, MoE)
+|           llama|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+|          llama4|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            deci|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          falcon|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        baichuan|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            grok|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            gpt2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            gptj|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         gptneox|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|             mpt|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       starcoder|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          refact|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            bert|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|     modern-bert|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      nomic-bert|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|  nomic-bert-moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        neo-bert|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|    jina-bert-v2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|    jina-bert-v3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        eurobert|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           bloom|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        stablelm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            qwen|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           qwen2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        qwen2moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         qwen2vl|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           qwen3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        qwen3moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       qwen3next|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         qwen3vl|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      qwen3vlmoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          qwen35|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       qwen35moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            phi2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            phi3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          phimoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           plamo|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          plamo2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          plamo3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       codeshell|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           orion|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       internlm2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         minicpm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        minicpm3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           gemma|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          gemma2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          gemma3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+test case: gemma3n (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+|         gemma3n|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;31mFAIL[0m (1.03e+00)|     [1;33mSKIP[0m|
+test case: gemma3n (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         gemma3n|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: gemma3n (Meta, Dense)
+|         gemma3n|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+| gemma-embedding|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      starcoder2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           mamba|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          mamba2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           jamba|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       falcon-h1|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          xverse|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       command-r|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         cohere2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      cohere2moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            dbrx|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            olmo|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           olmo2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           olmoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         openelm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          arctic|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        deepseek|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       deepseek2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|   deepseek2-ocr|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      deepseek32|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       deepseek4|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         chatglm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            glm4|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         glm4moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         glm-dsa|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          bitnet|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|              t5|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       t5encoder|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            jais|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           jais2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        nemotron|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      nemotron_h|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|  nemotron_h_moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          exaone|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         exaone4|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      exaone-moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           rwkv6|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      rwkv6qwen2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           rwkv7|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          arwkv7|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         granite|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      granitemoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|   granitehybrid|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       chameleon|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|wavtokenizer-dec|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|             plm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      bailingmoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|     bailingmoe2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           dots1|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           arcee|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           afmoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        ernie4_5|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|    ernie4_5-moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|     hunyuan-moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|   hunyuan-dense|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      hunyuan_vl|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         smollm3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         gpt-oss|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            lfm2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         lfm2moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           dream|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|    smallthinker|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           llada|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       llada-moe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        seed_oss|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        grovemoe|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|         apertus|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|      minimax-m2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          cogvlm|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|            rnd1|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|  pangu-embedded|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        mistral3|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|        mistral4|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       paddleocr|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|           mimo2|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          step35|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|     llama-embed|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|       maincoder|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|     kimi-linear|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          talkie|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+|          mellum|                                -|     -|[1;35mEXCLUDED[0m           | [1;35mEXCLUDED[0m|
+Roundtrip gate: NMSE(device, reloaded) <= 1e-04, not bit-equality. 0 row(s) round-tripped within tolerance but not bit-for-bit.
