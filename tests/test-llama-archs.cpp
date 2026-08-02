@@ -782,6 +782,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     // `test-llama-archs -a gemma4` printed a header, zero rows, and returned 0, which
     // reads as "gemma4 verified" to anything checking the status. See llama.cpp-k208.
     size_t n_measured = 0;
+    // Rows that round-tripped within tolerance but not bit-for-bit. Counted so the closing
+    // line can state it whether or not any row hit it -- see the legend below.
+    size_t n_bitdiff = 0;
     common_log_flush(common_log_main());
     printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
     printf("|");
@@ -793,6 +796,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         printf("-");
     }
     printf("|------|---------------|---------|\n");
+    // Printed unconditionally, and it has to be. The thing this legend exists to prevent is
+    // someone reading an all-OK Roundtrip column as proof that the logits matched bit for bit.
+    // That is precisely the run in which a mismatch-triggered notice would not appear, so a
+    // conditional notice is absent exactly when it is needed.
+    printf("Roundtrip: a GGUF save+reload of the device model, compared against that model.\n");
+    printf("  Gated on NMSE(device, reloaded) <= 1e-4, NOT on bit-equality: this path is not\n");
+    printf("  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.\n");
+    printf("  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row\n");
+    printf("  are on stderr.\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -909,9 +921,34 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_dev.first.get()));
                         const size_t n_ubatch = llama_n_ubatch(model_and_ctx_dev.second.get());
                         const logits_diff rt = logits_compare(logits_dev, logits_roundtrip, n_vocab);
-                        if (rt.n_diff > 0) {
+                        const double nmse_rt = nmse(logits_dev, logits_roundtrip);
+
+                        // Gate on NMSE, not on bit-equality.
+                        //
+                        // The column's job is to catch a save/reload that lost weights, and that
+                        // failure is O(1) -- the reloaded model computes something else entirely.
+                        // Bit-equality was only ever a proxy for it, and on this backend the proxy
+                        // is broken: the device path is not reproducible run to run, so two decodes
+                        // of the same weights differ in the last bits by an amount that varies with
+                        // scheduling. Measured 2026-08-01: same seed, same binary, same selector,
+                        // two processes -- 438 vs 1493 of 16384 logits differing, a 3.4x change,
+                        // with the save/reload path byte-identical between them. A bit-exact
+                        // comparison there is asking whether two non-deterministic decodes happened
+                        // to land identically; it fails at random and, worse, PASSES at random, so
+                        // a green column was never evidence either.
+                        //
+                        // 1e-4 is the threshold the NMSE column already uses, deliberately: the two
+                        // columns should not disagree about what "wrong" means.
+                        const bool roundtrip_broken = !std::isfinite(nmse_rt) || nmse_rt > 1e-4;
+                        if (roundtrip_broken) {
                             all_ok = false;
                             status_roundtrip = "\033[1;31mFAIL\033[0m";
+                        } else if (rt.n_diff > 0) {
+                            status_roundtrip = "\033[1;33mBITDIFF\033[0m";
+                            n_bitdiff++;
+                        }
+
+                        if (rt.n_diff > 0) {
 
                             // Report magnitudes only -- nothing here may touch a device.
                             //
@@ -927,20 +964,36 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             // exact mechanism, a diagnostic that costs the run it is diagnosing is
                             // worth less than no diagnostic: keep this block pure arithmetic over
                             // logits that have already been computed.
+                            // The movable quantities come FIRST, and that ordering is deliberate.
+                            // NMSE is the right gate -- it catches the O(1) corruption this column
+                            // exists for -- but it is not a sensitivity measure and must not be read
+                            // as one. At these magnitudes the whole divergence contributes ~6e-17 to
+                            // ~2e-16 to NMSE, against a value printed to four significant figures
+                            // whose last digit is worth ~1e-12: four orders of magnitude below what
+                            // the format can show. It stayed pinned at 2.201e-09 across the two
+                            // replicates whose differing-element counts were 438 and 1493. Anyone
+                            // diagnosing from NMSE alone is reading a quantity that cannot move.
+                            // The count, the first difference and the affected rows can.
                             fprintf(stderr,
-                                "\n%s (%s, %s): roundtrip mismatch\n"
+                                "\n%s (%s, %s): roundtrip not bit-exact [%s]\n"
                                 "  save/reload vs device: %zu/%zu logits differ, max abs %.3e, max rel %.3e\n"
                                 "  first difference:      token %zu of %zu, vocab %zu of %zu (flat index %zu)\n"
                                 "  token rows affected:   %zu of %zu, from %zu to %zu%s\n"
-                                "  NMSE vs CPU:           device %.3e, reloaded %.3e "
-                                "(both small => both models are correct and differ only in the last bits)\n",
+                                "  gate NMSE(dev,reload): %.3e vs threshold 1.0e-04 -- %s\n"
+                                "  NMSE vs CPU:           device %.3e, reloaded %.3e\n"
+                                "  (the gate is NMSE; the three lines above it are the ones with the\n"
+                                "   resolution to move between runs -- diagnose from those, not from NMSE)\n",
                                 llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                roundtrip_broken ? "FAIL" : "BITDIFF",
                                 rt.n_diff, logits_dev.size(), rt.max_abs, rt.max_rel,
                                 rt.first_row, logits_dev.size()/n_vocab, rt.first_col, n_vocab, rt.first_diff,
                                 rt.n_rows_diff, logits_dev.size()/n_vocab, rt.first_row, rt.last_row,
                                 rt.first_row == n_ubatch ?
                                     " -- exactly n_ubatch, so every token of the FIRST ubatch is bit-identical"
                                     " and divergence begins at the first token of the SECOND" : "",
+                                nmse_rt, roundtrip_broken ?
+                                    "EXCEEDED: the reloaded model computes something else; the save/reload lost data" :
+                                    "within tolerance: both models agree to far better than the gate",
                                 nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip));
                         }
                     }
@@ -952,6 +1005,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
+    // Unconditional, like the legend, and for the same reason -- a reader who scrolls to the
+    // bottom of a green run must still be told what OK did and did not establish. Stating the
+    // count even when it is zero is the point: "0 rows" is a measurement, while silence is
+    // indistinguishable from the check not having run.
+    printf("Roundtrip gate: NMSE(device, reloaded) <= 1e-4, not bit-equality. "
+           "%zu row(s) round-tripped within tolerance but not bit-for-bit.\n", n_bitdiff);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
     if (target_arch != LLM_ARCH_UNKNOWN && n_measured == 0) {
         // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: the caller asked for
