@@ -1,8 +1,18 @@
 // tests/test-dmmv-q4-0-coalesced.cpp
 // Test that Q4_0 DMMV with coalesced layout produces same output as SoA
 //
-// This is a TDD test - written to fail until the coalesced DMMV kernel
-// is properly integrated and produces correct results.
+// CORRECTED (llama.cpp-0igs, 2026-08-02): the note this replaced described
+// the whole file as "written to fail until the coalesced DMMV kernel is
+// properly integrated" -- that describes test_coalesced_vs_soa_dmmv(),
+// which main() never calls. main()'s actual Part 2 (run_dmmv_coalesced_case,
+// via GGML_SYCL_FORCE_DMMV=1 + a GGML_LAYOUT_COALESCED override) drives the
+// real, reachable production dispatch path -- confirmed via
+// ggml_backend_graph_compute in its backtrace, not a stub. It is real and
+// currently reproduces a genuine wrong-answer bug (~12-31% max_rel error,
+// ~35-40% of rows, at ncols/nrows 1024x64, 2048x128, 4096x256; Part 1's CPU
+// layout-integrity check passes cleanly at all three sizes, which rules out
+// the test's own coalesced-layout decoder as the cause). This is (a), a
+// live defect, not a red-by-design placeholder.
 //
 // The coalesced layout reorganizes SoA data into tile-based format for
 // better cache line utilization during DMMV operations.
