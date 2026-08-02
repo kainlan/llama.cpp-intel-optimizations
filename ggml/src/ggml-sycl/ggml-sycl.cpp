@@ -9081,6 +9081,13 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
                   slot, rows, reclaimed, live_after);
 }
 
+// Forward declarations: defined later in this TU (after the globals they
+// clear), called at the outermost model-load boundary below. See each
+// definition for the full rationale (llama.cpp-k7b0).
+static void ggml_sycl_reset_model_load_scratch_state();
+static void ggml_sycl_reset_layer_map_state();
+static void ggml_sycl_reset_moe_phase_demotion_state();
+
 void ggml_backend_sycl_set_model_loading(bool loading) {
     // Depth counter tracks nesting of load_tensors → load_all_data.
     // S1 mode: only clear registry at outermost entry, only preload at outermost exit.
@@ -9096,6 +9103,11 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
         // Only release at outermost entry — preserve host weight registrations from
         // load_tensors across load_all_data (nested calls increment depth).
         if (depth == 0) {
+            // Clean slate for every model-scoped scratch global before this
+            // model's own tensors are inventoried -- see the function for why
+            // this must not be left to the per-field writer alone.
+            ggml_sycl_reset_model_load_scratch_state();
+
             // A new outer model load is the ownership boundary for the previous
             // model's tensor extras. Release the registry's references before
             // resetting cache entries so smart handles can drop their refs and the
@@ -9749,6 +9761,83 @@ static ggml_sycl::placement_kv_info                  g_placement_kv_info{};
 static ggml_sycl_placement_envelope                  g_placement_envelope{};
 static bool                                          g_placement_envelope_set = false;
 std::atomic<bool>                                    g_tiered_enabled{ false };
+
+// Structural load-boundary reset (llama.cpp-k7b0) for every SCRATCH global in
+// this region that describes "the model currently being loaded", as opposed
+// to an already-live model's steady-state identity (that's the unified
+// cache's mem_handle-leased weight entries, which reset_model_weight_entries()
+// already handles correctly per-slot -- see CLAUDE.md's "another live
+// model's lease is correct, not leaked"). Called once per outer model-load
+// boundary, before any of the incoming model's tensors are inventoried, so a
+// stale value can never survive to be read as this model's own.
+//
+// On the normal path every global below already gets overwritten
+// field-by-field by the real writer (populate_inventory_globals()), which is
+// why this reset looks redundant there -- it is a defensive floor for the
+// path that ISN'T normal: ggml_backend_sycl_compute_placement_plan_early()
+// and ggml_backend_sycl_set_tensor_inventory() both return early (skipping
+// populate_inventory_globals() entirely) when backend/ctx/inventory is null
+// or malformed, which would otherwise leave every field of g_placement_kv_info
+// holding the PREVIOUS model's values -- exactly the class of bug
+// llama.cpp-k7b0 exists to close (kv_tier_manager's resize()-not-assign()
+// leak was the same shape one level down, in a per-device singleton instead
+// of a process-global).
+//
+// g_sycl_named_weight_cache_uuids and g_sycl_weight_identities_by_name are
+// deliberately NOT touched here: the former is keyed by a signature that is
+// a pure function of (name, type, ne, nbytes) -- a stale entry from a
+// different model is either identical (harmless reuse) or keyed differently
+// (no collision), so it is not model-scoped state at all. The latter is
+// unconditionally overwritten (`g_sycl_weight_identities_by_name[name] =
+// identity;`, not emplace-if-absent) on every real write, so staleness for a
+// name the current model does not have is simply never read.
+//
+// g_sycl_weight_usages IS a real bug, fixed here: registration only
+// *emplaces* on first sight of a name and forces UNKNOWN on a *mismatch*
+// against whatever is already mapped (tied-weight detection within one
+// model's own load). Never clearing it between models means a name a
+// PREVIOUS model forced to UNKNOWN for its own tied-weight reasons poisons a
+// DIFFERENT model's first (and only) registration of that same name --
+// `it->second != mapped` reads true against the stale UNKNOWN, so the new
+// model's real classification is discarded before it is ever used. The map
+// only makes sense for the model currently loading, so it is wiped here.
+static void ggml_sycl_reset_model_load_scratch_state() {
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        g_tensor_inventory.clear();
+        g_tensor_inventory_detail.clear();
+        g_tensor_inventory_index.clear();
+        g_tensor_inventory_total_size                          = 0;
+        g_tensor_inventory_onednn_scratchpad_bytes             = 0;
+        g_tensor_inventory_pp_pipeline_scratch_bytes           = 0;
+        g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
+        g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
+        g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
+        g_tensor_inventory_pp_moe_onednn_scratch_bytes         = 0;
+        g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
+        g_tensor_inventory_device                              = 0;
+        g_moe_expert_total_bytes                               = 0;
+        g_moe_n_experts_total                                  = 0;
+        g_moe_n_experts_used                                   = 0;
+        g_model_n_layer                                        = 0;
+        g_placement_kv_info                                    = ggml_sycl::placement_kv_info{};
+        g_placement_envelope                                   = ggml_sycl_placement_envelope{};
+        g_placement_envelope_set                               = false;
+        g_moe_expert_vram_reserve.fill(0);
+        g_placement_plan     = ggml_sycl::placement_plan{};
+        g_has_placement_plan = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
+        g_sycl_weight_usages.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_usage_unknown_mutex);
+        g_sycl_usage_unknown_once.clear();
+    }
+    ggml_sycl_reset_layer_map_state();
+    ggml_sycl_reset_moe_phase_demotion_state();
+}
 
 bool ggml_backend_sycl_has_active_placement_plan(void) {
     return g_has_placement_plan;
@@ -46130,6 +46219,28 @@ static void ggml_sycl_moe_phase_i8_demote(const ggml_tensor * src0) {
     g_moe_phase_i8_demoted.insert(src0);
 }
 
+// Load-boundary reset for the two memo sets above (llama.cpp-k7b0). Both are
+// keyed by raw `const ggml_tensor *`, and tensor object addresses are
+// allocator-owned and can be reused across model loads (see CLAUDE.md's SYCL
+// Memory Ownership section: raw pointers are transient ABI views, never a
+// source of truth for identity). Without this reset, a new model's tensor
+// that happens to land at an address a PREVIOUS model's tensor was demoted
+// at would read as already-demoted and skip a rematerialization attempt it
+// never actually failed. Perf-only (a missed optimization, not a wrong
+// result -- the tensor just stays on SOA a step longer than necessary), but
+// it is the same pointer-identity-reuse shape this audit exists to close,
+// and clearing it costs nothing.
+static void ggml_sycl_reset_moe_phase_demotion_state() {
+    {
+        std::lock_guard<std::mutex> lock(g_moe_phase_tiled_demoted_mutex);
+        g_moe_phase_tiled_demoted.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_moe_phase_i8_demoted_mutex);
+        g_moe_phase_i8_demoted.clear();
+    }
+}
+
 static bool ggml_sycl_moe_phase_down_i8_enabled();
 static bool ggml_sycl_moe_phase_down_i8_bulk_enabled();
 
@@ -71214,6 +71325,39 @@ static std::mutex g_layer_map_mutex;
 
 // Per-layer tracking: which layers have been classified (true = resolved)
 static std::vector<bool> g_layer_classified;
+
+// Load-boundary reset for the layer/CPU-offload map (llama.cpp-k7b0).
+//
+// g_layer_map_initialized is a double-checked-locking "run once" guard around
+// build_layer_device_map()/seed_layer_plan_classification() (see the two call
+// sites below, both gated the same way). Before this fix it was set once and
+// NEVER reset, which made it a "run once per PROCESS" guard rather than the
+// "run once per MODEL" guard its own callers assume: in test-llama-archs'
+// ~131-architecture sequential sweep, only the FIRST loaded model ever ran
+// build_layer_device_map(), so g_layer_on_cpu/g_layer_plan_forced/
+// g_layer_classified stayed sized (and populated) for that first model's
+// layer count and CPU/GPU placement for every architecture loaded after it.
+// A later model with fewer layers would read a PREVIOUS model's stale
+// per-layer CPU-offload decision for any layer index the first model also
+// had; a later model with more layers would silently never classify the
+// extra ones (every read is bounds-checked against the stale, smaller
+// vector size, so this fails quiet rather than crashing -- exactly the "OK
+// but wrong" shape the KV-sizing defect that motivated this audit had).
+//
+// Clearing the vectors here is defense in depth, not the load-bearing part:
+// every read site bounds-checks against .size() before indexing, so an
+// empty vector between this reset and the next lazy rebuild reads as "no
+// layers classified yet", the correct cold-start answer. Resetting the
+// atomic flag is what actually matters -- it is what makes
+// build_layer_device_map() and seed_layer_plan_classification() run again
+// for the next model's first compute call.
+static void ggml_sycl_reset_layer_map_state() {
+    std::lock_guard<std::mutex> lock(g_layer_map_mutex);
+    g_layer_on_cpu.clear();
+    g_layer_plan_forced.clear();
+    g_layer_classified.clear();
+    g_layer_map_initialized.store(false, std::memory_order_release);
+}
 
 static void seed_layer_plan_classification(int device) {
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
