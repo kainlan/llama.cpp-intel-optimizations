@@ -2766,7 +2766,8 @@ bool unified_cache::planned_materialization_allowed(const char *               o
 
 static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_key & cache_key,
                                                             int                       cache_device,
-                                                            unified_cache_entry &     entry);
+                                                            unified_cache_entry &     entry,
+                                                            const char *              site);
 static bool                        moe_direct_trace_enabled();
 
 static mem_handle make_copy_handle_for_raw_ptr(void * ptr, ggml_layout_mode layout, int fallback_device) {
@@ -2916,6 +2917,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             }
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
+                it->second.debug_last_lease_site = "direct_stage_weight/cache-hit-out_handle";
                 *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
                                                             it->second.layout, !it->second.host_resident, &it->second);
             }
@@ -3064,9 +3066,10 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         }
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
-        direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored);
+        direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_weight/mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
+            stored.debug_last_lease_site = "direct_stage_weight/publish-out_handle";
             *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
                                                         !stored.host_resident, &stored);
         }
@@ -3099,10 +3102,15 @@ static void moe_direct_trace_key(const char *               op,
                                  size_t                     direct_entries,
                                  const weight_entry *       entry);
 
+// `site` (llama.cpp-2wv5) names the caller for the debug-only lease-site tag;
+// this helper is shared by eight call sites, so tagging it with one literal of
+// its own would have named the helper instead of the path that leaked.
 static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_key & cache_key,
                                                             int                       cache_device,
-                                                            unified_cache_entry &     entry) {
+                                                            unified_cache_entry &     entry,
+                                                            const char *              site) {
     entry.in_use_count.fetch_add(1);
+    entry.debug_last_lease_site = site;
     return std::make_shared<mem_handle>(mem_handle::from_weight_lease(
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
@@ -3143,6 +3151,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             }
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
+                it->second.debug_last_lease_site = "direct_stage_expert/cache-hit-out_handle";
                 *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
                                                             it->second.layout, true, &it->second);
             }
@@ -3278,9 +3287,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.has_write_event  = false;
             entries_[cache_key]    = entry;
             auto & stored          = entries_[cache_key];
-            direct_handle          = make_direct_entry_handle(cache_key, cache_device, stored);
+            direct_handle =
+                make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert/host-mirror");
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "direct_stage_expert/host-publish-out_handle";
                 *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
                                                             stored.location == cache_location::DEVICE, &stored);
             }
@@ -3411,9 +3422,10 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
-        direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored);
+        direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert/mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
+            stored.debug_last_lease_site = "direct_stage_expert/publish-out_handle";
             *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
                                                         !stored.host_resident, &stored);
         }
@@ -3497,6 +3509,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                         make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
                     auto & entry = entries_.find(cache_key)->second;
                     entry.in_use_count.fetch_add(1);
+                    entry.debug_last_lease_site = "direct_stage_expert_tensor/all-existing";
                     out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, entry.device_ptr,
                                                                          entry.layout, true, &entry));
                 }
@@ -3674,10 +3687,12 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             direct_entry.location        = cache_location::DEVICE;
             direct_entry.has_ready_event = true;
             direct_entry.ready_event     = fill_event;
-            direct_entry.handle          = make_direct_entry_handle(cache_key, cache_device, stored);
+            direct_entry.handle =
+                make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert_tensor/mirror");
             direct_entries.push_back(std::move(direct_entry));
             if (out_handles) {
                 stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "direct_stage_expert_tensor/publish-out_handles";
                 out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr,
                                                                      stored.layout, true, &stored));
             }
@@ -3881,6 +3896,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                 expert_resolve_reason reject_reason = expert_resolve_reason::FOUND;
                 if (expert_resolution_allowed(req, location, owner, &reject_reason)) {
                     entry.in_use_count.fetch_add(1);
+                    entry.debug_last_lease_site = "resolve_expert/entry-hit";
                     result.ptr             = entry.device_ptr;
                     result.size            = entry.size;
                     result.tier            = expert_tier_from_location(location);
@@ -4324,9 +4340,11 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
                 old->second.access_count++;
                 old->second.last_access = time_++;
-                direct_handle           = make_direct_entry_handle(cache_key, dev, old->second);
+                direct_handle =
+                    make_direct_entry_handle(cache_key, dev, old->second, "register_host_expert/existing-mirror");
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
+                    old->second.debug_last_lease_site = "register_host_expert/existing-out_handle";
                     *out_handle =
                         mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
                                                       old->second.location == cache_location::DEVICE, &old->second);
@@ -4360,9 +4378,10 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
         cache_entry.has_write_event  = false;
         entries_[cache_key]          = cache_entry;
         auto & stored                = entries_[cache_key];
-        direct_handle                = make_direct_entry_handle(cache_key, dev, stored);
+        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_expert/publish-mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
+            stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
             *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
                                                         stored.location == cache_location::DEVICE, &stored);
         }
@@ -4413,9 +4432,11 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
                 old->second.access_count++;
                 old->second.last_access = time_++;
-                direct_handle           = make_direct_entry_handle(cache_key, dev, old->second);
+                direct_handle =
+                    make_direct_entry_handle(cache_key, dev, old->second, "register_host_weight/existing-mirror");
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
+                    old->second.debug_last_lease_site = "register_host_weight/existing-out_handle";
                     *out_handle =
                         mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
                                                       old->second.location == cache_location::DEVICE, &old->second);
@@ -4449,9 +4470,10 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
         cache_entry.has_write_event  = false;
         entries_[cache_key]          = cache_entry;
         auto & stored                = entries_[cache_key];
-        direct_handle                = make_direct_entry_handle(cache_key, dev, stored);
+        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_weight/publish-mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
+            stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
             *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
                                                         stored.location == cache_location::DEVICE, &stored);
         }
@@ -5632,6 +5654,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             // Bump the lease refcount under shared_lock.  Visible to any evictor
             // that later acquires the unique_lock (acq_rel ordering).
             entry.in_use_count.fetch_add(1);
+            entry.debug_last_lease_site = "acquire_entry_lease";  // debug-only, llama.cpp-2wv5
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
@@ -7562,6 +7585,66 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
         direct_weights_before = direct_weight_entries_.size();
         direct_experts_before = direct_expert_entries_.size();
     }
+
+    // llama.cpp-2wv5: drop this teardown's direct-stage mirror rows BEFORE the
+    // scan below reads in_use_count -- not after it, which is where the
+    // equivalent clear used to sit.
+    //
+    // Every row in direct_weight_entries_ / direct_expert_entries_ owns a
+    // shared_ptr<mem_handle> minted by make_direct_entry_handle(), and that
+    // handle holds exactly one lease on the backing entries_ entry.  Clearing
+    // the tables only at the END of this function meant that when the scan ran,
+    // the cache was still holding one lease per staged weight -- and reported
+    // every one of them as a leaked mem_handle.  That is precisely the
+    // 291-of-516 signature on a single-model Mistral teardown: uniform
+    // leases=1 and owners=0x00000000.  A third clue -- an acquisition-site tag
+    // captured inside acquire_entry_lease() reading null on all 291 -- is what
+    // ruled out the whole handle-lease API and pointed here; that scaffolding
+    // has been retired now that it has served its purpose, leaving the
+    // debug_last_lease_site literals as the successor probe.
+    //
+    // This is a re-ordering, not a forced reap.  The leases are released by
+    // destroying the handles that own them -- the only reclamation the
+    // ownership contract permits -- and these same rows were already being
+    // dropped unconditionally a few dozen lines further down.
+    //
+    // Scoped narrowly on purpose:
+    //   - MODEL_TEARDOWN only; LOAD_BOUNDARY and MID_LOAD_REPLAN keep their
+    //     existing ordering.
+    //   - Skipped whenever any entry is still owned by a SURVIVING model.  That
+    //     is the same ownership-based (deliberately lease-independent)
+    //     predicate the trailing `keep_direct_tables` branch uses, so a live
+    //     model's inference-time lookup rows are never dropped here; only the
+    //     trailing surviving_ids prune may touch them.
+    //
+    // direct_stage_mutex_ is taken on its own: nesting it inside rw_mutex_ would
+    // invert the lock order the direct staging paths use.
+    if (mode == weight_reclaim_mode::MODEL_TEARDOWN) {
+        const uint32_t dying_bit         = (slot < MODEL_SLOT_COUNT) ? (1u << slot) : 0u;
+        bool           owned_by_survivor = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+            const uint32_t                      surviving_mask = live_model_mask_ & ~dying_bit;
+            for (const auto & pair : entries_) {
+                if ((pair.second.owner_mask & ~dying_bit & surviving_mask) != 0) {
+                    owned_by_survivor = true;
+                    break;
+                }
+            }
+        }
+        if (!owned_by_survivor) {
+            std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
+            const size_t                        dropped_weights = direct_weight_entries_.size();
+            const size_t                        dropped_experts = direct_expert_entries_.size();
+            direct_weight_entries_.clear();
+            direct_expert_entries_.clear();
+            GGML_SYCL_DEBUG(
+                "[UNIFIED-CACHE] reclaim_weight_entries(model-teardown) released direct-stage mirror rows before "
+                "the reclaim scan: weights=%zu experts=%zu\n",
+                dropped_weights, dropped_experts);
+        }
+    }
+
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         // A model load is NOT a quiescent point for other models.  Several
@@ -7597,6 +7680,11 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                 // every replan is in, and clearing the tables there is what drops
                 // those leases -- keeping them would change single-model
                 // behaviour and reintroduce the fragmentation the replan avoids.
+                //
+                // llama.cpp-2wv5: a SECOND copy of this same ownership test lives
+                // in the MODEL_TEARDOWN pre-scan block above (`owned_by_survivor`),
+                // which drops the mirror rows before the scan reads in_use_count.
+                // The two must agree -- change both or neither.
                 keep_direct_tables = true;
             }
         }
@@ -7638,9 +7726,10 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                                                                  zone_largest_free(vram_zone_id::WEIGHT));
                     GGML_SYCL_DEBUG(
                         "[UNIFIED-CACHE] reclaim_weight_entries preserving leased model weight "
-                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x\n",
+                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x site=%s\n",
                         (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
-                        (int) entry.layout, live, entry.owner_mask);
+                        (int) entry.layout, live, entry.owner_mask,
+                        entry.debug_last_lease_site ? entry.debug_last_lease_site : "(none)");
                 } else if (owned_by_live) {
                     entries_owned++;
                 } else {

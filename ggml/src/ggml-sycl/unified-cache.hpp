@@ -1521,6 +1521,20 @@ struct unified_cache_entry {
     // runtime, outside a load) -- the latter is kept while any model is live.
     uint32_t              owner_mask   = 0;
     bool                  owner_tagged = false;
+    // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
+    // entry -- a distinct string literal stamped at each of the ~16 sites that
+    // bump in_use_count, whether directly or through acquire_entry_lease().
+    // Overwritten on every acquisition: not a history, just "who holds the
+    // current lease", which is enough to diagnose reclaim_weight_entries()'s
+    // "preserving leased model weight" report, since a leaked entry there always
+    // shows exactly one outstanding lease (in_use_count == 1).
+    //
+    // A literal, not the __builtin_return_address(0) an earlier revision used:
+    // it needs no addr2line, survives inlining, and -- decisively -- the direct
+    // fetch_add sites never reach acquire_entry_lease(), so a tag captured only
+    // at that function's entry read null on every leaked entry and named nobody.
+    // Static storage duration, never freed.
+    const char *          debug_last_lease_site = nullptr;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 

@@ -879,6 +879,12 @@ mem_handle::mem_handle(const mem_handle & other) :
         chunk_device_ = other.chunk_device_;
         if (leased_entry_) {
             leased_entry_->in_use_count.fetch_add(1);
+            // llama.cpp-2wv5: a copy takes its own lease, so it -- not whoever
+            // acquired the original -- is the site that owes the release.  Like
+            // the fetch_add above, this writes to the CACHE ENTRY rather than to
+            // handle state and takes no cache lock, so it is equally safe inside
+            // this critical section.
+            leased_entry_->debug_last_lease_site = "mem_handle/copy-ctor";
         }
     }
     // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.  This
@@ -938,6 +944,9 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_chunk_device = other.chunk_device_;
         if (new_entry) {
             new_entry->in_use_count.fetch_add(1);
+            // llama.cpp-2wv5: see the copy ctor -- the copy holds the lease it
+            // just took, so it is the site that owes the release.
+            new_entry->debug_last_lease_site = "mem_handle/copy-assign";
         }
     }
 
