@@ -1,0 +1,18 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 206492114
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: gemma2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+[SYCL-WATCHDOG] No GPU progress for 30279 ms (timeout 30000 ms, 1 devices known).
+[SYCL-WATCHDOG] Most likely a SYCL submit is hung inside the Level Zero driver;
+[SYCL-WATCHDOG] the xe driver would otherwise reset the GT engine in ~10 s and
+[SYCL-WATCHDOG] accumulate state that requires a reboot. Forcing cleanup + _Exit(1).
+[SYCL-WATCHDOG] Set GGML_SYCL_OP_TIMEOUT_MS=0 to disable, or raise the value for
+[SYCL-WATCHDOG] known-slow workloads (large model prestage, cold warmup).

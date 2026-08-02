@@ -1,0 +1,1036 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 1318138990
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: clip (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            clip|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: clip (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            clip|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: clip (Meta, Dense)
+|            clip|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+|           llama|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.35e-12)|       [1;32mOK[0m|
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           llama|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llama (Meta, Dense)
+|           llama|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.03.148.003 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.148.899 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.149.698 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.158.996 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.159.513 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.160.180 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.165.787 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.166.234 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.166.815 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.168.083 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.171.560 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.172.326 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.258.463 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.259.856 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.260.270 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.261.394 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.261.761 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.263.333 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.264.873 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.265.161 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.266.118 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.267.040 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.267.301 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.269.990 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|           llama|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.36e-12)|       [1;32mOK[0m|
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|           llama|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llama (Meta, MoE)
+|           llama|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llama4 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+llama4 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 1571/16384 logits differ, max abs 4.657e-10, max rel 1.081e-04
+  first difference:      token 4 of 128, vocab 0 of 128 (flat index 512)
+  token rows affected:   27 of 128, from 4 to 125
+  gate NMSE(dev,reload): 9.132e-16 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 1.852e-11, reloaded 1.852e-11
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|          llama4|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.85e-11)|  [1;36mBITDIFF[0m|
+test case: llama4 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|          llama4|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llama4 (Meta, MoE)
+|          llama4|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deci (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            deci|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (9.79e-13)|       [1;32mOK[0m|
+test case: deci (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            deci|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: deci (Meta, Dense)
+|            deci|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: falcon (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          falcon|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.57e-11)|       [1;32mOK[0m|
+test case: falcon (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          falcon|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: falcon (Meta, Dense)
+|          falcon|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: baichuan (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        baichuan|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.26e-12)|       [1;32mOK[0m|
+test case: baichuan (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        baichuan|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: baichuan (Meta, Dense)
+|        baichuan|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: grok (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|            grok|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.89e-12)|       [1;32mOK[0m|
+test case: grok (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|            grok|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: grok (Meta, MoE)
+|            grok|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gpt2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            gpt2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.22e-10)|       [1;32mOK[0m|
+test case: gpt2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            gpt2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: gpt2 (Meta, Dense)
+|            gpt2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gptj (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            gptj|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gptj (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            gptj|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gptj (Meta, Dense)
+|            gptj|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gptneox (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         gptneox|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.40e-10)|       [1;32mOK[0m|
+test case: gptneox (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         gptneox|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: gptneox (Meta, Dense)
+|         gptneox|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: mpt (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|             mpt|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (9.59e-10)|       [1;32mOK[0m|
+test case: mpt (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|             mpt|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: mpt (Meta, Dense)
+|             mpt|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: starcoder (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       starcoder|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.22e-10)|       [1;32mOK[0m|
+test case: starcoder (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       starcoder|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: starcoder (Meta, Dense)
+|       starcoder|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: refact (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          refact|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (7.03e-12)|       [1;32mOK[0m|
+test case: refact (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          refact|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: refact (Meta, Dense)
+|          refact|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: refact (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|          refact|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (5.34e-12)|       [1;32mOK[0m|
+test case: refact (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|          refact|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: refact (Meta, MoE)
+|          refact|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bert (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            bert|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bert (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            bert|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bert (Meta, Dense)
+|            bert|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: modern-bert (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|     modern-bert|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: modern-bert (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|     modern-bert|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: modern-bert (Meta, Dense)
+|     modern-bert|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|      nomic-bert|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      nomic-bert|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert (Meta, Dense)
+|      nomic-bert|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert-moe (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|  nomic-bert-moe|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert-moe (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|  nomic-bert-moe|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nomic-bert-moe (Meta, Dense)
+|  nomic-bert-moe|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: neo-bert (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        neo-bert|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: neo-bert (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        neo-bert|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: neo-bert (Meta, Dense)
+|        neo-bert|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|    jina-bert-v2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|    jina-bert-v2|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v2 (Meta, Dense)
+|    jina-bert-v2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|    jina-bert-v3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|    jina-bert-v3|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jina-bert-v3 (Meta, Dense)
+|    jina-bert-v3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: eurobert (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        eurobert|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: eurobert (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        eurobert|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: eurobert (Meta, Dense)
+|        eurobert|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bloom (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           bloom|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.37e-10)|       [1;32mOK[0m|
+test case: bloom (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           bloom|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: bloom (Meta, Dense)
+|           bloom|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: stablelm (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        stablelm|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.53e-12)|       [1;32mOK[0m|
+test case: stablelm (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        stablelm|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: stablelm (Meta, Dense)
+|        stablelm|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            qwen|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.87e-12)|       [1;32mOK[0m|
+test case: qwen (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            qwen|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen (Meta, Dense)
+|            qwen|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           qwen2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.46e-13)|       [1;32mOK[0m|
+test case: qwen2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           qwen2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen2 (Meta, Dense)
+|           qwen2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen2moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+qwen2moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 2433/16384 logits differ, max abs 9.313e-10, max rel 2.897e-04
+  first difference:      token 10 of 128, vocab 0 of 128 (flat index 1280)
+  token rows affected:   33 of 128, from 10 to 127
+  gate NMSE(dev,reload): 2.295e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 5.627e-10, reloaded 5.627e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|        qwen2moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (5.63e-10)|  [1;36mBITDIFF[0m|
+test case: qwen2moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|        qwen2moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen2moe (Meta, MoE)
+|        qwen2moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen2vl (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         qwen2vl|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.42e-12)|       [1;32mOK[0m|
+test case: qwen2vl (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         qwen2vl|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen2vl (Meta, Dense)
+|         qwen2vl|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           qwen3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.42e-12)|       [1;32mOK[0m|
+test case: qwen3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           qwen3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen3 (Meta, Dense)
+|           qwen3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen3moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.06.717.190 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.717.524 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.717.862 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.718.784 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.719.047 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.719.360 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.720.396 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.720.681 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.720.997 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.721.755 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.722.020 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.722.307 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.750.221 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.750.654 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.751.133 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.752.157 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.752.523 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.752.956 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.754.053 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=271 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.754.321 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=277 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.754.656 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.755.430 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.755.675 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.06.755.950 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|        qwen3moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (6.42e-12)|       [1;32mOK[0m|
+test case: qwen3moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|        qwen3moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen3moe (Meta, MoE)
+|        qwen3moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen3next (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+qwen3next (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 2626/16384 logits differ, max abs 4.657e-10, max rel 2.005e-04
+  first difference:      token 26 of 128, vocab 43 of 128 (flat index 3371)
+  token rows affected:   96 of 128, from 26 to 127
+  gate NMSE(dev,reload): 1.221e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 2.060e-09, reloaded 2.060e-09
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|       qwen3next|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.06e-09)|  [1;36mBITDIFF[0m|
+test case: qwen3next (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|       qwen3next|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen3next (Meta, MoE)
+|       qwen3next|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen3vl (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         qwen3vl|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.40e-12)|       [1;32mOK[0m|
+test case: qwen3vl (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         qwen3vl|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen3vl (Meta, Dense)
+|         qwen3vl|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen3vlmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|      qwen3vlmoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.23e-09)|       [1;32mOK[0m|
+test case: qwen3vlmoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      qwen3vlmoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen3vlmoe (Meta, MoE)
+|      qwen3vlmoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen35 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          qwen35|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.83e-14)|       [1;32mOK[0m|
+test case: qwen35 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          qwen35|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen35 (Meta, Dense)
+|          qwen35|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: qwen35moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.07.725.151 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.731.339 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.751.460 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.753.277 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.802.797 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.805.501 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.836.771 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=283 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.07.838.657 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|       qwen35moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.75e-13)|       [1;32mOK[0m|
+test case: qwen35moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|       qwen35moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: qwen35moe (Meta, MoE)
+|       qwen35moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: phi2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            phi2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (7.37e-12)|       [1;32mOK[0m|
+test case: phi2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            phi2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: phi2 (Meta, Dense)
+|            phi2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: phi3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            phi3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.33e-12)|       [1;32mOK[0m|
+test case: phi3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            phi3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: phi3 (Meta, Dense)
+|            phi3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: phimoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+phimoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 8138/16384 logits differ, max abs 2.733e-07, max rel 3.092e-02
+  first difference:      token 0 of 128, vocab 0 of 128 (flat index 0)
+  token rows affected:   64 of 128, from 0 to 63
+  gate NMSE(dev,reload): 1.299e-11 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 1.815e-11, reloaded 1.791e-11
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|          phimoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.81e-11)|  [1;36mBITDIFF[0m|
+test case: phimoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|          phimoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: phimoe (Meta, MoE)
+|          phimoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plamo (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           plamo|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.43e-12)|       [1;32mOK[0m|
+test case: plamo (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           plamo|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: plamo (Meta, Dense)
+|           plamo|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plamo2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          plamo2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.11e-14)|       [1;32mOK[0m|
+test case: plamo2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          plamo2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: plamo2 (Meta, Dense)
+|          plamo2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plamo3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          plamo3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.35e-14)|     [1;33mSKIP[0m|
+test case: plamo3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          plamo3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: plamo3 (Meta, Dense)
+|          plamo3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: codeshell (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       codeshell|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.38e-10)|       [1;32mOK[0m|
+test case: codeshell (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       codeshell|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: codeshell (Meta, Dense)
+|       codeshell|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: orion (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           orion|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.52e-12)|       [1;32mOK[0m|
+test case: orion (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           orion|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: orion (Meta, Dense)
+|           orion|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: internlm2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       internlm2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.41e-12)|       [1;32mOK[0m|
+test case: internlm2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       internlm2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: internlm2 (Meta, Dense)
+|       internlm2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: minicpm (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         minicpm|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (8.16e-14)|       [1;32mOK[0m|
+test case: minicpm (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         minicpm|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: minicpm (Meta, Dense)
+|         minicpm|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: minicpm (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|         minicpm|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.83e-11)|       [1;32mOK[0m|
+test case: minicpm (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         minicpm|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: minicpm (Meta, MoE)
+|         minicpm|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: minicpm3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        minicpm3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.87e-14)|       [1;32mOK[0m|
+test case: minicpm3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        minicpm3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: minicpm3 (Meta, Dense)
+|        minicpm3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           gemma|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.70e-14)|       [1;32mOK[0m|
+test case: gemma (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           gemma|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: gemma (Meta, Dense)
+|           gemma|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+|          gemma2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.76e-13)|       [1;32mOK[0m|
+test case: gemma2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          gemma2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: gemma2 (Meta, Dense)
+|          gemma2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          gemma3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.86e-13)|     [1;33mSKIP[0m|
+test case: gemma3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          gemma3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: gemma3 (Meta, Dense)
+|          gemma3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma3n (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+|         gemma3n|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;31mFAIL[0m (1.20e+00)|     [1;33mSKIP[0m|
+test case: gemma3n (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         gemma3n|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: gemma3n (Meta, Dense)
+|         gemma3n|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma-embedding (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+| gemma-embedding|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma-embedding (Intel(R) Core(TM) Ultra 7 265K, Dense)
+| gemma-embedding|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gemma-embedding (Meta, Dense)
+| gemma-embedding|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: starcoder2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+0.10.362.659 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.362.708 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.10.362.846 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.362.895 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.10.385.548 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.385.587 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.10.385.678 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.385.707 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+|      starcoder2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.38e-10)|       [1;32mOK[0m|
+test case: starcoder2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      starcoder2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: starcoder2 (Meta, Dense)
+|      starcoder2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: mamba (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           mamba|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.91e-14)|       [1;32mOK[0m|
+test case: mamba (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           mamba|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: mamba (Meta, Dense)
+|           mamba|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: mamba2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          mamba2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.91e-14)|       [1;32mOK[0m|
+test case: mamba2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          mamba2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: mamba2 (Meta, Dense)
+|          mamba2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jamba (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+0.10.941.412 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.941.483 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.10.997.342 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.10.997.439 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+|           jamba|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.31e-12)|       [1;32mOK[0m|
+test case: jamba (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           jamba|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: jamba (Meta, Dense)
+|           jamba|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: falcon-h1 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+0.11.195.934 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.195.964 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.196.039 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.196.065 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+
+falcon-h1 (Intel(R) Arc(TM) Pro B70 Graphics, Dense): non-finite NMSE: n=16384, non-finite CPU logits=0, non-finite device logits=16384, CPU reference energy=0.047832
+  device non-finite token positions: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,... (128 rows total)
+0.11.230.851 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.230.943 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.231.022 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.231.060 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+
+falcon-h1 (Intel(R) Arc(TM) Pro B70 Graphics, Dense): roundtrip not bit-exact [FAIL]
+  save/reload vs device: 16384/16384 logits differ, max abs 0.000e+00, max rel 0.000e+00
+  first difference:      token 0 of 128, vocab 0 of 128 (flat index 0)
+  token rows affected:   128 of 128, from 0 to 127
+  gate NMSE(dev,reload): -nan vs threshold 1.0e-04 -- EXCEEDED: the reloaded model computes something else; the save/reload lost data
+  NMSE vs CPU:           device -nan, reloaded -nan
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|       falcon-h1|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;31mFAIL[0m      (nan)|     [1;31mFAIL[0m|
+test case: falcon-h1 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       falcon-h1|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: falcon-h1 (Meta, Dense)
+|       falcon-h1|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: xverse (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+0.11.361.572 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.361.626 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.361.768 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.361.817 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.381.317 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.381.347 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.381.414 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.381.437 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+|          xverse|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.41e-12)|       [1;32mOK[0m|
+test case: xverse (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          xverse|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: xverse (Meta, Dense)
+|          xverse|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: command-r (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+0.11.447.612 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.447.657 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.447.746 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.447.771 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.470.780 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.470.810 E [KV-REMAP] ERROR: cache_v_l0 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+0.11.470.969 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=131072 > la.size=65536
+0.11.470.993 E [KV-REMAP] ERROR: cache_v_l1 overflows layer alloc! off_in_layer=131072 + nbytes=131072 > la.size=65536
+|       command-r|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.55e-12)|       [1;32mOK[0m|
+test case: command-r (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       command-r|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: command-r (Meta, Dense)
+|       command-r|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: cohere2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         cohere2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (2.74e-12)|     [1;33mSKIP[0m|
+test case: cohere2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         cohere2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: cohere2 (Meta, Dense)
+|         cohere2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: cohere2moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.11.630.495 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.11.632.525 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|      cohere2moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (4.43e-12)|     [1;33mSKIP[0m|
+test case: cohere2moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      cohere2moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: cohere2moe (Meta, MoE)
+|      cohere2moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: dbrx (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|            dbrx|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.67e-09)|       [1;32mOK[0m|
+test case: dbrx (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|            dbrx|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: dbrx (Meta, MoE)
+|            dbrx|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: olmo (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            olmo|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.94e-13)|       [1;32mOK[0m|
+test case: olmo (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            olmo|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: olmo (Meta, Dense)
+|            olmo|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: olmo2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           olmo2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (4.29e-14)|     [1;33mSKIP[0m|
+test case: olmo2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           olmo2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: olmo2 (Meta, Dense)
+|           olmo2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: olmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+olmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 2819/16384 logits differ, max abs 9.313e-10, max rel 1.478e-04
+  first difference:      token 21 of 128, vocab 1 of 128 (flat index 2689)
+  token rows affected:   39 of 128, from 21 to 127
+  gate NMSE(dev,reload): 2.757e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 5.564e-10, reloaded 5.565e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|           olmoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (5.56e-10)|  [1;36mBITDIFF[0m|
+test case: olmoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|           olmoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: olmoe (Meta, MoE)
+|           olmoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: openelm (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         openelm|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.90e-14)|       [1;32mOK[0m|
+test case: openelm (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         openelm|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: openelm (Meta, Dense)
+|         openelm|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: arctic (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|          arctic|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.14e-09)|       [1;32mOK[0m|
+test case: arctic (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|          arctic|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: arctic (Meta, MoE)
+|          arctic|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+deepseek (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 1989/16384 logits differ, max abs 6.985e-10, max rel 3.040e-05
+  first difference:      token 2 of 128, vocab 0 of 128 (flat index 256)
+  token rows affected:   26 of 128, from 2 to 127
+  gate NMSE(dev,reload): 2.091e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 2.267e-10, reloaded 2.266e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|        deepseek|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.27e-10)|  [1;36mBITDIFF[0m|
+test case: deepseek (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|        deepseek|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: deepseek (Meta, MoE)
+|        deepseek|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek2 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.12.484.301 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.484.368 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.511.749 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.511.799 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+
+deepseek2 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 21/16384 logits differ, max abs 2.328e-10, max rel 1.212e-05
+  first difference:      token 83 of 128, vocab 0 of 128 (flat index 10624)
+  token rows affected:   1 of 128, from 83 to 83
+  gate NMSE(dev,reload): 9.911e-18 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 1.393e-11, reloaded 1.393e-11
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|       deepseek2|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.39e-11)|  [1;36mBITDIFF[0m|
+test case: deepseek2 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|       deepseek2|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: deepseek2 (Meta, MoE)
+|       deepseek2|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek2-ocr (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|   deepseek2-ocr|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek2-ocr (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|   deepseek2-ocr|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek2-ocr (Meta, Dense)
+|   deepseek2-ocr|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek32 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.12.613.564 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.613.624 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.636.139 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.12.636.365 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.12.636.593 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.12.642.062 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=293 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.12.642.264 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.12.642.461 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=305 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+
+deepseek32 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): non-finite NMSE: n=16384, non-finite CPU logits=0, non-finite device logits=16384, CPU reference energy=0.0210244
+  device non-finite token positions: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,... (128 rows total)
+0.12.656.146 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.12.656.211 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+
+deepseek32 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [FAIL]
+  save/reload vs device: 16384/16384 logits differ, max abs 0.000e+00, max rel 0.000e+00
+  first difference:      token 0 of 128, vocab 0 of 128 (flat index 0)
+  token rows affected:   128 of 128, from 0 to 127
+  gate NMSE(dev,reload): -nan vs threshold 1.0e-04 -- EXCEEDED: the reloaded model computes something else; the save/reload lost data
+  NMSE vs CPU:           device -nan, reloaded -nan
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|      deepseek32|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|[1;31mFAIL[0m      (nan)|     [1;31mFAIL[0m|
+test case: deepseek32 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      deepseek32|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: deepseek32 (Meta, MoE)
+|      deepseek32|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek4 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       deepseek4|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek4 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       deepseek4|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: deepseek4 (Meta, Dense)
+|       deepseek4|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: chatglm (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         chatglm|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.43e-12)|       [1;32mOK[0m|
+test case: chatglm (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         chatglm|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: chatglm (Meta, Dense)
+|         chatglm|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: glm4 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            glm4|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (8.08e-11)|       [1;32mOK[0m|
+test case: glm4 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            glm4|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: glm4 (Meta, Dense)
+|            glm4|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: glm4moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+glm4moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 585/16384 logits differ, max abs 4.657e-10, max rel 2.970e-05
+  first difference:      token 4 of 128, vocab 71 of 128 (flat index 583)
+  token rows affected:   11 of 128, from 4 to 127
+  gate NMSE(dev,reload): 4.027e-16 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 2.574e-10, reloaded 2.574e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|         glm4moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.57e-10)|  [1;36mBITDIFF[0m|
+test case: glm4moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         glm4moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: glm4moe (Meta, MoE)
+|         glm4moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: glm-dsa (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.13.079.492 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.13.079.553 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.13.108.692 E [KV-REMAP] ERROR: cache_k_l0 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+0.13.108.742 E [KV-REMAP] ERROR: cache_k_l1 overflows layer alloc! off_in_layer=0 + nbytes=294912 > la.size=262144
+
+glm-dsa (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 132/16384 logits differ, max abs 4.657e-10, max rel 9.250e-06
+  first difference:      token 29 of 128, vocab 0 of 128 (flat index 3712)
+  token rows affected:   3 of 128, from 29 to 105
+  gate NMSE(dev,reload): 2.186e-16 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 1.486e-11, reloaded 1.486e-11
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|         glm-dsa|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.49e-11)|  [1;36mBITDIFF[0m|
+test case: glm-dsa (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         glm-dsa|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: glm-dsa (Meta, MoE)
+|         glm-dsa|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bitnet (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          bitnet|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.95e-14)|     [1;33mSKIP[0m|
+test case: bitnet (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          bitnet|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: bitnet (Meta, Dense)
+|          bitnet|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: t5 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|              t5|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (2.83e-11)|     [1;33mSKIP[0m|
+test case: t5 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|              t5|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: t5 (Meta, Dense)
+|              t5|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: t5encoder (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       t5encoder|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: t5encoder (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       t5encoder|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: t5encoder (Meta, Dense)
+|       t5encoder|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jais (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            jais|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.27e-13)|       [1;32mOK[0m|
+test case: jais (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            jais|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: jais (Meta, Dense)
+|            jais|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: jais2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           jais2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (5.83e-13)|       [1;32mOK[0m|
+test case: jais2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           jais2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: jais2 (Meta, Dense)
+|           jais2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nemotron (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        nemotron|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (5.83e-13)|       [1;32mOK[0m|
+test case: nemotron (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        nemotron|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: nemotron (Meta, Dense)
+|        nemotron|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nemotron_h (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|      nemotron_h|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (2.05e-12)|       [1;32mOK[0m|
+test case: nemotron_h (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      nemotron_h|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: nemotron_h (Meta, Dense)
+|      nemotron_h|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: nemotron_h_moe (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|  nemotron_h_moe|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (2.05e-12)|       [1;32mOK[0m|
+test case: nemotron_h_moe (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|  nemotron_h_moe|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: nemotron_h_moe (Meta, Dense)
+|  nemotron_h_moe|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: exaone (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          exaone|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.35e-12)|       [1;32mOK[0m|
+test case: exaone (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          exaone|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: exaone (Meta, Dense)
+|          exaone|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: exaone4 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         exaone4|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (8.09e-11)|       [1;32mOK[0m|
+test case: exaone4 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         exaone4|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: exaone4 (Meta, Dense)
+|         exaone4|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: exaone-moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|      exaone-moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.18e-10)|     [1;33mSKIP[0m|
+test case: exaone-moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      exaone-moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: exaone-moe (Meta, MoE)
+|      exaone-moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           rwkv6|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           rwkv6|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6 (Meta, Dense)
+|           rwkv6|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6qwen2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|      rwkv6qwen2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6qwen2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      rwkv6qwen2|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv6qwen2 (Meta, Dense)
+|      rwkv6qwen2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv7 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           rwkv7|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv7 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           rwkv7|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: rwkv7 (Meta, Dense)
+|           rwkv7|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: arwkv7 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|          arwkv7|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: arwkv7 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|          arwkv7|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: arwkv7 (Meta, Dense)
+|          arwkv7|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: granite (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         granite|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (9.79e-13)|       [1;32mOK[0m|
+test case: granite (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         granite|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: granite (Meta, Dense)
+|         granite|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: granite (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|         granite|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (3.10e-10)|       [1;32mOK[0m|
+test case: granite (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         granite|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: granite (Meta, MoE)
+|         granite|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: granitemoe (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|      granitemoe|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (9.79e-13)|       [1;32mOK[0m|
+test case: granitemoe (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      granitemoe|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: granitemoe (Meta, Dense)
+|      granitemoe|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: granitemoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|      granitemoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (3.10e-10)|       [1;32mOK[0m|
+test case: granitemoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      granitemoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: granitemoe (Meta, MoE)
+|      granitemoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: granitehybrid (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|   granitehybrid|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (9.64e-13)|       [1;32mOK[0m|
+test case: granitehybrid (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|   granitehybrid|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: granitehybrid (Meta, Dense)
+|   granitehybrid|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: chameleon (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|       chameleon|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: chameleon (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|       chameleon|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: chameleon (Meta, Dense)
+|       chameleon|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: wavtokenizer-dec (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|wavtokenizer-dec|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: wavtokenizer-dec (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|wavtokenizer-dec|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: wavtokenizer-dec (Meta, Dense)
+|wavtokenizer-dec|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plm (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|             plm|Intel(R) Arc(TM) Pro B70 Graphics| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plm (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|             plm|   Intel(R) Core(TM) Ultra 7 265K| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: plm (Meta, Dense)
+|             plm|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bailingmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+bailingmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 7935/16384 logits differ, max abs 1.139e-07, max rel 1.276e-01
+  first difference:      token 21 of 128, vocab 0 of 128 (flat index 2688)
+  token rows affected:   64 of 128, from 21 to 127
+  gate NMSE(dev,reload): 1.131e-10 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 5.628e-10, reloaded 5.724e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|      bailingmoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (5.63e-10)|  [1;36mBITDIFF[0m|
+test case: bailingmoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      bailingmoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: bailingmoe (Meta, MoE)
+|      bailingmoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: bailingmoe2 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+bailingmoe2 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 1239/16384 logits differ, max abs 9.313e-10, max rel 5.205e-05
+  first difference:      token 1 of 128, vocab 0 of 128 (flat index 128)
+  token rows affected:   17 of 128, from 1 to 126
+  gate NMSE(dev,reload): 1.133e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 2.162e-10, reloaded 2.162e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|     bailingmoe2|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.16e-10)|  [1;36mBITDIFF[0m|
+test case: bailingmoe2 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|     bailingmoe2|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: bailingmoe2 (Meta, MoE)
+|     bailingmoe2|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: dots1 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+dots1 (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 530/16384 logits differ, max abs 9.313e-10, max rel 3.012e-05
+  first difference:      token 3 of 128, vocab 0 of 128 (flat index 384)
+  token rows affected:   7 of 128, from 3 to 126
+  gate NMSE(dev,reload): 4.744e-16 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 2.217e-10, reloaded 2.217e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|           dots1|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.22e-10)|  [1;36mBITDIFF[0m|
+test case: dots1 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|           dots1|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: dots1 (Meta, MoE)
+|           dots1|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: arcee (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           arcee|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.36e-12)|       [1;32mOK[0m|
+test case: arcee (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           arcee|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: arcee (Meta, Dense)
+|           arcee|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: afmoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|           afmoe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.21e-11)|     [1;33mSKIP[0m|
+test case: afmoe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|           afmoe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: afmoe (Meta, MoE)
+|           afmoe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: ernie4_5 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|        ernie4_5|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (6.41e-12)|       [1;32mOK[0m|
+test case: ernie4_5 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|        ernie4_5|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: ernie4_5 (Meta, MoE)
+|        ernie4_5|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: ernie4_5-moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|    ernie4_5-moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (9.08e-10)|       [1;32mOK[0m|
+test case: ernie4_5-moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|    ernie4_5-moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: ernie4_5-moe (Meta, MoE)
+|    ernie4_5-moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: hunyuan-moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|     hunyuan-moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (2.23e-09)|       [1;32mOK[0m|
+test case: hunyuan-moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|     hunyuan-moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: hunyuan-moe (Meta, MoE)
+|     hunyuan-moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: hunyuan-dense (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|   hunyuan-dense|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.43e-12)|       [1;32mOK[0m|
+test case: hunyuan-dense (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|   hunyuan-dense|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: hunyuan-dense (Meta, Dense)
+|   hunyuan-dense|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: hunyuan_vl (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|      hunyuan_vl|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.43e-12)|       [1;32mOK[0m|
+test case: hunyuan_vl (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|      hunyuan_vl|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: hunyuan_vl (Meta, Dense)
+|      hunyuan_vl|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: smollm3 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|         smollm3|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.41e-12)|       [1;32mOK[0m|
+test case: smollm3 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         smollm3|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: smollm3 (Meta, Dense)
+|         smollm3|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: gpt-oss (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+|         gpt-oss|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (3.29e-13)|       [1;32mOK[0m|
+test case: gpt-oss (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         gpt-oss|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: gpt-oss (Meta, MoE)
+|         gpt-oss|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: lfm2 (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|            lfm2|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (2.14e-13)|       [1;32mOK[0m|
+test case: lfm2 (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|            lfm2|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: lfm2 (Meta, Dense)
+|            lfm2|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: lfm2moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|         lfm2moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (8.78e-10)|       [1;32mOK[0m|
+test case: lfm2moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|         lfm2moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: lfm2moe (Meta, MoE)
+|         lfm2moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: dream (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           dream|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (1.51e-11)|       [1;32mOK[0m|
+test case: dream (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           dream|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: dream (Meta, Dense)
+|           dream|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: smallthinker (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+|    smallthinker|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (4.46e-09)|       [1;32mOK[0m|
+test case: smallthinker (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|    smallthinker|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: smallthinker (Meta, MoE)
+|    smallthinker|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llada (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|           llada|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (3.79e-14)|       [1;32mOK[0m|
+test case: llada (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|           llada|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llada (Meta, Dense)
+|           llada|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: llada-moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+
+llada-moe (Intel(R) Arc(TM) Pro B70 Graphics, MoE): roundtrip not bit-exact [BITDIFF]
+  save/reload vs device: 916/16384 logits differ, max abs 9.313e-10, max rel 5.435e-05
+  first difference:      token 10 of 128, vocab 0 of 128 (flat index 1280)
+  token rows affected:   12 of 128, from 10 to 120
+  gate NMSE(dev,reload): 1.001e-15 vs threshold 1.0e-04 -- within tolerance: both models agree to far better than the gate
+  NMSE vs CPU:           device 5.721e-10, reloaded 5.721e-10
+  (the gate is NMSE; the three lines above it are the ones with the
+   resolution to move between runs -- diagnose from those, not from NMSE)
+|       llada-moe|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (5.72e-10)|  [1;36mBITDIFF[0m|
+test case: llada-moe (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|       llada-moe|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: llada-moe (Meta, MoE)
+|       llada-moe|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: seed_oss (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+|        seed_oss|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (6.43e-12)|       [1;32mOK[0m|
+test case: seed_oss (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|        seed_oss|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: seed_oss (Meta, Dense)
+|        seed_oss|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+test case: grovemoe (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+/Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:4852: [MOE-ROUTE] unresolved planner expert tensor=blk.0.ffn_gate_chexps.weight expert=0 requested_layout=0 planned_layout=0 planned_device=-2 planned_on_device=0 current_device=0 plan_missing=1 reason=not_found tier=unavailable parsed_layer=0 parsed_role=unknown | LIKELY CAUSE: this tensor name matches no known expert-tensor pattern, so the placement planner never created per-expert entries for it while MUL_MAT_ID still routes it as MoE. Teach BOTH classifiers: infer_tensor_usage() in ggml-sycl/common.hpp (must return MOE_EXPERT_WEIGHT) and expert_tensor_role_from_tensor_name() in ggml-sycl/unified-cache.hpp (must return a non-UNKNOWN role; build_index() drops UNKNOWN roles from the placement index).
+[New LWP 2200866]
+[New LWP 2197194]
+[New LWP 2197080]
+[New LWP 2197079]
+[New LWP 2197018]
+[New LWP 2197017]
+[New LWP 2197016]
+[New LWP 2196875]
+[New LWP 2196830]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+⚠️ warning: File "/opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000076d87c2a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x000076d87c31cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x000076d885071c1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x000076d885070d39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x000076d87ccc07a3 in ggml_sycl::ggml_sycl_abort_unresolved_device_expert(ggml_tensor const*, int, int, ggml_sycl::moe_expert_route const&, bool) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x000076d87ce0e41a in ggml_sycl_mul_mat_id(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x000076d87cddabc9 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x000076d87ceb8d2f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#10 0x000076d87cd36c17 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#11 0x000076d88509912c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#12 0x000076d8848c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp/build/bin/libllama.so.0
+#13 0x000076d8848c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp/build/bin/libllama.so.0
+#14 0x000076d8848c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp/build/bin/libllama.so.0
+#15 0x000076d8848c798b in llama_decode () from /Apps/llama.cpp/build/bin/libllama.so.0
+#16 0x000000000040f0a6 in get_logits(llama_model*, llama_context*, std::vector<int, std::allocator<int> > const&, bool) ()
+#17 0x000000000040ac67 in main ()
+[Inferior 1 (process 2196778) detached]
