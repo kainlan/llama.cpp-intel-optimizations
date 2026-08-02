@@ -73211,6 +73211,60 @@ static ggml_tensor * get_mul_weight(const ggml_tensor * mul, const ggml_tensor *
     return mul->src[0];
 }
 
+// Helper to get the ADD's "other" operand (the residual/bias) given the operand that is
+// the MUL's own output. ADD has two sources; return the one that isn't mul_out.
+static ggml_tensor * get_add_operand(const ggml_tensor * add, const ggml_tensor * mul_out) {
+    if (add->src[0] == mul_out) {
+        return add->src[1];
+    }
+    return add->src[0];
+}
+
+// Fix (llama.cpp-81gx): the RMS_NORM+MUL+ADD (bit1) fused kernel path
+// (ggml_sycl_op_rms_norm_fused_add, norm.cpp) resolves its mul_src/add_src pointers via
+// ggml_sycl_resolve_tensor_ptr and indexes them with an implicit unit stride on dim0 --
+// nothing in that path validates nb[0]==element_size for either operand, and nothing was
+// ever tested against a VIEW operand at a non-zero offset into a non-weight (graph-
+// internal) tensor. gemma3n's first_prediction_out chain (gemma3n.cpp:249-253) is exactly
+// that shape: `slice_rest`, a ggml_view_3d into `corrected` skipping altup index 0
+// (offset = n_embd*n_tokens*element_size). A GGML_SYCL_FUSION_SKIP_MUL bisection
+// (this ticket) confirmed declining fusion for that one chain alone is sufficient to fix
+// gemma3n's B70 wrong answers; the standalone kernel unit test
+// (test-rms-norm-mul-add-broadcast) only ever exercised plain contiguous, zero-offset
+// operands and could not have caught this, which is why four prior static reads of the
+// kernel body found nothing wrong -- the kernel's arithmetic is correct, its operand
+// preconditions were just never enforced.
+//
+// Reproducing exactly which layer of pointer resolution or stride computation
+// mis-handles this shape would need a GPU run to trace value-by-value, and shipping an
+// unverified change to that resolution path risks introducing a new, differently-shaped
+// silent-wrong-answer bug in code that is already dense (mem_handle / unified-cache
+// internals). Declining fusion for the untested shape is deliberate, not a placeholder:
+// it is provably safe (this exact case is what the bisection measured OK), it is general
+// (protects any future arch that builds this same pattern, not just gemma3n), and its
+// cost is one unfused RMS_NORM+MUL+ADD per occurrence -- for gemma3n, 22 of its ~89
+// per-pass bit1 matches, all in one already-small per-layer op.
+static bool ggml_sycl_fusion_operand_view_offset_safe(const ggml_tensor * operand) {
+    if (!operand) {
+        return false;
+    }
+    if (operand->nb[0] != ggml_type_size(operand->type)) {
+        return false;
+    }
+    if (operand->view_src != nullptr && !ggml_sycl_tensor_is_weight(operand)) {
+        size_t              view_offs = 0;
+        const ggml_tensor * cur       = operand;
+        while (cur && cur->view_src) {
+            view_offs += cur->view_offs;
+            cur = cur->view_src;
+        }
+        if (view_offs != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Check if RMS_NORM + MUL + MUL_MAT can be fused
 static bool ggml_sycl_can_fuse_rmsnorm_mulmat(const ggml_tensor * rms_norm,
 
@@ -80130,20 +80184,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 3) && ggml_is_contiguous(cgraph->nodes[i + 2]) &&
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
-                    ggml_tensor * mul_node = cgraph->nodes[i + 1];
-                    ggml_tensor * add_node = cgraph->nodes[i + 2];
-                    if (fusion_use_count_debug) {
-                        fprintf(stderr,
-                                "[FUSION-USE-COUNT] bit1 match: rms=%s(idx=%d,use_count=%d) "
-                                "mul=%s(idx=%d,use_count=%d) add=%s(idx=%d)\n",
-                                node->name ? node->name : "?", i, ggml_node_get_use_count(cgraph, i),
-                                mul_node->name ? mul_node->name : "?", i + 1, ggml_node_get_use_count(cgraph, i + 1),
-                                add_node->name ? add_node->name : "?", i + 2);
+                    ggml_tensor * mul_node      = cgraph->nodes[i + 1];
+                    ggml_tensor * add_node      = cgraph->nodes[i + 2];
+                    ggml_tensor * mul_src_check = get_mul_weight(mul_node, node);
+                    ggml_tensor * add_src_check = get_add_operand(add_node, mul_node);
+                    if (ggml_sycl_fusion_operand_view_offset_safe(mul_src_check) &&
+                        ggml_sycl_fusion_operand_view_offset_safe(add_src_check)) {
+                        if (fusion_use_count_debug) {
+                            fprintf(stderr,
+                                    "[FUSION-USE-COUNT] bit1 match: rms=%s(idx=%d,use_count=%d) "
+                                    "mul=%s(idx=%d,use_count=%d) add=%s(idx=%d)\n",
+                                    node->name ? node->name : "?", i, ggml_node_get_use_count(cgraph, i),
+                                    mul_node->name ? mul_node->name : "?", i + 1,
+                                    ggml_node_get_use_count(cgraph, i + 1), add_node->name ? add_node->name : "?",
+                                    i + 2);
+                        }
+                        ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, mul_node, add_node);
+                        gpu_queue_dirty = true;  // D+: GPU fusion submitted work
+                        i += 2;                  // Skip the MUL and ADD nodes
+                        continue;
                     }
-                    ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, mul_node, add_node);
-                    gpu_queue_dirty = true;  // D+: GPU fusion submitted work
-                    i += 2;                  // Skip the MUL and ADD nodes
-                    continue;
+                    // Declined: mul_src or add_src is an unsafe shape for this kernel (see the
+                    // comment on ggml_sycl_fusion_operand_view_offset_safe above). Fall through to
+                    // unfused RMS_NORM/MUL/ADD, same as the GGML_SYCL_FUSION_SKIP_MUL path but
+                    // automatic and permanent.
                 }
                 // Try per-projection fusion: RMS_NORM + MUL -> multiple MUL_MATs
                 // Unlike the standard 3-way fusion, this approach:
