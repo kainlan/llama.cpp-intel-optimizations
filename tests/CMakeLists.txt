@@ -288,6 +288,32 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    # Gates -x/--exclude of test-llama-archs (llama.cpp-fepd). Inside this block, not beside
+    # test-archs-table below, because it calls llm_arch_from_string()/llm_arch_all() -- the same
+    # internal symbols test-llama-archs uses, and the reason for the NOT WIN32 OR NOT
+    # BUILD_SHARED_LIBS guard in the first place. It still loads no model and touches no device.
+    #
+    # On the name: NOT test-llama-archs-exclude. Four CI workflows carry `ctest -E
+    # "test-llama-archs"` and -E is an UNANCHORED regex, so that name would be swallowed by the
+    # pattern meant for the test it gates, and the gate would silently never run. See the note
+    # on test-archs-table below -- this is the same trap, already sprung once.
+    llama_build_and_test(test-archs-exclude.cpp)
+
+    if (NOT WIN32)
+        # The other half: that main() actually rejects a bad -x, which the unit test above
+        # cannot see. Every invocation in the script exits inside argument parsing, so it never
+        # reaches the model-loading sweep -- see the warning at the top of the script before
+        # adding a probe to it.
+        llama_test_cmd(
+            bash
+            NAME test-archs-exclude-cli
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-archs-exclude-cli.sh $<TARGET_FILE:test-llama-archs>
+        )
+        # The script exits 77 (skip) when the binary it drives was not built.
+        set_tests_properties(test-archs-exclude-cli PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 # Gates the results table of test-llama-archs against the log output it shares a stream with

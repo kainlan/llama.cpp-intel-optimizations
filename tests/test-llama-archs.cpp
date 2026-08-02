@@ -24,8 +24,9 @@
 #include <utility>
 #include <vector>
 
-// Kept in its own include block: it belongs to no upstream group, and adding it to one above
-// makes clang-format re-sort a block this change has no business touching.
+// Kept in its own include block: they belong to no upstream group, and adding them to one
+// above makes clang-format re-sort a block this change has no business touching.
+#include "test-archs-exclude.h"
 #include "test-archs-table.h"
 
 // The one threshold both result columns judge by. The NMSE column and the Roundtrip column
@@ -201,7 +202,9 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--nan-trace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-x/--exclude arch]... [-s/--seed seed] [-v/--verbose] [--nan-trace]\n",
+           argv[0]);
+    printf("  -x/--exclude Skip this architecture; repeatable. It is reported as EXCLUDED, never omitted.\n");
     printf("  --nan-trace  CPU backend only: name the first graph tensors that go non-finite (needs -a)\n");
 }
 
@@ -673,7 +676,11 @@ static int trace_nan(const llm_arch target_arch, const size_t seed) {
     return 0;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch                target_arch,
+                       const std::vector<llm_arch> & excluded_archs,
+                       const size_t                  seed,
+                       const ggml_log_level          log_level,
+                       const std::string &           dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -696,6 +703,14 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             continue;
         }
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        if (archs_exclude::contains(excluded_archs, arch)) {
+            // stderr, not LOG_INF: the surrounding LOG_INF lines are filtered out at this
+            // path's default log level, so an exclusion announced through them would be
+            // invisible -- an exclude that silently excludes is the exact defect `-x` exists to
+            // avoid. -o writes files rather than a table, so there is no row to carry it.
+            fprintf(stderr, "%s: %s excluded by --exclude, not saved\n", __func__, llm_arch_name(arch));
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -726,7 +741,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch                target_arch,
+                         const std::vector<llm_arch> & excluded_archs,
+                         const size_t                  seed,
+                         const ggml_log_level          log_level) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -804,6 +822,27 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             continue;
         }
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        if (archs_exclude::contains(excluded_archs, arch)) {
+            // Ordered AFTER the -a filter and BEFORE the hard skips below, and both halves of
+            // that are deliberate.
+            //
+            // After -a, because an architecture the run never had in scope was not "excluded"
+            // by anything the user asked for: under `-a llama`, `-x gemma2` changes nothing,
+            // and a gemma2 row in a single-arch table would say otherwise.
+            //
+            // Before the hard skips, because `-x gemma4` should say EXCLUDED rather than
+            // inherit their silence. Those `continue`s emit no row at all, which is the
+            // property this row exists to avoid -- they are pre-existing and left alone here
+            // (llama.cpp-k208 covers the 77 that follows from them), but a user who explicitly
+            // named an arch is owed an explicit answer.
+            //
+            // Emitted through archs_table::row() like every other status, whole and in one
+            // stdio call, with the log drained first: a printf on the row path is exactly the
+            // interleaving llama.cpp-to9m removed.
+            common_log_flush(common_log_main());
+            archs_table::emit(archs_exclude::row(table, llm_arch_name(arch)));
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -1028,6 +1067,27 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         // about the sweep, stated in a comment and enforced by nothing, and the no-`-a` sweep
         // is precisely what CI runs. So the one path that was left unguarded was the one that
         // mattered. See llama.cpp-to9m.
+        //
+        // --exclude reaches here too, and 77 is the right answer for it as well: `-x` on
+        // everything the run would have measured (`-a llama -x llama` is the small case)
+        // leaves n_measured at 0, and a run that measured nothing must score as skipped, not
+        // passed. What it must NOT do is let the reader diagnose the wrong thing, so the note
+        // below names the exclusions -- otherwise the sweep branch sends someone hunting for a
+        // missing backend when the cause is on their own command line. The note is empty when
+        // no -x was given, which keeps that path's output byte-identical.
+        std::string excluded_note;
+        if (!excluded_archs.empty()) {
+            std::string names;
+            for (const llm_arch & excluded : excluded_archs) {
+                names += names.empty() ? "" : ", ";
+                names += llm_arch_name(excluded);
+            }
+            excluded_note = string_format(
+                "  %zu architecture(s) were excluded by --exclude (%s). If that covers "
+                "everything this run would otherwise have measured then 77 is the honest "
+                "answer, and the environment causes listed above do not apply.\n",
+                excluded_archs.size(), names.c_str());
+        }
         if (target_arch != LLM_ARCH_UNKNOWN) {
             fprintf(stderr,
                     "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
@@ -1035,8 +1095,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     "  Reasons this happens: the arch is excluded outright by test_backends() "
                     "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
                     "arch_supported() returns false for it (gemma-embedding, the BERT family, "
-                    "RWKV, ...) and every row is SKIP.\n",
-                    __func__, llm_arch_name(target_arch));
+                    "RWKV, ...) and every row is SKIP.\n%s",
+                    __func__, llm_arch_name(target_arch), excluded_note.c_str());
         } else {
             fprintf(stderr,
                     "\n%s: the full sweep performed no NMSE comparison at all -- every "
@@ -1044,8 +1104,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     "any of them.\n"
                     "  A sweep reaching this is a harness or environment failure, not a "
                     "property of one architecture: check that a backend was registered and "
-                    "that the run was not cut short before the first comparison.\n",
-                    __func__);
+                    "that the run was not cut short before the first comparison.\n%s",
+                    __func__, excluded_note.c_str());
         }
         return 77;
     }
@@ -1058,6 +1118,7 @@ int main(int argc, char ** argv) {
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    std::vector<llm_arch> excluded_archs;
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
@@ -1070,6 +1131,23 @@ int main(int argc, char ** argv) {
                 arch = llm_arch_from_string(arch_name);
                 if (arch == LLM_ARCH_UNKNOWN) {
                     LOG_ERR("%s: unkown LLM architecture: %s\n", __func__, arch_name.c_str());
+                    return 1;
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--exclude") == 0) {
+            if (i + 1 < argc) {
+                const std::string arch_name = argv[++i];
+                // Rejecting the name is the whole point of validating it. A typo'd -x that
+                // silently excluded nothing would leave the run measuring exactly what it
+                // measured before, while the operator believes an architecture was skipped --
+                // and worse, a run that dies where it always died would look like the exclude
+                // "did not help" rather than like it never applied.
+                if (!archs_exclude::parse(arch_name.c_str(), excluded_archs)) {
+                    LOG_ERR("%s: --exclude: not a usable LLM architecture: %s\n", __func__, arch_name.c_str());
                     return 1;
                 }
             } else {
@@ -1110,14 +1188,25 @@ int main(int argc, char ** argv) {
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
+    // --nan-trace traces the single architecture named by -a; it iterates no arch list, so
+    // there is nothing for --exclude to filter there. Rejecting the combination rather than
+    // ignoring it: a flag that is quietly inert in one mode is the same silent no-op the
+    // unknown-name check above exists to prevent, and `--nan-trace -a X -x X` in particular
+    // asks for two contradictory things.
+    if (nan_trace && !excluded_archs.empty()) {
+        LOG_ERR("%s: --exclude has nothing to filter under --nan-trace, which traces only the -a architecture\n",
+                __func__);
+        return 1;
+    }
+
     try {
         if (nan_trace) {
             return trace_nan(arch, seed);
         }
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, excluded_archs, seed, log_level, out);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, excluded_archs, seed, log_level);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
