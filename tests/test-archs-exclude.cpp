@@ -132,6 +132,12 @@ int main() {
         // exists, and the longest device description this fork has seen ("Intel(R) Arc(TM) Pro
         // B70 Graphics"). Derived from llm_arch_all() rather than written down, so a longer
         // arch name added upstream is measured here instead of silently overflowing.
+        // Asserted BEFORE the loop that consumes it, not after. An empty arch list would leave
+        // width_arch at 0 and longest at "", and every check below would then be measuring a
+        // row built from nothing -- and would pass, vacuously. A control placed after the code
+        // it protects cannot prevent that; it can only explain it afterwards.
+        check(!llm_arch_all().empty(), "control: llm_arch_all() is non-empty before anything reads it");
+
         size_t       width_arch = 0;
         const char * longest    = "";
         for (const llm_arch & arch : llm_arch_all()) {
@@ -140,7 +146,9 @@ int main() {
                 longest    = llm_arch_name(arch);
             }
         }
-        check(width_arch > 0, "control: llm_arch_all() yielded names, so the widths below are real");
+        // A separate claim from the one above, not a repeat of it: the list is non-empty AND at
+        // least one name is a non-empty string, so the width the row is built at is real.
+        check(width_arch > 0, "the longest architecture name has non-zero length");
 
         const archs_table table = { width_arch, 33 };
         const std::string line  = archs_exclude::row(table, longest);
