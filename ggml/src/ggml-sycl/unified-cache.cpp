@@ -18201,14 +18201,36 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // Each expert gets its own placement_entry with expert_id >= 0.
         // The composite tensor entry is NOT added — only per-expert entries.
         if (n_experts > 0 && usage == tensor_usage::MOE_EXPERT_WEIGHT) {
+            // Split by THIS tensor's expert count, not the model-wide one.
+            // `n_experts` is hparams.n_expert (it arrives as inventory->n_expert),
+            // but grovemoe's chunked trio `ffn_{gate,up,down}_chexps` has
+            // n_expert / n_group_experts experts.  Using the global count there
+            // creates n_group_experts times too many entries, each charging a
+            // *correct* dst_size -- so the chexps family's VRAM budget is
+            // over-charged by that factor, and the surplus entries are phantoms
+            // no lookup can reach (MUL_MAT_ID only asks for e < ne[2]).
+            //
+            // Verified by enumeration 2026-08-02: every expert weight created
+            // under src/models/ passes n_expert as ne[2]; grovemoe.cpp's chexps
+            // trio is the sole exception in the tree.  So this is a no-op for
+            // every other architecture, not merely believed to be one.
+            //
+            // The `> 0` guard is load-bearing, not defensive padding: ne is
+            // populated only when ne[0]/ne[1]/type are all valid (see the
+            // tensor-inventory registration in ggml-sycl.cpp), and it stays
+            // zeroed otherwise -- in which case falling back to n_experts
+            // reproduces the previous behaviour exactly.
+            const int n_tensor_experts = tensor.ne[2] > 0 ? static_cast<int>(tensor.ne[2]) : n_experts;
+
             const int                layer_id    = p4_extract_layer_id(name.c_str());
-            const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
+            const size_t             expert_size = src_size / static_cast<size_t>(n_tensor_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
             const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
             const ggml_layout_mode   layout      = planner_default_device_layout(tensor, usage, device_id);
-            const size_t dst_size = planner_layout_bytes_for_expert(tensor, n_experts, layout, device_id, expert_size);
+            const size_t             dst_size =
+                planner_layout_bytes_for_expert(tensor, n_tensor_experts, layout, device_id, expert_size);
 
-            for (int e = 0; e < n_experts; ++e) {
+            for (int e = 0; e < n_tensor_experts; ++e) {
                 placement_entry entry;
                 copy_tensor_info_to_entry(entry, tensor);
                 entry.src_size         = expert_size;
@@ -19540,17 +19562,23 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
         // MoE expert tensors: split into per-expert entries when n_experts > 0.
         if (n_experts > 0 && usage == tensor_usage::MOE_EXPERT_WEIGHT) {
+            // Per-tensor expert count -- see the long note on the same split in
+            // the single-device planner above for why the model-wide n_experts
+            // is wrong for grovemoe's chexps trio and a no-op for everything
+            // else, and why the `> 0` fallback is load-bearing.
+            const int n_tensor_experts = tensor.ne[2] > 0 ? static_cast<int>(tensor.ne[2]) : n_experts;
+
             const int                layer_id    = p4_extract_layer_id(name.c_str());
-            const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
+            const size_t             expert_size = src_size / static_cast<size_t>(n_tensor_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
             const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
             const ggml_layout_mode   layout =
                 n_devs > 1 ? planner_multi_device_moe_common_layout(tensor, device_budgets[0].device_id) :
                                planner_default_device_layout(tensor, usage, device_budgets[0].device_id);
-            const size_t dst_size =
-                planner_layout_bytes_for_expert(tensor, n_experts, layout, device_budgets[0].device_id, expert_size);
+            const size_t dst_size = planner_layout_bytes_for_expert(tensor, n_tensor_experts, layout,
+                                                                    device_budgets[0].device_id, expert_size);
 
-            for (int e = 0; e < n_experts; ++e) {
+            for (int e = 0; e < n_tensor_experts; ++e) {
                 placement_entry entry;
                 copy_tensor_info_to_entry(entry, tensor);
                 entry.src_size         = expert_size;
