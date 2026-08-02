@@ -361,8 +361,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
-        bool match_user_load_params = false) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -370,16 +369,19 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
-    if (match_user_load_params) {
-        // llama_model_init_from_user() forces these two off, llama_model_load_from_file_ptr()
-        // does not -- so the roundtrip model is loaded with mmap and weight-repacking extra
-        // buffer types that the model it is compared against never had. That is a difference
-        // in how the weights are placed, not in what was saved, and the Roundtrip column
-        // cannot tell the two apart. Setting them here holds everything but the save/reload
-        // equal, which is what the comparison is supposed to isolate.
-        model_params.use_mmap        = false;
-        model_params.use_extra_bufts = false;
-    }
+    // Both models in the Roundtrip comparison must be loaded the same way. They were not:
+    // llama_model_init_from_user() forces these two off, llama_model_load_from_file_ptr()
+    // passes llama_model_default_params() straight through, where both are on. So the model
+    // written by the saver came back mmap-backed and eligible for weight-repacking extra
+    // buffer types, and the model it is compared against bit-for-bit was neither.
+    //
+    // That is not a difference in what was saved, it is a difference in where the weights
+    // ended up: llama-model-loader.cpp demotes a host buffer type to plain CPU under mmap,
+    // and allocates host-side tensors directly over the mapping instead of going through
+    // ggml_backend_tensor_set. The Roundtrip column compares logits with a bare `!=` and
+    // cannot tell that apart from a bad save.
+    model_params.use_mmap        = false;
+    model_params.use_extra_bufts = false;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -887,40 +889,29 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             all_ok = false;
                             status_roundtrip = "\033[1;31mFAIL\033[0m";
 
-                            // Re-run the SAME already-loaded device model. If its own logits are
-                            // not reproducible from one decode to the next, then the save/reload
-                            // is not what the Roundtrip column caught and the reloaded model is
-                            // not the thing to go looking at.
-                            llama_memory_clear(llama_get_memory(model_and_ctx_dev.second.get()), true);
-                            const std::vector<float> logits_dev_rerun = get_logits(
-                                model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
-                            const logits_diff rerun = logits_compare(logits_dev, logits_dev_rerun);
-
-                            // Reload the same file with the load params the device model was
-                            // given (no mmap, no extra bufts). If THIS one matches, the bytes
-                            // survived the save/reload intact and the column was reporting the
-                            // asymmetric load, not the roundtrip.
-                            rewind(file);
-                            auto model_and_ctx_sym = get_model_and_ctx(
-                                nullptr, file, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, true);
-                            const std::vector<float> logits_sym = get_logits(
-                                model_and_ctx_sym.first.get(), model_and_ctx_sym.second.get(), tokens, encode);
-                            const logits_diff sym = logits_compare(logits_dev, logits_sym);
-
+                            // Report magnitudes only -- nothing here may touch a device.
+                            //
+                            // Two probes did, on 2026-08-01, and the run segfaulted: a re-decode
+                            // of the already-loaded device model, and a third load of the same
+                            // file. Which of the two crashed was not isolated. What the log shows
+                            // immediately before the fault is
+                            // "[UNIFIED-CACHE] planned-mode runtime materialization rejected
+                            // op=direct_stage_weight ... graph_active=1", i.e. inference asking to
+                            // stage a weight the placement plan has no entry for. The plan is
+                            // global per device and each load replaces it, so both probes run
+                            // against state the single-pass original never creates. Whatever the
+                            // exact mechanism, a diagnostic that costs the run it is diagnosing is
+                            // worth less than no diagnostic: keep this block pure arithmetic over
+                            // logits that have already been computed.
                             fprintf(stderr,
                                 "\n%s (%s, %s): roundtrip mismatch\n"
                                 "  save/reload vs device: %zu/%zu logits differ, first at %zu, "
                                 "max abs %.3e, max rel %.3e\n"
-                                "  NMSE vs CPU:           device %.3e, reloaded %.3e\n"
-                                "  device re-decode:      %zu/%zu logits differ, max abs %.3e "
-                                "(non-zero => the device is not bit-reproducible; the reload is not the cause)\n"
-                                "  reload, same params:   %zu/%zu logits differ, max abs %.3e "
-                                "(zero => the saved bytes are fine; the mismatch is the asymmetric load)\n",
+                                "  NMSE vs CPU:           device %.3e, reloaded %.3e "
+                                "(both small => both models are correct and differ only in the last bits)\n",
                                 llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
                                 rt.n_diff, logits_dev.size(), rt.first_diff, rt.max_abs, rt.max_rel,
-                                nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip),
-                                rerun.n_diff, logits_dev.size(), rerun.max_abs,
-                                sym.n_diff, logits_dev.size(), sym.max_abs);
+                                nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip));
                         }
                     }
                 }
