@@ -210,6 +210,51 @@ row should be re-run through the sweep with `pop_front`/`pop_back` added to
 the maintenance-pattern check before it is trusted either way — as flagged,
 it is exactly the kind of empty-probe result CLAUDE.md warns about.
 
+## `fattn.cpp:g_packed_k_sidecars` (assessed, not owned, flagged by the lead)
+
+The lead's gemma3n investigation flagged
+`ggml/src/ggml-sycl/fattn.cpp:124`'s
+`std::vector<std::unique_ptr<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>>
+g_packed_k_sidecars` as a suspect: zero `.clear()` calls, entries carrying a
+raw `const void * k_base`. `fattn.cpp` is outside this pass's ownership
+(`ggml-sycl.cpp` / `unified-cache.{cpp,hpp}` only), so this is assessment
+only, not a fix — but the `.clear()`-only grep that raised it is the same
+shape of empty probe this document warns about for `g_pending_kv_layer_masks`
+above, so it was worth checking before passing the flag along as-is.
+
+Reading the actual read/write/erase sites (`fattn.cpp:340-357`,
+`430-470`, `553-566`) changes the picture:
+
+- The correctness-determining lookup (both the cache-hit check and the
+  insert-or-reuse check) keys on `entry->k_handle.valid() &&
+  entry->k_handle_hash == params.K_handle_hash` — a `ggml_sycl::mem_handle`
+  and its stable identity hash, i.e. exactly the mechanism CLAUDE.md
+  prescribes in place of a raw pointer. `k_base` is stored on the entry but
+  is not what a lookup matches against.
+- There IS an erase path:
+  `ggml_sycl_fattn_xmx_unregister_packed_k_range(ptr, size)` removes every
+  entry whose `k_base` falls inside `[ptr, ptr+size)`. It is not dead code —
+  it has a real caller: `tiered_kv_buffer_free()` in `ggml-sycl.cpp`
+  (grep-verified with `cat | grep` per the oversize-file rule; `search_text`
+  reports zero callers for this symbol because it silently skips
+  `ggml-sycl.cpp`, which is exactly where the caller lives), invoked for
+  every layer allocation on both the vmem-pool and non-vmem KV-buffer
+  teardown paths. That is erase-on-free, wired to the actual KV buffer
+  lifetime — the correct way to prevent the address-reuse aliasing this
+  audit's other findings suffer from, not an instance of it.
+
+**Assessment: likely not a leak**, on the strength of the above, but not
+fully confirmed within this pass — two things weren't traced: (1) whether
+`tiered_kv_buffer_free()` is the *only* teardown path for every KV buffer
+across all 131 architectures (a KV buffer freed through a different code
+path would skip the unregister call), and (2) the whole feature is gated
+behind `ggml_sycl_fattn_xmx_sidecar_enabled()`
+(`GGML_SYCL_PACKED_K_SIDECAR` or `GGML_SYCL_FA_FORCE_PATH=split-packed`),
+neither of which the default `test-llama-archs` invocation sets — so this
+code path is dormant in the sweep that motivates this whole audit, and any
+residual risk only surfaces for someone running with that env var set.
+Flagging both as open questions rather than asserting either way.
+
 ## `layer_stream_manager` host_ptr registry (assessed, not owned)
 
 The ticket asked this audit to also assess
