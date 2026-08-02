@@ -1,0 +1,82 @@
+UpdateCTestConfiguration  from :/Apps/llama.cpp/build/DartConfiguration.tcl
+Parse Config file:/Apps/llama.cpp/build/DartConfiguration.tcl
+Test project /Apps/llama.cpp/build
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 89
+    Start 89: rms-norm-mul-add-broadcast
+
+89: Test command: /Apps/llama.cpp/build/bin/test-rms-norm-mul-add-broadcast
+89: Working Directory: /Apps/llama.cpp/build/ggml/src/ggml-sycl
+89: Environment variables: 
+89:  ONEAPI_DEVICE_SELECTOR=level_zero:1
+89:  LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tcm/1.5/env/../lib:/opt/intel/oneapi/tbb/2023.1/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/1.0/lib:/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.1/lib:/opt/intel/oneapi/ippcp/2026.0/lib/:/opt/intel/oneapi/ipp/2026.0/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/opt/intel/oneapi/debugger/2026.1/opt/debugger/lib:/opt/intel/oneapi/dal/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/opt/compiler/lib:/opt/intel/oneapi/compiler/2026.1/lib:/opt/intel/oneapi/ccl/2022.1/lib/
+89: Test timeout computed to be: 120
+89: Running with Environment Variables:
+89:   GGML_SYCL_DEBUG: 0
+89:   GGML_SYCL_DEBUG_SYNC: 0
+89:   GGML_SYCL_TP_DEBUG: 0
+89:   GGML_SYCL_KQV_FORCE_SIMPLE: 0
+89:   GGML_SYCL_KQV_DISABLE_FP16: 0
+89:   GGML_SYCL_DISABLE_GRAPH: 0
+89:   GGML_SYCL_ASYNC_MEM: 0
+89:   GGML_SYCL_DISABLE_DNN: 0
+89:   GGML_SYCL_PRIORITIZE_DMMV: 0
+89: Build with Macros:
+89:   GGML_SYCL_FORCE_MMQ: no
+89:   GGML_SYCL_F16: yes
+89: Found 1 SYCL devices:
+89: |  |                   |                                       |       |Max    |        |Max  |Global |                     |
+89: |  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+89: |ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+89: |--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+89: | 0| [level_zero:gpu:0]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+89: SYCL Optimization Feature:
+89: |ID|        Device Type|Reorder|
+89: |--|-------------------|-------|
+89: [SYCL] Device 0 alloc caps: raw=15488.8 MB, safe=14574.3 MB, host_unified=no
+89: [XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+89: [SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+89: [SYCL] Host malloc per-allocation limit: 15.1 GB (min max_mem_alloc_size across 1 active devices)
+89: | 0| [level_zero:gpu:0]|      Y|
+89: === bit1 (RMS_NORM+MUL+ADD) broadcast-vs-full-residual discriminator ===
+89: llama.cpp-81gx: does add_src's broadcast shape change fused-ADD correctness?
+89: 
+89: [UNIFIED-CACHE] Capping budget from 16304.0 MB to 15341.4 MB (pre-probe free VRAM)
+89: [UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14765.4 MB)
+89: [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15341.4 MB budget=14765.4 MB (100%)
+89: [VRAM-ARENA] External headroom 1539 MB (caller-reserved 1539 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+89: [VRAM-ARENA] Reserved single chunk: 14764.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13484.0 MB)
+89: [VRAM-ARENA] Active on device 0: 1 chunk(s), 14764.0 MB total
+89: [VRAM-ARENA] Scratch zone: 0xffffe392a2c00000 + 512.0 MB (offset 14252.0 MB from base)
+89: [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+89: [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+89: [SYCL] Pinned chunk pool created with 195.2 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+89: [HOST-ARENA] Created with 195.2 GB budget, committed=0.0 GB (system total=246.9 GB available=203.2 GB reserve=8.0 GB pct=90)
+89: [SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+89: [SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+89:   [PASS] ncols=64 broadcast (positive control) (ncols=64 nrows=8 broadcast, max_err=2.384e-07, tol=1.0e-03)
+89:   [PASS] ncols=64 full-residual (suspected) (ncols=64 nrows=8 full-residual, max_err=2.384e-07, tol=1.0e-03)
+89:   [PASS] ncols=256 broadcast (positive control) (ncols=256 nrows=8 broadcast, max_err=2.384e-07, tol=1.0e-03)
+89:   [PASS] ncols=256 full-residual (suspected) (ncols=256 nrows=8 full-residual, max_err=2.384e-07, tol=1.0e-03)
+89: 
+89: === 4 checks, 0 failures ===
+89: ALL CHECKS PASSED
+1/1 Test #89: rms-norm-mul-add-broadcast .......   Passed    0.80 sec
+
+The following tests passed:
+	rms-norm-mul-add-broadcast
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+fusion      =   0.80 sec*proc (1 test)
+rms-norm    =   0.80 sec*proc (1 test)
+sycl        =   0.80 sec*proc (1 test)
+tdd         =   0.80 sec*proc (1 test)
+
+Total Test time (real) =   0.80 sec

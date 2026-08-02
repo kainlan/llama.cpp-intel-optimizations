@@ -1,0 +1,51 @@
+UpdateCTestConfiguration  from :/Apps/llama.cpp/build/DartConfiguration.tcl
+Parse Config file:/Apps/llama.cpp/build/DartConfiguration.tcl
+Test project /Apps/llama.cpp/build
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 18
+    Start 18: cross-model-weight-usage
+
+18: Test command: /Apps/llama.cpp/build/bin/test-cross-model-weight-usage
+18: Working Directory: /Apps/llama.cpp/build/ggml/src/ggml-sycl
+18: Environment variables: 
+18:  ONEAPI_DEVICE_SELECTOR=level_zero:1
+18:  LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tcm/1.5/env/../lib:/opt/intel/oneapi/tbb/2023.1/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/1.0/lib:/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.1/lib:/opt/intel/oneapi/ippcp/2026.0/lib/:/opt/intel/oneapi/ipp/2026.0/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/opt/intel/oneapi/debugger/2026.1/opt/debugger/lib:/opt/intel/oneapi/dal/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/opt/compiler/lib:/opt/intel/oneapi/compiler/2026.1/lib:/opt/intel/oneapi/ccl/2022.1/lib/
+18: Test timeout computed to be: 120
+18: [SYCL] Device 0 alloc caps: raw=15488.8 MB, safe=14574.3 MB, host_unified=no
+18: [XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+18: [SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+18: [SYCL] Host malloc per-allocation limit: 15.1 GB (min max_mem_alloc_size across 1 active devices)
+18: [UNIFIED-CACHE] Capping budget from 16304.0 MB to 15341.4 MB (pre-probe free VRAM)
+18: [UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14765.4 MB)
+18: [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15341.4 MB budget=14765.4 MB (100%)
+18: [VRAM-ARENA] External headroom 1539 MB (caller-reserved 1539 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+18: [VRAM-ARENA] Reserved single chunk: 14764.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13484.0 MB)
+18: [VRAM-ARENA] Active on device 0: 1 chunk(s), 14764.0 MB total
+18: [VRAM-ARENA] Scratch zone: 0xffffe392a2c00000 + 512.0 MB (offset 14252.0 MB from base)
+18: [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+18: [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+18: [SYCL] Pinned chunk pool created with 195.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+18: [HOST-ARENA] Created with 195.3 GB budget, committed=0.0 GB (system total=246.9 GB available=203.3 GB reserve=8.0 GB pct=90)
+18: [S1-PRELOAD] 0 host-registered weights found for preload
+18: [S1-PRELOAD] 0 host-registered weights found for preload
+18: === 4 checks, 0 failures ===
+1/1 Test #18: cross-model-weight-usage .........   Passed    0.89 sec
+
+The following tests passed:
+	cross-model-weight-usage
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+cross-model         =   0.89 sec*proc (1 test)
+moe                 =   0.89 sec*proc (1 test)
+sycl                =   0.89 sec*proc (1 test)
+tdd                 =   0.89 sec*proc (1 test)
+tensor-placement    =   0.89 sec*proc (1 test)
+
+Total Test time (real) =   0.90 sec

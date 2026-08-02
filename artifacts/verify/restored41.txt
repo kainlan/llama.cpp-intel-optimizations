@@ -1,0 +1,1755 @@
+Test project /Apps/llama.cpp/build
+      Start 39: test-sycl-weight-key-stability
+ 1/41 Test #39: test-sycl-weight-key-stability ................   Passed    0.74 sec
+      Start 40: test-tensor-classification
+ 2/41 Test #40: test-tensor-classification ....................   Passed    0.24 sec
+      Start 41: test-sycl-kv-planned-device-materialization
+ 3/41 Test #41: test-sycl-kv-planned-device-materialization ...   Passed    1.29 sec
+      Start 42: test-sycl-moe-q8-scratch
+ 4/41 Test #42: test-sycl-moe-q8-scratch ......................   Passed    0.92 sec
+      Start 43: test-sycl-onednn-packed-cache
+ 5/41 Test #43: test-sycl-onednn-packed-cache .................   Passed    1.48 sec
+      Start 44: test-sycl-weight-key-uniqueness
+ 6/41 Test #44: test-sycl-weight-key-uniqueness ...............***Failed    0.57 sec
+[SYCL] dispatch tuning: failed to load /tmp/onednn_unified_bench.json (unable to open file)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x261a96e0 new=0x261e22f0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x261e22f0 new=0x2621b550)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2621b550 new=0x26254850)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26254850 new=0x2628db50)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2628db50 new=0x262c6ed0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x262c6ed0 new=0x26300270)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26300270 new=0x26339610)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26339610 new=0x263729b0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x263729b0 new=0x263abd50)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x263abd50 new=0x263e50f0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x263e50f0 new=0x2641e490)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2641e490 new=0x26457830)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26457830 new=0x26490bd0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26490bd0 new=0x264c9f70)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x264c9f70 new=0x26503310)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26503310 new=0x2653c6b0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2653c6b0 new=0x26575a50)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26575a50 new=0x265aedf0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x265aedf0 new=0x265e8190)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x265e8190 new=0x26621540)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26621540 new=0x2665a920)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2665a920 new=0x26693ce0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26693ce0 new=0x266cd0e0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x266cd0e0 new=0x267064a0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x267064a0 new=0x2673f8a0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2673f8a0 new=0x26778c60)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26778c60 new=0x267b2060)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x267b2060 new=0x267eb820)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x267eb820 new=0x26824c20)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x26824c20 new=0x2685dfe0)
+[SYCL] host weight registry mismatch for uuid_weight_shared_name (existing=0x2685dfe0 new=0x268973e0)
+[SYCL] dispatch tuning: failed to load /tmp/onednn_unified_bench.json (unable to open file)
+FAIL: tied weights did not share cache identity
+
+      Start 45: test-unified-cache-integrity
+ 7/41 Test #45: test-unified-cache-integrity ..................   Passed    1.48 sec
+      Start 46: test-sycl-fattn-onednn-materialization
+ 8/41 Test #46: test-sycl-fattn-onednn-materialization ........   Passed    0.88 sec
+      Start 47: test-sycl-fattn-xmx-policy
+ 9/41 Test #47: test-sycl-fattn-xmx-policy ....................   Passed    0.26 sec
+      Start 48: test-sycl-kernel-selection
+10/41 Test #48: test-sycl-kernel-selection ....................   Passed    0.72 sec
+      Start 49: test-cold-start
+11/41 Test #49: test-cold-start ...............................   Passed    0.29 sec
+      Start 50: test-unified-cache-concurrent
+12/41 Test #50: test-unified-cache-concurrent .................   Passed    1.37 sec
+      Start 51: test-sycl-moe-handle-resolution
+13/41 Test #51: test-sycl-moe-handle-resolution ...............Subprocess aborted***Exception:  11.38 sec
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32591.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32015.3 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32591.3 MB budget=32015.3 MB (100%)
+[VRAM-ARENA] External headroom 641 MB (caller-reserved 641 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32014.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32014.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32014.0 MB total (weight=30483.9, KV=250.1, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32014.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e6741c000 + 512.0 MB (offset 31502.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.3 GB budget, committed=0.0 GB (system total=246.9 GB available=203.3 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[VRAM-ARENA] Insufficient budget for single-chunk arena: 0.0 MB < tail 1280.0 MB + min shared 16.0 MB; refusing reservation
+[VRAM-ARENA] Insufficient budget for N-chunk arena: total 0.0 MB < tail 1280.0 MB + min KV 16.0 MB; refusing reservation
+[VRAM-ARENA] Failed on device 0, falling back to per-entry allocation
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[SYCL] Pinned chunk pool created with 193.2 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.2 GB budget, committed=0.0 GB (system total=246.9 GB available=201.2 GB reserve=8.0 GB pct=90)
+[SYCL] Pinned chunk pool destroyed, released 0 chunks
+[SYCL] Allocated pinned base chunk 1 (size=2048.0 MB, total=4.0 GB)
+[HOST-ARENA] configured zones: WEIGHT=8.0 MB  KV=8.0 MB  STAGING=8.0 MB  SCRATCH=8.0 MB  (total-cap=2048.0 MB)
+  FAIL: EXPERT_STAGING should route to SCRATCH host zone
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=185.60 dense_score=337.92 usable_vram=562.4 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.33 dense_score=168.96 usable_vram=15341.4 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: logical 0 raw device 0 -> raw device 1 for default cache/KV (primary_score 185.60 -> 2531.33, dense_score 337.92 -> 168.96, usable_vram 562.4 -> 15341.4 MB, CU 256 -> 128, XMX 1 -> 1)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=15488.8 MB, safe=14574.3 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=31023.2 MB, safe=534.3 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 15.1 GB (min max_mem_alloc_size across 1 active devices)
+[MOE-POLICY-MULTI] device=0 total=16304.0 MB free_init=15341.4 MB plan_budget=1024.0 MB weight_budget=1024.0 MB max_alloc=15488.8 MB safe_alloc=14574.3 MB arena=32014.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=128 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+[PLACEMENT-MULTI] Mode: HYBRID
+[PLACEMENT-MULTI] Dense candidate rank=0 logical=0 physical=0 raw_score=1.00 net_score=1.00 locality_penalty=1.00 supported=1 budget=1024.0 MB remaining=1024.0 MB
+[PLACEMENT-MULTI] Dense candidate rank=1 logical=1 physical=1 raw_score=1.00 net_score=1.00 locality_penalty=1.00 supported=1 budget=0.1 MB remaining=0.1 MB
+[PLACEMENT-BLOCK] no direct peer path for active devices; using cohesive complete-layer MoE placement (dense+KV+experts share each block device)
+[PLACEMENT-BLOCK] cohesive target logical=0 physical=0 layers=8 weights=1024.0 MB remaining=0.0 MB
+[PLACEMENT-BLOCK] cohesive target logical=1 physical=1 layers=0 weights=0.0 MB remaining=0.1 MB
+[PLACEMENT-BLOCK] cohesive host layers=1 reason=no-compatible-gpu-capacity
+[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=0 host_changed=0 xmx_tiled=0 i8_or_dpas=0 soa=0 aos=0 skipped_capacity=0 device_delta=0.0 MB host_delta=0.0 MB
+[PLACEMENT-MOE] layout upgrades: mxfp4_i8_down skipped entries=32 device=0 reason=executor-layout-not-supported
+[MOE-LAYOUT] down-i8 device=0 n_experts=32 considered=192 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=128 skip_already_i8=0 skip_not_device=32 skip_wrong_dev=0 skip_executor=32 skip_unsupported=0 requested=mxfp4_i8 granted=aos remaining=0.0 MB
+[MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=192 expert entries, of which skip_not_down=128 were gate/up). Entry-level rejections: skip_not_device=32 skip_executor=32.
+[PLACEMENT-MOE-MULTI] decode secondary alternates: considered=64 complete=64 groups=0 entries=0 already=0 skipped_incomplete=0 skipped_host_base=32 skipped_support=32 skipped_capacity=0 charged=0.0 MB hotness=static(layer,expert)
+[SYCL-PLAN] inventory top-8 of 6 tensors (total 2048.0 MB): blk.8.ffn_up_exps.weight=512.0MB(t43,0x0) blk.0.ffn_up_exps.weight=512.0MB(t43,0x0) blk.8.ffn_gate_exps.weight=256.0MB(t43,0x0) blk.0.ffn_gate_exps.weight=256.0MB(t43,0x0) blk.0.ffn_down_exps.weight=256.0MB(t43,0x0) blk.8.ffn_down_exps.weight=256.0MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 6 tensors; cardinality histogram: 6x1; largest card>=4: blk.0.ffn_up_exps.weight 512.0MB (card=6); largest card<=2: none
+[SYCL-PLAN] MoE routing buffer sizing: n_experts=32 n_moe_layers=9 max_batch=1 control_ids=0.00 MB host-pinned, expert_ptrs=0.02 MB VRAM, cpu_staging=512.00 MB
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=1026.0 MB total=1042.0 MB
+[PLACEMENT-MOE] expected=192 planned=192 unclassified=0 duplicates=0 missing=0
+[PLACEMENT-MOE] roles: gate=64 up=64 down=64 gate_up=0 unknown=0
+[PLACEMENT-MOE] target HOST: 96 expert tensors
+[PLACEMENT-MOE] target device0: 96 expert tensors
+[PLACEMENT-BLOCK] fastest_dense=device0 raw_score=1.00 blocks=2 policy=complete-layer-blocks boundary_edges=0 boundary_bytes=0.0 MB boundary_est_us=0.00 boundary_direct=0 hidden_dim=0 boundary_tokens=512 note=dense-fastest-may-be-deferred-by-boundary-cost
+[PLACEMENT-BLOCK] block=0 layers=[0,7] exec=device0 dense=device0 kv=HOST dense_score=1.00 fastest_dense=1 reason=fastest-dense-compatible dense=0.0 MB charge=0.0 MB kv=0.0 MB moe_device=1024.0 MB moe_host=0.0 MB prev=HOST next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK] block=1 layers=[8,8] exec=HOST dense=HOST kv=HOST dense_score=0.00 fastest_dense=0 reason=host-or-unplanned dense=0.0 MB charge=0.0 MB kv=0.0 MB moe_device=0.0 MB moe_host=1024.0 MB prev=device0 next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] reason=rejected-no-p2p-awaiting-event-chained-block-executor blocks=3 gpu_layers=7 host_layers=2 boundary_edges=0 boundary_bytes=0.0 MB boundary_est_us=0.00 boundary_direct=0 hidden_dim=0 boundary_tokens=512 runtime_reserve=3072.0 MB status=inactive-until-block-executor
+[PLACEMENT-BLOCK-CANDIDATE] block=0 layers=[0,0] exec=HOST dense_score=0.00 reason=candidate-capacity-spill dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=1024.0 MB prev=HOST next=device0 boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] block=1 layers=[1,7] exec=device0 dense_score=1.00 reason=candidate-fastest-dense-prefix dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=0.0 MB prev=HOST next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] block=2 layers=[8,8] exec=HOST dense_score=0.00 reason=candidate-capacity-spill dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=1024.0 MB prev=device0 next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] runtime headroom logical=0 physical=0 reserve=3072.0 MB remaining 0.0 -> 0.0 MB
+[PLACEMENT-BLOCK-CANDIDATE] runtime headroom logical=1 physical=1 reserve=3072.0 MB remaining 0.1 -> 0.0 MB
+[PLACEMENT-BLOCK-CANDIDATE] dense alternates: considered=0 candidates=0 added=0 already=0 skipped_support=0 skipped_capacity=0 no_layout_bytes=0 charged=0.0 MB reason=rejected-no-p2p-awaiting-event-chained-block-executor
+[PLACEMENT-BLOCK-CANDIDATE] moe alternates: considered=96 candidates=0 soa_added=0 already=0 skipped_support=0 skipped_capacity=0 no_layout_bytes=0 charged=0.0 MB reason=rejected-no-p2p-awaiting-event-chained-block-executor
+[PLACEMENT-MULTI] 2 devices, 9 layers, hybrid parallelism
+[PLACEMENT-MULTI] Device logical=0 physical=0 raw_dense_score=1.00 layers [0, 7], 1024.0 MB planned bytes used (1024.0 MB budget)
+[PLACEMENT-MULTI] Device logical=1 physical=1 raw_dense_score=1.00 layers [9, -1], 0.0 MB planned bytes used (0.1 MB budget)
+[PLACEMENT-MULTI] MOE_DOWN        device= 32 (256.0 MB)  host= 32 (256.0 MB)
+[PLACEMENT-MULTI] MOE_UP          device= 32 (512.0 MB)  host= 32 (512.0 MB)
+[PLACEMENT-MULTI] MOE_GATE_PROJ   device= 32 (256.0 MB)  host= 32 (256.0 MB)
+[PLACEMENT-MULTI] KV sizing: n_layer=0 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT-MULTI] Totals: weights=1024.0 MB device + 1024.0 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT-MULTI] Total: 1024.0 MB device + 1024.0 MB host (budget=1024.1 MB)
+[DIRECT-STAGE] expert fill failed model=0 name_hash=0x73a2c636a76949c aux=16971462307518053397 layout=1 bytes=136: Enqueue process failed.
+level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
+Using device: Intel(R) Arc(TM) Pro B70 Graphics
+
+=== Test: normal cache expert resolution ===
+
+=== Test: direct staged device expert resolution ===
+
+=== Test: direct host and miss expert resolution ===
+
+=== Test: EXPERT_STAGING HOST_COMPUTE zone ownership ===
+
+=== Test: planner role-specific expert placement ===
+
+=== Test: MoE route ready-event chaining contract ===
+/Apps/llama.cpp/ggml/src/ggml-sycl/unified-cache.cpp:3364: [DIRECT-STAGE] expert fill failed; aborting before inference can use a failed SYCL queue
+[New LWP 1840732]
+[New LWP 1840731]
+[New LWP 1840600]
+[New LWP 1840574]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x00007d5c294a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x00007d5c2951cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x00007d5c2a129c1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x00007d5c2a128d39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x00007d5c2ac64897 in ggml_sycl::unified_cache::direct_stage_expert(ggml_sycl_cache_id, void const*, unsigned long, unsigned long, ggml_layout_mode, sycl::_V1::event (*)(sycl::_V1::queue&, void*, unsigned long, void const*, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&), void const*, sycl::_V1::queue*, ggml_sycl::mem_handle*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x00007d5c2a4440d9 in ggml_sycl::test_stage_soa_expert_handle(ggml_sycl::unified_cache*, sycl::_V1::queue&, ggml_tensor_extra_gpu&, ggml_sycl_cache_id, int, void const*, unsigned long, void**, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> >*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x00007d5c2a441d71 in ggml_sycl::test_moe_route_preserves_ready_event_for_chaining() () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x000000000040b07b in main ()
+[Inferior 1 (process 1840515) detached]
+
+      Start 52: test-dmmv-q4-0-coalesced
+14/41 Test #52: test-dmmv-q4-0-coalesced ......................***Failed    3.20 sec
+=== Q4_0 DMMV Coalesced Layout Tests ===
+Testing coalesced memory layout for DMMV kernel
+Tile configuration: 32 blocks per tile, 512 bytes per tile
+
+=== Part 1: Layout Integrity Tests (CPU) ===
+
+=== Test: Coalesced Layout Data Integrity (16 x 1024) ===
+  Layout integrity: PASSED (errors=0)
+
+=== Test: Coalesced Layout Data Integrity (32 x 2048) ===
+  Layout integrity: PASSED (errors=0)
+
+=== Test: Coalesced Layout Data Integrity (64 x 4096) ===
+  Layout integrity: PASSED (errors=0)
+
+Layout integrity tests PASSED
+
+=== Part 2: GPU DMMV Tests (Coalesced) ===
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32598.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32022.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=32022.7 MB (100%)
+[VRAM-ARENA] External headroom 633 MB (caller-reserved 633 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32022.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32022.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32022.0 MB total (weight=30491.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32022.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67c2c000 + 512.0 MB (offset 31510.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.6 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.6 GB budget, committed=0.0 GB (system total=246.9 GB available=203.6 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=weight type=q4_0 ne=[1024,64,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.3 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.3 MB budget=14763.3 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 193.4 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.4 GB budget, committed=0.0 GB (system total=246.9 GB available=201.4 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 206276.3 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=47083.4 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 187.8 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 187.8 GB budget, committed=0.0 GB (system total=246.9 GB available=195.8 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+  DMMV coalesced ncols=1024 nrows=64: errors=26 max_diff=0.220037 max_rel=0.167222 FAIL
+[SYCL] host weight registry mismatch for weight (existing=0x3dc289a0 new=0x3dca4120)
+  DMMV coalesced ncols=2048 nrows=128: errors=48 max_diff=0.259021 max_rel=0.120178 FAIL
+[SYCL] host weight registry mismatch for weight (existing=0x3dca4120 new=0x3dc6af30)
+  DMMV coalesced ncols=4096 nrows=256: errors=88 max_diff=0.427313 max_rel=0.309105 FAIL
+
+=== Summary ===
+Layout tests: PASSED
+GPU tests: FAILED
+
+      Start 53: test-dmmv-q6k-coalesced
+15/41 Test #53: test-dmmv-q6k-coalesced .......................Subprocess aborted***Exception:   5.47 sec
+=== Q6_K DMMV Coalesced Tests ===
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32598.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32022.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=32022.7 MB (100%)
+[VRAM-ARENA] External headroom 633 MB (caller-reserved 633 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32022.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32022.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32022.0 MB total (weight=30491.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32022.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67c2c000 + 512.0 MB (offset 31510.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.5 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.5 GB budget, committed=0.0 GB (system total=246.9 GB available=203.5 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=weight type=q6_K ne=[8192,1,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.3 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.3 MB budget=14763.3 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 193.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.3 GB budget, committed=0.0 GB (system total=246.9 GB available=201.3 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 206155.5 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=46962.0 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 187.8 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 187.8 GB budget, committed=0.0 GB (system total=246.9 GB available=195.8 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+Non-uniform work-groups are not supported by the target device
+Exception caught at file:/Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:35843, func:operator()
+SYCL error: CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_row_size, stream)): Exception caught in this line of code.
+  in function ggml_sycl_op_mul_mat at /Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:35843
+/Apps/llama.cpp/ggml/src/ggml-sycl/../ggml-sycl/common.hpp:542: SYCL error
+[New LWP 1843087]
+[New LWP 1843025]
+[New LWP 1843006]
+[New LWP 1842974]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000072823b4a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x000072823b51cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x000072823c129c1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x000072823c128d39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x000072823c42b0b8 in ggml_sycl_error(char const*, char const*, char const*, int, char const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x000072823c59c0b3 in bool ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, void (*)(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, char const*, float const*, char const*, float*, long, long, long, long, sycl::_V1::queue* const&), ggml_layout_mode) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x000072823c582adc in ggml_sycl_mul_mat(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, ggml_layout_mode const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x000072823c5dbae6 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#10 0x000072823c6b953f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#11 0x000072823c537ee7 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#12 0x000072823c149fcc in ggml_backend_graph_compute () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#13 0x0000000000406453 in run_mul_mat_backend(ggml_backend*, ggml_type, void const*, unsigned long, float const*, int, int, std::vector<float, std::allocator<float> >&) ()
+#14 0x0000000000405eed in run_dmmv_q6k_coalesced_case(ggml_backend*, ggml_backend*, int, int, bool) ()
+#15 0x00000000004057e8 in main ()
+[Inferior 1 (process 1842913) detached]
+
+      Start 54: test-fattn-thread-local
+16/41 Test #54: test-fattn-thread-local .......................   Passed    1.02 sec
+      Start 55: test-ggml-sycl-soa
+17/41 Test #55: test-ggml-sycl-soa ............................Subprocess aborted***Exception:   7.04 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32598.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32022.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=32022.7 MB (100%)
+[VRAM-ARENA] External headroom 633 MB (caller-reserved 633 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32022.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32022.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32022.0 MB total (weight=30491.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32022.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67c2c000 + 512.0 MB (offset 31510.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.3 GB budget, committed=0.0 GB (system total=246.9 GB available=203.3 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=test_weight type=q4_0 ne=[2048,64,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] tensor usage UNKNOWN: name=ffn_weight type=q4_0 ne=[4096,11008,1,1]
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.3 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.3 MB budget=14763.3 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 193.2 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.2 GB budget, committed=0.0 GB (system total=246.9 GB available=201.2 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 206018.5 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=46715.5 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 187.6 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 187.6 GB budget, committed=0.0 GB (system total=246.9 GB available=195.6 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+[SYCL] host weight registry mismatch for ffn_weight (existing=0x36c71400 new=0x36c71400)
+[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG
+[SYCL] tensor usage UNKNOWN: name=leaf_0 type=q4_0 ne=[256,512,1,1]
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +46.2 MB (total 70.5 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +35.3 MB (total 59.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL] tensor usage UNKNOWN: name=gate_0 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_0 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_0 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_1 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_1 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_1 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_2 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_2 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_2 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_3 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_3 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_3 type=q4_0 ne=[14336,4096,1,1]
+[GRAPH-COMPUTE] device 0 below arena external driver headroom: free=237.1 MB target=256.0 MB. Continuing because arena scratch is already reserved internally.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +353.9 MB (total 378.1 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL] tensor usage UNKNOWN: name=TEST8_WEIGHT type=q4_0 ne=[4096,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=TEST9_MINIMAL type=q4_0 ne=[64,64,1,1]
+[SYCL] tensor usage UNKNOWN: name=TEST10_SINGLE_BLOCK type=q4_0 ne=[32,1,1,1]
+=== GGML SYCL SoA Integration Tests ===
+Using ACTUAL ggml backend API functions
+
+Layout override: Auto (layout policy)
+
+Test 1: Buffer initialization with ggml_backend_buffer_init_tensor
+  Backend: SYCL0
+  tensor->extra: set (SoA)
+  PASS: Buffer initialization completed
+
+Test 2: MUL_MAT graph execution with Q4_0 weights
+  Executing MUL_MAT graph...
+  Output: 11008/11008 non-zero values, sum=10116080.0000
+  Weight extra: 0x36c71400
+  Input extra: 0x36cefa50
+  PASS: MUL_MAT produced non-zero output
+
+Test 3: Prompt → Decode transition (bug scenario)
+  Phase 1: Prompt (batch=8 tokens)
+    Prompt output: 88064/88064 non-zero
+  Phase 2: Decode (batch=1 token)
+    Decode output: 11008/11008 non-zero
+  PASS: Both phases produce non-zero output
+
+Test 4: Numerical output verification
+  Output stats: non_zero=512/512, min=-128.1172, max=-128.1172, avg=-128.1172
+  First 10 values: -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 
+  Mode: Auto (layout policy)
+  PASS: Output verified
+
+Test 5: Actual Mistral 7B layer dimensions
+  Testing token_embd [4096, 32000]... PASS (32000 non-zero)
+  Testing q_proj [4096, 4096]... PASS (4096 non-zero)
+  Testing k_proj [4096, 1024]... PASS (1024 non-zero)
+  Testing v_proj [4096, 1024]... PASS (1024 non-zero)
+  Testing o_proj [4096, 4096]... PASS (4096 non-zero)
+  Testing gate_proj [4096, 14336]... PASS (14336 non-zero)
+  Testing up_proj [4096, 14336]... PASS (14336 non-zero)
+  Testing down_proj [14336, 4096]... PASS (4096 non-zero)
+  Subtests: 8 passed, 0 failed
+
+Test 6: Q4_0 vs Q8_0 comparison (same dimensions)
+  Q4_0 test...
+    Q4_0: 14336/14336 non-zero, sum=-29387776.00, first=[-2049.8750,-2049.8750,-2049.8750]
+  Q8_0 test...
+    Q8_0: 14336/14336 non-zero, sum=-29359872.00, first=[-200691.7500,196596.0000,-200691.7500]
+  PASS: Both Q4_0 and Q8_0 produce non-zero output
+
+Test 7: Sequential MUL_MAT operations (multi-layer simulation)
+  Executing 4-layer graph...
+  Output: 4096/4096 non-zero, sum=nan
+  PASS: Multi-layer graph produced non-zero output
+
+Test 8: Q4_0 DMMV correctness (GPU vs CPU reference)
+  [DEBUG] weight->data = 0xffffd55e47c2c000
+  [DEBUG] weight->extra = 0x36c71400
+  [DEBUG] buffer base = 0xffffd55e47c2c000
+
+  === SoA Memory Layout Debug ===
+  Tensor size: 9437184 bytes (524288 blocks x 18 = 9437184)
+  blocks_per_row: 128
+  Expected SoA qs section: 0 to 8388608
+  Expected SoA d offset: 8388608
+
+  First 20 bytes (hex): ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 
+  Bytes at d_offset 8388608 (should be fp16 d values): 00 3c 00 3c 00 3c 00 3c 00 3c 
+  d[0] raw = 0x3c00 (expected 0x3C00 for 1.0)
+  d[1] raw = 0x3c00 (expected 0x3C00 for 1.0)
+
+  AoS interpretation (if NOT reordered):
+  block[0].d = 0xffff, qs[0]=0xff
+  block[1].d = 0xffff, qs[0]=0xff
+
+  Manual SoA calculation for row 0:
+    block[0]: d_off=8388608 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+    block[1]: d_off=8388610 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+    block[2]: d_off=8388612 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+  First 5 blocks sum: 1120.0 (expected 5 * 224 = 1120)
+  === End Debug ===
+
+  === Input Upload Verification ===
+  input->data = 0xffffd55e4852c000
+  input->extra = 0x37b3f930
+  input_data[0..3] = [1.00, 1.00, 1.00, 1.00] (expected all 1.0)
+  GPU readback[0..7] = [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]
+  GPU readback[0] hex = 0x3f800000 (expected 0x3F800000 for 1.0f)
+  === End Input Verification ===
+
+  Dimensions: 4096 x 4096, 524288 blocks
+  Max diff: 3.750000 at row 0 (GPU=28668.2500, CPU=28672.0000)
+  First 5 GPU:  [28668.2500, 28668.2500, 28668.2500, 28668.2500, 28668.2500]
+  First 5 CPU:  [28672.0000, 28672.0000, 28672.0000, 28672.0000, 28672.0000]
+  PASS: GPU output matches CPU reference
+
+Test 9: Minimal dimension DMMV (64x64, batch=1)
+  Expected value per row: 448.0
+  First 10 GPU outputs: 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 
+  PASS: All 64 rows match expected value 448.0
+
+Test 10: Single Q4_0 block (32x1, batch=1)
+Non-uniform work-groups are not supported by the target device
+Exception caught at file:/Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:35843, func:operator()
+SYCL error: CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_row_size, stream)): Exception caught in this line of code.
+  in function ggml_sycl_op_mul_mat at /Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:35843
+/Apps/llama.cpp/ggml/src/ggml-sycl/../ggml-sycl/common.hpp:542: SYCL error
+[New LWP 1844503]
+[New LWP 1844500]
+[New LWP 1844250]
+[New LWP 1844141]
+[New LWP 1844134]
+[New LWP 1844062]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000073258b6a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x000073258b71cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x000073258c329c1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x000073258c328d39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x000073258c62b0b8 in ggml_sycl_error(char const*, char const*, char const*, int, char const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x000073258c79c0b3 in bool ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, void (*)(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, char const*, float const*, char const*, float*, long, long, long, long, sycl::_V1::queue* const&), ggml_layout_mode) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x000073258c782adc in ggml_sycl_mul_mat(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, ggml_layout_mode const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x000073258c7dbae6 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#10 0x000073258c8b953f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#11 0x000073258c737ee7 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#12 0x000073258c349fcc in ggml_backend_graph_compute () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#13 0x0000000000413b7d in test_single_block() ()
+#14 0x000000000041b6a4 in main ()
+[Inferior 1 (process 1844006) detached]
+
+      Start 56: test-layout-bytes
+18/41 Test #56: test-layout-bytes .............................***Failed    0.49 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.33 dense_score=168.96 usable_vram=15341.4 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.3 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+Q8_0 coalesced bytes: expected 340, got 2068
+Layout bytes test: FAIL
+
+      Start 57: test-mmq-q6k-gpu
+19/41 Test #57: test-mmq-q6k-gpu ..............................   Passed    2.09 sec
+      Start 58: test-moe-mini-graph
+20/41 Test #58: test-moe-mini-graph ...........................   Passed    3.42 sec
+      Start 59: test-moe-mul-mat-id
+21/41 Test #59: test-moe-mul-mat-id ...........................   Passed    2.43 sec
+      Start 60: test-moe-mul-mat-id-q4q8
+22/41 Test #60: test-moe-mul-mat-id-q4q8 ......................   Passed    4.91 sec
+      Start 61: test-mul-mat-host-streaming
+23/41 Test #61: test-mul-mat-host-streaming ...................Subprocess aborted***Exception:   3.89 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[SYCL] Host buffer alloc request: 2.0 MB (evictable=1, in_model_load=0)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 32653 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Insufficient budget for single-chunk arena: 2.0 MB < tail 1280.0 MB + min shared 16.0 MB; refusing reservation
+[VRAM-ARENA] Insufficient budget for N-chunk arena: total 2.0 MB < tail 1280.0 MB + min KV 16.0 MB; refusing reservation
+[VRAM-ARENA] Failed on device 0, falling back to per-entry allocation
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[SYCL] Pinned chunk pool created with 195.0 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.0 GB budget, committed=0.0 GB (system total=246.9 GB available=203.0 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[VRAM-ARENA] External headroom 1630 MB (caller-reserved 16301 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Insufficient budget for single-chunk arena: 2.0 MB < tail 1280.0 MB + min shared 16.0 MB; refusing reservation
+[VRAM-ARENA] Insufficient budget for N-chunk arena: total 2.0 MB < tail 1280.0 MB + min KV 16.0 MB; refusing reservation
+[VRAM-ARENA] Failed on device 1, falling back to per-entry allocation
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[SYCL] Pinned chunk pool created with 193.0 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.0 GB budget, committed=0.0 GB (system total=246.9 GB available=201.0 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 237217 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Insufficient budget for single-chunk arena: 2.0 MB < tail 1280.0 MB + min shared 16.0 MB; refusing reservation
+[VRAM-ARENA] Insufficient budget for N-chunk arena: total 2.0 MB < tail 1280.0 MB + min KV 16.0 MB; refusing reservation
+[VRAM-ARENA] Failed on device 2, falling back to per-entry allocation
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[SYCL] Pinned chunk pool created with 193.0 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.0 GB budget, committed=0.0 GB (system total=246.9 GB available=201.0 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+[SYCL-CPU] MUL_MAT routed to CPU from resolved-host-handle: weight=dense_weights dst=dense_out device=0 cpu_queue=0
+[CACHE-LOOKUP] MISS: model=0 hash=0xd8954cfeca06ed8e aux=0x3 layout=0 id_to_key_size=0 entries_size=0
+/Apps/llama.cpp/ggml/src/ggml-sycl/cpu-dispatch.cpp:4242: GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.src1_q.size()) failed
+[New LWP 1848001]
+[New LWP 1847994]
+[New LWP 1847936]
+[New LWP 1847935]
+[New LWP 1847934]
+[New LWP 1847912]
+[New LWP 1847870]
+[New LWP 1847811]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000078aa458a058c in __internal_syscall_cancel (a1=a1@entry=895043184, a2=<optimized out>, a3=a3@entry=895165568, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  0x000078aa458a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x35594670, expected=895165568, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+⚠️ warning: 57	./nptl/futex-internal.c: No such file or directory
+#3  __futex_abstimed_wait_common (futex_word=0x35594670, expected=895165568, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+87	in ./nptl/futex-internal.c
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x35594670, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+139	in ./nptl/futex-internal.c
+#5  0x000078aa458a3347 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x35594628, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+⚠️ warning: 421	./nptl/pthread_cond_wait.c: No such file or directory
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x35594628) at ./nptl/pthread_cond_wait.c:453
+453	in ./nptl/pthread_cond_wait.c
+#7  0x000078aa45cc1477 in std::condition_variable::wait(std::unique_lock<std::mutex>&) () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x000078aa4620f47d in sycl::_V1::detail::event_impl::waitInternal(bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#9  0x000078aa46304f5b in sycl::_V1::detail::Scheduler::GraphProcessor::waitForEvent(sycl::_V1::detail::event_impl&, std::shared_lock<std::shared_timed_mutex>&, std::vector<sycl::_V1::detail::Command*, std::allocator<sycl::_V1::detail::Command*> >&, bool, bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#10 0x000078aa4630093c in sycl::_V1::detail::Scheduler::waitForEvent(sycl::_V1::detail::event_impl&, bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#11 0x000078aa4620f819 in sycl::_V1::detail::event_impl::wait(bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#12 0x000078aa4621081c in sycl::_V1::detail::event_impl::wait_and_throw() () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#13 0x000078aa46c4b088 in ggml_sycl::mem_copy_submit(ggml_sycl::mem_handle const&, unsigned long, ggml_sycl::mem_handle const&, unsigned long, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, bool) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#14 0x000078aa46c4a413 in ggml_sycl::mem_copy_async(ggml_sycl::mem_handle const&, ggml_sycl::mem_handle const&, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#15 0x000078aa46a3fea9 in flush_output(ggml_tensor*, int, sycl::_V1::queue*, sycl::_V1::event const*, bool) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#16 0x000078aa46a473b8 in ggml_sycl_compute_forward_cpu(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#17 0x000078aa467da770 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#18 0x000078aa468b953f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#19 0x000078aa46737ee7 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#20 0x000078aa4e0a7fcc in ggml_backend_graph_compute () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#21 0x0000000000406469 in run_mul_mat_backend(ggml_backend*, ggml_backend_buffer_type*, std::vector<unsigned short, std::allocator<unsigned short> > const&, std::vector<float, std::allocator<float> > const&, int, int, int, std::vector<float, std::allocator<float> >&) ()
+#22 0x0000000000405b5f in main ()
+[Inferior 1 (process 1847790) detached]
+
+      Start 62: test-onednn-fallback
+24/41 Test #62: test-onednn-fallback ..........................   Passed    0.25 sec
+      Start 63: test-onednn-woq
+25/41 Test #63: test-onednn-woq ...............................   Passed    0.97 sec
+      Start 64: test-q6k-dispatch
+26/41 Test #64: test-q6k-dispatch .............................***Failed    5.61 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32598.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32022.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=32022.7 MB (100%)
+[VRAM-ARENA] External headroom 633 MB (caller-reserved 633 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32022.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32022.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32022.0 MB total (weight=30491.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32022.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67c2c000 + 512.0 MB (offset 31510.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.2 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.2 GB budget, committed=0.0 GB (system total=246.9 GB available=203.2 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=lm_head type=q6_K ne=[4096,32000,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.3 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.3 MB budget=14763.3 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 192.5 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 192.5 GB budget, committed=0.0 GB (system total=246.9 GB available=200.5 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 205339.1 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=45825.2 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 187.0 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 187.0 GB budget, committed=0.0 GB (system total=246.9 GB available=195.0 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+[SYCL] tensor usage UNKNOWN: name=ffn.gate type=q6_K ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=leaf_0 type=q6_K ne=[4096,1024,1,1]
+========================================
+Q6_K Dispatch Unit Test
+========================================
+
+Environment:
+  Layout override: (auto)
+  GGML_SYCL_DISABLE_GRAPH: (not set, graphs enabled)
+
+Test 1: Q6_K MUL_MAT single token (MMVQ dispatch path)
+  Backend: SYCL0
+  Executing MUL_MAT graph...
+  Computing CPU reference...
+  Row 8: GPU=-7.342700 CPU=-7.269313 diff=0.073387 (1.01%)
+  Row 11: GPU=0.824660 CPU=0.785486 diff=0.039174 (4.99%)
+  Max relative error: 4.9872%
+  Weight extra ptr: 0x11b23400
+  FAIL: 2/16 rows have >1% error
+
+Test 2: Q6_K with Mistral 7B layer dimensions
+  Sample row comparisons:
+    Row     0: GPU=    4.0847 CPU=    4.1049 err=0.4941% OK
+    Row   100: GPU=    0.9194 CPU=    0.9329 err=1.4442% FAIL
+    Row  1000: GPU=    4.0629 CPU=    4.1222 err=1.4401% FAIL
+    Row  5000: GPU=   -7.1717 CPU=   -7.1957 err=0.3337% OK
+    Row 10000: GPU=    4.9472 CPU=    4.9497 err=0.0507% OK
+    Row 14335: GPU=   -7.7501 CPU=   -7.7407 err=0.1209% OK
+  Max relative error: 1.4442%
+  FAIL: 2 sample rows have >1% error
+
+Test 3: Q6_K output determinism
+  PASS: Output is deterministic
+
+Test 4: Q6_K small dimension edge case
+  Max relative error: 0.0063%
+  PASS: Small dimension edge case works correctly
+
+========================================
+Results: 2 passed, 2 failed, 0 skipped
+========================================
+
+      Start 65: test-q8-0-layout-cache-path
+27/41 Test #65: test-q8-0-layout-cache-path ...................***Failed    1.20 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=28814.4 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=28814.4 MB (90%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 3842 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 28814.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=27534.0 MB)
+[VRAM-ARENA] Active on device 0: 1 chunk(s), 28814.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55d9f200000 + 512.0 MB (offset 28302.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 194.9 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 194.9 GB budget, committed=0.0 GB (system total=246.9 GB available=202.9 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+Failed to resolve SoA layout pointer (source=wrong_layout)
+
+      Start 66: test-q8-0-layout-cache-path-mmvq
+28/41 Test #66: test-q8-0-layout-cache-path-mmvq ..............***Failed    1.05 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=28814.4 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=28814.4 MB (90%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 3842 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 28814.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=27534.0 MB)
+[VRAM-ARENA] Active on device 0: 1 chunk(s), 28814.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55d9f200000 + 512.0 MB (offset 28302.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.0 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.0 GB budget, committed=0.0 GB (system total=246.9 GB available=203.0 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+Failed to resolve SoA layout pointer (source=wrong_layout)
+
+      Start 67: test-sycl-cpu-dispatch
+29/41 Test #67: test-sycl-cpu-dispatch ........................Subprocess aborted***Exception:   2.58 sec
+=== test-sycl-cpu-dispatch: T8 Mixed-Precision Cache Miss Loading ===
+
+test_int4_kernel_correctness ... /Apps/llama.cpp/ggml/src/ggml-sycl/cpu-dispatch.cpp:1425: GGML_ASSERT(q_size <= g_cpu_dispatch_buffers.src1_q.size()) failed
+[New LWP 1850202]
+[New LWP 1850201]
+[New LWP 1850200]
+[New LWP 1850199]
+[New LWP 1850198]
+[New LWP 1850197]
+[New LWP 1850196]
+[New LWP 1850194]
+[New LWP 1850193]
+[New LWP 1850192]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000075acfaca061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x000075acfad1cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x000075ad034fdc1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x000075ad034fcd39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x000075acfbe37fdd in ggml_sycl_cpu_expert_mul_mat_adaptive(cpu_expert_task const*, int, int) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x0000000000406086 in main ()
+[Inferior 1 (process 1850142) detached]
+
+      Start 68: test-sycl-moe-expert-parallelism
+30/41 Test #68: test-sycl-moe-expert-parallelism ..............   Passed    0.33 sec
+      Start 69: test-sycl-moe-identity-hash
+31/41 Test #69: test-sycl-moe-identity-hash ...................   Passed    0.63 sec
+      Start 70: test-sycl-orchestrator
+32/41 Test #70: test-sycl-orchestrator ........................   Passed    3.47 sec
+      Start 71: test-sycl-prestage-routed-experts
+33/41 Test #71: test-sycl-prestage-routed-experts .............   Passed    0.28 sec
+      Start 72: test-sycl-unified-cache
+34/41 Test #72: test-sycl-unified-cache .......................   Passed    1.05 sec
+      Start 73: test-sycl-unified-memory-e2e
+35/41 Test #73: test-sycl-unified-memory-e2e ..................***Timeout 120.15 sec
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32598.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32022.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32598.7 MB budget=32022.7 MB (100%)
+[VRAM-ARENA] External headroom 633 MB (caller-reserved 633 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32022.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32022.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32022.0 MB total (weight=30491.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32022.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67c2c000 + 512.0 MB (offset 31510.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 194.9 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 194.9 GB budget, committed=0.0 GB (system total=246.9 GB available=202.9 GB reserve=8.0 GB pct=90)
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[MOE-ENTRY-ERASE] path=remove layer=0 expert=0 layout=0 size=10485760 pinned=0 state=0
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+[UNIFIED-CACHE] alloc malloc_device returned nullptr
+=================================================================
+SYCL Unified Memory End-to-End Validation Tests
+Epic: llama.cpp-v3n, Task: llama.cpp-13o
+Goal: Validate 120B+ MoE inference on 13.5GB VRAM
+=================================================================
+
+Device 0: 32600 MB free / 32656 MB total
+
+TEST: test_120b_memory_pressure_simulation
+  Simulating 120B MoE memory patterns (without real model)
+  Budget: 32022 MB, Initial used: 0 MB
+  Scale factor: 1.00 (simulating 14.0 GB active set)
+  FAIL: attention allocation failed
+  >>> FAILED: test_120b_memory_pressure_simulation
+
+TEST: test_expert_streaming_under_pressure
+  Available: 32022 MB
+  Filled cache with 57 cold experts (570 MB)
+  FAIL: new expert allocation failed even with eviction
+  >>> FAILED: test_expert_streaming_under_pressure
+
+TEST: test_kv_expert_coexistence
+  Eviction order verified: P4 (cold) -> P3/P2 (experts) -> P1 (KV)
+  P0 (compute) was protected from eviction
+  PASS: priority-based eviction works correctly
+
+TEST: test_three_tier_memory_flow
+  Host arena budget: 199548 MB
+  PASS: three-tier memory system available
+
+TEST: test_budget_enforcement
+  Budget: 32022 MB (of 32656 MB total)
+  Used: 0 MB, Available: 32022 MB
+  PASS: budget enforcement is active and reasonable
+
+TEST: test_compute_buffer_protection
+  PASS: P0 compute buffers are protected from eviction
+
+TEST: test_expert_prefetch_integration
+  PASS: expert prefetch integration works (DMA engine smoke test)
+
+TEST: test_memory_tracking_consistency
+  SKIP: allocation 0 failed (memory pressure)
+  Allocated 0 entries totaling 0 MB
+  Freed 0 MB
+  PASS: memory tracking is consistent
+
+TEST: test_eviction_fragmentation
+  Allocated 0 small entries
+  FAIL: large allocation failed despite eviction
+  >>> FAILED: test_eviction_fragmentation
+
+TEST: test_cache_lookup_consistency
+  SKIP: allocation failed
+
+=================================================================
+E2E Test Results: 7/10 passed, 3 failed, 0 skipped
+=================================================================
+
+      Start 74: test-sycl-xmx-unified-correctness
+36/41 Test #74: test-sycl-xmx-unified-correctness .............Subprocess aborted***Exception:   4.98 sec
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32600.5 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32024.5 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32600.5 MB budget=32024.5 MB (100%)
+[VRAM-ARENA] External headroom 632 MB (caller-reserved 632 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32024.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32024.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32024.0 MB total (weight=30493.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32024.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67e30000 + 512.0 MB (offset 31512.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 195.2 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 195.2 GB budget, committed=0.0 GB (system total=246.9 GB available=203.2 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.4 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.4 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.4 MB budget=14763.4 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 193.1 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 193.1 GB budget, committed=0.0 GB (system total=246.9 GB available=201.1 GB reserve=8.0 GB pct=90)
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 205958.7 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=45322.5 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 187.6 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 187.6 GB budget, committed=0.0 GB (system total=246.9 GB available=195.6 GB reserve=8.0 GB pct=90)
+[SYCL] Multi-device SYCL execution active: disabling full graph replay until per-device graph segments can own cross-device smart-handle boundaries
+[SYCL-CPU] MUL_MAT routed to CPU from resolved-host-handle: weight=blk.0.attn_q.weight dst=xmx_out device=0 cpu_queue=0
+[CACHE-LOOKUP] MISS: model=0 hash=0x38771636bce5a702 aux=0x3 layout=0 id_to_key_size=0 entries_size=0
+/Apps/llama.cpp/ggml/src/ggml-sycl/cpu-dispatch.cpp:4252: GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size()) failed
+[New LWP 1872968]
+[New LWP 1872874]
+[New LWP 1872806]
+[New LWP 1872805]
+[New LWP 1872804]
+[New LWP 1872795]
+[New LWP 1872788]
+[New LWP 1872747]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x00007e05e28a058c in __internal_syscall_cancel (a1=a1@entry=746856096, a2=<optimized out>, a3=a3@entry=746978864, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  0x00007e05e28a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x2c841ea0, expected=746978864, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+⚠️ warning: 57	./nptl/futex-internal.c: No such file or directory
+#3  __futex_abstimed_wait_common (futex_word=0x2c841ea0, expected=746978864, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+87	in ./nptl/futex-internal.c
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x2c841ea0, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+139	in ./nptl/futex-internal.c
+#5  0x00007e05e28a3347 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x2c841e58, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+⚠️ warning: 421	./nptl/pthread_cond_wait.c: No such file or directory
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x2c841e58) at ./nptl/pthread_cond_wait.c:453
+453	in ./nptl/pthread_cond_wait.c
+#7  0x00007e05e2cc1477 in std::condition_variable::wait(std::unique_lock<std::mutex>&) () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007e05e320f47d in sycl::_V1::detail::event_impl::waitInternal(bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#9  0x00007e05e3304f5b in sycl::_V1::detail::Scheduler::GraphProcessor::waitForEvent(sycl::_V1::detail::event_impl&, std::shared_lock<std::shared_timed_mutex>&, std::vector<sycl::_V1::detail::Command*, std::allocator<sycl::_V1::detail::Command*> >&, bool, bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#10 0x00007e05e330093c in sycl::_V1::detail::Scheduler::waitForEvent(sycl::_V1::detail::event_impl&, bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#11 0x00007e05e320f819 in sycl::_V1::detail::event_impl::wait(bool*) () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#12 0x00007e05e321081c in sycl::_V1::detail::event_impl::wait_and_throw() () from /opt/intel/oneapi/redist/lib/libsycl.so.9
+#13 0x00007e05e3c4b088 in ggml_sycl::mem_copy_submit(ggml_sycl::mem_handle const&, unsigned long, ggml_sycl::mem_handle const&, unsigned long, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, bool) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#14 0x00007e05e3c4a413 in ggml_sycl::mem_copy_async(ggml_sycl::mem_handle const&, ggml_sycl::mem_handle const&, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#15 0x00007e05e3a3fea9 in flush_output(ggml_tensor*, int, sycl::_V1::queue*, sycl::_V1::event const*, bool) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#16 0x00007e05e3a473b8 in ggml_sycl_compute_forward_cpu(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#17 0x00007e05e37da770 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#18 0x00007e05e38b953f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#19 0x00007e05e3737ee7 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#20 0x00007e05eb069fcc in ggml_backend_graph_compute () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#21 0x000000000040638b in run_backend_matmul(ggml_backend*, matmul_case const&, bool, bool, std::vector<float, std::allocator<float> >&) ()
+#22 0x0000000000405cdf in main ()
+[Inferior 1 (process 1872689) detached]
+
+      Start 75: test-tiered-dispatch
+37/41 Test #75: test-tiered-dispatch ..........................Subprocess aborted***Exception:   3.88 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 3 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+| 1| [level_zero:gpu:1]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+| 2| [level_zero:gpu:2]|                         Intel Graphics|  12.70|     64|    1024|   32|248743M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Multi-GPU primary candidate: logical=0 raw=0 primary_score=10237.66 dense_score=337.92 usable_vram=31023.2 MB total_vram=32656.0 MB max_alloc=31023.2 MB CU=256 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=1 raw=1 primary_score=2531.30 dense_score=168.96 usable_vram=15341.2 MB total_vram=16304.0 MB max_alloc=15488.8 MB CU=128 XMX=1 fp16=1 usm_device=1
+[SYCL] Multi-GPU primary candidate: logical=2 raw=2 primary_score=281.60 dense_score=70.40 usable_vram=4096.0 MB total_vram=237220.4 MB max_alloc=4096.0 MB CU=64 XMX=0 fp16=1 usm_device=1
+[SYCL] Multi-GPU auto-primary: keeping logical 0 raw device 0 for default cache/KV (primary_score=10237.66, dense_score=337.92, usable_vram=31023.2 MB)
+[SYCL] Multi-GPU: exposing only device 0 to scheduler (3 physical GPUs available internally for MoE/split)
+[SYCL] WARNING: 3 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14574.2 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 1 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Device 2 alloc caps: raw=4096.0 MB, safe=3891.2 MB, host_unified=yes
+[SYCL] Device 2 caps: CU=64, WG=1024, SG=32 preferred, SLM=64KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=no M=0 N=0 K=0 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+| 1| [level_zero:gpu:1]|      Y|
+| 2| [level_zero:gpu:2]|      Y|
+[SYCL-PLAN] inventory oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 1304.1 MB)
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32600.5 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32024.5 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32600.5 MB budget=32024.5 MB (100%)
+[VRAM-ARENA] External headroom 632 MB (caller-reserved 632 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32024.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32024.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32024.0 MB total (weight=30493.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32024.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67e30000 + 512.0 MB (offset 31512.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 194.9 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 194.9 GB budget, committed=0.0 GB (system total=246.9 GB available=202.9 GB reserve=8.0 GB pct=90)
+[SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=32602.4 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=65204.7 MB, exceeds_budget=true
+[LAYER-STREAM] Built layer map: 50 layers, max_layer_size=1304.1 MB, total_entries=50
+[LAYER-STREAM] Failed to allocate buffer 0 (1306.0 MB)
+[SYCL-BUDGET] Layer streaming buffer allocation failed
+[SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=53.6 MB, headroom=0.0 MB
+[SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=65204.7 MB
+[SYCL] Tiered headroom reserve: 8164.0 MB (base headroom 0.0 MB, total 32656.0 MB)
+[VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+[VRAM-BUDGET]   Weights (dense): 65204.7 MB  [priority 1]
+[VRAM-BUDGET]   Headroom:        8164.0 MB  (scratch + KV + runtime)
+[VRAM-BUDGET]   Available:       0.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+[PER-DEV-QUEUE] Device 1 cache queue created with a single-device context
+[PER-DEV-QUEUE] Device 2 cache queue created with a single-device context
+[PER-DEV-QUEUE] 2 secondary queues created with per-device contexts
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 15339.3 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=14763.3 MB)
+[UNIFIED-CACHE] Device 1 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15339.3 MB budget=14763.3 MB (100%)
+[VRAM-ARENA] External headroom 1541 MB (caller-reserved 1541 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Reserved single chunk: 14762.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13482.0 MB)
+[VRAM-ARENA] Active on device 1: 1 chunk(s), 14762.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392a2a00000 + 512.0 MB (offset 14250.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 194.8 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 194.8 GB budget, committed=0.0 GB (system total=246.9 GB available=202.8 GB reserve=8.0 GB pct=90)
+[SYCL] device is host-unified; VRAM budget capped at 6144.0 MB (reported global_mem 237220.4 MB, 207674.6 MB currently available system RAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=5568.0 MB)
+[UNIFIED-CACHE] Device 2 (Intel(R) Graphics): total=6144.0 MB free=46986.9 MB budget=5568.0 MB (100%)
+[VRAM-ARENA] External headroom 2048 MB (caller-reserved 231652 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 5568.0 MB exceeds raw per-allocation cap 4096.0 MB (safe chunk cap 3891.2 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 5568.0 MB total (per-chunk cap 3891.2 MB)
+[VRAM-ARENA] Reserved 3 chunks, 5568.0 MB total (weight=4160.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 2: 3 chunk(s), 5568.0 MB total
+[VRAM-ARENA] Scratch zone: 0xfffff1c8ca400000 + 512.0 MB (offset 5056.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 189.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 189.3 GB budget, committed=0.0 GB (system total=246.9 GB available=197.3 GB reserve=8.0 GB pct=90)
+[PLACEMENT-MULTI] 3 secondary GPU cache arena(s) registered before planning
+[PLACEMENT-MULTI] Mode: LAYER
+[PLACEMENT-MULTI] Dense candidate rank=0 logical=0 physical=0 raw_score=354.82 net_score=354.82 locality_penalty=1.00 supported=1 budget=32656.0 MB remaining=30493.8 MB
+[PLACEMENT-MULTI] Dense candidate rank=1 logical=1 physical=1 raw_score=177.41 net_score=177.41 locality_penalty=1.00 supported=1 budget=16304.0 MB remaining=13482.0 MB
+[PLACEMENT-MULTI] Dense candidate rank=2 logical=2 physical=2 raw_score=73.92 net_score=73.92 locality_penalty=1.00 supported=1 budget=237220.4 MB remaining=4160.0 MB
+[PLACEMENT-MULTI] Dense layer 36 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 37 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 38 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 39 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 40 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 41 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 42 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 43 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 44 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 45 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 46 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 47 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 48 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense layer 49 -> host reason=no-compatible-gpu-capacity weights=1304.1 MB kv=0.0 MB
+[PLACEMENT-MULTI] Dense target logical=0 physical=0 raw_score=354.82 net_score=354.82 locality_penalty=1.00 assigned=29994.2 MB charged=29994.2 MB groups=23 remaining=499.6 MB
+[PLACEMENT-MULTI] Dense target logical=1 physical=1 raw_score=177.41 net_score=177.41 locality_penalty=1.00 assigned=13040.9 MB charged=13040.9 MB groups=10 remaining=441.1 MB
+[PLACEMENT-MULTI] Dense target logical=2 physical=2 raw_score=73.92 net_score=73.92 locality_penalty=1.00 assigned=3912.3 MB charged=3912.3 MB groups=3 remaining=247.7 MB
+[PLACEMENT-MULTI] Dense rank=0 device=0 groups=23
+[PLACEMENT-MULTI] Dense rank=1 device=1 groups=10
+[PLACEMENT-MULTI] Dense rank=2 device=2 groups=3
+[PLACEMENT-MULTI] Dense placement groups: net_best=23 spill_gpu=13 host=14 host_bytes=18257.3 MB
+[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=0 host_changed=0 xmx_tiled=0 i8_or_dpas=0 soa=0 aos=0 skipped_capacity=0 device_delta=0.0 MB host_delta=0.0 MB
+[PLACEMENT-MOE-MULTI] PP executable alternate layouts: considered=0 candidates=0 soa_added=0 already=0 not_needed=0 single_xmx_gateup=0 no_layout_bytes=0 skipped_capacity=0 charged=0.0 MB pp_tokens=512 selected_rows=512 envelope=no
+[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary capability remains SOA until grouped secondary XMX dispatch is implemented
+[SYCL-PLAN] zone sizing found no repeated (type, ne) group in 50 inventory entries (0 distinct groups, 50 without a shape): every path-scoped maximum collapsed to zero and each zone falls back to the global 1304.1 MB maximum, reclaiming nothing. If this model really is all singletons that is legitimate; otherwise the inventory adapter is not carrying type/ne/has_shape into zone_tensor_desc.
+[SYCL-PLAN] inventory top-8 of 50 tensors (total 65204.7 MB): blk.7.attn_q.weight=1304.1MB(t43,0x0) blk.4.attn_q.weight=1304.1MB(t43,0x0) blk.1.attn_q.weight=1304.1MB(t43,0x0) blk.3.attn_q.weight=1304.1MB(t43,0x0) blk.5.attn_q.weight=1304.1MB(t43,0x0) blk.0.attn_q.weight=1304.1MB(t43,0x0) blk.2.attn_q.weight=1304.1MB(t43,0x0) blk.6.attn_q.weight=1304.1MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 50 tensors; cardinality histogram: 50x1; largest card>=4: blk.38.attn_q.weight 1304.1MB (card=50); largest card<=2: none
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 1304.1 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 1304.1 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 1304.1 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2610.2 MB total=2626.2 MB
+[PLACEMENT-MULTI] 3 devices, 0 layers, hybrid parallelism
+[PLACEMENT-MULTI] Device logical=0 physical=0 raw_dense_score=354.82 layers [0, -1], 29994.2 MB planned bytes used (32656.0 MB budget)
+[PLACEMENT-MULTI] Device logical=1 physical=1 raw_dense_score=177.41 layers [0, -1], 13040.9 MB planned bytes used (16304.0 MB budget)
+[PLACEMENT-MULTI] Device logical=2 physical=2 raw_dense_score=73.92 layers [0, -1], 3912.3 MB planned bytes used (237220.4 MB budget)
+[PLACEMENT-MULTI] ATTENTION       device= 36 (46947.4 MB)  host= 14 (18257.3 MB)
+[PLACEMENT-MULTI] KV sizing: n_layer=0 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT-MULTI] Totals: weights=46947.4 MB device + 18257.3 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT-MULTI] Total: 46947.4 MB device + 18257.3 MB host (budget=286180.4 MB)
+[SYCL] Multi-device placement plan computed: 50 entries, 46947.4 MB device + 18257.3 MB host (3 GPUs)
+[PLACE-4] device weight zone: 46947.4 MB (36 tensors), host arena: 18257.3 MB (14 tensors)
+[MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+[SYCL] Tensor inventory set: 50 tensors, 63.68 GB total (VRAM: 31.84 GB free, tiered: enabled)
+[SYCL-PLAN] inventory oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 28.6 MB)
+[SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=572.5 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=286.3 MB, exceeds_budget=false
+[SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32083.5 MB, headroom=0.0 MB
+[SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=286.3 MB
+[VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+[VRAM-BUDGET]   Weights (dense): 286.3 MB  [priority 1]
+[VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+[VRAM-BUDGET]   Available:       32369.7 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+[PLACEMENT-MULTI] 3 secondary GPU cache arena(s) registered before planning
+[PLACEMENT-MULTI] Mode: LAYER
+[PLACEMENT-MULTI] Dense candidate rank=0 logical=0 physical=0 raw_score=354.82 net_score=354.82 locality_penalty=1.00 supported=1 budget=32656.0 MB remaining=30493.8 MB
+[PLACEMENT-MULTI] Dense candidate rank=1 logical=1 physical=1 raw_score=177.41 net_score=177.41 locality_penalty=1.00 supported=1 budget=16304.0 MB remaining=13482.0 MB
+[PLACEMENT-MULTI] Dense candidate rank=2 logical=2 physical=2 raw_score=73.92 net_score=73.92 locality_penalty=1.00 supported=1 budget=237220.4 MB remaining=4160.0 MB
+[PLACEMENT-MULTI] Dense target logical=0 physical=0 raw_score=354.82 net_score=354.82 locality_penalty=1.00 assigned=286.3 MB charged=286.3 MB groups=10 remaining=30207.6 MB
+[PLACEMENT-MULTI] Dense target logical=1 physical=1 raw_score=177.41 net_score=177.41 locality_penalty=1.00 assigned=0.0 MB charged=0.0 MB groups=0 remaining=13482.0 MB
+[PLACEMENT-MULTI] Dense target logical=2 physical=2 raw_score=73.92 net_score=73.92 locality_penalty=1.00 assigned=0.0 MB charged=0.0 MB groups=0 remaining=4160.0 MB
+[PLACEMENT-MULTI] Dense rank=0 device=0 groups=10
+[PLACEMENT-MULTI] Dense placement groups: net_best=10 spill_gpu=0 host=0 host_bytes=0.0 MB
+[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=0 host_changed=0 xmx_tiled=0 i8_or_dpas=0 soa=0 aos=0 skipped_capacity=0 device_delta=0.0 MB host_delta=0.0 MB
+[PLACEMENT-MOE-MULTI] PP executable alternate layouts: considered=0 candidates=0 soa_added=0 already=0 not_needed=0 single_xmx_gateup=0 no_layout_bytes=0 skipped_capacity=0 charged=0.0 MB pp_tokens=512 selected_rows=512 envelope=no
+[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary capability remains SOA until grouped secondary XMX dispatch is implemented
+[SYCL-PLAN] inventory top-8 of 10 tensors (total 286.3 MB): blk.7.attn_q.weight=28.6MB(t43,0x0) blk.4.attn_q.weight=28.6MB(t43,0x0) blk.1.attn_q.weight=28.6MB(t43,0x0) blk.3.attn_q.weight=28.6MB(t43,0x0) blk.5.attn_q.weight=28.6MB(t43,0x0) blk.0.attn_q.weight=28.6MB(t43,0x0) blk.2.attn_q.weight=28.6MB(t43,0x0) blk.6.attn_q.weight=28.6MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 10 tensors; cardinality histogram: 10x1; largest card>=4: blk.0.attn_q.weight 28.6MB (card=10); largest card<=2: none
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 28.6 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 28.6 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 28.6 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=59.3 MB total=75.3 MB
+[PLACEMENT-MULTI] 3 devices, 0 layers, hybrid parallelism
+[PLACEMENT-MULTI] Device logical=0 physical=0 raw_dense_score=354.82 layers [0, -1], 286.3 MB planned bytes used (32656.0 MB budget)
+[PLACEMENT-MULTI] Device logical=1 physical=1 raw_dense_score=177.41 layers [0, -1], 0.0 MB planned bytes used (16304.0 MB budget)
+[PLACEMENT-MULTI] Device logical=2 physical=2 raw_dense_score=73.92 layers [0, -1], 0.0 MB planned bytes used (237220.4 MB budget)
+[PLACEMENT-MULTI] ATTENTION       device= 10 (286.3 MB)  host=  0 (0.0 MB)
+[PLACEMENT-MULTI] KV sizing: n_layer=0 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT-MULTI] Totals: weights=286.3 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT-MULTI] Total: 286.3 MB device + 0.0 MB host (budget=286180.4 MB)
+[SYCL] Multi-device placement plan computed: 10 entries, 286.3 MB device + 0.0 MB host (3 GPUs)
+[PLACE-4] device weight zone: 286.3 MB (10 tensors), host arena: 0.0 MB (0 tensors)
+[MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+[SYCL] Tensor inventory set: 10 tensors, 0.28 GB total (VRAM: 0.56 GB free, tiered: enabled)
+test-tiered-dispatch: test-tiered-dispatch.cpp:118: void test_small_inventory_no_tiered(): Assertion `!tiered && "Small inventory (50% VRAM) should NOT enable tiered mode"' failed.
+
+      Start 76: test-xmx-host-streaming
+38/41 Test #76: test-xmx-host-streaming .......................   Passed    0.25 sec
+      Start 77: test-xmx-kernel-config
+39/41 Test #77: test-xmx-kernel-config ........................   Passed    0.26 sec
+      Start 78: test-xmx-quant-loaders
+40/41 Test #78: test-xmx-quant-loaders ........................   Passed    0.25 sec
+      Start 79: test-xmx-unified-kernel
+41/41 Test #79: test-xmx-unified-kernel .......................   Passed    0.24 sec
+
+66% tests passed, 14 tests failed out of 41
+
+Label Time Summary:
+0igs-batch1     =  21.62 sec*proc (13 tests)
+0igs-batch2     = 181.40 sec*proc (28 tests)
+concurrency     =   1.37 sec*proc (1 test)
+dequant         =   8.67 sec*proc (2 tests)
+dispatch        =  16.67 sec*proc (5 tests)
+dmmv            =   8.67 sec*proc (2 tests)
+fattn           =   2.16 sec*proc (3 tests)
+gpu-arch        =   0.29 sec*proc (1 test)
+hostonly        = 140.68 sec*proc (11 tests)
+kv              =   1.29 sec*proc (1 test)
+layout          =   9.78 sec*proc (4 tests)
+mmq             =   2.09 sec*proc (1 test)
+mmvq            =   1.05 sec*proc (1 test)
+moe             =  25.86 sec*proc (11 tests)
+onednn          =   3.58 sec*proc (4 tests)
+orchestrator    =   3.47 sec*proc (1 test)
+sycl            = 203.02 sec*proc (41 tests)
+tdd             = 203.02 sec*proc (41 tests)
+xmx             =   6.24 sec*proc (6 tests)
+
+Total Test time (real) = 203.04 sec
+
+The following tests FAILED:
+	 44 - test-sycl-weight-key-uniqueness (Failed)          0igs-batch1 hostonly moe sycl tdd
+	 51 - test-sycl-moe-handle-resolution (Subprocess aborted) 0igs-batch1 hostonly moe sycl tdd
+	 52 - test-dmmv-q4-0-coalesced (Failed)                 0igs-batch2 dequant dmmv sycl tdd
+	 53 - test-dmmv-q6k-coalesced (Subprocess aborted)      0igs-batch2 dequant dmmv sycl tdd
+	 55 - test-ggml-sycl-soa (Subprocess aborted)           0igs-batch2 layout sycl tdd
+	 56 - test-layout-bytes (Failed)                        0igs-batch2 layout sycl tdd
+	 61 - test-mul-mat-host-streaming (Subprocess aborted)  0igs-batch2 dispatch sycl tdd
+	 64 - test-q6k-dispatch (Failed)                        0igs-batch2 dispatch sycl tdd
+	 65 - test-q8-0-layout-cache-path (Failed)              0igs-batch2 layout sycl tdd
+	 66 - test-q8-0-layout-cache-path-mmvq (Failed)         0igs-batch2 layout mmvq sycl tdd
+	 67 - test-sycl-cpu-dispatch (Subprocess aborted)       0igs-batch2 dispatch sycl tdd
+	 73 - test-sycl-unified-memory-e2e (Timeout)            0igs-batch2 hostonly sycl tdd
+	 74 - test-sycl-xmx-unified-correctness (Subprocess aborted) 0igs-batch2 sycl tdd xmx
+	 75 - test-tiered-dispatch (Subprocess aborted)         0igs-batch2 dispatch sycl tdd
+Errors while running CTest
