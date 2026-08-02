@@ -1473,8 +1473,24 @@ inline tensor_usage infer_tensor_usage(const char * name) {
     // unbuilt and aborted MUL_MAT_ID with "[MOE-ROUTE] unresolved planner
     // expert ... plan_missing=1".  Keep this list in sync with
     // expert_tensor_role_from_tensor_name() in unified-cache.hpp.
+    //
+    // The "_chexps" trio is grovemoe's chunked-expert family
+    // (LLM_TENSOR_FFN_{GATE,DOWN,UP}_CHEXPS in src/llama-arch.cpp).  Those are
+    // 3D per-expert weights handed to build_moe_ffn() exactly like the plain
+    // trio, so MUL_MAT_ID routes them and they need per-expert entries; the
+    // planner's split is gated on this function returning MOE_EXPERT_WEIGHT.
+    // "ffn_gate_chexps" contains neither "ffn_gate_exps" nor "_exps", so like
+    // the fused name it needs its own literal, and grovemoe aborted the same
+    // way until it got one.
+    //
+    // Do NOT collapse this list to a bare "exps" substring.  "ffn_norm_exps"
+    // (arctic) is a 1D {n_embd} norm consumed by build_norm, not a routed
+    // expert weight, and the "ffn_*_shexp" trio is the DENSE shared-expert FFN
+    // that goes through ordinary MUL_MAT.  Both would be swept up.
     const bool moe_exps_name = strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") ||
-                               strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps");
+                               strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps") ||
+                               strstr(name, "ffn_gate_chexps") || strstr(name, "ffn_up_chexps") ||
+                               strstr(name, "ffn_down_chexps");
     if (moe_exps_name && !strstr(name, ".bias")) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }
@@ -4225,10 +4241,18 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
             }
 
             const char * tensor_name = tensor->name ? tensor->name : "";
-            const bool   is_composite_moe_weight =
-                tensor->ne[2] > 1 && std::strstr(tensor_name, "_exps.weight") != nullptr &&
-                std::strstr(tensor_name, ".bias") == nullptr &&
-                ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
+            // "exps.weight", not "_exps.weight": grovemoe's chunked-expert
+            // tensors are named "...ffn_gate_chexps.weight", which has no
+            // underscore before "exps".  With the stricter literal the refusal
+            // below never fired for them, so a placement-planned composite
+            // chexps tensor could still be materialized whole -- the exact
+            // thing this guard exists to prevent.  The MOE_EXPERT_WEIGHT and
+            // ne[2] > 1 clauses below already pin the set; the name test is
+            // only a cheap pre-filter.
+            const bool   is_composite_moe_weight = tensor->ne[2] > 1 &&
+                                                 std::strstr(tensor_name, "exps.weight") != nullptr &&
+                                                 std::strstr(tensor_name, ".bias") == nullptr &&
+                                                 ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
             if (cache->has_placement_plan() && is_composite_moe_weight) {
                 GGML_SYCL_DEBUG(
                     "[RESOLVE] refusing composite MoE expert tensor materialization for placement-planned '%s' "

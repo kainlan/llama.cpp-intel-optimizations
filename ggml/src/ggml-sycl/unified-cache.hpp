@@ -116,13 +116,28 @@ enum class placement_priority : uint8_t {
 // (mxfp4_moe_gateup_role, maybe_upgrade_moe_gate_up_layouts_to_i8,
 // moe_triplet_complete) looks for a matching partner entry that a fused tensor
 // does not have.  Those sites exclude GATE_UP rather than half-matching it.
+//
+// CHUNK_GATE/CHUNK_UP/CHUNK_DOWN are grovemoe's chunked-expert trio
+// (`blk.N.ffn_{gate,down,up}_chexps.weight`).  They are separate roles for a
+// hard reason, not for tidiness: grovemoe carries the plain trio AND the
+// chunked trio in the SAME layer, so aliasing chexps onto GATE/UP/DOWN would
+// make `blk.0.ffn_gate_exps` expert 0 and `blk.0.ffn_gate_chexps` expert 0
+// collide on the (layer, expert, role) key that build_index() and
+// lookup_expert_placement() use.  build_index()'s emplace keeps the FIRST
+// entry, so every chexps lookup would silently resolve to the plain tensor's
+// device and layout -- a wrong answer instead of the current loud abort.
+// The chunked trio also has FEWER experts than the plain one
+// (n_chunk_expert = n_expert / n_group_experts).
 enum class expert_tensor_role : uint8_t {
-    UNKNOWN = 0,
-    GATE    = 1,
-    UP      = 2,
-    DOWN    = 3,
-    GATE_UP = 4,  // fused gate+up (ffn_gate_up_exps); has no partner entry
-    COUNT   = 5,
+    UNKNOWN    = 0,
+    GATE       = 1,
+    UP         = 2,
+    DOWN       = 3,
+    GATE_UP    = 4,  // fused gate+up (ffn_gate_up_exps); has no partner entry
+    CHUNK_GATE = 5,  // grovemoe ffn_gate_chexps
+    CHUNK_UP   = 6,  // grovemoe ffn_up_chexps
+    CHUNK_DOWN = 7,  // grovemoe ffn_down_chexps
+    COUNT      = 8,
 };
 
 inline const char * expert_tensor_role_name(expert_tensor_role role) {
@@ -135,6 +150,12 @@ inline const char * expert_tensor_role_name(expert_tensor_role role) {
             return "down";
         case expert_tensor_role::GATE_UP:
             return "gate_up";
+        case expert_tensor_role::CHUNK_GATE:
+            return "chunk_gate";
+        case expert_tensor_role::CHUNK_UP:
+            return "chunk_up";
+        case expert_tensor_role::CHUNK_DOWN:
+            return "chunk_down";
         case expert_tensor_role::UNKNOWN:
         default:
             return "unknown";
@@ -161,6 +182,22 @@ inline expert_tensor_role expert_tensor_role_from_tensor_name(const char * name)
     }
     if (std::strstr(name, "ffn_down_exps")) {
         return expert_tensor_role::DOWN;
+    }
+    // grovemoe's chunked-expert trio.  None of these contain the literals
+    // above ("chexps" has no underscore before "exps"), so order is not
+    // load-bearing here -- but they must stay literal for the same reason the
+    // ones above do.  Keep in sync with infer_tensor_usage() in common.hpp:
+    // that function decides whether per-expert entries are built at all, this
+    // one decides whether build_index() keeps them (UNKNOWN roles are dropped
+    // from the placement index), and MUL_MAT_ID aborts unless BOTH agree.
+    if (std::strstr(name, "ffn_gate_chexps")) {
+        return expert_tensor_role::CHUNK_GATE;
+    }
+    if (std::strstr(name, "ffn_up_chexps")) {
+        return expert_tensor_role::CHUNK_UP;
+    }
+    if (std::strstr(name, "ffn_down_chexps")) {
+        return expert_tensor_role::CHUNK_DOWN;
     }
     return expert_tensor_role::UNKNOWN;
 }
@@ -793,6 +830,14 @@ struct placement_plan {
             // layers*experts for every fused arch, so derive it from the roles
             // actually observed and fall back to 3 only when nothing is
             // classified yet.
+            //
+            // The CHUNK_* roles are deliberately NOT counted here.  They exist
+            // only alongside the plain trio (grovemoe), and their expert count
+            // is n_expert / n_group_experts, not the `expected_experts` this
+            // formula multiplies by -- so counting them would inflate
+            // `expected` by a whole layer's worth of experts and report a
+            // spurious `missing`.  Leaving them out makes `planned` exceed
+            // `expected` instead, which saturates `missing` to 0.
             size_t roles_per_layer = 0;
             for (expert_tensor_role role : { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN,
                                              expert_tensor_role::GATE_UP }) {
