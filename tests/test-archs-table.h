@@ -30,6 +30,19 @@ struct archs_table {
     // n_columns + 1 '|' characters: arch, device, config, NMSE, roundtrip.
     static constexpr size_t n_columns = 5;
 
+    // The longest line emit() can promise as ONE write(2), and the precondition its whole
+    // argument rests on -- see emit(). A line must fit in stdout's buffer, whose size is
+    // implementation-defined; 256 is the floor C requires of BUFSIZ, so a line under it fits
+    // everywhere (glibc sizes the buffer from the fd's st_blksize, 4096 typically, so this is
+    // conservative by an order of magnitude).
+    //
+    // A row costs width_arch + width_device + 59: config 6, NMSE status 15, a space, the value
+    // 10, roundtrip 20, six delimiters and a newline. With arch names at 32 and the longest
+    // device description this fork has seen at 33 that is ~124 -- half the floor. The margin is
+    // real but it is not guaranteed: ggml_backend_dev_description() is free to return anything,
+    // so emit() checks rather than assuming, and test-archs-table pins the arithmetic.
+    static constexpr size_t max_atomic_line = 256;
+
     size_t width_arch   = 4;
     size_t width_device = 4;
 
@@ -89,9 +102,38 @@ struct archs_table {
     // any byte; stderr is unbuffered, so whatever the backend logs in the gap lands between the
     // halves. Flushing first leaves the buffer empty, so a line shorter than the buffer cannot
     // straddle a boundary; the single fputs puts all of it in; flushing after makes it one
-    // write(2), which the kernel does not interleave with the log's writes to the shared file
-    // description. Callers must never build a table line from successive printf()s.
+    // write(2). That last step is what actually buys the property: the log's worker thread writes
+    // to the same file description, and the kernel serialises write(2) against it, so a log line
+    // lands before or after the row and never inside it.
+    //
+    // TWO PRECONDITIONS, because the argument above quietly assumes both.
+    //
+    // 1. The line must be shorter than stdout's buffer, or the fputs itself splits into a
+    //    buffer-fill plus a direct write and the gap reopens. Checked below against
+    //    max_atomic_line; the check WARNS rather than aborts, because a long device name is not
+    //    worth failing a run over -- but the reader has to be told the guarantee lapsed, since
+    //    the symptom is a corrupt table that looks like the bug this file exists to fix.
+    //
+    // 2. Nothing else may write to stdout while this runs. Note this is NOT the same as "the
+    //    kernel serialises writes", which is about the log thread and holds regardless: the
+    //    fragile step is that the leading fflush establishes an EMPTY buffer, and any other
+    //    thread's stdout write between that flush and the fputs invalidates it, putting
+    //    precondition 1 back in play at an arbitrary offset. So emit() is safe against the
+    //    concurrent LOG writer and unsafe against a concurrent TABLE writer. test-llama-archs
+    //    emits from one thread in strict program order; a caller that does otherwise must
+    //    serialise externally and cannot rely on stdio's per-call locking, which protects each
+    //    call and not this three-call sequence.
+    //
+    // Callers must never build a table line from successive printf()s.
     static void emit(const std::string & text) {
+        if (text.size() >= max_atomic_line) {
+            // stderr, never stdout: a warning printed into the table would be the exact defect
+            // being warned about.
+            fprintf(stderr,
+                    "archs_table::emit: line of %zu bytes exceeds the %zu-byte atomic-write bound; "
+                    "it may be split across writes and interleaved with log output\n",
+                    text.size(), max_atomic_line);
+        }
         fflush(stdout);
         fputs(text.c_str(), stdout);
         fflush(stdout);

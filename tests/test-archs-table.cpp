@@ -155,6 +155,24 @@ static const row_case g_rows[] = {
 
 static const size_t g_n_rows = sizeof(g_rows) / sizeof(g_rows[0]);
 
+// The widest table a real sweep could plausibly produce: the longest arch name in llm_arch_all()
+// against a device description far longer than any this fork has seen. If a row at THAT size
+// still fits emit()'s atomic-write bound, the bound is not being met by luck.
+static const archs_table g_table_wide = { 40, 80 };
+
+// Wide enough that a row cannot fit the bound. Used only as the control that proves the bound is
+// reachable -- two checks that a row is under a limit nothing can exceed would pass for free.
+static const archs_table g_table_absurd = { 400, 400 };
+
+static std::string build_row(const archs_table & table, const row_case & rc) {
+    return table.row(rc.arch, rc.device, rc.config, rc.status_nmse, rc.nmse_value, rc.status_roundtrip);
+}
+
+// Emits one row too long for emit()'s bound, so the gate can watch the warning fire.
+static void body_oversize() {
+    archs_table::emit(build_row(g_table_absurd, g_rows[3]));
+}
+
 // The emission this ticket installed: the breadcrumb and the log noise go to stderr, the row is
 // assembled whole and written after the work it describes.
 static void body_fixed() {
@@ -163,8 +181,7 @@ static void body_fixed() {
         const row_case & rc = g_rows[i];
         fprintf(stderr, "test case: %s (%s, %s)\n", rc.arch, rc.device, rc.config);
         log_noise();
-        archs_table::emit(
-            g_table.row(rc.arch, rc.device, rc.config, rc.status_nmse, rc.nmse_value, rc.status_roundtrip));
+        archs_table::emit(build_row(g_table, rc));
     }
     archs_table::emit(g_table.footer(g_nmse_gate, 1));
 }
@@ -309,7 +326,29 @@ int main(int argc, char ** argv) {
     check(n_well_formed_with(out_pre_fix, "FAIL") == 0,
           "control: pre-fix, `grep FAIL` over well-formed rows finds nothing on a failing run");
 
-    // 4. Positive control on real pre-fix output rather than a reproduction of it.
+    // 4. emit()'s size precondition, pinned rather than assumed. The comment on
+    //    archs_table::max_atomic_line does arithmetic; this makes the arithmetic fail loudly if a
+    //    future column, a wider status string or a longer device description eats the margin.
+    const row_case & widest = g_rows[3];  // BITDIFF -- the longest roundtrip status
+    check(build_row(g_table, widest).size() < archs_table::max_atomic_line,
+          "a real-width row fits emit()'s atomic-write bound");
+    check(build_row(g_table_wide, widest).size() < archs_table::max_atomic_line,
+          "so does a row far wider than any device this fork has seen");
+    check(build_row(g_table_absurd, widest).size() >= archs_table::max_atomic_line,
+          "control: an absurd width DOES exceed the bound, so it is not vacuously large");
+
+    // And the warning must actually fire, or the runtime check is decorative. Captured, because
+    // it goes to stderr by design -- a warning printed into the table would be the defect itself.
+    std::string out_oversize;
+    if (!capture_merged(body_oversize, out_oversize)) {
+        fprintf(stderr, "SKIP: tmpfile() unavailable, cannot capture a merged stream\n");
+        return 77;
+    }
+    check(out_oversize.find("exceeds the 256-byte atomic-write bound") != std::string::npos,
+          "control: emit() warns when a line exceeds the bound");
+    check(parse_table(out_oversize, false).n_table == 1, "the oversized line is still emitted, not dropped");
+
+    // 5. Positive control on real pre-fix output rather than a reproduction of it.
     const parse_result historical = parse_table(g_historical_excerpt, false);
     check(historical.n_well_formed == 3, "historical excerpt: the intact rows still parse");
     check(historical.n_mangled == 1, "control: historical excerpt has a mangled row");
