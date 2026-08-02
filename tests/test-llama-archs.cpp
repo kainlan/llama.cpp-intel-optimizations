@@ -118,28 +118,50 @@ static std::string nmse_diagnosis(const std::vector<float> & a, const std::vecto
 //
 // A bare FAIL loses exactly that distinction, which is the one thing needed before
 // touching any code, so measure it.
+// Report differing positions as (token, vocab) and not as a flat index. The logits vector is
+// n_token rows of n_vocab, and a flat index invites the wrong decomposition: 16384 differing
+// logits "first at 8192" reads as the midpoint of the VOCABULARY, when these fixtures have
+// n_vocab=128 and 8192 is token 64 of 128 -- the first token of the second ubatch. Those two
+// readings point at completely different subsystems, so do the division here, once.
 struct logits_diff {
-    size_t n_diff     = 0;
-    size_t first_diff = 0;
-    double max_abs    = 0.0;
-    double max_rel    = 0.0;
+    size_t n_diff      = 0;
+    size_t first_diff  = 0;  // flat index
+    size_t first_row   = 0;  // token position
+    size_t first_col   = 0;  // vocab index
+    size_t n_rows_diff = 0;  // token positions with at least one differing logit
+    size_t last_row    = 0;
+    double max_abs     = 0.0;
+    double max_rel     = 0.0;
 };
 
-static logits_diff logits_compare(const std::vector<float> & a, const std::vector<float> & b) {
+static logits_diff logits_compare(const std::vector<float> & a, const std::vector<float> & b, const size_t n_col) {
     GGML_ASSERT(a.size() == b.size());
-    logits_diff ret;
-    for (size_t i = 0; i < a.size(); i++) {
-        if (a[i] == b[i]) {
-            continue;
+    GGML_ASSERT(n_col > 0 && a.size() % n_col == 0);
+    logits_diff  ret;
+    const size_t n_row = a.size() / n_col;
+    for (size_t row = 0; row < n_row; row++) {
+        bool row_differs = false;
+        for (size_t col = 0; col < n_col; col++) {
+            const size_t i = row*n_col + col;
+            if (a[i] == b[i]) {
+                continue;
+            }
+            if (ret.n_diff == 0) {
+                ret.first_diff = i;
+                ret.first_row  = row;
+                ret.first_col  = col;
+            }
+            ret.n_diff++;
+            row_differs = true;
+            const double abs_diff = std::fabs(double(a[i]) - double(b[i]));
+            const double scale    = std::max(std::fabs(double(a[i])), std::fabs(double(b[i])));
+            ret.max_abs = std::max(ret.max_abs, abs_diff);
+            ret.max_rel = std::max(ret.max_rel, scale > 0.0 ? abs_diff/scale : abs_diff);
         }
-        if (ret.n_diff == 0) {
-            ret.first_diff = i;
+        if (row_differs) {
+            ret.n_rows_diff++;
+            ret.last_row = row;
         }
-        ret.n_diff++;
-        const double abs_diff = std::fabs(double(a[i]) - double(b[i]));
-        const double scale    = std::max(std::fabs(double(a[i])), std::fabs(double(b[i])));
-        ret.max_abs = std::max(ret.max_abs, abs_diff);
-        ret.max_rel = std::max(ret.max_rel, scale > 0.0 ? abs_diff/scale : abs_diff);
     }
     return ret;
 }
@@ -884,7 +906,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        const logits_diff rt = logits_compare(logits_dev, logits_roundtrip);
+                        const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_dev.first.get()));
+                        const size_t n_ubatch = llama_n_ubatch(model_and_ctx_dev.second.get());
+                        const logits_diff rt = logits_compare(logits_dev, logits_roundtrip, n_vocab);
                         if (rt.n_diff > 0) {
                             all_ok = false;
                             status_roundtrip = "\033[1;31mFAIL\033[0m";
@@ -905,12 +929,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             // logits that have already been computed.
                             fprintf(stderr,
                                 "\n%s (%s, %s): roundtrip mismatch\n"
-                                "  save/reload vs device: %zu/%zu logits differ, first at %zu, "
-                                "max abs %.3e, max rel %.3e\n"
+                                "  save/reload vs device: %zu/%zu logits differ, max abs %.3e, max rel %.3e\n"
+                                "  first difference:      token %zu of %zu, vocab %zu of %zu (flat index %zu)\n"
+                                "  token rows affected:   %zu of %zu, from %zu to %zu%s\n"
                                 "  NMSE vs CPU:           device %.3e, reloaded %.3e "
                                 "(both small => both models are correct and differ only in the last bits)\n",
                                 llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
-                                rt.n_diff, logits_dev.size(), rt.first_diff, rt.max_abs, rt.max_rel,
+                                rt.n_diff, logits_dev.size(), rt.max_abs, rt.max_rel,
+                                rt.first_row, logits_dev.size()/n_vocab, rt.first_col, n_vocab, rt.first_diff,
+                                rt.n_rows_diff, logits_dev.size()/n_vocab, rt.first_row, rt.last_row,
+                                rt.first_row == n_ubatch ?
+                                    " -- exactly n_ubatch, so every token of the FIRST ubatch is bit-identical"
+                                    " and divergence begins at the first token of the SECOND" : "",
                                 nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip));
                         }
                     }
