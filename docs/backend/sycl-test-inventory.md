@@ -404,11 +404,10 @@ a preceding `#undef NDEBUG` or a gtest include. 28 files matched; triage:
 | `tests/test-quantize-stats.cpp` | 1 | registered via `llama_build` only (no `llama_test`/`add_test` found for it — may not even run as a test); general, not SYCL, not re-verified |
 | 17 remaining files (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | **unregistered anywhere** (confirmed against both `CMakeLists.txt` files) — part of `llama.cpp-0igs`'s 186-file dead-source population. Several are clearly SYCL/MoE-backend tests despite lacking a `sycl-` prefix (`tile-decomposition`, `vram-pool`, `pinned-chunk-pool`, `xmx-unified-kernel`, `test-sycl-prestage-routed-experts` itself). Would need **both** registration and the same `#undef NDEBUG` fix if restored — noting this so `llama.cpp-0igs` doesn't rediscover the NDEBUG half of the problem file-by-file the way `llama.cpp-4jlv`/`c17b010af`/`d4cccba5e`/`d4608ec7e` each rediscovered the registration half in isolation |
 
-## Two more ctest/grep traps, found during `llama.cpp-0igs` restoration batches
+## Four more ctest/grep traps, found during `llama.cpp-0igs` restoration batches
 
 Extending the trap list already in this doc (`ctest -R` on zero matches,
-`--output-on-failure` hiding a passing test's output, `SKIP` needing exit 77)
-with two more hit while restoring registrations:
+`--output-on-failure` hiding a passing test's output, `SKIP` needing exit 77):
 
 - **`ctest -N` prints test names, not labels — grepping it for a label
   returns 0 no matter what.** The lead's own first proof attempt for batch 1
@@ -425,20 +424,39 @@ with two more hit while restoring registrations:
   real architectural reason (the header it includes no longer exists —
   confirmed by `-fsyntax-only`), not a casualty of it. A line-level match is
   not the same claim as "this target builds when CMake processes this file."
-
-Also caught, and fixed before it became a live problem rather than after:
-**9 of batch 1's 13 restored tests carried `LABELS` containing the bare
-words `cache` or `mem-handle`**, which collide with CLAUDE.md's
-throttled-sweep denylist (`-LE 'residency|mem-handle|cache'`) — a host-only
-test (no `gpu_selector`/`malloc_device`/`queue.submit`/`parallel_for`, hence
-none of the GPU-memory hazard the denylist exists for) inheriting an
-exclusion it doesn't deserve, purely because its subsystem name happens to
-be a hazard word. This is the exact failure mode `llama.cpp-0igs` itself
-documents (`impl-5exz`: 5 of 9 un-guarded tests similarly affected) — batch
-1's rate was worse, 9 of 13, until caught and fixed
-(`32a70dcf3`: `cache`→`cache-hostonly`, `mem-handle`→`mem-handle-hostonly`).
-Batch 2's 28 tests got non-colliding labels from the start and were verified
-before commit instead of after.
+- **`-LE` is an unanchored regex over LABELS too, not just `-E` over test
+  names.** 9 of batch 1's 13 restored tests carried LABELS containing the
+  bare words `cache` or `mem-handle`, colliding with CLAUDE.md's
+  throttled-sweep denylist (`-LE 'residency|mem-handle|cache'`) despite being
+  confirmed host-only and deserving none of the GPU-memory hazard the
+  denylist exists for. The first fix (`32a70dcf3`) renamed them to
+  `cache-hostonly` / `mem-handle-hostonly` and was verified by checking that
+  no label *equalled* a denylisted word — the right property, checked with
+  the wrong operator. `ctest -LE` matches by regex/substring exactly the way
+  `-R`/`-E` already do over test names (this doc's own earlier trap: `-E
+  "test-llama-archs"` also excludes `test-llama-archs-table`), so `cache`
+  still matched inside `cache-hostonly` and 11 of 41 restored tests stayed
+  silently excluded. Nobody had written that `-L`/`-LE` share that semantic
+  with `-R`/`-E`, so the fix repeated the exact defect class it was fixing.
+  Corrected in `b7555cc73` by dropping the hazard word entirely rather than
+  suffixing it (bare `hostonly` + subsystem word, no shared substring with
+  the denylist at all), and verified with `re.search` over every label
+  string instead of equality — 0 of 41 collide. `llama.cpp-0igs` itself
+  documents the underlying failure mode (`impl-5exz`: 5 of 9 un-guarded
+  tests similarly affected); batch 1's original rate was worse, 9 of 13.
+- **`-fsyntax-only` proves compilation, not linking.** `test-onednn-woq.cpp`
+  compiled clean but failed to link (`undefined reference to
+  dnnl_primitive_destroy`, `DSO missing from command line`): it includes two
+  header-only files (`ggml-sycl/gemm.hpp`, `ggml-sycl/onednn-woq.hpp`) that
+  call the oneDNN C++ API inline, so those calls compile directly into the
+  test's own object file and need `DNNL::dnnl` linked into the test binary
+  itself — linking `ggml-sycl` (a `PRIVATE` link, so its own oneDNN link
+  doesn't propagate) isn't enough. `-fsyntax-only` stops before the link
+  step by design, so it cannot catch this class of failure; only an actual
+  build (or a link-only step) does. Fixed in `b7555cc73` with the same
+  `if (GGML_SYCL_DNNL)` / `DNNL::dnnl` guard `test-sycl-onednn-mxfp4-
+  feasibility` already used — copied from an existing oneDNN-linking target
+  rather than guessed.
 
 ## What this pass did NOT cover
 
