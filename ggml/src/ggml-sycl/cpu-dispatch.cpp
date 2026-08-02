@@ -4225,6 +4225,24 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             }
         }
 #    endif
+        // g_cpu_dispatch_buffers is thread_local and is only sized by
+        // ggml_sycl_cpu_dispatch_buffers_init() ("called once at model load
+        // time"). In normal inference that happens on some other path before
+        // cpu_mul_mat is ever reached, so this call was missing here --
+        // unlike every other consumer of these buffers, which calls it
+        // defensively right before touching them (8+ sites in
+        // ggml-sycl.cpp/mmvq.cpp). On the async_mode path this lambda can run
+        // inside a SYCL host_task on a different thread than the one that
+        // submitted it, so the call has to live here (where the buffers are
+        // actually touched), not at cpu_mul_mat's entry -- a call there would
+        // only initialize the submitting thread's copy. init() re-sizes to
+        // the same capacity on repeat calls (cheap, no-op std::vector::resize),
+        // so calling it on every invocation is safe. Found via
+        // llama.cpp-0igs: test-sycl-cpu-dispatch, test-mul-mat-host-streaming,
+        // and test-sycl-xmx-unified-correctness all hit this cold with the
+        // buffers still at their default (empty) size.
+        ggml_sycl_cpu_dispatch_buffers_init();
+
         ggml_from_float_t from_float_fn = nullptr;
         size_t            q_row_size    = 0;
         // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
