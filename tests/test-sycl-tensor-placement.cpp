@@ -23,6 +23,12 @@
 #include <cstdio>
 #include <cstring>
 
+// expert_tensor_role and its helpers live in namespace ggml_sycl
+// (unified-cache.hpp:43), while tensor_usage / infer_tensor_usage resolve
+// unqualified. Pulling the namespace in keeps the assertions readable rather
+// than qualifying thirteen call sites.
+using namespace ggml_sycl;
+
 namespace {
 
 int n_pass = 0;
