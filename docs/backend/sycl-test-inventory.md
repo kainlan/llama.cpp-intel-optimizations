@@ -67,6 +67,56 @@ mutation was run (no build access this pass), but nothing here needs one to
 see that it is not a mock — it exercises the real thread-local/global-atomic
 guard the regression (`llama.cpp-oze0`) was about. No fix needed.
 
+## The 19-test residency/MoE `foreach` loop (`ggml/src/ggml-sycl/CMakeLists.txt:1691`)
+
+**Ownership note:** `ggml/src/ggml-sycl/CMakeLists.txt` is `impl-w1`'s file as of
+2026-08-02 (corrected mid-ticket after a shared-checkout `git add` swept up
+their in-progress `test-cross-model-weight-usage` registration into this
+ticket's commit — see the task comment log). The 19 `.cpp` sources this loop
+registers are still `tests/` and in scope here; the CMake registration itself
+is not.
+
+Spot-checked 2 of 19 (`test-sycl-residency-diagnostics.cpp`,
+`test-sycl-moe-same-expert-grouping.cpp`) rather than reading all 19 in full —
+recording this as a partial result, not a clearance of the whole loop.
+Cross-referenced all 19 against the mechanical bare-`assert()` scan below:
+none flagged. Both spot-checked files call real production code, not a
+reimplementation:
+
+- `test-sycl-residency-diagnostics.cpp` calls real `ggml_sycl::` `_for_test`
+  instrumentation hooks (`residency_diagnostics_record_accept_for_test`,
+  `test_cache_replacement_allowed_for_test`, etc.) exposed by
+  `residency-plan.hpp`, uses an NDEBUG-proof `CHECK()`/`return 1` macro, and
+  includes a specific, plausible mutation target: `test_replacement_guard_refuses_live_or_retired_entries`
+  asserts that a live or retired cache entry refuses replacement (`reject_live_lease_pressure == 1`)
+  — inverting that guard in the real replacement-allowed logic should fail it.
+- `test-sycl-moe-same-expert-grouping.cpp` is a hybrid: it calls real
+  `ggml_sycl::test_moe_token_major_metadata_entry`/`_input` types AND reads the
+  actual `ggml-sycl.cpp` source text to assert against literal patterns (the
+  `read_required_file`/`contains` pair). The source-text half is the fragile
+  style `llama.cpp-0igs` already flagged elsewhere (a reformat or rewording
+  breaks it without the underlying behavior changing) — worth checking what
+  literal strings it greps for if it ever goes red for a non-behavioral reason.
+
+The other 17 in this loop (`test-sycl-mem-handle-lifetime`,
+`test-sycl-residency-reservation`, `test-sycl-descriptor-retention`,
+`test-sycl-moe-residency-preflight`, `test-sycl-moe-fused-down-sum-policy`,
+`test-sycl-moe-token-major-metadata`,
+`test-sycl-moe-direct-final-token-major-bridge`,
+`test-sycl-moe-direct-final-scratch-plan`, `test-sycl-moe-glu-q8-artifact-policy`,
+`test-sycl-moe-glu-q8-fused-store-policy`, `test-sycl-moe-gateup-prepack-policy`,
+`test-sycl-moe-gateup-prepack-scratch`,
+`test-sycl-moe-xmx-tiled-single-layout-policy`,
+`test-sycl-moe-xmx-tiled-single-layout-planner`,
+`test-sycl-moe-xmx-tiled-materialization`, `test-sycl-moe-fusion-noactivation`,
+`test-sycl-moe-sequence-graphlet-policy`) were confirmed to include a real
+production or shared-test header (`unified-cache.hpp`, `moe-layer-plan.hpp`,
+`mem-handle.hpp`, or `ggml-sycl/ggml-sycl-test.hpp`) rather than a
+self-contained mock — **that rules out the instance-1 defect class
+specifically, it is not a mutation-tested clearance.** Listing them here,
+un-cleared, rather than silently treating "includes a real header" as "can
+fail."
+
 ## Coordination finding that changes the shape of this ticket
 
 **`llama.cpp-0igs`** (P1, currently `open`, owner `impl-0igs` died in the
@@ -138,16 +188,29 @@ a preceding `#undef NDEBUG` or a gtest include. 28 files matched; triage:
 ## What this pass did NOT cover
 
 Being explicit rather than implying completeness: this pass verified the two
-named instances, the tensor-usage-family bonus fixes, and ran the mechanical
-NDEBUG scan above across the whole `tests/`+`ggml/src/ggml-sycl/tests/` SYCL
-population. It did **not** individually mutation-test the remaining ~85–90
-currently-*registered* SYCL C++ tests (the `residency`/`mem-handle`/`moe-*`
-family under the "un-guarded SYCL tests" section of
-`ggml/src/ggml-sycl/CMakeLists.txt`, the guarded XMX/ESIMD suite, etc.) or the
-~90 registered Python/shell parser and doc-assertion gates. `test-kv-slice-sizing.cpp`
-remains the model worth copying (87 checks; a one-word `assign`→`resize`
-mutation fires exactly 8 and leaves 79 green — specificity, not just
-sensitivity). A follow-up pass should work through that remaining population
-the same way: read the assertions, trace them against the real function being
-called (not a local reimplementation), and where a build is available, run the
+named instances, the tensor-usage-family bonus fixes, ran the mechanical
+NDEBUG scan across the whole `tests/`+`ggml/src/ggml-sycl/tests/` SYCL
+population, and header-checked (not mutation-tested) the 19-test
+residency/MoE `foreach` loop, spot-reading 2 of those 19 in full. It did
+**not** individually mutation-test:
+
+- The other 17 of the 19 residency/MoE-loop tests (header-checked only, see
+  above — real production headers confirmed, but that only rules out the
+  instance-1 mock defect class, nothing more).
+- The remaining ~65–70 currently-*registered* SYCL C++ tests outside that
+  loop (the guarded XMX/ESIMD suite behind `GGML_SYCL_BUILD_XMX_TESTS`, the
+  kernel-profiler/timeline/vtune/zebin parser `.cpp` gates, etc.).
+- The ~90 registered Python/shell parser and doc-assertion gates. `llama.cpp-0igs`'s
+  own report already found and fixed several of these (a vertical-alignment
+  break, a stale wording match, two gates asserting on files that never
+  existed in this repo) using a shadow-root mutation harness with a
+  no-op-mutation negative control — that harness is worth reusing here rather
+  than re-deriving one.
+
+`test-kv-slice-sizing.cpp` remains the model worth copying (87 checks; a
+one-word `assign`→`resize` mutation fires exactly 8 and leaves 79 green —
+specificity, not just sensitivity). A follow-up pass should work through the
+remaining population the same way: read the assertions, trace them against
+the real function being called (not a local reimplementation, and not merely
+"a real header is included"), and where a build is available, run the
 described mutation rather than reasoning through it.
