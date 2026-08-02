@@ -290,6 +290,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
 endif()
 
+# Gates the results table of test-llama-archs against the log output it shares a stream with
+# (llama.cpp-to9m). Registered unconditionally and outside the block above: it drives the
+# emitter in test-llama-archs-table.h directly, so it loads no model, touches no device, and
+# needs neither a vocab nor a backend.
+llama_build_and_test(test-llama-archs-table.cpp)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

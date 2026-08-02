@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+// Kept in its own include block: it belongs to no upstream group, and adding it to one above
+// makes clang-format re-sort a block this change has no business touching.
+#include "test-llama-archs-table.h"
+
 // The one threshold both result columns judge by. The NMSE column and the Roundtrip column
 // must not disagree about what "wrong" means, and until this existed that agreement was
 // maintained by five separate literals happening to match -- a property asserted in a comment
@@ -777,9 +781,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
-    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|\n";
+    // The table's layout, its emission discipline and the parser that gates it all live in
+    // tests/test-llama-archs-table.h; test-llama-archs-table verifies THIS emitter rather than a
+    // second copy of the format.
+    const archs_table table = { max_arch_name_length, max_device_label_length };
 
     bool all_ok = true;
     // Rows that produced an actual NMSE comparison. A targeted `-a <arch>` run that
@@ -793,25 +798,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     // line can state it whether or not any row hit it -- see the legend below.
     size_t n_bitdiff = 0;
     common_log_flush(common_log_main());
-    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
-    printf("|");
-    for (size_t i = 0; i < max_arch_name_length; i++) {
-        printf("-");
-    }
-    printf("|");
-    for (size_t i = 0; i < max_device_label_length; i++) {
-        printf("-");
-    }
-    printf("|------|---------------|---------|\n");
-    // Printed unconditionally, and it has to be. The thing this legend exists to prevent is
-    // someone reading an all-OK Roundtrip column as proof that the logits matched bit for bit.
-    // That is precisely the run in which a mismatch-triggered notice would not appear, so a
-    // conditional notice is absent exactly when it is needed.
-    printf("Roundtrip: a GGUF save+reload of the device model, compared against that model.\n");
-    printf("  Gated on NMSE(device, reloaded) <= %.0e, NOT on bit-equality: this path is not\n", nmse_gate);
-    printf("  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.\n");
-    printf("  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row\n");
-    printf("  are on stderr.\n");
+    archs_table::emit(table.header(nmse_gate));
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -839,10 +826,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
-                printf(template_row_cfg.c_str(),
-                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
-                fflush(stdout);
+                // Which test case is running, so that a crash during model loading or inference is
+                // still attributable -- the property the pre-printed row prefix bought, kept.
+                //
+                // What is not kept is printing it into the table. stdout and stderr are read
+                // merged, so every log line the load emitted landed inside the half-written row;
+                // see tests/test-llama-archs-table.h for the measurements. The row is now
+                // assembled whole and emitted after the work, further down.
+                fprintf(stderr, "test case: %s (%s, %s)\n", llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
 
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
@@ -1014,32 +1005,48 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     }
                 }
 
-                // log the results for this test case
-                printf(template_row_res.c_str(),
-                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                // The row for this test case, assembled whole and written with one stdio call.
+                // Draining the log first keeps anything this case logged ahead of its row rather
+                // than after it; the single write is what keeps it out of the row.
+                common_log_flush(common_log_main());
+                archs_table::emit(table.row(llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                            status_nmse.c_str(), nmse_str, status_roundtrip.c_str()));
             }
         }
     }
-    // Unconditional, like the legend, and for the same reason -- a reader who scrolls to the
-    // bottom of a green run must still be told what OK did and did not establish. Stating the
-    // count even when it is zero is the point: "0 rows" is a measurement, while silence is
-    // indistinguishable from the check not having run.
-    printf("Roundtrip gate: NMSE(device, reloaded) <= %.0e, not bit-equality. "
-           "%zu row(s) round-tripped within tolerance but not bit-for-bit.\n", nmse_gate, n_bitdiff);
+    common_log_flush(common_log_main());
+    archs_table::emit(table.footer(nmse_gate, n_bitdiff));
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-    if (target_arch != LLM_ARCH_UNKNOWN && n_measured == 0) {
-        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: the caller asked for
-        // one architecture and this harness compared nothing, so there is no result to
-        // report either way. 77 is unreachable from the registered `test-llama-archs`
-        // invocation, which passes no `-a` and always measures something.
-        fprintf(stderr,
-                "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
-                "measure that architecture, so this run proves NOTHING about it.\n"
-                "  Reasons this happens: the arch is excluded outright by test_backends() "
-                "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
-                "arch_supported() returns false for it (gemma-embedding, the BERT family, "
-                "RWKV, ...) and every row is SKIP.\n",
-                __func__, llm_arch_name(target_arch));
+    if (n_measured == 0) {
+        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: this harness compared
+        // nothing, so there is no result to report either way. `all_ok` is initialised true,
+        // so without this the run would report success it did not earn.
+        //
+        // Unconditional, deliberately. This used to be guarded by `target_arch !=
+        // LLM_ARCH_UNKNOWN`, on the reasoning that "77 is unreachable from the registered
+        // invocation, which passes no `-a` and always measures something" -- an assumption
+        // about the sweep, stated in a comment and enforced by nothing, and the no-`-a` sweep
+        // is precisely what CI runs. So the one path that was left unguarded was the one that
+        // mattered. See llama.cpp-to9m.
+        if (target_arch != LLM_ARCH_UNKNOWN) {
+            fprintf(stderr,
+                    "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
+                    "measure that architecture, so this run proves NOTHING about it.\n"
+                    "  Reasons this happens: the arch is excluded outright by test_backends() "
+                    "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
+                    "arch_supported() returns false for it (gemma-embedding, the BERT family, "
+                    "RWKV, ...) and every row is SKIP.\n",
+                    __func__, llm_arch_name(target_arch));
+        } else {
+            fprintf(stderr,
+                    "\n%s: the full sweep performed no NMSE comparison at all -- every "
+                    "architecture was excluded or skipped, so this run proves NOTHING about "
+                    "any of them.\n"
+                    "  A sweep reaching this is a harness or environment failure, not a "
+                    "property of one architecture: check that a backend was registered and "
+                    "that the run was not cut short before the first comparison.\n",
+                    __func__);
+        }
         return 77;
     }
     return all_ok ? 0 : 1;
