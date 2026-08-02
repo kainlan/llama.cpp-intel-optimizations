@@ -9295,16 +9295,28 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // resets cannot reclaim live owners. Transient EXPERT_STAGING
             // remains SCRATCH and must be released by scoped smart-handle
             // owners before reset.
+            //
+            // role decides before category: role == EXPERT_STAGING must route
+            // to SCRATCH even when category == HOST_COMPUTE (e.g. a MoE CPU
+            // fallback's expert staging slab, which is both). The WEIGHT
+            // branch's category disjuncts were added to route persistent
+            // host-compute/expert-cache owners to WEIGHT (9a0670712), but
+            // being checked first meant they shadowed EXPERT_STAGING's role
+            // for any request that also carried HOST_COMPUTE/EXPERT_CACHE,
+            // silently overriding the "must be released by scoped smart-
+            // handle owners before reset" contract above with a zone that is
+            // *not* swept by host_zone_reset() -- llama.cpp-0igs /
+            // llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
             auto select_zone = [&]() {
                 if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
                     return host_zone_id::KV;
                 }
+                if (req.intent.role == alloc_role::EXPERT_STAGING) {
+                    return host_zone_id::SCRATCH;
+                }
                 if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
                     cat == runtime_category::EXPERT_CACHE) {
                     return host_zone_id::WEIGHT;
-                }
-                if (req.intent.role == alloc_role::EXPERT_STAGING) {
-                    return host_zone_id::SCRATCH;
                 }
                 return host_zone_id::STAGING;
             };
