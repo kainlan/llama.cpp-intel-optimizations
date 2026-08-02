@@ -73244,6 +73244,20 @@ static ggml_tensor * get_add_operand(const ggml_tensor * add, const ggml_tensor 
 // (protects any future arch that builds this same pattern, not just gemma3n), and its
 // cost is one unfused RMS_NORM+MUL+ADD per occurrence -- for gemma3n, 22 of its ~89
 // per-pass bit1 matches, all in one already-small per-layer op.
+// Diagnostic (llama.cpp-81gx), split out of the guard below so its own reachability
+// debug print (GGML_SYCL_FUSION_BIT1_REACH_DEBUG) can report the same accumulated
+// offset the guard actually decided on, instead of re-deriving it separately and
+// risking the two disagreeing.
+static size_t ggml_sycl_fusion_accumulated_view_offs(const ggml_tensor * operand) {
+    size_t              offs = 0;
+    const ggml_tensor * cur  = operand;
+    while (cur && cur->view_src) {
+        offs += cur->view_offs;
+        cur = cur->view_src;
+    }
+    return offs;
+}
+
 static bool ggml_sycl_fusion_operand_view_offset_safe(const ggml_tensor * operand) {
     if (!operand) {
         return false;
@@ -73251,16 +73265,9 @@ static bool ggml_sycl_fusion_operand_view_offset_safe(const ggml_tensor * operan
     if (operand->nb[0] != ggml_type_size(operand->type)) {
         return false;
     }
-    if (operand->view_src != nullptr && !ggml_sycl_tensor_is_weight(operand)) {
-        size_t              view_offs = 0;
-        const ggml_tensor * cur       = operand;
-        while (cur && cur->view_src) {
-            view_offs += cur->view_offs;
-            cur = cur->view_src;
-        }
-        if (view_offs != 0) {
-            return false;
-        }
+    if (operand->view_src != nullptr && !ggml_sycl_tensor_is_weight(operand) &&
+        ggml_sycl_fusion_accumulated_view_offs(operand) != 0) {
+        return false;
     }
     return true;
 }
@@ -80177,11 +80184,43 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device);
                         bool operand_safe = false;
                         if (can_fuse) {
-                            ggml_tensor * probe_mul = cgraph->nodes[i + 1];
-                            ggml_tensor * probe_add = cgraph->nodes[i + 2];
-                            operand_safe =
-                                ggml_sycl_fusion_operand_view_offset_safe(get_mul_weight(probe_mul, node)) &&
-                                ggml_sycl_fusion_operand_view_offset_safe(get_add_operand(probe_add, probe_mul));
+                            // Diagnostic (llama.cpp-81gx): a mutation A/B proved the guard fixes
+                            // gemma3n run ALONE, but changes NOTHING inside a full 131-arch sweep
+                            // (bit-identical FAIL before/after). Leading theory: is_weight() is
+                            // misclassifying gemma3n's `corrected` (a graph-internal compute-node
+                            // output, never a weight) as a weight once other archs have loaded
+                            // weights into the same process -- CLAUDE.md records that
+                            // unified-cache-key.hpp deliberately excludes model_id from
+                            // cache_id_equal for GGUF weights, which is exactly the kind of
+                            // collision that would let a same-name/shape lookup misfire across
+                            // archs sharing a process. If is_weight is true here, the guard's
+                            // view_offs check is skipped entirely regardless of the real offset --
+                            // report both operands' is_weight/view_offs/nb0 so a diff between an
+                            // isolated run and an in-sweep run names the flip directly.
+                            ggml_tensor * probe_mul     = cgraph->nodes[i + 1];
+                            ggml_tensor * probe_add     = cgraph->nodes[i + 2];
+                            ggml_tensor * mul_operand   = get_mul_weight(probe_mul, node);
+                            ggml_tensor * add_operand   = get_add_operand(probe_add, probe_mul);
+                            const bool    mul_is_weight = mul_operand && ggml_sycl_tensor_is_weight(mul_operand);
+                            const bool    add_is_weight = add_operand && ggml_sycl_tensor_is_weight(add_operand);
+                            const size_t  mul_view_offs =
+                                mul_operand ? ggml_sycl_fusion_accumulated_view_offs(mul_operand) : 0;
+                            const size_t add_view_offs =
+                                add_operand ? ggml_sycl_fusion_accumulated_view_offs(add_operand) : 0;
+                            const bool mul_safe = ggml_sycl_fusion_operand_view_offset_safe(mul_operand);
+                            const bool add_safe = ggml_sycl_fusion_operand_view_offset_safe(add_operand);
+                            operand_safe        = mul_safe && add_safe;
+                            fprintf(stderr,
+                                    "[FUSION-BIT1-GUARD] rms=%s(idx=%d) "
+                                    "mul=%s(is_weight=%d,view_offs=%zu,nb0=%zu,elem_size=%zu,safe=%d) "
+                                    "add=%s(is_weight=%d,view_offs=%zu,nb0=%zu,elem_size=%zu,safe=%d)\n",
+                                    node->name ? node->name : "?", i,
+                                    (mul_operand && mul_operand->name) ? mul_operand->name : "?", mul_is_weight ? 1 : 0,
+                                    mul_view_offs, mul_operand ? mul_operand->nb[0] : 0,
+                                    mul_operand ? ggml_type_size(mul_operand->type) : 0, mul_safe ? 1 : 0,
+                                    (add_operand && add_operand->name) ? add_operand->name : "?", add_is_weight ? 1 : 0,
+                                    add_view_offs, add_operand ? add_operand->nb[0] : 0,
+                                    add_operand ? ggml_type_size(add_operand->type) : 0, add_safe ? 1 : 0);
                         }
                         fprintf(
                             stderr,
