@@ -1445,6 +1445,52 @@ set_tests_properties(test-sycl-graph-retention-scope PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the scoped transient allocators must decide allocation SHAPE -- role, category, arena
+# zone, allocator path -- from THIS thread's recording state (llama.cpp-f9tg).  The three
+# scoped_unified_*_temp templates in ggml-sycl.cpp took it from
+# ggml_sycl_graph_recording_active(), true whenever ANY thread records, so one context's
+# COMPUTE/CONTROL transient was labelled GRAPH and steered out of the SCRATCH zone whenever an
+# unrelated context happened to be recording.
+#
+# Unlike its sibling test-sycl-graph-retention-scope this guards ATTRIBUTION, not correctness:
+# the wide predicate is a superset, so it only over-applies graph treatment and fails safe.  The
+# corrupted fields are exactly the ones llama.cpp-iiff Phase 0's inventory is built from.
+#
+# CPU-only by construction: it calls the two pure intent builders in common.hpp and reads/writes
+# the recording flags -- no device, queue or cache.  The allocation itself is NOT reachable
+# device-free, which is why the decision was extracted from it.  Labels avoid every word in
+# CLAUDE.md's throttled-sweep denylist (-LE 'residency|mem-handle|cache'), which is about
+# memory-exhaustion hazard rather than subject matter.
+set(TRANSIENT_INTENT_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-transient-alloc-intent-scope
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-transient-alloc-intent-scope.cpp
+)
+target_include_directories(test-sycl-transient-alloc-intent-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-transient-alloc-intent-scope PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-transient-alloc-intent-scope PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-transient-alloc-intent-scope PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-transient-alloc-intent-scope PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-transient-alloc-intent-scope PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-transient-alloc-intent-scope COMMAND test-sycl-transient-alloc-intent-scope)
+set_tests_properties(test-sycl-transient-alloc-intent-scope PROPERTIES
+    LABELS "sycl;alloc;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"

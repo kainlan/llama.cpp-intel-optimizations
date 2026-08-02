@@ -1284,21 +1284,12 @@ template <typename T> struct scoped_unified_device_temp {
             return true;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = ctx.stream();
         req.device               = ctx.device;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
-        req.intent.cohort_id               = cohort_id;
-        req.intent.constraints.must_device = true;
-        if (!graph_lifetime) {
-            req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
-        }
+        req.intent               = ggml_sycl_transient_device_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {
@@ -1373,21 +1364,12 @@ template <typename T> struct scoped_unified_queue_temp {
             return nullptr;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = &q;
         req.device               = target;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
-        req.intent.cohort_id               = cohort_id;
-        req.intent.constraints.must_device = true;
-        if (!graph_lifetime) {
-            req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
-        }
+        req.intent               = ggml_sycl_transient_device_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {
@@ -1465,20 +1447,12 @@ template <typename T> struct scoped_unified_host_queue_temp {
             return nullptr;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = &q;
         req.device               = target;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::CONTROL;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::CONTROL;
-        req.intent.cohort_id                         = cohort_id;
-        req.intent.constraints.must_host_pinned      = true;
-        req.intent.constraints.use_pinned_pool       = !graph_lifetime;
-        req.intent.constraints.require_host_usm_base = graph_lifetime;
+        req.intent               = ggml_sycl_transient_host_pinned_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {

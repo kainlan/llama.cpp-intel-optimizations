@@ -254,8 +254,22 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
 //
 // PROCESS-WIDE by design: g_ggml_sycl_graph_recording_depth is a global counter, so this is
 // true on threads that are not themselves recording. That is correct for conservative
-// submission constraints -- "may I emit a memcpy node?", "must this allocation have a stable
-// host USM base?" -- where over-applying the restriction is safe.
+// submission constraints -- "may I emit a memcpy node?", and the host-USM-base requirement on
+// the shared staging payload path (ggml_sycl_copy_payload_to_handle_async) -- where
+// over-applying the restriction is safe.
+//
+// ⚠️ Do NOT use it to decide the SHAPE of an allocation made by the calling thread -- its role,
+// category, cohort, arena zone, or allocator path. ANALYSED as harmless for correctness, from
+// the definitions alone: this predicate is a superset of the per-thread one, so it can only
+// over-apply graph treatment, never withhold it. No run was needed to establish that, and none
+// could have refuted it -- which is exactly why the defect announces itself nowhere. What it
+// corrupts is attribution, and that part is MEASURED: llama.cpp-f9tg had three
+// scoped_unified_*_temp templates whose seven shape fields all flipped (COMPUTE/CONTROL ->
+// GRAPH, SCRATCH zone dropped, pinned pool skipped for a standalone USM base) on a thread that
+// was not recording, whenever any other context was -- see
+// tests/test-sycl-transient-alloc-intent-scope.cpp, which reproduces all seven against the
+// pre-fix predicate. Use ggml_sycl_graph_recording_this_thread() below, or better the two
+// intent builders next to it, which hold the whole mapping in one place.
 //
 // ⚠️ Do NOT use it to decide who OWNS a thread_local resource's release. Such a decision
 // selects a per-thread sink, so a non-recording thread takes the graph-lifetime branch and
@@ -269,6 +283,84 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
 // ANALYSED as a cross-context use-after-free in llama.cpp-mhyw -- suspected, not yet measured.
 inline bool ggml_sycl_graph_recording_active() {
     return g_ggml_sycl_graph_recording || g_ggml_sycl_graph_recording_depth.load(std::memory_order_acquire) > 0;
+}
+
+// Is THIS thread recording a command graph?
+//
+// The per-thread counterpart of ggml_sycl_graph_recording_active() above, and deliberately
+// narrower. Use it for any question scoped to the calling thread -- "will the allocation I am
+// about to make be captured into a graph?", "who owns this handle's release?" -- where the wide
+// predicate answers a different question ("is ANY thread recording?") and is therefore true on
+// threads that have no graph at all. The asymmetry is the point, not an inconsistency to tidy
+// away: see llama.cpp-oze0 (ownership) and llama.cpp-f9tg (allocation shape).
+//
+// It deliberately does NOT also test g_graph_retained_handle_sink, which
+// graph_lifetime_retention_active() (mem-handle.cpp) does. That predicate governs RELEASE and
+// must stay true across the short window in which recording has been turned off but the sink is
+// not yet detached (ggml-sycl.cpp does clear them in that order at several graph-teardown
+// sites), because a handle released in that window still belongs to the graph. An allocation
+// made in the same window does not -- recording is already off, so no node will capture it.
+inline bool ggml_sycl_graph_recording_this_thread() {
+    return g_ggml_sycl_graph_recording;
+}
+
+// Allocation shape for a scoped device-VRAM transient -- the scoped_unified_device_temp and
+// scoped_unified_queue_temp templates in ggml-sycl.cpp, which are byte-identical here.
+//
+// The whole decision lives in this one function, predicate included, for two reasons. It is the
+// only copy of the mapping, so the two templates cannot drift apart. And it can be called with
+// no device, no queue and no unified cache, which is what
+// tests/test-sycl-transient-alloc-intent-scope.cpp does: the allocation itself is NOT reachable
+// device-free (unified_alloc -> get_unified_cache_for_device -> the SYCL device manager, which
+// aborts "No SYCL devices available"), so the decision is separated from it deliberately.
+//
+// The predicate is THIS thread's recording state, not the process-wide one (llama.cpp-f9tg). A
+// transient allocated by a thread that is not recording is captured by no graph: it is an
+// ordinary COMPUTE transient and belongs in the reset-scoped SCRATCH zone. Taking the answer
+// from ggml_sycl_graph_recording_active() instead made the role, category, cohort and zone of
+// one context's allocation depend on an unrelated context's phase -- which over-applies graph
+// treatment, so it fails safe for correctness and announces itself nowhere, while corrupting
+// exactly the fields llama.cpp-iiff Phase 0's inventory is built from. It also disagreed with
+// the release side, which has routed on the calling thread since llama.cpp-oze0.
+inline ggml_sycl::alloc_intent ggml_sycl_transient_device_intent(const char * cohort_id) {
+    const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
+
+    ggml_sycl::alloc_intent intent{};
+    intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
+    intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
+    intent.cohort_id = cohort_id;
+    intent.constraints.must_device = true;
+    if (!graph_lifetime) {
+        // SCRATCH is reset at every graph boundary, so a transient that must outlive the
+        // recorded graph cannot be a slice of it.
+        intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    }
+    return intent;
+}
+
+// Allocation shape for a scoped host-pinned transient -- scoped_unified_host_queue_temp in
+// ggml-sycl.cpp. Same per-thread predicate as the device form above, but a different question
+// hangs off it, so it is a separate function rather than a flag on one.
+//
+// Beyond role/category this pair also picks the ALLOCATOR PATH: a graph-recorded host payload
+// needs a driver-visible USM base (a pinned-pool slice is an interior TLSF suballocation, and
+// the pool is reset-scoped), while an ordinary CONTROL transient wants the cheap pooled slice.
+// The comment on ggml_sycl_graph_recording_active() cites "must this allocation have a stable
+// host USM base?" as a case where over-applying is safe, and it is -- safe, but not free: a
+// non-recording thread was paying for a standalone sycl::malloc_host, and skipping the pool,
+// to satisfy a graph it has no part in. Correctness is unchanged either way; this is the
+// allocator-path half of llama.cpp-f9tg.
+inline ggml_sycl::alloc_intent ggml_sycl_transient_host_pinned_intent(const char * cohort_id) {
+    const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
+
+    ggml_sycl::alloc_intent intent{};
+    intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::CONTROL;
+    intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::CONTROL;
+    intent.cohort_id = cohort_id;
+    intent.constraints.must_host_pinned      = true;
+    intent.constraints.use_pinned_pool       = !graph_lifetime;
+    intent.constraints.require_host_usm_base = graph_lifetime;
+    return intent;
 }
 
 // Helper to check if we should add an event dependency.
