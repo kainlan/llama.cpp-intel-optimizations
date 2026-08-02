@@ -239,16 +239,18 @@ unversioned `git-clang-format`. This file recommended the broken form as
 failed. Use either spelling below — both verified working:
 
 ```bash
-# Preferred: format only staged changes (uses .clang-format)
+# Preferred WHEN YOU ARE ALONE in the checkout: format only staged changes
 git-clang-format-19          # direct
 git clang-format-19          # identical; git dispatches to the same binary
 
-# Check without writing (operates on the staged tree)
+# Check without writing (operates on the staged tree — the WHOLE index, see below)
 git-clang-format-19 --diff --staged   # "clang-format did not modify any files" = clean
 
+# Preferred WHEN OTHER AGENTS ARE LIVE: your own file, never writing
+clang-format-19 --dry-run -Werror <file.cpp>
+
 # Format specific files
-clang-format-19 -i <file.cpp>
-clang-format-19 --dry-run -Werror <file.cpp>  # dry-run check
+clang-format-19 -i <file.cpp>                 # ⚠️ see the -i warning below
 ```
 
 ⚠️ **`clang-format-19 -i` on a whole file is actively destructive here, which is the
@@ -273,6 +275,33 @@ try to hand-prune a 180-line reformat.
 
 `clang-format-19 --dry-run -Werror <file>` is safe and useful — it reports without
 writing. Just do not act on its whole-file findings as part of an unrelated change.
+
+⚠️ **`git-clang-format-19 --staged` operates on the WHOLE INDEX, not on your files —
+so in a shared checkout with live agents it is the dangerous one, and the two hazards
+on this page point in OPPOSITE directions.** Found 2026-08-02 by an implementer who
+ran the `--diff` form and had another agent's unformatted `unified-cache.cpp:5588`
+reported at it. It correctly did **not** run the write form, which would have
+reformatted that file underneath its owner.
+
+The index is shared mutable state ([[git-add-is-not-scoping]] is the same fact seen
+from the commit side). So there is no single "preferred" command — it depends on
+whether anyone else is live:
+
+| situation | use | why |
+|---|---|---|
+| alone in the checkout | `git-clang-format-19` (staged) | changed lines only; avoids the 180-line drift |
+| **other agents live** | `clang-format-19 --dry-run -Werror <your file>` | scoped to your file, and cannot write |
+| ever | ~~`clang-format-19 -i <file>`~~ | forbidden — 180 lines of unrelated drift |
+
+**Both caveats must survive together, and fixing one naively reintroduces the other.**
+"Just use `clang-format-19` instead of the staged form" walks into the `-i` drift
+problem; "always use the staged form" walks into reformatting a teammate's file. The
+resolution is that the *safe* substitute under concurrency is specifically
+`--dry-run -Werror`, which is neither whole-file-writing nor index-wide.
+
+If `--dry-run` reports drift in your own file that you did not introduce, leave it —
+that is pre-existing drift, and fixing it belongs in its own commit, not smuggled into
+an unrelated change.
 
 ## Project Architecture
 
@@ -1132,8 +1161,12 @@ var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
 ## CI and Validation
 
 ### Before Submitting PRs
-1. Format code: `git-clang-format-19` (preferred — **not** `git clang-format`, which does
-   not exist here; see "Code Formatting") or `clang-format-19 -i <files>`
+1. Format code — **which command depends on whether you are alone in the checkout**;
+   see "Code Formatting" for why the two hazards point in opposite directions:
+   - alone: `git-clang-format-19` (**not** `git clang-format`, which does not exist here)
+   - other agents live: `clang-format-19 --dry-run -Werror <your file>` — the staged
+     form operates on the whole index and would reformat their files
+   - **never** `clang-format-19 -i <file>` — ~180 lines of unrelated pre-existing drift
 2. Build: `./scripts/sycl-build.sh`
 3. Test: use a form from "Running Tests" above — **not** a bare
    `ctest --test-dir build --output-on-failure`, which runs `test-backend-ops`
