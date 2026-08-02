@@ -55,12 +55,21 @@ launch.
 
 CONSEQUENCE FOR ATTRIBUTION
 
-This predicts exactly ONE live allocation in the live-zone dump: a single
-concurrent owner caught in the window, not an accumulating set. That matches
-the measurement on the merge commit (alloc_id=226, one allocation,
+*** THE PARAGRAPH BELOW IS SUPERSEDED -- see "v2" at the end of this file. ***
+*** "exactly ONE" is WRONG. The count is a DISTRIBUTION bounded by the      ***
+*** number of concurrent contexts; it was fixed at 1 here only because v1   ***
+*** has exactly one owner thread. Do not quote this paragraph.              ***
+
+[superseded] This predicts exactly ONE live allocation in the live-zone dump: a
+single concurrent owner caught in the window, not an accumulating set. That
+matches the measurement on the merge commit (alloc_id=226, one allocation,
 available=511.2 MB vs target=512.0 MB -- a shortfall of 828504 bytes, i.e.
 exactly one). It does NOT match the "accumulation" reading in cf802823c's
 commit message, which is retracted; see the correction commit.
+
+[current] The TOCTOU account predicts a BOUNDED, VARYING count -- 1 on one run
+and 2 on the next at the same -np 4 are both inside it. The discriminator
+against the pre-fix stranding account is growth vs boundedness, never "1 vs 4".
 
 CONSEQUENCE FOR THE EPIC (llama.cpp-iiff)
 
