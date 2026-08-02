@@ -250,6 +250,22 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
                                                    ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q));
 }
 
+// Is ANY thread currently recording a command graph?
+//
+// PROCESS-WIDE by design: g_ggml_sycl_graph_recording_depth is a global counter, so this is
+// true on threads that are not themselves recording. That is correct for conservative
+// submission constraints -- "may I emit a memcpy node?", "must this allocation have a stable
+// host USM base?" -- where over-applying the restriction is safe.
+//
+// ⚠️ Do NOT use it to decide who OWNS a thread_local resource's release. The sinks and buffers
+// such a decision selects are per-thread, so a thread that is not recording takes the
+// graph-lifetime branch and then finds no sink of its own. See graph_lifetime_retention_active()
+// in mem-handle.cpp, which is deliberately narrower, and llama.cpp-oze0 for what happened when
+// this one was used there: transient scratch stranded live in shared zones, plus a
+// cross-context free of leases another context's work still depended on.
+//
+// The two are NOT interchangeable and must not be unified "for consistency" -- the asymmetry is
+// the fix. Widening the narrow one back to this reintroduces the use-after-free.
 inline bool ggml_sycl_graph_recording_active() {
     return g_ggml_sycl_graph_recording || g_ggml_sycl_graph_recording_depth.load(std::memory_order_acquire) > 0;
 }

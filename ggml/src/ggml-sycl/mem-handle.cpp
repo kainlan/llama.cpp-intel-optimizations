@@ -60,8 +60,8 @@ thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
 
 // Whether THIS thread's retained handles belong to a command graph.
 //
-// Deliberately narrower than ggml_sycl_graph_recording_active(), which is true
-// whenever *any* thread is recording -- g_ggml_sycl_graph_recording_depth is a
+// Deliberately narrower than ggml_sycl_graph_recording_active() (common.hpp),
+// which is true whenever *any* thread is recording -- the depth counter is a
 // process-global counter while g_ggml_sycl_graph_recording is thread_local.
 // The wide predicate is right for "may I emit a memcpy node?", a conservative
 // process-wide constraint. It is the wrong question for "who owns this handle's
