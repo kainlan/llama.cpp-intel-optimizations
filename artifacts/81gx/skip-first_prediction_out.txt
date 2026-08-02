@@ -1,0 +1,62 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 1680669091
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: gemma3n (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+[fattn-xmx-v2] device 0: local_mem=128 KB, required=53248 B for (D=256,ncols=32), variant=1, slm_ok=1
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-0 mul=first_prediction_out-0 (total_skipped=1)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-1 mul=first_prediction_out-1 (total_skipped=2)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-2 mul=first_prediction_out-2 (total_skipped=3)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-3 mul=first_prediction_out-3 (total_skipped=4)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-4 mul=first_prediction_out-4 (total_skipped=5)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-5 mul=first_prediction_out-5 (total_skipped=6)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-6 mul=first_prediction_out-6 (total_skipped=7)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-7 mul=first_prediction_out-7 (total_skipped=8)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-8 mul=first_prediction_out-8 (total_skipped=9)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-9 mul=first_prediction_out-9 (total_skipped=10)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-10 mul=first_prediction_out-10 (total_skipped=11)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-11 mul=first_prediction_out-11 (total_skipped=12)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-12 mul=first_prediction_out-12 (total_skipped=13)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-13 mul=first_prediction_out-13 (total_skipped=14)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-14 mul=first_prediction_out-14 (total_skipped=15)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-15 mul=first_prediction_out-15 (total_skipped=16)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-16 mul=first_prediction_out-16 (total_skipped=17)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-17 mul=first_prediction_out-17 (total_skipped=18)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-18 mul=first_prediction_out-18 (total_skipped=19)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-19 mul=first_prediction_out-19 (total_skipped=20)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-20 mul=first_prediction_out-20 (total_skipped=21)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-21 mul=first_prediction_out-21 (total_skipped=22)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-0 mul=first_prediction_out-0 (total_skipped=23)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-1 mul=first_prediction_out-1 (total_skipped=24)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-2 mul=first_prediction_out-2 (total_skipped=25)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-3 mul=first_prediction_out-3 (total_skipped=26)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-4 mul=first_prediction_out-4 (total_skipped=27)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-5 mul=first_prediction_out-5 (total_skipped=28)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-6 mul=first_prediction_out-6 (total_skipped=29)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-7 mul=first_prediction_out-7 (total_skipped=30)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-8 mul=first_prediction_out-8 (total_skipped=31)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-9 mul=first_prediction_out-9 (total_skipped=32)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-10 mul=first_prediction_out-10 (total_skipped=33)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-11 mul=first_prediction_out-11 (total_skipped=34)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-12 mul=first_prediction_out-12 (total_skipped=35)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-13 mul=first_prediction_out-13 (total_skipped=36)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-14 mul=first_prediction_out-14 (total_skipped=37)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-15 mul=first_prediction_out-15 (total_skipped=38)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-16 mul=first_prediction_out-16 (total_skipped=39)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-17 mul=first_prediction_out-17 (total_skipped=40)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-18 mul=first_prediction_out-18 (total_skipped=41)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-19 mul=first_prediction_out-19 (total_skipped=42)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-20 mul=first_prediction_out-20 (total_skipped=43)
+[FUSION-SKIP] chain matches GGML_SYCL_FUSION_SKIP_MUL=first_prediction_out, bit1+bit4 both declined: rms=norm-21 mul=first_prediction_out-21 (total_skipped=44)
+|         gemma3n|Intel(R) Arc(TM) Pro B70 Graphics| Dense|  [1;32mOK[0m (5.31e-06)|     [1;33mSKIP[0m|
+test case: gemma3n (Intel(R) Core(TM) Ultra 7 265K, Dense)
+|         gemma3n|   Intel(R) Core(TM) Ultra 7 265K| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|
+test case: gemma3n (Meta, Dense)
+|         gemma3n|                             Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+Roundtrip gate: NMSE(device, reloaded) <= 1e-04, not bit-equality. 0 row(s) round-tripped within tolerance but not bit-for-bit.
