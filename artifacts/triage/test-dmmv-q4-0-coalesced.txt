@@ -1,0 +1,70 @@
+=== Q4_0 DMMV Coalesced Layout Tests ===
+Testing coalesced memory layout for DMMV kernel
+Tile configuration: 32 blocks per tile, 512 bytes per tile
+
+=== Part 1: Layout Integrity Tests (CPU) ===
+
+=== Test: Coalesced Layout Data Integrity (16 x 1024) ===
+  Layout integrity: PASSED (errors=0)
+
+=== Test: Coalesced Layout Data Integrity (32 x 2048) ===
+  Layout integrity: PASSED (errors=0)
+
+=== Test: Coalesced Layout Data Integrity (64 x 4096) ===
+  Layout integrity: PASSED (errors=0)
+
+Layout integrity tests PASSED
+
+=== Part 2: GPU DMMV Tests (Coalesced) ===
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32602.6 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32026.6 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32602.6 MB budget=32026.6 MB (100%)
+[VRAM-ARENA] External headroom 629 MB (caller-reserved 629 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32026.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32026.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32026.0 MB total (weight=30495.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32026.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e68034000 + 512.0 MB (offset 31514.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 201.4 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 201.4 GB budget, committed=0.0 GB (system total=246.9 GB available=209.4 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=weight type=q4_0 ne=[1024,64,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+  DMMV coalesced ncols=1024 nrows=64: errors=26 max_diff=0.220037 max_rel=0.167222 FAIL
+[SYCL] host weight registry mismatch for weight (existing=0xae010d0 new=0xae7c700)
+  DMMV coalesced ncols=2048 nrows=128: errors=48 max_diff=0.259021 max_rel=0.120178 FAIL
+[SYCL] host weight registry mismatch for weight (existing=0xae7c700 new=0xae43510)
+  DMMV coalesced ncols=4096 nrows=256: errors=88 max_diff=0.427313 max_rel=0.309105 FAIL
+
+=== Summary ===
+Layout tests: PASSED
+GPU tests: FAILED

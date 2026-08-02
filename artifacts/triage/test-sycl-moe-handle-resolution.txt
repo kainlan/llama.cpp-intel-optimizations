@@ -1,0 +1,98 @@
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32595.0 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32019.0 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32595.0 MB budget=32019.0 MB (100%)
+[VRAM-ARENA] External headroom 637 MB (caller-reserved 637 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32018.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32018.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32018.0 MB total (weight=30487.9, KV=250.1, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32018.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67824000 + 512.0 MB (offset 31506.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 201.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 201.3 GB budget, committed=0.0 GB (system total=246.9 GB available=209.3 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[VRAM-ARENA] Insufficient budget for single-chunk arena: 0.0 MB < tail 1280.0 MB + min shared 16.0 MB; refusing reservation
+[VRAM-ARENA] Insufficient budget for N-chunk arena: total 0.0 MB < tail 1280.0 MB + min KV 16.0 MB; refusing reservation
+[VRAM-ARENA] Failed on device 0, falling back to per-entry allocation
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[SYCL] Pinned chunk pool created with 199.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 199.3 GB budget, committed=0.0 GB (system total=246.9 GB available=207.3 GB reserve=8.0 GB pct=90)
+[SYCL] Pinned chunk pool destroyed, released 0 chunks
+[SYCL] Allocated pinned base chunk 1 (size=2048.0 MB, total=4.0 GB)
+[HOST-ARENA] configured zones: WEIGHT=8.0 MB  KV=8.0 MB  STAGING=8.0 MB  SCRATCH=8.0 MB  (total-cap=2048.0 MB)
+  FAIL: EXPERT_STAGING should route to SCRATCH host zone
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=536.5 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+[MOE-POLICY-MULTI] device=0 total=32656.0 MB free_init=564.8 MB plan_budget=1024.0 MB weight_budget=1024.0 MB max_alloc=31023.2 MB safe_alloc=536.5 MB arena=0.0 MB zones(scratch/runtime/onednn)=0.0/0.0/0.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+[PLACEMENT-MULTI] Mode: HYBRID
+[PLACEMENT-MULTI] Dense candidate rank=0 logical=0 physical=0 raw_score=1.00 net_score=1.00 locality_penalty=1.00 supported=1 budget=1024.0 MB remaining=1024.0 MB
+[PLACEMENT-MULTI] Dense candidate rank=1 logical=1 physical=1 raw_score=1.00 net_score=1.00 locality_penalty=1.00 supported=1 budget=0.1 MB remaining=0.1 MB
+[PLACEMENT-BLOCK] no direct peer path for active devices; using cohesive complete-layer MoE placement (dense+KV+experts share each block device)
+[PLACEMENT-BLOCK] cohesive target logical=0 physical=0 layers=8 weights=1024.0 MB remaining=0.0 MB
+[PLACEMENT-BLOCK] cohesive target logical=1 physical=1 layers=0 weights=0.0 MB remaining=0.1 MB
+[PLACEMENT-BLOCK] cohesive host layers=1 reason=no-compatible-gpu-capacity
+[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=0 host_changed=0 xmx_tiled=0 i8_or_dpas=0 soa=0 aos=0 skipped_capacity=0 device_delta=0.0 MB host_delta=0.0 MB
+[PLACEMENT-MOE] layout upgrades: mxfp4_i8_down skipped entries=32 device=0 reason=executor-layout-not-supported
+[MOE-LAYOUT] down-i8 device=0 n_experts=32 considered=192 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=128 skip_already_i8=0 skip_not_device=32 skip_wrong_dev=0 skip_executor=32 skip_unsupported=0 requested=mxfp4_i8 granted=aos remaining=0.0 MB
+[MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=192 expert entries, of which skip_not_down=128 were gate/up). Entry-level rejections: skip_not_device=32 skip_executor=32.
+[PLACEMENT-MOE-MULTI] decode secondary alternates: considered=64 complete=64 groups=0 entries=0 already=0 skipped_incomplete=0 skipped_host_base=32 skipped_support=32 skipped_capacity=0 charged=0.0 MB hotness=static(layer,expert)
+[SYCL-PLAN] inventory top-8 of 6 tensors (total 2048.0 MB): blk.8.ffn_up_exps.weight=512.0MB(t43,0x0) blk.0.ffn_up_exps.weight=512.0MB(t43,0x0) blk.8.ffn_gate_exps.weight=256.0MB(t43,0x0) blk.0.ffn_gate_exps.weight=256.0MB(t43,0x0) blk.0.ffn_down_exps.weight=256.0MB(t43,0x0) blk.8.ffn_down_exps.weight=256.0MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 6 tensors; cardinality histogram: 6x1; largest card>=4: blk.0.ffn_up_exps.weight 512.0MB (card=6); largest card<=2: none
+[SYCL-PLAN] MoE routing buffer sizing: n_experts=32 n_moe_layers=9 max_batch=1 control_ids=0.00 MB host-pinned, expert_ptrs=0.02 MB VRAM, cpu_staging=512.00 MB
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 512.0 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=1026.0 MB total=1042.0 MB
+[PLACEMENT-MOE] expected=192 planned=192 unclassified=0 duplicates=0 missing=0
+[PLACEMENT-MOE] roles: gate=64 up=64 down=64 gate_up=0 unknown=0
+[PLACEMENT-MOE] target HOST: 96 expert tensors
+[PLACEMENT-MOE] target device0: 96 expert tensors
+[PLACEMENT-BLOCK] fastest_dense=device0 raw_score=1.00 blocks=2 policy=complete-layer-blocks boundary_edges=0 boundary_bytes=0.0 MB boundary_est_us=0.00 boundary_direct=0 hidden_dim=0 boundary_tokens=512 note=dense-fastest-may-be-deferred-by-boundary-cost
+[PLACEMENT-BLOCK] block=0 layers=[0,7] exec=device0 dense=device0 kv=HOST dense_score=1.00 fastest_dense=1 reason=fastest-dense-compatible dense=0.0 MB charge=0.0 MB kv=0.0 MB moe_device=1024.0 MB moe_host=0.0 MB prev=HOST next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK] block=1 layers=[8,8] exec=HOST dense=HOST kv=HOST dense_score=0.00 fastest_dense=0 reason=host-or-unplanned dense=0.0 MB charge=0.0 MB kv=0.0 MB moe_device=0.0 MB moe_host=1024.0 MB prev=device0 next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] reason=rejected-no-p2p-awaiting-event-chained-block-executor blocks=3 gpu_layers=7 host_layers=2 boundary_edges=0 boundary_bytes=0.0 MB boundary_est_us=0.00 boundary_direct=0 hidden_dim=0 boundary_tokens=512 runtime_reserve=3072.0 MB status=inactive-until-block-executor
+[PLACEMENT-BLOCK-CANDIDATE] block=0 layers=[0,0] exec=HOST dense_score=0.00 reason=candidate-capacity-spill dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=1024.0 MB prev=HOST next=device0 boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] block=1 layers=[1,7] exec=device0 dense_score=1.00 reason=candidate-fastest-dense-prefix dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=0.0 MB prev=HOST next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] block=2 layers=[8,8] exec=HOST dense_score=0.00 reason=candidate-capacity-spill dense=0.0 MB charge=0.0 MB kv=0.0 MB moe=1024.0 MB prev=device0 next=HOST boundary_in=0.0 MB boundary_out=0.0 MB est_in_us=0.00 est_out_us=0.00 direct_in=0 direct_out=0
+[PLACEMENT-BLOCK-CANDIDATE] runtime headroom logical=0 physical=0 reserve=3072.0 MB remaining 0.0 -> 0.0 MB
+[PLACEMENT-BLOCK-CANDIDATE] runtime headroom logical=1 physical=1 reserve=3072.0 MB remaining 0.1 -> 0.0 MB
+[PLACEMENT-BLOCK-CANDIDATE] dense alternates: considered=0 candidates=0 added=0 already=0 skipped_support=0 skipped_capacity=0 no_layout_bytes=0 charged=0.0 MB reason=rejected-no-p2p-awaiting-event-chained-block-executor
+[PLACEMENT-BLOCK-CANDIDATE] moe alternates: considered=96 candidates=0 soa_added=0 already=0 skipped_support=0 skipped_capacity=0 no_layout_bytes=0 charged=0.0 MB reason=rejected-no-p2p-awaiting-event-chained-block-executor
+[PLACEMENT-MULTI] 2 devices, 9 layers, hybrid parallelism
+[PLACEMENT-MULTI] Device logical=0 physical=0 raw_dense_score=1.00 layers [0, 7], 1024.0 MB planned bytes used (1024.0 MB budget)
+[PLACEMENT-MULTI] Device logical=1 physical=1 raw_dense_score=1.00 layers [9, -1], 0.0 MB planned bytes used (0.1 MB budget)
+[PLACEMENT-MULTI] MOE_DOWN        device= 32 (256.0 MB)  host= 32 (256.0 MB)
+[PLACEMENT-MULTI] MOE_UP          device= 32 (512.0 MB)  host= 32 (512.0 MB)
+[PLACEMENT-MULTI] MOE_GATE_PROJ   device= 32 (256.0 MB)  host= 32 (256.0 MB)
+[PLACEMENT-MULTI] KV sizing: n_layer=0 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT-MULTI] Totals: weights=1024.0 MB device + 1024.0 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT-MULTI] Total: 1024.0 MB device + 1024.0 MB host (budget=1024.1 MB)
+Using device: Intel(R) Arc(TM) Pro B70 Graphics
+
+=== Test: normal cache expert resolution ===
+
+=== Test: direct staged device expert resolution ===
+
+=== Test: direct host and miss expert resolution ===
+
+=== Test: EXPERT_STAGING HOST_COMPUTE zone ownership ===
+
+=== Test: planner role-specific expert placement ===
+
+=== Test: MoE route ready-event chaining contract ===
+
+=== Test: MoE pointer-table route lease lifetime ===
+
+=== Test: MoE shared ID cache rebuilds pointer-table lease lifetime ===
+
+=== Test: MoE shared ID cache rebuilds tensor-specific pointer tables ===
+
+=== Test: MoE pointer-table cache stores IDs only ===
+
+=== Test: MoE pointer-table populated slots are covered by leases ===
+
+SYCL MoE handle resolution tests: FAIL

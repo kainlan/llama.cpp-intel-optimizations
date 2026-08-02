@@ -1,0 +1,50 @@
+=== test-sycl-cpu-dispatch: T8 Mixed-Precision Cache Miss Loading ===
+
+test_int4_kernel_correctness ... /Apps/llama.cpp/ggml/src/ggml-sycl/cpu-dispatch.cpp:1425: GGML_ASSERT(q_size <= g_cpu_dispatch_buffers.src1_q.size()) failed
+[New LWP 3248364]
+[New LWP 3248363]
+[New LWP 3248362]
+[New LWP 3248361]
+[New LWP 3248360]
+[New LWP 3248359]
+[New LWP 3248358]
+[New LWP 3248357]
+[New LWP 3248356]
+[New LWP 3248355]
+[New LWP 3248354]
+[New LWP 3248353]
+[New LWP 3248341]
+[New LWP 3248340]
+⚠️ warning: File "/opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x000079cfb14a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x000079cfb151cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x000079cfb9d02c1a in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x000079cfb9d01d39 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x000079cfb263887d in ggml_sycl_cpu_expert_mul_mat_adaptive(cpu_expert_task const*, int, int) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x0000000000406086 in main ()
+[Inferior 1 (process 3248323) detached]
