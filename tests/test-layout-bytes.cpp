@@ -69,15 +69,21 @@ int main() {
         ok &= expect_eq("Q4_0 coalesced bytes", got, expected);
     }
 
-    // Q8_0 coalesced bytes.
+    // Q8_0 coalesced bytes. Row storage is padded to fixed warp-tile
+    // boundaries (ggml_sycl_q8_0_coalesced_row_quants_bytes(), common.hpp) for
+    // coalesced-load cache-line utilization -- not tight packing -- since
+    // d87d54cdd ("double gpt-oss moe decode throughput"). Call the real
+    // function rather than re-deriving the padding scheme here; a local
+    // reimplementation is exactly how this assertion went stale the first
+    // time (llama.cpp-u2mz / llama.cpp-0igs).
     {
         const int64_t ncols = QK8_0 * 5;
         const int64_t nrows = 2;
         ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ncols, nrows);
         const size_t blocks_per_row = static_cast<size_t>(ncols / QK8_0);
         const size_t nblocks = blocks_per_row * static_cast<size_t>(nrows);
-        const size_t expected = static_cast<size_t>(nrows) * static_cast<size_t>(ncols) +
-                                nblocks * sizeof(ggml_half);
+        const size_t  row_quants_bytes = ggml_sycl_q8_0_coalesced_row_quants_bytes(static_cast<int>(blocks_per_row));
+        const size_t  expected         = static_cast<size_t>(nrows) * row_quants_bytes + nblocks * sizeof(ggml_half);
         const size_t got = ggml_sycl::test_layout_bytes(t, GGML_LAYOUT_COALESCED, device);
         ok &= expect_eq("Q8_0 coalesced bytes", got, expected);
     }
