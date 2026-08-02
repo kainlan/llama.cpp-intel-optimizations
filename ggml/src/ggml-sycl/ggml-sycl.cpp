@@ -79640,6 +79640,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const auto fusion_site_on = [&](unsigned bit) {
         return !disable_fusion && (fusion_site_mask & (1u << bit));
     };
+    // Diagnostic (llama.cpp-81gx): GGML_SYCL_FUSION_MASK bisection (a1edc1599) isolated
+    // gemma3n's B70 wrong-answer bug to bit1 (RMS_NORM+MUL+ADD). A standalone 3-node
+    // kernel test (test-rms-norm-mul-add-broadcast) then showed ggml_sycl_op_rms_norm_
+    // fused_add computes gemma3n's exact shapes correctly in isolation -- so if bit1
+    // is still the culprit on the real graph, the defect is in whether this SITE
+    // should have fired at all, not in what it computes once it does. The eligibility
+    // gate (ggml_can_fuse_subgraph) trusts cgraph->use_counts, built once during graph
+    // construction; this prints what it actually saw at each match so it can be
+    // hand-counted against gemma3n.cpp's real consumers for the same tensor.
+    static const bool fusion_use_count_debug = getenv("GGML_SYCL_FUSION_USE_COUNT_DEBUG") != nullptr;
     // Track nodes that have been executed via fusion (to skip later)
 
     std::unordered_set<const ggml_tensor *> fused_nodes;
@@ -80077,6 +80087,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     ggml_tensor * add_node = cgraph->nodes[i + 2];
+                    if (fusion_use_count_debug) {
+                        fprintf(stderr,
+                                "[FUSION-USE-COUNT] bit1 match: rms=%s(idx=%d,use_count=%d) "
+                                "mul=%s(idx=%d,use_count=%d) add=%s(idx=%d)\n",
+                                node->name ? node->name : "?", i, ggml_node_get_use_count(cgraph, i),
+                                mul_node->name ? mul_node->name : "?", i + 1, ggml_node_get_use_count(cgraph, i + 1),
+                                add_node->name ? add_node->name : "?", i + 2);
+                    }
                     ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, mul_node, add_node);
                     gpu_queue_dirty = true;  // D+: GPU fusion submitted work
                     i += 2;                  // Skip the MUL and ADD nodes
