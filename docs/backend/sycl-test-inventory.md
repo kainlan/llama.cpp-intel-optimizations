@@ -159,6 +159,85 @@ files above. Not individually mutation-tested this pass, but the exit-code
 mechanism itself is sound, which is the property the two deletions above
 were missing.
 
+## ⚠️ Correction: the earlier "all 72 Python gates pass" baseline was checking the wrong thing
+
+An earlier draft of this doc reported running every `tests/test-sycl-*.py`
+file directly (`python3 tests/test-sycl-X.py`) and getting rc=0 across all 72.
+**That result is close to meaningless and is retracted.** 68 of the 72 are
+**pytest-style**: every check lives inside a bare `def test_*() -> None:`
+function with no `if __name__ == "__main__":` block. Invoking such a file with
+plain `python3` runs only module-level code (imports, constant tables) and
+**calls none of the `test_*` functions** — it cannot observe a failure no
+matter what the code under test does, and rc=0 says nothing. Confirmed the
+gap is real: rerunning the same 68 files correctly via
+`python3 -m pytest -q <files>` actually executes the assertions.
+
+**This is not a defect in the tests — the project already engineered around
+it.** `tests/CMakeLists.txt`'s `llama_test_pytest()` macro (used for every one
+of these 68) registers the ctest command as
+`python3 -c "import pytest; sys.exit(pytest.main(['-q', script]))"`, not a bare
+script invocation, and the macro's neighboring comment names the exact trap:
+*"an unregistered pytest-style file exits 0 for any state of the code under
+test, which would make a gate against vacuous passes itself a vacuous pass."*
+Confirmed against the generated registration
+(`build/tests/CTestTestfile.cmake`): `test-sycl-link-depends-coverage` really
+is invoked through `pytest.main()`. So the registered gates were never
+vacuous; **my first verification pass was.** Recording this prominently
+because the same mistake is easy to repeat: `python3 <file>.py` is the wrong
+command for any file in this population without its own `__main__` block, and
+the file itself gives no visual cue — it still parses, still imports cleanly,
+still exits 0.
+
+**Corrected baseline**, all 68 pytest-style files run together via
+`python3 -m pytest -q`: **470 passed, 3 failed.** The 3 failures are exactly
+the two `llama.cpp-0igs` already found and explicitly declined to restore
+(`test-sycl-end-to-end-profiling-docs.py::test_research_artifact_is_present`,
+`test-sycl-mxfp4-tg-speedup-docs.py::test_final_review_records_rejection_and_copied_validation_evidence`
+and `::test_final_review_does_not_present_tiles_as_default_on_or_recommended`
+— both assert against files, `research.md` and
+`activation/sycl-mxfp4-tg-speedup-final-review-20260707.md`, that have never
+existed in this repo). Confirmed both files are **not currently registered**
+in `ctest -N`, consistent with 0igs's "declined" disposition — this is not a
+live gap, just the same already-triaged finding reproduced independently.
+
+**Two files verified with a real, executed mutation** (not just
+code-reading), using a shadow-root technique for the one that reads real repo
+files — symlink every top-level entry to the real tree except a writable copy
+of the exact file(s) under test, confirmed by checking `Path.resolve()`
+doesn't silently collapse back to the real tree (it does if any ancestor in
+the path is itself a symlink — a second trap worth recording: make the
+*script's own* directory a real copy too, not just the target file's):
+
+- **`test-sycl-gap-causes.py`** (script-style, has `__main__`): subprocess-
+  invokes the real `scripts/parse-sycl-gap-causes.py` against a checked-in
+  fixture trace and asserts specific classification counts. Copied script +
+  fixture + full `scripts/` tree to a scratch dir (needed — the parser
+  dynamically loads a second module, `parse-sycl-timeline.py`). Control:
+  passes (`rc=0`) with a detailed PASS message naming every count. Mutation:
+  one line in the copied parser
+  (`if device_gap_has_implicit_serialization(...)` → `if False and …`) —
+  `rc=1`, 5 distinct `FAIL:` lines, exactly matching the predicted count shift
+  (`implicit_queue_serialization` count 1→0, `truly_idle` count 3→4).
+- **`test-sycl-link-depends-coverage.py`** (pytest-style): walks every
+  `CMakeLists.txt` in the repo checking that any directory linking with icpx
+  also sets `CMAKE_CXX_LINK_DEPENDS_USE_LINKER`. Control against the live
+  repo (`python3 -m pytest -q tests/test-sycl-link-depends-coverage.py`):
+  5 passed, `rc=0`. Mutation: removed the `set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)`
+  line from a shadow copy of `ggml/src/ggml-sycl/CMakeLists.txt` (the one
+  directory that carries it) — `rc=1`, 3 of 5 checks fail
+  (`test_at_least_one_directory_links_with_icpx`,
+  `test_every_icpx_linking_directory_disables_linker_depfiles`,
+  `test_ggml_sycl_self_declares`), 2 unrelated checks (`NOT_IN_BUILD`,
+  `PENDING` bookkeeping) correctly stay green — specificity, not just
+  sensitivity, same property the `test-kv-slice-sizing.cpp` model
+  demonstrates in C++.
+
+The remaining 66 pytest-style files and the other 3 script-style files
+(`test-sycl-gap-device-split.py`, `test-sycl-moe-profile-parser.py`,
+`test-sycl-timeline-gap-class-conservation.py`) were run correctly (via
+pytest / direct invocation as appropriate) but not individually
+mutation-tested this pass.
+
 ## Coordination finding that changes the shape of this ticket
 
 **`llama.cpp-0igs`** (P1, currently `open`, owner `impl-0igs` died in the
