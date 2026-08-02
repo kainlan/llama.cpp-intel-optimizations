@@ -24,6 +24,13 @@
 #include <utility>
 #include <vector>
 
+// The one threshold both result columns judge by. The NMSE column and the Roundtrip column
+// must not disagree about what "wrong" means, and until this existed that agreement was
+// maintained by five separate literals happening to match -- a property asserted in a comment
+// and enforced by nothing. Editing one of them would have left the test disagreeing with
+// itself about what constitutes a failure. Every site that tests or prints it reads it here.
+static constexpr double nmse_gate = 1e-4;
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
@@ -102,6 +109,66 @@ static std::string nmse_diagnosis(const std::vector<float> & a, const std::vecto
     }
     if (nonfinite_b > 0) {
         ret += "\n  device non-finite token positions: " + nonfinite_rows(b, n_row);
+    }
+    return ret;
+}
+
+// The Roundtrip column is a BIT-EXACT comparison, so it reports a single FAIL for two
+// causes that need completely different fixes and are trivially told apart by magnitude:
+//
+//   - the weights did not survive the GGUF save/reload, so the reloaded model computes
+//     something else entirely -- large, structured differences, and the reloaded model is
+//     also wrong against the CPU reference;
+//   - the same correct computation took a different path (different kernel, different
+//     residency, non-reproducible accumulation order) -- last-bit differences, and the
+//     reloaded model is still correct against the CPU reference.
+//
+// A bare FAIL loses exactly that distinction, which is the one thing needed before
+// touching any code, so measure it.
+// Report differing positions as (token, vocab) and not as a flat index. The logits vector is
+// n_token rows of n_vocab, and a flat index invites the wrong decomposition: 16384 differing
+// logits "first at 8192" reads as the midpoint of the VOCABULARY, when these fixtures have
+// n_vocab=128 and 8192 is token 64 of 128 -- the first token of the second ubatch. Those two
+// readings point at completely different subsystems, so do the division here, once.
+struct logits_diff {
+    size_t n_diff      = 0;
+    size_t first_diff  = 0;  // flat index
+    size_t first_row   = 0;  // token position
+    size_t first_col   = 0;  // vocab index
+    size_t n_rows_diff = 0;  // token positions with at least one differing logit
+    size_t last_row    = 0;
+    double max_abs     = 0.0;
+    double max_rel     = 0.0;
+};
+
+static logits_diff logits_compare(const std::vector<float> & a, const std::vector<float> & b, const size_t n_col) {
+    GGML_ASSERT(a.size() == b.size());
+    GGML_ASSERT(n_col > 0 && a.size() % n_col == 0);
+    logits_diff  ret;
+    const size_t n_row = a.size() / n_col;
+    for (size_t row = 0; row < n_row; row++) {
+        bool row_differs = false;
+        for (size_t col = 0; col < n_col; col++) {
+            const size_t i = row*n_col + col;
+            if (a[i] == b[i]) {
+                continue;
+            }
+            if (ret.n_diff == 0) {
+                ret.first_diff = i;
+                ret.first_row  = row;
+                ret.first_col  = col;
+            }
+            ret.n_diff++;
+            row_differs = true;
+            const double abs_diff = std::fabs(double(a[i]) - double(b[i]));
+            const double scale    = std::max(std::fabs(double(a[i])), std::fabs(double(b[i])));
+            ret.max_abs = std::max(ret.max_abs, abs_diff);
+            ret.max_rel = std::max(ret.max_rel, scale > 0.0 ? abs_diff/scale : abs_diff);
+        }
+        if (row_differs) {
+            ret.n_rows_diff++;
+            ret.last_row = row;
+        }
     }
     return ret;
 }
@@ -331,6 +398,19 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    // Both models in the Roundtrip comparison must be loaded the same way. They were not:
+    // llama_model_init_from_user() forces these two off, llama_model_load_from_file_ptr()
+    // passes llama_model_default_params() straight through, where both are on. So the model
+    // written by the saver came back mmap-backed and eligible for weight-repacking extra
+    // buffer types, and the model it is compared against bit-for-bit was neither.
+    //
+    // That is not a difference in what was saved, it is a difference in where the weights
+    // ended up: llama-model-loader.cpp demotes a host buffer type to plain CPU under mmap,
+    // and allocates host-side tensors directly over the mapping instead of going through
+    // ggml_backend_tensor_set. The Roundtrip column compares logits with a bare `!=` and
+    // cannot tell that apart from a bad save.
+    model_params.use_mmap        = false;
+    model_params.use_extra_bufts = false;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -709,6 +789,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     // `test-llama-archs -a gemma4` printed a header, zero rows, and returned 0, which
     // reads as "gemma4 verified" to anything checking the status. See llama.cpp-k208.
     size_t n_measured = 0;
+    // Rows that round-tripped within tolerance but not bit-for-bit. Counted so the closing
+    // line can state it whether or not any row hit it -- see the legend below.
+    size_t n_bitdiff = 0;
     common_log_flush(common_log_main());
     printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
     printf("|");
@@ -720,6 +803,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         printf("-");
     }
     printf("|------|---------------|---------|\n");
+    // Printed unconditionally, and it has to be. The thing this legend exists to prevent is
+    // someone reading an all-OK Roundtrip column as proof that the logits matched bit for bit.
+    // That is precisely the run in which a mismatch-triggered notice would not appear, so a
+    // conditional notice is absent exactly when it is needed.
+    printf("Roundtrip: a GGUF save+reload of the device model, compared against that model.\n");
+    printf("  Gated on NMSE(device, reloaded) <= %.0e, NOT on bit-equality: this path is not\n", nmse_gate);
+    printf("  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.\n");
+    printf("  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row\n");
+    printf("  are on stderr.\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -810,7 +902,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                                 nmse_diagnosis(logits_cpu, logits_dev, tokens.size()).c_str());
                         } else {
                             snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
-                            if (nmse_val > 1e-4) {
+                            if (nmse_val > nmse_gate) {
                                 all_ok = false;
                                 status_nmse = "\033[1;31mFAIL\033[0m";
                             }
@@ -833,12 +925,91 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            if (logits_roundtrip[i] != logits_dev[i]) {
-                                all_ok = false;
-                                status_roundtrip = "\033[1;31mFAIL\033[0m";
-                                break;
-                            }
+                        const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_dev.first.get()));
+                        const size_t n_ubatch = llama_n_ubatch(model_and_ctx_dev.second.get());
+                        const logits_diff rt = logits_compare(logits_dev, logits_roundtrip, n_vocab);
+                        const double nmse_rt = nmse(logits_dev, logits_roundtrip);
+
+                        // Gate on NMSE, not on bit-equality.
+                        //
+                        // The column's job is to catch a save/reload that lost weights, and that
+                        // failure is O(1) -- the reloaded model computes something else entirely.
+                        // Bit-equality was only ever a proxy for it, and on this backend the proxy
+                        // is broken: the device path is not reproducible run to run, so two decodes
+                        // of the same weights differ in the last bits by an amount that varies with
+                        // scheduling. Measured 2026-08-01: same seed, same binary, same selector,
+                        // two processes -- 438 vs 1493 of 16384 logits differing, a 3.4x change,
+                        // with the save/reload path byte-identical between them. A bit-exact
+                        // comparison there is asking whether two non-deterministic decodes happened
+                        // to land identically; it fails at random and, worse, PASSES at random, so
+                        // a green column was never evidence either.
+                        //
+                        // Judged by nmse_gate, the same constant the NMSE column tests against --
+                        // deliberately, because the two columns must not disagree about what
+                        // "wrong" means. Sharing the constant is what makes that a constraint
+                        // rather than a comment.
+                        const bool roundtrip_broken = !std::isfinite(nmse_rt) || nmse_rt > nmse_gate;
+                        if (roundtrip_broken) {
+                            all_ok = false;
+                            status_roundtrip = "\033[1;31mFAIL\033[0m";
+                        } else if (rt.n_diff > 0) {
+                            // Cyan, deliberately NOT the yellow this table uses for SKIP. The
+                            // column's vocabulary is green=OK / red=FAIL / yellow=SKIP, so reusing
+                            // yellow would render "measured, within tolerance, not bit-exact"
+                            // identically to "not measured at all" -- and BITDIFF exists precisely
+                            // so a non-bit-exact row can never be mistaken for silence.
+                            status_roundtrip = "\033[1;36mBITDIFF\033[0m";
+                            n_bitdiff++;
+                        }
+
+                        if (rt.n_diff > 0) {
+                            const size_t n_tok = logits_dev.size()/n_vocab;
+
+                            // Report magnitudes only -- nothing here may touch a device.
+                            //
+                            // Two probes did, on 2026-08-01, and the run segfaulted: a re-decode
+                            // of the already-loaded device model, and a third load of the same
+                            // file. Which of the two crashed was not isolated. What the log shows
+                            // immediately before the fault is
+                            // "[UNIFIED-CACHE] planned-mode runtime materialization rejected
+                            // op=direct_stage_weight ... graph_active=1", i.e. inference asking to
+                            // stage a weight the placement plan has no entry for. The plan is
+                            // global per device and each load replaces it, so both probes run
+                            // against state the single-pass original never creates. Whatever the
+                            // exact mechanism, a diagnostic that costs the run it is diagnosing is
+                            // worth less than no diagnostic: keep this block pure arithmetic over
+                            // logits that have already been computed.
+                            // The movable quantities come FIRST, and that ordering is deliberate.
+                            // NMSE is the right gate -- it catches the O(1) corruption this column
+                            // exists for -- but it is not a sensitivity measure and must not be read
+                            // as one. At these magnitudes the whole divergence contributes ~6e-17 to
+                            // ~2e-16 to NMSE, against a value printed to four significant figures
+                            // whose last digit is worth ~1e-12: four orders of magnitude below what
+                            // the format can show. It stayed pinned at 2.201e-09 across the two
+                            // replicates whose differing-element counts were 438 and 1493. Anyone
+                            // diagnosing from NMSE alone is reading a quantity that cannot move.
+                            // The count, the first difference and the affected rows can.
+                            fprintf(stderr,
+                                "\n%s (%s, %s): roundtrip not bit-exact [%s]\n"
+                                "  save/reload vs device: %zu/%zu logits differ, max abs %.3e, max rel %.3e\n"
+                                "  first difference:      token %zu of %zu, vocab %zu of %zu (flat index %zu)\n"
+                                "  token rows affected:   %zu of %zu, from %zu to %zu%s\n"
+                                "  gate NMSE(dev,reload): %.3e vs threshold %.1e -- %s\n"
+                                "  NMSE vs CPU:           device %.3e, reloaded %.3e\n"
+                                "  (the gate is NMSE; the three lines above it are the ones with the\n"
+                                "   resolution to move between runs -- diagnose from those, not from NMSE)\n",
+                                llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                roundtrip_broken ? "FAIL" : "BITDIFF",
+                                rt.n_diff, logits_dev.size(), rt.max_abs, rt.max_rel,
+                                rt.first_row, n_tok, rt.first_col, n_vocab, rt.first_diff,
+                                rt.n_rows_diff, n_tok, rt.first_row, rt.last_row,
+                                rt.first_row == n_ubatch ?
+                                    " -- exactly n_ubatch, so every token of the FIRST ubatch is bit-identical"
+                                    " and divergence begins at the first token of the SECOND" : "",
+                                nmse_rt, nmse_gate, roundtrip_broken ?
+                                    "EXCEEDED: the reloaded model computes something else; the save/reload lost data" :
+                                    "within tolerance: both models agree to far better than the gate",
+                                nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip));
                         }
                     }
                 }
@@ -849,6 +1020,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
+    // Unconditional, like the legend, and for the same reason -- a reader who scrolls to the
+    // bottom of a green run must still be told what OK did and did not establish. Stating the
+    // count even when it is zero is the point: "0 rows" is a measurement, while silence is
+    // indistinguishable from the check not having run.
+    printf("Roundtrip gate: NMSE(device, reloaded) <= %.0e, not bit-equality. "
+           "%zu row(s) round-tripped within tolerance but not bit-for-bit.\n", nmse_gate, n_bitdiff);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
     if (target_arch != LLM_ARCH_UNKNOWN && n_measured == 0) {
         // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: the caller asked for
@@ -903,6 +1080,12 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             log_level = GGML_LOG_LEVEL_INFO;
+            // Raising the harness's own filter is not enough: common_get_verbosity() maps
+            // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE (4), and the default threshold is
+            // LOG_LEVEL_INFO (3), so every GGML_LOG_INFO line -- every [MOE-LAYOUT],
+            // [S1-PRELOAD], [UNIFIED-CACHE] line the backend emits -- was dropped by the
+            // sink after this flag had already let it through. `-v` printed nothing new.
+            common_log_set_verbosity_thold(LOG_LEVEL_TRACE);
             continue;
         }
         if (strcmp(argv[i], "--nan-trace") == 0) {
