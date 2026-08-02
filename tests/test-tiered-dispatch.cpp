@@ -22,9 +22,24 @@
 // that cannot fail. Verified by mutation: with all assertions forced false,
 // the binary still exits 0 under -DNDEBUG and 134 without it.
 //
-// UNVERIFIED: this binary aborts before reaching any assertion, at
-//     ggml-sycl.cpp:9988 `[SYCL-PLAN] failed to size VRAM arena zones from tensor
-//     inventory`, in all four mutation cells. Pre-existing and unrelated.
+// CORRECTED (llama.cpp-0igs, 2026-08-02): the note this replaced named the
+// wrong abort site -- ggml-sycl.cpp:9988 "[SYCL-PLAN] failed to size VRAM
+// arena zones" does NOT fire on a real run. The actual failure is
+// test_small_inventory_no_tiered()'s own assertion at line ~118:
+// `!tiered && "Small inventory (50% VRAM) should NOT enable tiered mode"`.
+// Root cause: g_tiered_enabled (ggml-sycl.cpp) is a process-global,
+// write-once-true, never-reset atomic. compute_vram_budget_for_plan()
+// stores it unconditionally on every call, regardless of whether the
+// inventory actually exceeds the VRAM budget -- confirmed via
+// `git log -L` on that store: it read
+// `g_tiered_enabled.store(ggml_sycl::unified_cache_enabled(), ...)` before
+// a2e5f52b9, then was hardcoded to `store(true, ...)` in 9a0670712. Once
+// this test's own test_tiered_mode_query() (200%-of-VRAM inventory, which
+// legitimately wants tiered mode) sets it, test_small_inventory_no_tiered()
+// (50%, deliberately should NOT) inherits the stuck flag regardless of its
+// own inventory. This is a real, live bug affecting any process that calls
+// ggml_backend_sycl_set_tensor_inventory() more than once with different
+// models (see the escalation to the arena/tiered-mode owner).
 //
 // Must precede <cassert>, which binds assert at include time.
 #undef NDEBUG
