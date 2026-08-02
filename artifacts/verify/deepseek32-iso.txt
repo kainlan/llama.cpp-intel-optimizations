@@ -1,0 +1,28 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 2519249043
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: deepseek32 (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.02.146.683 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=132 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.146.964 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=138 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.147.182 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=144 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.152.728 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=132 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.152.905 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=138 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.153.072 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=144 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.212.385 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=132 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.212.720 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=138 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.213.300 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=144 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.218.924 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=132 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.219.159 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=138 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.02.219.343 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=144 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+|      deepseek32|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.56e-08)|       [1;32mOK[0m|
+test case: deepseek32 (Intel(R) Core(TM) Ultra 7 265K, MoE)
+|      deepseek32|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: deepseek32 (Meta, MoE)
+|      deepseek32|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+Roundtrip gate: NMSE(device, reloaded) <= 1e-04, not bit-equality. 0 row(s) round-tripped within tolerance but not bit-for-bit.

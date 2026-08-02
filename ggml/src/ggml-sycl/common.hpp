@@ -250,8 +250,116 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
                                                    ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q));
 }
 
+// Is ANY thread currently recording a command graph?
+//
+// PROCESS-WIDE by design: g_ggml_sycl_graph_recording_depth is a global counter, so this is
+// true on threads that are not themselves recording. That is correct for conservative
+// submission constraints -- "may I emit a memcpy node?", and the host-USM-base requirement on
+// the shared staging payload path (ggml_sycl_copy_payload_to_handle_async) -- where
+// over-applying the restriction is safe.
+//
+// ⚠️ Do NOT use it to decide the SHAPE of an allocation made by the calling thread -- its role,
+// category, cohort, arena zone, or allocator path (llama.cpp-f9tg). Use
+// ggml_sycl_graph_recording_this_thread() below, or better the two intent builders next to it,
+// which hold the whole mapping in one place and carry the reasoning.
+//
+// ⚠️ Do NOT use it to decide who OWNS a thread_local resource's release. Such a decision
+// selects a per-thread sink, so a non-recording thread takes the graph-lifetime branch and
+// finds no sink of its own. MEASURED in llama.cpp-oze0: transient scratch stayed live in the
+// shared SCRATCH/STAGING zones until some unrelated context invalidated its graph, so the next
+// graph boundary's zone reset was correctly refused and launch aborted. Use
+// graph_lifetime_retention_active() (mem-handle.cpp) for that question -- it is deliberately
+// narrower, and the asymmetry is the fix, not an inconsistency to tidy away.
+//
+// Those stranded handles are then freed by whichever context clears a graph next, which is
+// ANALYSED as a cross-context use-after-free in llama.cpp-mhyw -- suspected, not yet measured.
 inline bool ggml_sycl_graph_recording_active() {
     return g_ggml_sycl_graph_recording || g_ggml_sycl_graph_recording_depth.load(std::memory_order_acquire) > 0;
+}
+
+// Is THIS thread recording a command graph?
+//
+// The per-thread counterpart of ggml_sycl_graph_recording_active() above, and deliberately
+// narrower. Use it for any question scoped to the calling thread -- "will the allocation I am
+// about to make be captured into a graph?", "who owns this handle's release?" -- where the wide
+// predicate answers a different question ("is ANY thread recording?") and is therefore true on
+// threads that have no graph at all. The asymmetry is the point, not an inconsistency to tidy
+// away: see llama.cpp-oze0 (ownership) and llama.cpp-f9tg (allocation shape).
+//
+// It deliberately does NOT also test g_graph_retained_handle_sink, which
+// graph_lifetime_retention_active() (mem-handle.cpp) does. That predicate governs RELEASE and
+// must stay true across the short window in which recording has been turned off but the sink is
+// not yet detached (ggml-sycl.cpp does clear them in that order at several graph-teardown
+// sites), because a handle released in that window still belongs to the graph. An allocation
+// made in the same window does not -- recording is already off, so no node will capture it.
+inline bool ggml_sycl_graph_recording_this_thread() {
+    return g_ggml_sycl_graph_recording;
+}
+
+// Allocation shape for a scoped device-VRAM transient -- the scoped_unified_device_temp and
+// scoped_unified_queue_temp templates in ggml-sycl.cpp, which are byte-identical here.
+//
+// The whole decision lives in this one function, predicate included, for two reasons. It is the
+// only copy of the mapping, so the two templates cannot drift apart. And it can be called with
+// no device, no queue and no unified cache, which is what
+// tests/test-sycl-transient-alloc-intent-scope.cpp does: the allocation itself is NOT reachable
+// device-free (unified_alloc -> get_unified_cache_for_device -> the SYCL device manager, which
+// aborts "No SYCL devices available"), so the decision is separated from it deliberately.
+//
+// The predicate is THIS thread's recording state, not the process-wide one (llama.cpp-f9tg). A
+// transient allocated by a thread that is not recording is captured by no graph: it is an
+// ordinary COMPUTE transient and belongs in the reset-scoped SCRATCH zone.
+//
+// Reading it from ggml_sycl_graph_recording_active() instead is ANALYSED as harmless for
+// correctness, from the definitions alone -- that predicate is a superset of this one, so it can
+// only over-apply graph treatment, never withhold it. No run could have refuted that, which is
+// precisely why the defect announced itself nowhere. The damage is to attribution, and that part
+// is MEASURED: all seven shape fields across the three templates flipped on a non-recording
+// thread whenever any other context was recording (COMPUTE/CONTROL -> GRAPH, SCRATCH zone
+// dropped, pinned pool skipped for a standalone USM base), and those are exactly the fields
+// llama.cpp-iiff Phase 0's inventory is built from.
+// tests/test-sycl-transient-alloc-intent-scope.cpp reproduces all seven against the pre-fix
+// predicate. The wide predicate also disagreed with the release side, which has routed on the
+// calling thread since llama.cpp-oze0.
+inline ggml_sycl::alloc_intent ggml_sycl_transient_device_intent(const char * cohort_id) {
+    const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
+
+    ggml_sycl::alloc_intent intent{};
+    intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
+    intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
+    intent.cohort_id = cohort_id;
+    intent.constraints.must_device = true;
+    if (!graph_lifetime) {
+        // SCRATCH is reset at every graph boundary, so a transient that must outlive the
+        // recorded graph cannot be a slice of it.
+        intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    }
+    return intent;
+}
+
+// Allocation shape for a scoped host-pinned transient -- scoped_unified_host_queue_temp in
+// ggml-sycl.cpp. Same per-thread predicate as the device form above, but a different question
+// hangs off it, so it is a separate function rather than a flag on one.
+//
+// Beyond role/category this pair also picks the ALLOCATOR PATH: a graph-recorded host payload
+// needs a driver-visible USM base (a pinned-pool slice is an interior TLSF suballocation, and
+// the pool is reset-scoped), while an ordinary CONTROL transient wants the cheap pooled slice.
+// Over-applying that is safe -- ggml_sycl_graph_recording_active() is still the right question
+// on the shared staging payload path it names -- but safe is not free: here a non-recording
+// thread was paying for a standalone sycl::malloc_host, and skipping the pool, to satisfy a
+// graph it has no part in. Correctness is unchanged either way; this is the allocator-path half
+// of llama.cpp-f9tg.
+inline ggml_sycl::alloc_intent ggml_sycl_transient_host_pinned_intent(const char * cohort_id) {
+    const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
+
+    ggml_sycl::alloc_intent intent{};
+    intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::CONTROL;
+    intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::CONTROL;
+    intent.cohort_id = cohort_id;
+    intent.constraints.must_host_pinned      = true;
+    intent.constraints.use_pinned_pool       = !graph_lifetime;
+    intent.constraints.require_host_usm_base = graph_lifetime;
+    return intent;
 }
 
 // Helper to check if we should add an event dependency.
@@ -1077,6 +1185,13 @@ struct sycl_device_info {
     size_t          max_alloc_size;       // device-reported max allocation size
     size_t          safe_max_alloc_size;  // probed safe allocation size
     //sycl_hw_info hw_info;     \\ device id and aarch, currently not used
+    // Integrated GPU: `global_mem_size` reports the SAME physical RAM the
+    // host and every other allocator on the box use, not dedicated VRAM
+    // (see llama.cpp-403s: an Arrow Lake-S iGPU reporting 231.7 GB of
+    // "global memory" drove a ~180 GB TTM-shmem arena reservation for a
+    // 19 MB model). Budget computations must consult this before taking a
+    // percentage of `total_vram`/`global_mem_size` for such a device.
+    bool            host_unified_memory  = false;
     bool            supports_soa_reorder = false;  // Device capability: can use SoA weight layout
     XMXCapabilities xmx_caps;                      // XMX matrix engine capabilities (queried at init)
     char            device_name[256] = { 0 };      // Device name for GPU family detection
@@ -1358,8 +1473,24 @@ inline tensor_usage infer_tensor_usage(const char * name) {
     // unbuilt and aborted MUL_MAT_ID with "[MOE-ROUTE] unresolved planner
     // expert ... plan_missing=1".  Keep this list in sync with
     // expert_tensor_role_from_tensor_name() in unified-cache.hpp.
+    //
+    // The "_chexps" trio is grovemoe's chunked-expert family
+    // (LLM_TENSOR_FFN_{GATE,DOWN,UP}_CHEXPS in src/llama-arch.cpp).  Those are
+    // 3D per-expert weights handed to build_moe_ffn() exactly like the plain
+    // trio, so MUL_MAT_ID routes them and they need per-expert entries; the
+    // planner's split is gated on this function returning MOE_EXPERT_WEIGHT.
+    // "ffn_gate_chexps" contains neither "ffn_gate_exps" nor "_exps", so like
+    // the fused name it needs its own literal, and grovemoe aborted the same
+    // way until it got one.
+    //
+    // Do NOT collapse this list to a bare "exps" substring.  "ffn_norm_exps"
+    // (arctic) is a 1D {n_embd} norm consumed by build_norm, not a routed
+    // expert weight, and the "ffn_*_shexp" trio is the DENSE shared-expert FFN
+    // that goes through ordinary MUL_MAT.  Both would be swept up.
     const bool moe_exps_name = strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") ||
-                               strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps");
+                               strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps") ||
+                               strstr(name, "ffn_gate_chexps") || strstr(name, "ffn_up_chexps") ||
+                               strstr(name, "ffn_down_chexps");
     if (moe_exps_name && !strstr(name, ".bias")) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }
@@ -4110,10 +4241,18 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
             }
 
             const char * tensor_name = tensor->name ? tensor->name : "";
-            const bool   is_composite_moe_weight =
-                tensor->ne[2] > 1 && std::strstr(tensor_name, "_exps.weight") != nullptr &&
-                std::strstr(tensor_name, ".bias") == nullptr &&
-                ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
+            // "exps.weight", not "_exps.weight": grovemoe's chunked-expert
+            // tensors are named "...ffn_gate_chexps.weight", which has no
+            // underscore before "exps".  With the stricter literal the refusal
+            // below never fired for them, so a placement-planned composite
+            // chexps tensor could still be materialized whole -- the exact
+            // thing this guard exists to prevent.  The MOE_EXPERT_WEIGHT and
+            // ne[2] > 1 clauses below already pin the set; the name test is
+            // only a cheap pre-filter.
+            const bool   is_composite_moe_weight = tensor->ne[2] > 1 &&
+                                                 std::strstr(tensor_name, "exps.weight") != nullptr &&
+                                                 std::strstr(tensor_name, ".bias") == nullptr &&
+                                                 ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
             if (cache->has_placement_plan() && is_composite_moe_weight) {
                 GGML_SYCL_DEBUG(
                     "[RESOLVE] refusing composite MoE expert tensor materialization for placement-planned '%s' "
@@ -5867,6 +6006,42 @@ bool gpu_has_xmx(sycl::device & dev);
 
 // XMXCapabilities struct and query_xmx_capabilities() declaration
 // moved to line ~487 so sycl_device_info can include xmx_caps as a member
+
+// Direct SYCL query for sycl::info::device::host_unified_memory, bypassing
+// ggml_sycl_info(). Safe to call from paths that may run during
+// ggml_sycl_info()'s own static initialization (mirrors the constraint on
+// query_device_memory_no_info() in unified-cache.cpp: dereferencing
+// ggml_sycl_info() there can deadlock). Returns false (i.e. "treat as
+// discrete") if the query throws.
+bool ggml_sycl_device_is_host_unified(const sycl::device & dev);
+
+// Portable (non-SYCL) queries of total/available system RAM in bytes.
+// Returns 0 if detection fails. Used to size VRAM budgets for host-unified
+// (integrated) GPUs, whose "global memory" is backed by this same RAM --
+// see ggml_sycl_vram_budget_base_mem() below.
+size_t ggml_sycl_get_total_system_memory_bytes();
+size_t ggml_sycl_get_available_system_memory_bytes();
+
+// Adjusts a raw device memory total for VRAM-budget purposes (see
+// llama.cpp-403s). Host-unified (integrated) GPUs report system RAM as
+// "global memory" -- an Arrow Lake-S iGPU reporting 231.7 GB drove a
+// single-chunk VRAM-arena reservation of nearly the same size, landing
+// entirely in TTM shmem (system RAM) backing, for a 19 MB model. Taking a
+// raw percentage of that number budgets against memory the host and every
+// other allocator on the box need too.
+//
+// For host-unified devices, returns min(raw_total_mem, a small fixed
+// absolute cap, further tightened by a fraction of *currently available*
+// system RAM on small machines). A flat PERCENTAGE of raw_total_mem was
+// tried first and rejected: on a big-RAM host it can still exceed a real
+// discrete card's dedicated VRAM (measured: 25% of ~211 GB available gave
+// an integrated GPU a 53 GB arena against the B70's 31.9 GB), so the cap
+// must not scale with host RAM. For discrete devices (the common case),
+// returns raw_total_mem unchanged: this is a no-op on the existing,
+// documented-correct `min(total*pct, free_at_init)` discrete-GPU budget
+// path, and GGML_SYCL_VRAM_BUDGET_PCT continues to apply (by both call
+// sites, unchanged) on top of whatever this function returns.
+size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {

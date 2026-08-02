@@ -201,7 +201,15 @@ function(llama_build_and_test source)
         COMMAND $<TARGET_FILE:${TEST_TARGET}>
         ${LLAMA_TEST_ARGS})
 
-    set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    # Exit 77 is the skip status, matching llama_test_pytest above and the
+    # test-sycl-*-policy.sh family. Without it a test that skips at run time --
+    # the model-requiring ones via test_skip_no_model() in tests/test-skip.h --
+    # would be reported "Passed", indistinguishable from a run that did the
+    # work. Set here rather than per-registration so no future model-requiring
+    # test can be added without it (llama.cpp-nwip).
+    set_tests_properties(${TEST_TARGET} PROPERTIES
+        LABELS "${LLAMA_TEST_LABEL}"
+        SKIP_RETURN_CODE 77)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
@@ -280,7 +288,48 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    # Gates -x/--exclude of test-llama-archs (llama.cpp-fepd). Inside this block, not beside
+    # test-archs-table below, because it calls llm_arch_from_string()/llm_arch_all() -- the same
+    # internal symbols test-llama-archs uses, and the reason for the NOT WIN32 OR NOT
+    # BUILD_SHARED_LIBS guard in the first place. It still loads no model and touches no device.
+    #
+    # On the name: NOT test-llama-archs-exclude. Four CI workflows carry `ctest -E
+    # "test-llama-archs"` and -E is an UNANCHORED regex, so that name would be swallowed by the
+    # pattern meant for the test it gates, and the gate would silently never run. See the note
+    # on test-archs-table below -- this is the same trap, already sprung once.
+    llama_build_and_test(test-archs-exclude.cpp)
+
+    if (NOT WIN32)
+        # The other half: that main() actually rejects a bad -x, which the unit test above
+        # cannot see. Every invocation in the script exits inside argument parsing, so it never
+        # reaches the model-loading sweep -- see the warning at the top of the script before
+        # adding a probe to it.
+        llama_test_cmd(
+            bash
+            NAME test-archs-exclude-cli
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-archs-exclude-cli.sh $<TARGET_FILE:test-llama-archs>
+        )
+        # The script exits 77 (skip) when the binary it drives was not built.
+        set_tests_properties(test-archs-exclude-cli PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
+
+# Gates the results table of test-llama-archs against the log output it shares a stream with
+# (llama.cpp-to9m). Registered unconditionally and outside the block above: it drives the
+# emitter in test-archs-table.h directly, so it loads no model, touches no device, and
+# needs neither a vocab nor a backend.
+#
+# NOT named test-llama-archs-table, however obvious that name looks. Four CI workflows carry
+# `ctest -E "test-llama-archs"` (build-apple.yml, build-openvino.yml x3) to disable the test
+# this one gates, and `-E` is an UNANCHORED regex -- so that name is swallowed by the same
+# pattern and the gate would silently never run. Measured: `ctest -N -E "test-llama-archs"`
+# listed neither, `-E "^test-llama-archs$"` listed the gate. Anchoring the workflows would
+# also fix it, but they are upstream files that a rebase reverts without a word, and the cost
+# of losing that fix is a gate nobody knows has stopped running. A name the pattern cannot
+# catch needs no upstream cooperation. Do not "tidy" this back.
+llama_build_and_test(test-archs-table.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
@@ -546,6 +595,29 @@ if (NOT WIN32)
         LABEL "build;policy"
         TIMEOUT 60
     )
+
+    # Gate for the skip policy itself: a test that skips must exit 77, and
+    # llama_build_and_test() must keep SKIP_RETURN_CODE 77 so ctest scores that
+    # as "Skipped" rather than "Passed" (or, for a test that already exits 77
+    # deliberately like test-llama-archs, rather than "Failed"). llama.cpp-nwip:
+    # get_model_or_exit() exited EXIT_SUCCESS, so three model-requiring tests
+    # reported green in 0.18 s having loaded nothing. Both halves of the fix are
+    # one edit from gone -- tests/get-model.cpp is upstream code a rebase can
+    # revert, and the property is a single line here -- so this asserts the
+    # source text AND runs a binary to check the exit code. Needs no model and
+    # no GPU: the skip path returns before llama is touched.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-skip-policy.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "build;policy"
+        TIMEOUT 180
+    )
+    # Resolved at generate time, so the target may be declared further down this
+    # file. Passing the path beats having the script guess a build directory --
+    # it cannot know which one ctest is running from.
+    set_property(TEST test-skip-policy PROPERTY
+        ENVIRONMENT "LLAMA_TEST_SKIP_BINARY=$<TARGET_FILE:test-autorelease>")
 
     # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
     # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It

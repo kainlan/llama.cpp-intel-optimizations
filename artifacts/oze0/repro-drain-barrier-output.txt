@@ -1,0 +1,135 @@
+repro-drain-barrier -- device-free measurement, llama.cpp-oze0
+tree: cf802823c (task/oze0)   date: 2026-08-01   host load average ~50-60 (busy; irrelevant to a ratio)
+
+Build (no device required, no oneAPI device selector needed):
+
+  icpx -fsycl -Wno-narrowing -DGGML_SYCL_WARP_SIZE=32 -DGGML_SYCL_DNNL=1 \
+       -I ggml/src/ggml-sycl -I ggml/src -I ggml/include \
+       -o repro-drain-barrier artifacts/oze0/repro-drain-barrier.cpp \
+       -L build/bin -lggml-sycl -lggml-base -lggml -Wl,-rpath,$PWD/build/bin
+
+QUESTION: ggml_sycl_graph_boundary_reset_arenas() relies on
+drain_retained_handles(true) to make "the SCRATCH zone is empty" a safe
+precondition for graph launch. Is that drain a barrier against another
+context that owns scratch?
+
+ANSWER: no, and not marginally so.
+
+Batch 1 -- kHoldWindow 50 us, 2000 owner iterations, 10 runs:
+
+  drains=9146748  held=8106071  (88.62%)  REPRODUCED
+  run2: TIMED OUT at 180 s (harness limit, not a hang)
+  drains=5232676  held=4397782  (84.04%)  REPRODUCED
+  drains=9019376  held=7460513  (82.72%)  REPRODUCED
+  drains=7526685  held=6729252  (89.41%)  REPRODUCED
+  drains=6556013  held=6192806  (94.46%)  REPRODUCED
+  drains=8921615  held=8120193  (91.02%)  REPRODUCED
+  drains=8896861  held=8392388  (94.33%)  REPRODUCED
+  drains=6306403  held=6247244  (99.06%)  REPRODUCED
+  drains=8640259  held=6858807  (79.38%)  REPRODUCED
+
+Batch 2 -- same binary, re-run for the record:
+
+  drains=11358829 held=10076734 (88.71%) REPRODUCED
+  run2: TIMED OUT at 240 s (harness limit)
+  drains=10701052 held=8552892  (79.93%) REPRODUCED
+  drains=11480712 held=10298616 (89.70%) REPRODUCED
+  run5: TIMED OUT at 240 s (harness limit)
+
+12 of 12 completed runs reproduce, at 79-99% of boundary crossings. The three
+non-results are the harness timeout (the boundary thread spins millions of
+drains per run under host load ~55); no run has ever reported 0 with a
+faithful hold window. An earlier variant with a 200-cycle hold window -- far
+shorter than a real stream_dma submission -- reproduced in only 1 of 5 runs,
+which is why the window was widened to something honest rather than left where
+it flattered the barrier.
+
+WHAT THIS MEANS
+
+drain_retained_handles(true) waits for state.queue to empty and state.active to
+reach 0. A thread holding an allocation that has not YET been handed to
+retain_handles_until_event() is in neither structure, so it is invisible. The
+drain therefore returns "all clear" while another context demonstrably owns
+scratch, and the reset that follows is correctly refused -- aborting graph
+launch.
+
+CONSEQUENCE FOR ATTRIBUTION
+
+*** THE PARAGRAPH BELOW IS SUPERSEDED -- see "v2" at the end of this file. ***
+*** "exactly ONE" is WRONG. The count is a DISTRIBUTION bounded by the      ***
+*** number of concurrent contexts; it was fixed at 1 here only because v1   ***
+*** has exactly one owner thread. Do not quote this paragraph.              ***
+
+[superseded] This predicts exactly ONE live allocation in the live-zone dump: a
+single concurrent owner caught in the window, not an accumulating set. That
+matches the measurement on the merge commit (alloc_id=226, one allocation,
+available=511.2 MB vs target=512.0 MB -- a shortfall of 828504 bytes, i.e.
+exactly one). It does NOT match the "accumulation" reading in cf802823c's
+commit message, which is retracted; see the correction commit.
+
+[current] The TOCTOU account predicts a BOUNDED, VARYING count -- 1 on one run
+and 2 on the next at the same -np 4 are both inside it. The discriminator
+against the pre-fix stranding account is growth vs boundedness, never "1 vs 4".
+
+CONSEQUENCE FOR THE EPIC (llama.cpp-iiff)
+
+The reset cannot be made safe by draining harder, ordering better, or holding a
+lock longer -- the owner is not observable from the boundary at all. This is
+positive evidence for Phase 2's "delete the reset" rather than for any attempt
+to repair the precondition.
+
+
+================================================================================
+v2 -- HOW MANY owners should the boundary expect to find? (2026-08-01, later)
+================================================================================
+
+WHY THIS EXISTS
+
+v1 above has exactly ONE owner thread, so it can only ever observe 0 or 1
+holders. The claim derived from it -- "the TOCTOU predicts exactly one live
+allocation" -- was reading a harness parameter as a prediction about the system.
+The lead then measured TWO live get_rows:seq_device allocations (alloc_id 226 and
+231, shortfall 1.6 MB = 2 x 828504) at the same -np 4 that had previously shown
+one. That is what prompted this.
+
+repro-drain-barrier-multi.cpp takes an owner count and histograms how many
+holders the boundary finds per crossing. test-thread-safety runs several
+contexts, so N owners + 1 boundary is the faithful shape.
+
+MEASURED
+
+  owners=1  crossings=2030    0 live:   15 ( 0.74%)   1 live: 2015 (99.26%)
+  owners=2  crossings=1638    0 live:    1 ( 0.06%)   1 live:  219 (13.37%)
+                                                      2 live: 1418 (86.57%)
+  owners=3  crossings=1142    0 live:    6 ( 0.53%)   1 live:   70 ( 6.13%)
+                                                      2 live:   45 ( 3.94%)
+                                                      3 live: 1021 (89.40%)
+
+CONCLUSION
+
+The count is a DISTRIBUTION bounded by the number of concurrent non-boundary
+contexts, not a constant. With 3 owners the boundary finds 1, 2 or 3. Observing
+1 on one run and 2 on the next at the same -np 4 is the race showing its range --
+it is what this model predicts, not a correction to it.
+
+The "exactly one" reading was an artifact of v1's single owner thread, and the
+owners=1 row above is that artifact reproduced deliberately: 99.26% of crossings
+find exactly 1, because 1 is the only non-zero value available.
+
+THE DISCRIMINATOR, RESTATED CORRECTLY
+
+The pre-fix STRANDING account and the residual TOCTOU account were never
+distinguished by "1 vs 4". They are distinguished by:
+
+  stranding  ->  count GROWS, because handles accumulate in graph_unwaitable
+                 until some context invalidates a graph
+  TOCTOU     ->  count is BOUNDED and VARIES run to run, bounded by the number
+                 of concurrent contexts
+
+1 then 2 at -np 4 is bounded-and-varying. 224/226/227/228 accumulating was
+growth. Both observations still land where they were said to land; the reasoning
+that connected them was sloppy and is corrected here.
+
+Note also that "found 0 live holders" -- the only case where the reset succeeds --
+is 0.06-0.74% of crossings across all three configurations. The precondition the
+graph boundary asserts is almost never true under concurrency.

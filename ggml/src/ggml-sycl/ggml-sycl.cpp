@@ -1284,21 +1284,12 @@ template <typename T> struct scoped_unified_device_temp {
             return true;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = ctx.stream();
         req.device               = ctx.device;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
-        req.intent.cohort_id               = cohort_id;
-        req.intent.constraints.must_device = true;
-        if (!graph_lifetime) {
-            req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
-        }
+        req.intent               = ggml_sycl_transient_device_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {
@@ -1373,21 +1364,12 @@ template <typename T> struct scoped_unified_queue_temp {
             return nullptr;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = &q;
         req.device               = target;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
-        req.intent.cohort_id               = cohort_id;
-        req.intent.constraints.must_device = true;
-        if (!graph_lifetime) {
-            req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
-        }
+        req.intent               = ggml_sycl_transient_device_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {
@@ -1465,20 +1447,12 @@ template <typename T> struct scoped_unified_host_queue_temp {
             return nullptr;
         }
 
-        const bool graph_lifetime = ggml_sycl_graph_recording_active();
-
         ggml_sycl::alloc_request req{};
         req.queue                = &q;
         req.device               = target;
         req.size                 = count * sizeof(T);
         req.suppress_failure_log = true;
-        req.intent.role          = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::CONTROL;
-        req.intent.category =
-            graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::CONTROL;
-        req.intent.cohort_id                         = cohort_id;
-        req.intent.constraints.must_host_pinned      = true;
-        req.intent.constraints.use_pinned_pool       = !graph_lifetime;
-        req.intent.constraints.require_host_usm_base = graph_lifetime;
+        req.intent               = ggml_sycl_transient_host_pinned_intent(cohort_id);
 
         ggml_sycl::alloc_handle alloc_handle{};
         if (!ggml_sycl::unified_alloc(req, &alloc_handle) || !alloc_handle.ptr) {
@@ -10061,7 +10035,17 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
                                          size_t &                    free_mem_out) {
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(ctx->device, &free_mem, &total_mem);
-    const size_t base_mem      = total_mem > 0 ? total_mem : free_mem;
+    const size_t raw_base_mem = total_mem > 0 ? total_mem : free_mem;
+    // Host-unified (integrated) GPUs report system RAM as "global memory" --
+    // see llama.cpp-403s and the matching adjustment in unified-cache.cpp's
+    // create_cache_for_device(), which is where the actual VRAM-arena malloc
+    // this budget feeds into happens. This call is safe here (unlike in that
+    // deadlock-sensitive path): placement-plan computation only runs during
+    // model load, well after ggml_sycl_info()'s static init has completed.
+    const bool   host_unified =
+        (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
+        ggml_sycl_info().devices[ctx->device].host_unified_memory;
+    const size_t base_mem      = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
     const size_t base_headroom = 0;
 
     int          budget_pct     = 100;
@@ -16329,6 +16313,13 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].total_vram           = device_vram;
         info.devices[i].max_alloc_size       = std::min(prop.get_max_mem_alloc_size(), device_vram);
         info.max_work_group_sizes[i]         = prop.get_max_work_group_size();
+        // Integrated GPUs report system RAM as "global memory" -- see
+        // ggml_sycl_vram_budget_base_mem() (common.cpp) and llama.cpp-403s.
+        // Cached here (rather than queried live at every budget computation)
+        // so paths that must avoid ggml_sycl_info() reentry during static
+        // init use ggml_sycl_device_is_host_unified() directly instead; this
+        // cached copy is for the (safe, post-init) placement-plan path.
+        info.devices[i].host_unified_memory  = ggml_sycl_device_is_host_unified(device);
 
         // Store device name for GPU family detection (used for ESIMD limits)
         std::string name = device.get_info<sycl::info::device::name>();
@@ -16387,10 +16378,16 @@ static ggml_sycl_device_info ggml_sycl_init() {
         size_t       safe_alloc    = (size_t) std::floor((double) probe_upper * safety_margin);
 
         info.devices[i].safe_max_alloc_size = safe_alloc;
-        GGML_LOG_INFO("[SYCL] Device %d alloc caps: raw=%.1f MB, safe=%.1f MB\n", i,
+        // WARN, not INFO: GGML_LOG_INFO is dropped at default verbosity in
+        // every tool (common_get_verbosity() maps INFO to TRACE against a
+        // threshold that excludes it -- see llama.cpp-403s), so an INFO line
+        // here would be invisible in exactly the runs where someone is
+        // wondering where their RAM went. This is a one-time per-device
+        // startup line, not per-op, so promoting it to WARN is not spam.
+        GGML_LOG_WARN("[SYCL] Device %d alloc caps: raw=%.1f MB, safe=%.1f MB, host_unified=%s\n", i,
                       info.devices[i].max_alloc_size / (1024.0 * 1024.0),
-
-                      info.devices[i].safe_max_alloc_size / (1024.0 * 1024.0));
+                      info.devices[i].safe_max_alloc_size / (1024.0 * 1024.0),
+                      info.devices[i].host_unified_memory ? "yes" : "no");
         // Query XMX (Intel matrix engine) capabilities
         info.devices[i].xmx_caps = query_xmx_capabilities(device);
         const auto & caps        = info.devices[i].xmx_caps;
@@ -27780,8 +27777,31 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
             }
 
             size_t offset_within_layer = abs_offset - ctx->layer_base_offsets[layer_id];
-            void * old_data            = tensor->data;
-            tensor->data               = static_cast<char *>(la.ptr) + offset_within_layer;
+
+            // Bounds check: the remapped pointer must lie inside the per-layer
+            // allocation.  This FAILS the allocation, and it runs BEFORE
+            // tensor->data is touched so the failure path leaves no
+            // out-of-bounds pointer behind.
+            //
+            // It used to log and then return GGML_STATUS_SUCCESS with an OOB
+            // tensor->data, so a memory-safety violation surfaced downstream as
+            // "some architecture produces nan" — or as nothing at all.  Ten
+            // architectures were reading past the end of their KV slices and
+            // seven of them reported OK (llama.cpp-2120).
+            //
+            // ggml-alloc.c's alloc_tensor_range() turns a non-SUCCESS status
+            // into "failed to initialize tensor <name>", frees the buffers and
+            // returns NULL, so KV cache creation fails loudly instead.
+            if (offset_within_layer + ggml_nbytes(tensor) > la.size) {
+                GGML_LOG_ERROR(
+                    "[KV-REMAP] ERROR: %s overflows layer alloc! "
+                    "off_in_layer=%zu + nbytes=%zu > la.size=%zu\n",
+                    name, offset_within_layer, ggml_nbytes(tensor), la.size);
+                return GGML_STATUS_ALLOC_FAILED;
+            }
+
+            void * old_data = tensor->data;
+            tensor->data    = static_cast<char *>(la.ptr) + offset_within_layer;
 
             // Set the smart handle for both device and host-pinned KV layers so
             // SET_ROWS and attention dispatch can route by actual residency.
@@ -27809,19 +27829,12 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
                     offset_within_layer, la.ptr, la.size, tensor->data, alloc_type_str);
             }
 
-            // Bounds check: verify remapped pointer is within the per-layer allocation
-            if (offset_within_layer + ggml_nbytes(tensor) > la.size) {
-                GGML_LOG_ERROR(
-                    "[KV-REMAP] ERROR: %s overflows layer alloc! "
-                    "off_in_layer=%zu + nbytes=%zu > la.size=%zu\n",
-                    name, offset_within_layer, ggml_nbytes(tensor), la.size);
-            }
-
             // A7L5W Site 4: hard assertion on the remapped pointer covering the
-            // tensor.  Without this, the overflow only emits a log line and
-            // execution continues with an OOB pointer.  Under the A7L5W
-            // compile flag we want the process to abort at the site of the
-            // bad pointer construction, not downstream in a JIT kernel.
+            // tensor.  The per-layer overflow above now fails unconditionally,
+            // so this only fires on the registry-level invariants the bounds
+            // check does not cover — and, under the A7L5W compile flag, aborts
+            // at the site of the bad pointer construction rather than
+            // downstream in a JIT kernel.
             GGML_SYCL_A7L5W_ASSERT_TENSOR("kv_remap/per_layer", tensor, tensor->data, ggml_nbytes(tensor));
 
             return GGML_STATUS_SUCCESS;
@@ -28159,24 +28172,30 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     };
     const bool kv_buffer_covers_all_layers =
         has_explicit_layer_mask ? explicit_layer_count == n_layers : buffer_kind == kv_buffer_kind::ALL_LAYERS;
-    size_t   kv_per_layer;
-    uint32_t n_kv_layers;
+    // The slice is the ONE place the per-layer KV size is decided, and it is
+    // what the tier manager is configured with — see kv_slice_size.  The
+    // denominator must be the layers that actually hold KV in *this* buffer;
+    // dividing by the model's layer count undersizes every slice on any model
+    // where some layers hold no KV, and the cache is then written out of
+    // bounds (llama.cpp-2120).
+    ggml_sycl::kv_slice_size kv_slice;
     if (has_explicit_layer_mask) {
-        n_kv_layers  = explicit_layer_count > 0 ? explicit_layer_count : n_layers;
-        kv_per_layer = size / n_kv_layers;
+        kv_slice =
+            ggml_sycl::kv_slice_size::from_layer_mask(size, explicit_layer_count > 0 ? explicit_layer_count : n_layers);
     } else if (buffer_kind == kv_buffer_kind::FULL_ATTN_ONLY) {
         // Size matches expected full-attention total (within 10% for alignment)
-        kv_per_layer = planner_full_kv;
-        n_kv_layers  = n_full_layers;
+        kv_slice = ggml_sycl::kv_slice_size::from_planner_bytes(size, planner_full_kv, n_full_layers);
     } else if (buffer_kind == kv_buffer_kind::SWA_ONLY) {
         // Smaller than full-attn total — this is the SWA buffer
-        n_kv_layers  = n_swa_layers;
-        kv_per_layer = size / n_kv_layers;
+        kv_slice = ggml_sycl::kv_slice_size::from_planner_layers(size, n_swa_layers);
     } else {
-        // Fallback: divide evenly across model layers
-        kv_per_layer = (n_layers > 0) ? size / n_layers : size;
-        n_kv_layers  = n_layers;
+        // No layer mask and no planner KV geometry: every model layer is
+        // *assumed* to hold KV.  The only defensible use of n_layers here.
+        kv_slice = ggml_sycl::kv_slice_size::from_model_layers_unverified(size, n_layers);
     }
+    const size_t   kv_per_layer = kv_slice.bytes();
+    const uint32_t n_kv_layers  = kv_slice.kv_layers();
+
     const size_t aligned_per_layer = (kv_per_layer + 511) & ~size_t(511);
     GGML_LOG_INFO("[KV-ALLOC] kv_per_layer=%.1f MB (full=%.1f MB, swa=%.1f MB), n_kv_layers=%u/%u\n",
                   kv_per_layer / (1024.0 * 1024.0), planner_full_kv / (1024.0 * 1024.0),
@@ -28252,9 +28271,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
 
     if (kv_plan) {
-        mgr.configure_from_plan(device, *kv_plan, n_layers, size);
+        mgr.configure_from_plan(device, *kv_plan, n_layers, kv_slice);
     } else {
-        mgr.configure_with_weights(device, n_layers, kv_vram_cap, size);
+        mgr.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }
 
     // Compute per-layer layout from the tier manager.
@@ -28586,7 +28605,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     for (uint32_t l = 0; l < n_layers; ++l) {
         actual_layer_on_device[l] = layer_allocs[l].on_device;
     }
-    mgr.set_actual_layer_placement(device, actual_layer_on_device, size);
+    mgr.set_actual_layer_placement(device, actual_layer_on_device);
 
     // Plan-vs-actual divergence diagnostic (T4 acceptance criterion):
     // If a placement plan exists, verify that actual allocation matches the
@@ -72366,9 +72385,34 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_op_gated_linear_attn(ctx, safe_dst);
             break;
 
+            // The ops below are recovered upstream dispatch (ad0922465, a93c0ef0f) whose
+            // ggml-sycl.cpp hunks were lost in a merge; the kernels were always compiled and
+            // linked, only the wiring was missing.  Their entry points still take a raw
+            // ggml_tensor * and read tensor->data directly, so they take `dst` rather than
+            // `safe_dst` -- converting them to ggml_sycl::sycl_tensor/resolve_as (as
+            // ssm_conv, roll and gla already are) is a separate change to those .cpp files.
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_sycl_gated_delta_net(ctx, dst);
+            break;
+
         case GGML_OP_SSM_CONV:
             ggml_sycl_ssm_conv(ctx, safe_dst);
 
+            break;
+        case GGML_OP_SSM_SCAN:
+            ggml_sycl_ssm_scan(ctx, dst);
+            break;
+        case GGML_OP_FILL:
+            ggml_sycl_fill(ctx, dst);
+            break;
+        case GGML_OP_CUMSUM:
+            ggml_sycl_cumsum(ctx, dst);
+            break;
+        case GGML_OP_DIAG:
+            ggml_sycl_diag(ctx, dst);
+            break;
+        case GGML_OP_SOLVE_TRI:
+            ggml_sycl_solve_tri(ctx, dst);
             break;
         case GGML_OP_ROLL:
 
@@ -93665,9 +93709,25 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
+        case GGML_OP_GATED_DELTA_NET:
             return true;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_SCAN:
+            if (op->src[3]->ne[0] == 1) {
+                // Mamba2
+                // (kernel only supports (d_state == 128 || d_state == 256) && d_head % WARP_SIZE == 0)
+                return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % WARP_SIZE == 0;
+            } else {
+                // TODO Mamba-1 not yet ported to SYCL
+                return false;
+            }
+        case GGML_OP_FILL:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_DIAG:
+            return true;
+        case GGML_OP_SOLVE_TRI:
+            return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_ROLL:
             return op->type == GGML_TYPE_F32;
 

@@ -715,13 +715,40 @@ Detail Standard.
 audit**: `get_rows:seq_device` and `get_rows_indices_small_host` (both Task 8), and the
 291-entry weight-lease leak (Task 8b). This task covers whatever the audit adds beyond those.
 
-Indicative further candidates, derived from reading the eight drain steps — i.e. escapes
-that already bit someone, **not** a substitute for the inventory:
+> **PHASE 0 HAS REPORTED (2026-08-01). This task's scope collapsed to almost nothing —
+> read `llama.cpp-iiff` comment `c-jec1` before planning any work here.**
+>
+> Across three captures (Mistral 7B Q4_0, GPT-OSS 20B MXFP4, `test-thread-safety` with three
+> models), **every non-weight reset site reported `visits_with_live=0`**: device SCRATCH on
+> dev0/dev1/dev2, device ONEDNN, host SCRATCH, host STAGING, and scratch-pool bump. The
+> indicative candidate list below — staging-cache entries, TBB worker captures, in-flight BCS
+> DMA staging, managed host-pinned buffers — produced **zero** live allocations at reset.
+>
+> The audit found exactly **four** cohorts, and three already have owners:
+> `weight:leaked_lease` and `weight:leased` (Task 8b), `get_rows_indices_small_host` (Task 8),
+> and `weight:owned_by_live_model` — which is **correct behaviour, not an escape**, and must
+> not be ticketed.
+>
+> **So Task 9 currently has no cohorts of its own.** Do not open speculative tickets from the
+> list below; the measurement says they are not live.
+>
+> ⚠️ Scope of that claim, stated precisely: this is "not observed across three workloads",
+> **not** "cannot occur". The captures did not include `test-llama-archs` or the full sweep
+> (deferred by owner decision — both are 195–206 GB runs on a host that OOM'd that day). A
+> workload exercising a path none of the three touched could still surface a cohort. Re-run
+> the audit rather than reasoning from this note if you add a materially different workload.
 
-- staging-cache entries holding reset-zone pointers (`ggml_sycl_clear_staging_cache`)
-- TBB worker captures (`g_pending_scatter`, `g_pending_cpu_pipeline`)
-- in-flight BCS DMA staging (`staging_pool().release_all_idle`)
-- whatever `reset_managed_host_pinned_buffers_before_host_zone_reset` covers
+Indicative further candidates, derived from reading the eight drain steps — i.e. escapes
+that already bit someone. **All four were checked by the audit and found NOT live.** Retained
+only as a record of what was ruled out:
+
+- ~~staging-cache entries holding reset-zone pointers (`ggml_sycl_clear_staging_cache`)~~
+- ~~TBB worker captures (`g_pending_scatter`, `g_pending_cpu_pipeline`)~~
+- ~~in-flight BCS DMA staging (`staging_pool().release_all_idle`)~~
+- ~~whatever `reset_managed_host_pinned_buffers_before_host_zone_reset` covers~~
+
+This is a *good* result for Tasks 10–11: the drains guarding these zones are guarding nothing
+in the measured workloads, which is exactly the evidence Task 10 needs to delete them.
 
 **Acceptance Criteria (per cohort ticket):**
 
@@ -792,7 +819,13 @@ first — they are the workarounds — re-verify empty, then delete the reset it
 
 - [ ] No `zone_reset` / `host_zone_reset` / `reset_scratch_pool` call remains in the backend.
 - [ ] All zone allocations release via refcount reaching zero.
-- [ ] `test-thread-safety` 3x; `test-llama-archs` no worse; Mistral + GPT-OSS gates pass.
+- [ ] `test-thread-safety` **once** — never looped. (This line read "3x" until 2026-08-01. It is
+      the same withdrawn criterion Task 7 already carries a warning about, surviving in a second
+      place because the retraction was recorded as a tracker comment and never applied to the
+      doc. Measured: one run peaks at 156–180 GB of `Shmem` on a 255 GB host **for a 19 MB
+      model** — see `llama.cpp-403s`. Two do not fit.) If one run is genuinely insufficient
+      evidence for a race, build a narrower in-process reproducer.
+- [ ] `test-llama-archs` no worse — **one** run; Mistral + GPT-OSS gates pass.
 - [ ] Interleaved A/B shows no throughput regression beyond documented noise (B70 tg is noisy,
       cv 3.3 %; the B50 is the sensitive instrument at cv 0.7 %).
 - [ ] `zone_largest_free` does not degrade over a long run.
@@ -806,7 +839,16 @@ first — they are the workarounds — re-verify empty, then delete the reset it
   should become mask-driven off `9f3a2e0f0`'s `owner_mask`, but the behaviour must survive.
 - `LOAD_BOUNDARY` / `MID_LOAD_REPLAN` erase is a separate question — see `llama.cpp-4r37`.
   Measured `erased=0` in a multi-model run, but `impl-acsq`'s patch claims it prevents TLSF
-  fragmentation. Settle with data; both cannot be generally true.
+  fragmentation. ⚠️ **Phase 0 settled the fragmentation half of this (2026-08-01,
+  `llama.cpp-iiff` comment `c-6ngo`): there is none.** `zone_largest_free` was sampled at first
+  visit, last visit and minimum across three workloads — in 9 of 11 zone/capture pairs
+  `first == last == min`, i.e. the largest free block never shrank at all. The worst case was a
+  44 % occupancy dip that still left a 143 MB contiguous block; a fragmenting allocator instead
+  shows `min` collapsing toward zero while total free stays high. Allocator cost is likewise
+  negligible (~350 ns per op amortised; 4.4 / 10.4 / 0.2 ms total per capture). **So the
+  anti-fragmentation justification for that erase does not hold, and the wider "should we
+  replace TLSF?" question is answered NO.** What remains of `4r37` is only whether the erase
+  serves some *other* purpose — decide that on its own merits, not on fragmentation.
 
 ---
 

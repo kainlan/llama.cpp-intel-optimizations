@@ -460,6 +460,8 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness supplies the channel id each session). Terminal text is logging only — never "await a reply" there.
 - **Work on the active feature branch** (`git branch --show-current` — do not trust a branch name written down here). When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
 - **Worktrees are allowed and are the right tool for build-heavy parallel work** (owner decision, 2026-08-01). This entry previously said *"skip git worktrees — a worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate."* The cost is real but was overstated: **ccache is global (`~/.ccache`), not per-tree**, so a worktree build still gets its hits; only the `build/` object tree and CMake cache are fresh.
+  ⚠️ **But "still gets its hits" is only half true, and the missing half is the expensive one.** ccache keys on the compiler command line, and a **new worktree path misses on every TU whose command line embeds absolute paths** — which here includes `ggml-sycl.cpp`, the 60k-line one. Measured 2026-08-01: a first build in a fresh worktree spent **~50 minutes on that single translation unit**, against a lifetime ccache hit rate of 82.8 %. So **a first build at a NEW path is close to a cold build regardless of ccache**; only *subsequent* builds in that same worktree are cheap.
+  Consequence for fan-out: size a wave by the number of **first** builds it triggers, not by the number of tasks. Reusing an existing worktree for a follow-up task is dramatically cheaper than creating one, and three concurrent first-builds on this 20-core box is already past the point where adding agents slows everything down (measured: load 96, ~1 wave/hour).
   Measured 2026-08-01: with one shared `build/`, four agents serialised on a ~14-min build cycle and one track was starved **~2 hours**. Two worktree builds completed fine in the same session. Path-scoped commits prevent *file* conflicts; they do nothing about *build* contention, and that is what actually costs time.
   Use a worktree when a track will build repeatedly. Stay in the shared checkout when the work is small, or when it must operate on the checked-out branch itself (git refuses to check out one branch in two trees — so a **merge into** the active branch must happen in the main checkout, though only the build needs isolating).
   ⚠️ **Lock scope follows the build directory, not the act of building.** Shared checkout → take `/Apps/llama.cpp/BUILD.lock`. Own worktree → take nothing; nothing contends. `GPU.lock` is always global, from any tree, because the *devices* are shared.
@@ -507,6 +509,65 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   for `Shmem < 30 GB` **and** `MemAvailable > 150 GB`; if it has not settled in ~10 minutes,
   release the lock and escalate rather than proceeding or holding it while you wait.
 
+  ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
+  2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports
+  231.7 GB of "VRAM" that is actually system RAM, against a budget defaulting to 100 % (see
+  the VRAM-budget entry under Architecture). Every binary in the list below enumerates all
+  devices because none of them pins a selector.
+
+  **Pinning the selector to the discrete cards holds `Shmem` flat.** Measured on a full model
+  load: `level_zero:0` → 2.4 GB, `level_zero:0,1` → 2.4 GB, unset → 127.8 GB.
+
+  ```bash
+  # Prefer this for ANY local test run that does not specifically need the iGPU:
+  ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure
+  ```
+
+  **Now measured on the two worst offenders, and both collapse to nothing:**
+
+  | binary | unpinned | pinned `level_zero:0,1` |
+  |--------|---------:|------------------------:|
+  | `llama-completion` (19 MB model) | 127.8 GB | **2.4 GB** |
+  | `test-llama-archs -a llama` | 195–206 GB | **2.2 GB** |
+  | `test-thread-safety` | 156–180 GB | **2.2 GB** |
+
+  Both pinned runs were confirmed to do **real work**, not skip: `test-llama-archs` emitted
+  its results table with numerical error magnitudes (`3.13e-11`, `0.00e+00`), and
+  `test-thread-safety` logged model load, `get_rows`, and KV-cache tensors. (It still
+  crashes — that is `llama.cpp-oze0`, unrelated and unchanged by the selector. Post-fix it
+  exits **134/SIGABRT** via `[GRAPH-COMPUTE] arena scratch unavailable`, not SIGSEGV;
+  measured twice 2026-08-01, plainly and under gdb.)
+
+  ⚠️ **The `test-llama-archs` half of that sentence leans on a table that is CORRUPTED**
+  (`llama.cpp-to9m`). GGML log output interleaves *into* the row, so cells are routinely
+  truncated mid-field — across four sweeps, 7–11 of ~51 rows were mangled and **every single
+  `FAIL` cell was destroyed**, making `grep FAIL` return zero on runs that had 1–3 real
+  failures. The use above happens to survive, because it needs cells to be *present* rather
+  than *absent*, so the `403s` selector finding stands. But do not copy the pattern:
+
+  ```bash
+  # WRONG — the table is not evidence
+  ./build/bin/test-llama-archs -a llama | grep FAIL          # returns nothing on a failing run
+
+  # RIGHT — rc, plus the prose detail lines, which survive interleaving
+  ./build/bin/test-llama-archs -a llama; echo "rc=$?"        # rc=0 trustworthy; 77 = skipped
+  grep -c 'roundtrip mismatch' <log>                         # a real printed string
+  ```
+
+  `rc=0` is trustworthy — `all_ok` is computed from in-memory comparisons, and a separate
+  `n_measured` counter returns **77** when a targeted `-a` run measured nothing. `rc=1` is
+  **ambiguous**: a `[SYCL-WATCHDOG] _Exit(1)` and a genuine FAIL share it (`llama.cpp-4lnb`).
+
+  ⚠️ **This does NOT retire the never-loop rule; it gives it one documented escape.** An
+  *unpinned* run of either binary is exactly as dangerous as before, and unpinned is the
+  **default** — nothing in either binary's ctest registration sets a selector. So the burden
+  is entirely on whoever runs it. Two further limits: the full `test-llama-archs` sweep (no
+  `-a`) has not been measured pinned, only a single arch; and the property-based rule at the
+  top of this section still governs any binary nobody has measured.
+
+  Treat "pin the selector" as a precondition you must actively satisfy, not as a fact about
+  the tests.
+
   Known members (**not** an exhaustive list — apply the property):
   - **`test-backend-ops`** — never in a subagent or background task. Hundreds of GPU BOs, TTM
     shmem 50–224 GB, two hangs on 2026-04-06. Run manually, with monitoring, only.
@@ -533,7 +594,10 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
 - **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST errors or corrupted results. Handles must resolve location on dereference so the cache can move data between tiers transparently.
 - **Host-resident weights → CPU dispatch, not GPU PCIe "zero-copy."** Measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s (1.6–2.6x slower). Parallelize CPU work with GPU via `sycl::depends_on` (~9.7 µs cross-device latency). Never feed a host-pinned pointer to a GPU kernel as "zero-copy."
-- **The VRAM budget calc is correct by design** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
+- **The VRAM budget calc is correct by design for DISCRETE cards** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
+  ⚠️ **It is catastrophically wrong for an INTEGRATED GPU, and that is the cause of this host's OOM history** (`llama.cpp-403s`, measured 2026-08-01). The Arrow Lake-S iGPU reports `global_mem_size` = **231.7 GB** — 94 % of the host's 246.9 GB — because for an integrated GPU "VRAM" *is* system RAM. `ggml-sycl.cpp:10043-10049` feeds that into the same budget path as a discrete card at a **default of 100 %**, and neither `ggml-sycl.cpp` nor `unified-cache.cpp` contains a single occurrence of `host_unified` or `is_integrated`. So the backend claims the machine.
+  Isolated with one variable — same 19 MB model, same single-threaded `llama-completion`, only the selector changed: `level_zero:0` → peak `Shmem` **2.4 GB**; `level_zero:0,1` → **2.4 GB**; selector unset (adds the iGPU) → **127.8 GB**.
+  For an integrated device, "free VRAM" and "free host RAM" are the same pool, so taking 100 % of it is not a conservative reading of available memory — it is claiming memory the host needs. `sycl::info::device::host_unified_memory` is queryable and `caps.global_mem_size` is already captured at `common.cpp:716`; the information is present and simply never consulted.
 - **Small-block dequant (Q4_0/Q8_0/Q4_K) belongs on standard SYCL, not ESIMD.** ESIMD measured 1.9x SLOWER on Arc B580 + oneAPI 2025.3 (block granularity too small to amortize LSC loads). The real dequant lever is structural — fuse dequant into the matmul. Opt-in retest hatch: `GGML_SYCL_ESIMD_DEQUANT=1`.
 
 > Live debugging state (active bug investigations, bisect results, perf-regression hunts) lives in the **codescout task tracker** (`task_ready`, `task_list`), not here. This section is for settled rules only.
@@ -600,6 +664,70 @@ you do when iterating on one failing test. Nothing in the output distinguishes
   `test-sycl-*-policy.sh` family), so ctest reports *skipped* and a bare shell
   run gets a non-zero status. The goal is to make a skip **visible as a skip**,
   not to forbid skipping — a CPU-only runner still legitimately skips.
+
+⚠️ **Generalise it: WHAT THE REGISTRATION PROVIDES, DIRECT INVOCATION DOES NOT.**
+`LD_LIBRARY_PATH` above is one instance; the **model fixture** is another, and it
+bites the same way. `tests/CMakeLists.txt:312-329` downloads `stories15M-q4_0.gguf`
+via a ctest fixture — `test-download-model` carries `FIXTURES_SETUP`,
+`test-thread-safety` carries `FIXTURES_REQUIRED` — so `ctest -R '^test-thread-safety$'`
+stages it automatically and `./build/bin/test-thread-safety -m …` does not. And
+`build/` is gitignored (`/build*`), so a staged copy does **not** survive
+`sycl-build.sh -c`.
+
+Stage it without running any GPU work — safe for any agent, unlike recovering via
+the gate itself:
+
+```bash
+ctest --test-dir build -R '^test-download-model$'
+```
+
+Before blaming a directly-invoked test, check what its **registration** supplies:
+`awk '/add_test|set_tests_properties.*<name>/,/\)/' build/**/CTestTestfile.cmake`.
+
+⚠️ **GREP THE STRING THE CODE PRINTS, NOT THE NAME THAT PRODUCES IT.** Measured
+2026-08-01, and it reached a P1 ticket before anyone checked. `GGML_ABORT` count was
+reported as **0** to show a change introduced no new aborts:
+
+```c
+ggml.h:300   #define GGML_ABORT(...) ggml_abort(__FILE__, __LINE__, __VA_ARGS__)
+ggml.c:252   void ggml_abort(const char * file, int line, const char * fmt, ...)
+```
+
+The macro expands to a call printing `file:line: message`. **The literal string
+`GGML_ABORT` never reaches a log, ever.** Two runs that demonstrably aborted
+*through* `ggml_abort` (exit 134; the frame visible in the backtrace) both returned
+`grep -c 'GGML_ABORT'` → **0**. That probe was guaranteed zero in every run ever
+taken, so "no new aborts" was never tested.
+
+Probes scored against a run that provably aborted (the committed gdb backtrace, in
+which the `ggml_abort` frame appears):
+
+| probe | count | verdict |
+|---|---|---|
+| `GGML_ABORT` | **0** | void — zero on a run that provably aborted |
+| `arena scratch unavailable` | 1 | ✅ use this |
+| `ggml-sycl\.cpp:[0-9]+:` | 1 | ✅ use this |
+| `ggml_abort` (lowercase) | 2 | ⚠️ **trap** — matched only because *gdb symbolised the frame* |
+
+⚠️ **Do not "fix" it by lowercasing to `ggml_abort`.** That is the obvious repair and
+it is wrong in the same way one layer down: it passes on a gdb log and returns 0 on
+every plain run.
+
+**Why the mistake is seductive, and why the sibling macro is fine:**
+
+```c
+ggml.h:301   #define GGML_ASSERT(x) if (!(x)) GGML_ABORT("GGML_ASSERT(%s) failed", #x)
+```
+
+`GGML_ASSERT` bakes its own name into a **format string**, so it survives to the
+output and *is* a valid probe. `GGML_ABORT` is consumed by the preprocessor. Two
+adjacent, nearly identical identifiers, opposite answers — which is exactly why
+symmetry is not a substitute for a positive control.
+
+The general test, and it is one line of thought: **could this check have produced a
+different result if the property were false?** If you cannot produce a positive
+control — a run where the condition is known true and the probe fires — the probe is
+decorative and its zero means nothing.
 
 ⚠️ **`test-llama-archs -a <arch>` had the same shape and it is the one that
 matters most**, because the whole point of `-a` is to answer "is this

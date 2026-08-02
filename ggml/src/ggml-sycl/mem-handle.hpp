@@ -8,6 +8,7 @@
 
 #include "unified-cache-key.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -69,6 +70,67 @@ enum class mem_handle_kind : uint8_t {
 };
 
 struct mem_handle_debug_info;
+
+// === mem_handle_spin_lock ===
+// Per-handle lock guarding the state resolve() mutates (llama.cpp-c48l).
+//
+// resolve() is declared const but is a *mutating* operation: it rewrites
+// cached_, gen_, leased_entry_ and the chunk-lease fields.  A mem_handle that
+// lives in shared model state — above all ggml_tensor_extra_gpu::data_handle[],
+// which every weight tensor carries — is resolved concurrently by every context
+// thread decoding on that model.  llama.cpp supports many contexts per model
+// (tests/test-thread-safety.cpp), and ggml_backend_sycl_graph_compute drops the
+// process-wide graph mutex before dispatch on nearly every path
+// (compute_impl_unlocked), so those resolves genuinely overlap.  Unsynchronised,
+// two of them corrupt the shared_ptr inside cached_.ready_event and
+// double-release a single cache-entry lease.
+//
+// CONTRACT: this lock is NEVER held across a call into unified_cache.  Slow-path
+// work (acquiring leases, releasing leases) runs unlocked; the result is
+// published under the lock, and a resolve that loses the publish race releases
+// the lease it acquired rather than leaking it.  That is what keeps the lock off
+// the global lock order, so it cannot deadlock against the cache's rw_mutex_.
+//
+// The critical sections are short but NOT allocation-free: assigning cached_
+// destroys the outgoing resolved_ptr's sycl::event, and that refcount drop can
+// deallocate a control block.  It is a handful of instructions in the common
+// case and touches no cache lock, so it is safe here — but do not add work to a
+// critical section on the belief that nothing under this lock can allocate.
+class mem_handle_spin_lock {
+  public:
+    mem_handle_spin_lock() = default;
+
+    // Copies/moves of a mem_handle produce an independent, unlocked handle.
+    mem_handle_spin_lock(const mem_handle_spin_lock &) {}
+
+    mem_handle_spin_lock & operator=(const mem_handle_spin_lock &) { return *this; }
+
+    void lock() const {
+        while (flag_.exchange(true, std::memory_order_acquire)) {
+            while (flag_.load(std::memory_order_relaxed)) {
+                // Critical sections are a few dozen nanoseconds; spin.
+            }
+        }
+    }
+
+    void unlock() const { flag_.store(false, std::memory_order_release); }
+
+  private:
+    mutable std::atomic<bool> flag_{ false };
+};
+
+class mem_handle_lock_guard {
+  public:
+    explicit mem_handle_lock_guard(const mem_handle_spin_lock & lock) : lock_(lock) { lock_.lock(); }
+
+    ~mem_handle_lock_guard() { lock_.unlock(); }
+
+    mem_handle_lock_guard(const mem_handle_lock_guard &)             = delete;
+    mem_handle_lock_guard & operator=(const mem_handle_lock_guard &) = delete;
+
+  private:
+    const mem_handle_spin_lock & lock_;
+};
 
 class mem_handle {
   public:
@@ -191,7 +253,14 @@ class mem_handle {
     // included to allow DIRECT handles with nullptr but DIRECT handles must always
     // have an explicit non-null pointer, so the kind check was incorrect for
     // default-constructed handles (kind_==DIRECT, ptr==nullptr → falsely valid).
-    bool valid() const { return cached_.ptr != nullptr; }
+    //
+    // Reads cached_, so it takes the handle lock: the overwhelmingly common
+    // caller shape is `if (h.valid()) h.resolve(dev)` on a shared
+    // extra->data_handle[], concurrently with another thread's resolve().
+    bool valid() const {
+        mem_handle_lock_guard g(lock_);
+        return cached_.ptr != nullptr;
+    }
 
     // Access the cache key (only meaningful for WEIGHT handles).
     const unified_cache_key & key() const { return key_; }
@@ -251,17 +320,8 @@ class mem_handle {
     mem_handle_debug_info debug_info() const;
 
   private:
-    // Shared body of resolve()/resolve(device_id): dispatches by kind and,
-    // on the slow path, forwards `caller` through to resolve_slow() so the
-    // acquired lease can be tagged with the TRUE external call site (debug
-    // diagnostics only, llama.cpp-2wv5). Each public overload captures its
-    // own __builtin_return_address(0) before calling this, since capturing it
-    // here would only ever see the other overload's internal call site.
-    resolved_ptr resolve_impl(const void * caller) const;
-
     // Slow path: re-query the unified cache for the current pointer.
-    // debug_caller: see resolve_impl() above; purely diagnostic, safe to omit.
-    resolved_ptr resolve_slow(const void * debug_caller = nullptr) const;
+    resolved_ptr resolve_slow() const;
 
     // Slow path for arena handles: resolve base + offset from arena.
     resolved_ptr resolve_arena() const;
@@ -270,6 +330,39 @@ class mem_handle {
     // copy-assign, and move-assign before transitioning to a new state.
     // No-op if no lease is held.
     void release_lease() noexcept;
+
+    // === lease_state ===
+    // The releasable half of a handle's resolve state.  Releasing a lease calls
+    // into unified_cache (host_release_chunk_lease / arena_release_chunk_lease),
+    // which must not happen under the handle lock — so every transition takes
+    // the current lease_state out under the lock and releases it afterwards.
+    struct lease_state {
+        unified_cache_entry * entry             = nullptr;
+        uint8_t               chunk_source      = 0;
+        uint64_t              host_chunk_handle = UINT64_MAX;
+        int32_t               vram_chunk_idx    = -1;
+        int                   chunk_device      = -1;
+    };
+
+    // Detach this handle's lease state (caller holds lock_).  The handle no
+    // longer owns the returned leases; the caller must release them.
+    lease_state take_lease_state_locked() const;
+
+    // Adopt an already-acquired lease state (caller holds lock_).
+    void store_lease_state_locked(const lease_state & state) const;
+
+    // Drop the references described by `state`.  Never call under lock_.
+    static void release_lease_state(const lease_state & state) noexcept;
+
+    // stable_identity_hash() body, for callers that already hold lock_.
+    size_t stable_identity_hash_locked() const;
+
+    // Guards the mutable resolve state below (cached_, gen_, leased_entry_,
+    // chunk_source_, host_chunk_handle_, vram_chunk_idx_, chunk_device_).
+    // The immutable-after-construction fields are not covered: reassigning or
+    // destroying a handle that another thread is resolving is out of contract
+    // and no production path does it.
+    mutable mem_handle_spin_lock lock_;
 
     mem_handle_kind   kind_   = mem_handle_kind::DIRECT;
     int               device_ = HOST_DEVICE;
@@ -283,8 +376,14 @@ class mem_handle {
 
     // Mutable because resolve() is logically const (returns the current
     // pointer) but updates the cache as a side effect.
-    mutable uint64_t     gen_    = 0;
-    mutable resolved_ptr cached_ = {};
+    //
+    // The seven fields tagged GUARDED below are the ones resolve() rewrites, and
+    // every read or write of them must hold lock_.  They are not contiguous
+    // (owned_alloc_ and debug_owner_tag_ sit among them), so the tag — not the
+    // position — is what marks membership.  A new mutable field belongs in this
+    // set unless you can say why it does not.
+    mutable uint64_t     gen_    = 0;   // GUARDED by lock_
+    mutable resolved_ptr cached_ = {};  // GUARDED by lock_
 
     // Optional runtime allocation owner.  DIRECT handles that wrap scratch,
     // staging, or runtime allocations can carry this shared owner so copies are
@@ -302,7 +401,7 @@ class mem_handle {
     // only invalidates pointers to the erased element.  Eviction paths
     // MUST NOT erase entries with in_use_count > 0, which is the contract
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
-    mutable unified_cache_entry * leased_entry_ = nullptr;
+    mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from
@@ -320,10 +419,10 @@ class mem_handle {
     //
     // A CHUNK_LEASE-kind handle stores its protected raw ptr in cached_.ptr;
     // resolve() returns cached_ directly (never re-queries the cache).
-    mutable uint8_t  chunk_source_      = 0;
-    mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
-    mutable int32_t  vram_chunk_idx_    = -1;
-    mutable int32_t  chunk_device_      = -1;
+    mutable uint8_t  chunk_source_      = 0;           // GUARDED by lock_
+    mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // GUARDED (pinned_chunk_pool::INVALID_CHUNK_HANDLE)
+    mutable int32_t  vram_chunk_idx_    = -1;          // GUARDED by lock_
+    mutable int32_t  chunk_device_      = -1;          // GUARDED by lock_
 
     const char * debug_owner_tag_ = "";
 };
@@ -407,6 +506,13 @@ void drain_retained_handles(bool wait_all = false);
 // is invalidated. These handles are not event-waitable, so drain_retained_handles()
 // intentionally does not touch them.
 void release_graph_retained_handles();
+
+// How many handles are currently parked for command-graph lifetime. Exposed so a
+// test can assert WHERE retain_handles_until_event() routed a handle: a handle
+// parked here is invisible to drain_retained_handles() and is released by
+// whichever context next invalidates a graph, so a non-recording thread's
+// transient scratch must never land in it. See test-sycl-graph-retention-scope.
+size_t graph_retained_handle_count();
 
 }  // namespace ggml_sycl
 

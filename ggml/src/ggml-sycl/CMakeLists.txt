@@ -585,71 +585,6 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         target_link_libraries(test-xmx-esimd-basic PRIVATE IntelSYCL::SYCL_CXX)
     endif()
 
-    # Test 3: XMX ESIMD Q8_0 GEMM Kernel Tests - DISABLED (API mismatch)
-    # Tests the ESIMD-based Q8_0 GEMM kernel with dynamic hardware detection
-    # add_executable(test-xmx-esimd-q8-gemm
-    #     tests/test-xmx-esimd-q8-gemm.cpp
-    # )
-    # target_include_directories(test-xmx-esimd-q8-gemm PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-esimd-q8-gemm PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-esimd-q8-gemm PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
-    # Test 4: XMX DPAS Basic Infrastructure Tests (DISABLED - uses old XMXDpasConfig API)
-    # Superseded by unified-kernel.hpp joint_matrix approach
-    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
-    # add_executable(test-xmx-dpas-basic
-    #     tests/test-xmx-dpas-basic.cpp
-    # )
-    # target_include_directories(test-xmx-dpas-basic PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-dpas-basic PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-dpas-basic PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
-    # Test 5: XMX ESIMD Q4_0 GEMM Kernel Tests (DISABLED - uses old XMXDpasConfig API)
-    # Superseded by unified-kernel.hpp joint_matrix approach
-    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
-    # add_executable(test-xmx-esimd-q4-gemm
-    #     tests/test-xmx-esimd-q4-gemm.cpp
-    # )
-    # target_include_directories(test-xmx-esimd-q4-gemm PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-esimd-q4-gemm PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-esimd-q4-gemm PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
     # Test 6: XMX MoE MXFP4 Fused Kernel Tests
     # Tests the fused MXFP4 MoE GEMM kernel with E8M0 exponents and kvalues LUT
     add_executable(test-xmx-moe-mxfp4
@@ -676,9 +611,6 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     include(CTest)
     add_test(NAME xmx-hardware-detect COMMAND test-xmx-hardware-detect)
     add_test(NAME xmx-esimd-basic COMMAND test-xmx-esimd-basic)
-    # add_test(NAME xmx-esimd-q8-gemm COMMAND test-xmx-esimd-q8-gemm)  # DISABLED
-    # add_test(NAME xmx-dpas-basic COMMAND test-xmx-dpas-basic)  # DISABLED - old API
-    # add_test(NAME xmx-esimd-q4-gemm COMMAND test-xmx-esimd-q4-gemm)  # DISABLED - old API
     add_test(NAME xmx-moe-mxfp4 COMMAND test-xmx-moe-mxfp4)
 
     # Test: MoE MXFP4 DP4A vs Scalar Correctness
@@ -1113,6 +1045,51 @@ set_tests_properties(sycl-dispatch-tuning PROPERTIES
     TIMEOUT 60
 )
 
+# KV per-layer slice sizing (llama.cpp-2120): the buffer must be divided by the
+# layers that actually HOLD KV, not by the model's total layer count.  Pure
+# arithmetic over the real kv_tier_manager -- no device, no allocation, so it is
+# safe at any parallelism and safe in a subagent.  It compiles kv-tier-manager.cpp
+# directly and stubs only unified_cache_get_layer_vram_bytes(), so it exercises
+# the shipped class rather than a mock of it.
+#
+# It needs -fsycl solely because unified-cache.hpp (for placement_plan) pulls in
+# SYCL headers; there is no device kernel here, hence
+# SYCL_LINK_ONLY_TEST_OPTIONS per rule 1 above.  ggml-base alone satisfies the
+# link (ggml_log_internal); linking ggml would also pull libggml-sycl.so, whose
+# own copy of unified_cache_get_layer_vram_bytes would collide with the stub.
+#
+# NAME: deliberately not "kv-tier-manager".  ctest -R/-E take UNANCHORED
+# regexes, so a gate named after the thing it guards lands inside any
+# pre-existing exclusion of that name.  Checked against the exclusions in force:
+# .github/workflows/* exclude "test-llama-archs", "tokenizer" and
+# "test-backend-ops"; CLAUDE.md's throttled sweep excludes labels matching
+# residency|mem-handle|cache.  "sycl-kv-slice-sizing" and its labels below hit
+# none of them.
+add_executable(test-kv-slice-sizing
+    tests/test-kv-slice-sizing.cpp
+    kv-tier-manager.cpp
+)
+target_include_directories(test-kv-slice-sizing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-kv-slice-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-kv-slice-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-kv-slice-sizing PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-kv-slice-sizing PRIVATE ggml-base)
+add_test(NAME sycl-kv-slice-sizing COMMAND test-kv-slice-sizing)
+set_tests_properties(sycl-kv-slice-sizing PROPERTIES
+    # No ONEAPI_DEVICE_SELECTOR: this test never creates a queue.  LD_LIBRARY_PATH
+    # is still needed -- the binary links the SYCL runtime because of the headers.
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;kv;sizing;hostonly"
+    TIMEOUT 60
+)
+
 # MMQ XMX dispatch integration: XMX-path selection, MMQ fallback, and edge
 # cases (empty batch, non-aligned dims). Moved outside the guard
 # (llama.cpp-9c0s) -- it spent its life behind GGML_SYCL_BUILD_XMX_TESTS
@@ -1424,6 +1401,141 @@ set_tests_properties(sycl-layout-choice PROPERTIES
     TIMEOUT 180
 )
 
+# Test: mem_handle::resolve() is a MUTATING operation on shared state
+# (llama.cpp-c48l).  extra->data_handle[dev] is resolved concurrently by every
+# context thread of a model, so a handle that publishes cached_/leased_entry_
+# without synchronisation corrupts a sycl::event refcount and double-releases a
+# cache-entry lease -- observed as a SIGSEGV inside resolve() itself.
+#
+# CPU-only by construction: it builds DIRECT/WEIGHT handles by hand and never
+# touches a device, a queue, or the unified cache.  It is therefore registered
+# OUTSIDE the _residency_test loop below, whose "cache;residency;mem-handle"
+# labels are exactly what CLAUDE.md's throttled sweep excludes
+# (-LE 'residency|mem-handle|cache').  Putting a GPU-free test behind that
+# filter would hide it from the sweep it belongs in; the labels here
+# deliberately avoid every word in that pattern.
+set(MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-mem-handle-concurrent-resolve
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-concurrent-resolve.cpp
+)
+target_include_directories(test-sycl-mem-handle-concurrent-resolve PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mem-handle-concurrent-resolve PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-mem-handle-concurrent-resolve PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-mem-handle-concurrent-resolve PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-mem-handle-concurrent-resolve COMMAND test-sycl-mem-handle-concurrent-resolve)
+set_tests_properties(test-sycl-mem-handle-concurrent-resolve PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: retain_handles_until_event() must route a handle by THIS thread's
+# recording state (llama.cpp-oze0).  Its guard was
+# ggml_sycl_graph_recording_active(), true whenever ANY thread records, while
+# the sink that guard selects is thread_local -- so a non-recording thread fell
+# through to the process-global graph_unwaitable list, which
+# drain_retained_handles() does not wait on.  get_rows' two staging cohorts
+# (get_rows:seq_device in VRAM SCRATCH, get_rows_indices_small_host in host
+# STAGING) then stayed live across a graph boundary and the zone reset was
+# correctly refused, aborting graph launch in test-thread-safety.
+#
+# CPU-only by construction: DIRECT handle views over stack buffers plus
+# default-constructed (already complete) events -- no device, queue or cache.
+# Registered outside the _residency_test loop below and labelled to avoid every
+# word in CLAUDE.md's throttled-sweep denylist (-LE 'residency|mem-handle|cache'),
+# which is about memory-exhaustion hazard rather than subject matter; a GPU-free
+# gate carrying one of those words would be hidden from the sweep it belongs in.
+set(GRAPH_RETENTION_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-graph-retention-scope
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-retention-scope.cpp
+)
+target_include_directories(test-sycl-graph-retention-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-graph-retention-scope PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-graph-retention-scope PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-graph-retention-scope PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-graph-retention-scope PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-graph-retention-scope PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-graph-retention-scope COMMAND test-sycl-graph-retention-scope)
+set_tests_properties(test-sycl-graph-retention-scope PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: the scoped transient allocators must decide allocation SHAPE -- role, category, arena
+# zone, allocator path -- from THIS thread's recording state (llama.cpp-f9tg).  The three
+# scoped_unified_*_temp templates in ggml-sycl.cpp took it from
+# ggml_sycl_graph_recording_active(), true whenever ANY thread records, so one context's
+# COMPUTE/CONTROL transient was labelled GRAPH and steered out of the SCRATCH zone whenever an
+# unrelated context happened to be recording.
+#
+# Unlike its sibling test-sycl-graph-retention-scope this guards ATTRIBUTION, not correctness:
+# the wide predicate is a superset, so it only over-applies graph treatment and fails safe.  The
+# corrupted fields are exactly the ones llama.cpp-iiff Phase 0's inventory is built from.
+#
+# CPU-only by construction: it calls the two pure intent builders in common.hpp and reads/writes
+# the recording flags -- no device, queue or cache.  The allocation itself is NOT reachable
+# device-free, which is why the decision was extracted from it.  Labels avoid every word in
+# CLAUDE.md's throttled-sweep denylist (-LE 'residency|mem-handle|cache'), which is about
+# memory-exhaustion hazard rather than subject matter.
+set(TRANSIENT_INTENT_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-transient-alloc-intent-scope
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-transient-alloc-intent-scope.cpp
+)
+target_include_directories(test-sycl-transient-alloc-intent-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-transient-alloc-intent-scope PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-transient-alloc-intent-scope PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-transient-alloc-intent-scope PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-transient-alloc-intent-scope PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-transient-alloc-intent-scope PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-transient-alloc-intent-scope COMMAND test-sycl-transient-alloc-intent-scope)
+set_tests_properties(test-sycl-transient-alloc-intent-scope PROPERTIES
+    LABELS "sycl;alloc;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
@@ -1479,7 +1591,19 @@ endforeach()
 # Test: reset_model_weight_entries() must preserve entries still leased by a
 # live model at a model-load boundary instead of aborting (llama.cpp-ljb9,
 # commit acdb192d4), and must keep id_to_key_ pointed at a surviving layout
-# sibling rather than dangling. Registered outside the GGML_SYCL_BUILD_XMX_TESTS
+# sibling rather than dangling.
+#
+# It also carries the model-OWNERSHIP tests for llama.cpp-0qlw / 9f3a2e0f0: a
+# live model's IDLE weights (in_use_count == 0 between graphs) must survive
+# another model's load boundary, and the two reclaim modes must keep their
+# opposite treatment of unattributed entries. Each preserve assertion is paired
+# with a mutation control that forces live_model_mask_ to 0 and requires the
+# same entry to be reclaimed -- without which "preserved N of N" is equally
+# what a no-op prints. This file is the affordable instrument for that claim:
+# test-thread-safety needs 156-180 GB of Shmem and currently SEGFAULTs for two
+# unrelated reasons, while this test measured peak RSS 317 MB (see below).
+#
+# Registered outside the GGML_SYCL_BUILD_XMX_TESTS
 # guard (which defaults OFF) so it always runs -- mirrors the _residency_test
 # loop above: no device kernel code of its own, so it only needs -fsycl to
 # link against the prebuilt ggml-sycl library, not the full XMX AOT target list.
@@ -1522,6 +1646,10 @@ add_test(NAME sycl-reset-model-weight-lease-preserve COMMAND test-sycl-reset-mod
 set_tests_properties(sycl-reset-model-weight-lease-preserve PROPERTIES
     LABELS "sycl;lease;bugfix"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # The test exits 77 when no GPU is present, and when built without the SYCL
+    # backend at all. Without this, ctest renders 77 as FAILED rather than the
+    # intended Skipped. Matches mmq-xmx-dispatch (0f48c5352, llama.cpp-k208).
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 

@@ -19,11 +19,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+
+#if defined(_WIN32)
+#    include <windows.h>
+#else
+#    include <unistd.h>
+#endif
 
 #if __has_include(<sycl/ext/oneapi/matrix/matrix.hpp>)
 #    include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -699,6 +706,117 @@ void ggml_sycl_watchdog_start() {
 
 void ggml_sycl_watchdog_stop() {
     g_watchdog_active.store(false, std::memory_order_release);
+}
+
+bool ggml_sycl_device_is_host_unified(const sycl::device & dev) {
+    try {
+        return dev.get_info<sycl::info::device::host_unified_memory>();
+    } catch (...) {
+        return false;
+    }
+}
+
+// Moved here (from a file-local static in unified-cache.cpp) so both the
+// unified-cache VRAM-arena budget path and ggml-sycl.cpp's placement-plan
+// budget path can share one implementation instead of drifting apart.
+size_t ggml_sycl_get_total_system_memory_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<size_t>(status.ullTotalPhys);
+    }
+    return 0;
+#else
+    long pages     = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+#endif
+}
+
+size_t ggml_sycl_get_available_system_memory_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<size_t>(status.ullAvailPhys);
+    }
+    return 0;
+#else
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (f) {
+        char               key[64]  = {};
+        char               unit[32] = {};
+        unsigned long long value_kb = 0;
+        while (std::fscanf(f, "%63s %llu %31s", key, &value_kb, unit) == 3) {
+            if (std::strcmp(key, "MemAvailable:") == 0) {
+                std::fclose(f);
+                return static_cast<size_t>(value_kb) * 1024ULL;
+            }
+        }
+        std::fclose(f);
+    }
+#    ifdef _SC_AVPHYS_PAGES
+    long pages     = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+    }
+#    endif
+    return 0;
+#endif
+}
+
+size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem) {
+    if (!host_unified) {
+        return raw_total_mem;  // Discrete GPU: unchanged -- this function is a no-op.
+    }
+
+    // Integrated GPUs report system RAM as "global memory" (see
+    // llama.cpp-403s). A flat PERCENTAGE of that number is not a real fix:
+    // it still scales with host RAM, so on a big-RAM box it can exceed a
+    // real discrete card's dedicated VRAM outright (measured: 25% of this
+    // host's ~211 GB available gave the iGPU a 53 GB arena against the
+    // B70's 31.9 GB and the B50's 15.9 GB -- the device least likely to do
+    // useful work would hold the largest reservation on the machine, and a
+    // bigger machine makes that worse, not better).
+    //
+    // Use a small, fixed absolute cap instead. "An integrated GPU gets a
+    // fixed modest arena because its memory is the host's memory" is a
+    // story that holds on any machine; a percentage dressed up to look
+    // bounded is not. The available-RAM fraction below is kept ONLY as a
+    // second, tighter ceiling so a small machine (e.g. 8 GB total) degrades
+    // further still rather than reserving the full absolute cap outright.
+    constexpr size_t kIntegratedGpuAbsoluteCapBytes  = 6ull * 1024ull * 1024ull * 1024ull;  // 6 GiB
+    constexpr double kIntegratedGpuAvailableFraction = 0.25;
+
+    const size_t available = ggml_sycl_get_available_system_memory_bytes();
+    size_t       cap       = kIntegratedGpuAbsoluteCapBytes;
+    if (available > 0) {
+        cap = std::min(cap, static_cast<size_t>(available * kIntegratedGpuAvailableFraction));
+    } else {
+        // Detection failed. Keep the absolute cap rather than falling back
+        // to the raw (unbounded) device total -- an unconditional fallback
+        // here would silently reintroduce the exact bug this function
+        // exists to close on any host where /proc/meminfo is unreadable.
+        GGML_LOG_WARN(
+            "[SYCL] host-unified device: available system memory query failed; "
+            "using the %.1f MB absolute cap without a RAM-based second ceiling. "
+            "Set GGML_SYCL_VRAM_BUDGET_PCT to constrain this further if needed.\n",
+            kIntegratedGpuAbsoluteCapBytes / (1024.0 * 1024.0));
+    }
+
+    const size_t base_mem = std::min(raw_total_mem, cap);
+    if (base_mem < raw_total_mem) {
+        GGML_LOG_WARN(
+            "[SYCL] device is host-unified; VRAM budget capped at %.1f MB "
+            "(reported global_mem %.1f MB, %.1f MB currently available system RAM)\n",
+            base_mem / (1024.0 * 1024.0), raw_total_mem / (1024.0 * 1024.0), available / (1024.0 * 1024.0));
+    }
+    return base_mem;
 }
 
 bool gpu_has_xmx(sycl::device & dev) {

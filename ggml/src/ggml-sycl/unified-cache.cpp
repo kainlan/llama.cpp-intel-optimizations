@@ -1550,10 +1550,6 @@ static void unified_cache_atexit_handler() {
     g_sycl_shutting_down.store(true, std::memory_order_release);
 }
 
-// Forward declarations needed by unified_cache constructor (defined later in file)
-static size_t get_total_system_memory_bytes();
-static size_t get_available_system_memory_bytes();
-
 bool ggml_sycl_is_shutting_down() {
     return g_sycl_shutting_down.load(std::memory_order_acquire);
 }
@@ -1672,8 +1668,8 @@ unified_cache::unified_cache(sycl::queue & queue,
         size_t available_mem   = 0;
         size_t os_reserve      = 0;
         if (host_mem_budget == 0) {
-            total_mem     = get_total_system_memory_bytes();
-            available_mem = get_available_system_memory_bytes();
+            total_mem     = ggml_sycl_get_total_system_memory_bytes();
+            available_mem = ggml_sycl_get_available_system_memory_bytes();
             int pct       = g_unified_cache_host_budget_pct;
             if (pct < 1) {
                 pct = 1;
@@ -2275,56 +2271,10 @@ static uint64_t compute_content_hash(const void * data, size_t size) {
     return hash;
 }
 
-static size_t get_total_system_memory_bytes() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        return static_cast<size_t>(status.ullTotalPhys);
-    }
-    return 0;
-#else
-    long pages     = sysconf(_SC_PHYS_PAGES);
-    long page_size = sysconf(_SC_PAGE_SIZE);
-    if (pages <= 0 || page_size <= 0) {
-        return 0;
-    }
-    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-#endif
-}
-
-static size_t get_available_system_memory_bytes() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        return static_cast<size_t>(status.ullAvailPhys);
-    }
-    return 0;
-#else
-    FILE * f = std::fopen("/proc/meminfo", "r");
-    if (f) {
-        char               key[64]  = {};
-        char               unit[32] = {};
-        unsigned long long value_kb = 0;
-        while (std::fscanf(f, "%63s %llu %31s", key, &value_kb, unit) == 3) {
-            if (std::strcmp(key, "MemAvailable:") == 0) {
-                std::fclose(f);
-                return static_cast<size_t>(value_kb) * 1024ULL;
-            }
-        }
-        std::fclose(f);
-    }
-#    ifdef _SC_AVPHYS_PAGES
-    long pages     = sysconf(_SC_AVPHYS_PAGES);
-    long page_size = sysconf(_SC_PAGE_SIZE);
-    if (pages > 0 && page_size > 0) {
-        return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-    }
-#    endif
-    return 0;
-#endif
-}
+// get_total_system_memory_bytes() / get_available_system_memory_bytes() moved
+// to ggml_sycl_get_total_system_memory_bytes() / ggml_sycl_get_available_system_memory_bytes()
+// in common.cpp so ggml-sycl.cpp's placement-plan budget path can share the
+// same implementation (see llama.cpp-403s).
 
 static bool is_host_accessible_ptr(const void * ptr, const sycl::queue & queue) {
     if (!ptr) {
@@ -4041,7 +3991,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             make_direct_stage_key(cache_entry_type::MOE_EXPERT, req.key, req.requested_layout);
         lock.unlock();
 
-        auto lease = acquire_entry_lease(mirror_key, __builtin_return_address(0));
+        auto lease = acquire_entry_lease(mirror_key);
         if (lease) {
             result.ptr             = lease.ptr;
             result.size            = entry_size;
@@ -5635,17 +5585,16 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
 // mem-handle.cpp and was out of scope for the commit that added this note.
 // ---------------------------------------------------------------------------
 unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const ggml_sycl_cache_id & key) {
-    const void * const caller = __builtin_return_address(0);
     static const ggml_layout_mode try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
     for (auto layout : try_layouts) {
         unified_cache_key ckey  = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
-        auto              lease = acquire_entry_lease(ckey, caller);
+        auto              lease = acquire_entry_lease(ckey);
         if (lease) {
             return lease;
         }
     }
     unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
-    auto              lease = acquire_entry_lease(ckey, caller);
+    auto              lease = acquire_entry_lease(ckey);
     if (lease) {
         return lease;
     }
@@ -5668,13 +5617,12 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const
         }
     }
     if (have_mapped && !(mapped == ckey)) {
-        return acquire_entry_lease(mapped, caller);
+        return acquire_entry_lease(mapped);
     }
     return lease;
 }
 
-unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key,
-                                                                          const void *              debug_caller) {
+unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {
     weight_ptr_lease_result result{};
     if (!key.id.valid) {
         return result;
@@ -5706,8 +5654,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             // Bump the lease refcount under shared_lock.  Visible to any evictor
             // that later acquires the unique_lock (acq_rel ordering).
             entry.in_use_count.fetch_add(1);
-            entry.debug_last_lease_caller = debug_caller;  // debug-only, see llama.cpp-2wv5
-            entry.debug_last_lease_site   = "acquire_entry_lease";
+            entry.debug_last_lease_site = "acquire_entry_lease";  // debug-only, llama.cpp-2wv5
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
@@ -7650,8 +7597,11 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     // the cache was still holding one lease per staged weight -- and reported
     // every one of them as a leaked mem_handle.  That is precisely the
     // 291-of-516 signature on a single-model Mistral teardown: uniform
-    // leases=1, owners=0x00000000, and (because these bumps never go through
-    // acquire_entry_lease) caller=(nil).
+    // leases=1 and owners=0x00000000.  A third clue -- an acquisition-site tag
+    // captured inside acquire_entry_lease() reading null on all 291 -- is what
+    // ruled out the whole handle-lease API and pointed here; that scaffolding
+    // has been retired now that it has served its purpose, leaving the
+    // debug_last_lease_site literals as the successor probe.
     //
     // This is a re-ordering, not a forced reap.  The leases are released by
     // destroying the handles that own them -- the only reclamation the
@@ -7776,9 +7726,9 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                                                                  zone_largest_free(vram_zone_id::WEIGHT));
                     GGML_SYCL_DEBUG(
                         "[UNIFIED-CACHE] reclaim_weight_entries preserving leased model weight "
-                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x caller=%p site=%s\n",
+                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x site=%s\n",
                         (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
-                        (int) entry.layout, live, entry.owner_mask, entry.debug_last_lease_caller,
+                        (int) entry.layout, live, entry.owner_mask,
                         entry.debug_last_lease_site ? entry.debug_last_lease_site : "(none)");
                 } else if (owned_by_live) {
                     entries_owned++;
@@ -8636,6 +8586,18 @@ static unified_cache * create_cache_for_device(int                     device_id
         if (base_mem == 0) {
             base_mem = total_mem > 0 ? total_mem : free_mem;
         }
+
+        // Host-unified (integrated) GPUs report system RAM as their
+        // "global memory" -- taking a percentage of that for the VRAM arena
+        // reservation below claims memory the host needs too (llama.cpp-403s:
+        // an Arrow Lake-S iGPU reporting 231.7 GB drove a ~180 GB single-chunk
+        // arena malloc, landing in TTM shmem, for a 19 MB model). Query the
+        // device directly rather than via ggml_sycl_info() -- this path can
+        // run during ggml_sycl_info()'s own static initialization (see the
+        // query_device_memory_no_info() comment above), so touching that
+        // global here would risk the same reentrant deadlock it avoids.
+        const bool host_unified = ggml_sycl_device_is_host_unified(queue.get_device());
+        base_mem                = ggml_sycl_vram_budget_base_mem(host_unified, base_mem);
 
         int          pct     = g_unified_cache_budget_pct;
         // Allow env var override for testing host fallback paths
@@ -18328,14 +18290,36 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // Each expert gets its own placement_entry with expert_id >= 0.
         // The composite tensor entry is NOT added — only per-expert entries.
         if (n_experts > 0 && usage == tensor_usage::MOE_EXPERT_WEIGHT) {
+            // Split by THIS tensor's expert count, not the model-wide one.
+            // `n_experts` is hparams.n_expert (it arrives as inventory->n_expert),
+            // but grovemoe's chunked trio `ffn_{gate,up,down}_chexps` has
+            // n_expert / n_group_experts experts.  Using the global count there
+            // creates n_group_experts times too many entries, each charging a
+            // *correct* dst_size -- so the chexps family's VRAM budget is
+            // over-charged by that factor, and the surplus entries are phantoms
+            // no lookup can reach (MUL_MAT_ID only asks for e < ne[2]).
+            //
+            // Verified by enumeration 2026-08-02: every expert weight created
+            // under src/models/ passes n_expert as ne[2]; grovemoe.cpp's chexps
+            // trio is the sole exception in the tree.  So this is a no-op for
+            // every other architecture, not merely believed to be one.
+            //
+            // The `> 0` guard is load-bearing, not defensive padding: ne is
+            // populated only when ne[0]/ne[1]/type are all valid (see the
+            // tensor-inventory registration in ggml-sycl.cpp), and it stays
+            // zeroed otherwise -- in which case falling back to n_experts
+            // reproduces the previous behaviour exactly.
+            const int n_tensor_experts = tensor.ne[2] > 0 ? static_cast<int>(tensor.ne[2]) : n_experts;
+
             const int                layer_id    = p4_extract_layer_id(name.c_str());
-            const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
+            const size_t             expert_size = src_size / static_cast<size_t>(n_tensor_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
             const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
             const ggml_layout_mode   layout      = planner_default_device_layout(tensor, usage, device_id);
-            const size_t dst_size = planner_layout_bytes_for_expert(tensor, n_experts, layout, device_id, expert_size);
+            const size_t             dst_size =
+                planner_layout_bytes_for_expert(tensor, n_tensor_experts, layout, device_id, expert_size);
 
-            for (int e = 0; e < n_experts; ++e) {
+            for (int e = 0; e < n_tensor_experts; ++e) {
                 placement_entry entry;
                 copy_tensor_info_to_entry(entry, tensor);
                 entry.src_size         = expert_size;
@@ -19667,17 +19651,23 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
         // MoE expert tensors: split into per-expert entries when n_experts > 0.
         if (n_experts > 0 && usage == tensor_usage::MOE_EXPERT_WEIGHT) {
+            // Per-tensor expert count -- see the long note on the same split in
+            // the single-device planner above for why the model-wide n_experts
+            // is wrong for grovemoe's chexps trio and a no-op for everything
+            // else, and why the `> 0` fallback is load-bearing.
+            const int n_tensor_experts = tensor.ne[2] > 0 ? static_cast<int>(tensor.ne[2]) : n_experts;
+
             const int                layer_id    = p4_extract_layer_id(name.c_str());
-            const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
+            const size_t             expert_size = src_size / static_cast<size_t>(n_tensor_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
             const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
             const ggml_layout_mode   layout =
                 n_devs > 1 ? planner_multi_device_moe_common_layout(tensor, device_budgets[0].device_id) :
                                planner_default_device_layout(tensor, usage, device_budgets[0].device_id);
-            const size_t dst_size =
-                planner_layout_bytes_for_expert(tensor, n_experts, layout, device_budgets[0].device_id, expert_size);
+            const size_t dst_size = planner_layout_bytes_for_expert(tensor, n_tensor_experts, layout,
+                                                                    device_budgets[0].device_id, expert_size);
 
-            for (int e = 0; e < n_experts; ++e) {
+            for (int e = 0; e < n_tensor_experts; ++e) {
                 placement_entry entry;
                 copy_tensor_info_to_entry(entry, tensor);
                 entry.src_size         = expert_size;

@@ -1,0 +1,7 @@
+[meminfo] start                        Shmem=2.36 GB  MemAvailable=214.67 GB
+  dev0: Intel(R) Arc(TM) Pro B70 Graphics
+  dev1: Intel(R) Arc(TM) Pro B50 Graphics
+  dev2: Intel(R) Graphics
+spawning 8 threads, 40 iters each, round-robin over 3 device(s)
+[meminfo] during concurrent run        Shmem=2.36 GB  MemAvailable=214.65 GB
+[meminfo] all threads joined           Shmem=2.37 GB  MemAvailable=214.57 GB

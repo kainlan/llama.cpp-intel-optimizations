@@ -24,6 +24,18 @@
 #include <utility>
 #include <vector>
 
+// Kept in its own include block: they belong to no upstream group, and adding them to one
+// above makes clang-format re-sort a block this change has no business touching.
+#include "test-archs-exclude.h"
+#include "test-archs-table.h"
+
+// The one threshold both result columns judge by. The NMSE column and the Roundtrip column
+// must not disagree about what "wrong" means, and until this existed that agreement was
+// maintained by five separate literals happening to match -- a property asserted in a comment
+// and enforced by nothing. Editing one of them would have left the test disagreeing with
+// itself about what constitutes a failure. Every site that tests or prints it reads it here.
+static constexpr double nmse_gate = 1e-4;
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
@@ -106,6 +118,66 @@ static std::string nmse_diagnosis(const std::vector<float> & a, const std::vecto
     return ret;
 }
 
+// The Roundtrip column is a BIT-EXACT comparison, so it reports a single FAIL for two
+// causes that need completely different fixes and are trivially told apart by magnitude:
+//
+//   - the weights did not survive the GGUF save/reload, so the reloaded model computes
+//     something else entirely -- large, structured differences, and the reloaded model is
+//     also wrong against the CPU reference;
+//   - the same correct computation took a different path (different kernel, different
+//     residency, non-reproducible accumulation order) -- last-bit differences, and the
+//     reloaded model is still correct against the CPU reference.
+//
+// A bare FAIL loses exactly that distinction, which is the one thing needed before
+// touching any code, so measure it.
+// Report differing positions as (token, vocab) and not as a flat index. The logits vector is
+// n_token rows of n_vocab, and a flat index invites the wrong decomposition: 16384 differing
+// logits "first at 8192" reads as the midpoint of the VOCABULARY, when these fixtures have
+// n_vocab=128 and 8192 is token 64 of 128 -- the first token of the second ubatch. Those two
+// readings point at completely different subsystems, so do the division here, once.
+struct logits_diff {
+    size_t n_diff      = 0;
+    size_t first_diff  = 0;  // flat index
+    size_t first_row   = 0;  // token position
+    size_t first_col   = 0;  // vocab index
+    size_t n_rows_diff = 0;  // token positions with at least one differing logit
+    size_t last_row    = 0;
+    double max_abs     = 0.0;
+    double max_rel     = 0.0;
+};
+
+static logits_diff logits_compare(const std::vector<float> & a, const std::vector<float> & b, const size_t n_col) {
+    GGML_ASSERT(a.size() == b.size());
+    GGML_ASSERT(n_col > 0 && a.size() % n_col == 0);
+    logits_diff  ret;
+    const size_t n_row = a.size() / n_col;
+    for (size_t row = 0; row < n_row; row++) {
+        bool row_differs = false;
+        for (size_t col = 0; col < n_col; col++) {
+            const size_t i = row*n_col + col;
+            if (a[i] == b[i]) {
+                continue;
+            }
+            if (ret.n_diff == 0) {
+                ret.first_diff = i;
+                ret.first_row  = row;
+                ret.first_col  = col;
+            }
+            ret.n_diff++;
+            row_differs = true;
+            const double abs_diff = std::fabs(double(a[i]) - double(b[i]));
+            const double scale    = std::max(std::fabs(double(a[i])), std::fabs(double(b[i])));
+            ret.max_abs = std::max(ret.max_abs, abs_diff);
+            ret.max_rel = std::max(ret.max_rel, scale > 0.0 ? abs_diff/scale : abs_diff);
+        }
+        if (row_differs) {
+            ret.n_rows_diff++;
+            ret.last_row = row;
+        }
+    }
+    return ret;
+}
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     std::hash<std::string> hasher;
     std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
@@ -130,7 +202,9 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--nan-trace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-x/--exclude arch]... [-s/--seed seed] [-v/--verbose] [--nan-trace]\n",
+           argv[0]);
+    printf("  -x/--exclude Skip this architecture; repeatable. It is reported as EXCLUDED, never omitted.\n");
     printf("  --nan-trace  CPU backend only: name the first graph tensors that go non-finite (needs -a)\n");
 }
 
@@ -331,6 +405,19 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    // Both models in the Roundtrip comparison must be loaded the same way. They were not:
+    // llama_model_init_from_user() forces these two off, llama_model_load_from_file_ptr()
+    // passes llama_model_default_params() straight through, where both are on. So the model
+    // written by the saver came back mmap-backed and eligible for weight-repacking extra
+    // buffer types, and the model it is compared against bit-for-bit was neither.
+    //
+    // That is not a difference in what was saved, it is a difference in where the weights
+    // ended up: llama-model-loader.cpp demotes a host buffer type to plain CPU under mmap,
+    // and allocates host-side tensors directly over the mapping instead of going through
+    // ggml_backend_tensor_set. The Roundtrip column compares logits with a bare `!=` and
+    // cannot tell that apart from a bad save.
+    model_params.use_mmap        = false;
+    model_params.use_extra_bufts = false;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -589,7 +676,11 @@ static int trace_nan(const llm_arch target_arch, const size_t seed) {
     return 0;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch                target_arch,
+                       const std::vector<llm_arch> & excluded_archs,
+                       const size_t                  seed,
+                       const ggml_log_level          log_level,
+                       const std::string &           dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -612,6 +703,14 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             continue;
         }
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        if (archs_exclude::contains(excluded_archs, arch)) {
+            // stderr, not LOG_INF: the surrounding LOG_INF lines are filtered out at this
+            // path's default log level, so an exclusion announced through them would be
+            // invisible -- an exclude that silently excludes is the exact defect `-x` exists to
+            // avoid. -o writes files rather than a table, so there is no row to carry it.
+            fprintf(stderr, "%s: %s excluded by --exclude, not saved\n", __func__, llm_arch_name(arch));
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -642,7 +741,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch                target_arch,
+                         const std::vector<llm_arch> & excluded_archs,
+                         const size_t                  seed,
+                         const ggml_log_level          log_level) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -697,9 +799,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
-    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|\n";
+    // The table's layout, its emission discipline and the parser that gates it all live in
+    // tests/test-archs-table.h; test-archs-table verifies THIS emitter rather than a
+    // second copy of the format.
+    const archs_table table = { max_arch_name_length, max_device_label_length };
 
     bool all_ok = true;
     // Rows that produced an actual NMSE comparison. A targeted `-a <arch>` run that
@@ -709,22 +812,37 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     // `test-llama-archs -a gemma4` printed a header, zero rows, and returned 0, which
     // reads as "gemma4 verified" to anything checking the status. See llama.cpp-k208.
     size_t n_measured = 0;
+    // Rows that round-tripped within tolerance but not bit-for-bit. Counted so the closing
+    // line can state it whether or not any row hit it -- see the legend below.
+    size_t n_bitdiff = 0;
     common_log_flush(common_log_main());
-    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
-    printf("|");
-    for (size_t i = 0; i < max_arch_name_length; i++) {
-        printf("-");
-    }
-    printf("|");
-    for (size_t i = 0; i < max_device_label_length; i++) {
-        printf("-");
-    }
-    printf("|------|---------------|---------|\n");
+    archs_table::emit(table.header(nmse_gate));
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
         }
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        if (archs_exclude::contains(excluded_archs, arch)) {
+            // Ordered AFTER the -a filter and BEFORE the hard skips below, and both halves of
+            // that are deliberate.
+            //
+            // After -a, because an architecture the run never had in scope was not "excluded"
+            // by anything the user asked for: under `-a llama`, `-x gemma2` changes nothing,
+            // and a gemma2 row in a single-arch table would say otherwise.
+            //
+            // Before the hard skips, because `-x gemma4` should say EXCLUDED rather than
+            // inherit their silence. Those `continue`s emit no row at all, which is the
+            // property this row exists to avoid -- they are pre-existing and left alone here
+            // (llama.cpp-k208 covers the 77 that follows from them), but a user who explicitly
+            // named an arch is owed an explicit answer.
+            //
+            // Emitted through archs_table::row() like every other status, whole and in one
+            // stdio call, with the log drained first: a printf on the row path is exactly the
+            // interleaving llama.cpp-to9m removed.
+            common_log_flush(common_log_main());
+            archs_table::emit(archs_exclude::row(table, llm_arch_name(arch)));
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -747,10 +865,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
-                printf(template_row_cfg.c_str(),
-                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
-                fflush(stdout);
+                // Which test case is running, so that a crash during model loading or inference is
+                // still attributable -- the property the pre-printed row prefix bought, kept.
+                //
+                // What is not kept is printing it into the table. stdout and stderr are read
+                // merged, so every log line the load emitted landed inside the half-written row;
+                // see tests/test-archs-table.h for the measurements. The row is now
+                // assembled whole and emitted after the work, further down.
+                fprintf(stderr, "test case: %s (%s, %s)\n", llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
 
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
@@ -810,7 +932,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                                 nmse_diagnosis(logits_cpu, logits_dev, tokens.size()).c_str());
                         } else {
                             snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
-                            if (nmse_val > 1e-4) {
+                            if (nmse_val > nmse_gate) {
                                 all_ok = false;
                                 status_nmse = "\033[1;31mFAIL\033[0m";
                             }
@@ -833,36 +955,158 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            if (logits_roundtrip[i] != logits_dev[i]) {
-                                all_ok = false;
-                                status_roundtrip = "\033[1;31mFAIL\033[0m";
-                                break;
-                            }
+                        const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_dev.first.get()));
+                        const size_t n_ubatch = llama_n_ubatch(model_and_ctx_dev.second.get());
+                        const logits_diff rt = logits_compare(logits_dev, logits_roundtrip, n_vocab);
+                        const double nmse_rt = nmse(logits_dev, logits_roundtrip);
+
+                        // Gate on NMSE, not on bit-equality.
+                        //
+                        // The column's job is to catch a save/reload that lost weights, and that
+                        // failure is O(1) -- the reloaded model computes something else entirely.
+                        // Bit-equality was only ever a proxy for it, and on this backend the proxy
+                        // is broken: the device path is not reproducible run to run, so two decodes
+                        // of the same weights differ in the last bits by an amount that varies with
+                        // scheduling. Measured 2026-08-01: same seed, same binary, same selector,
+                        // two processes -- 438 vs 1493 of 16384 logits differing, a 3.4x change,
+                        // with the save/reload path byte-identical between them. A bit-exact
+                        // comparison there is asking whether two non-deterministic decodes happened
+                        // to land identically; it fails at random and, worse, PASSES at random, so
+                        // a green column was never evidence either.
+                        //
+                        // Judged by nmse_gate, the same constant the NMSE column tests against --
+                        // deliberately, because the two columns must not disagree about what
+                        // "wrong" means. Sharing the constant is what makes that a constraint
+                        // rather than a comment.
+                        const bool roundtrip_broken = !std::isfinite(nmse_rt) || nmse_rt > nmse_gate;
+                        if (roundtrip_broken) {
+                            all_ok = false;
+                            status_roundtrip = "\033[1;31mFAIL\033[0m";
+                        } else if (rt.n_diff > 0) {
+                            // Cyan, deliberately NOT the yellow this table uses for SKIP. The
+                            // column's vocabulary is green=OK / red=FAIL / yellow=SKIP, so reusing
+                            // yellow would render "measured, within tolerance, not bit-exact"
+                            // identically to "not measured at all" -- and BITDIFF exists precisely
+                            // so a non-bit-exact row can never be mistaken for silence.
+                            status_roundtrip = "\033[1;36mBITDIFF\033[0m";
+                            n_bitdiff++;
+                        }
+
+                        if (rt.n_diff > 0) {
+                            const size_t n_tok = logits_dev.size()/n_vocab;
+
+                            // Report magnitudes only -- nothing here may touch a device.
+                            //
+                            // Two probes did, on 2026-08-01, and the run segfaulted: a re-decode
+                            // of the already-loaded device model, and a third load of the same
+                            // file. Which of the two crashed was not isolated. What the log shows
+                            // immediately before the fault is
+                            // "[UNIFIED-CACHE] planned-mode runtime materialization rejected
+                            // op=direct_stage_weight ... graph_active=1", i.e. inference asking to
+                            // stage a weight the placement plan has no entry for. The plan is
+                            // global per device and each load replaces it, so both probes run
+                            // against state the single-pass original never creates. Whatever the
+                            // exact mechanism, a diagnostic that costs the run it is diagnosing is
+                            // worth less than no diagnostic: keep this block pure arithmetic over
+                            // logits that have already been computed.
+                            // The movable quantities come FIRST, and that ordering is deliberate.
+                            // NMSE is the right gate -- it catches the O(1) corruption this column
+                            // exists for -- but it is not a sensitivity measure and must not be read
+                            // as one. At these magnitudes the whole divergence contributes ~6e-17 to
+                            // ~2e-16 to NMSE, against a value printed to four significant figures
+                            // whose last digit is worth ~1e-12: four orders of magnitude below what
+                            // the format can show. It stayed pinned at 2.201e-09 across the two
+                            // replicates whose differing-element counts were 438 and 1493. Anyone
+                            // diagnosing from NMSE alone is reading a quantity that cannot move.
+                            // The count, the first difference and the affected rows can.
+                            fprintf(stderr,
+                                "\n%s (%s, %s): roundtrip not bit-exact [%s]\n"
+                                "  save/reload vs device: %zu/%zu logits differ, max abs %.3e, max rel %.3e\n"
+                                "  first difference:      token %zu of %zu, vocab %zu of %zu (flat index %zu)\n"
+                                "  token rows affected:   %zu of %zu, from %zu to %zu%s\n"
+                                "  gate NMSE(dev,reload): %.3e vs threshold %.1e -- %s\n"
+                                "  NMSE vs CPU:           device %.3e, reloaded %.3e\n"
+                                "  (the gate is NMSE; the three lines above it are the ones with the\n"
+                                "   resolution to move between runs -- diagnose from those, not from NMSE)\n",
+                                llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                roundtrip_broken ? "FAIL" : "BITDIFF",
+                                rt.n_diff, logits_dev.size(), rt.max_abs, rt.max_rel,
+                                rt.first_row, n_tok, rt.first_col, n_vocab, rt.first_diff,
+                                rt.n_rows_diff, n_tok, rt.first_row, rt.last_row,
+                                rt.first_row == n_ubatch ?
+                                    " -- exactly n_ubatch, so every token of the FIRST ubatch is bit-identical"
+                                    " and divergence begins at the first token of the SECOND" : "",
+                                nmse_rt, nmse_gate, roundtrip_broken ?
+                                    "EXCEEDED: the reloaded model computes something else; the save/reload lost data" :
+                                    "within tolerance: both models agree to far better than the gate",
+                                nmse(logits_cpu, logits_dev), nmse(logits_cpu, logits_roundtrip));
                         }
                     }
                 }
 
-                // log the results for this test case
-                printf(template_row_res.c_str(),
-                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                // The row for this test case, assembled whole and written with one stdio call.
+                // Draining the log first keeps anything this case logged ahead of its row rather
+                // than after it; the single write is what keeps it out of the row.
+                common_log_flush(common_log_main());
+                archs_table::emit(table.row(llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                            status_nmse.c_str(), nmse_str, status_roundtrip.c_str()));
             }
         }
     }
+    common_log_flush(common_log_main());
+    archs_table::emit(table.footer(nmse_gate, n_bitdiff));
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-    if (target_arch != LLM_ARCH_UNKNOWN && n_measured == 0) {
-        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: the caller asked for
-        // one architecture and this harness compared nothing, so there is no result to
-        // report either way. 77 is unreachable from the registered `test-llama-archs`
-        // invocation, which passes no `-a` and always measures something.
-        fprintf(stderr,
-                "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
-                "measure that architecture, so this run proves NOTHING about it.\n"
-                "  Reasons this happens: the arch is excluded outright by test_backends() "
-                "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
-                "arch_supported() returns false for it (gemma-embedding, the BERT family, "
-                "RWKV, ...) and every row is SKIP.\n",
-                __func__, llm_arch_name(target_arch));
+    if (n_measured == 0) {
+        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: this harness compared
+        // nothing, so there is no result to report either way. `all_ok` is initialised true,
+        // so without this the run would report success it did not earn.
+        //
+        // Unconditional, deliberately. This used to be guarded by `target_arch !=
+        // LLM_ARCH_UNKNOWN`, on the reasoning that "77 is unreachable from the registered
+        // invocation, which passes no `-a` and always measures something" -- an assumption
+        // about the sweep, stated in a comment and enforced by nothing, and the no-`-a` sweep
+        // is precisely what CI runs. So the one path that was left unguarded was the one that
+        // mattered. See llama.cpp-to9m.
+        //
+        // --exclude reaches here too, and 77 is the right answer for it as well: `-x` on
+        // everything the run would have measured (`-a llama -x llama` is the small case)
+        // leaves n_measured at 0, and a run that measured nothing must score as skipped, not
+        // passed. What it must NOT do is let the reader diagnose the wrong thing, so the note
+        // below names the exclusions -- otherwise the sweep branch sends someone hunting for a
+        // missing backend when the cause is on their own command line. The note is empty when
+        // no -x was given, which keeps that path's output byte-identical.
+        std::string excluded_note;
+        if (!excluded_archs.empty()) {
+            std::string names;
+            for (const llm_arch & excluded : excluded_archs) {
+                names += names.empty() ? "" : ", ";
+                names += llm_arch_name(excluded);
+            }
+            excluded_note = string_format(
+                "  %zu architecture(s) were excluded by --exclude (%s). If that covers "
+                "everything this run would otherwise have measured then 77 is the honest "
+                "answer, and the environment causes listed above do not apply.\n",
+                excluded_archs.size(), names.c_str());
+        }
+        if (target_arch != LLM_ARCH_UNKNOWN) {
+            fprintf(stderr,
+                    "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
+                    "measure that architecture, so this run proves NOTHING about it.\n"
+                    "  Reasons this happens: the arch is excluded outright by test_backends() "
+                    "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
+                    "arch_supported() returns false for it (gemma-embedding, the BERT family, "
+                    "RWKV, ...) and every row is SKIP.\n%s",
+                    __func__, llm_arch_name(target_arch), excluded_note.c_str());
+        } else {
+            fprintf(stderr,
+                    "\n%s: the full sweep performed no NMSE comparison at all -- every "
+                    "architecture was excluded or skipped, so this run proves NOTHING about "
+                    "any of them.\n"
+                    "  A sweep reaching this is a harness or environment failure, not a "
+                    "property of one architecture: check that a backend was registered and "
+                    "that the run was not cut short before the first comparison.\n%s",
+                    __func__, excluded_note.c_str());
+        }
         return 77;
     }
     return all_ok ? 0 : 1;
@@ -874,6 +1118,7 @@ int main(int argc, char ** argv) {
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    std::vector<llm_arch> excluded_archs;
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
@@ -893,6 +1138,23 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--exclude") == 0) {
+            if (i + 1 < argc) {
+                const std::string arch_name = argv[++i];
+                // Rejecting the name is the whole point of validating it. A typo'd -x that
+                // silently excluded nothing would leave the run measuring exactly what it
+                // measured before, while the operator believes an architecture was skipped --
+                // and worse, a run that dies where it always died would look like the exclude
+                // "did not help" rather than like it never applied.
+                if (!archs_exclude::parse(arch_name.c_str(), excluded_archs)) {
+                    LOG_ERR("%s: --exclude: not a usable LLM architecture: %s\n", __func__, arch_name.c_str());
+                    return 1;
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -903,6 +1165,12 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             log_level = GGML_LOG_LEVEL_INFO;
+            // Raising the harness's own filter is not enough: common_get_verbosity() maps
+            // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE (4), and the default threshold is
+            // LOG_LEVEL_INFO (3), so every GGML_LOG_INFO line -- every [MOE-LAYOUT],
+            // [S1-PRELOAD], [UNIFIED-CACHE] line the backend emits -- was dropped by the
+            // sink after this flag had already let it through. `-v` printed nothing new.
+            common_log_set_verbosity_thold(LOG_LEVEL_TRACE);
             continue;
         }
         if (strcmp(argv[i], "--nan-trace") == 0) {
@@ -920,14 +1188,25 @@ int main(int argc, char ** argv) {
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
+    // --nan-trace traces the single architecture named by -a; it iterates no arch list, so
+    // there is nothing for --exclude to filter there. Rejecting the combination rather than
+    // ignoring it: a flag that is quietly inert in one mode is the same silent no-op the
+    // unknown-name check above exists to prevent, and `--nan-trace -a X -x X` in particular
+    // asks for two contradictory things.
+    if (nan_trace && !excluded_archs.empty()) {
+        LOG_ERR("%s: --exclude has nothing to filter under --nan-trace, which traces only the -a architecture\n",
+                __func__);
+        return 1;
+    }
+
     try {
         if (nan_trace) {
             return trace_nan(arch, seed);
         }
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, excluded_archs, seed, log_level, out);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, excluded_archs, seed, log_level);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
