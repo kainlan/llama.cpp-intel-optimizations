@@ -10,6 +10,104 @@ executed, because this pass ran without `BUILD.lock` or device access — those
 still need the lead (or a follow-up) to actually run the described mutation and
 confirm the reasoning.
 
+## ⚠️ TOP-LINE ANSWER: the `llama.cpp-0igs` merge-blocker question
+
+**Of the still-unregistered test sources, 64 cover code this branch changed.**
+Redirected here by the lead: exhaustively mutation-verifying the whole
+remaining population (~65–70 more registered C++ tests, ~90 Python/shell
+gates) has falling marginal value and is not what gates *this* merge — the
+question that matters is how much of `llama.cpp-0igs`'s ~147-file backlog is
+actually merge-relevant.
+
+**Method:**
+1. Changed surface: `git diff --name-only master...HEAD -- ggml/src/ggml-sycl/ src/`
+   → 44 files (`fattn*`, `unified-cache`/`unified-kernel`, `mem-handle`,
+   `kv-tier-manager`, `zone-sizing`, `gpu-arch`/`cold-start`, `dispatch.hpp`,
+   `xmx-dispatch-gate.hpp`, `common.hpp/cpp`, `binbcast.cpp`, plus
+   `src/llama-model.cpp/h` and `src/llama-moe-profile.cpp` on the MoE side).
+2. Registration status for all 291 unique `tests/*.cpp` +
+   `ggml/src/ggml-sycl/tests/*.cpp` source names: literal-name grep against
+   both `CMakeLists.txt` files (catches `foreach`-loop registrations, where
+   the name appears in the loop list even though `add_executable` uses a
+   variable) → **166 unregistered** (125 registered, matching the lead's
+   171-registration figure once Python/shell registrations are added back in).
+3. Intersected the 166 against the changed surface two ways: does the source
+   `#include` one of the 12 changed headers, or does its filename contain one
+   of 21 keyword stems drawn from the changed subsystems (`fattn`, `onednn`,
+   `xmx`, `unified-cache`, `unified-kernel`, `mem-handle`, `mem-ops`,
+   `kv-tier`, `zone-sizing`, `gpu-arch`, `cold-start`, `binbcast`, `dispatch`,
+   `graph-replay`, `cross-model`, `moe`, `tensor-usage`, `tensor-placement`,
+   `tensor-class`, `expert`, `grovemoe`/`chexps`) → **65 hits**.
+4. Split those 65 by whether they existed at `3c8f296fd` (the pre-wipe
+   commit) — this matters because the lead's own rule is explicit: **a file
+   registered at `3c8f296fd` belongs on the `0igs` restoration list even if
+   currently vacuous; only a never-registered file is a delete candidate.**
+   **64 of 65 existed at `3c8f296fd`** (genuine wipe casualties). The one
+   exception, `tests/bench-sycl-fattn-gptoss.cpp`, is new to this branch and
+   named like the other `bench-*`/`bench-dnnl-ops.cpp` files that were never
+   meant to be ctest targets — almost certainly not a real restoration
+   candidate, though not individually confirmed.
+
+**So: 64, not 147.** Full sorted list (all under `tests/`, all pre-existing
+at `3c8f296fd`): `mini-context-prototype`, `test-cold-start`,
+`test-cpu-gpu-soa-interaction`, `test-dmmv-q4-0-coalesced`,
+`test-dmmv-q6k-coalesced`, `test-expert-cache`,
+`test-expert-routing-roundtrip`, `test-fattn-thread-local`,
+`test-ggml-sycl-soa`, `test-layout-bytes`, `test-mmq-q6k-gpu`,
+`test-mmvq-q8-0-streaming-bench`, `test-moe-expert-placement`,
+`test-moe-mini-graph`, `test-moe-mul-mat-id`, `test-moe-mul-mat-id-q4q8`,
+`test-mul-mat-host-streaming`, `test-mxfp4-xmx-tiled`,
+`test-onednn-fallback`, `test-onednn-woq`, `test-pinned-chunk-pool`,
+`test-planner-canary-cpy-visibility`, `test-planner-canary-direct-load`,
+`test-planner-canary-pp-tg-union`,
+`test-planner-canary-skeleton-determinism`, `test-q6k-56block-debug`,
+`test-q6k-dispatch`, `test-q6k-layout-debug`, `test-q6k-reorder-dispatch`,
+`test-q6k-variable-reorder`, `test-q8-0-layout-cache-path`,
+`test-q8-0-layout-cache-path-mmvq`, `test-sycl-cpu-dispatch`,
+`test-sycl-expert-cache-bandwidth`, `test-sycl-expert-prefetch`,
+`test-sycl-fattn-onednn-descriptors`,
+`test-sycl-fattn-onednn-materialization`, `test-sycl-fattn-xmx-policy`,
+`test-sycl-kernel-selection`, `test-sycl-kv-planned-device-materialization`,
+`test-sycl-moe-expert-parallelism`, `test-sycl-moe-handle-resolution`,
+`test-sycl-moe-identity-hash`, `test-sycl-moe-q8-scratch`,
+`test-sycl-onednn-packed-cache`, `test-sycl-orchestrator`,
+`test-sycl-prestage-routed-experts`, `test-sycl-race-conditions`,
+`test-sycl-set-rows-owner-routing`, `test-sycl-unified-cache`,
+`test-sycl-unified-memory-e2e`, `test-sycl-weight-key-stability`,
+`test-sycl-weight-key-uniqueness`, `test-sycl-xmx-unified-correctness`,
+`test-tensor-classification`, `test-tiered-dispatch`,
+`test-tile-decomposition`, `test-unified-cache-concurrent`,
+`test-unified-cache-integrity`, `test-unified-dispatch-integration`,
+`test-xmx-host-streaming`, `test-xmx-kernel-config`,
+`test-xmx-quant-loaders`, `test-xmx-unified-kernel`.
+
+Aggregate size, as a build-cost proxy: **~26,000 lines, ~347
+`CHECK`/`assert`/`TEST_FAIL`/`EXPECT_`-style call sites** across the 64. At
+the ticket's own ~15-min-per-file `ocloc` estimate, restoring this subset is
+**~16 hours** of serialised build time against ~35.5 hours for the full
+~142-file backlog — a real reduction, not a rounding difference.
+
+**Caveats, stated plainly rather than glossed over:**
+- This is a *topical-relevance* filter (header includes + filename
+  keywords), not a read of each file. Two spot-checks (`test-moe-expert-placement.cpp`,
+  `test-sycl-unified-cache.cpp`) confirmed genuine, substantive relevance —
+  but the filter can't distinguish a real regression test from another
+  `test-graph-replay`-shaped exploration script that happens to touch a
+  changed subsystem. `test-moe-expert-placement.cpp` in particular opens with
+  "Micro-benchmark" framing and manual build instructions, the same shape as
+  the two files already deleted this pass — it is on the *coverage-relevant*
+  list, not a confirmed-good list. Per the lead's own rule this is moot for
+  the disposition question (registered-at-`3c8f296fd` → restore, not
+  delete), but it matters for how much of the resulting coverage is real
+  once restored.
+- The keyword list is mine, not exhaustive-by-construction; a false negative
+  (a relevant file missed because it uses vocabulary outside the 12
+  headers/21 keywords) is more likely than a false positive here, so 64
+  should be read as a floor, not a ceiling.
+- None of the 64 were mutation-tested this pass — that is the natural next
+  step once the lead has the restoration-vs-defer decision this number is
+  for.
+
 ## Two instances named in the ticket
 
 ### 1. `tests/test-sycl-tensor-placement.cpp` — FIXED, was a mock
