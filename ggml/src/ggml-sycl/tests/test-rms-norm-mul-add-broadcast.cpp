@@ -39,6 +39,22 @@
 // add_src is a view into a larger tensor, offset to its SECOND slice, mirroring
 // slice_rest precisely rather than approximating it.
 //
+// UPDATE 2 (this ticket, continued further): Case C's FIRST version read op_seq=0
+// (GGML_SYCL_FUSION_BIT1_REACH_DEBUG) -- it never reached bit1 at all, on either ncols.
+// Root cause: `ggml_add(ctx, mul, add_src)` put the VIEW operand at src[1]. ggml's
+// post-order graph builder visits src[0] before src[1], and a VIEW is its own
+// cgraph->nodes[] entry (not a leaf), so that ordering placed the view node BETWEEN mul
+// and the ADD (next_ops=[MUL,VIEW]) -- structurally ineligible before bit1's op-sequence
+// check could even look at it. Fixed by matching gemma3n's actual argument order --
+// `ggml_add(ctx0, slice_rest, first_prediction)` puts the view FIRST -- which flushes the
+// view's (trivial) dependency chain to cgraph->nodes[] before the rms->mul chain is even
+// visited, landing RMS_NORM/MUL/ADD consecutively regardless of what precedes them. See
+// the comment at Case C's own ggml_add call for the full DFS trace. This was a real,
+// separate defect in the test's construction -- not the same bug as gemma3n's, but a
+// concrete demonstration of the "numerically identical shape, structurally ineligible"
+// trap: building the right operand shape is not sufficient to reach the code that
+// operand shape is supposed to exercise.
+//
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
@@ -253,7 +269,26 @@ static bool run_case_view_offset(ggml_backend_t backend, int ncols, int nrows, c
 
     struct ggml_tensor * rms   = ggml_rms_norm(ctx, x, eps);
     struct ggml_tensor * mul   = ggml_mul(ctx, rms, gamma);
-    struct ggml_tensor * added = ggml_add(ctx, mul, add_src);
+    // Operand order matters here in a way it doesn't for Cases A/B, and getting it backwards
+    // is exactly why this case originally read op_seq=0 (GGML_SYCL_FUSION_BIT1_REACH_DEBUG,
+    // this ticket): ggml_build_forward_expand does a post-order DFS that visits src[0] before
+    // src[1], appending each child to cgraph->nodes[] only after ALL of it is visited. add_src
+    // is a VIEW node (op=GGML_OP_VIEW, not a leaf), so wherever it sits in the src[] order, it
+    // becomes its own entry in cgraph->nodes[] -- the only question is where.
+    //   ggml_add(ctx, mul, add_src)  -- add_src is src[1], visited AFTER the whole
+    //     rms->mul chain is already appended, landing the VIEW node BETWEEN mul and this ADD:
+    //     nodes[] = [..., rms, mul, add_src(VIEW), added]. next_ops=[MUL,VIEW], not
+    //     [MUL,ADD] -- bit1's adjacency check fails before it can even look at the operands.
+    //   ggml_add(ctx, add_src, mul)  -- add_src is src[0], visited FIRST; its own (trivial,
+    //     one-level) view chain resolves and flushes to nodes[] before DFS ever starts on
+    //     src[1]. The rms->mul chain, visited second, lands immediately adjacent to `added`
+    //     when DFS returns: nodes[] = [..., add_src(VIEW), rms, mul, added]. RMS_NORM, MUL,
+    //     ADD are consecutive regardless of what precedes them.
+    // gemma3n's real chain (gemma3n.cpp:253) already uses this order --
+    // `ggml_add(ctx0, slice_rest, first_prediction)`, view first -- which is why it reaches
+    // bit1 in the real graph while this test, built with the arguments the "natural" way
+    // round, silently didn't.
+    struct ggml_tensor * added = ggml_add(ctx, add_src, mul);
     ggml_set_output(added);
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -334,9 +369,13 @@ int main() {
     run_case(backend, 256, 8, /*broadcast_add=*/false, "ncols=256 full-residual (suspected)");
 
     // Case C: gemma3n's actual root cause (first_prediction_out / slice_rest) -- a view
-    // at a non-zero offset into a graph-internal tensor. Expected RED before
-    // ggml_sycl_fusion_operand_view_offset_safe (ggml-sycl.cpp) declines fusion for this
-    // shape, GREEN after.
+    // at a non-zero offset into a graph-internal tensor. GGML_SYCL_FUSION_BIT1_REACH_DEBUG
+    // should now show op_seq=1 and a [FUSION-BIT1-GUARD] line for both ncols (it read
+    // op_seq=0 -- never reached bit1 at all -- before the ggml_add argument-order fix; see
+    // the file header and the comment at run_case_view_offset's ggml_add call). With the
+    // guard (ggml_sycl_fusion_operand_view_offset_safe, ggml-sycl.cpp) intact, expect PASS;
+    // with it mutated to unconditionally return true, expect FAIL -- that A/B is what
+    // proves this case actually exercises the bug rather than merely reaching the code.
     run_case_view_offset(backend, 64, 8, "ncols=64 view-at-nonzero-offset (root cause)");
     run_case_view_offset(backend, 256, 8, "ncols=256 view-at-nonzero-offset (root cause)");
 
