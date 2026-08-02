@@ -306,41 +306,49 @@ inline bool fattn_xmx_v2_decode_m1n64_supported(const sycl::device & dev, int tk
 }
 
 // Shape-aware variant selector for XMX-v2.
-// Returns 0 (fallback TM=8) for shapes that should not use TM=16:
-//   - TG/small ncols: ne01 <= 1 or ncols <= 8 (TM=16 over-provisioned)
-//   - small D: D < 128 (not enough elements per tile for TM=16 benefit)
-// Returns 1 (TM=16) for PP shapes with ncols >= 16 and D >= 128,
-//   only when the device matrix extension supports (16,16,16).
 //
-// Env override: GGML_SYCL_FA_XMX_V2_VARIANT=0/tm8 forces TM=8,
-// =1/tm16 forces TM=16, =auto (default) uses shape-aware selection.
+// TM=16 (variant 1) IS DISABLED BY DEFAULT: this always returns 0 (TM=8) unless
+// GGML_SYCL_FA_XMX_V2_VARIANT explicitly forces otherwise. See llama.cpp-dqp2.
+//
+// Why: TM=16 was only ever reachable in ONE configuration in this tree, and that
+// configuration hangs the GPU. The old selection required
+// `ne01 > 1 && ncols >= 16 && D >= 128`, but the dispatcher never offers a shape
+// that satisfies it safely:
+//
+//   * fattn.cpp passes ncols in {1, 2, 8, 16} on the D >= 128 ladder, and the
+//     sole ncols=32 site is D=64-only (`can_use_xmx_v2_d64_batched_pp` opens with
+//     `if constexpr (D != 64) return false;`), so D >= 128 caps ncols at 16.
+//   * ncols == 16 was therefore the only value that could select TM=16, and it
+//     forces SG_ROWS_PER_Q = ceil(16/16) = 1 — a single-sub-group work-group.
+//
+// Measured 2026-08-02, Arc Pro B70, `test-llama-archs -a gemma2` (gemma2 is the
+// only in-tree arch reaching this leaf at D=128 — everything else is taken by
+// oneDNN SDPA or XMX-v1):
+//
+//   default (TM=16)                   -> [SYCL-WATCHDOG] no GPU progress for
+//                                        30279 ms, _Exit(1), no result row
+//   GGML_SYCL_FA_XMX_V2_VARIANT=tm8   -> rc=0, NMSE OK (6.07e-14)
+//
+// So disabling costs no measured throughput: no in-tree shape selects TM=16.
+//
+// The leaf's actual defect is NOT fixed here. The mechanism is unproven — the
+// single-sub-group geometry is a correlate, not a demonstrated cause, because
+// there is no second reachable TM=16 shape to contrast against.
+//
+// The env override is deliberately left ABOVE this gate so
+// GGML_SYCL_FA_XMX_V2_VARIANT=tm16 still reproduces the hang; that is the
+// reproducer for whoever fixes the leaf body. Re-enabling by default means
+// deleting the `return 0` AND showing a passing `test-llama-archs -a gemma2`.
 inline std::size_t fattn_xmx_v2_pick_variant_for_shape(const sycl::device & dev, int D, int ncols, int ne01) noexcept {
     const int forced_variant = fattn_xmx_v2_parse_forced_variant(std::getenv("GGML_SYCL_FA_XMX_V2_VARIANT"));
     if (forced_variant >= 0 && fattn_xmx_v2_variant_supported(dev, static_cast<std::size_t>(forced_variant))) {
         return static_cast<std::size_t>(forced_variant);
     }
 
-    // Shape guard: don't use TM=16 for small shapes.
-    // TG (ncol=1) or small batches (< 16 queries) → TM=8 is strictly better.
-    // Small D (< 128) doesn't benefit from wider tiles.
-    if (ne01 <= 1 || ncols < 16 || D < 128) {
-        return 0;
-    }
-
-    // Delegate to device-wide matrix_combinations query for TM=16 support.
-    const auto combos = fattn_xmx_v2_query_combinations(dev);
-    for (const auto & c : combos) {
-        using sycl_xmx::matrix_type;
-        if (c.atype == matrix_type::fp16 && c.btype == matrix_type::fp16 && c.ctype == matrix_type::fp32 &&
-            c.dtype == matrix_type::fp32 && (int) c.nsize == 16 && (int) c.ksize == 16) {
-            const bool m_is_range = (c.msize == 0);
-            const int  m_fixed    = (int) c.msize;
-            const int  m_max      = (int) c.max_msize;
-            if (m_is_range ? m_max >= 16 : m_fixed == 16) {
-                return 1;
-            }
-        }
-    }
+    (void) dev;
+    (void) D;
+    (void) ncols;
+    (void) ne01;
     return 0;
 }
 
