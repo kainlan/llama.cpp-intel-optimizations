@@ -3127,3 +3127,25 @@ set_tests_properties(esimd-dpas-gate PROPERTIES
     LABELS "sycl;arch;dispatch;tdd"
     TIMEOUT 60
 )
+
+# test-rms-norm-mul-add-broadcast: discriminator for bit1's broadcast-vs-full-residual
+# axis (llama.cpp-81gx, source committed c725c4a75, registration supplied by impl-w2).
+# Submits real device work, so ONEAPI_DEVICE_SELECTOR is pinned to the validation card
+# (level_zero:1) rather than left to whatever a bare ctest run picks up.
+add_executable(test-rms-norm-mul-add-broadcast
+    tests/test-rms-norm-mul-add-broadcast.cpp
+)
+target_include_directories(test-rms-norm-mul-add-broadcast PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include ${SYCL_INCLUDE_DIR})
+target_compile_definitions(test-rms-norm-mul-add-broadcast PRIVATE
+    GGML_SYCL_WARP_SIZE=32 GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
+target_link_libraries(test-rms-norm-mul-add-broadcast PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-rms-norm-mul-add-broadcast PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME rms-norm-mul-add-broadcast COMMAND test-rms-norm-mul-add-broadcast)
+set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
+    LABELS "sycl;fusion;rms-norm;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120)
