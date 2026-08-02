@@ -117,6 +117,48 @@ specifically, it is not a mutation-tested clearance.** Listing them here,
 un-cleared, rather than silently treating "includes a real header" as "can
 fail."
 
+## `ggml/src/ggml-sycl/tests/*.cpp` — two deleted, several confirmed good
+
+Header/mechanism-checked the remaining `.cpp` files directly under
+`ggml/src/ggml-sycl/tests/` (distinct from the `tests/` files the CMake loop
+above pulls in by relative path).
+
+**Deleted: `test-graph-replay.cpp` and `test-graph-replay-chain.cpp`.** Both
+are genuinely "cannot fail," confirmed by reading `main()`, not inferred:
+each per-scenario `check()`/inline comparison returns a `bool` or prints
+`OK`/`FAIL` as a **string label only** — the caller (a `void`-returning
+per-test function) never propagates it, and `main()` unconditionally
+`return 0`s unless a `sycl::exception` escapes. A reader has to notice the
+printed word "FAIL" themselves; `ctest` (or any script checking exit code)
+cannot. Both were **never registered, at any point in this repo's history**
+(`git show 3c8f296fd:tests/CMakeLists.txt` has zero hits for either name, and
+`search_text` across the live tree, including `build/`, returns zero) —
+confirmed via `git log`, the introducing commit (`54b5e6f1e`) is titled "add
+**standalone** L0 graph replay behavior tests" and the file's own header
+comment gives manual `icpx -fsycl -o test-graph-replay …` build instructions,
+consistent with "always meant as an ad-hoc diagnostic, not a ctest test."
+Neither exercises any `ggml-sycl` production code — both are pure raw
+SYCL/L0 command-graph API exploration (does L0 graph replay re-read updated
+`malloc_device`/`malloc_host` memory). This is the `llama.cpp-0igs`
+"~30 never registered even at `3c8f296fd`" population, where that ticket's
+own text names deletion (with a stated reason) as the correct action rather
+than restoration. Deleted here rather than left inert, per this ticket's own
+acceptance criteria ("any test that cannot be made to fail is deleted").
+
+**Confirmed good, properly wired:** `test-kernel-dispatch.cpp` and
+`test-mmq-xmx-dispatch.cpp` (both currently registered and active — ctest
+names `kernel-dispatch` / `mmq-xmx-dispatch`) and `test-xmx-hardware-detect.cpp`,
+`test-xmx-esimd-basic.cpp`, `test-esimd-vectorized-dequant.cpp` (registered
+but gated behind `GGML_SYCL_BUILD_XMX_TESTS`, OFF by default — same
+lower-live-risk caveat as `test-xmx-config.cpp` above). All five use the
+`all_passed &= test_...()` accumulator pattern and end with
+`return all_passed ? 0 : 1;` (with an explicit, narrow graceful-skip `return 0`
+only when hardware genuinely lacks the feature being tested, e.g. no XMX/ESIMD
+support) — real failure propagation, not discarded like the two deleted
+files above. Not individually mutation-tested this pass, but the exit-code
+mechanism itself is sound, which is the property the two deletions above
+were missing.
+
 ## Coordination finding that changes the shape of this ticket
 
 **`llama.cpp-0igs`** (P1, currently `open`, owner `impl-0igs` died in the
