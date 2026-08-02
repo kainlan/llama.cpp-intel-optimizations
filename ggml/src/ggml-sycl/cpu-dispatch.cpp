@@ -498,6 +498,13 @@ void ggml_sycl_cpu_vec_dot_rows(ggml_type     type,
         return;
     }
 
+    // g_cpu_dispatch_buffers is thread_local; this function is reachable
+    // from CpuExpertPool worker threads and std::async fallback threads
+    // (see ggml_sycl_cpu_expert_mul_mat_batched's callers in ggml-sycl.cpp),
+    // neither of which is guaranteed to have sized it. Cheap when already
+    // correctly sized -- resize() to an unchanged size is a no-op.
+    ggml_sycl_cpu_dispatch_buffers_init();
+
     const auto * cpu_traits = ggml_get_type_traits_cpu(type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
         GGML_LOG_WARN("[TENSOR-SPLIT] No vec_dot for type %d, skipping CPU rows\n", type);
@@ -812,6 +819,9 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
         return;
     }
 
+    // See ggml_sycl_cpu_vec_dot_rows -- same thread_local hazard, same fix.
+    ggml_sycl_cpu_dispatch_buffers_init();
+
     if (!task.bias) {
         // Fast path: delegate to the shared row kernel when no bias is needed.
         ggml_sycl_cpu_vec_dot_rows(task.type, task.K, task.weight_host, task.act_host, task.output_host, task.N);
@@ -1083,6 +1093,15 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         ggml_sycl_tbb::parallel_for(
             ggml_sycl_tbb::blocked_range<int>(0, total_rows, grain),
             [tasks_ptr, q8_ptrs, meta_ptr, n_tasks](const ggml_sycl_tbb::blocked_range<int> & range) {
+                // This lambda runs on a TBB arena worker thread, which is
+                // NOT necessarily the thread that called
+                // ggml_sycl_cpu_expert_mul_mat_batched() -- and the MXFP4
+                // large-chunk4 path below (chunk4 > 256) touches
+                // g_cpu_dispatch_buffers.accs directly. thread_local means
+                // each TBB worker has its own, separately-unsized instance;
+                // init here, not at the enclosing function's entry.
+                ggml_sycl_cpu_dispatch_buffers_init();
+
                 // Binary search for starting task
                 int cur_task = 0;
                 {
@@ -1457,6 +1476,15 @@ void ggml_sycl_cpu_expert_mul_mat_adaptive(const cpu_expert_task * tasks, int n_
         return;
     }
 
+    // cpu_expert_mul_mat_int4()'s reduced-precision loop below touches
+    // g_cpu_dispatch_buffers.src1_q directly and is NOT wrapped in a
+    // parallel_for/host_task of its own -- it just runs on whatever thread
+    // called this function. That thread (CpuExpertPool worker, std::async
+    // fallback, or a direct test caller) may never have sized the buffer.
+    // Confirmed crash site: cpu-dispatch.cpp:1425 GGML_ASSERT via
+    // test-sycl-cpu-dispatch's test_int4_kernel_correctness.
+    ggml_sycl_cpu_dispatch_buffers_init();
+
     const int                   threshold = ggml_sycl_expert_miss_burst_threshold();
     const expert_miss_precision mode      = ggml_sycl_expert_miss_precision_mode();
 
@@ -1543,6 +1571,9 @@ void ggml_sycl_cpu_expert_fused_gate_up_silu(const cpu_expert_fused_task & task)
     if (task.N <= 0 || task.K <= 0 || !task.weight_gate || !task.weight_up || !task.act_host || !task.output_host) {
         return;
     }
+
+    // See ggml_sycl_cpu_vec_dot_rows -- same thread_local hazard, same fix.
+    ggml_sycl_cpu_dispatch_buffers_init();
 
     const auto * cpu_traits = ggml_get_type_traits_cpu(task.type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
@@ -6262,6 +6293,12 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
                            int64_t       M,
                            float *       dst_host,
                            int64_t       ldc) {
+    // See ggml_sycl_cpu_vec_dot_rows -- same thread_local hazard, same fix.
+    // Both g_cpu_dispatch_buffers.src1_q (quantized-activation path) and
+    // .scratch_nk (DNNL dequant fallback) below are touched on whichever
+    // thread calls this function, before any internal parallel_for.
+    ggml_sycl_cpu_dispatch_buffers_init();
+
     const int64_t nb01         = static_cast<int64_t>(ggml_row_size(weight_type, K));
     const char *  weight_bytes = static_cast<const char *>(weight_host);
 
