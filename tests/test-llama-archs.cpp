@@ -26,7 +26,7 @@
 
 // Kept in its own include block: it belongs to no upstream group, and adding it to one above
 // makes clang-format re-sort a block this change has no business touching.
-#include "test-llama-archs-table.h"
+#include "test-archs-table.h"
 
 // The one threshold both result columns judge by. The NMSE column and the Roundtrip column
 // must not disagree about what "wrong" means, and until this existed that agreement was
@@ -782,7 +782,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     }
 
     // The table's layout, its emission discipline and the parser that gates it all live in
-    // tests/test-llama-archs-table.h; test-llama-archs-table verifies THIS emitter rather than a
+    // tests/test-archs-table.h; test-archs-table verifies THIS emitter rather than a
     // second copy of the format.
     const archs_table table = { max_arch_name_length, max_device_label_length };
 
@@ -831,7 +831,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 //
                 // What is not kept is printing it into the table. stdout and stderr are read
                 // merged, so every log line the load emitted landed inside the half-written row;
-                // see tests/test-llama-archs-table.h for the measurements. The row is now
+                // see tests/test-archs-table.h for the measurements. The row is now
                 // assembled whole and emitted after the work, further down.
                 fprintf(stderr, "test case: %s (%s, %s)\n", llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
 

@@ -292,9 +292,18 @@ endif()
 
 # Gates the results table of test-llama-archs against the log output it shares a stream with
 # (llama.cpp-to9m). Registered unconditionally and outside the block above: it drives the
-# emitter in test-llama-archs-table.h directly, so it loads no model, touches no device, and
+# emitter in test-archs-table.h directly, so it loads no model, touches no device, and
 # needs neither a vocab nor a backend.
-llama_build_and_test(test-llama-archs-table.cpp)
+#
+# NOT named test-llama-archs-table, however obvious that name looks. Four CI workflows carry
+# `ctest -E "test-llama-archs"` (build-apple.yml, build-openvino.yml x3) to disable the test
+# this one gates, and `-E` is an UNANCHORED regex -- so that name is swallowed by the same
+# pattern and the gate would silently never run. Measured: `ctest -N -E "test-llama-archs"`
+# listed neither, `-E "^test-llama-archs$"` listed the gate. Anchoring the workflows would
+# also fix it, but they are upstream files that a rebase reverts without a word, and the cost
+# of losing that fix is a gate nobody knows has stopped running. A name the pattern cannot
+# catch needs no upstream cooperation. Do not "tidy" this back.
+llama_build_and_test(test-archs-table.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)

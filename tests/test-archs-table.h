@@ -2,7 +2,7 @@
 
 // The results table of test-llama-archs: how a row is assembled, how it reaches stdout, and
 // what a well-formed line looks like. The three live together because they are one contract,
-// and because tests/test-llama-archs-table.cpp gates the emitter THROUGH this header rather
+// and because tests/test-archs-table.cpp gates the emitter THROUGH this header rather
 // than re-stating the layout -- a parser carrying its own copy of the format stops testing the
 // harness the moment either copy drifts.
 //
@@ -10,8 +10,11 @@
 // merged, because that is where the backend's log lines are. The harness used to print a row in
 // two halves -- prefix, fflush(stdout), load a model and decode, then the result -- so every
 // line logged in between landed INSIDE the row. Measured over four sweeps on 2026-08-01
-// (artifacts/1p2k/): 7 to 11 of ~51 rows mangled, and EVERY FAIL cell in EVERY run was among the
-// mangled ones. That is not chance: a failing row is the one that took the slow or odd path, and
+// (artifacts/1p2k/): 6 to 8 of the 50 B70 rows mangled, and EVERY FAIL cell in EVERY run was
+// among the mangled ones. (The ticket first said 7 to 11 of 51. That denominator came from
+// `grep -c B70`, which also counts the stderr detail lines the table deliberately writes out of
+// band -- one of them in s7-a -- so every subtraction was one high. `--check` counts in band and
+// cannot drift that way.) That is not chance: a failing row took the slow or odd path, and
 // that path is what logs. `grep FAIL` on such output comes back clean on a run that failed --
 // a check that fails open. A row is now assembled whole and written with one stdio call.
 

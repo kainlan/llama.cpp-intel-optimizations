@@ -7,7 +7,7 @@
 // rows carrying FAIL. `grep FAIL` returned clean on runs that had failed.
 //
 // Everything here is CPU-only and device-free: it drives the emitter from tests/
-// test-llama-archs-table.h directly, so no model is loaded and no backend is initialised.
+// test-archs-table.h directly, so no model is loaded and no backend is initialised.
 //
 // Positive controls, because a green gate whose RED was never observed is worth nothing:
 //   * `pre-fix emission` replays the exact sequence this ticket removed (prefix, fflush, log,
@@ -20,7 +20,7 @@
 //
 // Run with `--check <file>` to point the same parser at a captured sweep log.
 
-#include "test-llama-archs-table.h"
+#include "test-archs-table.h"
 
 #include <cstdio>
 #include <cstring>
