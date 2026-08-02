@@ -79716,6 +79716,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // GGML_SYCL_FUSION_SKIP_MUL=laurel_out is the way to target that chain specifically.
     static const char * fusion_skip_mul_prefix = getenv("GGML_SYCL_FUSION_SKIP_MUL");
     static int          fusion_skip_count      = 0;
+    // Diagnostic (llama.cpp-81gx): a mutation A/B on gemma3n proved ggml_sycl_fusion_
+    // operand_view_offset_safe is what fixes it (guard in -> OK, guard out -> FAIL), but
+    // the SAME mutation left test-rms-norm-mul-add-broadcast's Cases A/B/C unchanged in
+    // BOTH states -- meaning that test file has never been shown to reach bit1 at all,
+    // on any of its graphs, ever. This is the same void-probe shape this ticket has hit
+    // repeatedly elsewhere (an empty/absent artifact reads as "nothing observed" instead
+    // of "not measured"). GGML_SYCL_FUSION_BIT1_REACH_DEBUG=1 logs, for every RMS_NORM
+    // node visited, whether the next two ops are even {MUL, ADD} at all, and if so, the
+    // individual pass/fail of every gate bit1 checks in order (adjacency+use_count via
+    // ggml_can_fuse_subgraph, dtype, ADD-output contiguity, device accessibility, and
+    // finally this file's own operand-safety guard) -- so a test graph that never
+    // engages bit1 shows exactly which gate stops it, instead of just "PASS" for reasons
+    // nobody has verified.
+    static const bool   fusion_bit1_reach_debug = getenv("GGML_SYCL_FUSION_BIT1_REACH_DEBUG") != nullptr;
     // Track nodes that have been executed via fusion (to skip later)
 
     std::unordered_set<const ggml_tensor *> fused_nodes;
@@ -80146,6 +80160,45 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
 #endif
             if (!disable_fusion && node->op == GGML_OP_RMS_NORM) {
+                // Diagnostic (llama.cpp-81gx): reachability breakdown for bit1, gated behind
+                // GGML_SYCL_FUSION_BIT1_REACH_DEBUG (see the flag's own comment near
+                // fusion_skip_mul_prefix for why this exists). Every RMS_NORM node gets one
+                // line; evaluates the SAME conditions bit1 itself checks below, but
+                // unconditionally (not short-circuited) so every gate's individual result is
+                // visible, not just the first one that happened to fail.
+                if (fusion_bit1_reach_debug) {
+                    if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+                        cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
+                        const bool can_fuse = ggml_can_fuse_subgraph(
+                            cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 });
+                        const bool types_ok   = ggml_sycl_check_fusion_types(cgraph, i, 3);
+                        const bool add_contig = ggml_is_contiguous(cgraph->nodes[i + 2]);
+                        const bool accessible =
+                            ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device);
+                        bool operand_safe = false;
+                        if (can_fuse) {
+                            ggml_tensor * probe_mul = cgraph->nodes[i + 1];
+                            ggml_tensor * probe_add = cgraph->nodes[i + 2];
+                            operand_safe =
+                                ggml_sycl_fusion_operand_view_offset_safe(get_mul_weight(probe_mul, node)) &&
+                                ggml_sycl_fusion_operand_view_offset_safe(get_add_operand(probe_add, probe_mul));
+                        }
+                        fprintf(
+                            stderr,
+                            "[FUSION-BIT1-REACH] rms=%s(idx=%d) op_seq=1 site_on=%d can_fuse=%d types_ok=%d "
+                            "add_contig=%d accessible=%d operand_safe=%d WOULD_FUSE=%d\n",
+                            node->name ? node->name : "?", i, fusion_site_on(1) ? 1 : 0, can_fuse ? 1 : 0,
+                            types_ok ? 1 : 0, add_contig ? 1 : 0, accessible ? 1 : 0, operand_safe ? 1 : 0,
+                            (fusion_site_on(1) && can_fuse && types_ok && add_contig && accessible && operand_safe) ?
+                                1 :
+                                0);
+                    } else {
+                        fprintf(stderr, "[FUSION-BIT1-REACH] rms=%s(idx=%d) op_seq=0 next_ops=[%s,%s]\n",
+                                node->name ? node->name : "?", i,
+                                (i + 1 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i + 1]->op) : "(oob)",
+                                (i + 2 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i + 2]->op) : "(oob)");
+                    }
+                }
                 // Diagnostic (llama.cpp-81gx): decide ONCE, before any of the fusion attempts
                 // below, whether this RMS_NORM's chain matches GGML_SYCL_FUSION_SKIP_MUL. Bit1
                 // (3-way) is not the only site that can fuse this chain's MUL -- bit4 (2-way,
