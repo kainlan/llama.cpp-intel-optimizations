@@ -27,6 +27,18 @@
 // cgraph->use_counts accuracy under gemma3n's graph size). Case B is the suspected
 // break. Both must be true for the axis to be confirmed.
 //
+// UPDATE (this ticket, continued): Cases A and B above both PASS (max_err ~2.4e-07 for
+// all four), refuting the broadcast-vs-residual axis. That result held: a
+// GGML_SYCL_FUSION_MASK use_count instrumentation pass then found bit1 firing on FIVE
+// chains in gemma3n, not the two this file's original comment names, and a per-chain
+// GGML_SYCL_FUSION_SKIP_MUL bisection isolated the actual culprit to
+// `first_prediction_out` (gemma3n.cpp:227-253). Its ADD operand, `slice_rest`, is a
+// ggml_view_3d into a graph-internal tensor (`corrected`) at a NON-ZERO byte offset
+// (skipping altup index 0) -- an axis Case A/B never varied, since both used plain,
+// zero-offset, freshly-allocated operands. Case C below reproduces that exact shape:
+// add_src is a view into a larger tensor, offset to its SECOND slice, mirroring
+// slice_rest precisely rather than approximating it.
+//
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
@@ -180,6 +192,114 @@ static bool run_case(ggml_backend_t backend, int ncols, int nrows, bool broadcas
     return ok;
 }
 
+// Case C: reproduces gemma3n's actual first_prediction_out shape (gemma3n.cpp:227-253)
+// rather than approximating it. `big` stands in for `corrected` -- a graph-internal 3D
+// tensor with 2 "altup-like" slices along its outermost dimension. `add_src` is a VIEW
+// into big's SECOND slice only (byte offset = big->nb[2], i.e. skip slice 0), exactly
+// mirroring `slice_rest = ggml_view_3d(ctx0, corrected, ..., n_embd*n_tokens*elemsize)`:
+// a view at a non-zero offset into a tensor that is itself a fresh compute-node output,
+// not a leaf/weight. Cases A and B (above) never varied this axis -- their add_src was
+// always either a leaf 1D vector or a leaf 2D tensor at offset 0.
+static bool run_case_view_offset(ggml_backend_t backend, int ncols, int nrows, const char * label) {
+    g_checks++;
+
+    std::mt19937                          rng(5678u + (unsigned) ncols * 13u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> h_x((size_t) ncols * nrows);
+    std::vector<float> h_gamma((size_t) ncols);
+    // Both slices of `big` get random data; only the second slice (index 1) is the
+    // addend `slice_rest` actually points at, mirroring corrected's altup index 1.
+    std::vector<float> h_big((size_t) ncols * nrows * 2);
+
+    for (auto & v : h_x) {
+        v = dist(rng);
+    }
+    for (auto & v : h_gamma) {
+        v = 0.8f + 0.4f * dist(rng);
+    }
+    for (auto & v : h_big) {
+        v = dist(rng);
+    }
+
+    const float eps = 1e-6f;
+
+    // Reference addend is big[slice 1] = h_big[ncols*nrows .. 2*ncols*nrows).
+    std::vector<float> h_add_slice1(h_big.begin() + (size_t) ncols * nrows, h_big.end());
+    std::vector<float> h_ref;
+    ref_rms_norm_mul_add(h_x, h_gamma, h_add_slice1, ncols, nrows, /*broadcast_add=*/false, eps, h_ref);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        std::fprintf(stderr, "  [FAIL] %s: ggml_init failed\n", label);
+        g_failures++;
+        return false;
+    }
+
+    struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, nrows);
+    ggml_set_input(x);
+    struct ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ncols);
+    ggml_set_input(gamma);
+    struct ggml_tensor * big = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nrows, 2);
+    ggml_set_input(big);
+    // View into big's second slice only -- offset = big->nb[2] (the byte stride between
+    // slices), the same "skip slice 0" pattern as slice_rest's offset into `corrected`.
+    struct ggml_tensor * add_src = ggml_view_2d(ctx, big, ncols, nrows, big->nb[1], big->nb[2]);
+
+    struct ggml_tensor * rms   = ggml_rms_norm(ctx, x, eps);
+    struct ggml_tensor * mul   = ggml_mul(ctx, rms, gamma);
+    struct ggml_tensor * added = ggml_add(ctx, mul, add_src);
+    ggml_set_output(added);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, added);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        std::fprintf(stderr, "  [FAIL] %s: ggml_backend_alloc_ctx_tensors failed\n", label);
+        ggml_free(ctx);
+        g_failures++;
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, h_x.data(), 0, h_x.size() * sizeof(float));
+    ggml_backend_tensor_set(gamma, h_gamma.data(), 0, h_gamma.size() * sizeof(float));
+    ggml_backend_tensor_set(big, h_big.data(), 0, h_big.size() * sizeof(float));
+
+    const enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+    bool                   ok     = (status == GGML_STATUS_SUCCESS);
+    if (!ok) {
+        std::fprintf(stderr, "  [FAIL] %s: ggml_backend_graph_compute status=%d\n", label, (int) status);
+    }
+
+    std::vector<float> h_out((size_t) ncols * nrows);
+    if (ok) {
+        ggml_backend_tensor_get(added, h_out.data(), 0, h_out.size() * sizeof(float));
+
+        float max_err = 0.0f;
+        for (size_t i = 0; i < h_out.size(); i++) {
+            max_err = std::max(max_err, std::fabs(h_out[i] - h_ref[i]));
+        }
+        const float tol = 1e-3f;
+        ok              = max_err < tol;
+        std::fprintf(stderr, "  [%s] %s (ncols=%d nrows=%d view-nonzero-offset, max_err=%.3e, tol=%.1e)\n",
+                     ok ? "PASS" : "FAIL", label, ncols, nrows, max_err, tol);
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    if (!ok) {
+        g_failures++;
+    }
+    return ok;
+}
+
 int main() {
     std::vector<sycl::device> gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (gpus.empty()) {
@@ -212,6 +332,13 @@ int main() {
     run_case(backend, 64, 8, /*broadcast_add=*/false, "ncols=64 full-residual (suspected)");
     run_case(backend, 256, 8, /*broadcast_add=*/true, "ncols=256 broadcast (positive control)");
     run_case(backend, 256, 8, /*broadcast_add=*/false, "ncols=256 full-residual (suspected)");
+
+    // Case C: gemma3n's actual root cause (first_prediction_out / slice_rest) -- a view
+    // at a non-zero offset into a graph-internal tensor. Expected RED before
+    // ggml_sycl_fusion_operand_view_offset_safe (ggml-sycl.cpp) declines fusion for this
+    // shape, GREEN after.
+    run_case_view_offset(backend, 64, 8, "ncols=64 view-at-nonzero-offset (root cause)");
+    run_case_view_offset(backend, 256, 8, "ncols=256 view-at-nonzero-offset (root cause)");
 
     ggml_backend_free(backend);
 
