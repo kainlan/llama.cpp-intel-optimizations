@@ -2085,6 +2085,746 @@ set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     TIMEOUT 120
 )
 
+# ---------------------------------------------------------------------------
+# llama.cpp-0igs restoration batch 2: registrations lost near 4974bf53c,
+# restored from known-good blocks at 3c8f296fd and adapted to the current
+# ggml-base/ggml/ggml-cpu/ggml-sycl link topology. Confirmed host-only (no
+# gpu_selector/malloc_device/queue.submit/parallel_for in the test itself).
+# Labels deliberately avoid the bare words "cache"/"mem-handle", which
+# collide with CLAUDE.md's throttled-sweep denylist -- batch 1 shipped that
+# mistake on 9 of 13 tests (llama.cpp-u2mz/0igs); use *-hostonly or an
+# unrelated subsystem word instead.
+# ---------------------------------------------------------------------------
+
+add_executable(test-dmmv-q4-0-coalesced
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-dmmv-q4-0-coalesced.cpp
+)
+target_include_directories(test-dmmv-q4-0-coalesced PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-dmmv-q4-0-coalesced PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-dmmv-q4-0-coalesced PRIVATE "-fsycl")
+target_compile_definitions(test-dmmv-q4-0-coalesced PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-dmmv-q4-0-coalesced PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-dmmv-q4-0-coalesced PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-dmmv-q4-0-coalesced COMMAND test-dmmv-q4-0-coalesced)
+set_tests_properties(test-dmmv-q4-0-coalesced PROPERTIES
+    LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-dmmv-q6k-coalesced
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-dmmv-q6k-coalesced.cpp
+)
+target_include_directories(test-dmmv-q6k-coalesced PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-dmmv-q6k-coalesced PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-dmmv-q6k-coalesced PRIVATE "-fsycl")
+target_compile_definitions(test-dmmv-q6k-coalesced PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-dmmv-q6k-coalesced PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-dmmv-q6k-coalesced PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-dmmv-q6k-coalesced COMMAND test-dmmv-q6k-coalesced)
+set_tests_properties(test-dmmv-q6k-coalesced PROPERTIES
+    LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+
+add_executable(test-fattn-thread-local
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-fattn-thread-local.cpp
+)
+target_include_directories(test-fattn-thread-local PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-fattn-thread-local PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-fattn-thread-local PRIVATE "-fsycl")
+target_compile_definitions(test-fattn-thread-local PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-fattn-thread-local PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-fattn-thread-local PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-fattn-thread-local COMMAND test-fattn-thread-local)
+set_tests_properties(test-fattn-thread-local PROPERTIES
+    LABELS "sycl;fattn;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-ggml-sycl-soa
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-ggml-sycl-soa.cpp
+)
+target_include_directories(test-ggml-sycl-soa PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-ggml-sycl-soa PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-ggml-sycl-soa PRIVATE "-fsycl")
+target_compile_definitions(test-ggml-sycl-soa PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-ggml-sycl-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-ggml-sycl-soa PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-ggml-sycl-soa COMMAND test-ggml-sycl-soa)
+set_tests_properties(test-ggml-sycl-soa PROPERTIES
+    LABELS "sycl;layout;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-layout-bytes
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-layout-bytes.cpp
+)
+target_include_directories(test-layout-bytes PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-layout-bytes PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-layout-bytes PRIVATE "-fsycl")
+target_compile_definitions(test-layout-bytes PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-layout-bytes PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-layout-bytes PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-layout-bytes COMMAND test-layout-bytes)
+set_tests_properties(test-layout-bytes PROPERTIES
+    LABELS "sycl;layout;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-mmq-q6k-gpu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mmq-q6k-gpu.cpp
+)
+target_include_directories(test-mmq-q6k-gpu PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-mmq-q6k-gpu PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-mmq-q6k-gpu PRIVATE "-fsycl")
+target_compile_definitions(test-mmq-q6k-gpu PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mmq-q6k-gpu PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mmq-q6k-gpu PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-mmq-q6k-gpu COMMAND test-mmq-q6k-gpu)
+set_tests_properties(test-mmq-q6k-gpu PROPERTIES
+    LABELS "sycl;mmq;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-moe-mini-graph
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mini-graph.cpp
+)
+target_include_directories(test-moe-mini-graph PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-mini-graph PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-mini-graph PRIVATE "-fsycl")
+target_compile_definitions(test-moe-mini-graph PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-mini-graph PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-mini-graph PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-moe-mini-graph COMMAND test-moe-mini-graph)
+set_tests_properties(test-moe-mini-graph PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-moe-mul-mat-id
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mul-mat-id.cpp
+)
+target_include_directories(test-moe-mul-mat-id PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-mul-mat-id PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-mul-mat-id PRIVATE "-fsycl")
+target_compile_definitions(test-moe-mul-mat-id PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-mul-mat-id PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-mul-mat-id PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-moe-mul-mat-id COMMAND test-moe-mul-mat-id)
+set_tests_properties(test-moe-mul-mat-id PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-moe-mul-mat-id-q4q8
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mul-mat-id-q4q8.cpp
+)
+target_include_directories(test-moe-mul-mat-id-q4q8 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-mul-mat-id-q4q8 PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-mul-mat-id-q4q8 PRIVATE "-fsycl")
+target_compile_definitions(test-moe-mul-mat-id-q4q8 PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-mul-mat-id-q4q8 PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-mul-mat-id-q4q8 PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-moe-mul-mat-id-q4q8 COMMAND test-moe-mul-mat-id-q4q8)
+set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-mul-mat-host-streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
+)
+target_include_directories(test-mul-mat-host-streaming PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-mul-mat-host-streaming PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-mul-mat-host-streaming PRIVATE "-fsycl")
+target_compile_definitions(test-mul-mat-host-streaming PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mul-mat-host-streaming PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mul-mat-host-streaming PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-mul-mat-host-streaming COMMAND test-mul-mat-host-streaming)
+set_tests_properties(test-mul-mat-host-streaming PROPERTIES
+    LABELS "sycl;dispatch;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-onednn-fallback
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-onednn-fallback.cpp
+)
+target_include_directories(test-onednn-fallback PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-onednn-fallback PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-onednn-fallback PRIVATE "-fsycl")
+target_compile_definitions(test-onednn-fallback PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-onednn-fallback PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-onednn-fallback PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-onednn-fallback COMMAND test-onednn-fallback)
+set_tests_properties(test-onednn-fallback PROPERTIES
+    LABELS "sycl;onednn;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-onednn-woq
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-onednn-woq.cpp
+)
+target_include_directories(test-onednn-woq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-onednn-woq PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-onednn-woq PRIVATE "-fsycl")
+target_compile_definitions(test-onednn-woq PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-onednn-woq PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-onednn-woq PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-onednn-woq COMMAND test-onednn-woq)
+set_tests_properties(test-onednn-woq PROPERTIES
+    LABELS "sycl;onednn;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-q6k-dispatch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q6k-dispatch.cpp
+)
+target_include_directories(test-q6k-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-q6k-dispatch PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-q6k-dispatch PRIVATE "-fsycl")
+target_compile_definitions(test-q6k-dispatch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-q6k-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-q6k-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-q6k-dispatch COMMAND test-q6k-dispatch)
+set_tests_properties(test-q6k-dispatch PROPERTIES
+    LABELS "sycl;dispatch;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-q8-0-layout-cache-path
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q8-0-layout-cache-path.cpp
+)
+target_include_directories(test-q8-0-layout-cache-path PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-q8-0-layout-cache-path PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-q8-0-layout-cache-path PRIVATE "-fsycl")
+target_compile_definitions(test-q8-0-layout-cache-path PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-q8-0-layout-cache-path PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-q8-0-layout-cache-path PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-q8-0-layout-cache-path COMMAND test-q8-0-layout-cache-path)
+set_tests_properties(test-q8-0-layout-cache-path PROPERTIES
+    LABELS "sycl;layout;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-q8-0-layout-cache-path-mmvq
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q8-0-layout-cache-path-mmvq.cpp
+)
+target_include_directories(test-q8-0-layout-cache-path-mmvq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-q8-0-layout-cache-path-mmvq PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-q8-0-layout-cache-path-mmvq PRIVATE "-fsycl")
+target_compile_definitions(test-q8-0-layout-cache-path-mmvq PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-q8-0-layout-cache-path-mmvq PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-q8-0-layout-cache-path-mmvq PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-q8-0-layout-cache-path-mmvq COMMAND test-q8-0-layout-cache-path-mmvq)
+set_tests_properties(test-q8-0-layout-cache-path-mmvq PROPERTIES
+    LABELS "sycl;layout;mmvq;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-cpu-dispatch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-dispatch.cpp
+)
+target_include_directories(test-sycl-cpu-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-cpu-dispatch PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-cpu-dispatch PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-cpu-dispatch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-cpu-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-cpu-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-cpu-dispatch COMMAND test-sycl-cpu-dispatch)
+set_tests_properties(test-sycl-cpu-dispatch PROPERTIES
+    LABELS "sycl;dispatch;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-moe-expert-parallelism
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-expert-parallelism.cpp
+)
+target_include_directories(test-sycl-moe-expert-parallelism PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-expert-parallelism PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-expert-parallelism PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-moe-expert-parallelism PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-moe-expert-parallelism PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-expert-parallelism PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-moe-expert-parallelism COMMAND test-sycl-moe-expert-parallelism)
+set_tests_properties(test-sycl-moe-expert-parallelism PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-moe-identity-hash
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-identity-hash.cpp
+)
+target_include_directories(test-sycl-moe-identity-hash PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-identity-hash PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-identity-hash PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-moe-identity-hash PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-moe-identity-hash PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-identity-hash PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-moe-identity-hash COMMAND test-sycl-moe-identity-hash)
+set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-orchestrator.cpp
+)
+target_include_directories(test-sycl-orchestrator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-orchestrator PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-orchestrator PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-orchestrator PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-orchestrator PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-orchestrator PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-orchestrator COMMAND test-sycl-orchestrator)
+set_tests_properties(test-sycl-orchestrator PROPERTIES
+    LABELS "sycl;orchestrator;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-prestage-routed-experts
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-prestage-routed-experts.cpp
+)
+target_include_directories(test-sycl-prestage-routed-experts PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-prestage-routed-experts PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-prestage-routed-experts PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-prestage-routed-experts PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-prestage-routed-experts PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-prestage-routed-experts PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-prestage-routed-experts COMMAND test-sycl-prestage-routed-experts)
+set_tests_properties(test-sycl-prestage-routed-experts PROPERTIES
+    LABELS "sycl;moe;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-unified-cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-cache.cpp
+)
+target_include_directories(test-sycl-unified-cache PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-unified-cache PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-unified-cache PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-unified-cache PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-unified-cache PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-unified-cache PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-unified-cache COMMAND test-sycl-unified-cache)
+set_tests_properties(test-sycl-unified-cache PROPERTIES
+    LABELS "sycl;cache-hostonly;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-unified-memory-e2e
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-memory-e2e.cpp
+)
+target_include_directories(test-sycl-unified-memory-e2e PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-unified-memory-e2e PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-unified-memory-e2e PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-unified-memory-e2e PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-unified-memory-e2e PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-unified-memory-e2e PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-unified-memory-e2e COMMAND test-sycl-unified-memory-e2e)
+set_tests_properties(test-sycl-unified-memory-e2e PROPERTIES
+    LABELS "sycl;cache-hostonly;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-xmx-unified-correctness
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-xmx-unified-correctness.cpp
+)
+target_include_directories(test-sycl-xmx-unified-correctness PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-xmx-unified-correctness PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-xmx-unified-correctness PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-xmx-unified-correctness PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-xmx-unified-correctness PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-xmx-unified-correctness PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-xmx-unified-correctness COMMAND test-sycl-xmx-unified-correctness)
+set_tests_properties(test-sycl-xmx-unified-correctness PROPERTIES
+    LABELS "sycl;xmx;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-tiered-dispatch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-tiered-dispatch.cpp
+)
+target_include_directories(test-tiered-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-tiered-dispatch PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-tiered-dispatch PRIVATE "-fsycl")
+target_compile_definitions(test-tiered-dispatch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-tiered-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-tiered-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-tiered-dispatch COMMAND test-tiered-dispatch)
+set_tests_properties(test-tiered-dispatch PROPERTIES
+    LABELS "sycl;dispatch;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-xmx-host-streaming
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-host-streaming.cpp
+)
+target_include_directories(test-xmx-host-streaming PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-xmx-host-streaming PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-xmx-host-streaming PRIVATE "-fsycl")
+target_compile_definitions(test-xmx-host-streaming PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-xmx-host-streaming PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-xmx-host-streaming PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
+set_tests_properties(test-xmx-host-streaming PROPERTIES
+    LABELS "sycl;xmx;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-xmx-kernel-config
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-kernel-config.cpp
+)
+target_include_directories(test-xmx-kernel-config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-xmx-kernel-config PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-xmx-kernel-config PRIVATE "-fsycl")
+target_compile_definitions(test-xmx-kernel-config PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-xmx-kernel-config PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-xmx-kernel-config PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-xmx-kernel-config COMMAND test-xmx-kernel-config)
+set_tests_properties(test-xmx-kernel-config PROPERTIES
+    LABELS "sycl;xmx;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-xmx-quant-loaders
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-quant-loaders.cpp
+)
+target_include_directories(test-xmx-quant-loaders PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-xmx-quant-loaders PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-xmx-quant-loaders PRIVATE "-fsycl")
+target_compile_definitions(test-xmx-quant-loaders PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-xmx-quant-loaders PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-xmx-quant-loaders PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-xmx-quant-loaders COMMAND test-xmx-quant-loaders)
+set_tests_properties(test-xmx-quant-loaders PROPERTIES
+    LABELS "sycl;xmx;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-xmx-unified-kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-unified-kernel.cpp
+)
+target_include_directories(test-xmx-unified-kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-xmx-unified-kernel PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-xmx-unified-kernel PRIVATE "-fsycl")
+target_compile_definitions(test-xmx-unified-kernel PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-xmx-unified-kernel PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-xmx-unified-kernel PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-xmx-unified-kernel COMMAND test-xmx-unified-kernel)
+set_tests_properties(test-xmx-unified-kernel PROPERTIES
+    LABELS "sycl;xmx;tdd;0igs-batch2"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: reset_model_weight_entries() must preserve entries still leased by a
 # live model at a model-load boundary instead of aborting (llama.cpp-ljb9,
 # commit acdb192d4), and must keep id_to_key_ pointed at a surviving layout
