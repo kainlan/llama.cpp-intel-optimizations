@@ -18,7 +18,7 @@ kv_tier_manager & get_kv_tier_manager(int device) {
     return g_kv_tier_managers[device];
 }
 
-bool kv_tier_manager::configure(int device, uint32_t n_layers, size_t kv_vram_cap, size_t total_bytes) {
+bool kv_tier_manager::configure(int device, uint32_t n_layers, size_t kv_vram_cap, const kv_slice_size & slice) {
     device_       = device;
     total_layers_ = n_layers;
 
@@ -29,7 +29,7 @@ bool kv_tier_manager::configure(int device, uint32_t n_layers, size_t kv_vram_ca
         return false;
     }
 
-    kv_per_layer_ = total_bytes / n_layers;
+    kv_per_layer_ = slice.bytes();
 
     // Check env var override: GGML_SYCL_KV_HOT_LAYERS=N
     const char * env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
@@ -89,12 +89,12 @@ void kv_tier_manager::set_actual_hot_layers(uint32_t n_hot) {
     }
 }
 
-void kv_tier_manager::set_actual_layer_placement(int                       device,
-                                                 const std::vector<bool> & layer_on_device,
-                                                 size_t                    total_bytes) {
+void kv_tier_manager::set_actual_layer_placement(int device, const std::vector<bool> & layer_on_device) {
     device_          = device;
     total_layers_    = static_cast<uint32_t>(layer_on_device.size());
-    kv_per_layer_    = total_layers_ > 0 ? total_bytes / total_layers_ : 0;
+    // kv_per_layer_ and per_layer_kv_bytes_ are intentionally left alone: this
+    // reconciles *placement* after allocation, and the slice sizes were already
+    // established by the configure_*() call that preceded it.
     layer_on_device_ = layer_on_device;
     hot_layers_      = 0;
     for (bool on_device : layer_on_device_) {
@@ -155,11 +155,14 @@ std::vector<layer_region> kv_tier_manager::compute_region_layout(size_t total_by
     return regions;
 }
 
-void kv_tier_manager::configure_with_weights(int device, uint32_t n_layers, size_t kv_vram_cap, size_t total_bytes) {
+void kv_tier_manager::configure_with_weights(int                   device,
+                                             uint32_t              n_layers,
+                                             size_t                kv_vram_cap,
+                                             const kv_slice_size & slice) {
     device_       = device;
     total_layers_ = n_layers;
 
-    if (n_layers == 0 || total_bytes == 0) {
+    if (n_layers == 0 || slice.total_bytes() == 0) {
         active_       = false;
         hot_layers_   = 0;
         kv_per_layer_ = 0;
@@ -167,7 +170,7 @@ void kv_tier_manager::configure_with_weights(int device, uint32_t n_layers, size
         return;
     }
 
-    kv_per_layer_ = total_bytes / n_layers;
+    kv_per_layer_ = slice.bytes();
 
     // PHASE 1: Query unified cache for per-layer weight residency
     std::vector<bool> layer_has_device_weights(n_layers, false);
@@ -183,7 +186,7 @@ void kv_tier_manager::configure_with_weights(int device, uint32_t n_layers, size
     // Budget-only path uses contiguous hot_layers_ without per-layer vector.
     if (device_weight_count == 0) {
         layer_on_device_.clear();
-        configure(device, n_layers, kv_vram_cap, total_bytes);
+        configure(device, n_layers, kv_vram_cap, slice);
         return;
     }
 
@@ -231,23 +234,23 @@ void kv_tier_manager::configure_with_weights(int device, uint32_t n_layers, size
 
     active_ = (hot_layers_ < total_layers_);
 
-    const size_t dev_bytes  = total_layers_ > 0 ? total_bytes * hot_layers_ / total_layers_ : 0;
-    const size_t host_bytes = total_bytes > dev_bytes ? total_bytes - dev_bytes : 0;
+    const size_t dev_bytes  = std::min(static_cast<size_t>(hot_layers_) * kv_per_layer_, slice.total_bytes());
+    const size_t host_bytes = slice.total_bytes() - dev_bytes;
     GGML_LOG_INFO(
         "[KV-TIER] Weight-aware: %u/%u layers on device (%d with device weights, "
-        "%.1f MB device, %.1f MB host)\n",
-        hot_layers_, total_layers_, device_weight_count, dev_bytes / (1024.0 * 1024.0),
+        "%u KV layers, %.1f MB device, %.1f MB host)\n",
+        hot_layers_, total_layers_, device_weight_count, slice.kv_layers(), dev_bytes / (1024.0 * 1024.0),
         host_bytes / (1024.0 * 1024.0));
 }
 
 void kv_tier_manager::configure_from_plan(int                    device,
                                           const placement_plan & plan,
                                           uint32_t               n_layers,
-                                          size_t                 total_bytes) {
+                                          const kv_slice_size &  slice) {
     device_       = device;
     total_layers_ = n_layers;
 
-    if (n_layers == 0 || total_bytes == 0) {
+    if (n_layers == 0 || slice.total_bytes() == 0) {
         active_       = false;
         hot_layers_   = 0;
         kv_per_layer_ = 0;
@@ -255,11 +258,23 @@ void kv_tier_manager::configure_from_plan(int                    device,
         return;
     }
 
-    // Use the planner's authoritative KV-per-layer when available.
-    // Not all layers may have KV (e.g. alternating SWA), so total_bytes / n_layers
-    // can undercount when the denominator includes non-attention layers.
-    kv_per_layer_ = (plan.kv_per_layer > 0 && total_bytes >= plan.kv_per_layer) ? plan.kv_per_layer
-                                                                                 : total_bytes / n_layers;
+    // Ranking, strongest first.  Not all layers hold KV (alternating SWA,
+    // hybrid attention/recurrent), so any denominator that includes
+    // non-attention layers undercounts and the cache is written out of bounds.
+    //
+    // 1. A slice derived from llama's explicit per-buffer layer mask wins
+    //    outright: it describes *this* buffer, whereas plan is a file-scope
+    //    global that can still hold a previous model's numbers.
+    // 2. Otherwise the planner's own per-layer size, if it is sane.
+    // 3. Otherwise whatever the slice carries (never a fresh division here --
+    //    see kv_slice_size).
+    if (slice.source() == kv_slice_source::LAYER_MASK && slice.bytes() > 0) {
+        kv_per_layer_ = slice.bytes();
+    } else if (plan.kv_per_layer > 0 && slice.total_bytes() >= plan.kv_per_layer) {
+        kv_per_layer_ = plan.kv_per_layer;
+    } else {
+        kv_per_layer_ = slice.bytes();
+    }
 
     // Explicit debug override remains higher priority than planned placement.
     const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
@@ -272,8 +287,8 @@ void kv_tier_manager::configure_from_plan(int                    device,
                 layer_on_device_[l] = true;
             }
             active_ = (hot_layers_ < total_layers_);
-            const size_t dev_bytes  = total_layers_ > 0 ? total_bytes * hot_layers_ / total_layers_ : 0;
-            const size_t host_bytes = total_bytes > dev_bytes ? total_bytes - dev_bytes : 0;
+            const size_t dev_bytes  = std::min(static_cast<size_t>(hot_layers_) * kv_per_layer_, slice.total_bytes());
+            const size_t host_bytes = slice.total_bytes() - dev_bytes;
             GGML_LOG_INFO(
                 "[KV-TIER] Plan-driven (env override): %u/%u layers on device "
                 "(%.1f MB device, %.1f MB host)\n",
@@ -285,7 +300,10 @@ void kv_tier_manager::configure_from_plan(int                    device,
     // Build per-layer placement and heterogeneous KV sizes.
     // Full-attention layers use plan.kv_per_layer; SWA layers use plan.kv_per_swa_layer.
     layer_on_device_.assign(n_layers, false);
-    per_layer_kv_bytes_.resize(n_layers, kv_per_layer_);
+    // assign(), not resize(): kv_tier_manager is a per-device singleton reused
+    // across models, and resize() would leave a shorter previous model's
+    // per-layer sizes in place.
+    per_layer_kv_bytes_.assign(n_layers, kv_per_layer_);
     hot_layers_ = 0;
     for (uint32_t l = 0; l < n_layers; ++l) {
         const bool on_device = plan.get_kv_device(static_cast<int>(l)) == device;
@@ -312,10 +330,13 @@ void kv_tier_manager::configure_from_plan(int                    device,
             host_bytes += per_layer_kv_bytes_[l];
         }
     }
+    // kv_layers/kv_per_layer are printed here on purpose: the sizing bug this
+    // class guards against was invisible because the only logged per-layer
+    // figure came from a value the allocator never used (llama.cpp-2120).
     GGML_LOG_INFO(
         "[KV-TIER] Plan-driven: %u/%u layers on device "
-        "(planner_n_ctx=%u, %.1f MB device, %.1f MB host)\n",
-        hot_layers_, total_layers_, plan.planner_n_ctx, dev_bytes / (1024.0 * 1024.0),
+        "(planner_n_ctx=%u, kv_layers=%u, kv_per_layer=%zu, %.1f MB device, %.1f MB host)\n",
+        hot_layers_, total_layers_, plan.planner_n_ctx, slice.kv_layers(), kv_per_layer_, dev_bytes / (1024.0 * 1024.0),
         host_bytes / (1024.0 * 1024.0));
 }
 

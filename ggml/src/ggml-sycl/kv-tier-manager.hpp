@@ -13,6 +13,85 @@ namespace ggml_sycl {
 
 struct placement_plan;
 
+// Where a kv_slice_size's denominator came from.  Ranked: a mask pushed by
+// llama_kv_cache states exactly which layers this buffer holds, so it outranks
+// anything the placement planner inferred.
+enum class kv_slice_source {
+    UNKNOWN,                 // default-constructed; bytes() == 0
+    LAYER_MASK,              // llama's explicit per-buffer layer mask (authoritative)
+    PLANNER,                 // planner KV geometry (full-attn / SWA layer counts)
+    MODEL_LAYERS_UNVERIFIED  // no mask, no planner geometry -- every layer assumed to hold KV
+};
+
+// Size of one layer's KV slice within a KV buffer.
+//
+// This type exists so that `total_bytes / n_layers` is not expressible where
+// the slice size is set.  Only the layers that actually hold KV contribute to
+// a KV buffer, so the model's *total* layer count is the wrong denominator: a
+// hybrid model with 1 attention layer of 2 gets a 2x-undersized slice, and the
+// KV cache is then written past its allocation (llama.cpp-2120 -- 10
+// architectures ran with out-of-bounds KV pointers and 7 of them reported OK).
+//
+// The constructor is private; every slice is built through a named factory
+// that states its denominator, and kv-tier-manager.cpp divides total_bytes by
+// nothing at all.  Adding a new sizing path therefore means adding a factory
+// here, in front of this comment, rather than another bare division at a call
+// site.
+class kv_slice_size {
+  public:
+    kv_slice_size() = default;
+
+    // Divide the buffer by the layers llama said this buffer holds.
+    static kv_slice_size from_layer_mask(size_t total_bytes, uint32_t n_kv_layers) {
+        return kv_slice_size(total_bytes, n_kv_layers, kv_slice_source::LAYER_MASK);
+    }
+
+    // Take the planner's per-layer byte size directly (not a division).
+    static kv_slice_size from_planner_bytes(size_t total_bytes, size_t bytes_per_layer, uint32_t n_kv_layers) {
+        kv_slice_size s;
+        s.total_bytes_ = total_bytes;
+        s.bytes_       = bytes_per_layer;
+        s.n_kv_layers_ = n_kv_layers;
+        s.source_      = kv_slice_source::PLANNER;
+        return s;
+    }
+
+    // Divide the buffer by a KV-bearing layer count derived from planner geometry.
+    static kv_slice_size from_planner_layers(size_t total_bytes, uint32_t n_kv_layers) {
+        return kv_slice_size(total_bytes, n_kv_layers, kv_slice_source::PLANNER);
+    }
+
+    // Last resort: no layer mask and no planner KV geometry, so every model
+    // layer is *assumed* to hold KV.  This is the only legitimate use of the
+    // model layer count as a denominator, and the name says it is unverified.
+    static kv_slice_size from_model_layers_unverified(size_t total_bytes, uint32_t n_model_layers) {
+        return kv_slice_size(total_bytes, n_model_layers, kv_slice_source::MODEL_LAYERS_UNVERIFIED);
+    }
+
+    size_t bytes() const { return bytes_; }
+
+    uint32_t kv_layers() const { return n_kv_layers_; }
+
+    size_t total_bytes() const { return total_bytes_; }
+
+    kv_slice_source source() const { return source_; }
+
+  private:
+    // A zero KV-layer count means "nothing told us how this buffer is split",
+    // so the whole buffer is one slice.  Never zero bytes: a zero slice makes
+    // every layer allocation get skipped, which is worse than one big slice.
+    kv_slice_size(size_t total_bytes, uint32_t n_kv_layers, kv_slice_source source) :
+        bytes_(n_kv_layers > 0 ? total_bytes / n_kv_layers : total_bytes),
+        total_bytes_(total_bytes),
+        n_kv_layers_(n_kv_layers),
+        source_(source) {}
+
+    size_t          bytes_       = 0;
+    size_t          total_bytes_ = 0;
+    uint32_t        n_kv_layers_ = 0;
+    kv_slice_source source_      = kv_slice_source::UNKNOWN;
+};
+
 // Per-layer region descriptor for KV cache placement.
 struct layer_region {
     uint32_t layer_id;
@@ -29,20 +108,24 @@ class kv_tier_manager {
     kv_tier_manager() = default;
 
     // Configure the layer-based tier split for a device.
-    // n_layers: total number of transformer layers
+    // n_layers: total number of transformer layers (indexes the placement vectors)
     // kv_vram_cap: VRAM bytes available for KV cache
-    // total_bytes: total KV buffer size in bytes
+    // slice: per-layer KV byte size -- see kv_slice_size on why this is not a
+    //        (total_bytes, n_layers) pair
     // Returns true if tiering is active (some layers on host)
-    bool configure(int device, uint32_t n_layers, size_t kv_vram_cap, size_t total_bytes);
+    bool configure(int device, uint32_t n_layers, size_t kv_vram_cap, const kv_slice_size & slice);
 
     // Weight-aware configuration: queries unified cache for per-layer weight
     // residency and co-locates KV with device-resident weights.
     // Populates per-layer placement vector for non-contiguous placement.
     // Falls back to budget-based configure() when cache data is unavailable.
-    void configure_with_weights(int device, uint32_t n_layers, size_t kv_vram_cap, size_t total_bytes);
+    void configure_with_weights(int device, uint32_t n_layers, size_t kv_vram_cap, const kv_slice_size & slice);
 
     // Plan-driven configuration: use authoritative planner KV residency.
-    void configure_from_plan(int device, const placement_plan & plan, uint32_t n_layers, size_t total_bytes);
+    // The slice still wins over plan.kv_per_layer when it came from llama's
+    // explicit layer mask -- the plan is a file-scope global and can carry a
+    // stale cross-model value, whereas the mask describes *this* buffer.
+    void configure_from_plan(int device, const placement_plan & plan, uint32_t n_layers, const kv_slice_size & slice);
 
     // Query tier state
     bool is_active() const { return active_; }
@@ -92,7 +175,11 @@ class kv_tier_manager {
     void set_actual_hot_layers(uint32_t n_hot);
 
     // Replace placement with the actual per-layer allocation result.
-    void set_actual_layer_placement(int device, const std::vector<bool> & layer_on_device, size_t total_bytes);
+    // Deliberately does NOT touch the slice size: allocation reconciliation
+    // moves layers between tiers, it does not resize them, and re-deriving the
+    // slice from the layer-vector length is exactly the wrong-denominator bug
+    // this class is shaped to prevent (llama.cpp-2120).
+    void set_actual_layer_placement(int device, const std::vector<bool> & layer_on_device);
 
   private:
     bool              active_       = false;

@@ -27753,8 +27753,31 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
             }
 
             size_t offset_within_layer = abs_offset - ctx->layer_base_offsets[layer_id];
-            void * old_data            = tensor->data;
-            tensor->data               = static_cast<char *>(la.ptr) + offset_within_layer;
+
+            // Bounds check: the remapped pointer must lie inside the per-layer
+            // allocation.  This FAILS the allocation, and it runs BEFORE
+            // tensor->data is touched so the failure path leaves no
+            // out-of-bounds pointer behind.
+            //
+            // It used to log and then return GGML_STATUS_SUCCESS with an OOB
+            // tensor->data, so a memory-safety violation surfaced downstream as
+            // "some architecture produces nan" — or as nothing at all.  Ten
+            // architectures were reading past the end of their KV slices and
+            // seven of them reported OK (llama.cpp-2120).
+            //
+            // ggml-alloc.c's alloc_tensor_range() turns a non-SUCCESS status
+            // into "failed to initialize tensor <name>", frees the buffers and
+            // returns NULL, so KV cache creation fails loudly instead.
+            if (offset_within_layer + ggml_nbytes(tensor) > la.size) {
+                GGML_LOG_ERROR(
+                    "[KV-REMAP] ERROR: %s overflows layer alloc! "
+                    "off_in_layer=%zu + nbytes=%zu > la.size=%zu\n",
+                    name, offset_within_layer, ggml_nbytes(tensor), la.size);
+                return GGML_STATUS_ALLOC_FAILED;
+            }
+
+            void * old_data = tensor->data;
+            tensor->data    = static_cast<char *>(la.ptr) + offset_within_layer;
 
             // Set the smart handle for both device and host-pinned KV layers so
             // SET_ROWS and attention dispatch can route by actual residency.
@@ -27782,19 +27805,12 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
                     offset_within_layer, la.ptr, la.size, tensor->data, alloc_type_str);
             }
 
-            // Bounds check: verify remapped pointer is within the per-layer allocation
-            if (offset_within_layer + ggml_nbytes(tensor) > la.size) {
-                GGML_LOG_ERROR(
-                    "[KV-REMAP] ERROR: %s overflows layer alloc! "
-                    "off_in_layer=%zu + nbytes=%zu > la.size=%zu\n",
-                    name, offset_within_layer, ggml_nbytes(tensor), la.size);
-            }
-
             // A7L5W Site 4: hard assertion on the remapped pointer covering the
-            // tensor.  Without this, the overflow only emits a log line and
-            // execution continues with an OOB pointer.  Under the A7L5W
-            // compile flag we want the process to abort at the site of the
-            // bad pointer construction, not downstream in a JIT kernel.
+            // tensor.  The per-layer overflow above now fails unconditionally,
+            // so this only fires on the registry-level invariants the bounds
+            // check does not cover — and, under the A7L5W compile flag, aborts
+            // at the site of the bad pointer construction rather than
+            // downstream in a JIT kernel.
             GGML_SYCL_A7L5W_ASSERT_TENSOR("kv_remap/per_layer", tensor, tensor->data, ggml_nbytes(tensor));
 
             return GGML_STATUS_SUCCESS;
@@ -28132,24 +28148,30 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     };
     const bool kv_buffer_covers_all_layers =
         has_explicit_layer_mask ? explicit_layer_count == n_layers : buffer_kind == kv_buffer_kind::ALL_LAYERS;
-    size_t   kv_per_layer;
-    uint32_t n_kv_layers;
+    // The slice is the ONE place the per-layer KV size is decided, and it is
+    // what the tier manager is configured with — see kv_slice_size.  The
+    // denominator must be the layers that actually hold KV in *this* buffer;
+    // dividing by the model's layer count undersizes every slice on any model
+    // where some layers hold no KV, and the cache is then written out of
+    // bounds (llama.cpp-2120).
+    ggml_sycl::kv_slice_size kv_slice;
     if (has_explicit_layer_mask) {
-        n_kv_layers  = explicit_layer_count > 0 ? explicit_layer_count : n_layers;
-        kv_per_layer = size / n_kv_layers;
+        kv_slice =
+            ggml_sycl::kv_slice_size::from_layer_mask(size, explicit_layer_count > 0 ? explicit_layer_count : n_layers);
     } else if (buffer_kind == kv_buffer_kind::FULL_ATTN_ONLY) {
         // Size matches expected full-attention total (within 10% for alignment)
-        kv_per_layer = planner_full_kv;
-        n_kv_layers  = n_full_layers;
+        kv_slice = ggml_sycl::kv_slice_size::from_planner_bytes(size, planner_full_kv, n_full_layers);
     } else if (buffer_kind == kv_buffer_kind::SWA_ONLY) {
         // Smaller than full-attn total — this is the SWA buffer
-        n_kv_layers  = n_swa_layers;
-        kv_per_layer = size / n_kv_layers;
+        kv_slice = ggml_sycl::kv_slice_size::from_planner_layers(size, n_swa_layers);
     } else {
-        // Fallback: divide evenly across model layers
-        kv_per_layer = (n_layers > 0) ? size / n_layers : size;
-        n_kv_layers  = n_layers;
+        // No layer mask and no planner KV geometry: every model layer is
+        // *assumed* to hold KV.  The only defensible use of n_layers here.
+        kv_slice = ggml_sycl::kv_slice_size::from_model_layers_unverified(size, n_layers);
     }
+    const size_t   kv_per_layer = kv_slice.bytes();
+    const uint32_t n_kv_layers  = kv_slice.kv_layers();
+
     const size_t aligned_per_layer = (kv_per_layer + 511) & ~size_t(511);
     GGML_LOG_INFO("[KV-ALLOC] kv_per_layer=%.1f MB (full=%.1f MB, swa=%.1f MB), n_kv_layers=%u/%u\n",
                   kv_per_layer / (1024.0 * 1024.0), planner_full_kv / (1024.0 * 1024.0),
@@ -28225,9 +28247,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
 
     if (kv_plan) {
-        mgr.configure_from_plan(device, *kv_plan, n_layers, size);
+        mgr.configure_from_plan(device, *kv_plan, n_layers, kv_slice);
     } else {
-        mgr.configure_with_weights(device, n_layers, kv_vram_cap, size);
+        mgr.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }
 
     // Compute per-layer layout from the tier manager.
@@ -28559,7 +28581,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     for (uint32_t l = 0; l < n_layers; ++l) {
         actual_layer_on_device[l] = layer_allocs[l].on_device;
     }
-    mgr.set_actual_layer_placement(device, actual_layer_on_device, size);
+    mgr.set_actual_layer_placement(device, actual_layer_on_device);
 
     // Plan-vs-actual divergence diagnostic (T4 acceptance criterion):
     // If a placement plan exists, verify that actual allocation matches the

@@ -1045,6 +1045,51 @@ set_tests_properties(sycl-dispatch-tuning PROPERTIES
     TIMEOUT 60
 )
 
+# KV per-layer slice sizing (llama.cpp-2120): the buffer must be divided by the
+# layers that actually HOLD KV, not by the model's total layer count.  Pure
+# arithmetic over the real kv_tier_manager -- no device, no allocation, so it is
+# safe at any parallelism and safe in a subagent.  It compiles kv-tier-manager.cpp
+# directly and stubs only unified_cache_get_layer_vram_bytes(), so it exercises
+# the shipped class rather than a mock of it.
+#
+# It needs -fsycl solely because unified-cache.hpp (for placement_plan) pulls in
+# SYCL headers; there is no device kernel here, hence
+# SYCL_LINK_ONLY_TEST_OPTIONS per rule 1 above.  ggml-base alone satisfies the
+# link (ggml_log_internal); linking ggml would also pull libggml-sycl.so, whose
+# own copy of unified_cache_get_layer_vram_bytes would collide with the stub.
+#
+# NAME: deliberately not "kv-tier-manager".  ctest -R/-E take UNANCHORED
+# regexes, so a gate named after the thing it guards lands inside any
+# pre-existing exclusion of that name.  Checked against the exclusions in force:
+# .github/workflows/* exclude "test-llama-archs", "tokenizer" and
+# "test-backend-ops"; CLAUDE.md's throttled sweep excludes labels matching
+# residency|mem-handle|cache.  "sycl-kv-slice-sizing" and its labels below hit
+# none of them.
+add_executable(test-kv-slice-sizing
+    tests/test-kv-slice-sizing.cpp
+    kv-tier-manager.cpp
+)
+target_include_directories(test-kv-slice-sizing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-kv-slice-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-kv-slice-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-kv-slice-sizing PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-kv-slice-sizing PRIVATE ggml-base)
+add_test(NAME sycl-kv-slice-sizing COMMAND test-kv-slice-sizing)
+set_tests_properties(sycl-kv-slice-sizing PROPERTIES
+    # No ONEAPI_DEVICE_SELECTOR: this test never creates a queue.  LD_LIBRARY_PATH
+    # is still needed -- the binary links the SYCL runtime because of the headers.
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;kv;sizing;hostonly"
+    TIMEOUT 60
+)
+
 # MMQ XMX dispatch integration: XMX-path selection, MMQ fallback, and edge
 # cases (empty batch, non-aligned dims). Moved outside the guard
 # (llama.cpp-9c0s) -- it spent its life behind GGML_SYCL_BUILD_XMX_TESTS
