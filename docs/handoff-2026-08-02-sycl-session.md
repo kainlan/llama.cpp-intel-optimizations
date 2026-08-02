@@ -253,3 +253,52 @@ lived ~7 weeks.
 all work committed, nothing dirty. `impl-w3` was about to write the closing `0igs` report.
 Neither has GPU access by design. Messages crossed frequently — check a teammate's latest
 message before assuming an instruction is current.
+
+---
+
+## 12. impl-w3's closing report — scope not covered above
+
+Delivered just before shutdown. Adds detail this handoff did not otherwise capture.
+
+### Corrected count on `llama.cpp-ktlb`
+**8 touch sites across 6 public entry points** (not "6 sites"). All fixed across
+`cd02cd5f3` + `dd81d76be`, placed at function entry or inside the specific parallel
+lambda depending on whether the touch can migrate threads.
+
+### Still unresolved — read but NOT root-caused
+- `test-q8-0-layout-cache-path` and `-mmvq` — both fail identically at
+  `Failed to resolve SoA layout pointer (source=wrong_layout)`, never reaching their
+  numerical comparison. Partially traced, no specific defect named. Open question worth
+  checking first: is `wrong_layout` downstream of the same Q8_0 warp-tile padding change
+  (`d87d54cdd`) that made `test-layout-bytes` stale? If so, one root cause covers three
+  tests.
+- `test-q6k-dispatch` — Test 2 fails on accuracy (max_rel 1.4442 % against a 1 % gate);
+  Tests 3 (determinism) and 4 pass. Determinism passing **rules out a race**. Unresolved
+  whether 1 % was ever a justified threshold — `git log -S` on the constant would settle
+  (a) real regression vs (b) marginal gate.
+- `test-sycl-xmx-unified-correctness` — progressed past its abort thanks to `ktlb`'s fix;
+  now `FAIL: SYCL backend run failed` preceded by `SKIP: no graph-pinned entries`.
+  Cause not chased. **Nobody has checked whether that SKIP causes the FAIL or is merely
+  adjacent** — do not assume ordering means causation.
+- **DMMV Q4_0 coalesced numerical error has NO OWNER.** Confirmed real, reachable through
+  production `graph_compute`, ~12–31 % max_rel. Root-caused only as far as "the GPU
+  disagrees with CPU and the test's own decoder is exonerated" (its Part 1 CPU layout
+  check passes). Needs a numerical investigation nobody started.
+
+### Restoration scope NOT completed
+- **22 of the 64-file set remain**: 12 GPU-touching, 5 model-loading hazards (do NOT
+  register as-is — see the never-loop rule), 5 never-registered-at-`3c8f296fd`
+  (mock-vs-real triage). Deferred deliberately, not started.
+- **~83 files outside this branch's changed surface** — explicitly out of scope, tracked
+  in `llama.cpp-0igs`.
+
+### Process traps impl-w3 hit (additional to section 10)
+- **Two of its own harness bugs had the same shape as the defects it was auditing** —
+  `tail | grep` reading the wrong command's exit code. The tooling you write to find a
+  defect class is susceptible to that same class.
+- **`ctest -LE` is an unanchored substring match**, which cost a fix-then-refix cycle:
+  `cache-hostonly` still matched `-LE cache`. Verification used equality where ctest uses
+  substring.
+- **codescout's oversize blind spot on `ggml-sycl.cpp` hid 7 of 8** production
+  `ggml_sycl_cpu_dispatch_buffers_init()` call sites. `cat … | grep -n` was required
+  throughout. Never conclude "no other callers" there from the index.
