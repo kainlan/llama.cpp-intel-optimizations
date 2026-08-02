@@ -68,3 +68,59 @@ The reset cannot be made safe by draining harder, ordering better, or holding a
 lock longer -- the owner is not observable from the boundary at all. This is
 positive evidence for Phase 2's "delete the reset" rather than for any attempt
 to repair the precondition.
+
+
+================================================================================
+v2 -- HOW MANY owners should the boundary expect to find? (2026-08-01, later)
+================================================================================
+
+WHY THIS EXISTS
+
+v1 above has exactly ONE owner thread, so it can only ever observe 0 or 1
+holders. The claim derived from it -- "the TOCTOU predicts exactly one live
+allocation" -- was reading a harness parameter as a prediction about the system.
+The lead then measured TWO live get_rows:seq_device allocations (alloc_id 226 and
+231, shortfall 1.6 MB = 2 x 828504) at the same -np 4 that had previously shown
+one. That is what prompted this.
+
+repro-drain-barrier-multi.cpp takes an owner count and histograms how many
+holders the boundary finds per crossing. test-thread-safety runs several
+contexts, so N owners + 1 boundary is the faithful shape.
+
+MEASURED
+
+  owners=1  crossings=2030    0 live:   15 ( 0.74%)   1 live: 2015 (99.26%)
+  owners=2  crossings=1638    0 live:    1 ( 0.06%)   1 live:  219 (13.37%)
+                                                      2 live: 1418 (86.57%)
+  owners=3  crossings=1142    0 live:    6 ( 0.53%)   1 live:   70 ( 6.13%)
+                                                      2 live:   45 ( 3.94%)
+                                                      3 live: 1021 (89.40%)
+
+CONCLUSION
+
+The count is a DISTRIBUTION bounded by the number of concurrent non-boundary
+contexts, not a constant. With 3 owners the boundary finds 1, 2 or 3. Observing
+1 on one run and 2 on the next at the same -np 4 is the race showing its range --
+it is what this model predicts, not a correction to it.
+
+The "exactly one" reading was an artifact of v1's single owner thread, and the
+owners=1 row above is that artifact reproduced deliberately: 99.26% of crossings
+find exactly 1, because 1 is the only non-zero value available.
+
+THE DISCRIMINATOR, RESTATED CORRECTLY
+
+The pre-fix STRANDING account and the residual TOCTOU account were never
+distinguished by "1 vs 4". They are distinguished by:
+
+  stranding  ->  count GROWS, because handles accumulate in graph_unwaitable
+                 until some context invalidates a graph
+  TOCTOU     ->  count is BOUNDED and VARIES run to run, bounded by the number
+                 of concurrent contexts
+
+1 then 2 at -np 4 is bounded-and-varying. 224/226/227/228 accumulating was
+growth. Both observations still land where they were said to land; the reasoning
+that connected them was sloppy and is corrected here.
+
+Note also that "found 0 live holders" -- the only case where the reset succeeds --
+is 0.06-0.74% of crossings across all three configurations. The precondition the
+graph boundary asserts is almost never true under concurrency.

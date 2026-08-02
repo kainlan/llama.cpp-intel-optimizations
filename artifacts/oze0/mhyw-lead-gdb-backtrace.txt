@@ -1,0 +1,472 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+warning: File "/opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+[New Thread 0x7fffc2bff6c0 (LWP 1726359)]
+[Thread 0x7fffc2bff6c0 (LWP 1726359) exited]
+[New Thread 0x7fffc2bff6c0 (LWP 1726360)]
+[New Thread 0x7fffc23fe6c0 (LWP 1726366)]
+[New Thread 0x7fffc17ff6c0 (LWP 1726437)]
+0.00.355.387 W [SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.
+0.00.355.417 W [SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+0.00.355.428 W [SYCL] Device 1 alloc caps: raw=15488.8 MB, safe=14593.3 MB, host_unified=no
+0.00.357.125 I system_info: n_threads = 2 (n_threads_batch = 2) / 20 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.370.170 W load: empty token at index 30143
+0.00.370.362 W load: bad special token: 'tokenizer.ggml.seperator_token_id' = 4294967295, using default id -1
+0.00.370.364 W load: bad special token: 'tokenizer.ggml.padding_token_id' = 4294967295, using default id -1
+[New Thread 0x7ffe925ff6c0 (LWP 1726580)]
+[New Thread 0x7ffe919986c0 (LWP 1726581)]
+0.01.656.915 W load: empty token at index 30143
+0.01.658.611 W load: bad special token: 'tokenizer.ggml.seperator_token_id' = 4294967295, using default id -1
+0.01.658.612 W load: bad special token: 'tokenizer.ggml.padding_token_id' = 4294967295, using default id -1
+0.01.676.798 W [UNIFIED-CACHE] reclaim_weight_entries(load-boundary) preserved 100 of 100 weight entries (leased=57 owned-by-live-model=43 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000001)
+0.01.698.332 W load: empty token at index 30143
+0.01.698.649 W load: bad special token: 'tokenizer.ggml.seperator_token_id' = 4294967295, using default id -1
+0.01.698.662 W load: bad special token: 'tokenizer.ggml.padding_token_id' = 4294967295, using default id -1
+0.01.710.370 W [UNIFIED-CACHE] reclaim_weight_entries(load-boundary) preserved 100 of 100 weight entries (leased=57 owned-by-live-model=43 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000003)
+0.02.040.031 W [UNIFIED-CACHE] reclaim_weight_entries(mid-load-replan) preserved 100 of 100 weight entries (leased=57 owned-by-live-model=43 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000003)
+[New Thread 0x7ffe911976c0 (LWP 1726651)]
+0.02.041.704 I Creating context 1/4 for model 1/3
+0.02.041.791 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe909966c0 (LWP 1726652)]
+0.02.042.693 I Creating context 2/4 for model 1/3
+0.02.042.746 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe0a8b06c0 (LWP 1726653)]
+0.02.043.676 I Creating context 3/4 for model 1/3
+0.02.043.729 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe0a0af6c0 (LWP 1726654)]
+0.02.044.535 I Creating context 4/4 for model 1/3
+0.02.044.600 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe098ae6c0 (LWP 1726655)]
+0.02.046.752 I Creating context 1/4 for model 2/3
+0.02.046.804 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe090ad6c0 (LWP 1726656)]
+0.02.047.144 I Creating context 2/4 for model 2/3
+0.02.047.190 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffe088ac6c0 (LWP 1726657)]
+0.02.048.064 I Creating context 3/4 for model 2/3
+0.02.048.121 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffdf2a646c0 (LWP 1726658)]
+0.02.048.996 I Creating context 4/4 for model 2/3
+0.02.049.050 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.052.344 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.052.347 W resolve_fused_ops: Flash Attention not supported, set to disabled
+[New Thread 0x7ffdf0cc86c0 (LWP 1726661)]
+0.02.053.151 I Creating context 1/4 for model 3/3
+0.02.053.208 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.053.232 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.053.233 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.053.899 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.053.900 W resolve_fused_ops: Flash Attention not supported, set to disabled
+[New Thread 0x7ffde54c96c0 (LWP 1726662)]
+0.02.054.114 I Creating context 2/4 for model 3/3
+0.02.054.139 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.054.140 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.054.166 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffde4bc56c0 (LWP 1726664)]
+0.02.055.630 I Creating context 3/4 for model 3/3
+0.02.055.972 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+[New Thread 0x7ffddd4c96c0 (LWP 1726665)]
+0.02.057.654 I Creating context 4/4 for model 3/3
+0.02.057.710 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.059.116 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.059.118 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.059.949 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.059.950 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.061.434 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.061.436 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.063.266 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.063.268 W resolve_fused_ops: Flash Attention not supported, set to disabled
+[New Thread 0x7ffddccc78c0 (LWP 1726667)]
+[New Thread 0x7ffdd54c8940 (LWP 1726668)]
+[New Thread 0x7ffdd4cc69c0 (LWP 1726669)]
+[New Thread 0x7ffdc2992a40 (LWP 1726670)]
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7ffe96c00040 alloc_id=227 size=828504 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=get_rows:seq_host
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7ffe9ac00040 alloc_id=229 size=828504 device=0 tier=host_pinned role=6 category=2 vram_zone=5 host_zone=3 zone_managed=1 cohort=mem-copy-host-to-device
+0.02.109.481 W [GET_ROWS] host-mmap weights; using streamed get_rows
+0.02.110.483 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7ffe96c00040 alloc_id=227 size=828504 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=get_rows:seq_host
+0.02.110.497 W [UNIFIED-CACHE] refusing STAGING host zone_reset with 1 live registered allocations; owners must release their mem_handles instead of resetting the shared allocator
+0.02.110.506 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7ffe9ac00040 alloc_id=229 size=828504 device=0 tier=host_pinned role=6 category=2 vram_zone=5 host_zone=3 zone_managed=1 cohort=mem-copy-host-to-device
+0.02.110.507 W [UNIFIED-CACHE] refusing SCRATCH host zone_reset with 1 live registered allocations; owners must release their mem_handles instead of resetting the shared allocator
+0.02.110.595 W [GET_ROWS] host-mmap weights; using streamed get_rows
+[UNIFIED-ALLOC] device-zone-reset live allocation at reset ptr=0xffffd55e67cf6500 alloc_id=231 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 cohort=get_rows:seq_device
+[UNIFIED-ALLOC] device-zone-reset live allocation at reset ptr=0xffffd55e67c2c000 alloc_id=226 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 cohort=get_rows:seq_device
+[UNIFIED-ALLOC] live-zone-dump at graph-scratch-headroom device=0 zone=4 used=1.6 MB available=510.4 MB capacity=512.0 MB largest_free=510.4 MB base=0xffffd55e67c2c000
+[UNIFIED-ALLOC] live-zone-dump at graph-scratch-headroom ptr=0xffffd55e67cf6500 alloc_id=231 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 from_arena=1 cohort=get_rows:seq_device
+[UNIFIED-ALLOC] live-zone-dump at graph-scratch-headroom ptr=0xffffd55e67c2c000 alloc_id=226 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 from_arena=1 cohort=get_rows:seq_device
+[UNIFIED-ALLOC] live-zone-dump at graph-scratch-headroom device=0 zone=4 address-live=2 bytes=1.6 MB logged=2/2
+/Apps/llama.cpp-worktrees/t-oze0/ggml/src/ggml-sycl/ggml-sycl.cpp:78815: [GRAPH-COMPUTE] arena scratch unavailable before graph launch
+0.02.114.136 E [UNIFIED-ALLOC] device-zone-reset live allocation at reset ptr=0xffffd55e67cf6500 alloc_id=231 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 cohort=get_rows:seq_device
+0.02.114.143 E [UNIFIED-ALLOC] device-zone-reset live allocation at reset ptr=0xffffd55e67c2c000 alloc_id=226 size=828504 device=0 tier=device_vram role=3 category=2 vram_zone=4 host_zone=4 zone_managed=1 cohort=get_rows:seq_device
+0.02.114.154 W [UNIFIED-CACHE] refusing zone_reset of VRAM zone SCRATCH with 2 live registered allocations; owners must release their mem_handles instead of resetting the shared allocator
+0.02.114.164 W [GRAPH-COMPUTE] device 0 arena scratch zone not reset: available=510.4 MB target=512.0 MB. Aborting before graph launch; scratch ownership must be released before reset.
+
+Thread 8 "test-thread-saf" received signal SIGABRT, Aborted.
+[Switching to Thread 0x7ffe911976c0 (LWP 1726651)]
+__pthread_kill_implementation (threadid=<optimized out>, signo=6, no_tid=0) at ./nptl/pthread_kill.c:44
+warning: 44	./nptl/pthread_kill.c: No such file or directory
+
+===== FAULTING THREAD =====
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=6, no_tid=0) at ./nptl/pthread_kill.c:44
+#1  __pthread_kill_internal (threadid=<optimized out>, signo=6) at ./nptl/pthread_kill.c:89
+#2  __GI___pthread_kill (threadid=<optimized out>, signo=signo@entry=6) at ./nptl/pthread_kill.c:100
+#3  0x00007fffef045b7e in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#4  0x00007fffef0288ec in __GI_abort () at ./stdlib/abort.c:77
+#5  0x00007ffff7ed1d3e in ggml_abort () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007fffefb3c463 in ggml_sycl_graph_boundary_reset_arenas(ggml_backend_sycl_context*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#7  0x00007fffefb28e15 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#8  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#9  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#11 0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#12 0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#13 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#14 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#15 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#16 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+===== ALL THREADS =====
+
+Thread 23 (Thread 0x7ffdc2992a40 (LWP 1726670) "openmp_worker"):
+#0  0x00007fffef11acab in __GI_sched_yield () at ../sysdeps/unix/syscall-template.S:120
+#1  0x00007fffec484cbe in __kmp_wait_template<kmp_flag_64<false, true>, true, false, true> (this_thr=0x7ffe900c9000, flag=0x7ffdc2737da0, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:608
+#2  kmp_flag_64<false, true>::wait (this=0x7ffdc2737da0, this_thr=0x7ffe900c9000, final_spin=1, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:964
+#3  0x00007fffec47f1b7 in __kmp_hyper_barrier_release (bt=bt@entry=bs_forkjoin_barrier, this_thr=this_thr@entry=0x7ffe900c9000, gtid=gtid@entry=7, tid=tid@entry=-2, propagate_icvs=propagate_icvs@entry=1, itt_sync_obj=itt_sync_obj@entry=0x0) at ../../src/kmp_barrier.cpp:1214
+#4  0x00007fffec482ced in __kmp_fork_barrier (gtid=7, tid=-2) at ../../src/kmp_barrier.cpp:2569
+#5  0x00007fffec4d0bfd in __kmp_launch_thread (this_thr=0x7ffe900c9000) at ../../src/kmp_runtime.cpp:7002
+#6  0x00007fffec552e62 in __kmp_launch_worker (thr=0x7ffe900c9000) at ../../src/z_Linux_util.cpp:742
+#7  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#8  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 22 (Thread 0x7ffdd4cc69c0 (LWP 1726669) "openmp_worker"):
+#0  __kmp_wait_template<kmp_flag_64<false, true>, true, false, true> (this_thr=0x7ffe900c5000, flag=0x7ffdd4a6bd60, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:608
+#1  kmp_flag_64<false, true>::wait (this=0x7ffdd4a6bd60, this_thr=0x7ffe900c5000, final_spin=1, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:964
+#2  0x00007fffec47f1b7 in __kmp_hyper_barrier_release (bt=bt@entry=bs_forkjoin_barrier, this_thr=this_thr@entry=0x7ffe900c5000, gtid=gtid@entry=6, tid=tid@entry=-2, propagate_icvs=propagate_icvs@entry=1, itt_sync_obj=itt_sync_obj@entry=0x0) at ../../src/kmp_barrier.cpp:1214
+#3  0x00007fffec482ced in __kmp_fork_barrier (gtid=6, tid=-2) at ../../src/kmp_barrier.cpp:2569
+#4  0x00007fffec4d0bfd in __kmp_launch_thread (this_thr=0x7ffe900c5000) at ../../src/kmp_runtime.cpp:7002
+#5  0x00007fffec552e62 in __kmp_launch_worker (thr=0x7ffe900c5000) at ../../src/z_Linux_util.cpp:742
+#6  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 21 (Thread 0x7ffdd54c8940 (LWP 1726668) "openmp_worker"):
+#0  __kmp_wait_template<kmp_flag_64<false, true>, true, false, true> (this_thr=0x7ffe900c1000, flag=0x7ffdd526dd20, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:608
+#1  kmp_flag_64<false, true>::wait (this=0x7ffdd526dd20, this_thr=0x7ffe900c1000, final_spin=1, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:964
+#2  0x00007fffec47f1b7 in __kmp_hyper_barrier_release (bt=bt@entry=bs_forkjoin_barrier, this_thr=this_thr@entry=0x7ffe900c1000, gtid=gtid@entry=5, tid=tid@entry=-2, propagate_icvs=propagate_icvs@entry=1, itt_sync_obj=itt_sync_obj@entry=0x0) at ../../src/kmp_barrier.cpp:1214
+#3  0x00007fffec482ced in __kmp_fork_barrier (gtid=5, tid=-2) at ../../src/kmp_barrier.cpp:2569
+#4  0x00007fffec4d0bfd in __kmp_launch_thread (this_thr=0x7ffe900c1000) at ../../src/kmp_runtime.cpp:7002
+#5  0x00007fffec552e62 in __kmp_launch_worker (thr=0x7ffe900c1000) at ../../src/z_Linux_util.cpp:742
+#6  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 20 (Thread 0x7ffddccc78c0 (LWP 1726667) "openmp_worker"):
+#0  __kmp_wait_template<kmp_flag_64<false, true>, true, false, true> (this_thr=0x7ffe900bd000, flag=0x7ffddca6cce0, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:608
+#1  kmp_flag_64<false, true>::wait (this=0x7ffddca6cce0, this_thr=0x7ffe900bd000, final_spin=1, itt_sync_obj=0x0) at ../../src/kmp_wait_release.h:964
+#2  0x00007fffec47f1b7 in __kmp_hyper_barrier_release (bt=bt@entry=bs_forkjoin_barrier, this_thr=this_thr@entry=0x7ffe900bd000, gtid=gtid@entry=4, tid=tid@entry=-2, propagate_icvs=propagate_icvs@entry=1, itt_sync_obj=itt_sync_obj@entry=0x0) at ../../src/kmp_barrier.cpp:1214
+#3  0x00007fffec482ced in __kmp_fork_barrier (gtid=4, tid=-2) at ../../src/kmp_barrier.cpp:2569
+#4  0x00007fffec4d0bfd in __kmp_launch_thread (this_thr=0x7ffe900bd000) at ../../src/kmp_runtime.cpp:7002
+#5  0x00007fffec552e62 in __kmp_launch_worker (thr=0x7ffe900bd000) at ../../src/z_Linux_util.cpp:742
+#6  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 19 (Thread 0x7ffddd4c96c0 (LWP 1726665) "test-thread-saf"):
+#0  futex_wait (futex_word=0x7ffff716f388 <g_sycl_graph_compute_mutex>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7ffff716f388 <g_sycl_graph_compute_mutex>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffefb2884b in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#5  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#7  0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#8  0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#9  0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#11 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#12 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#13 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 18 (Thread 0x7ffde4bc56c0 (LWP 1726664) "test-thread-saf"):
+#0  futex_wait (futex_word=0x7ffff716f388 <g_sycl_graph_compute_mutex>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7ffff716f388 <g_sycl_graph_compute_mutex>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffefb2884b in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#5  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#7  0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#8  0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#9  0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#11 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#12 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#13 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 17 (Thread 0x7ffde54c96c0 (LWP 1726662) "test-thread-saf"):
+#0  __memcpy_avx_unaligned_erms () at ../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:765
+#1  0x00007fffac9b27ea in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#2  0x00007fffab3b5697 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#3  0x00007fffab3b396e in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#4  0x00007fffab613ac4 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#5  0x00007fffab616399 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#6  0x00007fffaae7da29 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#7  0x00007fffaaefddd4 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#8  0x00007fffaae94c07 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#9  0x00007fffaaeae396 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#10 0x00007fffaaeb049a in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#11 0x00007fffaaeb3cc6 in ?? () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#12 0x00007fffaaec18f6 in IGC::IgcOclTranslationCtx<0ul>::Impl::Translate(unsigned long, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, unsigned int, void*, unsigned long) const () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#13 0x00007fffaaec3469 in IGC::IgcOclTranslationCtx<2ul>::TranslateImpl(unsigned long, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, CIF::Builtins::Buffer<1ul>*, unsigned int, void*) () from /usr/lib/x86_64-linux-gnu/libigc.so.2
+#14 0x00007fffb85e3caf in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#15 0x00007fffb85e593b in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#16 0x00007fffb85e8ac2 in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#17 0x00007fffb85ea039 in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#18 0x00007fffb85f2ff8 in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#19 0x00007fffb85009b7 in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#20 0x00007fffeeee6825 in ur::level_zero::urProgramLinkExp(ur_context_handle_t_*, unsigned int, ur_device_handle_t_**, unsigned int, unsigned int, ur_program_handle_t_* const*, char const*, ur_program_handle_t_**) () from /opt/intel/oneapi/compiler/2026.1/lib/libur_adapter_level_zero_v2.so.0
+#21 0x00007fffc416e446 in urProgramLinkExp () from /opt/intel/oneapi/compiler/2026.1/lib/libur_loader.so.0
+#22 0x00007fffdb277135 in sycl::_V1::detail::ProgramManager::build(sycl::_V1::detail::Managed<ur_program_handle_t_*>, sycl::_V1::detail::context_impl&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<ur_device_handle_t_*, std::allocator<ur_device_handle_t_*> >&, std::vector<sycl::_V1::detail::Managed<ur_program_handle_t_*>, std::allocator<sycl::_V1::detail::Managed<ur_program_handle_t_*> > > const&, bool) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#23 0x00007fffdb270383 in sycl::_V1::detail::ProgramManager::getBuiltURProgram(sycl::_V1::detail::ObjectWithDeps<sycl::_V1::detail::RTDeviceBinaryImage const*> const&, sycl::_V1::detail::context_impl&, sycl::_V1::detail::devices_range, sycl::_V1::detail::ObjectWithDeps<sycl::_V1::detail::device_image_plain> const*, std::vector<unsigned char, std::allocator<unsigned char> > const&)::$_2::operator()() const () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#24 0x00007fffdb26ebf2 in sycl::_V1::detail::ProgramManager::getBuiltURProgram(sycl::_V1::detail::ObjectWithDeps<sycl::_V1::detail::RTDeviceBinaryImage const*> const&, sycl::_V1::detail::context_impl&, sycl::_V1::detail::devices_range, sycl::_V1::detail::ObjectWithDeps<sycl::_V1::detail::device_image_plain> const*, std::vector<unsigned char, std::allocator<unsigned char> > const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#25 0x00007fffdb269a79 in sycl::_V1::detail::ProgramManager::getBuiltURProgram(sycl::_V1::detail::context_impl&, sycl::_V1::detail::device_impl&, std::basic_string_view<char, std::char_traits<char> >, sycl::_V1::detail::NDRDescT const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#26 0x00007fffdb27166d in sycl::_V1::detail::ProgramManager::getOrCreateKernel(sycl::_V1::detail::context_impl&, sycl::_V1::detail::device_impl&, sycl::_V1::detail::DeviceKernelInfo&, sycl::_V1::detail::NDRDescT const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#27 0x00007fffdb2ef989 in sycl::_V1::detail::enqueueImpKernel(sycl::_V1::detail::queue_impl&, sycl::_V1::detail::NDRDescT&, std::vector<sycl::_V1::detail::ArgDesc, std::allocator<sycl::_V1::detail::ArgDesc> >&, sycl::_V1::detail::kernel_bundle_impl*, sycl::_V1::detail::kernel_impl const*, sycl::_V1::detail::DeviceKernelInfo&, std::vector<ur_event_handle_t_*, std::allocator<ur_event_handle_t_*> >&, sycl::_V1::detail::event_impl*, std::function<void* (sycl::_V1::detail::AccessorImplHost*)> const&, ur_kernel_cache_config_t, bool, bool, unsigned long, sycl::_V1::detail::RTDeviceBinaryImage const*, void*) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#28 0x00007fffdb2b3eeb in sycl::_V1::detail::queue_impl::submit_kernel_scheduler_bypass(sycl::_V1::detail::KernelData&, std::vector<std::shared_ptr<sycl::_V1::detail::event_impl>, std::allocator<std::shared_ptr<sycl::_V1::detail::event_impl> > >&, bool, sycl::_V1::detail::kernel_impl*, sycl::_V1::detail::kernel_bundle_impl*, sycl::_V1::detail::code_location const&, bool)::$_0::operator()() const () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#29 0x00007fffdb2b3b69 in sycl::_V1::detail::queue_impl::submit_kernel_scheduler_bypass(sycl::_V1::detail::KernelData&, std::vector<std::shared_ptr<sycl::_V1::detail::event_impl>, std::allocator<std::shared_ptr<sycl::_V1::detail::event_impl> > >&, bool, sycl::_V1::detail::kernel_impl*, sycl::_V1::detail::kernel_bundle_impl*, sycl::_V1::detail::code_location const&, bool) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#30 0x00007fffdb32f6a9 in sycl::_V1::handler::finalize() () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#31 0x00007fffdb2b2b56 in std::shared_ptr<sycl::_V1::detail::event_impl> sycl::_V1::detail::queue_impl::finalizeHandlerInOrderNoEventsUnlocked<sycl::_V1::handler>(sycl::_V1::handler&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#32 0x00007fffdb2b218b in sycl::_V1::detail::queue_impl::submit_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, bool, sycl::_V1::detail::code_location const&, bool, sycl::_V1::detail::_V1::SubmissionInfo const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#33 0x00007fffdb378299 in sycl::_V1::queue::submit_with_event_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, sycl::_V1::detail::_V1::SubmissionInfo const&, sycl::_V1::detail::code_location const&, bool) const () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#34 0x00007ffff002b99b in sycl::_V1::event ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#35 0x00007ffff001fcd9 in ggml_sycl_op_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#36 0x00007fffefbe1bad in ggml_sycl_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#37 0x00007fffefbdaf44 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#38 0x00007fffefcb8d3f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#39 0x00007fffefb36c17 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#40 0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#41 0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#42 0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#43 0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#44 0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#45 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#46 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#47 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#48 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 16 (Thread 0x7ffdf0cc86c0 (LWP 1726661) "test-thread-saf"):
+#0  futex_wait (futex_word=0x7ffff716f388 <g_sycl_graph_compute_mutex>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7ffff716f388 <g_sycl_graph_compute_mutex>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffefb2884b in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#5  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#7  0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#8  0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#9  0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#11 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#12 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#13 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 15 (Thread 0x7ffdf2a646c0 (LWP 1726658) "test-thread-saf"):
+#0  0x00007ffff7c7bcde in common_sampler::set_logits(llama_context*, int) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#1  0x00007ffff7c765d4 in common_sampler_sample(common_sampler*, llama_context*, int, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#2  0x0000000000408e04 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#3  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#4  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#5  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 14 (Thread 0x7ffe088ac6c0 (LWP 1726657) "test-thread-saf"):
+#0  0x00007ffff7c7bcd6 in common_sampler::set_logits(llama_context*, int) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#1  0x00007ffff7c765d4 in common_sampler_sample(common_sampler*, llama_context*, int, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#2  0x0000000000408e04 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#3  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#4  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#5  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 13 (Thread 0x7ffe090ad6c0 (LWP 1726656) "test-thread-saf"):
+#0  0x00007ffff7c7bcd6 in common_sampler::set_logits(llama_context*, int) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#1  0x00007ffff7c765d4 in common_sampler_sample(common_sampler*, llama_context*, int, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#2  0x0000000000408e04 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#3  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#4  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#5  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 12 (Thread 0x7ffe098ae6c0 (LWP 1726655) "test-thread-saf"):
+#0  0x00007ffff7c7bcd9 in common_sampler::set_logits(llama_context*, int) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#1  0x00007ffff7c765d4 in common_sampler_sample(common_sampler*, llama_context*, int, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#2  0x0000000000408e04 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#3  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#4  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#5  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 11 (Thread 0x7ffe0a0af6c0 (LWP 1726654) "test-thread-saf"):
+#0  futex_wait (futex_word=0x7ffff716f388 <g_sycl_graph_compute_mutex>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7ffff716f388 <g_sycl_graph_compute_mutex>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7ffff716f388 <g_sycl_graph_compute_mutex>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffefb2884b in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#5  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#7  0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#8  0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#9  0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#11 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#12 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#13 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x7ffe0a8b06c0 (LWP 1726653) "test-thread-saf"):
+#0  futex_wait (futex_word=0x284dfa0, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x284dfa0, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x284dfa0) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x284dfa0) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffdb2b214c in sycl::_V1::detail::queue_impl::submit_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, bool, sycl::_V1::detail::code_location const&, bool, sycl::_V1::detail::_V1::SubmissionInfo const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#5  0x00007fffdb378299 in sycl::_V1::queue::submit_with_event_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, sycl::_V1::detail::_V1::SubmissionInfo const&, sycl::_V1::detail::code_location const&, bool) const () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#6  0x00007ffff002b99b in sycl::_V1::event ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#7  0x00007ffff0022656 in get_rows_stream_slice(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#8  0x00007ffff027b5bf in ggml_sycl::unified_cache::stream_dma(ggml_sycl::cache_ptr_view const&, unsigned long, unsigned long, unsigned long, sycl::_V1::event (*)(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&), void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, sycl::_V1::event (*)(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&)) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#9  0x00007ffff001d510 in ggml_sycl_op_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#10 0x00007fffefbe1bad in ggml_sycl_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#11 0x00007fffefbdaf44 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#12 0x00007fffefcb8d3f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#13 0x00007fffefb5e071 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*)::{lambda()#5}::operator()() const () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#14 0x00007fffefb34ab8 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#15 0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#16 0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#17 0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#18 0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#19 0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#20 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#21 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#22 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#23 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7ffe909966c0 (LWP 1726652) "test-thread-saf"):
+#0  futex_wait (futex_word=0x284dfa0, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x284dfa0, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fffef0a79d4 in lll_mutex_lock_optimized (mutex=0x284dfa0) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x284dfa0) at ./nptl/pthread_mutex_lock.c:87
+#4  0x00007fffdb2b214c in sycl::_V1::detail::queue_impl::submit_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, bool, sycl::_V1::detail::code_location const&, bool, sycl::_V1::detail::_V1::SubmissionInfo const&) () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#5  0x00007fffdb378299 in sycl::_V1::queue::submit_with_event_impl(sycl::_V1::detail::type_erased_cgfo_ty const&, sycl::_V1::detail::_V1::SubmissionInfo const&, sycl::_V1::detail::code_location const&, bool) const () from /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9
+#6  0x00007ffff004a7ee in ggml_sycl::mem_copy_direct_submit(ggml_sycl::mem_handle const&, unsigned long, ggml_sycl::mem_handle const&, unsigned long, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, char const*, char const*, char const*, char const*, int, char const*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#7  0x00007ffff0047a34 in ggml_sycl::mem_copy_submit(ggml_sycl::mem_handle const&, unsigned long, ggml_sycl::mem_handle const&, unsigned long, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#8  0x00007ffff0046c93 in ggml_sycl::mem_copy_async(ggml_sycl::mem_handle const&, ggml_sycl::mem_handle const&, unsigned long, sycl::_V1::queue&, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#9  0x00007ffff00239ea in get_rows_stream_copy(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#10 0x00007ffff027b3b0 in ggml_sycl::unified_cache::stream_dma(ggml_sycl::cache_ptr_view const&, unsigned long, unsigned long, unsigned long, sycl::_V1::event (*)(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&), void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&, sycl::_V1::event (*)(sycl::_V1::queue&, void*, unsigned long, unsigned long, void const*, unsigned long, void const*, std::vector<sycl::_V1::event, std::allocator<sycl::_V1::event> > const&)) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#11 0x00007ffff001d510 in ggml_sycl_op_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#12 0x00007fffefbe1bad in ggml_sycl_get_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#13 0x00007fffefbdaf44 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#14 0x00007fffefcb8d3f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#15 0x00007fffefb36c17 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#16 0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#17 0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#18 0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#19 0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#20 0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#21 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#22 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#23 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#24 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x7ffe911976c0 (LWP 1726651) "test-thread-saf"):
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=6, no_tid=0) at ./nptl/pthread_kill.c:44
+#1  __pthread_kill_internal (threadid=<optimized out>, signo=6) at ./nptl/pthread_kill.c:89
+#2  __GI___pthread_kill (threadid=<optimized out>, signo=signo@entry=6) at ./nptl/pthread_kill.c:100
+#3  0x00007fffef045b7e in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#4  0x00007fffef0288ec in __GI_abort () at ./stdlib/abort.c:77
+#5  0x00007ffff7ed1d3e in ggml_abort () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#6  0x00007fffefb3c463 in ggml_sycl_graph_boundary_reset_arenas(ggml_backend_sycl_context*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#7  0x00007fffefb28e15 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#8  0x00007ffff7efa12c in ggml_backend_sched_graph_compute_async () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-base.so.0
+#9  0x00007ffff76c0e71 in llama_context::graph_compute(ggml_cgraph*, bool) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#10 0x00007ffff76c0825 in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#11 0x00007ffff76c2685 in llama_context::decode(llama_batch const&) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#12 0x00007ffff76c798b in llama_decode () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama.so.0
+#13 0x00000000004089cf in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_0> > >::_M_run() ()
+#14 0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#15 0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#16 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x7ffe919986c0 (LWP 1726581) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=0, a2=a2@entry=0, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=230) at ./nptl/cancellation.c:49
+#2  0x00007fffef0f5d72 in __GI___clock_nanosleep (clock_id=<optimized out>, clock_id@entry=0, flags=flags@entry=0, req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:48
+#3  0x00007fffef103987 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#4  0x00007fffefdffb1b in watchdog_thread_fn(long) () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#5  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#6  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x7ffe925ff6c0 (LWP 1726580) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=32215464, a2=<optimized out>, a3=a3@entry=4227858480, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007fffef0a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x1eb91a8, expected=4227858480, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x1eb91a8, expected=4227858480, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x1eb91a8, expected=expected@entry=30, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007fffef0a3347 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x1eb9160, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x1eb9160) at ./nptl/pthread_cond_wait.c:453
+#7  0x00007ffff0045a0b in ggml_sycl::(anonymous namespace)::retained_handle_drain_loop() () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libggml-sycl.so.0
+#8  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#9  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#10 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7fffc17ff6c0 (LWP 1726437) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=36335916, a2=<optimized out>, a3=a3@entry=3243920880, a4=a4@entry=140736437309312, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007fffef0a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x22a712c, expected=3243920880, op=137, abstime=0x7fffc15a4f80, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x22a712c, expected=3243920880, clockid=1, abstime=0x7fffc15a4f80, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x22a712c, expected=expected@entry=9, clockid=clockid@entry=1, abstime=abstime@entry=0x7fffc15a4f80, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007fffef0a3909 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x22a7138, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_clockwait64 (cond=<optimized out>, mutex=0x22a7138, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:517
+#7  ___pthread_cond_clockwait64 (cond=<optimized out>, mutex=0x22a7138, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:505
+#8  0x00007fffb8b51fc9 in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#9  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#10 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7fffc23fe6c0 (LWP 1726366) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=33093432, a2=<optimized out>, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007fffef0a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x1f8f738, expected=0, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x1f8f738, expected=0, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x1f8f738, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007fffef0a3347 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x1f8f6f0, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x1f8f6f0) at ./nptl/pthread_cond_wait.c:453
+#7  0x00007fffb8c2179e in ?? () from /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+#8  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#9  0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7fffc2bff6c0 (LWP 1726360) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=32222932, a2=<optimized out>, a3=a3@entry=6, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007fffef0a0967 in __futex_abstimed_wait_common64 (private=0, futex_word=0x1ebaed4, expected=6, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x1ebaed4, expected=6, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x1ebaed4, expected=expected@entry=41, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007fffef0a3347 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x1ebae80, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x1ebae80) at ./nptl/pthread_cond_wait.c:453
+#7  0x00007ffff7c35b7b in common_log::resume()::{lambda()#1}::operator()() const () from /Apps/llama.cpp-worktrees/t-oze0/build/bin/libllama-common.so.0
+#8  0x00007fffef4f5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#9  0x00007fffef0a407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#10 0x00007fffef13772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7fffc3bfe600 (LWP 1726160) "test-thread-saf"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007fffef0a058c in __internal_syscall_cancel (a1=a1@entry=140731332787432, a2=<optimized out>, a3=<optimized out>, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007fffef0a0967 in __futex_abstimed_wait_common64 (private=128, futex_word=0x7ffe91197ce8, expected=<optimized out>, op=265, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x7ffe91197ce8, expected=<optimized out>, clockid=0, abstime=0x0, private=128, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ffe91197ce8, expected=<optimized out>, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=128) at ./nptl/futex-internal.c:139
+#5  0x00007fffef0a6059 in __pthread_clockjoin_ex (threadid=140731332785856, thread_return=0x0, clockid=0, abstime=0x0, cancel=<optimized out>) at ./nptl/pthread_join_common.c:66
+#6  0x00007fffef4f5f73 in std::thread::join() () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#7  0x0000000000408468 in main ()
