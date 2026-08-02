@@ -30,6 +30,8 @@ namespace esimd = sycl::ext::intel::esimd;
 // Include XMX ESIMD common header (will be created)
 #include "../xmx-esimd-common.hpp"
 
+#include "sycl-test-skip.hpp"
+
 // =============================================================================
 // Test Helpers
 // =============================================================================
@@ -510,15 +512,19 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "WARNING: ESIMD header not available, tests will be skipped.\n\n");
 #endif
 
-    // Create SYCL queue
-    sycl::queue q;
-    try {
-        q = sycl::queue(sycl::gpu_selector_v);
-        fprintf(stderr, "Using GPU: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU found, using default device\n");
-        q = sycl::queue(sycl::default_selector_v);
+    // Select a device BEFORE constructing the queue. The bare `sycl::queue q;`
+    // this replaced default-constructs through the default selector and THROWS on
+    // a device-less host, from outside the try -- and the default_selector
+    // fallback in the catch handler threw again, so the process aborted (exit 134)
+    // instead of falling back. See sycl-test-skip.hpp. The GPU-preferred /
+    // any-device-accepted intent is unchanged.
+    std::optional<sycl::device> dev_opt = sycl_test_prefer_gpu("basic ESIMD operations");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
+    fprintf(stderr, "Using device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
+    sycl::queue q(dev);
 
     fprintf(stderr, "ESIMD available: %s\n\n", SYCL_ESIMD_AVAILABLE ? "YES" : "NO");
 

@@ -17,6 +17,8 @@
 // Include the XMX ESIMD common header (provides XMXCapabilities in standalone mode)
 #include "../xmx-esimd-common.hpp"
 
+#include "sycl-test-skip.hpp"
+
 // =============================================================================
 // Test Helpers
 // =============================================================================
@@ -266,16 +268,18 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "=== XMX Hardware Detection Tests ===\n");
 
-    // Find a SYCL device
-    sycl::device dev;
-    try {
-        // Try to get a GPU device
-        dev = sycl::device(sycl::gpu_selector_v);
-        fprintf(stderr, "Using GPU: %s\n", dev.get_info<sycl::info::device::name>().c_str());
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU found, using default device\n");
-        dev = sycl::device(sycl::default_selector_v);
+    // Find a SYCL device. Enumeration comes FIRST -- the bare `sycl::device dev;`
+    // this replaced default-constructs through the default selector and THROWS on
+    // a device-less host, from outside the try. The default_selector fallback in
+    // the catch handler then threw again, so the process aborted (exit 134)
+    // instead of falling back. See sycl-test-skip.hpp. The GPU-preferred /
+    // any-device-accepted intent is unchanged.
+    std::optional<sycl::device> dev_opt = sycl_test_prefer_gpu("XMX hardware detection");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
+    fprintf(stderr, "Using device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
 
     // Check for XMX support upfront
     bool has_xmx = dev.has(sycl::aspect::ext_intel_matrix);
