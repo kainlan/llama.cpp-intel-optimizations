@@ -1,0 +1,1393 @@
+0.00.233.200 W [SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+0.00.233.209 I [XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+0.00.233.213 I [SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+0.00.233.291 I [SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+main: using seed 3741908792
+|     Model arch.|                           Device|Config|   NMSE vs. CPU|Roundtrip|
+|----------------|---------------------------------|------|---------------|---------|
+Roundtrip: a GGUF save+reload of the device model, compared against that model.
+  Gated on NMSE(device, reloaded) <= 1e-04, NOT on bit-equality: this path is not
+  bit-reproducible run to run, so OK does NOT mean the logits matched bit for bit.
+  BITDIFF = bits differ, within tolerance. Magnitudes for any non-bit-exact row
+  are on stderr.
+test case: kimi-linear (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+0.00.234.441 I llama_model_loader: loaded meta data with 60 key-value pairs and 0 tensors from (file*) (version GGUF V3 (latest))
+0.00.234.447 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.234.457 I llama_model_loader: - kv   0:                       general.architecture str              = kimi-linear
+0.00.234.460 I llama_model_loader: - kv   1:                     kimi-linear.vocab_size u32              = 128
+0.00.234.460 I llama_model_loader: - kv   2:                 kimi-linear.context_length u32              = 128
+0.00.234.460 I llama_model_loader: - kv   3:               kimi-linear.embedding_length u32              = 128
+0.00.234.460 I llama_model_loader: - kv   4:                kimi-linear.features_length u32              = 128
+0.00.234.460 I llama_model_loader: - kv   5:                    kimi-linear.block_count u32              = 2
+0.00.234.461 I llama_model_loader: - kv   6:      kimi-linear.leading_dense_block_count u32              = 1
+0.00.234.461 I llama_model_loader: - kv   7:            kimi-linear.feed_forward_length u32              = 192
+0.00.234.462 I llama_model_loader: - kv   8:          kimi-linear.use_parallel_residual bool             = false
+0.00.234.464 I llama_model_loader: - kv   9:                    kimi-linear.logit_scale f32              = 1.000000
+0.00.234.464 I llama_model_loader: - kv  10:             kimi-linear.time_mix_extra_dim u32              = 64
+0.00.234.465 I llama_model_loader: - kv  11:           kimi-linear.time_decay_extra_dim u32              = 128
+0.00.234.465 I llama_model_loader: - kv  12:        kimi-linear.full_attention_interval u32              = 2
+0.00.234.476 I llama_model_loader: - kv  13:           kimi-linear.attention.head_count arr[u32,2]       = [1, 0]
+0.00.234.476 I llama_model_loader: - kv  14:        kimi-linear.attention.head_count_kv arr[u32,2]       = [1, 0]
+0.00.234.476 I llama_model_loader: - kv  15:       kimi-linear.attention.max_alibi_bias f32              = 8.000000
+0.00.234.477 I llama_model_loader: - kv  16:           kimi-linear.attention.key_length u32              = 576
+0.00.234.477 I llama_model_loader: - kv  17:         kimi-linear.attention.value_length u32              = 512
+0.00.234.477 I llama_model_loader: - kv  18:           kimi-linear.rope.dimension_count u32              = 64
+0.00.234.477 I llama_model_loader: - kv  19:       kimi-linear.attention.key_length_mla u32              = 192
+0.00.234.477 I llama_model_loader: - kv  20:     kimi-linear.attention.value_length_mla u32              = 128
+0.00.234.478 I llama_model_loader: - kv  21:            kimi-linear.attention.clamp_kqv f32              = 1.000000
+0.00.234.478 I llama_model_loader: - kv  22:   kimi-linear.attention.layer_norm_epsilon f32              = 0.000010
+0.00.234.478 I llama_model_loader: - kv  23: kimi-linear.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.00.234.479 I llama_model_loader: - kv  24:   kimi-linear.attention.group_norm_epsilon f32              = 0.000010
+0.00.234.479 I llama_model_loader: - kv  25:    kimi-linear.attention.group_norm_groups u32              = 8
+0.00.234.479 I llama_model_loader: - kv  26:          kimi-linear.attention.q_lora_rank u32              = 512
+0.00.234.479 I llama_model_loader: - kv  27:         kimi-linear.attention.kv_lora_rank u32              = 512
+0.00.234.480 I llama_model_loader: - kv  28: kimi-linear.attention.relative_buckets_count u32              = 8
+0.00.234.480 I llama_model_loader: - kv  29:       kimi-linear.attention.sliding_window u32              = 16
+0.00.234.480 I llama_model_loader: - kv  30: kimi-linear.attention.sliding_window_pattern u32              = 2
+0.00.234.480 I llama_model_loader: - kv  31:   kimi-linear.attention.indexer.head_count u32              = 1
+0.00.234.480 I llama_model_loader: - kv  32:   kimi-linear.attention.indexer.key_length u32              = 64
+0.00.234.480 I llama_model_loader: - kv  33:        kimi-linear.attention.indexer.top_k u32              = 8
+0.00.234.482 I llama_model_loader: - kv  34:        kimi-linear.rope.dimension_sections arr[u32,4]       = [32, 32, 32, 32]
+0.00.234.482 I llama_model_loader: - kv  35:                       tokenizer.ggml.model str              = no_vocab
+0.00.234.482 I llama_model_loader: - kv  36:     kimi-linear.expert_feed_forward_length u32              = 192
+0.00.234.482 I llama_model_loader: - kv  37:      kimi-linear.interleave_moe_layer_step u32              = 2
+0.00.234.482 I llama_model_loader: - kv  38:                   kimi-linear.expert_count u32              = 2
+0.00.234.483 I llama_model_loader: - kv  39:              kimi-linear.expert_used_count u32              = 1
+0.00.234.483 I llama_model_loader: - kv  40:            kimi-linear.expert_shared_count u32              = 1
+0.00.234.483 I llama_model_loader: - kv  41:             kimi-linear.expert_gating_func u32              = 2
+0.00.234.483 I llama_model_loader: - kv  42:             kimi-linear.expert_group_scale f32              = 1.000000
+0.00.234.483 I llama_model_loader: - kv  43:              kimi-linear.experts_per_group u32              = 1
+0.00.234.483 I llama_model_loader: - kv  44:        kimi-linear.posnet.embedding_length u32              = 128
+0.00.234.484 I llama_model_loader: - kv  45:             kimi-linear.posnet.block_count u32              = 2
+0.00.234.484 I llama_model_loader: - kv  46:      kimi-linear.convnext.embedding_length u32              = 128
+0.00.234.484 I llama_model_loader: - kv  47:           kimi-linear.convnext.block_count u32              = 2
+0.00.234.484 I llama_model_loader: - kv  48:                              xielu.alpha_n f32              = 1.000000
+0.00.234.484 I llama_model_loader: - kv  49:                              xielu.alpha_p f32              = 1.000000
+0.00.234.485 I llama_model_loader: - kv  50:                                 xielu.beta f32              = 1.000000
+0.00.234.485 I llama_model_loader: - kv  51:                                  xielu.eps f32              = 0.000000
+0.00.234.485 I llama_model_loader: - kv  52:                 kimi-linear.ssm.inner_size u32              = 256
+0.00.234.485 I llama_model_loader: - kv  53:                kimi-linear.ssm.conv_kernel u32              = 4
+0.00.234.486 I llama_model_loader: - kv  54:                 kimi-linear.ssm.state_size u32              = 128
+0.00.234.486 I llama_model_loader: - kv  55:             kimi-linear.ssm.time_step_rank u32              = 1
+0.00.234.486 I llama_model_loader: - kv  56:                kimi-linear.ssm.group_count u32              = 2
+0.00.234.486 I llama_model_loader: - kv  57:                   kimi-linear.kda.head_dim u32              = 128
+0.00.234.486 I llama_model_loader: - kv  58:                  kimi-linear.wkv.head_size u32              = 128
+0.00.234.486 I llama_model_loader: - kv  59:              kimi-linear.shortconv.l_cache u32              = 3
+0.00.234.489 I print_info: file format = GGUF V3 (latest)
+0.00.234.489 I print_info: file type   = (guessed) all F32
+0.00.234.490 I print_info: file size   = 0.00 MiB (-nan BPW) 
+0.00.234.581 W load: adding 128 dummy tokens
+0.00.234.585 I print_info: arch                  = kimi-linear
+0.00.234.585 I print_info: vocab_only            = 0
+0.00.234.585 I print_info: no_alloc              = 0
+0.00.234.586 I print_info: n_ctx_train           = 128
+0.00.234.586 I print_info: n_embd_inp            = 128
+0.00.234.586 I print_info: n_embd                = 128
+0.00.234.587 I print_info: n_embd_out            = 128
+0.00.234.587 I print_info: n_layer               = 2
+0.00.234.587 I print_info: n_layer_all           = 2
+0.00.234.591 I print_info: n_head                = [1, 0]
+0.00.234.591 I print_info: n_head_kv             = [1, 0]
+0.00.234.591 I print_info: n_rot                 = 64
+0.00.234.591 I print_info: n_swa                 = 0
+0.00.234.592 I print_info: is_swa_any            = 0
+0.00.234.592 I print_info: n_embd_head_k         = 576
+0.00.234.593 I print_info: n_embd_head_v         = 512
+0.00.234.594 I print_info: n_gqa                 = [1, 0]
+0.00.234.595 I print_info: n_embd_k_gqa          = [576, 0]
+0.00.234.596 I print_info: n_embd_v_gqa          = [512, 0]
+0.00.234.596 I print_info: f_norm_eps            = 0.0e+00
+0.00.234.596 I print_info: f_norm_rms_eps        = 1.0e-05
+0.00.234.596 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.234.596 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.234.597 I print_info: f_logit_scale         = 0.0e+00
+0.00.234.597 I print_info: f_attn_scale          = 0.0e+00
+0.00.234.597 I print_info: f_attn_value_scale    = 0.0000
+0.00.234.598 I print_info: n_ff                  = 192
+0.00.234.598 I print_info: n_expert              = 2
+0.00.234.598 I print_info: n_expert_used         = 1
+0.00.234.598 I print_info: n_expert_groups       = 0
+0.00.234.598 I print_info: n_group_used          = 0
+0.00.234.598 I print_info: causal attn           = 1
+0.00.234.599 I print_info: pooling type          = -1
+0.00.234.599 I print_info: rope type             = -1
+0.00.234.599 I print_info: rope scaling          = linear
+0.00.234.599 I print_info: freq_base_train       = 10000.0
+0.00.234.600 I print_info: freq_scale_train      = 1
+0.00.234.600 I print_info: n_ctx_orig_yarn       = 128
+0.00.234.600 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.234.600 I print_info: rope_finetuned        = unknown
+0.00.234.600 I print_info: model type            = ?B
+0.00.234.601 I print_info: model params          = 0.00 K
+0.00.234.601 I print_info: general.name          = n/a
+0.00.234.603 I print_info: vocab type            = no vocab
+0.00.234.604 I print_info: n_vocab               = 128
+0.00.234.604 I print_info: n_merges              = 0
+0.00.234.604 I print_info: max token length      = 0
+0.00.234.687 I [UNIFIED-CACHE] Capping budget from 32656.0 MB to 32600.7 MB (pre-probe free VRAM)
+0.00.234.690 I [UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32024.7 MB)
+0.00.234.691 I [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32600.7 MB budget=32024.7 MB (100%)
+0.00.255.184 I [VRAM-ARENA] External headroom 631 MB (caller-reserved 631 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+0.00.255.191 I [VRAM-ARENA] Arena 32024.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+0.00.255.194 I [VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32024.0 MB total (per-chunk cap 29472.0 MB)
+0.00.503.132 I [VRAM-ARENA] Reserved 3 chunks, 32024.0 MB total (weight=30493.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+0.00.503.179 I [VRAM-ARENA] Active on device 0: 3 chunk(s), 32024.0 MB total
+0.00.503.180 I [VRAM-ARENA] Scratch zone: 0xffffd55e67e30000 + 512.0 MB (offset 31512.0 MB from base)
+0.00.514.382 I [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+0.00.514.390 I [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+0.00.514.461 I [SYCL] Pinned chunk pool created with 194.4 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+0.00.514.463 I [HOST-ARENA] Created with 194.4 GB budget, committed=0.0 GB (system total=246.9 GB available=202.4 GB reserve=8.0 GB pct=90)
+0.00.514.525 I load_tensors: loading model tensors, this can take a while... (mmap = false, direct_io = false)
+0.00.514.704 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.00.514.705 I load_tensors: [SYCL] Collected 0 tensors, 0.00 GiB total
+0.00.514.755 I load_tensors: offloading output layer to GPU
+0.00.514.755 I load_tensors: offloading 1 repeating layers to GPU
+0.00.514.756 I load_tensors: offloaded 3/3 layers to GPU
+0.00.514.757 I load_tensors:          CPU model buffer size =     2.70 MiB
+0.00.630.542 I [S1-PRELOAD] 0 host-registered weights found for preload
+0.00.630.613 I llama_context: constructing llama_context
+0.00.630.617 I llama_context: n_seq_max     = 1
+0.00.630.617 I llama_context: n_ctx         = 256
+0.00.630.618 I llama_context: n_ctx_seq     = 256
+0.00.630.618 I llama_context: n_batch       = 128
+0.00.630.618 I llama_context: n_ubatch      = 64
+0.00.630.618 I llama_context: causal_attn   = 1
+0.00.630.620 I llama_context: flash_attn    = auto
+0.00.630.621 I llama_context: kv_unified    = false
+0.00.630.625 I llama_context: freq_base     = 10000.0
+0.00.630.626 I llama_context: freq_scale    = 1
+0.00.630.626 I llama_context: n_rs_seq      = 0
+0.00.630.626 I llama_context: n_outputs_max = 128
+0.00.630.626 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.00.630.665 I llama_context:        CPU  output buffer size =     0.00 MiB
+0.00.630.729 I llama_kv_cache:        CPU KV buffer size =     0.28 MiB
+0.00.630.783 I llama_kv_cache: size =    0.28 MiB (   256 cells,   1 layers,  1/1 seqs), K (f16):    0.28 MiB, V (f16):    0.00 MiB
+0.00.630.784 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 576
+0.00.630.784 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.00.630.833 I llama_memory_recurrent:        CPU RS buffer size =     0.07 MiB
+0.00.630.838 I llama_memory_recurrent: size =    0.07 MiB (     1 cells,   2 layers,  1 seqs  0 rs_seq), R (f32):    0.00 MiB, S (f32):    0.06 MiB
+0.00.630.843 I sched_reserve: reserving ...
+0.00.632.064 I resolve_fused_ops: Flash Attention enabled
+0.00.632.066 I resolve_fused_ops: resolving fused Gated Delta Net support:
+0.00.632.110 I resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+0.00.632.146 I resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+0.00.632.353 I sched_reserve:        CPU compute buffer size =     0.70 MiB
+0.00.632.353 I sched_reserve: graph nodes  = 165
+0.00.632.353 I sched_reserve: graph splits = 1
+0.00.632.354 I sched_reserve: reserve took 1.51 ms, sched copies = 1
+0.00.660.720 I llama_model_loader: loaded meta data with 60 key-value pairs and 0 tensors from (file*) (version GGUF V3 (latest))
+0.00.660.732 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.660.740 I llama_model_loader: - kv   0:                       general.architecture str              = kimi-linear
+0.00.660.743 I llama_model_loader: - kv   1:                     kimi-linear.vocab_size u32              = 128
+0.00.660.743 I llama_model_loader: - kv   2:                 kimi-linear.context_length u32              = 128
+0.00.660.745 I llama_model_loader: - kv   3:               kimi-linear.embedding_length u32              = 128
+0.00.660.745 I llama_model_loader: - kv   4:                kimi-linear.features_length u32              = 128
+0.00.660.745 I llama_model_loader: - kv   5:                    kimi-linear.block_count u32              = 2
+0.00.660.746 I llama_model_loader: - kv   6:      kimi-linear.leading_dense_block_count u32              = 1
+0.00.660.746 I llama_model_loader: - kv   7:            kimi-linear.feed_forward_length u32              = 192
+0.00.660.747 I llama_model_loader: - kv   8:          kimi-linear.use_parallel_residual bool             = false
+0.00.660.754 I llama_model_loader: - kv   9:                    kimi-linear.logit_scale f32              = 1.000000
+0.00.660.754 I llama_model_loader: - kv  10:             kimi-linear.time_mix_extra_dim u32              = 64
+0.00.660.755 I llama_model_loader: - kv  11:           kimi-linear.time_decay_extra_dim u32              = 128
+0.00.660.755 I llama_model_loader: - kv  12:        kimi-linear.full_attention_interval u32              = 2
+0.00.660.766 I llama_model_loader: - kv  13:           kimi-linear.attention.head_count arr[u32,2]       = [1, 0]
+0.00.660.766 I llama_model_loader: - kv  14:        kimi-linear.attention.head_count_kv arr[u32,2]       = [1, 0]
+0.00.660.767 I llama_model_loader: - kv  15:       kimi-linear.attention.max_alibi_bias f32              = 8.000000
+0.00.660.767 I llama_model_loader: - kv  16:           kimi-linear.attention.key_length u32              = 576
+0.00.660.768 I llama_model_loader: - kv  17:         kimi-linear.attention.value_length u32              = 512
+0.00.660.768 I llama_model_loader: - kv  18:           kimi-linear.rope.dimension_count u32              = 64
+0.00.660.768 I llama_model_loader: - kv  19:       kimi-linear.attention.key_length_mla u32              = 192
+0.00.660.768 I llama_model_loader: - kv  20:     kimi-linear.attention.value_length_mla u32              = 128
+0.00.660.768 I llama_model_loader: - kv  21:            kimi-linear.attention.clamp_kqv f32              = 1.000000
+0.00.660.769 I llama_model_loader: - kv  22:   kimi-linear.attention.layer_norm_epsilon f32              = 0.000010
+0.00.660.769 I llama_model_loader: - kv  23: kimi-linear.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.00.660.770 I llama_model_loader: - kv  24:   kimi-linear.attention.group_norm_epsilon f32              = 0.000010
+0.00.660.770 I llama_model_loader: - kv  25:    kimi-linear.attention.group_norm_groups u32              = 8
+0.00.660.770 I llama_model_loader: - kv  26:          kimi-linear.attention.q_lora_rank u32              = 512
+0.00.660.770 I llama_model_loader: - kv  27:         kimi-linear.attention.kv_lora_rank u32              = 512
+0.00.660.770 I llama_model_loader: - kv  28: kimi-linear.attention.relative_buckets_count u32              = 8
+0.00.660.771 I llama_model_loader: - kv  29:       kimi-linear.attention.sliding_window u32              = 16
+0.00.660.771 I llama_model_loader: - kv  30: kimi-linear.attention.sliding_window_pattern u32              = 2
+0.00.660.771 I llama_model_loader: - kv  31:   kimi-linear.attention.indexer.head_count u32              = 1
+0.00.660.772 I llama_model_loader: - kv  32:   kimi-linear.attention.indexer.key_length u32              = 64
+0.00.660.772 I llama_model_loader: - kv  33:        kimi-linear.attention.indexer.top_k u32              = 8
+0.00.660.774 I llama_model_loader: - kv  34:        kimi-linear.rope.dimension_sections arr[u32,4]       = [32, 32, 32, 32]
+0.00.660.774 I llama_model_loader: - kv  35:                       tokenizer.ggml.model str              = no_vocab
+0.00.660.774 I llama_model_loader: - kv  36:     kimi-linear.expert_feed_forward_length u32              = 192
+0.00.660.774 I llama_model_loader: - kv  37:      kimi-linear.interleave_moe_layer_step u32              = 2
+0.00.660.775 I llama_model_loader: - kv  38:                   kimi-linear.expert_count u32              = 2
+0.00.660.775 I llama_model_loader: - kv  39:              kimi-linear.expert_used_count u32              = 1
+0.00.660.775 I llama_model_loader: - kv  40:            kimi-linear.expert_shared_count u32              = 1
+0.00.660.775 I llama_model_loader: - kv  41:             kimi-linear.expert_gating_func u32              = 2
+0.00.660.775 I llama_model_loader: - kv  42:             kimi-linear.expert_group_scale f32              = 1.000000
+0.00.660.776 I llama_model_loader: - kv  43:              kimi-linear.experts_per_group u32              = 1
+0.00.660.776 I llama_model_loader: - kv  44:        kimi-linear.posnet.embedding_length u32              = 128
+0.00.660.776 I llama_model_loader: - kv  45:             kimi-linear.posnet.block_count u32              = 2
+0.00.660.776 I llama_model_loader: - kv  46:      kimi-linear.convnext.embedding_length u32              = 128
+0.00.660.776 I llama_model_loader: - kv  47:           kimi-linear.convnext.block_count u32              = 2
+0.00.660.777 I llama_model_loader: - kv  48:                              xielu.alpha_n f32              = 1.000000
+0.00.660.777 I llama_model_loader: - kv  49:                              xielu.alpha_p f32              = 1.000000
+0.00.660.777 I llama_model_loader: - kv  50:                                 xielu.beta f32              = 1.000000
+0.00.660.777 I llama_model_loader: - kv  51:                                  xielu.eps f32              = 0.000000
+0.00.660.778 I llama_model_loader: - kv  52:                 kimi-linear.ssm.inner_size u32              = 256
+0.00.660.778 I llama_model_loader: - kv  53:                kimi-linear.ssm.conv_kernel u32              = 4
+0.00.660.778 I llama_model_loader: - kv  54:                 kimi-linear.ssm.state_size u32              = 128
+0.00.660.778 I llama_model_loader: - kv  55:             kimi-linear.ssm.time_step_rank u32              = 1
+0.00.660.778 I llama_model_loader: - kv  56:                kimi-linear.ssm.group_count u32              = 2
+0.00.660.778 I llama_model_loader: - kv  57:                   kimi-linear.kda.head_dim u32              = 128
+0.00.660.779 I llama_model_loader: - kv  58:                  kimi-linear.wkv.head_size u32              = 128
+0.00.660.779 I llama_model_loader: - kv  59:              kimi-linear.shortconv.l_cache u32              = 3
+0.00.660.780 I print_info: file format = GGUF V3 (latest)
+0.00.660.780 I print_info: file type   = (guessed) all F32
+0.00.660.781 I print_info: file size   = 0.00 MiB (-nan BPW) 
+0.00.660.909 I llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B70 Graphics) (unknown id) - 572 MiB free
+0.00.660.966 W load: adding 128 dummy tokens
+0.00.660.968 I print_info: arch                  = kimi-linear
+0.00.660.968 I print_info: vocab_only            = 0
+0.00.660.969 I print_info: no_alloc              = 0
+0.00.660.969 I print_info: n_ctx_train           = 128
+0.00.660.969 I print_info: n_embd_inp            = 128
+0.00.660.969 I print_info: n_embd                = 128
+0.00.660.969 I print_info: n_embd_out            = 128
+0.00.660.969 I print_info: n_layer               = 2
+0.00.660.969 I print_info: n_layer_all           = 2
+0.00.660.971 I print_info: n_head                = [1, 0]
+0.00.660.972 I print_info: n_head_kv             = [1, 0]
+0.00.660.972 I print_info: n_rot                 = 64
+0.00.660.972 I print_info: n_swa                 = 0
+0.00.660.973 I print_info: is_swa_any            = 0
+0.00.660.973 I print_info: n_embd_head_k         = 576
+0.00.660.973 I print_info: n_embd_head_v         = 512
+0.00.660.973 I print_info: n_gqa                 = [1, 0]
+0.00.660.974 I print_info: n_embd_k_gqa          = [576, 0]
+0.00.660.975 I print_info: n_embd_v_gqa          = [512, 0]
+0.00.660.975 I print_info: f_norm_eps            = 0.0e+00
+0.00.660.975 I print_info: f_norm_rms_eps        = 1.0e-05
+0.00.660.975 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.660.976 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.660.976 I print_info: f_logit_scale         = 0.0e+00
+0.00.660.976 I print_info: f_attn_scale          = 0.0e+00
+0.00.660.976 I print_info: f_attn_value_scale    = 0.0000
+0.00.660.976 I print_info: n_ff                  = 192
+0.00.660.977 I print_info: n_expert              = 2
+0.00.660.977 I print_info: n_expert_used         = 1
+0.00.660.977 I print_info: n_expert_groups       = 0
+0.00.660.977 I print_info: n_group_used          = 0
+0.00.660.977 I print_info: causal attn           = 1
+0.00.660.977 I print_info: pooling type          = -1
+0.00.660.977 I print_info: rope type             = -1
+0.00.660.977 I print_info: rope scaling          = linear
+0.00.660.978 I print_info: freq_base_train       = 10000.0
+0.00.660.978 I print_info: freq_scale_train      = 1
+0.00.660.979 I print_info: n_ctx_orig_yarn       = 128
+0.00.660.979 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.660.979 I print_info: rope_finetuned        = unknown
+0.00.660.979 I print_info: model type            = ?B
+0.00.660.980 I print_info: model params          = 0.00 K
+0.00.660.980 I print_info: general.name          = n/a
+0.00.660.981 I print_info: vocab type            = no vocab
+0.00.660.981 I print_info: n_vocab               = 128
+0.00.660.981 I print_info: n_merges              = 0
+0.00.660.981 I print_info: max token length      = 0
+0.00.661.020 I load_tensors: loading model tensors, this can take a while... (mmap = false, direct_io = false)
+0.00.670.579 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.00.670.593 I load_tensors: [SYCL] Collected 74 tensors, 0.00 GiB total
+0.00.670.611 I Running with Environment Variables:
+0.00.670.611 I   GGML_SYCL_DEBUG: 0
+0.00.670.611 I   GGML_SYCL_DEBUG_SYNC: 0
+0.00.670.611 I   GGML_SYCL_TP_DEBUG: 0
+0.00.670.611 I   GGML_SYCL_KQV_FORCE_SIMPLE: 0
+0.00.670.612 I   GGML_SYCL_KQV_DISABLE_FP16: 0
+0.00.670.612 I   GGML_SYCL_DISABLE_GRAPH: 0
+0.00.670.612 I   GGML_SYCL_ASYNC_MEM: 0
+0.00.670.612 I   GGML_SYCL_DISABLE_DNN: 0
+0.00.670.612 I   GGML_SYCL_PRIORITIZE_DMMV: 0
+0.00.670.612 I Build with Macros:
+0.00.670.612 I   GGML_SYCL_FORCE_MMQ: no
+0.00.670.612 I   GGML_SYCL_F16: yes
+0.00.670.614 I Found 1 SYCL devices:
+0.00.670.615 I |  |                   |                                       |       |Max    |        |Max  |Global |                     |
+0.00.670.615 I |  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+0.00.670.615 I |ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+0.00.670.615 I |--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+0.00.670.702 I | 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+0.00.670.702 I SYCL Optimization Feature:
+0.00.670.702 I |ID|        Device Type|Reorder|
+0.00.670.702 I |--|-------------------|-------|
+0.00.670.705 I | 0| [level_zero:gpu:0]|      Y|
+0.00.670.760 I [SYCL-PLAN] inventory oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.00.670.764 I [SYCL-PLAN] KV inputs: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.00.670.767 I [SYCL-BUDGET] MoE model detected: 2 experts, 1 active, 0.6 MB expert weights
+0.00.670.861 I [SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=572.8 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=2.6 MB, exceeds_budget=false
+0.00.670.862 I [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32083.2 MB, headroom=0.0 MB
+0.00.670.862 I [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=2.7 MB
+0.00.670.863 I [VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+0.00.670.863 I [VRAM-BUDGET]   Weights (dense): 2.1 MB  [priority 1]
+0.00.670.864 I [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.6 MB total)  [priority 2]
+0.00.670.864 I [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+0.00.670.864 I [VRAM-BUDGET]   Available:       32653.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+0.00.670.870 I [SYCL] Plan budget tied to arena: 32024.0 MB arena (shared zone 30744.0 MB after 1280.0 MB zones)
+0.00.670.873 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.00.670.930 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32024.0 MB, weight zone=30493.8 MB)
+0.00.670.935 I [MOE-POLICY] device=0 total=32656.0 MB free_init=32600.7 MB plan_budget=32024.0 MB weight_budget=30493.8 MB max_alloc=31023.2 MB safe_alloc=29472.0 MB arena=32024.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.00.670.954 I [MOE-LAYOUT] down-i8 device=0 n_experts=2 considered=12 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=8 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_executor=0 skip_unsupported=4 requested=mxfp4_i8 granted=aos remaining=30489.0 MB
+0.00.670.955 I [MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=12 expert entries, of which skip_not_down=8 were gate/up). Entry-level rejections: skip_unsupported=4.
+0.00.670.961 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=2 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=30489.0 MB
+0.00.670.963 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
+0.00.670.965 I [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
+0.00.670.968 I [PLACEMENT-MOE] triplet packing: groups=2 complete=2 incomplete=0 device_groups=2 host_groups=0 device_entries=12 (0.6 MB) host_entries=0 (0.0 MB) remaining=30489.0 MB hotness=static(layer,expert)
+0.00.670.992 I [SYCL-PLAN] inventory top-8 of 74 tensors (total 2.7 MB): blk.0.attn_kv_a_mqa.weight=0.3MB(t0,128x576) blk.0.attn_v_b.weight=0.2MB(t0,512x128) blk.0.attn_k_b.weight=0.2MB(t0,128x512) blk.1.ffn_up_exps.weight=0.2MB(t0,128x192) blk.1.ffn_down_exps.weight=0.2MB(t0,192x128) blk.1.ffn_gate_exps.weight=0.2MB(t0,128x192) blk.0.ffn_up.weight=0.1MB(t0,128x192) blk.0.ffn_down.weight=0.1MB(t0,192x128)
+0.00.671.001 I [SYCL-PLAN] inventory groups: 14 distinct (type,ne) groups over 74 tensors; cardinality histogram: 1x6 2x2 3x1 5x1 7x1 11x2 27x1; largest card>=4: blk.1.ffn_gate_shexp.weight 0.1MB (card=5); largest card<=2: blk.0.attn_kv_a_mqa.weight 0.3MB (card=1)
+0.00.671.004 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=2 n_moe_layers=2 max_batch=512 control_ids=0.00 MB host-pinned, expert_ptrs=0.00 MB VRAM, cpu_staging=0.19 MB
+0.00.671.004 I [SYCL-PLAN] CPU quant buffers: 0.3 MB (3 x cpu_quant_eligible 0.1 MB; global max 0.3 MB)
+0.00.671.005 I [SYCL-PLAN] DMA staging pool: 0.2 MB (2 x dma_streamed 0.1 MB; global max 0.3 MB)
+0.00.671.005 I [SYCL-PLAN] oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.00.671.006 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=0.6 MB weight_slot=0.0 MB activation_slot=0.2 MB output_slot=0.4 MB
+0.00.671.007 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.6 MB total=64.0 MB
+0.00.671.027 I [PLACEMENT-MOE] expected=6 planned=6 unclassified=0 duplicates=6 missing=0
+0.00.671.028 I [PLACEMENT-MOE] roles: gate=4 up=4 down=4 gate_up=0 unknown=0
+0.00.671.033 I [PLACEMENT-MOE] target device0: 12 expert tensors
+0.00.671.034 I [PLACEMENT] NORM/EMBED      device=  7 (0.1 MB)  host=  0 (0.0 MB)
+0.00.671.035 I [PLACEMENT] ATTENTION       device= 26 (1.3 MB)  host=  0 (0.0 MB)
+0.00.671.035 I [PLACEMENT] FFN             device= 31 (0.8 MB)  host=  0 (0.0 MB)
+0.00.671.035 I [PLACEMENT] MOE_GATE        device=  1 (0.0 MB)  host=  0 (0.0 MB)
+0.00.671.036 I [PLACEMENT] MOE_DOWN        device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.00.671.036 I [PLACEMENT] MOE_UP          device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.00.671.036 I [PLACEMENT] MOE_GATE_PROJ   device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.00.671.038 I [PLACEMENT] layer   0  weight=1.2 MB  kv=1.1 MB (full)  total=2.3 MB  dense_target=device 0  kv_target=device 0
+0.00.671.039 I [PLACEMENT] layer   1  weight=0.8 MB  kv=1.1 MB (full)  total=1.9 MB  dense_target=device 0  kv_target=device 0
+0.00.671.039 I [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
+0.00.671.040 I [PLACEMENT] KV sizing: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.00.671.040 I [PLACEMENT] Totals: weights=2.7 MB device + 0.0 MB host, kv=2.1 MB device + 0.0 MB host
+0.00.671.040 I [PLACEMENT] Total: 4.8 MB device + 0.0 MB host (budget=32024.0 MB)
+0.00.671.050 I [SYCL] Placement plan computed: 77 entries, 4.8 MB device + 0.0 MB host
+0.00.671.051 I [PLACE-4] device weight zone: 2.7 MB (77 tensors), host arena: 0.0 MB (0 tensors)
+0.00.671.067 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.00.671.068 I [SYCL] Tensor inventory set: 74 tensors, 0.00 GB total (VRAM: 0.56 GB free, tiered: enabled)
+0.00.671.380 I load_tensors: SYCL tensor inventory: 74 tensors, 0.00 GiB (enables unified placement before allocation)
+0.00.671.429 I [SYCL] Host buffer alloc request: 2.7 MB (evictable=1, in_model_load=1)
+0.00.845.037 I [SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+0.00.845.067 I load_tensors: offloading output layer to GPU
+0.00.845.067 I load_tensors: offloading 1 repeating layers to GPU
+0.00.845.067 I load_tensors: offloaded 3/3 layers to GPU
+0.00.845.068 I load_tensors:    SYCL_Host model buffer size =     2.70 MiB
+0.00.850.081 I [S1-PRELOAD] 74 host-registered weights found for preload
+0.00.850.111 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_beta.input_scale type=f32 ne=[1,1,1,1]
+0.00.850.114 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_beta.scale type=f32 ne=[1,1,1,1]
+0.00.850.116 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_beta.weight type=f32 ne=[128,1,1,1]
+0.00.850.118 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_f_b.weight type=f32 ne=[128,128,1,1]
+0.00.850.120 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_conv1d_v.weight type=f32 ne=[4,1,128,1]
+0.00.850.121 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_f_a.weight type=f32 ne=[128,128,1,1]
+0.00.850.126 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_dt.bias type=f32 ne=[128,1,1,1]
+0.00.850.128 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_g_a.weight type=f32 ne=[128,128,1,1]
+0.00.850.132 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_g_b.weight type=f32 ne=[128,128,1,1]
+0.00.850.136 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_conv1d_k.weight type=f32 ne=[4,1,128,1]
+0.00.850.137 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_a type=f32 ne=[1,1,1,1]
+0.00.850.140 W [SYCL] tensor usage UNKNOWN: name=blk.1.ssm_conv1d_q.weight type=f32 ne=[4,1,128,1]
+0.00.850.145 W [SYCL] tensor usage UNKNOWN: name=blk.1.exp_probs_b.bias type=f32 ne=[2,1,1,1]
+0.00.850.202 I [S1-PRELOAD] Resetting weight materialization before applying latest plan
+0.00.850.314 I [S1-PRELOAD] Using unified-cache BCS queue for preload copies
+0.01.009.041 I [SYCL] Allocated pinned base chunk 1 (size=2048.0 MB, total=4.0 GB)
+0.01.009.047 I [SYCL] Pinned pool pre_allocate: grew 1 chunks for 192.0 MB working set (total=4.0 GB)
+0.01.009.068 I [HOST-ARENA] configured zones: WEIGHT=0.0 MB  KV=64.0 MB  STAGING=64.0 MB  SCRATCH=64.0 MB  (total-cap=2048.0 MB)
+0.01.009.071 I [SYCL] Pinned pool pre_allocate_runtime: already have 2045.3 MB free (need 0.9 MB)
+0.01.009.095 I [UNIFIED-CACHE] PP MoE oneDNN scratch ring reserved from arena-runtime: depth=1 total=0.6 MB weight_slot=0.0 MB activation_slot=0.2 MB output_slot=0.4 MB
+0.01.009.096 I [HOST-ARENA] Zones configured: WEIGHT=0.0 MB KV=64.0 MB STAGING=64.0 MB SCRATCH=64.0 MB
+0.01.009.100 I [HOST-ARENA] Committed 4096.0 MB in 2 chunk(s) after plan pre-size (budget=199088.5 MB)
+0.01.020.196 I [SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+0.01.023.105 I [MOE-LAYOUT] tensor=blk.1.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[128,192,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.01.023.187 I [MOE-LAYOUT] tensor=blk.1.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[128,192,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.01.023.225 I [MOE-LAYOUT] tensor=blk.1.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[192,128,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.01.023.407 I [S1-PRELOAD] Pinned 65 dense weights in VRAM (2.1 MB)
+0.01.023.421 I [UNIFIED-CACHE] Layout pool sealed on device 0
+0.01.023.442 I [S1-PRELOAD] async bulk: dense cached=65 failed=0 host_placed=0, moe cached=3 failed=0, 2.7 MB in 173 ms (0.0 GB/s)
+0.01.023.448 I [SYCL-BUDGET] MoE expert VRAM reserve: 0.6 MB (2 experts = 1 active x 2 mult, 2 layers, 0.1 MB/expert, budget=32024.7 MB)
+0.01.023.477 I llama_context: constructing llama_context
+0.01.023.484 I llama_context: n_seq_max     = 1
+0.01.023.488 I llama_context: n_ctx         = 256
+0.01.023.493 I llama_context: n_ctx_seq     = 256
+0.01.023.497 I llama_context: n_batch       = 128
+0.01.023.501 I llama_context: n_ubatch      = 64
+0.01.023.506 I llama_context: causal_attn   = 1
+0.01.023.511 I llama_context: flash_attn    = auto
+0.01.023.515 I llama_context: kv_unified    = false
+0.01.023.520 I llama_context: freq_base     = 10000.0
+0.01.023.525 I llama_context: freq_scale    = 1
+0.01.023.529 I llama_context: n_rs_seq      = 0
+0.01.023.533 I llama_context: n_outputs_max = 128
+0.01.023.537 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.01.023.558 I [SYCL-PLAN] Runtime context update: n_ctx=256 n_ubatch=64 n_seq_max=1 kv_per_layer=0.5 MB kv_per_swa_layer=0.0 MB
+0.01.023.576 I [SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+0.01.174.628 I [SYCL] Allocated pinned base chunk 2 (size=2048.0 MB, total=6.0 GB)
+0.01.174.635 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 2048.0 MB)
+0.01.174.676 I llama_context:  SYCL_Host  output buffer size =     0.00 MiB
+0.01.174.726 I [KV-ALLOC] tiered_kv_buft_alloc_buffer: size=0.3 MB, n_layers=2
+0.01.174.734 I [KV-ALLOC] kv_per_layer=0.3 MB (full=0.5 MB, swa=0.0 MB), n_kv_layers=1/2
+0.01.174.774 I [KV-TIER] Plan-driven: 2/2 layers on device (planner_n_ctx=256, kv_layers=1, kv_per_layer=294912, 0.6 MB device, 0.0 MB host)
+0.01.174.779 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=planned 0.3 MB device / 0.0 MB host (1 device layers / 0 host layers, 0.3 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.01.174.780 I [KV-TIER] Device 0: using plan-driven KV placement (2 layers, no secondary kv budget)
+0.01.174.881 I [KV-TIER] layer 0 planned_device=0 materialized=device ptr=0xffffd55e28400000 size=294912
+0.01.174.882 I [KV-TIER] All 1 KV-buffer layers match placement plan
+0.01.175.012 I [KV-TIER] alloc_base=0x29ae8d00 size=294912 (range 0x29ae8d00-0x29b30d00)
+0.01.175.012 I [KV-TIER] layer_allocs[0]: ptr=0xffffd55e28400000 size=294912 on_device=1 zone_managed=1
+0.01.175.013 I [KV-TIER] layer_allocs[1]: ptr=(nil) size=0 on_device=0 zone_managed=0
+0.01.175.013 I [KV-TIER] Device 0: all 1 KV-buffer layers on device (0.3 MB, per-layer alloc, arena KV zone)
+0.01.175.021 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=actual 0.3 MB device / 0.0 MB host (1 device layers / 0 host layers, 0.3 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.01.175.134 I [KV-REMAP] cache_k_l0: layer=0 alloc_base=0x29ae8d00 old_data=0x29ae8d00 abs_off=0 layer_base=0 off_in_layer=0 la.ptr=0xffffd55e28400000 la.size=294912 -> data=0xffffd55e28400000 (DEVICE)
+0.01.175.211 I llama_kv_cache: SYCL_KV_Tiered KV buffer size =     0.28 MiB
+0.01.175.843 I llama_kv_cache: size =    0.28 MiB (   256 cells,   1 layers,  1/1 seqs), K (f16):    0.28 MiB, V (f16):    0.00 MiB
+0.01.175.845 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 576
+0.01.175.845 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.01.175.853 I [KV-ALLOC] tiered_kv_buft_alloc_buffer: size=0.1 MB, n_layers=2
+0.01.175.854 I [KV-ALLOC] kv_per_layer=0.0 MB (full=0.5 MB, swa=0.0 MB), n_kv_layers=2/2
+0.01.175.873 I [KV-TIER] Plan-driven: 2/2 layers on device (planner_n_ctx=256, kv_layers=2, kv_per_layer=35072, 0.1 MB device, 0.0 MB host)
+0.01.175.876 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=planned 0.1 MB device / 0.0 MB host (2 device layers / 0 host layers, 0.1 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.01.175.876 I [KV-TIER] Device 0: using plan-driven KV placement (2 layers, no secondary kv budget)
+0.01.175.882 I [KV-TIER] layer 0 planned_device=0 materialized=device ptr=0xffffd55e28448000 size=35328
+0.01.175.882 I [KV-TIER] layer 1 planned_device=0 materialized=device ptr=0xffffd55e28450a00 size=35328
+0.01.175.883 I [KV-TIER] All 2 KV-buffer layers match placement plan
+0.01.175.883 I [KV-TIER] Using arena KV zone as alloc_base: 0xffffd55e28448000 (no synthetic base)
+0.01.175.883 I [KV-TIER] alloc_base=0xffffd55e28448000 size=70144 (range 0xffffd55e28448000-0xffffd55e28459200)
+0.01.175.883 I [KV-TIER] layer_allocs[0]: ptr=0xffffd55e28448000 size=35328 on_device=1 zone_managed=1
+0.01.175.884 I [KV-TIER] layer_allocs[1]: ptr=0xffffd55e28450a00 size=35328 on_device=1 zone_managed=1
+0.01.175.884 I [KV-TIER] Device 0: all 2 KV-buffer layers on device (0.1 MB, per-layer alloc, arena KV zone)
+0.01.175.886 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=actual 0.1 MB device / 0.0 MB host (2 device layers / 0 host layers, 0.1 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.01.180.478 I llama_memory_recurrent: SYCL_KV_Tiered RS buffer size =     0.07 MiB
+0.01.180.486 I llama_memory_recurrent: size =    0.07 MiB (     1 cells,   2 layers,  1 seqs  0 rs_seq), R (f32):    0.00 MiB, S (f32):    0.06 MiB
+0.01.180.504 I sched_reserve: reserving ...
+0.01.181.905 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.01.181.908 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.01.181.908 I resolve_fused_ops: resolving fused Gated Delta Net support:
+0.01.181.990 I resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+0.01.182.050 I resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+0.01.182.239 I [SYCL] Host buffer alloc request: 0.1 MB (evictable=1, in_model_load=0)
+0.01.182.458 I sched_reserve:      SYCL0 compute buffer size =     0.64 MiB
+0.01.182.458 I sched_reserve:  SYCL_Host compute buffer size =     0.09 MiB
+0.01.182.459 I sched_reserve: graph nodes  = 166
+0.01.182.459 I sched_reserve: graph splits = 3
+0.01.182.459 I sched_reserve: reserve took 1.95 ms, sched copies = 1
+0.01.182.551 I [SYCL] Host buffer alloc request: 0.1 MB (evictable=1, in_model_load=0)
+0.01.201.403 I check_graph_compatibility: disabling SYCL graphs due to unsupported node type CONCAT
+0.01.459.847 W [SYCL] tensor usage UNKNOWN: name=cache_k_l0 (view) (permuted) type=f16 ne=[576,256,1,1]
+0.02.140.800 W [SYCL] tensor usage UNKNOWN: name=v_cont-0 type=f16 ne=[256,512,1,1]
+0.02.169.282 W [CACHE-LOOKUP] MISS: model=0 hash=0xb4eca53370e368b5 aux=0x8f layout=0 id_to_key_size=71 entries_size=71
+0.02.233.537 W [CACHE-LOOKUP] MISS: model=0 hash=0xa9feb3818c985035 aux=0x91 layout=0 id_to_key_size=71 entries_size=71
+0.02.233.675 W [CACHE-LOOKUP] MISS: model=0 hash=0xd935be77c3483dd9 aux=0x93 layout=0 id_to_key_size=71 entries_size=71
+0.02.234.266 I [MOE-HYBRID] Detected MoE: 3 layers, 2 experts/layer, top-1, 96.0 KB/expert, 0/6 host-resident
+0.02.234.278 I [UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): 0.1 MB
+0.02.234.289 I [MOE-WARMUP] Zero-warmup mode: 3 layers x 2 experts, using gate weight norms for initial placement
+0.02.234.290 I [MOE-HYBRID] Expert registry: 6 entries, 0 with host_src_ptr, 6 device-only
+0.02.234.293 I [MOE-HYBRID] Expert metadata stored: 6 entries for post-warmup pre-staging
+0.02.234.296 I [MOE-HYBRID] Expert group registry: 2 groups (2 complete with gate+up+down), 6 entries registered
+0.02.234.297 I [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
+0.02.234.299 I [MOE-HYBRID] Phase 1: GPU0 cache budget=32024.7 MB, expert total=0.6 MB -> all on GPU0 (fits)
+0.02.234.323 I [MOE-HYBRID] Phase 2 verify: GPU0=6 GPU1=0 CPU=0 (planner-direct-cache)
+0.02.234.323 I [MOE-HYBRID] First tensor L1358208392: GPU0 experts=[0,1,] (2), GPU1 experts=0
+0.02.234.324 I [MOE-HYBRID] Expert distribution: GPU0=6(cache) (6 total, 96.0 KB/expert)
+0.02.240.677 I [SYCL] Expert prefetcher initialized (depth=2, dynamic pool)
+0.02.240.684 I [MOE-HYBRID] Phase 3: skipped; unified cache owns planned expert residency/layout
+0.02.240.704 I [SYCL] Expert predictor initialized (layers=3, experts=2, top_k=1, depth=3)
+0.02.240.704 I [MOE-HYBRID] Predictor initialized: 3 layers, 2 experts, top-1
+0.02.240.723 I [MOE-HYBRID] Pre-gated routing: registered 1 gate weight tensors
+0.02.240.754 I [MOE-POOL] Pinned buffer pool: act=48 KB, out=48 KB, max_experts=64
+0.02.265.552 I [CPU-EXPERT-POOL] Initialized: 18 threads, 4 ring slots, 96.0 KB/slot (act=48.0 KB, out=48.0 KB)
+0.02.265.625 I [MOE-GATE-NORM] Computing gate weight norms for 1 blocks, 2 experts/block
+0.02.267.768 I [MOE-GATE-NORM] Computed gate norms for 1/1 blocks, applying popularity placement
+0.02.267.782 I [MOE-WARMUP] Popularity profiling complete: 3 layers, 6 total experts ranked
+0.02.267.789 I [MOE-WARMUP] Popularity ranks applied. Cache eviction now favors popular experts; pre-staging on next dispatch.
+0.02.267.802 I [MOE-PRESTAGE] Placement-plan preload active; runtime prestage disabled (set GGML_SYCL_LEGACY_PRESTAGE=1 to restore legacy behavior)
+0.02.267.809 I [MOE-GATE-NORM] Zero-warmup placement complete. Skipping inference-based warmup entirely.
+0.02.267.822 I [SYCL] Pinned pool pre_allocate: already have 4096.0 MB free (need 2048.0 MB)
+0.02.267.837 I [MOE-PREALLOC] device 0: n_tables=3 table_bytes=16 total_table=0.0 KB ids_staging=2.0 KB compact=4.0 KB
+0.02.270.233 I [MOE-PREALLOC] device 0: tables=VRAM (3 x 16 B) ids=VRAM (2.0 KB) compact=VRAM (4.0 KB)
+0.02.270.272 I [MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=3, experts=2)
+0.02.270.310 I check_graph_compatibility: disabling SYCL graphs for MUL_MAT_ID (type=f32, ne12=64)
+0.02.315.074 I [MMVQ-MoE] PP batch threshold = 32 (n_experts=2 top_k=1 adaptive)
+0.02.331.854 I check_graph_compatibility: disabling SYCL graphs due to unsupported node type CONCAT
+0.02.335.895 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_q.weight (reshaped) (existing=0x2c6d9d80 new=0x2f082080)
+0.02.336.104 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_k.weight (reshaped) (existing=0x2cba2120 new=0x2f09cf50)
+0.02.339.249 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_v.weight (reshaped) (existing=0x2d2435b0 new=0x2f0cf100)
+0.02.339.853 W [SYCL] host weight registry mismatch for blk.1.ssm_a (reshaped) (existing=0x2e2ab400 new=0x2f120f90)
+0.02.348.180 I llama_model_loader: loaded meta data with 135 key-value pairs and 74 tensors from (file*) (version GGUF V3 (latest))
+0.02.348.239 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.02.348.251 I llama_model_loader: - kv   0:                       general.architecture str              = kimi-linear
+0.02.348.258 I llama_model_loader: - kv   1:                               general.name str              = n/a
+0.02.348.266 I llama_model_loader: - kv   2:                     kimi-linear.vocab_size u32              = 128
+0.02.348.273 I llama_model_loader: - kv   3:                 kimi-linear.context_length u32              = 128
+0.02.348.279 I llama_model_loader: - kv   4:               kimi-linear.embedding_length u32              = 128
+0.02.348.286 I llama_model_loader: - kv   5:                    kimi-linear.block_count u32              = 2
+0.02.348.293 I llama_model_loader: - kv   6:      kimi-linear.leading_dense_block_count u32              = 1
+0.02.348.300 I llama_model_loader: - kv   7:            kimi-linear.feed_forward_length u32              = 192
+0.02.348.306 I llama_model_loader: - kv   8:     kimi-linear.expert_feed_forward_length u32              = 192
+0.02.348.313 I llama_model_loader: - kv   9: kimi-linear.expert_shared_feed_forward_length u32              = 0
+0.02.348.383 I llama_model_loader: - kv  10:               kimi-linear.swiglu_clamp_exp arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.348.433 I llama_model_loader: - kv  11:             kimi-linear.swiglu_clamp_shexp arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.348.441 I llama_model_loader: - kv  12:          kimi-linear.use_parallel_residual bool             = false
+0.02.348.448 I llama_model_loader: - kv  13:                   kimi-linear.expert_count u32              = 2
+0.02.348.455 I llama_model_loader: - kv  14:              kimi-linear.expert_used_count u32              = 1
+0.02.348.461 I llama_model_loader: - kv  15:            kimi-linear.expert_shared_count u32              = 1
+0.02.348.468 I llama_model_loader: - kv  16:             kimi-linear.expert_group_count u32              = 0
+0.02.348.477 I llama_model_loader: - kv  17:        kimi-linear.expert_group_used_count u32              = 0
+0.02.348.485 I llama_model_loader: - kv  18:           kimi-linear.expert_weights_scale f32              = 0.000000
+0.02.348.493 I llama_model_loader: - kv  19:            kimi-linear.expert_weights_norm bool             = false
+0.02.348.500 I llama_model_loader: - kv  20:             kimi-linear.expert_gating_func u32              = 2
+0.02.348.508 I llama_model_loader: - kv  21:             kimi-linear.expert_group_scale f32              = 0.050000
+0.02.348.516 I llama_model_loader: - kv  22:              kimi-linear.experts_per_group u32              = 0
+0.02.348.522 I llama_model_loader: - kv  23:             kimi-linear.moe_every_n_layers u32              = 0
+0.02.348.529 I llama_model_loader: - kv  24:           kimi-linear.nextn_predict_layers u32              = 0
+0.02.348.536 I llama_model_loader: - kv  25:             kimi-linear.n_deepstack_layers u32              = 0
+0.02.348.553 I llama_model_loader: - kv  26:              kimi-linear.deepstack_mapping arr[i32,512]     = [-1, -1, -1, -1, -1, -1, -1, -1, -1, ...
+0.02.348.561 I llama_model_loader: - kv  27:                   kimi-linear.pooling_type u32              = 4294967295
+0.02.348.568 I llama_model_loader: - kv  28:                    kimi-linear.logit_scale f32              = 0.000000
+0.02.348.574 I llama_model_loader: - kv  29:         kimi-linear.decoder_start_token_id i32              = -1
+0.02.348.581 I llama_model_loader: - kv  30:            kimi-linear.decoder_block_count u32              = 0
+0.02.348.588 I llama_model_loader: - kv  31:         kimi-linear.attn_logit_softcapping f32              = 50.000000
+0.02.348.595 I llama_model_loader: - kv  32:       kimi-linear.router_logit_softcapping f32              = 30.000000
+0.02.348.602 I llama_model_loader: - kv  33:        kimi-linear.final_logit_softcapping f32              = 30.000000
+0.02.348.610 I llama_model_loader: - kv  34:                      kimi-linear.swin_norm bool             = false
+0.02.348.616 I llama_model_loader: - kv  35:         kimi-linear.rescale_every_n_layers u32              = 0
+0.02.348.623 I llama_model_loader: - kv  36:             kimi-linear.time_mix_extra_dim u32              = 0
+0.02.348.629 I llama_model_loader: - kv  37:           kimi-linear.time_decay_extra_dim u32              = 0
+0.02.348.636 I llama_model_loader: - kv  38:                 kimi-linear.residual_scale f32              = 0.000000
+0.02.348.643 I llama_model_loader: - kv  39:                kimi-linear.embedding_scale f32              = 0.000000
+0.02.348.650 I llama_model_loader: - kv  40:              kimi-linear.token_shift_count u32              = 2
+0.02.348.656 I llama_model_loader: - kv  41:      kimi-linear.interleave_moe_layer_step u32              = 0
+0.02.348.663 I llama_model_loader: - kv  42:           kimi-linear.attention.head_count arr[u32,2]       = [1, 0]
+0.02.348.671 I llama_model_loader: - kv  43:        kimi-linear.attention.head_count_kv arr[u32,2]       = [1, 0]
+0.02.348.678 I llama_model_loader: - kv  44:       kimi-linear.attention.max_alibi_bias f32              = 0.000000
+0.02.348.685 I llama_model_loader: - kv  45:            kimi-linear.attention.clamp_kqv f32              = 0.000000
+0.02.348.696 I llama_model_loader: - kv  46:           kimi-linear.attention.key_length u32              = 576
+0.02.348.710 I llama_model_loader: - kv  47:         kimi-linear.attention.value_length u32              = 512
+0.02.348.718 I llama_model_loader: - kv  48:   kimi-linear.attention.layer_norm_epsilon f32              = 0.000000
+0.02.348.725 I llama_model_loader: - kv  49: kimi-linear.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.02.348.731 I llama_model_loader: - kv  50:   kimi-linear.attention.group_norm_epsilon f32              = 0.000000
+0.02.348.738 I llama_model_loader: - kv  51:    kimi-linear.attention.group_norm_groups u32              = 0
+0.02.348.745 I llama_model_loader: - kv  52:               kimi-linear.attention.causal bool             = true
+0.02.348.752 I llama_model_loader: - kv  53:          kimi-linear.attention.q_lora_rank u32              = 0
+0.02.348.758 I llama_model_loader: - kv  54:         kimi-linear.attention.kv_lora_rank u32              = 512
+0.02.348.765 I llama_model_loader: - kv  55:      kimi-linear.attention.decay_lora_rank u32              = 0
+0.02.348.772 I llama_model_loader: - kv  56:       kimi-linear.attention.iclr_lora_rank u32              = 0
+0.02.348.778 I llama_model_loader: - kv  57: kimi-linear.attention.value_residual_mix_lora_rank u32              = 0
+0.02.348.785 I llama_model_loader: - kv  58:       kimi-linear.attention.gate_lora_rank u32              = 0
+0.02.348.792 I llama_model_loader: - kv  59: kimi-linear.attention.relative_buckets_count u32              = 0
+0.02.348.798 I llama_model_loader: - kv  60:       kimi-linear.attention.sliding_window u32              = 0
+0.02.348.805 I llama_model_loader: - kv  61:                kimi-linear.attention.scale f32              = 0.000000
+0.02.348.811 I llama_model_loader: - kv  62:         kimi-linear.attention.output_scale f32              = 0.000000
+0.02.348.818 I llama_model_loader: - kv  63:          kimi-linear.attention.value_scale f32              = 0.000000
+0.02.348.825 I llama_model_loader: - kv  64:   kimi-linear.attention.temperature_length u32              = 0
+0.02.348.832 I llama_model_loader: - kv  65:    kimi-linear.attention.temperature_scale f32              = 0.000000
+0.02.348.838 I llama_model_loader: - kv  66:       kimi-linear.attention.key_length_mla u32              = 192
+0.02.348.845 I llama_model_loader: - kv  67:     kimi-linear.attention.value_length_mla u32              = 128
+0.02.348.852 I llama_model_loader: - kv  68:       kimi-linear.attention.key_length_swa u32              = 576
+0.02.348.858 I llama_model_loader: - kv  69:     kimi-linear.attention.value_length_swa u32              = 512
+0.02.348.864 I llama_model_loader: - kv  70:   kimi-linear.attention.indexer.head_count u32              = 0
+0.02.348.870 I llama_model_loader: - kv  71:   kimi-linear.attention.indexer.key_length u32              = 0
+0.02.348.877 I llama_model_loader: - kv  72:        kimi-linear.attention.indexer.top_k u32              = 0
+0.02.348.884 I llama_model_loader: - kv  73:     kimi-linear.attention.recurrent_layers arr[u32,2]       = [0, 1]
+0.02.348.891 I llama_model_loader: - kv  74:           kimi-linear.rope.dimension_count u32              = 64
+0.02.348.898 I llama_model_loader: - kv  75:       kimi-linear.rope.dimension_count_swa u32              = 64
+0.02.348.905 I llama_model_loader: - kv  76:        kimi-linear.rope.dimension_sections arr[i32,4]       = [0, 0, 0, 0]
+0.02.348.912 I llama_model_loader: - kv  77:                 kimi-linear.rope.freq_base f32              = 10000.000000
+0.02.348.919 I llama_model_loader: - kv  78:             kimi-linear.rope.freq_base_swa f32              = 10000.000000
+0.02.348.926 I llama_model_loader: - kv  79:              kimi-linear.rope.scaling.type str              = linear
+0.02.348.932 I llama_model_loader: - kv  80:            kimi-linear.rope.scaling.factor f32              = 0.000000
+0.02.348.939 I llama_model_loader: - kv  81:       kimi-linear.rope.scaling.attn_factor f32              = 1.000000
+0.02.348.974 I llama_model_loader: - kv  82: kimi-linear.rope.scaling.original_context_length u32              = 128
+0.02.349.007 I llama_model_loader: - kv  83:         kimi-linear.rope.scaling.finetuned bool             = false
+0.02.350.369 I llama_model_loader: - kv  84: kimi-linear.rope.scaling.yarn_log_multiplier f32              = 0.000000
+0.02.350.371 I llama_model_loader: - kv  85:   kimi-linear.rope.scaling.yarn_ext_factor f32              = -1.000000
+0.02.350.372 I llama_model_loader: - kv  86:  kimi-linear.rope.scaling.yarn_attn_factor f32              = 1.000000
+0.02.350.373 I llama_model_loader: - kv  87:    kimi-linear.rope.scaling.yarn_beta_fast f32              = 32.000000
+0.02.350.374 I llama_model_loader: - kv  88:    kimi-linear.rope.scaling.yarn_beta_slow f32              = 1.000000
+0.02.350.374 I llama_model_loader: - kv  89:                 kimi-linear.ssm.inner_size u32              = 0
+0.02.350.374 I llama_model_loader: - kv  90:                kimi-linear.ssm.conv_kernel u32              = 4
+0.02.350.375 I llama_model_loader: - kv  91:                 kimi-linear.ssm.state_size u32              = 0
+0.02.350.375 I llama_model_loader: - kv  92:             kimi-linear.ssm.time_step_rank u32              = 0
+0.02.350.375 I llama_model_loader: - kv  93:                kimi-linear.ssm.group_count u32              = 0
+0.02.350.376 I llama_model_loader: - kv  94:                 kimi-linear.ssm.dt_b_c_rms bool             = false
+0.02.350.376 I llama_model_loader: - kv  95:                   kimi-linear.kda.head_dim u32              = 128
+0.02.350.377 I llama_model_loader: - kv  96:                  kimi-linear.wkv.head_size u32              = 0
+0.02.350.377 I llama_model_loader: - kv  97:                       tokenizer.ggml.model str              = no_vocab
+0.02.350.395 I llama_model_loader: - kv  98:                      tokenizer.ggml.tokens arr[str,128]     = ["", "", "", "", "", "", "", "", "", ...
+0.02.350.398 I llama_model_loader: - kv  99:                  tokenizer.ggml.token_type arr[i32,128]     = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+0.02.350.398 I llama_model_loader: - kv 100:            tokenizer.ggml.token_type_count u32              = 0
+0.02.350.409 I llama_model_loader: - kv 101:                      tokenizer.ggml.scores arr[f32,128]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.350.410 I llama_model_loader: - kv 102:                      tokenizer.ggml.merges arr[str,0]       = []
+0.02.350.410 I llama_model_loader: - kv 103:                tokenizer.ggml.bos_token_id u32              = 4294967295
+0.02.350.410 I llama_model_loader: - kv 104:                tokenizer.ggml.eos_token_id u32              = 4294967295
+0.02.350.410 I llama_model_loader: - kv 105:                tokenizer.ggml.eot_token_id u32              = 4294967295
+0.02.350.411 I llama_model_loader: - kv 106:                tokenizer.ggml.eom_token_id u32              = 4294967295
+0.02.350.411 I llama_model_loader: - kv 107:            tokenizer.ggml.unknown_token_id u32              = 4294967295
+0.02.350.411 I llama_model_loader: - kv 108:          tokenizer.ggml.seperator_token_id u32              = 4294967295
+0.02.350.411 I llama_model_loader: - kv 109:            tokenizer.ggml.padding_token_id u32              = 4294967295
+0.02.350.412 I llama_model_loader: - kv 110:               tokenizer.ggml.add_bos_token bool             = false
+0.02.350.412 I llama_model_loader: - kv 111:               tokenizer.ggml.add_eos_token bool             = false
+0.02.350.412 I llama_model_loader: - kv 112:               tokenizer.ggml.add_sep_token bool             = false
+0.02.350.412 I llama_model_loader: - kv 113:            tokenizer.ggml.add_space_prefix bool             = false
+0.02.350.413 I llama_model_loader: - kv 114:    tokenizer.ggml.remove_extra_whitespaces bool             = false
+0.02.350.413 I llama_model_loader: - kv 115:            tokenizer.ggml.fim_pre_token_id u32              = 4294967295
+0.02.350.415 I llama_model_loader: - kv 116:            tokenizer.ggml.fim_suf_token_id u32              = 4294967295
+0.02.350.415 I llama_model_loader: - kv 117:            tokenizer.ggml.fim_mid_token_id u32              = 4294967295
+0.02.350.415 I llama_model_loader: - kv 118:            tokenizer.ggml.fim_pad_token_id u32              = 4294967295
+0.02.350.416 I llama_model_loader: - kv 119:            tokenizer.ggml.fim_rep_token_id u32              = 4294967295
+0.02.350.416 I llama_model_loader: - kv 120:            tokenizer.ggml.fim_sep_token_id u32              = 4294967295
+0.02.350.416 I llama_model_loader: - kv 121:        kimi-linear.posnet.embedding_length u32              = 0
+0.02.350.416 I llama_model_loader: - kv 122:             kimi-linear.posnet.block_count u32              = 0
+0.02.350.416 I llama_model_loader: - kv 123:      kimi-linear.convnext.embedding_length u32              = 0
+0.02.350.416 I llama_model_loader: - kv 124:           kimi-linear.convnext.block_count u32              = 0
+0.02.350.417 I llama_model_loader: - kv 125:       kimi-linear.classifier.output_labels arr[str,0]       = []
+0.02.350.417 I llama_model_loader: - kv 126:              kimi-linear.shortconv.l_cache u32              = 0
+0.02.350.454 I llama_model_loader: - kv 127:                              xielu.alpha_n arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.350.489 I llama_model_loader: - kv 128:                              xielu.alpha_p arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.350.524 I llama_model_loader: - kv 129:                                 xielu.beta arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.350.558 I llama_model_loader: - kv 130:                                  xielu.eps arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.350.559 I llama_model_loader: - kv 131:                kimi-linear.dense_2_feat_in u32              = 0
+0.02.350.559 I llama_model_loader: - kv 132:               kimi-linear.dense_2_feat_out u32              = 0
+0.02.350.559 I llama_model_loader: - kv 133:                kimi-linear.dense_3_feat_in u32              = 0
+0.02.350.560 I llama_model_loader: - kv 134:               kimi-linear.dense_3_feat_out u32              = 0
+0.02.350.561 I llama_model_loader: - type  f32:   74 tensors
+0.02.350.563 I print_info: file format = GGUF V3 (latest)
+0.02.350.563 I print_info: file type   = (guessed) all F32
+0.02.350.564 I print_info: file size   = 2.70 MiB (32.00 BPW) 
+0.02.350.729 I llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B70 Graphics) (unknown id) - 464 MiB free
+0.02.350.821 W load: adding 128 dummy tokens
+0.02.350.824 I print_info: arch                  = kimi-linear
+0.02.350.825 I print_info: vocab_only            = 0
+0.02.350.825 I print_info: no_alloc              = 0
+0.02.350.825 I print_info: n_ctx_train           = 128
+0.02.350.825 I print_info: n_embd_inp            = 128
+0.02.350.826 I print_info: n_embd                = 128
+0.02.350.826 I print_info: n_embd_out            = 128
+0.02.350.826 I print_info: n_layer               = 2
+0.02.350.826 I print_info: n_layer_all           = 2
+0.02.350.829 I print_info: n_head                = [1, 0]
+0.02.350.830 I print_info: n_head_kv             = [1, 0]
+0.02.350.830 I print_info: n_rot                 = 64
+0.02.350.830 I print_info: n_swa                 = 0
+0.02.350.831 I print_info: is_swa_any            = 0
+0.02.350.831 I print_info: n_embd_head_k         = 576
+0.02.350.831 I print_info: n_embd_head_v         = 512
+0.02.350.831 I print_info: n_gqa                 = [1, 0]
+0.02.350.832 I print_info: n_embd_k_gqa          = [576, 0]
+0.02.350.832 I print_info: n_embd_v_gqa          = [512, 0]
+0.02.350.832 I print_info: f_norm_eps            = 0.0e+00
+0.02.350.833 I print_info: f_norm_rms_eps        = 1.0e-05
+0.02.350.833 I print_info: f_clamp_kqv           = 0.0e+00
+0.02.350.833 I print_info: f_max_alibi_bias      = 0.0e+00
+0.02.350.833 I print_info: f_logit_scale         = 0.0e+00
+0.02.350.833 I print_info: f_attn_scale          = 0.0e+00
+0.02.350.833 I print_info: f_attn_value_scale    = 0.0000
+0.02.350.834 I print_info: n_ff                  = 192
+0.02.350.834 I print_info: n_expert              = 2
+0.02.350.834 I print_info: n_expert_used         = 1
+0.02.350.834 I print_info: n_expert_groups       = 0
+0.02.350.834 I print_info: n_group_used          = 0
+0.02.350.834 I print_info: causal attn           = 1
+0.02.350.835 I print_info: pooling type          = -1
+0.02.350.835 I print_info: rope type             = -1
+0.02.350.835 I print_info: rope scaling          = linear
+0.02.350.835 I print_info: freq_base_train       = 10000.0
+0.02.350.835 I print_info: freq_scale_train      = 1
+0.02.350.835 I print_info: n_ctx_orig_yarn       = 128
+0.02.350.836 I print_info: rope_yarn_log_mul     = 0.0000
+0.02.350.836 I print_info: rope_finetuned        = unknown
+0.02.350.836 I print_info: model type            = ?B
+0.02.350.837 I print_info: model params          = 708.26 K
+0.02.350.837 I print_info: general.name          = n/a
+0.02.350.838 I print_info: vocab type            = no vocab
+0.02.350.838 I print_info: n_vocab               = 128
+0.02.350.838 I print_info: n_merges              = 0
+0.02.350.839 I print_info: max token length      = 0
+0.02.358.713 W [UNIFIED-CACHE] reclaim_weight_entries(load-boundary) preserved 71 of 71 weight entries (leased=71 owned-by-live-model=0 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000003)
+0.02.358.886 I [SYCL-PLAN] inventory oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.358.898 I [SYCL-PLAN] KV inputs: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.358.907 I [SYCL-BUDGET] MoE model detected: 2 experts, 1 active, 0.6 MB expert weights
+0.02.359.024 I [SYCL] Plan budget tied to arena: 32024.0 MB arena (shared zone 30744.0 MB after 1280.0 MB zones)
+0.02.359.035 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.02.359.071 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32024.0 MB, weight zone=30493.8 MB)
+0.02.359.086 I [MOE-POLICY] device=0 total=32656.0 MB free_init=32600.7 MB plan_budget=32024.0 MB weight_budget=30493.8 MB max_alloc=31023.2 MB safe_alloc=29472.0 MB arena=32024.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.02.359.110 I [MOE-LAYOUT] down-i8 device=0 n_experts=2 considered=12 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=8 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_executor=0 skip_unsupported=4 requested=mxfp4_i8 granted=aos remaining=30489.0 MB
+0.02.359.119 I [MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=12 expert entries, of which skip_not_down=8 were gate/up). Entry-level rejections: skip_unsupported=4.
+0.02.359.129 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=2 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=30489.0 MB
+0.02.359.137 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
+0.02.359.146 I [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
+0.02.359.154 I [PLACEMENT-MOE] triplet packing: groups=2 complete=2 incomplete=0 device_groups=2 host_groups=0 device_entries=12 (0.6 MB) host_entries=0 (0.0 MB) remaining=30489.0 MB hotness=static(layer,expert)
+0.02.359.181 I [SYCL-PLAN] inventory top-8 of 74 tensors (total 2.7 MB): blk.0.attn_kv_a_mqa.weight=0.3MB(t0,128x576) blk.0.attn_k_b.weight=0.2MB(t0,128x512) blk.0.attn_v_b.weight=0.2MB(t0,512x128) blk.1.ffn_up_exps.weight=0.2MB(t0,128x192) blk.1.ffn_gate_exps.weight=0.2MB(t0,128x192) blk.1.ffn_down_exps.weight=0.2MB(t0,192x128) blk.0.ffn_up.weight=0.1MB(t0,128x192) blk.0.attn_q.weight=0.1MB(t0,128x192)
+0.02.359.206 I [SYCL-PLAN] inventory groups: 14 distinct (type,ne) groups over 74 tensors; cardinality histogram: 1x6 2x2 3x1 5x1 7x1 11x2 27x1; largest card>=4: blk.1.ffn_up_shexp.weight 0.1MB (card=5); largest card<=2: blk.0.attn_kv_a_mqa.weight 0.3MB (card=1)
+0.02.359.218 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=2 n_moe_layers=2 max_batch=512 control_ids=0.00 MB host-pinned, expert_ptrs=0.00 MB VRAM, cpu_staging=0.19 MB
+0.02.359.226 I [SYCL-PLAN] CPU quant buffers: 0.3 MB (3 x cpu_quant_eligible 0.1 MB; global max 0.3 MB)
+0.02.359.233 I [SYCL-PLAN] DMA staging pool: 0.2 MB (2 x dma_streamed 0.1 MB; global max 0.3 MB)
+0.02.359.239 I [SYCL-PLAN] oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.359.247 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=0.6 MB weight_slot=0.0 MB activation_slot=0.2 MB output_slot=0.4 MB
+0.02.359.255 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.6 MB total=64.0 MB
+0.02.359.276 I [PLACEMENT-MOE] expected=6 planned=6 unclassified=0 duplicates=6 missing=0
+0.02.359.284 I [PLACEMENT-MOE] roles: gate=4 up=4 down=4 gate_up=0 unknown=0
+0.02.359.292 I [PLACEMENT-MOE] target device0: 12 expert tensors
+0.02.359.300 I [PLACEMENT] NORM/EMBED      device=  7 (0.1 MB)  host=  0 (0.0 MB)
+0.02.359.307 I [PLACEMENT] ATTENTION       device= 26 (1.3 MB)  host=  0 (0.0 MB)
+0.02.359.314 I [PLACEMENT] FFN             device= 31 (0.8 MB)  host=  0 (0.0 MB)
+0.02.359.321 I [PLACEMENT] MOE_GATE        device=  1 (0.0 MB)  host=  0 (0.0 MB)
+0.02.359.328 I [PLACEMENT] MOE_DOWN        device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.359.335 I [PLACEMENT] MOE_UP          device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.359.342 I [PLACEMENT] MOE_GATE_PROJ   device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.359.350 I [PLACEMENT] layer   0  weight=1.2 MB  kv=1.1 MB (full)  total=2.3 MB  dense_target=device 0  kv_target=device 0
+0.02.359.357 I [PLACEMENT] layer   1  weight=0.8 MB  kv=1.1 MB (full)  total=1.9 MB  dense_target=device 0  kv_target=device 0
+0.02.359.363 I [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
+0.02.359.370 I [PLACEMENT] KV sizing: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.359.377 I [PLACEMENT] Totals: weights=2.7 MB device + 0.0 MB host, kv=2.1 MB device + 0.0 MB host
+0.02.359.384 I [PLACEMENT] Total: 4.8 MB device + 0.0 MB host (budget=32024.0 MB)
+0.02.359.405 I [SYCL] Placement plan computed: 77 entries, 4.8 MB device + 0.0 MB host
+0.02.359.413 I [PLACE-4] device weight zone: 2.7 MB (77 tensors), host arena: 0.0 MB (0 tensors)
+0.02.359.439 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.02.359.461 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.359.468 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 6, Expert rows: 384
+0.02.359.475 I [MOE-ROUTE-STATS FINAL] Device0 rows:       384 (100.0%)
+0.02.359.481 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.359.488 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.359.494 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.359.501 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.359.507 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.359.513 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.359.520 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.359.542 I [SYCL] Expert prefetcher shut down (prefetched=0)
+0.02.359.549 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.359.555 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 6, Expert rows: 384
+0.02.359.562 I [MOE-ROUTE-STATS FINAL] Device0 rows:       384 (100.0%)
+0.02.359.568 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.359.574 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.359.586 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.359.592 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.359.599 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.359.605 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.359.612 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.385.876 I [CPU-EXPERT-POOL] Shut down
+0.02.385.982 I load_tensors: SYCL early placement plan: 74 weights, 0.00 GiB (computed pre-create_tensor)
+0.02.385.985 I load_tensors: loading model tensors, this can take a while... (mmap = false, direct_io = false)
+0.02.388.133 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.02.388.142 I load_tensors: [SYCL] Collected 74 tensors, 0.00 GiB total
+0.02.388.206 I [SYCL-PLAN] inventory oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.388.208 I [SYCL-PLAN] KV inputs: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.388.211 I [SYCL-BUDGET] MoE model detected: 2 experts, 1 active, 0.6 MB expert weights
+0.02.388.271 I [SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=464.1 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=2.6 MB, exceeds_budget=false
+0.02.388.273 I [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32191.9 MB, headroom=0.0 MB
+0.02.388.274 I [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=2.7 MB
+0.02.388.274 I [VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+0.02.388.275 I [VRAM-BUDGET]   Weights (dense): 2.1 MB  [priority 1]
+0.02.388.275 I [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.6 MB total)  [priority 2]
+0.02.388.275 I [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+0.02.388.276 I [VRAM-BUDGET]   Available:       32653.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+0.02.388.280 I [SYCL] Plan budget tied to arena: 32024.0 MB arena (shared zone 30744.0 MB after 1280.0 MB zones)
+0.02.388.281 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.02.388.306 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32024.0 MB, weight zone=30493.8 MB)
+0.02.388.312 I [MOE-POLICY] device=0 total=32656.0 MB free_init=32600.7 MB plan_budget=32024.0 MB weight_budget=30493.8 MB max_alloc=31023.2 MB safe_alloc=29472.0 MB arena=32024.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.02.388.324 I [MOE-LAYOUT] down-i8 device=0 n_experts=2 considered=12 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=8 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_executor=0 skip_unsupported=4 requested=mxfp4_i8 granted=aos remaining=30489.0 MB
+0.02.388.326 I [MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=12 expert entries, of which skip_not_down=8 were gate/up). Entry-level rejections: skip_unsupported=4.
+0.02.388.329 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=2 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=30489.0 MB
+0.02.388.331 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
+0.02.388.332 I [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
+0.02.388.334 I [PLACEMENT-MOE] triplet packing: groups=2 complete=2 incomplete=0 device_groups=2 host_groups=0 device_entries=12 (0.6 MB) host_entries=0 (0.0 MB) remaining=30489.0 MB hotness=static(layer,expert)
+0.02.388.351 I [SYCL-PLAN] inventory top-8 of 74 tensors (total 2.7 MB): blk.0.attn_kv_a_mqa.weight=0.3MB(t0,128x576) blk.0.attn_v_b.weight=0.2MB(t0,512x128) blk.0.attn_k_b.weight=0.2MB(t0,128x512) blk.1.ffn_up_exps.weight=0.2MB(t0,128x192) blk.1.ffn_down_exps.weight=0.2MB(t0,192x128) blk.1.ffn_gate_exps.weight=0.2MB(t0,128x192) blk.0.ffn_up.weight=0.1MB(t0,128x192) blk.0.ffn_down.weight=0.1MB(t0,192x128)
+0.02.388.357 I [SYCL-PLAN] inventory groups: 14 distinct (type,ne) groups over 74 tensors; cardinality histogram: 1x6 2x2 3x1 5x1 7x1 11x2 27x1; largest card>=4: blk.1.ffn_gate_shexp.weight 0.1MB (card=5); largest card<=2: blk.0.attn_kv_a_mqa.weight 0.3MB (card=1)
+0.02.388.361 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=2 n_moe_layers=2 max_batch=512 control_ids=0.00 MB host-pinned, expert_ptrs=0.00 MB VRAM, cpu_staging=0.19 MB
+0.02.388.362 I [SYCL-PLAN] CPU quant buffers: 0.3 MB (3 x cpu_quant_eligible 0.1 MB; global max 0.3 MB)
+0.02.388.362 I [SYCL-PLAN] DMA staging pool: 0.2 MB (2 x dma_streamed 0.1 MB; global max 0.3 MB)
+0.02.388.363 I [SYCL-PLAN] oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.388.363 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=0.6 MB weight_slot=0.0 MB activation_slot=0.2 MB output_slot=0.4 MB
+0.02.388.364 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.6 MB total=64.0 MB
+0.02.388.376 I [PLACEMENT-MOE] expected=6 planned=6 unclassified=0 duplicates=6 missing=0
+0.02.388.377 I [PLACEMENT-MOE] roles: gate=4 up=4 down=4 gate_up=0 unknown=0
+0.02.388.378 I [PLACEMENT-MOE] target device0: 12 expert tensors
+0.02.388.379 I [PLACEMENT] NORM/EMBED      device=  7 (0.1 MB)  host=  0 (0.0 MB)
+0.02.388.379 I [PLACEMENT] ATTENTION       device= 26 (1.3 MB)  host=  0 (0.0 MB)
+0.02.388.380 I [PLACEMENT] FFN             device= 31 (0.8 MB)  host=  0 (0.0 MB)
+0.02.388.380 I [PLACEMENT] MOE_GATE        device=  1 (0.0 MB)  host=  0 (0.0 MB)
+0.02.388.380 I [PLACEMENT] MOE_DOWN        device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.388.381 I [PLACEMENT] MOE_UP          device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.388.381 I [PLACEMENT] MOE_GATE_PROJ   device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.388.382 I [PLACEMENT] layer   0  weight=1.2 MB  kv=1.1 MB (full)  total=2.3 MB  dense_target=device 0  kv_target=device 0
+0.02.388.383 I [PLACEMENT] layer   1  weight=0.8 MB  kv=1.1 MB (full)  total=1.9 MB  dense_target=device 0  kv_target=device 0
+0.02.388.383 I [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
+0.02.388.384 I [PLACEMENT] KV sizing: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.388.384 I [PLACEMENT] Totals: weights=2.7 MB device + 0.0 MB host, kv=2.1 MB device + 0.0 MB host
+0.02.388.384 I [PLACEMENT] Total: 4.8 MB device + 0.0 MB host (budget=32024.0 MB)
+0.02.388.399 I [SYCL] Placement plan computed: 77 entries, 4.8 MB device + 0.0 MB host
+0.02.388.400 I [PLACE-4] device weight zone: 2.7 MB (77 tensors), host arena: 0.0 MB (0 tensors)
+0.02.388.418 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.02.388.419 I [SYCL] Tensor inventory set: 74 tensors, 0.00 GB total (VRAM: 0.45 GB free, tiered: enabled)
+0.02.388.427 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.388.428 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 6, Expert rows: 384
+0.02.388.428 I [MOE-ROUTE-STATS FINAL] Device0 rows:       384 (100.0%)
+0.02.388.428 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.388.428 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.388.429 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.388.429 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.388.429 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.388.429 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.388.429 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.388.488 I load_tensors: SYCL tensor inventory: 74 tensors, 0.00 GiB (enables unified placement before allocation)
+0.02.388.521 I [SYCL] Host buffer alloc request: 2.7 MB (evictable=1, in_model_load=1)
+0.02.388.535 I load_tensors: offloading output layer to GPU
+0.02.388.536 I load_tensors: offloading 1 repeating layers to GPU
+0.02.388.536 I load_tensors: offloaded 3/3 layers to GPU
+0.02.388.537 I load_tensors:    SYCL_Host model buffer size =     2.70 MiB
+0.02.389.510 I [S1-PRELOAD] 74 host-registered weights found for preload
+0.02.389.601 I [S1-PRELOAD] Resetting weight materialization before applying latest plan
+0.02.389.682 W [UNIFIED-CACHE] reclaim_weight_entries(mid-load-replan) preserved 71 of 71 weight entries (leased=71 owned-by-live-model=0 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000003)
+0.02.389.962 I [MOE-LAYOUT] tensor=blk.1.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[128,192,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.02.389.973 I [MOE-LAYOUT] tensor=blk.1.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[128,192,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.02.389.979 I [MOE-LAYOUT] tensor=blk.1.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=f32 shape=[192,128,2] layout=aos reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.02.390.031 I [S1-PRELOAD] Pinned 65 dense weights in VRAM (2.1 MB)
+0.02.390.039 I [UNIFIED-CACHE] Layout pool sealed on device 0
+0.02.390.049 I [S1-PRELOAD] async bulk: dense cached=65 failed=0 host_placed=0, moe cached=3 failed=0, 2.7 MB in 0 ms (0.0 GB/s)
+0.02.390.050 I [SYCL-BUDGET] MoE expert VRAM reserve: 0.6 MB (2 experts = 1 active x 2 mult, 2 layers, 0.1 MB/expert, budget=32024.7 MB)
+0.02.390.099 I llama_context: constructing llama_context
+0.02.390.101 I llama_context: n_seq_max     = 1
+0.02.390.101 I llama_context: n_ctx         = 256
+0.02.390.101 I llama_context: n_ctx_seq     = 256
+0.02.390.101 I llama_context: n_batch       = 128
+0.02.390.101 I llama_context: n_ubatch      = 64
+0.02.390.102 I llama_context: causal_attn   = 1
+0.02.390.102 I llama_context: flash_attn    = auto
+0.02.390.102 I llama_context: kv_unified    = false
+0.02.390.102 I llama_context: freq_base     = 10000.0
+0.02.390.103 I llama_context: freq_scale    = 1
+0.02.390.103 I llama_context: n_rs_seq      = 0
+0.02.390.103 I llama_context: n_outputs_max = 128
+0.02.390.103 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.390.110 I [SYCL-PLAN] Runtime context update: n_ctx=256 n_ubatch=64 n_seq_max=1 kv_per_layer=0.5 MB kv_per_swa_layer=0.0 MB
+0.02.390.117 I [SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+0.02.390.121 I llama_context:  SYCL_Host  output buffer size =     0.00 MiB
+0.02.390.136 I [KV-ALLOC] tiered_kv_buft_alloc_buffer: size=0.3 MB, n_layers=2
+0.02.390.137 I [KV-ALLOC] kv_per_layer=0.3 MB (full=0.5 MB, swa=0.0 MB), n_kv_layers=1/2
+0.02.390.152 I [KV-TIER] Plan-driven: 2/2 layers on device (planner_n_ctx=256, kv_layers=1, kv_per_layer=294912, 0.6 MB device, 0.0 MB host)
+0.02.390.156 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=planned 0.3 MB device / 0.0 MB host (1 device layers / 0 host layers, 0.3 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.02.390.156 I [KV-TIER] Device 0: using plan-driven KV placement (2 layers, no secondary kv budget)
+0.02.390.162 I [KV-TIER] layer 0 planned_device=0 materialized=device ptr=0xffffd55e28459400 size=294912
+0.02.390.163 I [KV-TIER] All 1 KV-buffer layers match placement plan
+0.02.390.177 I [KV-TIER] alloc_base=0x2f082080 size=294912 (range 0x2f082080-0x2f0ca080)
+0.02.390.177 I [KV-TIER] layer_allocs[0]: ptr=0xffffd55e28459400 size=294912 on_device=1 zone_managed=1
+0.02.390.178 I [KV-TIER] layer_allocs[1]: ptr=(nil) size=0 on_device=0 zone_managed=0
+0.02.390.178 I [KV-TIER] Device 0: all 1 KV-buffer layers on device (0.3 MB, per-layer alloc, arena KV zone)
+0.02.390.182 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=actual 0.3 MB device / 0.0 MB host (1 device layers / 0 host layers, 0.3 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.02.390.211 I [KV-REMAP] cache_k_l0: layer=0 alloc_base=0x2f082080 old_data=0x2f082080 abs_off=0 layer_base=0 off_in_layer=0 la.ptr=0xffffd55e28459400 la.size=294912 -> data=0xffffd55e28459400 (DEVICE)
+0.02.390.234 I llama_kv_cache: SYCL_KV_Tiered KV buffer size =     0.28 MiB
+0.02.390.847 I llama_kv_cache: size =    0.28 MiB (   256 cells,   1 layers,  1/1 seqs), K (f16):    0.28 MiB, V (f16):    0.00 MiB
+0.02.390.860 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 576
+0.02.390.865 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.02.390.874 I [KV-ALLOC] tiered_kv_buft_alloc_buffer: size=0.1 MB, n_layers=2
+0.02.390.880 I [KV-ALLOC] kv_per_layer=0.0 MB (full=0.5 MB, swa=0.0 MB), n_kv_layers=2/2
+0.02.390.899 I [KV-TIER] Plan-driven: 2/2 layers on device (planner_n_ctx=256, kv_layers=2, kv_per_layer=35072, 0.1 MB device, 0.0 MB host)
+0.02.390.905 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=planned 0.1 MB device / 0.0 MB host (2 device layers / 0 host layers, 0.1 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.02.390.910 I [KV-TIER] Device 0: using plan-driven KV placement (2 layers, no secondary kv budget)
+0.02.390.919 I [KV-TIER] layer 0 planned_device=0 materialized=device ptr=0xffffd55e284a1400 size=35328
+0.02.390.925 I [KV-TIER] layer 1 planned_device=0 materialized=device ptr=0xffffd55e284a9e00 size=35328
+0.02.390.930 I [KV-TIER] All 2 KV-buffer layers match placement plan
+0.02.390.934 I [KV-TIER] Using arena KV zone as alloc_base: 0xffffd55e284a1400 (no synthetic base)
+0.02.390.939 I [KV-TIER] alloc_base=0xffffd55e284a1400 size=70144 (range 0xffffd55e284a1400-0xffffd55e284b2600)
+0.02.390.944 I [KV-TIER] layer_allocs[0]: ptr=0xffffd55e284a1400 size=35328 on_device=1 zone_managed=1
+0.02.390.948 I [KV-TIER] layer_allocs[1]: ptr=0xffffd55e284a9e00 size=35328 on_device=1 zone_managed=1
+0.02.390.952 I [KV-TIER] Device 0: all 2 KV-buffer layers on device (0.1 MB, per-layer alloc, arena KV zone)
+0.02.390.958 I [LOAD-SUMMARY] Device 0: weights=actual 2.7 MB device / 0.0 MB host (71 device / 0 host, 2.7 MB total), kv=actual 0.1 MB device / 0.0 MB host (2 device layers / 0 host layers, 0.1 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.02.391.110 I llama_memory_recurrent: SYCL_KV_Tiered RS buffer size =     0.07 MiB
+0.02.391.118 I llama_memory_recurrent: size =    0.07 MiB (     1 cells,   2 layers,  1 seqs  0 rs_seq), R (f32):    0.00 MiB, S (f32):    0.06 MiB
+0.02.391.129 I sched_reserve: reserving ...
+0.02.392.512 W resolve_fused_ops: layer 0 is assigned to device SYCL0 but Flash Attention is assigned to device CPU (usually due to missing support)
+0.02.392.531 W resolve_fused_ops: Flash Attention not supported, set to disabled
+0.02.392.535 I resolve_fused_ops: resolving fused Gated Delta Net support:
+0.02.392.618 I resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+0.02.392.686 I resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+0.02.392.839 I [SYCL] Host buffer alloc request: 0.1 MB (evictable=1, in_model_load=0)
+0.02.393.026 I sched_reserve:      SYCL0 compute buffer size =     0.64 MiB
+0.02.393.032 I sched_reserve:  SYCL_Host compute buffer size =     0.09 MiB
+0.02.393.037 I sched_reserve: graph nodes  = 166
+0.02.393.042 I sched_reserve: graph splits = 3
+0.02.393.046 I sched_reserve: reserve took 1.91 ms, sched copies = 1
+0.02.393.135 I [SYCL] Host buffer alloc request: 0.1 MB (evictable=1, in_model_load=0)
+0.02.410.177 I check_graph_compatibility: disabling SYCL graphs due to unsupported node type CONCAT
+0.02.415.637 W [SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during pp phase: +1.1 MB (total 2.7 MB, baseline 1.6 MB). Expected zero new allocations during steady-state inference.
+0.02.417.350 W [SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during pp phase: +1.3 MB (total 2.9 MB, baseline 1.6 MB). Expected zero new allocations during steady-state inference.
+0.02.440.703 I check_graph_compatibility: disabling SYCL graphs due to unsupported node type CONCAT
+0.02.443.724 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_q.weight (reshaped) (existing=0x31727660 new=0x337602c0)
+0.02.443.896 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_k.weight (reshaped) (existing=0x31742530 new=0x3377fb20)
+0.02.444.017 W [SYCL] host weight registry mismatch for blk.1.ssm_conv1d_v.weight (reshaped) (existing=0x3175dca0 new=0x337b8cf0)
+0.02.444.183 W [SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during pp phase: +1.1 MB (total 2.7 MB, baseline 1.6 MB). Expected zero new allocations during steady-state inference.
+0.02.444.374 W [SYCL] host weight registry mismatch for blk.1.ssm_a (reshaped) (existing=0x317afb30 new=0x3380bb80)
+0.02.445.742 W [SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during pp phase: +1.1 MB (total 2.7 MB, baseline 1.6 MB). Expected zero new allocations during steady-state inference.
+0.02.445.945 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.445.952 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 12, Expert rows: 768
+0.02.445.957 I [MOE-ROUTE-STATS FINAL] Device0 rows:       768 (100.0%)
+0.02.445.963 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.445.967 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.445.971 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.445.976 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.445.981 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.445.985 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.445.990 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.458.827 W [UNIFIED-CACHE] reclaim_weight_entries(model-teardown) preserved 71 of 71 weight entries (leased=71 owned-by-live-model=0 unattributed=0 leaked=0 erased=0 unpinned=0 live_mask=0x00000003)
+0.02.458.970 I [SYCL] model slot 2 released: 74 registry rows, 0 cache entries reclaimed (live mask 0x00000003)
+|     kimi-linear|Intel(R) Arc(TM) Pro B70 Graphics|   MoE|  [1;32mOK[0m (1.45e-10)|       [1;32mOK[0m|
+0.02.459.781 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.459.796 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 12, Expert rows: 768
+0.02.459.797 I [MOE-ROUTE-STATS FINAL] Device0 rows:       768 (100.0%)
+0.02.459.797 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.459.798 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.459.798 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.459.798 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.459.798 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.459.799 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.459.799 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.469.369 W [UNIFIED-CACHE] reclaim_weight_entries(model-teardown) preserved 71 of 71 weight entries (leased=71 owned-by-live-model=0 unattributed=0 leaked=71 erased=0 unpinned=71 live_mask=0x00000001)
+0.02.469.417 W [UNIFIED-CACHE] 71 weight entries are still leased with NO live model owning them -- this is a leaked mem_handle, not concurrent model use (set GGML_SYCL_STRICT_LEASES=1 to abort here)
+0.02.469.466 I [SYCL] model slot 1 released: 0 registry rows, 0 cache entries reclaimed (live mask 0x00000001)
+test case: kimi-linear (Intel(R) Core(TM) Ultra 7 265K, MoE)
+0.02.469.517 I llama_model_loader: loaded meta data with 60 key-value pairs and 0 tensors from (file*) (version GGUF V3 (latest))
+0.02.469.533 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.02.469.549 I llama_model_loader: - kv   0:                       general.architecture str              = kimi-linear
+0.02.469.574 I llama_model_loader: - kv   1:                     kimi-linear.vocab_size u32              = 128
+0.02.469.585 I llama_model_loader: - kv   2:                 kimi-linear.context_length u32              = 128
+0.02.469.606 I llama_model_loader: - kv   3:               kimi-linear.embedding_length u32              = 128
+0.02.469.618 I llama_model_loader: - kv   4:                kimi-linear.features_length u32              = 128
+0.02.469.629 I llama_model_loader: - kv   5:                    kimi-linear.block_count u32              = 2
+0.02.469.640 I llama_model_loader: - kv   6:      kimi-linear.leading_dense_block_count u32              = 1
+0.02.469.654 I llama_model_loader: - kv   7:            kimi-linear.feed_forward_length u32              = 192
+0.02.469.666 I llama_model_loader: - kv   8:          kimi-linear.use_parallel_residual bool             = false
+0.02.469.680 I llama_model_loader: - kv   9:                    kimi-linear.logit_scale f32              = 1.000000
+0.02.469.691 I llama_model_loader: - kv  10:             kimi-linear.time_mix_extra_dim u32              = 64
+0.02.469.708 I llama_model_loader: - kv  11:           kimi-linear.time_decay_extra_dim u32              = 128
+0.02.469.719 I llama_model_loader: - kv  12:        kimi-linear.full_attention_interval u32              = 2
+0.02.469.742 I llama_model_loader: - kv  13:           kimi-linear.attention.head_count arr[u32,2]       = [1, 0]
+0.02.469.756 I llama_model_loader: - kv  14:        kimi-linear.attention.head_count_kv arr[u32,2]       = [1, 0]
+0.02.469.767 I llama_model_loader: - kv  15:       kimi-linear.attention.max_alibi_bias f32              = 8.000000
+0.02.469.779 I llama_model_loader: - kv  16:           kimi-linear.attention.key_length u32              = 576
+0.02.469.787 I llama_model_loader: - kv  17:         kimi-linear.attention.value_length u32              = 512
+0.02.469.794 I llama_model_loader: - kv  18:           kimi-linear.rope.dimension_count u32              = 64
+0.02.469.801 I llama_model_loader: - kv  19:       kimi-linear.attention.key_length_mla u32              = 192
+0.02.469.808 I llama_model_loader: - kv  20:     kimi-linear.attention.value_length_mla u32              = 128
+0.02.469.815 I llama_model_loader: - kv  21:            kimi-linear.attention.clamp_kqv f32              = 1.000000
+0.02.469.822 I llama_model_loader: - kv  22:   kimi-linear.attention.layer_norm_epsilon f32              = 0.000010
+0.02.469.831 I llama_model_loader: - kv  23: kimi-linear.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.02.469.839 I llama_model_loader: - kv  24:   kimi-linear.attention.group_norm_epsilon f32              = 0.000010
+0.02.469.845 I llama_model_loader: - kv  25:    kimi-linear.attention.group_norm_groups u32              = 8
+0.02.469.852 I llama_model_loader: - kv  26:          kimi-linear.attention.q_lora_rank u32              = 512
+0.02.469.858 I llama_model_loader: - kv  27:         kimi-linear.attention.kv_lora_rank u32              = 512
+0.02.469.865 I llama_model_loader: - kv  28: kimi-linear.attention.relative_buckets_count u32              = 8
+0.02.469.871 I llama_model_loader: - kv  29:       kimi-linear.attention.sliding_window u32              = 16
+0.02.469.878 I llama_model_loader: - kv  30: kimi-linear.attention.sliding_window_pattern u32              = 2
+0.02.469.884 I llama_model_loader: - kv  31:   kimi-linear.attention.indexer.head_count u32              = 1
+0.02.469.891 I llama_model_loader: - kv  32:   kimi-linear.attention.indexer.key_length u32              = 64
+0.02.469.897 I llama_model_loader: - kv  33:        kimi-linear.attention.indexer.top_k u32              = 8
+0.02.469.906 I llama_model_loader: - kv  34:        kimi-linear.rope.dimension_sections arr[u32,4]       = [32, 32, 32, 32]
+0.02.469.912 I llama_model_loader: - kv  35:                       tokenizer.ggml.model str              = no_vocab
+0.02.469.919 I llama_model_loader: - kv  36:     kimi-linear.expert_feed_forward_length u32              = 192
+0.02.469.925 I llama_model_loader: - kv  37:      kimi-linear.interleave_moe_layer_step u32              = 2
+0.02.469.934 I llama_model_loader: - kv  38:                   kimi-linear.expert_count u32              = 2
+0.02.469.943 I llama_model_loader: - kv  39:              kimi-linear.expert_used_count u32              = 1
+0.02.469.952 I llama_model_loader: - kv  40:            kimi-linear.expert_shared_count u32              = 1
+0.02.469.959 I llama_model_loader: - kv  41:             kimi-linear.expert_gating_func u32              = 2
+0.02.469.965 I llama_model_loader: - kv  42:             kimi-linear.expert_group_scale f32              = 1.000000
+0.02.469.971 I llama_model_loader: - kv  43:              kimi-linear.experts_per_group u32              = 1
+0.02.469.977 I llama_model_loader: - kv  44:        kimi-linear.posnet.embedding_length u32              = 128
+0.02.469.983 I llama_model_loader: - kv  45:             kimi-linear.posnet.block_count u32              = 2
+0.02.469.989 I llama_model_loader: - kv  46:      kimi-linear.convnext.embedding_length u32              = 128
+0.02.469.995 I llama_model_loader: - kv  47:           kimi-linear.convnext.block_count u32              = 2
+0.02.470.001 I llama_model_loader: - kv  48:                              xielu.alpha_n f32              = 1.000000
+0.02.470.007 I llama_model_loader: - kv  49:                              xielu.alpha_p f32              = 1.000000
+0.02.470.013 I llama_model_loader: - kv  50:                                 xielu.beta f32              = 1.000000
+0.02.470.021 I llama_model_loader: - kv  51:                                  xielu.eps f32              = 0.000000
+0.02.470.027 I llama_model_loader: - kv  52:                 kimi-linear.ssm.inner_size u32              = 256
+0.02.470.032 I llama_model_loader: - kv  53:                kimi-linear.ssm.conv_kernel u32              = 4
+0.02.470.038 I llama_model_loader: - kv  54:                 kimi-linear.ssm.state_size u32              = 128
+0.02.470.045 I llama_model_loader: - kv  55:             kimi-linear.ssm.time_step_rank u32              = 1
+0.02.470.052 I llama_model_loader: - kv  56:                kimi-linear.ssm.group_count u32              = 2
+0.02.470.059 I llama_model_loader: - kv  57:                   kimi-linear.kda.head_dim u32              = 128
+0.02.470.065 I llama_model_loader: - kv  58:                  kimi-linear.wkv.head_size u32              = 128
+0.02.470.071 I llama_model_loader: - kv  59:              kimi-linear.shortconv.l_cache u32              = 3
+0.02.470.078 I print_info: file format = GGUF V3 (latest)
+0.02.470.085 I print_info: file type   = (guessed) all F32
+0.02.470.092 I print_info: file size   = 0.00 MiB (-nan BPW) 
+0.02.470.199 I llama_prepare_model_devices: using device CPU (Intel(R) Core(TM) Ultra 7 265K) (unknown id) - 252840 MiB free
+0.02.470.278 W load: adding 128 dummy tokens
+0.02.470.287 I print_info: arch                  = kimi-linear
+0.02.470.293 I print_info: vocab_only            = 0
+0.02.470.300 I print_info: no_alloc              = 0
+0.02.470.308 I print_info: n_ctx_train           = 128
+0.02.470.314 I print_info: n_embd_inp            = 128
+0.02.470.323 I print_info: n_embd                = 128
+0.02.470.330 I print_info: n_embd_out            = 128
+0.02.470.336 I print_info: n_layer               = 2
+0.02.470.342 I print_info: n_layer_all           = 2
+0.02.470.353 I print_info: n_head                = [1, 0]
+0.02.470.359 I print_info: n_head_kv             = [1, 0]
+0.02.470.365 I print_info: n_rot                 = 64
+0.02.470.371 I print_info: n_swa                 = 0
+0.02.470.377 I print_info: is_swa_any            = 0
+0.02.470.383 I print_info: n_embd_head_k         = 576
+0.02.470.389 I print_info: n_embd_head_v         = 512
+0.02.470.395 I print_info: n_gqa                 = [1, 0]
+0.02.470.402 I print_info: n_embd_k_gqa          = [576, 0]
+0.02.470.409 I print_info: n_embd_v_gqa          = [512, 0]
+0.02.470.415 I print_info: f_norm_eps            = 0.0e+00
+0.02.470.421 I print_info: f_norm_rms_eps        = 1.0e-05
+0.02.470.428 I print_info: f_clamp_kqv           = 0.0e+00
+0.02.470.436 I print_info: f_max_alibi_bias      = 0.0e+00
+0.02.470.444 I print_info: f_logit_scale         = 0.0e+00
+0.02.470.450 I print_info: f_attn_scale          = 0.0e+00
+0.02.470.458 I print_info: f_attn_value_scale    = 0.0000
+0.02.470.464 I print_info: n_ff                  = 192
+0.02.470.471 I print_info: n_expert              = 2
+0.02.470.477 I print_info: n_expert_used         = 1
+0.02.470.484 I print_info: n_expert_groups       = 0
+0.02.470.489 I print_info: n_group_used          = 0
+0.02.470.495 I print_info: causal attn           = 1
+0.02.470.501 I print_info: pooling type          = -1
+0.02.470.508 I print_info: rope type             = -1
+0.02.470.514 I print_info: rope scaling          = linear
+0.02.470.521 I print_info: freq_base_train       = 10000.0
+0.02.470.527 I print_info: freq_scale_train      = 1
+0.02.470.535 I print_info: n_ctx_orig_yarn       = 128
+0.02.470.541 I print_info: rope_yarn_log_mul     = 0.0000
+0.02.470.548 I print_info: rope_finetuned        = unknown
+0.02.470.554 I print_info: model type            = ?B
+0.02.470.560 I print_info: model params          = 0.00 K
+0.02.470.566 I print_info: general.name          = n/a
+0.02.470.573 I print_info: vocab type            = no vocab
+0.02.470.579 I print_info: n_vocab               = 128
+0.02.470.585 I print_info: n_merges              = 0
+0.02.470.591 I print_info: max token length      = 0
+0.02.470.878 I load_tensors: loading model tensors, this can take a while... (mmap = false, direct_io = false)
+0.02.471.020 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.02.471.028 I load_tensors: [SYCL] Collected 0 tensors, 0.00 GiB total
+0.02.471.044 I load_tensors: offloading output layer to GPU
+0.02.471.051 I load_tensors: offloading 1 repeating layers to GPU
+0.02.471.058 I load_tensors: offloaded 3/3 layers to GPU
+0.02.471.065 I load_tensors:          CPU model buffer size =     2.70 MiB
+0.02.475.674 I [S1-PRELOAD] 0 host-registered weights found for preload
+0.02.475.757 I llama_context: constructing llama_context
+0.02.475.766 I llama_context: n_seq_max     = 1
+0.02.475.773 I llama_context: n_ctx         = 256
+0.02.475.779 I llama_context: n_ctx_seq     = 256
+0.02.475.786 I llama_context: n_batch       = 128
+0.02.475.799 I llama_context: n_ubatch      = 64
+0.02.475.804 I llama_context: causal_attn   = 1
+0.02.475.809 I llama_context: flash_attn    = auto
+0.02.475.816 I llama_context: kv_unified    = false
+0.02.475.824 I llama_context: freq_base     = 10000.0
+0.02.475.830 I llama_context: freq_scale    = 1
+0.02.475.836 I llama_context: n_rs_seq      = 0
+0.02.475.842 I llama_context: n_outputs_max = 128
+0.02.475.848 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.475.868 I llama_context:        CPU  output buffer size =     0.00 MiB
+0.02.475.892 I llama_kv_cache:        CPU KV buffer size =     0.28 MiB
+0.02.475.907 I llama_kv_cache: size =    0.28 MiB (   256 cells,   1 layers,  1/1 seqs), K (f16):    0.28 MiB, V (f16):    0.00 MiB
+0.02.475.913 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 576
+0.02.475.922 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.02.475.938 I llama_memory_recurrent:        CPU RS buffer size =     0.07 MiB
+0.02.475.945 I llama_memory_recurrent: size =    0.07 MiB (     1 cells,   2 layers,  1 seqs  0 rs_seq), R (f32):    0.00 MiB, S (f32):    0.06 MiB
+0.02.475.953 I sched_reserve: reserving ...
+0.02.476.296 I resolve_fused_ops: Flash Attention enabled
+0.02.476.318 I resolve_fused_ops: resolving fused Gated Delta Net support:
+0.02.476.366 I resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+0.02.476.414 I resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+0.02.476.583 I sched_reserve:        CPU compute buffer size =     0.70 MiB
+0.02.476.596 I sched_reserve: graph nodes  = 165
+0.02.476.607 I sched_reserve: graph splits = 1
+0.02.476.618 I sched_reserve: reserve took 0.66 ms, sched copies = 1
+0.02.491.850 I llama_model_loader: loaded meta data with 135 key-value pairs and 74 tensors from (file*) (version GGUF V3 (latest))
+0.02.491.858 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.02.491.863 I llama_model_loader: - kv   0:                       general.architecture str              = kimi-linear
+0.02.491.864 I llama_model_loader: - kv   1:                               general.name str              = n/a
+0.02.491.864 I llama_model_loader: - kv   2:                     kimi-linear.vocab_size u32              = 128
+0.02.491.865 I llama_model_loader: - kv   3:                 kimi-linear.context_length u32              = 128
+0.02.491.865 I llama_model_loader: - kv   4:               kimi-linear.embedding_length u32              = 128
+0.02.491.865 I llama_model_loader: - kv   5:                    kimi-linear.block_count u32              = 2
+0.02.491.865 I llama_model_loader: - kv   6:      kimi-linear.leading_dense_block_count u32              = 1
+0.02.491.866 I llama_model_loader: - kv   7:            kimi-linear.feed_forward_length u32              = 192
+0.02.491.866 I llama_model_loader: - kv   8:     kimi-linear.expert_feed_forward_length u32              = 192
+0.02.491.866 I llama_model_loader: - kv   9: kimi-linear.expert_shared_feed_forward_length u32              = 0
+0.02.491.911 I llama_model_loader: - kv  10:               kimi-linear.swiglu_clamp_exp arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.491.939 I llama_model_loader: - kv  11:             kimi-linear.swiglu_clamp_shexp arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.491.940 I llama_model_loader: - kv  12:          kimi-linear.use_parallel_residual bool             = false
+0.02.491.940 I llama_model_loader: - kv  13:                   kimi-linear.expert_count u32              = 2
+0.02.491.940 I llama_model_loader: - kv  14:              kimi-linear.expert_used_count u32              = 1
+0.02.491.940 I llama_model_loader: - kv  15:            kimi-linear.expert_shared_count u32              = 1
+0.02.491.940 I llama_model_loader: - kv  16:             kimi-linear.expert_group_count u32              = 0
+0.02.491.941 I llama_model_loader: - kv  17:        kimi-linear.expert_group_used_count u32              = 0
+0.02.491.941 I llama_model_loader: - kv  18:           kimi-linear.expert_weights_scale f32              = 0.000000
+0.02.491.941 I llama_model_loader: - kv  19:            kimi-linear.expert_weights_norm bool             = false
+0.02.491.941 I llama_model_loader: - kv  20:             kimi-linear.expert_gating_func u32              = 2
+0.02.491.943 I llama_model_loader: - kv  21:             kimi-linear.expert_group_scale f32              = 0.050000
+0.02.491.943 I llama_model_loader: - kv  22:              kimi-linear.experts_per_group u32              = 0
+0.02.491.943 I llama_model_loader: - kv  23:             kimi-linear.moe_every_n_layers u32              = 0
+0.02.491.943 I llama_model_loader: - kv  24:           kimi-linear.nextn_predict_layers u32              = 0
+0.02.491.944 I llama_model_loader: - kv  25:             kimi-linear.n_deepstack_layers u32              = 0
+0.02.491.951 I llama_model_loader: - kv  26:              kimi-linear.deepstack_mapping arr[i32,512]     = [-1, -1, -1, -1, -1, -1, -1, -1, -1, ...
+0.02.491.951 I llama_model_loader: - kv  27:                   kimi-linear.pooling_type u32              = 4294967295
+0.02.491.951 I llama_model_loader: - kv  28:                    kimi-linear.logit_scale f32              = 0.000000
+0.02.491.952 I llama_model_loader: - kv  29:         kimi-linear.decoder_start_token_id i32              = -1
+0.02.491.952 I llama_model_loader: - kv  30:            kimi-linear.decoder_block_count u32              = 0
+0.02.491.952 I llama_model_loader: - kv  31:         kimi-linear.attn_logit_softcapping f32              = 50.000000
+0.02.491.953 I llama_model_loader: - kv  32:       kimi-linear.router_logit_softcapping f32              = 30.000000
+0.02.491.953 I llama_model_loader: - kv  33:        kimi-linear.final_logit_softcapping f32              = 30.000000
+0.02.491.953 I llama_model_loader: - kv  34:                      kimi-linear.swin_norm bool             = false
+0.02.491.953 I llama_model_loader: - kv  35:         kimi-linear.rescale_every_n_layers u32              = 0
+0.02.491.954 I llama_model_loader: - kv  36:             kimi-linear.time_mix_extra_dim u32              = 0
+0.02.491.954 I llama_model_loader: - kv  37:           kimi-linear.time_decay_extra_dim u32              = 0
+0.02.491.954 I llama_model_loader: - kv  38:                 kimi-linear.residual_scale f32              = 0.000000
+0.02.491.954 I llama_model_loader: - kv  39:                kimi-linear.embedding_scale f32              = 0.000000
+0.02.491.954 I llama_model_loader: - kv  40:              kimi-linear.token_shift_count u32              = 2
+0.02.491.954 I llama_model_loader: - kv  41:      kimi-linear.interleave_moe_layer_step u32              = 0
+0.02.491.955 I llama_model_loader: - kv  42:           kimi-linear.attention.head_count arr[u32,2]       = [1, 0]
+0.02.491.956 I llama_model_loader: - kv  43:        kimi-linear.attention.head_count_kv arr[u32,2]       = [1, 0]
+0.02.491.956 I llama_model_loader: - kv  44:       kimi-linear.attention.max_alibi_bias f32              = 0.000000
+0.02.491.956 I llama_model_loader: - kv  45:            kimi-linear.attention.clamp_kqv f32              = 0.000000
+0.02.491.956 I llama_model_loader: - kv  46:           kimi-linear.attention.key_length u32              = 576
+0.02.491.956 I llama_model_loader: - kv  47:         kimi-linear.attention.value_length u32              = 512
+0.02.491.957 I llama_model_loader: - kv  48:   kimi-linear.attention.layer_norm_epsilon f32              = 0.000000
+0.02.491.957 I llama_model_loader: - kv  49: kimi-linear.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.02.491.957 I llama_model_loader: - kv  50:   kimi-linear.attention.group_norm_epsilon f32              = 0.000000
+0.02.491.957 I llama_model_loader: - kv  51:    kimi-linear.attention.group_norm_groups u32              = 0
+0.02.491.958 I llama_model_loader: - kv  52:               kimi-linear.attention.causal bool             = true
+0.02.491.958 I llama_model_loader: - kv  53:          kimi-linear.attention.q_lora_rank u32              = 0
+0.02.491.958 I llama_model_loader: - kv  54:         kimi-linear.attention.kv_lora_rank u32              = 512
+0.02.491.958 I llama_model_loader: - kv  55:      kimi-linear.attention.decay_lora_rank u32              = 0
+0.02.491.958 I llama_model_loader: - kv  56:       kimi-linear.attention.iclr_lora_rank u32              = 0
+0.02.491.958 I llama_model_loader: - kv  57: kimi-linear.attention.value_residual_mix_lora_rank u32              = 0
+0.02.491.959 I llama_model_loader: - kv  58:       kimi-linear.attention.gate_lora_rank u32              = 0
+0.02.491.959 I llama_model_loader: - kv  59: kimi-linear.attention.relative_buckets_count u32              = 0
+0.02.491.959 I llama_model_loader: - kv  60:       kimi-linear.attention.sliding_window u32              = 0
+0.02.491.959 I llama_model_loader: - kv  61:                kimi-linear.attention.scale f32              = 0.000000
+0.02.491.959 I llama_model_loader: - kv  62:         kimi-linear.attention.output_scale f32              = 0.000000
+0.02.491.959 I llama_model_loader: - kv  63:          kimi-linear.attention.value_scale f32              = 0.000000
+0.02.491.960 I llama_model_loader: - kv  64:   kimi-linear.attention.temperature_length u32              = 0
+0.02.491.960 I llama_model_loader: - kv  65:    kimi-linear.attention.temperature_scale f32              = 0.000000
+0.02.491.960 I llama_model_loader: - kv  66:       kimi-linear.attention.key_length_mla u32              = 192
+0.02.491.960 I llama_model_loader: - kv  67:     kimi-linear.attention.value_length_mla u32              = 128
+0.02.491.960 I llama_model_loader: - kv  68:       kimi-linear.attention.key_length_swa u32              = 576
+0.02.491.961 I llama_model_loader: - kv  69:     kimi-linear.attention.value_length_swa u32              = 512
+0.02.491.961 I llama_model_loader: - kv  70:   kimi-linear.attention.indexer.head_count u32              = 0
+0.02.491.961 I llama_model_loader: - kv  71:   kimi-linear.attention.indexer.key_length u32              = 0
+0.02.491.961 I llama_model_loader: - kv  72:        kimi-linear.attention.indexer.top_k u32              = 0
+0.02.491.961 I llama_model_loader: - kv  73:     kimi-linear.attention.recurrent_layers arr[u32,2]       = [0, 1]
+0.02.491.962 I llama_model_loader: - kv  74:           kimi-linear.rope.dimension_count u32              = 64
+0.02.491.962 I llama_model_loader: - kv  75:       kimi-linear.rope.dimension_count_swa u32              = 64
+0.02.491.962 I llama_model_loader: - kv  76:        kimi-linear.rope.dimension_sections arr[i32,4]       = [0, 0, 0, 0]
+0.02.491.963 I llama_model_loader: - kv  77:                 kimi-linear.rope.freq_base f32              = 10000.000000
+0.02.491.963 I llama_model_loader: - kv  78:             kimi-linear.rope.freq_base_swa f32              = 10000.000000
+0.02.491.963 I llama_model_loader: - kv  79:              kimi-linear.rope.scaling.type str              = linear
+0.02.491.964 I llama_model_loader: - kv  80:            kimi-linear.rope.scaling.factor f32              = 0.000000
+0.02.491.964 I llama_model_loader: - kv  81:       kimi-linear.rope.scaling.attn_factor f32              = 1.000000
+0.02.491.964 I llama_model_loader: - kv  82: kimi-linear.rope.scaling.original_context_length u32              = 128
+0.02.491.964 I llama_model_loader: - kv  83:         kimi-linear.rope.scaling.finetuned bool             = false
+0.02.491.965 I llama_model_loader: - kv  84: kimi-linear.rope.scaling.yarn_log_multiplier f32              = 0.000000
+0.02.491.965 I llama_model_loader: - kv  85:   kimi-linear.rope.scaling.yarn_ext_factor f32              = -1.000000
+0.02.491.965 I llama_model_loader: - kv  86:  kimi-linear.rope.scaling.yarn_attn_factor f32              = 1.000000
+0.02.491.965 I llama_model_loader: - kv  87:    kimi-linear.rope.scaling.yarn_beta_fast f32              = 32.000000
+0.02.491.966 I llama_model_loader: - kv  88:    kimi-linear.rope.scaling.yarn_beta_slow f32              = 1.000000
+0.02.491.966 I llama_model_loader: - kv  89:                 kimi-linear.ssm.inner_size u32              = 0
+0.02.491.966 I llama_model_loader: - kv  90:                kimi-linear.ssm.conv_kernel u32              = 4
+0.02.491.966 I llama_model_loader: - kv  91:                 kimi-linear.ssm.state_size u32              = 0
+0.02.491.966 I llama_model_loader: - kv  92:             kimi-linear.ssm.time_step_rank u32              = 0
+0.02.491.966 I llama_model_loader: - kv  93:                kimi-linear.ssm.group_count u32              = 0
+0.02.491.967 I llama_model_loader: - kv  94:                 kimi-linear.ssm.dt_b_c_rms bool             = false
+0.02.491.967 I llama_model_loader: - kv  95:                   kimi-linear.kda.head_dim u32              = 128
+0.02.491.967 I llama_model_loader: - kv  96:                  kimi-linear.wkv.head_size u32              = 0
+0.02.491.967 I llama_model_loader: - kv  97:                       tokenizer.ggml.model str              = no_vocab
+0.02.491.972 I llama_model_loader: - kv  98:                      tokenizer.ggml.tokens arr[str,128]     = ["", "", "", "", "", "", "", "", "", ...
+0.02.491.974 I llama_model_loader: - kv  99:                  tokenizer.ggml.token_type arr[i32,128]     = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+0.02.491.974 I llama_model_loader: - kv 100:            tokenizer.ggml.token_type_count u32              = 0
+0.02.491.983 I llama_model_loader: - kv 101:                      tokenizer.ggml.scores arr[f32,128]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.491.983 I llama_model_loader: - kv 102:                      tokenizer.ggml.merges arr[str,0]       = []
+0.02.491.983 I llama_model_loader: - kv 103:                tokenizer.ggml.bos_token_id u32              = 4294967295
+0.02.491.983 I llama_model_loader: - kv 104:                tokenizer.ggml.eos_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 105:                tokenizer.ggml.eot_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 106:                tokenizer.ggml.eom_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 107:            tokenizer.ggml.unknown_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 108:          tokenizer.ggml.seperator_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 109:            tokenizer.ggml.padding_token_id u32              = 4294967295
+0.02.491.984 I llama_model_loader: - kv 110:               tokenizer.ggml.add_bos_token bool             = false
+0.02.491.985 I llama_model_loader: - kv 111:               tokenizer.ggml.add_eos_token bool             = false
+0.02.491.985 I llama_model_loader: - kv 112:               tokenizer.ggml.add_sep_token bool             = false
+0.02.491.985 I llama_model_loader: - kv 113:            tokenizer.ggml.add_space_prefix bool             = false
+0.02.491.985 I llama_model_loader: - kv 114:    tokenizer.ggml.remove_extra_whitespaces bool             = false
+0.02.491.985 I llama_model_loader: - kv 115:            tokenizer.ggml.fim_pre_token_id u32              = 4294967295
+0.02.491.985 I llama_model_loader: - kv 116:            tokenizer.ggml.fim_suf_token_id u32              = 4294967295
+0.02.491.985 I llama_model_loader: - kv 117:            tokenizer.ggml.fim_mid_token_id u32              = 4294967295
+0.02.491.986 I llama_model_loader: - kv 118:            tokenizer.ggml.fim_pad_token_id u32              = 4294967295
+0.02.491.986 I llama_model_loader: - kv 119:            tokenizer.ggml.fim_rep_token_id u32              = 4294967295
+0.02.491.986 I llama_model_loader: - kv 120:            tokenizer.ggml.fim_sep_token_id u32              = 4294967295
+0.02.491.986 I llama_model_loader: - kv 121:        kimi-linear.posnet.embedding_length u32              = 0
+0.02.491.986 I llama_model_loader: - kv 122:             kimi-linear.posnet.block_count u32              = 0
+0.02.491.986 I llama_model_loader: - kv 123:      kimi-linear.convnext.embedding_length u32              = 0
+0.02.491.986 I llama_model_loader: - kv 124:           kimi-linear.convnext.block_count u32              = 0
+0.02.491.987 I llama_model_loader: - kv 125:       kimi-linear.classifier.output_labels arr[str,0]       = []
+0.02.491.987 I llama_model_loader: - kv 126:              kimi-linear.shortconv.l_cache u32              = 0
+0.02.492.015 I llama_model_loader: - kv 127:                              xielu.alpha_n arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.492.042 I llama_model_loader: - kv 128:                              xielu.alpha_p arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.492.070 I llama_model_loader: - kv 129:                                 xielu.beta arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.492.097 I llama_model_loader: - kv 130:                                  xielu.eps arr[f32,512]     = [0.000000, 0.000000, 0.000000, 0.0000...
+0.02.492.097 I llama_model_loader: - kv 131:                kimi-linear.dense_2_feat_in u32              = 0
+0.02.492.097 I llama_model_loader: - kv 132:               kimi-linear.dense_2_feat_out u32              = 0
+0.02.492.097 I llama_model_loader: - kv 133:                kimi-linear.dense_3_feat_in u32              = 0
+0.02.492.097 I llama_model_loader: - kv 134:               kimi-linear.dense_3_feat_out u32              = 0
+0.02.492.098 I llama_model_loader: - type  f32:   74 tensors
+0.02.492.098 I print_info: file format = GGUF V3 (latest)
+0.02.492.098 I print_info: file type   = (guessed) all F32
+0.02.492.099 I print_info: file size   = 2.70 MiB (32.00 BPW) 
+0.02.492.115 I llama_prepare_model_devices: using device CPU (Intel(R) Core(TM) Ultra 7 265K) (unknown id) - 252840 MiB free
+0.02.492.178 W load: adding 128 dummy tokens
+0.02.492.179 I print_info: arch                  = kimi-linear
+0.02.492.179 I print_info: vocab_only            = 0
+0.02.492.179 I print_info: no_alloc              = 0
+0.02.492.179 I print_info: n_ctx_train           = 128
+0.02.492.180 I print_info: n_embd_inp            = 128
+0.02.492.180 I print_info: n_embd                = 128
+0.02.492.180 I print_info: n_embd_out            = 128
+0.02.492.180 I print_info: n_layer               = 2
+0.02.492.180 I print_info: n_layer_all           = 2
+0.02.492.184 I print_info: n_head                = [1, 0]
+0.02.492.184 I print_info: n_head_kv             = [1, 0]
+0.02.492.184 I print_info: n_rot                 = 64
+0.02.492.184 I print_info: n_swa                 = 0
+0.02.492.185 I print_info: is_swa_any            = 0
+0.02.492.185 I print_info: n_embd_head_k         = 576
+0.02.492.185 I print_info: n_embd_head_v         = 512
+0.02.492.185 I print_info: n_gqa                 = [1, 0]
+0.02.492.186 I print_info: n_embd_k_gqa          = [576, 0]
+0.02.492.186 I print_info: n_embd_v_gqa          = [512, 0]
+0.02.492.186 I print_info: f_norm_eps            = 0.0e+00
+0.02.492.186 I print_info: f_norm_rms_eps        = 1.0e-05
+0.02.492.187 I print_info: f_clamp_kqv           = 0.0e+00
+0.02.492.187 I print_info: f_max_alibi_bias      = 0.0e+00
+0.02.492.187 I print_info: f_logit_scale         = 0.0e+00
+0.02.492.187 I print_info: f_attn_scale          = 0.0e+00
+0.02.492.187 I print_info: f_attn_value_scale    = 0.0000
+0.02.492.187 I print_info: n_ff                  = 192
+0.02.492.188 I print_info: n_expert              = 2
+0.02.492.188 I print_info: n_expert_used         = 1
+0.02.492.188 I print_info: n_expert_groups       = 0
+0.02.492.188 I print_info: n_group_used          = 0
+0.02.492.188 I print_info: causal attn           = 1
+0.02.492.188 I print_info: pooling type          = -1
+0.02.492.188 I print_info: rope type             = -1
+0.02.492.188 I print_info: rope scaling          = linear
+0.02.492.189 I print_info: freq_base_train       = 10000.0
+0.02.492.189 I print_info: freq_scale_train      = 1
+0.02.492.189 I print_info: n_ctx_orig_yarn       = 128
+0.02.492.189 I print_info: rope_yarn_log_mul     = 0.0000
+0.02.492.189 I print_info: rope_finetuned        = unknown
+0.02.492.190 I print_info: model type            = ?B
+0.02.492.190 I print_info: model params          = 708.26 K
+0.02.492.190 I print_info: general.name          = n/a
+0.02.492.191 I print_info: vocab type            = no vocab
+0.02.492.191 I print_info: n_vocab               = 128
+0.02.492.191 I print_info: n_merges              = 0
+0.02.492.191 I print_info: max token length      = 0
+0.02.492.324 I [SYCL-PLAN] inventory oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.492.326 I [SYCL-PLAN] KV inputs: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.492.328 I [SYCL-BUDGET] MoE model detected: 2 experts, 1 active, 0.6 MB expert weights
+0.02.492.425 I [SYCL] Plan budget tied to arena: 32024.0 MB arena (shared zone 30744.0 MB after 1280.0 MB zones)
+0.02.492.426 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.02.492.450 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32024.0 MB, weight zone=30493.8 MB)
+0.02.492.455 I [MOE-POLICY] device=0 total=32656.0 MB free_init=32600.7 MB plan_budget=32024.0 MB weight_budget=30493.8 MB max_alloc=31023.2 MB safe_alloc=29472.0 MB arena=32024.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.02.492.467 I [MOE-LAYOUT] down-i8 device=0 n_experts=2 considered=12 candidates=0 upgraded_tensors=0 upgraded_entries=0 preserved_soa=0 skip_not_down=8 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_executor=0 skip_unsupported=4 requested=mxfp4_i8 granted=aos remaining=30489.0 MB
+0.02.492.469 I [MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry passed the entry filters, so nothing reached candidate construction (considered=12 expert entries, of which skip_not_down=8 were gate/up). Entry-level rejections: skip_unsupported=4.
+0.02.492.472 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=2 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=30489.0 MB
+0.02.492.473 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
+0.02.492.475 I [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
+0.02.492.477 I [PLACEMENT-MOE] triplet packing: groups=2 complete=2 incomplete=0 device_groups=2 host_groups=0 device_entries=12 (0.6 MB) host_entries=0 (0.0 MB) remaining=30489.0 MB hotness=static(layer,expert)
+0.02.492.495 I [SYCL-PLAN] inventory top-8 of 74 tensors (total 2.7 MB): blk.0.attn_kv_a_mqa.weight=0.3MB(t0,128x576) blk.0.attn_k_b.weight=0.2MB(t0,128x512) blk.0.attn_v_b.weight=0.2MB(t0,512x128) blk.1.ffn_up_exps.weight=0.2MB(t0,128x192) blk.1.ffn_gate_exps.weight=0.2MB(t0,128x192) blk.1.ffn_down_exps.weight=0.2MB(t0,192x128) blk.0.ffn_up.weight=0.1MB(t0,128x192) blk.0.attn_q.weight=0.1MB(t0,128x192)
+0.02.492.499 I [SYCL-PLAN] inventory groups: 14 distinct (type,ne) groups over 74 tensors; cardinality histogram: 1x6 2x2 3x1 5x1 7x1 11x2 27x1; largest card>=4: blk.1.ffn_up_shexp.weight 0.1MB (card=5); largest card<=2: blk.0.attn_kv_a_mqa.weight 0.3MB (card=1)
+0.02.492.503 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=2 n_moe_layers=2 max_batch=512 control_ids=0.00 MB host-pinned, expert_ptrs=0.00 MB VRAM, cpu_staging=0.19 MB
+0.02.492.503 I [SYCL-PLAN] CPU quant buffers: 0.3 MB (3 x cpu_quant_eligible 0.1 MB; global max 0.3 MB)
+0.02.492.504 I [SYCL-PLAN] DMA staging pool: 0.2 MB (2 x dma_streamed 0.1 MB; global max 0.3 MB)
+0.02.492.504 I [SYCL-PLAN] oneDNN scratchpad: 0.1 MB (onednn_reorder 0.0 MB + onednn_eligible 0.1 MB; global max 0.3 MB)
+0.02.492.504 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=0.6 MB weight_slot=0.0 MB activation_slot=0.2 MB output_slot=0.4 MB
+0.02.492.505 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.6 MB total=64.0 MB
+0.02.492.518 I [PLACEMENT-MOE] expected=6 planned=6 unclassified=0 duplicates=6 missing=0
+0.02.492.518 I [PLACEMENT-MOE] roles: gate=4 up=4 down=4 gate_up=0 unknown=0
+0.02.492.519 I [PLACEMENT-MOE] target device0: 12 expert tensors
+0.02.492.520 I [PLACEMENT] NORM/EMBED      device=  7 (0.1 MB)  host=  0 (0.0 MB)
+0.02.492.521 I [PLACEMENT] ATTENTION       device= 26 (1.3 MB)  host=  0 (0.0 MB)
+0.02.492.521 I [PLACEMENT] FFN             device= 31 (0.8 MB)  host=  0 (0.0 MB)
+0.02.492.522 I [PLACEMENT] MOE_GATE        device=  1 (0.0 MB)  host=  0 (0.0 MB)
+0.02.492.522 I [PLACEMENT] MOE_DOWN        device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.492.522 I [PLACEMENT] MOE_UP          device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.492.522 I [PLACEMENT] MOE_GATE_PROJ   device=  4 (0.2 MB)  host=  0 (0.0 MB)
+0.02.492.523 I [PLACEMENT] layer   0  weight=1.2 MB  kv=1.1 MB (full)  total=2.3 MB  dense_target=device 0  kv_target=device 0
+0.02.492.524 I [PLACEMENT] layer   1  weight=0.8 MB  kv=1.1 MB (full)  total=1.9 MB  dense_target=device 0  kv_target=device 0
+0.02.492.524 I [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
+0.02.492.525 I [PLACEMENT] KV sizing: n_layer=2 n_embd_k_gqa=576 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.1 MB
+0.02.492.525 I [PLACEMENT] Totals: weights=2.7 MB device + 0.0 MB host, kv=2.1 MB device + 0.0 MB host
+0.02.492.525 I [PLACEMENT] Total: 4.8 MB device + 0.0 MB host (budget=32024.0 MB)
+0.02.492.548 I [SYCL] Placement plan computed: 77 entries, 4.8 MB device + 0.0 MB host
+0.02.492.549 I [PLACE-4] device weight zone: 2.7 MB (77 tensors), host arena: 0.0 MB (0 tensors)
+0.02.492.577 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.02.492.589 I 
+[MOE-ROUTE-STATS FINAL] ===== MoE Route Residency =====
+0.02.492.589 I [MOE-ROUTE-STATS FINAL] Tokens: 0, Layers: 12, Expert rows: 768
+0.02.492.589 I [MOE-ROUTE-STATS FINAL] Device0 rows:       768 (100.0%)
+0.02.492.590 I [MOE-ROUTE-STATS FINAL] Other-device rows:  0 (0.0%)
+0.02.492.590 I [MOE-ROUTE-STATS FINAL] Host rows:          0 (0.0%)
+0.02.492.590 I [MOE-ROUTE-STATS FINAL] Missing rows:       0 (0.0%)
+0.02.492.590 I [MOE-ROUTE-STATS FINAL] Layout mismatches:  0 (0.0%)
+0.02.492.590 I [MOE-ROUTE-STATS FINAL] Unsupported rows:   0 (0.0%)
+0.02.492.591 I [MOE-ROUTE-STATS FINAL] Prediction: 0/0 correct (0.0%) across 0 layers
+0.02.492.591 I [MOE-ROUTE-STATS FINAL] ================================
+
+0.02.492.662 I load_tensors: SYCL early placement plan: 74 weights, 0.00 GiB (computed pre-create_tensor)
+0.02.492.663 I load_tensors: loading model tensors, this can take a while... (mmap = false, direct_io = false)
+0.02.492.857 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.02.492.858 I load_tensors: [SYCL] Collected 0 tensors, 0.00 GiB total
+0.02.492.881 I load_tensors: offloading output layer to GPU
+0.02.492.881 I load_tensors: offloading 1 repeating layers to GPU
+0.02.492.881 I load_tensors: offloaded 3/3 layers to GPU
+0.02.492.882 I load_tensors:          CPU model buffer size =     2.70 MiB
+0.02.493.613 I [S1-PRELOAD] 0 host-registered weights found for preload
+0.02.493.656 I llama_context: constructing llama_context
+0.02.493.657 I llama_context: n_seq_max     = 1
+0.02.493.657 I llama_context: n_ctx         = 256
+0.02.493.657 I llama_context: n_ctx_seq     = 256
+0.02.493.657 I llama_context: n_batch       = 128
+0.02.493.657 I llama_context: n_ubatch      = 64
+0.02.493.657 I llama_context: causal_attn   = 1
+0.02.493.658 I llama_context: flash_attn    = auto
+0.02.493.658 I llama_context: kv_unified    = false
+0.02.493.659 I llama_context: freq_base     = 10000.0
+0.02.493.659 I llama_context: freq_scale    = 1
+0.02.493.659 I llama_context: n_rs_seq      = 0
+0.02.493.659 I llama_context: n_outputs_max = 128
+0.02.493.660 W llama_context: n_ctx_seq (256) > n_ctx_train (128) -- possible training context overflow
+0.02.493.666 I llama_context:        CPU  output buffer size =     0.00 MiB
+0.02.493.682 I llama_kv_cache:        CPU KV buffer size =     0.28 MiB
+0.02.493.691 I llama_kv_cache: size =    0.28 MiB (   256 cells,   1 layers,  1/1 seqs), K (f16):    0.28 MiB, V (f16):    0.00 MiB
+0.02.493.691 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 576
+0.02.493.691 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 0
+0.02.493.701 I llama_memory_recurrent:        CPU RS buffer size =     0.07 MiB
+0.02.493.703 I llama_memory_recurrent: size =    0.07 MiB (     1 cells,   2 layers,  1 seqs  0 rs_seq), R (f32):    0.00 MiB, S (f32):    0.06 MiB
+0.02.493.704 I sched_reserve: reserving ...
+0.02.494.064 I resolve_fused_ops: Flash Attention enabled
+0.02.494.065 I resolve_fused_ops: resolving fused Gated Delta Net support:
+0.02.494.105 I resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled
+0.02.494.140 I resolve_fused_ops: fused Gated Delta Net (chunked) enabled
+0.02.494.306 I sched_reserve:        CPU compute buffer size =     0.70 MiB
+0.02.494.306 I sched_reserve: graph nodes  = 165
+0.02.494.307 I sched_reserve: graph splits = 1
+0.02.494.307 I sched_reserve: reserve took 0.60 ms, sched copies = 1
+0.02.509.497 I [SYCL] model slot 2 released: 0 registry rows, 0 cache entries reclaimed (live mask 0x00000003)
+|     kimi-linear|   Intel(R) Core(TM) Ultra 7 265K|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|
+test case: kimi-linear (Meta, MoE)
+0.02.510.010 I [SYCL] model slot 1 released: 0 registry rows, 0 cache entries reclaimed (live mask 0x00000001)
+|     kimi-linear|                             Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|
+0.02.512.594 I [SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed (live mask 0x00000000)
+Roundtrip gate: NMSE(device, reloaded) <= 1e-04, not bit-equality. 0 row(s) round-tripped within tolerance but not bit-for-bit.
