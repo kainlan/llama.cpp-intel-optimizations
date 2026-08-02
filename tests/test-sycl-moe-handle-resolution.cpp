@@ -54,7 +54,10 @@ static bool test_normal_cache_expert_resolution(sycl::queue & q) {
     TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
     constexpr size_t test_arena_bytes = 32u * 1024u * 1024u;
     if (cache->zone_available(ggml_sycl::vram_zone_id::WEIGHT) < 4096) {
-        TEST_ASSERT(cache->arena_reserve(q, test_arena_bytes, test_arena_bytes, 0, 0, 0, 0),
+        // arena_reserve() gained a trailing device_total_vram parameter after this test
+        // was originally registered; 0 matches the convention at ggml-sycl.cpp's own
+        // arena_reserve() call site (llama.cpp-0igs restoration).
+        TEST_ASSERT(cache->arena_reserve(q, test_arena_bytes, test_arena_bytes, 0, 0, 0, 0, 0),
                     "test cache should reserve a small WEIGHT arena");
     }
     std::vector<uint8_t> data(128, 0x31);

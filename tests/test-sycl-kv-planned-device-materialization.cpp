@@ -103,8 +103,12 @@ int main() {
     ggml_backend_buffer_t      buf  = ggml_backend_buft_alloc_buffer(buft, total_bytes);
     TEST_ASSERT(buf != nullptr, "KV buffer allocation failed");
 
-    TEST_ASSERT(ggml_backend_tensor_alloc_offset(buf, k0, 0) == GGML_STATUS_SUCCESS, "cache_k_l0 allocation failed");
-    TEST_ASSERT(ggml_backend_tensor_alloc_offset(buf, k1, layer_bytes) == GGML_STATUS_SUCCESS,
+    // ggml_backend_tensor_alloc_offset() no longer exists -- ggml_backend_tensor_alloc()
+    // takes an absolute address, so build one from the buffer base plus this
+    // tensor's byte offset within it (llama.cpp-0igs restoration).
+    uint8_t * buf_base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf));
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf, k0, buf_base) == GGML_STATUS_SUCCESS, "cache_k_l0 allocation failed");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf, k1, buf_base + layer_bytes) == GGML_STATUS_SUCCESS,
                 "cache_k_l1 allocation failed");
 
     TEST_ASSERT(k1->extra != nullptr, "cache_k_l1 extra must be populated");
