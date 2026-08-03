@@ -106,10 +106,25 @@ if (BUILD_TESTING)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
+    foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
+                  concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown bounded-tombstones begin-allocation-failure null-output stale-token-after-reuse)
+        add_test(NAME sycl-lifecycle-h2-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
+    endforeach()
+    foreach(_case slot-exhaustion model-id-overflow load-txn-id-overflow slot-generation-overflow invocation-id-counter-overflow)
+        add_test(NAME sycl-lifecycle-h10-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
+    endforeach()
+    add_test(NAME sycl-lifecycle-multi-model COMMAND test-sycl-lifecycle-load-txn --case multi-model --case sequential-aba)
+    foreach(_mutation M1 M2 M3)
+        add_test(NAME sycl-lifecycle-mutation-${_mutation}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-mutations.sh
+                    ${CMAKE_BINARY_DIR} ${_mutation})
+    endforeach()
 
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
+    add_test(NAME sycl-lifecycle-public-wrappers
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-wrappers.py)
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.

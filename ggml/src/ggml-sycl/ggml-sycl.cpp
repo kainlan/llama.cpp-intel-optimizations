@@ -8380,7 +8380,7 @@ struct sycl_host_weight_extra_entry {
     // Model slot that registered this row (llama.cpp-0qlw).  The registry holds
     // an extra ref, and through it a weight lease, so model teardown must drop
     // exactly its own rows -- otherwise the leases it left behind read as leaks.
-    uint32_t                owner_slot = GGML_SYCL_MODEL_SLOT_NONE;
+    ggml_sycl::lifecycle::ModelToken owner{};
 };
 
 static std::mutex                                                    g_sycl_host_weight_extras_mutex;
@@ -8984,14 +8984,14 @@ static uint64_t ggml_sycl_named_weight_cache_uuid_locked(const std::string & nam
 // excludes model_id from cache_id_equal for GGUF weights, and the load-boundary
 // reset runs before any tensor of the incoming model exists.  A slot is bound to
 // the llama_model object instead, which does exist at both ends of its life.
-// Drop the registry rows registered by one model slot, releasing the registry's
-// extra refs.  Unlike the load-boundary sweep this does not touch other models'
-// rows.  Returns rows released.
-static size_t ggml_sycl_release_host_weight_extras_for_slot(uint32_t slot) {
+// Drop rows registered by one complete model/load/slot-generation owner,
+// releasing the registry's extra refs. Unlike the load-boundary sweep this
+// cannot match a stale generation or another model. Returns rows released.
+static size_t ggml_sycl_release_host_weight_extras_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
     size_t                      released = 0;
     std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
     for (auto it = g_sycl_host_weight_extras.begin(); it != g_sycl_host_weight_extras.end();) {
-        if (it->second.owner_slot != slot) {
+        if (!(it->second.owner == owner)) {
             ++it;
             continue;
         }
@@ -9032,7 +9032,10 @@ static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecy
         case E::POISONED:        return GGML_SYCL_LIFECYCLE_POISONED;
         case E::NOT_FOUND:       return GGML_SYCL_LIFECYCLE_NOT_FOUND;
         case E::STALE_IDENTITY:  return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
-        case E::OK_ALREADY_DEAD: return GGML_SYCL_LIFECYCLE_ABORTED;
+        case E::NULL_OUTPUT:     return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+        case E::ALLOCATION_FAILED:return GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED;
+        case E::EFFECT_FAILED:   return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        case E::OK_ALREADY_DEAD: return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
     }
     return GGML_SYCL_LIFECYCLE_ABORTED;
 }
@@ -9041,9 +9044,10 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
     return {{token.model_id}, {token.load_txn_id}, {token.slot, token.slot_generation}};
 }
 
-static void ggml_sycl_release_model_slot_resources(uint32_t slot) {
+static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
+    const uint32_t slot = owner.owner.slot;
     const uint32_t live_after = ggml_sycl::lifecycle::global_registry().live_mask();
-    const size_t rows = ggml_sycl_release_host_weight_extras_for_slot(slot);
+    const size_t rows = ggml_sycl_release_host_weight_extras_for_owner(owner);
     ggml_sycl_release_graph_replay_leases_all_devices();
     ggml_sycl::unified_cache_set_live_model_mask(live_after);
     const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
@@ -9059,9 +9063,17 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
     auto & registry = ggml_sycl::lifecycle::global_registry();
-    const auto result = registry.teardown(ggml_sycl_cpp_token(token));
-    if (result == ggml_sycl::lifecycle::error::OK) ggml_sycl_release_model_slot_resources(token.slot);
-    return ggml_sycl_lifecycle_c_result(result);
+    const auto owner = ggml_sycl_cpp_token(token);
+    ggml_sycl::lifecycle::teardown_ticket ticket;
+    try {
+        ticket = registry.prepare_teardown(owner);
+        if (!ticket.finisher) return ggml_sycl_lifecycle_c_result(ticket.code);
+        ggml_sycl_release_model_slot_resources(owner);
+        return ggml_sycl_lifecycle_c_result(registry.finalize_teardown(ticket, true));
+    } catch (...) {
+        if (ticket.finisher) (void) registry.finalize_teardown(ticket, false);
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
 }
 
 // Forward declarations: defined later in this TU (after the globals they
@@ -9153,57 +9165,133 @@ static void ggml_sycl_export_token(const ggml_sycl::lifecycle::ModelToken & in, 
     if (out) *out = {in.model.value, in.load.value, in.owner.slot, in.owner.generation};
 }
 
+static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_snapshot() {
+    ggml_sycl::lifecycle::publication_data data;
+    size_t actual_device = 0;
+    bool have_actual = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_load_summary_mutex);
+        for (const auto & state : g_sycl_load_summary) {
+            if (state.have_actual_weights) {
+                have_actual = true;
+                data.actual_host_bytes += state.weight_host_bytes;
+                actual_device += state.weight_device_bytes;
+            }
+        }
+    }
+    size_t planned_device = 0;
+    const int total_gpus = ggml_sycl_info().total_gpu_count;
+    for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+        if (cache && cache->has_placement_plan()) {
+            data.planned_host_bytes += cache->get_placement_plan().weight_host_bytes;
+            planned_device += cache->get_placement_plan().weight_vram_bytes;
+        }
+    }
+    const size_t reported_host = have_actual ? data.actual_host_bytes : data.planned_host_bytes;
+    const size_t reported_device = have_actual ? actual_device : planned_device;
+    data.verdict = reported_host == 0 ? ggml_sycl::lifecycle::tier_verdict::DEVICE :
+                   reported_device == 0 ? ggml_sycl::lifecycle::tier_verdict::HOST :
+                                          ggml_sycl::lifecycle::tier_verdict::MIXED;
+    return data;
+}
+
+static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
+    (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
+    (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
+    ggml_sycl_reset_model_load_scratch_state();
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     if (!txn) return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
-    auto result = ggml_sycl::lifecycle::global_registry().begin_outer();
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    const auto result = registry.begin_outer();
     if (result.code != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result.code);
     txn->id = result.txn.value;
-    ggml_sycl_model_loading_effects(true, true);
-    return GGML_SYCL_LIFECYCLE_OK;
+    try {
+        ggml_sycl_model_loading_effects(true, true);
+        return GGML_SYCL_LIFECYCLE_OK;
+    } catch (...) {
+        const auto ticket = registry.prepare_end(result.txn, false);
+        if (ticket.finisher) {
+            bool cleanup_ok = true;
+            try { ggml_sycl_abort_owner_effects(ticket.token); } catch (...) { cleanup_ok = false; }
+            (void) registry.finalize_end(ticket, cleanup_ok);
+        }
+        txn->id = 0;
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
-    const auto result = ggml_sycl::lifecycle::global_registry().enter_nested({txn.id});
-    if (result == ggml_sycl::lifecycle::error::OK) ggml_sycl_model_loading_effects(true, false);
-    return ggml_sycl_lifecycle_c_result(result);
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    const auto result = registry.enter_nested({txn.id});
+    if (result != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result);
+    try {
+        ggml_sycl_model_loading_effects(true, false);
+        return GGML_SYCL_LIFECYCLE_OK;
+    } catch (...) {
+        (void) registry.poison({txn.id});
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
         ggml_sycl_load_txn txn, bool explicit_success, ggml_sycl_model_token * model) {
     auto & registry = ggml_sycl::lifecycle::global_registry();
-    if (!registry.transaction_active({txn.id})) {
-        (void) registry.poison({txn.id});
-        return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    ggml_sycl::lifecycle::finish_ticket ticket;
+    try {
+        ticket = registry.prepare_end({txn.id}, explicit_success, model != nullptr);
+        if (!ticket.finisher) {
+            if (ticket.replay.committed) {
+                if (!model) return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+                ggml_sycl_export_token(ticket.replay.token, model);
+            }
+            return ggml_sycl_lifecycle_c_result(ticket.replay.token.model.value ? ticket.replay.code : ticket.code);
+        }
+
+        g_sycl_abort_load_exit = !ticket.commit;
+        ggml_sycl_model_loading_effects(false, ticket.outer);
+        g_sycl_abort_load_exit = false;
+        if (!ticket.commit) {
+            ggml_sycl_abort_owner_effects(ticket.token);
+            return ggml_sycl_lifecycle_c_result(registry.finalize_end(ticket, true).code);
+        }
+
+        ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot);
+        const auto publication = ggml_sycl_lifecycle_publication_snapshot();
+        auto state = std::make_shared<const ggml_sycl::lifecycle::ModelState>(
+            ggml_sycl::lifecycle::ModelState{ticket.token, ggml_sycl::lifecycle::model_phase::LIVE,
+                publication.planned_host_bytes, publication.actual_host_bytes, publication.verdict});
+        const auto result = registry.finalize_end(ticket, true, publication, std::move(state));
+        if (result.committed) ggml_sycl_export_token(result.token, model);
+        return ggml_sycl_lifecycle_c_result(result.code);
+    } catch (...) {
+        g_sycl_abort_load_exit = false;
+        if (ticket.finisher) {
+            try { ggml_sycl_abort_owner_effects(ticket.token); } catch (...) { }
+            (void) registry.finalize_end(ticket, false);
+        }
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
-    const bool outer = registry.is_outer_exit({txn.id});
-    const bool will_commit = explicit_success && registry.ready_to_commit({txn.id});
-    g_sycl_abort_load_exit = !will_commit;
-    ggml_sycl_model_loading_effects(false, outer);
-    g_sycl_abort_load_exit = false;
-    auto result = registry.end({txn.id}, explicit_success);
-    if (result.committed) {
-        ggml_sycl_export_token(result.token, model);
-        ggml_sycl::unified_cache_note_model_load_end(result.token.owner.slot);
-    } else if (result.outer && result.token.owner.slot < ggml_sycl::MODEL_SLOT_COUNT) {
-        // Abort owns only this transaction's attributed rows/entries. Never
-        // publish LIVE/last-success and never sweep another live model.
-        (void) ggml_sycl_release_host_weight_extras_for_slot(result.token.owner.slot);
-        (void) ggml_sycl::unified_cache_release_model_slot(result.token.owner.slot);
-        ggml_sycl_reset_model_load_scratch_state();
-    }
-    return ggml_sycl_lifecycle_c_result(result.code);
 }
 
 void ggml_backend_sycl_set_model_loading(bool loading) {
     // Legacy callers receive abort-default semantics and no last-success token.
+    GGML_LOG_WARN("[SYCL] deprecated bool model-load boundary called (%s); transaction is abort-default; migrate to explicit begin/end\n",
+                  loading ? "begin" : "end");
     static thread_local ggml_sycl_load_txn legacy{};
     static thread_local uint64_t depth = 0;
     if (loading) {
         const auto rc = depth == 0 ? ggml_backend_sycl_model_load_begin(&legacy)
                                    : ggml_backend_sycl_model_load_enter_nested(legacy);
         if (rc == GGML_SYCL_LIFECYCLE_OK) ++depth;
+        else GGML_LOG_ERROR("[SYCL] deprecated model-load begin failed: result=%d\n", (int) rc);
     } else if (depth != 0) {
-        (void) ggml_backend_sycl_model_load_end(legacy, false, nullptr);
+        const auto rc = ggml_backend_sycl_model_load_end(legacy, false, nullptr);
+        if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED) {
+            GGML_LOG_ERROR("[SYCL] deprecated model-load abort failed: result=%d\n", (int) rc);
+        }
         if (--depth == 0) legacy = {};
     }
 }
@@ -9431,9 +9519,8 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
             GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
         }
-        uint32_t owner_slot;
-        owner_slot = ggml_sycl::lifecycle::global_registry().current_active_slot().slot;
-        sycl_host_weight_extra_entry new_entry{ tensor, extra, owner_slot };
+        const auto owner = ggml_sycl::lifecycle::global_registry().current_active_token();
+        sycl_host_weight_extra_entry new_entry{ tensor, extra, owner };
         auto                         insert = g_sycl_host_weight_extras.emplace(key, new_entry);
         if (!insert.second) {
             sycl_host_weight_extra_entry & existing = insert.first->second;

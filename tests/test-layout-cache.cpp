@@ -49,8 +49,12 @@ static const char * usage_name(tensor_usage usage) {
 
 static void reset_layout_choices() {
     ggml_sycl::test_clear_host_weight_registry();
-    ggml_backend_sycl_set_model_loading(true);
-    ggml_backend_sycl_set_model_loading(false);
+    ggml_sycl_load_txn load{};
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK &&
+        ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_unloaded_token(model);
+    }
 }
 
 static bool expect_usage(const char * label, tensor_usage got, tensor_usage expected) {
@@ -574,13 +578,16 @@ static bool test_layout_ptr_eviction_guard(int device_id) {
 static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
     GGML_UNUSED(device_id);
 
-    ggml_backend_sycl_set_model_loading(true);
+    ggml_sycl_load_txn load{};
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_begin(&load) != GGML_SYCL_LIFECYCLE_OK) return false;
     ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
     const size_t               size      = 128ULL * 1024ULL * 1024ULL;  // 128MB
     ggml_backend_buffer_t      buffer    = ggml_backend_buft_alloc_buffer(host_buft, size);
-    ggml_backend_sycl_set_model_loading(false);
+    if (ggml_backend_sycl_model_load_end(load, true, &model) != GGML_SYCL_LIFECYCLE_OK) return false;
 
     if (buffer == nullptr) {
+        (void) ggml_backend_sycl_model_unloaded_token(model);
         fprintf(stderr, "test_model_load_host_buffer_avoids_pinned: allocation failed\n");
         return false;
     }
@@ -588,6 +595,7 @@ static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
     void *             ptr   = ggml_backend_buffer_get_base(buffer);
     const sycl::usm::alloc typ = sycl::get_pointer_type(ptr, dpct::get_in_order_queue().get_context());
     ggml_backend_buffer_free(buffer);
+    (void) ggml_backend_sycl_model_unloaded_token(model);
 
     if (typ == sycl::usm::alloc::host || typ == sycl::usm::alloc::shared) {
         fprintf(stderr, "test_model_load_host_buffer_avoids_pinned: got USM alloc type %d\n", (int) typ);
@@ -599,12 +607,14 @@ static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
 
 static bool test_model_load_preload_caches_weight(int device_id) {
     ggml_sycl::test_clear_host_weight_registry();
-    ggml_backend_sycl_set_model_loading(true);
+    ggml_sycl_load_txn load{};
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_begin(&load) != GGML_SYCL_LIFECYCLE_OK) return false;
 
     ggml_backend_t backend = ggml_backend_sycl_init(device_id);
     if (!backend) {
         fprintf(stderr, "test_model_load_preload_caches_weight: backend init failed\n");
-        ggml_backend_sycl_set_model_loading(false);
+        (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
         return false;
     }
 
@@ -614,7 +624,7 @@ static bool test_model_load_preload_caches_weight(int device_id) {
     params.no_alloc   = true;
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        ggml_backend_sycl_set_model_loading(false);
+        (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
         ggml_backend_free(backend);
         fprintf(stderr, "test_model_load_preload_caches_weight: ctx init failed\n");
         return false;
@@ -627,7 +637,7 @@ static bool test_model_load_preload_caches_weight(int device_id) {
     const size_t weight_size             = ggml_backend_buft_get_alloc_size(host_buft, weight);
     ggml_backend_buffer_t weight_buf     = ggml_backend_buft_alloc_buffer(host_buft, weight_size);
     if (!weight_buf) {
-        ggml_backend_sycl_set_model_loading(false);
+        (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
         ggml_free(ctx);
         ggml_backend_free(backend);
         fprintf(stderr, "test_model_load_preload_caches_weight: buffer alloc failed\n");
@@ -646,7 +656,7 @@ static bool test_model_load_preload_caches_weight(int device_id) {
     std::vector<uint8_t> weight_data(ggml_nbytes(weight), 0);
     ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
 
-    ggml_backend_sycl_set_model_loading(false);
+    if (ggml_backend_sycl_model_load_end(load, true, &model) != GGML_SYCL_LIFECYCLE_OK) return false;
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device_id);
     ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(weight, device_id);
@@ -655,12 +665,14 @@ static bool test_model_load_preload_caches_weight(int device_id) {
         ggml_backend_buffer_free(weight_buf);
         ggml_free(ctx);
         ggml_backend_free(backend);
+        (void) ggml_backend_sycl_model_unloaded_token(model);
         return false;
     }
 
     ggml_backend_buffer_free(weight_buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
+    (void) ggml_backend_sycl_model_unloaded_token(model);
     return true;
 }
 

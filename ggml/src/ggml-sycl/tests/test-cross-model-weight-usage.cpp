@@ -9,7 +9,7 @@
 // end-to-end through the REAL production API:
 // ggml_backend_sycl_register_weight_usage() / ggml_sycl_get_tensor_usage()
 // (g_sycl_weight_usages, ggml-sycl.cpp), bracketed by the REAL load
-// boundary, ggml_backend_sycl_set_model_loading(), whose depth==0 branch now
+// boundary, ggml_backend_sycl_model_load_begin(), whose outer branch
 // calls ggml_sycl_reset_model_load_scratch_state() (the fix under test).
 //
 // The bug: ggml_backend_sycl_register_weight_usage() only *emplaces* a
@@ -93,7 +93,9 @@ int main() {
     }
 
     // ---- Model A --------------------------------------------------------
-    ggml_backend_sycl_set_model_loading(true);
+    ggml_sycl_load_txn load_a{};
+    ggml_sycl_model_token model_a{};
+    check(ggml_backend_sycl_model_load_begin(&load_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle begin");
 
     // Check 1 (positive control): first-sight registration of a name unique
     // to this run classifies correctly. Failing this means the harness
@@ -118,10 +120,12 @@ int main() {
     // A name every architecture reuses verbatim with a CONSISTENT usage.
     ggml_backend_sycl_register_weight_usage("zzz_test_consistent", GGML_SYCL_TENSOR_USAGE_NORM);
 
-    ggml_backend_sycl_set_model_loading(false);
+    check(ggml_backend_sycl_model_load_end(load_a, true, &model_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle commit");
 
     // ---- Model B: a DIFFERENT, unrelated model in the SAME process ------
-    ggml_backend_sycl_set_model_loading(true);
+    ggml_sycl_load_txn load_b{};
+    ggml_sycl_model_token model_b{};
+    check(ggml_backend_sycl_model_load_begin(&load_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle begin");
 
     // Check 3 (negative control): the reused name, registered fresh with
     // the SAME usage as model A, must still read correctly after the reset.
@@ -139,9 +143,10 @@ int main() {
     check(usage_of(ctx, "zzz_test_tied") == tensor_usage::EMBEDDING,
           "check 4: model B's shared name gets its OWN usage, not model A's stale UNKNOWN");
 
-    ggml_backend_sycl_set_model_loading(false);
-
+    check(ggml_backend_sycl_model_load_end(load_b, true, &model_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle commit");
     ggml_free(ctx);
+    (void) ggml_backend_sycl_model_unloaded_token(model_b);
+    (void) ggml_backend_sycl_model_unloaded_token(model_a);
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
