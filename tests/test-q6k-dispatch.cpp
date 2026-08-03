@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <cmath>
 #include <vector>
 #include <random>
@@ -38,17 +39,53 @@
 #define QI8_1 (QK8_1 / 4)
 #endif
 
-// Helpers copied from test-mmvq-q6k-soa-rowslice.cpp for a Q8_1 positive control.
-static inline int get_int_from_int8_aligned(const int8_t* x8, const int i32) {
-    return *((const int*)(x8 + sizeof(int) * i32));
+// Portable packed-byte helpers for the Q8_1 positive control.
+static constexpr uint32_t assemble_u32_le(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    return static_cast<uint32_t>(b0) |
+           (static_cast<uint32_t>(b1) << 8) |
+           (static_cast<uint32_t>(b2) << 16) |
+           (static_cast<uint32_t>(b3) << 24);
 }
 
-static inline int get_int_from_uint8(const uint8_t* x8, const int i32) {
-    const uint16_t* x16 = (const uint16_t*)(x8 + sizeof(int) * i32);
-    int x32 = 0;
-    x32 |= x16[0];
-    x32 |= (int)x16[1] << 16;
-    return x32;
+static inline uint32_t load_u32_le(const uint8_t * bytes, int i32) {
+    bytes += 4 * i32;
+    return assemble_u32_le(bytes[0], bytes[1], bytes[2], bytes[3]);
+}
+
+static inline uint32_t load_u32_le(const int8_t * bytes, int i32) {
+    bytes += 4 * i32;
+    return assemble_u32_le(
+        static_cast<uint8_t>(bytes[0]), static_cast<uint8_t>(bytes[1]),
+        static_cast<uint8_t>(bytes[2]), static_cast<uint8_t>(bytes[3]));
+}
+
+static constexpr int signed_byte_lane(uint32_t packed, int lane) {
+    return ((packed >> (8 * lane)) & 0xffu) < 0x80u
+        ? static_cast<int>((packed >> (8 * lane)) & 0xffu)
+        : static_cast<int>((packed >> (8 * lane)) & 0xffu) - 0x100;
+}
+
+static constexpr int q6_lane(uint32_t vl, uint32_t vh, int nibble, int lane) {
+    return static_cast<int>(
+        ((vl >> (8 * lane + 4 * nibble)) & 0x0fu) |
+        (((vh >> (8 * lane + 4 * nibble)) & 0x03u) << 4)) - 32;
+}
+
+static bool q6k_positive_control_helper_known_vector() {
+    const uint8_t ql[4] = { 0x10, 0x32, 0x54, 0x76 };
+    const uint8_t qh[4] = { 0x20, 0x10, 0x30, 0x00 };
+    const int8_t qs[4] = { -128, -1, 0, 127 };
+    const uint32_t packed_ql = load_u32_le(ql, 0);
+    const uint32_t packed_qh = load_u32_le(qh, 0);
+    const uint32_t packed_qs = load_u32_le(qs, 0);
+
+    return packed_ql == 0x76543210u && packed_qh == 0x00301020u && packed_qs == 0x7f00ff80u &&
+           q6_lane(packed_ql, packed_qh, 1, 0) == 1 &&
+           q6_lane(packed_ql, packed_qh, 1, 1) == -13 &&
+           q6_lane(packed_ql, packed_qh, 1, 2) == 21 &&
+           q6_lane(packed_ql, packed_qh, 1, 3) == -25 &&
+           signed_byte_lane(packed_qs, 0) == -128 && signed_byte_lane(packed_qs, 1) == -1 &&
+           signed_byte_lane(packed_qs, 2) == 0 && signed_byte_lane(packed_qs, 3) == 127;
 }
 
 static float cpu_vec_dot_q6_K_q8_1(const block_q6_K* bq6_K, const block_q8_1* bq8_1, int iqs) {
@@ -56,27 +93,22 @@ static float cpu_vec_dot_q6_K_q8_1(const block_q6_K* bq6_K, const block_q8_1* bq
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int vl = get_int_from_uint8(bq6_K->ql, iqs);
-    const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const uint32_t vl = load_u32_le(bq6_K->ql, iqs);
+    const uint32_t vh = load_u32_le(
+        bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
 
     const int8_t* scs = bq6_K->scales + scale_offset;
 
     float sumf = 0.0f;
     for (int i = 0; i < QR6_K; ++i) {
         const int sc = scs[4 * i];
-        const int u = get_int_from_int8_aligned(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        const uint32_t u = load_u32_le(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
         const float d8 = ggml_fp16_to_fp32(bq8_1[bq8_offset + 2*i].d);
-
-        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int8_t* vil_bytes = (const int8_t*)&vil;
-        const int8_t* vih_bytes = (const int8_t*)&vih;
-        const int8_t* u_bytes = (const int8_t*)&u;
 
         int dp4a_result = 0;
         for (int j = 0; j < 4; ++j) {
-            int vi_j = (vil_bytes[j] | vih_bytes[j]) - 32;
-            dp4a_result += vi_j * u_bytes[j];
+            const int vi_j = q6_lane(vl, vh, i, j);
+            dp4a_result += vi_j * signed_byte_lane(u, j);
         }
 
         sumf += d8 * (dp4a_result * sc);
@@ -767,6 +799,11 @@ int main(int argc, char** argv) {
     printf("========================================\n");
     printf("Q6_K Dispatch Unit Test\n");
     printf("========================================\n\n");
+
+    if (!q6k_positive_control_helper_known_vector()) {
+        printf("FAIL: Q6_K positive-control packed-byte helper known vector failed\n");
+        return 1;
+    }
 
     // Check environment
     const char * disable_graph = getenv("GGML_SYCL_DISABLE_GRAPH");
