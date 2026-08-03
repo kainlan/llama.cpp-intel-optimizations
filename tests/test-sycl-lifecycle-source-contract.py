@@ -79,10 +79,11 @@ checks = {
             "lifecycle_abort_placement_plan",
         )
     ),
-    "transaction-local load candidate": re.search(r"thread_local\s+uint64_t\s+g_load_candidate_txn_id", backend)
-    is not None
-    and "lifecycle_find_candidate_placement_plan(g_load_candidate_txn_id)" in backend
-    and "g_load_candidate_txn_id = have_plan ? active_plan_owner.load.value : 0" in backend
+    "keyed transaction-local load candidate": "thread_local std::vector<candidate_binding> candidate_bindings" in cpp
+    and "global_registry().bound_candidate()" in backend
+    and "registry->bind_candidate(result.txn)" in backend
+    and "registry_.unbind_candidate(txn_)" in backend
+    and "g_load_candidate_txn_id" not in backend
     and "ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr)" not in backend
     and "ggml_sycl_reset_model_load_scratch_state(true)" in backend
     and "lifecycle_stage_no_placement_plan(token.load.value" in backend
@@ -265,7 +266,7 @@ checks = {
     "fallible pre-finalize restoration": backend.index("teardown_owner_effects(owner)")
     < backend.index("finalize_teardown(ticket, true)"),
     "busy quarantine queues before defer": backend.index("if (!ggml_sycl_quarantine_enqueue(token))")
-    < backend.index("(void) registry.defer_quarantine(owner)"),
+    < backend.index("registry.defer_quarantine(owner)"),
     "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
     < backend.index("registry->finalize_end(ticket, true, publication"),
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
@@ -275,15 +276,17 @@ checks = {
     "durable quarantine reaper": all(
         x in backend
         for x in (
-            "g_sycl_quarantine_tokens",
-            "ggml_sycl_quarantine_reap",
+            "g_sycl_quarantine_queue",
+            "g_sycl_quarantine_queue.take_all",
+            "g_sycl_quarantine_queue.enqueue",
             "model_quarantine_token",
         )
     ),
     "late poison cleanup authority": "cleanup_required" in hpp
     and "finalize_cleanup" in cpp,
     "exact quarantine validation": "is_quarantined" in hpp
-    and "slot_generation == token.slot_generation" in backend,
+    and "tokens_[i] == token" in cpp
+    and "operator==(ModelToken a, ModelToken b)" in hpp,
     "no all-device graph sweep": "release_graph_replay_leases_all_devices"
     not in backend,
     "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend

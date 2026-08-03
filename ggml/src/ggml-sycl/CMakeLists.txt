@@ -189,13 +189,14 @@ if (BUILD_TESTING)
         add_test(NAME sycl-lifecycle-h10-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
     endforeach()
     add_test(NAME sycl-lifecycle-multi-model COMMAND test-sycl-lifecycle-load-txn --case multi-model --case sequential-aba)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     foreach(_mutation M1 M2 M3)
         add_test(NAME sycl-lifecycle-mutation-${_mutation}
-            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-mutations.sh
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-mutations.py
                     $<TARGET_FILE:test-sycl-lifecycle-load-txn> ${_mutation})
     endforeach()
 
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
 endif()
