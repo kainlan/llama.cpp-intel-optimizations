@@ -143,29 +143,34 @@ bare slot masks, process-global load/planner scratch, per-device pending-KV FIFO
 and all-device graph cleanup do not satisfy it.
 
 The concise rule is: allocation identity, semantic owner, and asynchronous use
-are three different things. A `mem_handle` identifies/leases an allocation; the
-model/context/session/graph identities say who may reset it; and an event-held
-execution lease says when async work is finished. A submit must retain every
-handle and `(device, ModelId, ContextId, GraphEpoch)` execution lease until its
-terminal event, not merely until the host function returns. Same-device
-inference must serialize or reject before mutable arena state is touched;
-multiple LIVE model objects and sequential A→B→A remain required and do not
-imply overlapping inference support.
+are three different things. One exclusive top-level token per device is acquired
+before mutable arena work, copied into every submit, and retained through the
+final join event. Same-owner reentrancy copies it; incompatible work returns
+BUSY or waits outside locks; multi-device acquisition is ascending/all-or-none.
+Multiple LIVE model objects and sequential A→B→A remain required and do not
+imply overlapping same-device inference.
+
+Every async pointer also has a backing lifetime. Bare `DIRECT` is rejected for
+async work unless paired with a validated owner/backing lease; ARENA handles
+retain their arena/chunk generation lease. A retiring `GraphEpoch` completion
+releases only that old epoch's resources and cannot mutate the replacement
+context/session/epoch.
 
 Loads are explicit abort-default transactions. Nested calls share one
-`LoadTxnId`; only a successful outermost commit publishes LIVE. Any nested
-failure, cancellation, protocol mismatch, or missing success rolls back only
-that transaction. Reset, graph clear, and teardown target exact owners and
-never sweep another model/context/device merely because the current structures
-lack attribution.
+`LoadTxnId`; only a successful outermost commit publishes LIVE. Wrong txn,
+depth underflow, cancellation, failure, or missing success rolls back exactly
+once. IDs/generations never wrap. The 33rd live slot returns a typed,
+side-effect-free error before LOADING; unattributed fallback is not allowed.
+Context/session/graph state machines and resets target exact owners.
 
-Locks follow identity/load → model/context/graph → cache metadata → zone
-allocator. No event/queue wait, blocking device call, callback, or final handle
-destruction occurs under any of those locks. Tier verdicts are immutable
-reporting keyed to the load/model and never dispatch or reset authorities. See
-canonical §12.8-§12.10 for per-child requirements (`nn6z`, `nlww`, `vbeb`,
-`y36c`, `t5nq`, `h5m4`, `x3ou`, final census `hcyp`), exact tests, mutations,
-and the phased source plan.
+Locks follow lifecycle/ID → device execution → model/context/session/graph →
+cache metadata → zone allocator, with deterministic same-rank ordering; the
+completion queue lock is isolated. No wait, blocking device call, callback, or
+final handle/token/backing destruction occurs under them. Tier verdicts are
+reporting-only. Canonical §12.8-§12.10 defines the non-overlapping child DAG
+(`nn6z → nlww → vbeb → h5m4 → y36c`, `t5nq` before teardown), G1 ownership,
+legacy supersession, exact H1-H12/G1-G6 fixtures/tests, executable M1-M8
+mutations, and final census `hcyp`.
 
 ## Path-scoped zone sizing
 

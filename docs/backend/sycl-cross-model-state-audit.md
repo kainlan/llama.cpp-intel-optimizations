@@ -206,34 +206,43 @@ awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.
 | plan, tensor inventory, load diagnostics, temporary registrations | `LoadTxnId` until commit, then `ModelId` | rollback transaction only; never “clear current model” globally |
 | bounded weight owner slot | `ModelId` + `(slot, SlotGeneration)` | remove exact owner; preserve shared entry and all live/event leases |
 | KV/RUNTIME/SCRATCH/oneDNN/staging | `ContextId`; KV rows also `SessionId` | exact context/session only; whole-device reset must refuse |
-| recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | stale clear/callback rejected; old epoch drains its own terminal event |
-| async kernel/copy lifetime | exact mem handles plus `(device, ModelId, ContextId, GraphEpoch)` execution lease | release on terminal event, never host-submit return |
+| recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
+| async kernel/copy lifetime | exact mem/backing handles plus the copied top-level `(device, ModelId, ContextId, GraphEpoch, invocation)` token | one exclusive token/device; release only after final join, never host-submit return |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
 
-The required lock rank is identity/load registry → model/context/graph registry →
-unified-cache metadata → zone allocator metadata. Event/queue waits, callbacks,
-blocking device calls, and final handle destruction are forbidden while any
-ranked lock is held. Audit evidence must include deterministic lock-rank and
-wait-under-lock positive controls, not merely an absence grep.
+IDs/generations are checked and nonwrapping. Slot 33 fails with typed
+`SLOT_EXHAUSTED` before LOADING and without registry/planner/reset side effects;
+it cannot fall back to unattributed ownership. Context, session, and graph state
+machines and stale completion behavior are canonical §12.2.
+
+The concrete ranks are lifecycle/ID (L1) → per-device execution registry (L2) →
+model/context/session/graph (L3) → cache metadata/`rw_mutex_` (L4) → zone/chunk
+allocator (L5), with stable same-rank key ordering. The completion-queue lock is
+isolated and never co-held. Event/queue waits, callbacks, blocking device calls,
+and final handle/token/backing-lease destruction are forbidden under every lock.
+Audit evidence includes every M7 variant, not merely an absence grep.
 
 ### Child and final-census gates
 
 | Child | Audit must prove |
 |---|---|
-| `nn6z` | transaction identity, checked nesting, abort-default rollback, generated slots, A→B→A |
-| `nlww` | context/session-keyed KV and arena state; no device FIFO attribution |
-| `vbeb` | epoch-keyed record/replay and same-device terminal-event execution lease |
-| `y36c` | owner-targeted reset/teardown; no all-device graph clear |
-| `t5nq` | lock rank and no waits/final destruction under locks |
-| `h5m4` | every raw pointer consumer has a handle lease through terminal event |
+| `nn6z` | transaction identity, checked nesting, typed side-effect-free exhaustion, nonwrapping IDs, A→B→A; owns G1 |
+| `nlww` | context/session state machines and keyed KV/arena state; no device FIFO attribution |
+| `vbeb` | graph state machine, retiring-epoch isolation, one top-level token/device, reentrant/busy/wait/multi-device/final join |
+| `h5m4` | submit payload retains allocation/backing leases; async bare DIRECT rejected and ARENA backing required |
+| `t5nq` | concrete lock inventory/tie-break and wait/callback/blocking/final-destruction prohibitions |
+| `y36c` | owner-targeted reset/teardown consumes `vbeb` + `h5m4`; no all-device graph clear |
 | `x3ou` | all tier-verdict readers are reporting-only |
 | `hcyp` | final parser census regenerated at implementation HEAD and reconciled against all identities |
 
-The exact host/GPU test commands and mutation matrix M1-M8 are canonical §12.9
-and are incorporated here by reference rather than duplicated. In particular,
-multiple LIVE models and sequential A→B→A are separate gates; neither proves
-same-device overlapping execution, which must serialize/reject through the
-terminal-event lease.
+Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
+vbeb → h5m4 → y36c`, with `t5nq` also preceding `y36c`; it maps and supersedes
+overlapping `32dg8.15.10/.12/.13`, `0qlw`, `2wv5`, and `k7b0` lifecycle work.
+The exact H1-H12/G1-G6 commands, reproducible hash-checked model fixtures,
+same-physical-device assertions, and executable/restoring M1-M8 hooks are
+canonical §12.9. Multiple LIVE models and sequential A→B→A are separate gates;
+neither proves overlapping execution, which must serialize/reject through the
+final-join-held token.
 
 **Census status now:** the checked-in inventory remains the historical
 `5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
