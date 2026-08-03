@@ -24,10 +24,13 @@ in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
 pointer/reference-to-function and pointer-to-member function/data objects
 (including arrays) remain census objects. Function-type `using` aliases are
-resolved through namespace-qualified identities and alias chains: direct alias
-declarations remain excluded as functions, indirect pointer/reference objects
-are included, and unresolved qualified aliases or invalid array-of-function
-alias uses fail closed. Object aliases also carry top-level binding cv through
+resolved through namespace-qualified identities and alias chains. Lookup is
+position-aware: only aliases declared before a declaration are visible, so a
+later same-name alias cannot retroactively shadow an earlier binding. Relative
+qualified names search enclosing namespace prefixes before global scope, while
+leading `::` remains absolute. Direct alias declarations remain excluded as
+functions, indirect pointer/reference objects are included, and unresolved
+qualified aliases or invalid array-of-function alias uses fail closed. Object aliases also carry top-level binding cv through
 chains and arrays, so an array whose aliased pointer elements are `const` is
 reported immutable.
 The scope walk includes file and named-namespace objects, anonymous-namespace
@@ -101,8 +104,9 @@ pointer-to-member function/data objects and arrays, including exact direct
 class-scope spellings recovered from the pinned grammar's `ERROR` shape. Const
 pointer elements are recognized through array declarators, and all positive
 const-array declarations include compiler-required `={}` initialization.
-Function-type alias fixtures cover qualified identities/chains and cv-bearing
-object aliases while excluding direct function declarations; unresolved aliases
+Function-type alias fixtures cover declaration-position visibility, relative
+and absolute qualified identities/chains, and cv-bearing object aliases while
+excluding direct function declarations; unresolved aliases
 and invalid arrays of aliased function type must fail closed. A `g++ -std=c++17
 -pedantic-errors -fsyntax-only` gate proves the positive fixture declarations
 are compiler-valid. Negative fixtures also require rejection

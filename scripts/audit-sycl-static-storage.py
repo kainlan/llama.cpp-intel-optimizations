@@ -258,68 +258,78 @@ def normalized_identity(value: str):
     return re.sub(r"\s*::\s*", "::", value.strip()).removeprefix("::")
 
 
+def alias_candidates(spelling: str, prefix: str):
+    """Return C++-lookup candidates, preserving leading-:: absolute names."""
+    absolute = spelling.strip().startswith("::")
+    identity = normalized_identity(spelling)
+    if absolute:
+        return [identity]
+    parts = prefix.split("::") if prefix else []
+    candidates = []
+    for count in range(len(parts), -1, -1):
+        candidates.append("::".join([*parts[:count], identity]) if count else identity)
+    return list(dict.fromkeys(candidates))
+
+
+def visible_alias(aliases, candidates, offset):
+    visible = [
+        record for candidate in candidates for record in aliases.get(candidate, ())
+        if record["offset"] < offset
+    ]
+    return max(visible, key=lambda record: record["offset"], default=None)
+
+
 def function_type_aliases(source_b: bytes, root):
-    """Resolve qualified using-aliases and preserve top-level binding mutability."""
-    pending, resolved = {}, {}
-    for item in walk(root):
-        if kind(item) != "alias_declaration":
-            continue
-        name = next((child_item for child_item in children(item) if kind(child_item) == "type_identifier"), None)
-        descriptor = next((child_item for child_item in children(item) if kind(child_item) == "type_descriptor"), None)
+    """Resolve using-aliases by qualified identity and declaration position."""
+    declarations = [item for item in walk(root) if kind(item) == "alias_declaration"]
+    all_identities = set()
+    for item in declarations:
+        name = next((part for part in children(item) if kind(part) == "type_identifier"), None)
+        if name is not None:
+            prefix = namespace_prefix(source_b, item)
+            all_identities.add("::".join(part for part in (prefix, text(source_b, name)) if part))
+
+    aliases = {}
+    for item in declarations:
+        name = next((part for part in children(item) if kind(part) == "type_identifier"), None)
+        descriptor = next((part for part in children(item) if kind(part) == "type_descriptor"), None)
         if name is None or descriptor is None:
             continue
         prefix = namespace_prefix(source_b, item)
-        alias = normalized_identity("::".join(part for part in (prefix, text(source_b, name)) if part))
-        if alias in resolved or alias in pending:
-            pending.pop(alias, None)
-            resolved[alias] = {"status": "unknown", "immutable": False}
-            continue
+        identity = normalized_identity("::".join(part for part in (prefix, text(source_b, name)) if part))
         binding = abstract_binding_node(descriptor)
         if binding is not None:
             binding_kind = kind(binding)
-            status = "function" if binding_kind == "abstract_function_declarator" else "object"
-            immutable = binding_kind == "abstract_reference_declarator" or (
-                binding_kind == "abstract_pointer_declarator" and "const" in direct_qualifiers(source_b, binding)
-            )
-            resolved[alias] = {"status": status, "immutable": immutable}
-            continue
-        dependency = field(descriptor, "type")
-        if dependency is None:
-            dependency = next((part for part in children(descriptor) if kind(part) == "type_identifier"), None)
-        if dependency is not None and (
-            kind(dependency) in {"primitive_type", "sized_type_specifier"}
-            or any(kind(part) == "template_type" for part in walk(dependency))
-        ):
-            resolved[alias] = {
-                "status": "object", "immutable": "const" in direct_qualifiers(source_b, descriptor),
+            info = {
+                "status": "function" if binding_kind == "abstract_function_declarator" else "object",
+                "immutable": binding_kind == "abstract_reference_declarator" or (
+                    binding_kind == "abstract_pointer_declarator"
+                    and "const" in direct_qualifiers(source_b, binding)
+                ),
             }
-            continue
-        dependency_name = normalized_identity(text(source_b, dependency)) if dependency is not None else None
-        if dependency_name and "::" not in dependency_name and prefix:
-            dependency_name = prefix + "::" + dependency_name
-        pending[alias] = dependency_name
-    changed = True
-    while changed:
-        changed = False
-        for alias, dependency in list(pending.items()):
-            lookup = dependency
-            if lookup not in pending and lookup not in resolved and lookup and "::" in lookup:
-                global_lookup = lookup.rsplit("::", 1)[1]
-                if global_lookup in pending or global_lookup in resolved:
-                    lookup = global_lookup
-            if lookup not in pending and lookup not in resolved:
-                resolved[alias] = {
-                    "status": "unknown" if lookup and "::" in lookup else "object",
-                    "immutable": False,
-                }
-            elif lookup in resolved:
-                resolved[alias] = resolved[lookup]
+        else:
+            dependency = field(descriptor, "type")
+            if dependency is None:
+                dependency = next((part for part in children(descriptor) if kind(part) == "type_identifier"), None)
+            concrete = dependency is not None and (
+                kind(dependency) in {"primitive_type", "sized_type_specifier"}
+                or any(kind(part) == "template_type" for part in walk(dependency))
+            )
+            if concrete:
+                info = {"status": "object", "immutable": "const" in direct_qualifiers(source_b, descriptor)}
+            elif dependency is None:
+                info = {"status": "unknown", "immutable": False}
             else:
-                continue
-            del pending[alias]
-            changed = True
-    resolved.update({alias: {"status": "unknown", "immutable": False} for alias in pending})
-    return resolved
+                candidates = alias_candidates(text(source_b, dependency), prefix)
+                resolved = visible_alias(aliases, candidates, start_byte(item))
+                if resolved is not None:
+                    info = {"status": resolved["status"], "immutable": resolved["immutable"]}
+                elif any(candidate in all_identities for candidate in candidates):
+                    info = {"status": "unknown", "immutable": False}
+                else:
+                    info = {"status": "object", "immutable": False}
+        aliases.setdefault(identity, []).append({**info, "offset": start_byte(item)})
+    return aliases
 
 
 def is_function_declaration(name_node, core):
@@ -340,19 +350,10 @@ def is_function_declaration(name_node, core):
 
 def lookup_alias(source_b: bytes, node, type_node, aliases):
     if type_node is None or kind(type_node) not in {"type_identifier", "qualified_identifier"}:
-        return None, None
-    spelling = normalized_identity(text(source_b, type_node))
-    if "::" in spelling:
-        return aliases.get(spelling), spelling
-    prefix = namespace_prefix(source_b, node)
-    candidates = []
-    parts = prefix.split("::") if prefix else []
-    for count in range(len(parts), -1, -1):
-        candidates.append("::".join([*parts[:count], spelling]) if count else spelling)
-    for candidate in candidates:
-        if candidate in aliases:
-            return aliases[candidate], candidate
-    return None, spelling
+        return None, None, []
+    spelling = text(source_b, type_node)
+    candidates = alias_candidates(spelling, namespace_prefix(source_b, node))
+    return visible_alias(aliases, candidates, start_byte(node)), normalized_identity(spelling), candidates
 
 
 DIRECT_MEMBER_FUNCTION_RE = re.compile(
@@ -416,11 +417,16 @@ def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures
         if not result:
             continue
         name, name_node = result
-        alias_info, type_name = lookup_alias(source_b, decl, type_node, aliases)
+        alias_info, type_name, alias_lookup_candidates = lookup_alias(source_b, decl, type_node, aliases)
         alias_status = alias_info["status"] if alias_info is not None else None
         if alias_info is None and type_node is not None and kind(type_node) == "qualified_identifier":
-            qualifier = type_name.rsplit("::", 1)[0]
-            if any(identity.startswith(qualifier + "::") for identity in aliases):
+            if any(
+                candidate in aliases or any(
+                    identity.startswith(candidate.rsplit("::", 1)[0] + "::")
+                    for identity in aliases
+                )
+                for candidate in alias_lookup_candidates if "::" in candidate
+            ):
                 failures.append((line_of(source_b, decl), f"unproved qualified type alias {type_name}"))
                 continue
         path_kinds = declarator_path_kinds(name_node, core)
@@ -762,6 +768,15 @@ static alias_users::QualifiedChain *cross_namespace_qualified_pointer;
 using ConstPointer = int * const;
 using ConstPointerChain = ConstPointer;
 static ConstPointerChain const_pointer_alias_array[2] = {};
+using F = int;
+namespace N { static F object; using F = int(int); }
+namespace GlobalAliases { using F = int(int); }
+namespace Outer {
+namespace Aliases { using F = int(int); }
+namespace GlobalAliases { using F = int; }
+static Aliases::F direct;
+static ::GlobalAliases::F absolute;
+}
 """
     result = subprocess.run(
         ["g++", "-std=c++17", "-pedantic-errors", "-fsyntax-only", "-x", "c++", "-"],
@@ -878,6 +893,22 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
         assert (row["type"], row["scope"], row["immutable"]) == expected, (name, row)
     assert "alias_hidden_function" not in by_name
     assert "qualified_alias_hidden_function" not in by_name
+
+    position_source = """using F = int;
+namespace N { static F object; using F = int(int); }
+namespace GlobalAliases { using F = int(int); }
+namespace Outer {
+namespace Aliases { using F = int(int); }
+namespace GlobalAliases { using F = int; }
+static Aliases::F direct;
+static ::GlobalAliases::F absolute;
+}
+"""
+    _, position_rows, position_gaps, _, position_failures = parse_source(parser, position_source)
+    assert not position_gaps and not position_failures
+    assert [(row["name"], row["type"], row["scope"], row["immutable"]) for row in position_rows] == [
+        ("object", "F", "namespace:N", False),
+    ]
     same_rows = by_name["same"]
     lines = source.splitlines()
     for row in same_rows:
@@ -937,6 +968,7 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
     }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
           "function-pointer-object-scopes,member-pointer-object-scopes,function-type-aliases,"
+          "declaration-position-aliases,relative-qualified-aliases,"
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
           "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
           "template-lambda-wrong-close,nested-function-lambda-wrong-close,function-alias-array,"
