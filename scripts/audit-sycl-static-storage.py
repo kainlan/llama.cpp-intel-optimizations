@@ -396,22 +396,16 @@ def recovery_coverage(source_b: bytes, root, declarations, recovered_regions):
         function = parsed_function_context(gap)
         if function is None or kind(function) != "function_definition":
             continue
-        body = next((item for item in ancestors(gap) if kind(item) == "compound_statement"), None)
-        if body is None:
-            continue
-        body_span = (start_byte(body), end_byte(body))
-        if body_span in checked_parsed_bodies:
-            continue
-        checked_parsed_bodies.add(body_span)
-        body_children = children(body)
-        parsed_close = next((item for item in reversed(body_children) if kind(item) == "}"), None)
-        if parsed_close is not None and not is_missing(parsed_close):
-            continue
-        body_end = balanced_body_end(masked, start_byte(body), end_byte(body))
-        if body_end is None:
-            failures.append((line_of(source_b, body), "unproved recovery function body"))
-        elif body_end < end_byte(body) and not recovery_tail_is_structurally_parsed(masked, body, body_end):
-            failures.append((line_of(source_b, body_end), "unproved recovery tail after function body"))
+        for body in (item for item in ancestors(gap) if kind(item) == "compound_statement"):
+            body_span = (start_byte(body), end_byte(body))
+            if body_span in checked_parsed_bodies:
+                continue
+            checked_parsed_bodies.add(body_span)
+            body_end = balanced_body_end(masked, start_byte(body), end_byte(body))
+            if body_end is None:
+                failures.append((line_of(source_b, body), "unproved recovery function body"))
+            elif body_end < end_byte(body) and not recovery_tail_is_structurally_parsed(masked, body, body_end):
+                failures.append((line_of(source_b, body_end), "unproved recovery tail after function body"))
 
     for match in re.finditer(rb"\b(?:static|thread_local)\b", masked):
         pos = match.start()
@@ -563,11 +557,14 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
         "namespace-direct-init-recovery": "namespace broken { Widget implicit_global{; }",
         "recovered-function-tail": "static void recovered() { #wat x }\nWidget implicit_global{;",
         "parsed-function-recovery-tail": "static void recovered() { #wat x }\nWidget implicit_global{};",
+        "parsed-function-wrong-close": "static void recovered() { x; x template #if X }\nWidget implicit_global{};",
     }
     for fixture, broken in negative_fixtures.items():
         _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
         assert broken_gaps and broken_failures, f"{fixture} must fail closed"
-        if fixture in {"recovered-function-tail", "parsed-function-recovery-tail"}:
+        if fixture in {
+            "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close"
+        }:
             assert any(reason == "unproved recovery tail after function body" for _, reason in broken_failures)
     audited = (repo / FILES[0]).read_text(encoding="utf-8")
     audited_b, audited_rows, _, _, audited_failures = parse_source(parser, audited)
@@ -589,7 +586,7 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
     }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
-          "parsed-function-recovery-tail,file-tail-scopes")
+          "parsed-function-recovery-tail,parsed-function-wrong-close,file-tail-scopes")
 
 
 def main():
