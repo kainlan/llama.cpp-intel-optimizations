@@ -923,16 +923,18 @@ viu2 ─────────────────────────
 {viu2, 1q72, tudj, o6jx} ───────────────────────────> x3ou (diagnostics)
 
 {1q72, o6jx} --preserve/revalidate--> h5m4 (merged TLS-worker-reset gate)
-{1q72, tudj, o6jx} --preserve/revalidate--> t5nq (merged packed-K-sidecar gate)
+{1q72, tudj, o6jx} --live-gate--> t5nq (OPEN merged reviewed packed-K-sidecar gate)
 32dg8.15.13 (event-returning memory-op surface) ─────> tudj
 {viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
   └──> otry ──> jwy4 ──> k7b0
 hcyp (closed self-test line-drift repair prerequisite) ────────────> jwy4
 ```
 
-This graph is acyclic. Closed `h5m4`/`t5nq` supply merged proof evidence and
-regression gates only; foundation owners must preserve/re-run those gates but do
-not assign them new implementation. `otry` starts only after every foundation
+This graph is acyclic. Closed `h5m4` supplies merged proof evidence. OPEN
+`t5nq` has merged reviewed packed-K-sidecar code but still awaits its live GPU
+failpoint/retry/teardown gate. Both retain focused regression-gate scope only;
+foundation owners must preserve/re-run them without assigning either lifecycle
+foundation implementation. `otry` starts only after every foundation
 and focused child listed above. Final-census owner `jwy4` starts after `otry` and
 closed self-test prerequisite `hcyp`; `k7b0` starts only after `jwy4`.
 
@@ -948,7 +950,7 @@ closed self-test prerequisite `hcyp`; `k7b0` starts only after `jwy4`.
 | `y36c` | pending KV-mask only; consumes `1q72` context/session keys and `o6jx` cleanup hooks | keyed queue/reset tests; no general teardown ownership |
 | `x3ou` | diagnostics/reporting only; consumes immutable snapshots from all foundations | H9/M8 and identity-reporting audit; no lifecycle mutation |
 | `h5m4` | **closed merged gate:** TLS worker reset proof/fix | `1q72`/`o6jx` preserve and revalidate it; no new implementation ownership |
-| `t5nq` | **closed merged gate:** packed-K sidecar event teardown proof/fix | `1q72`/`tudj`/`o6jx` preserve and revalidate it; no new implementation ownership |
+| `t5nq` | **OPEN merged reviewed scope:** packed-K sidecar event teardown proof/fix | consumes `1q72`/`tudj`/`o6jx`; reviewed code is merged, but the live GPU failpoint/retry/teardown gate must pass before closure; no lifecycle-foundation ownership |
 | `otry` | final convergence after all foundations and focused children | integrated payload/lock/teardown convergence corrections |
 | `hcyp` | **closed merged prerequisite:** self-test line-drift repair only | existing parser self-test is green; no final-census ownership |
 | `jwy4` | final audit script/fixtures, generated CSV, source-hash/count prose | consumes `otry` and `hcyp`; refreshes all artifacts atomically at final HEAD |
@@ -980,7 +982,7 @@ new exclusive owner:
 | current bare-slot ownership/reclaim (`0qlw` history) | `viu2` owns generated identity; `o6jx` consumes it |
 | current all-device graph cleanup (`2wv5` history) | `1q72` owns epoch attribution; `o6jx` removes the sweep |
 | current load scratch reset history | mitigation until `viu2` transaction rollback supersedes it; downstream `k7b0` does not own this foundation |
-| merged `h5m4` / `t5nq` | remain TLS-reset and packed-K-sidecar proof/fix gates respectively; never lifecycle foundation owners |
+| merged `h5m4` / `t5nq` | `h5m4` remains a closed TLS-reset gate; `t5nq` is OPEN with merged reviewed packed-K-sidecar code pending its live GPU failpoint/retry/teardown gate; neither owns a lifecycle foundation |
 
 Cross-child changes require an explicit handoff commit from the exclusive owner;
 no duplicate “temporary” token, epoch, reset, or event-lease implementation is
@@ -1105,7 +1107,7 @@ unowned mutable model/context/session/graph/invocation state. The historical
 | P2 context/execution foundation | context/session/graph registries, control extract API, InvocationId/device token/aggregate | `1q72`: H6-H7/H11/H13 and token/epoch GPU gates pass; named handoff to `o6jx` lands |
 | P3 async/lock foundation | event/backing payload, delete oneDNN global registry, logical reservation, exhaustive lock protocol | `tudj`: H7-H8/H12, split M6/M7, backing GPU phases pass; consumes `.15.13` API |
 | P4 teardown foundation | exact-owner model/context/session reset and teardown integration | `o6jx`: begin drain → unlocked wait → L4 extract → unlocked destruction → finish; H3/H5/H14/G2-G5b/M4-M5 pass |
-| P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; merged `h5m4`/`t5nq` gates revalidated |
+| P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; closed `h5m4` is revalidated and OPEN `t5nq` passes its live GPU failpoint/retry/teardown gate |
 | P6 final convergence | integrated foundation + every focused subsystem payload/lock/teardown census | `otry` starts after `o6jx` and all focused children; owns only convergence corrections |
 | P6R reporting | planner/tier API readers within diagnostics scope | `x3ou` proves reporting-only H9/M8 behavior |
 | P7 final audit | `jwy4` script fixtures, CSV, source hashes/count prose after `otry` and closed `hcyp` self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |

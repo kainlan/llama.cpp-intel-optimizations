@@ -190,8 +190,9 @@ Canonical §12.8-§12.10 assigns foundations only to `viu2` (model/load), `1q72`
 `o6jx` (owner-targeted teardown), in that order. Existing focused IDs retain
 their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
 `vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics. Closed
-`h5m4`/`t5nq` remain TLS-reset and packed-K-sidecar proof gates, not foundation
-implementers. Exact tail is `all foundations/focused children → otry → jwy4 →
+Closed `h5m4` remains the TLS-reset proof gate. `t5nq` is OPEN with merged
+reviewed packed-K-sidecar code awaiting its live GPU failpoint/retry/teardown
+gate; it remains a focused gate, not a foundation implementer. Exact tail is `all foundations/focused children → otry → jwy4 →
 k7b0`, with closed self-test line-drift prerequisite `hcyp → jwy4`; `.15.13 →
 tudj` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
 census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split

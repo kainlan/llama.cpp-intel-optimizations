@@ -260,7 +260,7 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `y36c` | focused pending KV-mask consumer only |
 | `x3ou` | focused diagnostics/reporting consumer only |
 | `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
-| `t5nq` | closed packed-K-sidecar-event-teardown gate revalidated by `1q72`/`tudj`/`o6jx`; no implementation ownership |
+| `t5nq` | OPEN with merged reviewed packed-K-sidecar-event-teardown code; awaits live GPU failpoint/retry/teardown gate; consumes `1q72`/`tudj`/`o6jx` and owns no lifecycle foundation |
 | `otry` | final convergence after every foundation and focused child |
 | `hcyp` | closed merged prerequisite: self-test line-drift repair only; no census ownership |
 | `jwy4` | after `otry` and `hcyp`, owns final audit script/fixtures, CSV, source hashes/count prose refresh together |
@@ -269,8 +269,9 @@ H8/M7 must cover every operation/rank and each named lock alias.
 Canonical §12.8 is authoritative. Foundation chain: `viu2 → 1q72 → tudj →
 o6jx`. Focused consumers retain only their subsystem scopes. Exact convergence
 edge: `{viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
-→ otry`; closed
-`h5m4`/`t5nq` are proof gates, not implementers. `32dg8.15.13 → tudj` remains a
+→ otry`; closed `h5m4` and OPEN `t5nq` are focused proof gates, not foundation
+implementers. `t5nq` blocks `otry` until its live GPU failpoint/retry/teardown
+gate passes; its reviewed code is already merged. `32dg8.15.13 → tudj` remains a
 prerequisite. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
 `0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact tail:
 all foundations/focused children → `otry → jwy4 → k7b0`, with closed prerequisite
