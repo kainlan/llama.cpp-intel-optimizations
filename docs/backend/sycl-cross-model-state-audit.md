@@ -181,19 +181,19 @@ Line numbers are review aids and may drift; the symbols/behaviors are the gate.
 
 | Source anchor | Current behavior observed | Contract gap / child |
 |---|---|---|
-| `ggml-sycl.cpp:8986-9006` | process-global allocated/live bitmasks; 32 bare slots; conservative unattributed fallback | no `ModelId` or generation; ABA/attribution work: `nn6z` |
-| `ggml-sycl.cpp:9029-9032` | “current” API returns process-global last-completed slot | not caller/model identity: `nn6z` |
-| `ggml-sycl.cpp:9041-9083` | teardown releases a bare slot, then clears graph replay leases on every device | not owner/epoch targeted: `y36c`, `vbeb` |
-| `ggml-sycl.cpp:9093-9199` | atomic nesting depth; outer entry resets scratch/reserves slot; outer `false` preloads and publishes LIVE | no transaction ID or failure channel; clamp can turn protocol failure into completion: `nn6z` |
-| `ggml-sycl.cpp:9244-9273` | pending KV layer masks are per-device FIFO queues | no context/session attribution: `nlww` |
-| `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
-| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
-| `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
-| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `t5nq` deletes registry and supplies logical generation/refcount reservation; `h5m4` event-retains reservation/backing without mutex ownership |
-| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | blocking allocation/device/final-owner work under metadata lock: `t5nq`, `h5m4` |
-| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/device work must use reserve-create-publish: `t5nq` |
-| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | target snapshot must carry an owner lease: `nlww`, `t5nq` |
-| `common.hpp:4614-4615`, `ggml-sycl.cpp:32784-32791` | `control_host_allocs_mutex` protects a vector whose clear destroys `mem_handle`s while locked | `nlww` extract primitive + `y36c` outside-lock destruction; rank/alias: `t5nq`; terminal retention: `h5m4` |
+| `ggml-sycl.cpp:8986-9006` | process-global allocated/live bitmasks; 32 bare slots; conservative unattributed fallback | no `ModelId` or generation; foundation owner: `viu2` |
+| `ggml-sycl.cpp:9029-9032` | “current” API returns process-global last-completed slot | not caller/model identity: `viu2` |
+| `ggml-sycl.cpp:9041-9083` | teardown releases a bare slot, then clears graph replay leases on every device | not owner/epoch targeted: `1q72`, `o6jx` |
+| `ggml-sycl.cpp:9093-9199` | atomic nesting depth; outer entry resets scratch/reserves slot; outer `false` preloads and publishes LIVE | no transaction ID or failure channel; clamp can turn protocol failure into completion: `viu2` |
+| `ggml-sycl.cpp:9244-9273` | pending KV layer masks are per-device FIFO queues | foundation keys: `1q72`; focused pending-mask migration: `y36c` |
+| `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | model/load foundation: `viu2`; reporting consumer: `x3ou` |
+| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | epoch/token foundation: `1q72`; backing: `tudj`; teardown: `o6jx` |
+| `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | identity: `viu2`; teardown consumer: `o6jx` |
+| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `tudj` owns deletion, logical generation/refcount reservation, and event backing |
+| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | lock/backing foundation: `tudj`; focused MoE consumers use its API |
+| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/lock foundation: `tudj` |
+| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | context owner: `1q72`; lock/backing protocol: `tudj` |
+| `common.hpp:4614-4615`, `ggml-sycl.cpp:32784-32791` | `control_host_allocs_mutex` protects a vector whose clear destroys `mem_handle`s while locked | extract primitive: `1q72`; outside-lock teardown: `o6jx`; rank/retention: `tudj` |
 
 Recheck these anchors without relying on a size-limited index:
 
@@ -250,24 +250,26 @@ H8/M7 must cover every operation/rank and each named lock alias.
 
 | Child | Audit must prove |
 |---|---|
-| `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
-| `nlww` | context/session/reset-epoch registries and state primitives/create/publish; implements named control-host-allocation extract API |
-| `vbeb` | graph/invocation identities, one context/epoch, OPEN/SEALED producer+submit accounting, one token/device, aggregate+quarantine; owns H11/G5a/G7/M6e |
-| `t5nq` | pre-h5 only: deletes global registry, freezes logical generation/refcount acquire/completion API, inventories control mutex; no post-h5 work |
-| `h5m4` | consumes frozen t5 API and event-retains logical oneDNN reservation/backing plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA |
-| `y36c` | teardown integration after h5: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
-| `otry` | final post-y36c convergence owner: payload/lock/teardown census, registry/async-mutex absence, integration fixes |
-| `x3ou` | all tier-verdict readers are reporting-only |
-| `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
+| `viu2` | model/load registry foundation: ModelId, slots/generations, LoadTxnId, checked nesting/rollback |
+| `1q72` | context/session/GraphEpoch foundation, InvocationId/device tokens, aggregate state, control extract API |
+| `tudj` | async backing/event payload, oneDNN logical reservations, exhaustive lock protocol |
+| `o6jx` | owner-targeted model/context/session reset and teardown integration |
+| `nn6z` | focused MoE discovery/popularity consumer only |
+| `nlww` | focused MoE bias/activation consumer only |
+| `vbeb` | focused layer-stream manager consumer only |
+| `y36c` | focused pending KV-mask consumer only |
+| `x3ou` | focused diagnostics/reporting consumer only |
+| `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
+| `t5nq` | closed packed-K-sidecar-event-teardown gate revalidated by `1q72`/`tudj`/`o6jx`; no implementation ownership |
+| `otry` | final convergence after `o6jx` and every focused child |
+| `hcyp` | after main repairs self-test and `otry` converges, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
-Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
-vbeb → h5m4 → y36c → otry`, with explicit `t5nq logical-reservation API →
-h5m4` and `32dg8.15.13 → h5m4` edges. `t5nq` ends at handoff; `y36c` owns
-teardown integration; `otry` starts afterward and owns the final convergence
-census. No edge returns from `otry` to an implementation child. It supersedes stale `32dg8.2` ownership
-assumptions and treats historical `.15.10` as superseded by `nlww`/`y36c` while
-mapping `.15.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
-editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
+Canonical §12.8 is authoritative. Foundation chain: `viu2 → 1q72 → tudj →
+o6jx`. Focused consumers retain only their subsystem scopes. Exact convergence
+edge: `{o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou} → otry`; closed
+`h5m4`/`t5nq` are proof gates, not implementers. `32dg8.15.13 → tudj` remains a
+prerequisite. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
+`0qlw`, `2wv5`, and `k7b0` map to foundations without dual editing or cycles. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
 shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
 M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
 L1-L5/C/D M7 hooks (global-registry absence and cross-thread completion are

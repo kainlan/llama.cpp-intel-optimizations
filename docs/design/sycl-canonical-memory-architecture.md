@@ -290,7 +290,7 @@ for the owning device's cache. A reset proceeds only when the target zone has no
 live registered allocations; otherwise the reset is refused and existing
 allocations are preserved. It must not reset another context's zones. The
 historical `32dg8.2` is preload/placement work, not context-ownership work;
-until target child `nlww` adds explicit context/session ownership keys, callers
+until foundation owner `1q72` adds explicit context/session ownership keys, callers
 must ensure single-active-context per device.
 
 ### 5.3 Multiple models, contexts, and server slots
@@ -305,8 +305,8 @@ Keep these cases separate:
 - Object coexistence does not imply execution concurrency. Each server slot
   would need a distinct context and context-keyed KV/RUNTIME arena reservation;
   that ownership is not implemented yet. `32dg8.15.10` is historical proof/fix
-  work and is superseded as a live owner: target `nlww` owns registry primitives
-  and target `y36c` owns drain/reset/teardown callers.
+  work and is superseded as a live owner: foundation `1q72` owns registry
+  primitives and foundation `o6jx` owns drain/reset/teardown callers.
   `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
   the process-global `g_graph_compute_active` eviction guard
   (`unified-cache.cpp:303`). It is not per-device or per-context state.
@@ -392,8 +392,8 @@ forms above with the understanding that they are scheduled for replacement.
 The lifetime and execution distinctions in §5.3 apply. Contexts sharing a model
 may share its read-only `placement_plan` and WEIGHT entries, but the
 process-global mutex does not make host submission or device execution globally
-serial. Separately, same-device concurrent inference remains unsupported until target `nlww` lands
-explicit context-keyed KV/RUNTIME ownership and target `y36c` lands its
+serial. Separately, same-device concurrent inference remains unsupported until foundation `1q72`
+lands context-keyed KV/RUNTIME ownership and foundation `o6jx` lands its
 owner-targeted callers. Historical `32dg8.15.10` is not the live owner.
 
 ---
@@ -511,7 +511,7 @@ temporarily allowed but must be audited for multi-GPU callers:
 | `llama.cpp-32dg8.15.7` | P7 — Prove planner can predict runtime and scratch allocation demand | §1.1, §5, §6 |
 | `llama.cpp-32dg8.15.8` | P8 — Prove host-resident fallback coverage for spilled subgraphs | §9.2 |
 | `llama.cpp-32dg8.15.9` | P9 — Make 32dg8 implementation beads junior-ready | all |
-| `llama.cpp-32dg8.15.10` | Historical P1-FIX evidence — superseded for live context ownership by `nlww`/`y36c` (§12.8) | §5.1, §5.2, §5.3 |
+| `llama.cpp-32dg8.15.10` | Historical P1-FIX evidence — superseded for live context ownership by `1q72`/`o6jx` (§12.8) | §5.1, §5.2, §5.3 |
 | `llama.cpp-32dg8.15.11` | P2-FIX — `mem_handle` device identity | §1.3, §7.2, §9.4 |
 | `llama.cpp-32dg8.15.12` | P3-FIX — in-flight handle lease lifetime | §1.3, §4 |
 | `llama.cpp-32dg8.15.13` | P4-FIX — canonical event-returning memory ops | §6.2 |
@@ -552,7 +552,7 @@ Observed result: `All threads finished without errors.` The run selected the
 Intel Arc Pro B50 and exercised two concurrent contexts per loaded model.
 
 This is historical smoke proof only; it neither makes `32dg8.15.10` a live
-owner nor closes target `nlww`/`y36c`. It does not prove server slots with
+owner nor closes foundations `1q72`/`o6jx`. It does not prove server slots with
 different context sizes, explicit context-keyed arena ownership, or keyed resets
 for KV/RUNTIME/HOST zones. C1 remains open until the target ownership keys and
 callers land and the test matrix covers different `n_ctx`/slot lifetimes.
@@ -804,7 +804,7 @@ The target lock inventory and mandatory order is concrete:
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
 This table is exhaustive for locks touched by the lifecycle, graph, cache,
-staging, pool, and event-retention paths in scope. `t5nq` must update it in the
+staging, pool, and event-retention paths in scope. Foundation owner `tudj` must update it in the
 same commit when migration introduces or discovers another such lock; an
 unclassified lock is a failing census item, not implicitly L5.
 
@@ -818,12 +818,12 @@ nested with per-device execution locks, and `g_cache_rw_mutex` must be dropped
 before a per-cache L4 lock is acquired. Snapshot/revalidate bridges these cases.
 The target **deletes** `g_onednn_scratch_lock_mutex` and
 `g_onednn_scratch_locks`; no global registry or async payload may store a
-`std::unique_lock`/mutex ownership token. `t5nq` supplies a logical
+`std::unique_lock`/mutex ownership token. Foundation `tudj` supplies a logical
 `onednn_scratch_reservation { device, generation, reservation_id }` API. Acquire
 briefly locks that device's surviving keyed `onednn_scratch_mutex_`, validates
 or creates the current logical generation without allocating, increments its
 reservation refcount, snapshots backing handles, and unlocks on the same thread.
-Growth/allocation remains a two-phase outside-lock operation. `h5m4` retains the
+Growth/allocation remains a two-phase outside-lock operation. `tudj` retains the
 logical reservation and backing handles in each registered event payload.
 Completion may run on another thread: it briefly takes the keyed mutex itself,
 rejects a stale generation/reservation, decrements the refcount, marks the
@@ -906,58 +906,62 @@ load scratch and is not a compliant multi-model routing authority.
 
 ### 12.8 Child DAG, path ownership, and acceptance
 
-No child may claim closure from a log-only or grep-only check. The dependency DAG
-is normative; in particular graph epoch, execution-token, and allocation event
-leases land before teardown consumes them:
+No child may claim closure from a log-only or grep-only check. The four new
+foundation owners are normative; existing focused tracker IDs keep their actual
+subsystem scopes and do not implement lifecycle foundations:
 
 ```text
-nn6z (model/load/slot foundation; owns G1)
-  ├──> nlww (context/session ownership + control-allocation extract API)
-  │      └──> vbeb (GraphEpoch + top-level device token + aggregate seal)
-  │             └──> h5m4 (allocation/backing/control-host event leases)
-  │                    └──> y36c (teardown integration: drain/extract/destroy)
-  │                           └──> otry (final post-integration convergence)
-  └──> x3ou (reporting-only tier verdict)
+viu2 (ModelId/SlotGeneration/LoadTxnId + load registry)
+  └──> 1q72 (ContextId/SessionId/GraphEpoch + execution tokens/aggregate)
+         └──> tudj (async backing leases + oneDNN/lock protocol)
+                └──> o6jx (owner-targeted context/model teardown integration)
 
-32dg8.15.13 (event-returning memory-op surface) ──> h5m4
-t5nq (logical oneDNN reservation/event API) ─────> h5m4
-h5m4 ────────────────────────────────────────────> y36c ──> otry
-main self-test repair ──> hcyp
+viu2 ───────────────────────────────────────────────> nn6z (MoE discovery/popularity)
+{viu2, 1q72, tudj} ─────────────────────────────────> nlww (MoE bias/activation)
+{viu2, 1q72, o6jx} ─────────────────────────────────> vbeb (layer-stream manager)
+{1q72, o6jx} ───────────────────────────────────────> y36c (pending KV-mask)
+{viu2, 1q72, tudj, o6jx} ───────────────────────────> x3ou (diagnostics)
 
-t5nq consumes lock inventories from nn6z/nlww/vbeb and lands the logical oneDNN
-reservation/event API before h5m4 integrates it. `h5m4` consumes that frozen API
-and does not edit its locks. New convergence child `otry` exclusively owns the
-final post-integration payload/lock census and convergence corrections only
-after `y36c` integrates teardown. `t5nq` has no post-h5 work. The exact live
-chain is `t5nq → h5m4 → y36c → otry`; no edge points from `otry` back to an
-implementation child.
-(all implementation children) ──> hcyp final census
+{1q72, o6jx} --preserve/revalidate--> h5m4 (merged TLS-worker-reset gate)
+{1q72, tudj, o6jx} --preserve/revalidate--> t5nq (merged packed-K-sidecar gate)
+32dg8.15.13 (event-returning memory-op surface) ─────> tudj
+{o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou} ──> otry
+main self-test repair + all implementation/convergence children ──> hcyp
 ```
 
-| Child | Exclusive code-path ownership | Required deliverable/evidence |
-|---|---|---|
-| `nn6z` | slot/ID registry; model-load begin/nesting/commit/abort; planner publication | checked nonwrapping IDs, side-effect-free slot exhaustion, rollback; H1-H4, H10, **G1**, M1-M3 |
-| `nlww` | `ContextId`/`SessionId`/`SessionResetEpoch` types and registries; state-transition primitives; context/session create+publish; KV/arena keys; implementation of control-allocation extract primitive | named transition/extract API handoff, nonwrapping/ABA tests; H5-H6, H13-H14, G3-G4 |
-| `vbeb` | `GraphEpoch`/`InvocationId` registries; per-device token acquisition/copy; one-context/epoch per invocation; per-device aggregate retention; record/replay epoch plumbing | retiring isolation, owner-mismatch rejection, quarantine, busy/wait/multi-device; H7, H11, H13, G5a/G6/G7, M6a/M6e |
-| `t5nq` | pre-integration only: delete oneDNN global registry; implement logical generation/refcount reservation acquire/completion API and lock probes; instrument `control_host_allocs_mutex` | sentinel/tie-break, named alias, and every no-under-lock prohibition; H8, M7 |
-| `h5m4` | consumes frozen oneDNN reservation API; event payload retention for reservation/backing handles plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA | allocation lifetime through sealed aggregate completion; control handles remain leased until extraction after drain; H7, H12, rerun G5a, G6/G7, M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d |
-| `y36c` | teardown integration: drain/reset/teardown callers, event-wait/extract/destroy sequence, cache owner removal | consumes `nlww`/`vbeb`/`h5m4`; never edits registry primitives; H3-H6, H14, G2-G4/G5b, M4-M5 |
-| `otry` | final convergence after y36c: event-payload/lock census, verify registry absence/no async mutex ownership, integration corrections | all h5+y36c paths and H8/M7 cross-thread/absence gates; no redesign of frozen t5 API |
-| `x3ou` | tier-verdict record/public reporting and reader audit | no routing/reset readers; H9, M8 |
-| `hcyp` | `scripts/audit-sycl-static-storage.py`, its self-test fixtures, `docs/backend/sycl-static-storage-inventory.csv`, and final census/count prose in this audit | starts after main's self-test repair; refreshes all four artifacts together at final HEAD and makes `--self-test`/`--check` clean |
+This graph is acyclic. Closed `h5m4`/`t5nq` supply merged proof evidence and
+regression gates only; foundation owners must preserve/re-run those gates but do
+not assign them new implementation. `otry` starts only after `o6jx` and every
+focused child listed above.
 
-The `nlww`→`y36c` API handoff is named and exclusive. `nlww` implements
+| Owner | Actual exclusive scope | Required evidence |
+|---|---|---|
+| `viu2` | model/load IDs, slot generations, load nesting/commit/abort, planner publication | H1-H4/H10/G1, M1-M3 |
+| `1q72` | context/session/reset IDs and state; GraphEpoch/InvocationId; device tokens and OPEN/SEALED aggregate; control-allocation registry/extract primitive | H6-H7/H11/H13, G3-G7 token/epoch phases, M6a/M6e |
+| `tudj` | event payload/backing leases, logical oneDNN reservation, exhaustive lock protocol/instrumentation | H7-H8/H12, G5a/G6/G7 backing phases, M6b-d/M7 |
+| `o6jx` | exact-owner model/context/session reset and teardown callers; drain→wait→extract→destroy→finish | H3/H5/H14, G2-G5b, M4-M5 |
+| `nn6z` | MoE discovery/popularity only; consumes `viu2` model/load identity | subsystem tests plus lifecycle identity integration; no registry ownership |
+| `nlww` | MoE bias/activation only; consumes `viu2`/`1q72`/`tudj` APIs | subsystem event/backing tests; no context registry ownership |
+| `vbeb` | layer-stream manager only; consumes model/context identities and `o6jx` teardown hooks | manager teardown tests; no GraphEpoch/token ownership |
+| `y36c` | pending KV-mask only; consumes `1q72` context/session keys and `o6jx` cleanup hooks | keyed queue/reset tests; no general teardown ownership |
+| `x3ou` | diagnostics/reporting only; consumes immutable snapshots from all foundations | H9/M8 and identity-reporting audit; no lifecycle mutation |
+| `h5m4` | **closed merged gate:** TLS worker reset proof/fix | `1q72`/`o6jx` preserve and revalidate it; no new implementation ownership |
+| `t5nq` | **closed merged gate:** packed-K sidecar event teardown proof/fix | `1q72`/`tudj`/`o6jx` preserve and revalidate it; no new implementation ownership |
+| `otry` | final convergence after `o6jx` and all focused children | integrated payload/lock/teardown census and corrections |
+| `hcyp` | audit script/fixtures, generated CSV, final source-hash/count prose | refresh together after implementation/convergence |
+
+The `1q72`→`o6jx` API handoff is named and exclusive. `1q72` implements
 `lifecycle_context_begin_drain(ContextId) -> DrainTicket`,
 `lifecycle_session_begin_reset(ContextId, SessionId, expected_epoch) -> ResetTicket`,
 `lifecycle_session_finish_reset(ResetTicket)`,
 `lifecycle_context_extract_control_host_allocs(DrainTicket) -> ControlAllocBatch`,
-and `lifecycle_context_finish_drain(DrainTicket)`. `y36c` owns every legacy
+and `lifecycle_context_finish_drain(DrainTicket)`. `o6jx` owns every legacy
 free/reset/teardown caller and cleanup sequence that invokes those APIs. The
 mandatory call order is exactly `begin_drain` → wait for all terminal context
 events outside locks → `extract_control_host_allocs` (L4 held only inside the
 call) → destroy returned batch unlocked → `finish_drain`. It does not access
-registry storage or transition state directly; `nlww` does not edit those legacy
-callers. The handoff commit lands before `y36c` starts.
+registry storage or transition state directly; `1q72` does not edit those legacy
+callers. The handoff commit lands before `o6jx` starts.
 
 Overlapping legacy work is superseded for lifecycle acceptance as follows; it
 may supply prerequisites/history but must not edit a path concurrently with its
@@ -965,13 +969,14 @@ new exclusive owner:
 
 | Legacy scope | Superseding owner / boundary |
 |---|---|
-| `32dg8.2` preload/placement consumption | not a lifecycle-ownership owner; `nn6z` supersedes its load/publication ownership assumptions while preserving planner consumption |
-| historical/superseded `32dg8.15.10` model/context proof and §5 guard | `nlww` owns registry primitives/create/publish; `y36c` owns drain/reset/teardown callers through the named API |
-| `32dg8.15.12` in-flight handle lifetime | `h5m4` owns allocation/backing event payload; `vbeb` owns device token/epoch/aggregate |
-| `32dg8.15.13` event-returning memory ops | explicit prerequisite edge to `h5m4`; it owns only the event-returning memory-op surface, then hands it off; `h5m4` exclusively owns lifecycle payload/retention |
-| current bare-slot ownership/reclaim (`0qlw` history) | `nn6z` owns generated identity; `y36c` only consumes it |
-| current all-device graph cleanup (`2wv5` history) | `vbeb` owns epoch attribution; `y36c` removes the sweep after that lands |
-| current load scratch reset (`k7b0` history) | retained as mitigation until `nn6z` transaction rollback supersedes it |
+| `32dg8.2` preload/placement consumption | not lifecycle ownership; `viu2` supersedes load/publication assumptions while preserving planner consumption |
+| historical `32dg8.15.10` context proof/guard | `1q72` owns registry primitives; `o6jx` owns teardown callers |
+| `32dg8.15.12` in-flight handle lifetime | prerequisite evidence consumed by `tudj`; not owned by closed TLS gate `h5m4` |
+| `32dg8.15.13` event-returning memory ops | explicit prerequisite edge to `tudj`, which owns lifecycle payload/retention integration |
+| current bare-slot ownership/reclaim (`0qlw` history) | `viu2` owns generated identity; `o6jx` consumes it |
+| current all-device graph cleanup (`2wv5` history) | `1q72` owns epoch attribution; `o6jx` removes the sweep |
+| current load scratch reset (`k7b0` history) | mitigation until `viu2` transaction rollback supersedes it |
+| merged `h5m4` / `t5nq` | remain TLS-reset and packed-K-sidecar proof/fix gates respectively; never lifecycle foundation owners |
 
 Cross-child changes require an explicit handoff commit from the exclusive owner;
 no duplicate “temporary” token, epoch, reset, or event-lease implementation is
@@ -991,21 +996,21 @@ test names, not claims that they exist now**.
 | H5 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | reset/teardown touches only target model/context/session/epoch |
 | H6 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | stale slot generation and stale/retiring graph callback cannot mutate current state |
 | H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | one bound context/epoch; OPEN/SEALED counters and incomplete per-device terminal sets retain each device's handles/root independently |
-| H8 | host | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-global-registry-absent,onednn-reservation-acquire,onednn-reservation-complete,onednn-reservation-cross-thread-complete,onednn-reservation-stale-generation,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; oneDNN global-registry absence and cross-thread logical completion pass; named MoE/pipeline/backend-context/control-host positive controls fire |
+| H8 | host (`tudj`) | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-global-registry-absent,onednn-reservation-acquire,onednn-reservation-complete,onednn-reservation-cross-thread-complete,onednn-reservation-stale-generation,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; oneDNN global-registry absence and cross-thread logical completion pass; named MoE/pipeline/backend-context/control-host positive controls fire |
 | H9 | host | `ctest --test-dir build -R '^sycl-lifecycle-tier-reporting$' --output-on-failure` | changing verdict changes report only, never route/reset |
-| H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case model-id-overflow --case load-txn-id-overflow --case slot-generation-overflow --case invocation-id-counter-overflow` | 33rd slot is side-effect-free before LOADING; common checked counter refuses InvocationId wrap; model/load IDs never wrap; exhausted slot retires; `nn6z` owns common primitive fixture |
-| H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case invocation-id-overflow --case reentrant --case cross-context-rejected --case cross-epoch-rejected --case busy --case wait-cancel --case multi-device --case aggregate-terminals --case fast-first-terminal-before-final-registration --case join-create-failure --case submit-exception-known --case submit-exception-uncertain` | `vbeb` owns cases; one bound context/epoch, owner mismatch before side effects, one token/device, nonwrapping invocation, OPEN→SEALED gating, registered producer/submit counts, fast-terminal race resistance, independent device roots, and drain/quarantine fallback |
+| H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case model-id-overflow --case load-txn-id-overflow --case slot-generation-overflow --case invocation-id-counter-overflow` | 33rd slot is side-effect-free before LOADING; common checked counter refuses InvocationId wrap; model/load IDs never wrap; exhausted slot retires; `viu2` owns common primitive fixture |
+| H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case invocation-id-overflow --case reentrant --case cross-context-rejected --case cross-epoch-rejected --case busy --case wait-cancel --case multi-device --case aggregate-terminals --case fast-first-terminal-before-final-registration --case join-create-failure --case submit-exception-known --case submit-exception-uncertain` | `1q72` owns cases; one bound context/epoch, owner mismatch before side effects, one token/device, nonwrapping invocation, OPEN→SEALED gating, registered producer/submit counts, fast-terminal race resistance, independent device roots, and drain/quarantine fallback |
 | H12 | host | `./build/bin/test-sycl-lifecycle-event-lease --case bare-direct-rejected --case direct-with-owner --case arena-backing` | async bare DIRECT rejected; matching backing accepted; ARENA reset blocked until all device terminal events |
-| H13 | host | `./build/bin/test-sycl-lifecycle-owner-reset --case context-id-overflow --case session-id-overflow --case session-reset-epoch-overflow --case graph-epoch-overflow --case session-reset-aba` | `nlww` owns context/session/reset cases; `vbeb` owns graph case; all fail closed/nonwrapping and stale reset N cannot finish N+1 |
+| H13 | host | `./build/bin/test-sycl-lifecycle-owner-reset --case context-id-overflow --case session-id-overflow --case session-reset-epoch-overflow --case graph-epoch-overflow --case session-reset-aba` | `1q72` owns all context/session/reset/graph cases; all fail closed/nonwrapping and stale reset N cannot finish N+1 |
 | H14 | host | `./build/bin/test-sycl-lifecycle-owner-reset --case teardown-repeat --case teardown-unknown-model --case teardown-stale-slot-generation --case teardown-unknown-context --case teardown-never-issued-session --case teardown-never-issued-graph-epoch --case teardown-stale-context --case teardown-stale-session --case teardown-stale-graph-epoch` | repeat returns `OK_ALREADY_DEAD` with one original teardown; every unknown/never-issued identity returns `NOT_FOUND`; every stale previously-issued identity returns `STALE_IDENTITY`; all owner snapshots remain unchanged |
-| G1 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure` | `nn6z` owner; one process runs A→B→A on logged/asserted same physical device |
+| G1 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure` | `viu2` owner; one process runs A→B→A on logged/asserted same physical device |
 | G2 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-multi-live$' --output-on-failure` | A remains runnable after B load, injected failed load, and B teardown on same device |
 | G3 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | clearing context/session 1 preserves context/session 2 KV on same device |
 | G4 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | unequal `n_ctx`, interleaved slot lifetime, no cross-reset |
-| G5a | GPU P3/P4 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-token-busy$' --output-on-failure` | `vbeb` owns token phase: delayed terminal keeps second owner `DEVICE_BUSY`; no teardown is called; rerun after `h5m4` P4 payload integration |
-| G5b | GPU P5 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-teardown-wait$' --output-on-failure` | `y36c` owns teardown phase: teardown enters DRAINING, waits outside locks, preserves owners before terminal completion, then reaches DEAD |
+| G5a | GPU P2/P3 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-token-busy$' --output-on-failure` | `1q72` owns token phase: delayed terminal keeps second owner `DEVICE_BUSY`; no teardown is called; rerun after `tudj` async-backing integration |
+| G5b | GPU P5 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-teardown-wait$' --output-on-failure` | `o6jx` owns teardown phase: teardown enters DRAINING, waits outside locks, preserves owners before terminal completion, then reaches DEAD |
 | G6 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | retiring epoch releases old resources but cannot mutate replacement epoch |
-| G7 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICES=0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-multidevice-aggregate$' --output-on-failure` | `vbeb` owner; one ContextId/GraphEpoch across two physical UUIDs, per-device terminal sets; delayed device cannot release either root incorrectly; cross-context injection returns `INVOCATION_OWNER_MISMATCH` |
+| G7 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICES=0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-multidevice-aggregate$' --output-on-failure` | `1q72` owner; one ContextId/GraphEpoch across two physical UUIDs, per-device terminal sets; delayed device cannot release either root incorrectly; cross-context injection returns `INVOCATION_OWNER_MISMATCH` |
 
 The lifecycle GPU CMake registrations must require a reproducible
 `test-sycl-lifecycle-models` fixture with three paths:
@@ -1091,14 +1096,13 @@ historical 5793 census is not accepted as final evidence.
 | Phase | Code paths to migrate | Exit criterion |
 |---|---|---|
 | P0 inventory | slot/load globals, planner scratch, pending KV FIFO, graph clear, cache owner masks | Every mutable site assigned one exclusive owner in §12.8 |
-| P1 transactions | model load begin/nested exit/preload/failure; slot/ID registry | `nn6z`, including G1, exhaustion/overflow, and rollback mutations pass |
-| P2 context ownership | `nlww` types/registries/state primitives/create/publish, KV/RUNTIME/SCRATCH keys, control-host snapshot/extract API | H13 passes; extract handoff lands; no legacy drain/reset caller edited |
-| P3 graph/execution foundation | graph compute, checked InvocationId, one-context/epoch binding, device token, per-device aggregate/quarantine, record/replay/retiring epochs | `vbeb` H11/G5a/G7/M6a/M6e passes, including fast-terminal-before-final-registration; G5a contains no teardown |
-| P3L lock API handoff | delete oneDNN global registry; logical generation/refcount reservation transitions under brief keyed lock | `t5nq` absence/acquire/same- and cross-thread completion H8/M7 pass; frozen API handed to `h5m4`; t5 ends |
-| P4 allocation event foundation | `.15.13` event surface handoff, ordinary I/O/pointer-table/sidecar/control-host, DIRECT/ARENA backing, logical oneDNN reservation/backing | `h5m4` consumes frozen API; H7/H12/G6/G7 and split M6 pass; rerun G5a |
-| P5 teardown integration | `y36c` legacy drain/reset/teardown callers and cache reclaim | consumes P2-P4; begin drain → unlocked terminal wait → L4 extract → unlocked batch destruction → finish; H14 and G5b pass |
-| P5C final convergence | integrated event-payload, teardown, and lock census | `otry` starts only after y36c; proves no global registry/async mutex ownership, runs all H8/M7 gates, owns convergence corrections |
-| P6 reporting | planner/tier API and all readers | `x3ou` proves report-only behavior |
+| P1 model/load foundation | model load begin/nested exit/preload/failure; slot/ID registry | `viu2`: H1-H4/H10/G1 and M1-M3 pass |
+| P2 context/execution foundation | context/session/graph registries, control extract API, InvocationId/device token/aggregate | `1q72`: H6-H7/H11/H13 and token/epoch GPU gates pass; named handoff to `o6jx` lands |
+| P3 async/lock foundation | event/backing payload, delete oneDNN global registry, logical reservation, exhaustive lock protocol | `tudj`: H7-H8/H12, split M6/M7, backing GPU phases pass; consumes `.15.13` API |
+| P4 teardown foundation | exact-owner model/context/session reset and teardown integration | `o6jx`: begin drain → unlocked wait → L4 extract → unlocked destruction → finish; H3/H5/H14/G2-G5b/M4-M5 pass |
+| P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; merged `h5m4`/`t5nq` gates revalidated |
+| P6 final convergence | integrated foundation + every focused subsystem payload/lock/teardown census | `otry` starts after `o6jx` and all focused children; owns only convergence corrections |
+| P6R reporting | planner/tier API readers within diagnostics scope | `x3ou` proves reporting-only H9/M8 behavior |
 | P7 final audit | `hcyp` script fixtures, CSV, source hashes/count prose after main self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
 
 No phase may expose a target identity API as supported current behavior before
