@@ -2907,7 +2907,7 @@ bool unified_cache::planned_materialization_allowed(const char *               o
                                                     const ggml_sycl_cache_id & key,
                                                     ggml_layout_mode           layout,
                                                     const char *               caller) const {
-    const auto plan_owner = coherent_placement_plan_owner(this);
+    const auto plan_owner = coherent_cache_placement_plan_owner(this);
     if (plan_owner->entries.empty()) {
         return true;
     }
@@ -3101,7 +3101,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !!coherent_placement_plan_owner(this)->entries.empty()) {
+    if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3339,7 +3339,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 "[DIRECT-STAGE] begin expert device=%d layout=%d src=%p src_size=%zu dst_size=%zu plan=%d "
                 "arena=%d weight_used=%.1f MB avail=%.1f MB largest=%.1f MB\n",
                 cache_device, (int) layout, src_ptr, src_size, dst_size,
-                !coherent_placement_plan_owner(this)->entries.empty() ? 1 : 0, arena_active() ? 1 : 0,
+                !coherent_cache_placement_plan_owner(this)->entries.empty() ? 1 : 0, arena_active() ? 1 : 0,
                 zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
@@ -3351,7 +3351,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !!coherent_placement_plan_owner(this)->entries.empty()) {
+    if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3367,7 +3367,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
     }
     if (!ptr) {
-        if (!coherent_placement_plan_owner(this)->entries.empty()) {
+        if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {
             static std::atomic<int> planned_stage_fail_log{ 0 };
             if (planned_stage_fail_log.fetch_add(1, std::memory_order_relaxed) < 10) {
                 size_t entry_count         = 0;
@@ -4956,7 +4956,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     // Check VRAM budget and evict if needed.
     // Skip the legacy layout_pool_ when the cache has a placement plan: the arena manages
     // all VRAM allocations in that mode, making pool sub-allocation redundant.
-    const bool skip_pool     = !coherent_placement_plan_owner(this)->entries.empty();
+    const bool skip_pool     = !coherent_cache_placement_plan_owner(this)->entries.empty();
     bool       is_pool_alloc = false;
     void *     device_ptr    = nullptr;
     mem_handle direct_alloc_owner;
@@ -6093,7 +6093,7 @@ void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void unified_cache::unpin_experts() {
-    if (!coherent_placement_plan_owner(this)->entries.empty()) {
+    if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         // Placement-plan experts are model-load residency decisions.  Runtime
         // prestage/LRU helpers must not invalidate those smart-handle routes.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] ignoring expert unpin request while placement plan is active\n");

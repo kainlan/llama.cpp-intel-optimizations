@@ -1035,9 +1035,11 @@ inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycl
 }
 
 class unified_cache;
-// Cross-TU owning read entry point. It performs bounded global/cache/global
-// validation and fails closed to an immutable empty plan on any mismatch.
+std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept;
+// Policy readers retain immutable global authority during cache-first publication.
 std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept;
+// Cache-local readers require exact shared-owner identity and fail closed.
+std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
 
 void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan);

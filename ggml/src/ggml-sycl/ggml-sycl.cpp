@@ -2009,7 +2009,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_globa
 }
 
 static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_global_plan_owner() {
-    return ggml_sycl::coherent_placement_plan_owner(ggml_sycl::get_unified_cache_for_device(0));
+    return ggml_sycl::global_placement_plan_owner();
 }
 
 static bool ggml_sycl_has_global_plan() {
@@ -2017,23 +2017,40 @@ static bool ggml_sycl_has_global_plan() {
 }
 
 namespace ggml_sycl {
-std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept {
+static const std::shared_ptr<const placement_plan> & empty_placement_plan_owner() noexcept {
     static const auto empty = std::make_shared<const placement_plan>();
-    if (!cache) {
-        return empty;
-    }
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        const auto global_first = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
-        if (!global_first || !global_first->plan) {
-            return empty;
-        }
-        const auto cached        = cache->get_placement_plan_snapshot();
-        const auto global_second = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
-        if (global_first.get() == global_second.get() && lifecycle_plan_snapshot_matches(global_first, cached)) {
-            return global_first->plan;
-        }
-    }
     return empty;
+}
+
+std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {
+    const auto authority = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+    return authority && authority->plan ? authority->plan : empty_placement_plan_owner();
+}
+
+std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept {
+    const auto authority = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+    if (!authority || !authority->plan) {
+        return empty_placement_plan_owner();
+    }
+    if (cache) {
+        const auto cached = cache->get_placement_plan_snapshot();
+        if (!lifecycle_plan_snapshot_matches(authority, cached)) {
+            static std::atomic<uint64_t> mismatch_count{ 0 };
+            mismatch_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    // Cache-first/global-last publication makes the old global owner the safe
+    // policy authority until the final store flips to the new owner.
+    return authority->plan;
+}
+
+std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept {
+    if (!cache) {
+        return empty_placement_plan_owner();
+    }
+    const auto authority = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+    const auto cached    = cache->get_placement_plan_snapshot();
+    return lifecycle_plan_snapshot_matches(authority, cached) ? authority->plan : empty_placement_plan_owner();
 }
 }  // namespace ggml_sycl
 
@@ -2042,17 +2059,23 @@ static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_own
     return ggml_sycl::coherent_placement_plan_owner(cache);
 }
 
+class ggml_sycl_placement_publication_exhausted final : public std::runtime_error {
+  public:
+    ggml_sycl_placement_publication_exhausted() : std::runtime_error("placement publication ID exhausted") {}
+};
+
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_make_provisional_plan_snapshot(
     ggml_sycl::placement_plan plan) {
+    const uint64_t version = ggml_sycl::lifecycle_next_plan_publication_id();
+    if (version == 0) {
+        throw ggml_sycl_placement_publication_exhausted();
+    }
     auto       snapshot   = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>();
     const auto token      = ggml_sycl::lifecycle::global_registry().current_active_token();
     snapshot->model_id    = token.model.value;
     snapshot->load_txn_id = token.load.value;
-    snapshot->version     = ggml_sycl::lifecycle_next_plan_publication_id();
-    if (snapshot->version == 0) {
-        GGML_ABORT("[SYCL-PLAN] placement publication ID exhausted");
-    }
-    snapshot->plan = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
+    snapshot->version     = version;
+    snapshot->plan        = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
     return snapshot;
 }
 
@@ -10383,12 +10406,26 @@ static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl:
     // extant cache is explicitly assigned the shared owner or null before the
     // process authority changes.
     const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    std::array<ggml_sycl::unified_cache *, GGML_SYCL_MAX_DEVICES> unique_caches{};
+    std::array<bool, GGML_SYCL_MAX_DEVICES>                       participates{};
+    int                                                           unique_count = 0;
     for (int d = 0; d < total; ++d) {
-        if (auto * cache = ggml_sycl::get_unified_cache_for_device(d)) {
-            const bool participates =
-                snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d);
-            cache->set_placement_plan_snapshot(participates ? snapshot : nullptr);
+        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+        if (!cache) {
+            continue;
         }
+        int i = 0;
+        while (i < unique_count && unique_caches[i] != cache) {
+            ++i;
+        }
+        if (i == unique_count) {
+            unique_caches[unique_count++] = cache;
+        }
+        participates[i] =
+            participates[i] || (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d));
+    }
+    for (int i = 0; i < unique_count; ++i) {
+        unique_caches[i]->set_placement_plan_snapshot(participates[i] ? snapshot : nullptr);
     }
     g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
                                                  std::memory_order_release);
@@ -10678,6 +10715,18 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
 namespace ggml_sycl {
 int test_physical_device_count() {
     return ggml_sycl_info().total_gpu_count;
+}
+
+bool test_provisional_placement_id_exhaustion_is_caught() {
+    lifecycle_set_next_plan_publication_id_for_test(UINT64_MAX);
+    bool caught = false;
+    try {
+        (void) ggml_sycl_make_provisional_plan_snapshot({});
+    } catch (const ggml_sycl_placement_publication_exhausted &) {
+        caught = true;
+    }
+    lifecycle_set_next_plan_publication_id_for_test(1);
+    return caught;
 }
 
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer) {
@@ -11144,33 +11193,36 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     }
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    auto                        next_kv_info = g_placement_kv_info;
     if (n_ubatch > 0) {
-        g_placement_kv_info.n_ubatch = n_ubatch;
+        next_kv_info.n_ubatch = n_ubatch;
     }
-    g_placement_kv_info.n_ctx            = n_ctx;
-    g_placement_kv_info.n_ctx_is_runtime = true;
+    next_kv_info.n_ctx            = n_ctx;
+    next_kv_info.n_ctx_is_runtime = true;
 
     const auto current = ggml_sycl_global_plan_snapshot();
-    if (current && current->plan) {
-        auto next_plan = ggml_sycl::placement_plan(*current->plan);
-        next_plan.update_runtime_kv_sizes(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
-                                          g_placement_kv_info.kv_bytes_per_swa_layer());
-        auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
-        next->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
-        next->version = ggml_sycl::lifecycle_next_plan_publication_id();
-        if (next->version == 0) {
-            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
-            return;
-        }
-        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
-        // CAS against lifecycle ownership before publishing. A newer commit or
-        // teardown erases/replaces this exact owner and makes the update fail.
-        if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable) ||
-            ggml_sycl_global_plan_snapshot().get() != current.get()) {
-            return;
-        }
-        ggml_sycl_publish_plan_locked(immutable);
+    if (!current || !current->plan) {
+        return;
     }
+    auto next_plan = ggml_sycl::placement_plan(*current->plan);
+    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
+    auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
+    next->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
+    next->version = ggml_sycl::lifecycle_next_plan_publication_id();
+    if (next->version == 0) {
+        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
+        return;
+    }
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
+    // Validate current authority, CAS lifecycle ownership, and publish while
+    // holding the canonical writer lock. Metadata commits only after all three
+    // succeed, so exhaustion/commit/teardown races leave it unchanged.
+    if (ggml_sycl_global_plan_snapshot().get() != current.get() ||
+        !ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
+        return;
+    }
+    ggml_sycl_publish_plan_locked(immutable);
+    g_placement_kv_info = std::move(next_kv_info);
 
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(

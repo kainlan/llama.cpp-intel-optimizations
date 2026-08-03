@@ -19,9 +19,11 @@
 // cache is touched.
 
 #include "common.hpp"
+#include "ggml-sycl-test.hpp"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -117,6 +119,30 @@ void check_role(const char * name, expert_tensor_role expected) {
 
 int main() {
     check_concurrent_snapshot_publication();
+    if (test_provisional_placement_id_exhaustion_is_caught()) {
+        n_pass++;
+    } else {
+        printf("FAIL provisional placement exhaustion was not caught\n");
+        n_fail++;
+    }
+
+    // Hot owning reads retain shared immutable storage; they do not deep-copy a
+    // placement plan or allocate per call. The broad bound catches accidental
+    // plan copying/locking without depending on a particular host CPU.
+    const auto hot_begin = std::chrono::steady_clock::now();
+    const auto hot_owner = global_placement_plan_owner();
+    bool       hot_same  = true;
+    for (int i = 0; i < 1000000; ++i) {
+        hot_same = hot_same && global_placement_plan_owner().get() == hot_owner.get();
+    }
+    const auto hot_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hot_begin).count();
+    if (hot_same && hot_ms < 5000) {
+        n_pass++;
+    } else {
+        printf("FAIL hot placement owner copied/allocated or took too long: %lld ms\n", (long long) hot_ms);
+        n_fail++;
+    }
 
     // Equal metadata is insufficient: only the exact shared publication owner
     // distributed to authority and cache is coherent. Null authority also

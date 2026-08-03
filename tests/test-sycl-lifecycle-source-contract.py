@@ -18,7 +18,8 @@ placement_paths = sorted(
     + list((root / "src").glob("*.cpp"))
     + list((root / "src").glob("*.h"))
 )
-placement_production = "\n".join(path.read_text(errors="replace") for path in placement_paths)
+placement_sources = {path.relative_to(root).as_posix(): path.read_text(errors="replace") for path in placement_paths}
+placement_production = "\n".join(placement_sources.values())
 legacy_global_re = re.compile(r"\bg_(?:has_)?placement_plan\b")
 legacy_cache_re = re.compile(
     r"(?:->|\.)\s*(?:has_placement_plan|get_placement_plan|get_placement_plan_owner|"
@@ -82,16 +83,23 @@ checks = {
         for x in (
             "g_tensor_inventory_mutex",
             "ggml_sycl_publish_plan_locked",
-            "set_placement_plan_snapshot(participates ? snapshot : nullptr)",
+            "set_placement_plan_snapshot(participates[i] ? snapshot : nullptr)",
             "atomic_store_explicit(&g_placement_publication, snapshot",
         )
     ),
     "globally checked publication IDs": "lifecycle_next_plan_publication_id" in cache_hpp
     and "next == UINT64_MAX" in (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
     and "g_provisional_plan_version" not in backend,
-    "bounded cross-TU coherent owner": "coherent_placement_plan_owner" in cache_hpp
-    and "for (int attempt = 0; attempt < 4" in backend
-    and "global_first.get() == global_second.get()" in backend,
+    "single-load cross-TU coherent owners": all(
+        name in cache_hpp
+        for name in (
+            "global_placement_plan_owner",
+            "coherent_placement_plan_owner",
+            "coherent_cache_placement_plan_owner",
+        )
+    )
+    and "for (int attempt" not in backend
+    and "global_second" not in backend,
     "no unsafe global placement readers": not legacy_global_re.search(
         placement_production
     ),
@@ -101,18 +109,46 @@ checks = {
     "global census positive control": len(legacy_global_re.findall(census_fixture))
     == 2,
     "cache census positive control": len(legacy_cache_re.findall(census_fixture)) == 1,
-    "all cache readers retain owners": backend.count("ggml_sycl_cache_plan_owner(")
-    >= 49,
-    "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(global_first, cached)"
+    "exact owning reader call census": {
+        path: text.count("coherent_placement_plan_owner(") + text.count("coherent_cache_placement_plan_owner(")
+        for path, text in placement_sources.items()
+        if "coherent_placement_plan_owner(" in text or "coherent_cache_placement_plan_owner(" in text
+    }
+    == {
+        "ggml/src/ggml-sycl/common.hpp": 3,
+        "ggml/src/ggml-sycl/expert-prefetch.cpp": 2,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": 3,
+        "ggml/src/ggml-sycl/mmvq.cpp": 1,
+        "ggml/src/ggml-sycl/unified-cache.cpp": 7,
+        "ggml/src/ggml-sycl/unified-cache.hpp": 2,
+    },
+    "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
     in backend
     and "authority.get() == cache.get()" in cache_hpp
     and "authority->version == cache->version" not in cache_hpp,
-    "raw snapshot reader whitelist": len(raw_snapshot_reader_re.findall(placement_production)) == 1,
+    "raw snapshot reader exact allowlist": {
+        path: len(raw_snapshot_reader_re.findall(text))
+        for path, text in placement_sources.items()
+        if raw_snapshot_reader_re.search(text)
+    }
+    == {"ggml/src/ggml-sycl/ggml-sycl.cpp": 2},
     "raw snapshot writer whitelist": len(raw_snapshot_writer_re.findall(placement_production)) == 1,
     "same snapshot cache publication": backend.count("set_placement_plan_snapshot") == 1,
     "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
     and "get_placement_plan_owner(" not in cache_hpp,
-    "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend,
+    "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend
+    and "auto                        next_kv_info = g_placement_kv_info" in backend
+    and backend.index("g_placement_kv_info = std::move(next_kv_info)")
+    > backend.index("ggml_sycl_publish_plan_locked(immutable)"),
+    "provisional exhaustion is typed": "ggml_sycl_placement_publication_exhausted" in backend
+    and "GGML_ABORT(\"[SYCL-PLAN] placement publication ID exhausted\")" not in backend,
+    "global owner has no cache dependency": "return ggml_sycl::global_placement_plan_owner();" in backend,
+    "hot global owner one atomic load": re.search(
+        r"global_placement_plan_owner\(\) noexcept \{(?P<body>.*?)\n\}", backend, re.S
+    ).group("body").count("atomic_load_explicit")
+    == 1,
+    "global cache aliases aggregated": "unique_caches" in backend
+    and re.search(r"participates\[i\]\s*=\s*participates\[i\]\s*\|\|", backend),
     "atomic dying cache bit": "unified_cache_set_live_model_mask(live_after)"
     not in backend,
     "candidate-only publication accounting": "publication_from_plan" in backend

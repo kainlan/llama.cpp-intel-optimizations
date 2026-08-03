@@ -20162,7 +20162,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
     const queue_ptr stream                = ctx.stream();
     auto *          route_cache           = ggml_sycl::get_unified_cache(*stream);
-    const auto      plan_owner            = ggml_sycl::coherent_placement_plan_owner(route_cache);
+    const auto      plan_owner            = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);
     const bool      placement_plan_active = !plan_owner->entries.empty();
     bool            plan_has_host_experts = false;
     if (placement_plan_active && src0->name && src0->name[0] != '\0') {

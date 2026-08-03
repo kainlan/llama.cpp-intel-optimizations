@@ -448,6 +448,7 @@ test_moe_decode_down_layout_policy_result test_moe_decode_down_layout_policy(
 void test_reset_orchestrator_call_count();
 int  test_get_orchestrator_call_count();
 int  test_physical_device_count();
+bool test_provisional_placement_id_exhaustion_is_caught();
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
 void test_clear_kv_placement_plan();
 bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
