@@ -13,6 +13,17 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
+`--self-test` validates the parser logic against synthetic fixtures only. It
+never reads the repository census inputs or the checked-in inventory, so it is
+independent of source-tree and line-number drift (including running at a newer
+integration HEAD). Generation is the refresh operation, and `--check` is the
+staleness gate: it parses the current inputs and requires their rendered census
+to match the checked-in CSV byte-for-byte. Under the pinned audited-commit
+policy, a newer source commit is therefore allowed to pass `--self-test` while
+`--check` reports that the audited snapshot needs an explicitly reviewed
+refresh. Do not treat a green self-test as evidence that the inventory is
+current, and do not suppress `--check` drift by weakening its comparison.
+
 The generator pins and checks the C++ grammar ABI 15 through
 `tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
 different installed version. It walks C++ `declaration` and
@@ -128,9 +139,14 @@ global after assigning it local scope. Lambda coverage includes the exact
 file-scope fixture `static auto recovered = [] { x; x template #if X }\nWidget
 implicit_global{};`, its templated-lambda variant, and a nested-function lambda
 wrong-close fixture; each must fail closed rather than letting a recovery-expanded
-lambda compound hide static-storage declarations. It also asserts that the declarations at
-`ggml-sycl.cpp` lines 93499,
-94640, 94700, 94801, and 94857 retain file scope.
+lambda compound hide static-storage declarations. A synthetic, brace-balanced
+recovered-function fixture makes the pinned grammar produce one oversized `ERROR`
+whose parser-owned tail contains valid file and named-namespace declarations. The
+self-test proves the recovered region is non-empty, its lexical body end precedes the
+`ERROR` end, both declarations are inside that tail, and their symbol/scope identities
+remain file and named-namespace scope both normally and with unrelated lines prepended.
+No self-test assertion selects declarations from live `ggml-sycl.cpp` by historical
+line number; current-input changes are covered by generation and `--check` instead.
 
 ### Static high-risk highlights (no behavior changes in this census)
 
