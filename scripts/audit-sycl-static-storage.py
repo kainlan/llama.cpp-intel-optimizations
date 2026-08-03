@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the SYCL static-storage census using tree-sitter-cpp.
+"""Generate the parser-grade SYCL static-storage census.
 
-This is a source audit, not a compiler: preprocessor alternatives remain in the
-concrete syntax tree.  The coverage gate fails if a declaration containing a
-storage-duration marker is swallowed by an ERROR node or cannot be classified.
+Pinned parser dependencies:
+  tree-sitter==0.25.2
+  tree-sitter-language-pack==1.8.1 (C++ grammar ABI 15)
 """
 from __future__ import annotations
 
@@ -12,9 +12,13 @@ import csv
 import hashlib
 import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from importlib.metadata import version
+from io import StringIO
 from pathlib import Path
 
+PARSER_PACK_VERSION = "1.8.1"
+TREE_SITTER_VERSION = "0.25.2"
 FILES = (
     "ggml/src/ggml-sycl/ggml-sycl.cpp",
     "ggml/src/ggml-sycl/unified-cache.cpp",
@@ -33,8 +37,20 @@ DECLARATOR_KINDS = {
     "qualified_identifier", "attributed_declarator",
 }
 FUNCTIONISH = {"function_declarator", "function_definition"}
-WRITE_RE = re.compile(r"(?:\b{n}\s*(?:\[[^\n;]*\])?\s*(?:=(?!=)|\+=|-=|\+\+|--)|\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*(?:(?:try_)?emplace|insert(?:_or_assign)?|clear|erase|push_\w*|pop_\w*|resize|assign|reset|store|exchange|fetch_\w*|swap|release|acquire)\s*\()")
-RESET_RE = re.compile(r"\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*(?:clear|erase|reset|release|swap)\s*\(|\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*store\s*\(\s*(?:false|0|nullptr)|\b(?:reset|free|destroy|unregister)\w*\s*\([^;\n]*\b{n}\b", re.I)
+SCOPE_KINDS = {
+    "function_definition", "lambda_expression", "class_specifier", "struct_specifier",
+    "union_specifier", "namespace_definition", "ERROR",
+}
+WRITE_RE = re.compile(
+    r"(?:\b{n}\s*(?:\[[^\n;]*\])?\s*(?:=(?!=)|\+=|-=|\+\+|--)|"
+    r"\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*(?:(?:try_)?emplace|insert(?:_or_assign)?|"
+    r"clear|erase|push_\w*|pop_\w*|resize|assign|reset|store|exchange|fetch_\w*|swap|release|acquire)\s*\()"
+)
+RESET_RE = re.compile(
+    r"\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*(?:clear|erase|reset|release|swap)\s*\(|"
+    r"\b{n}\s*(?:\[[^\n;]*\])?\s*\.\s*store\s*\(\s*(?:false|0|nullptr)|"
+    r"\b(?:reset|free|destroy|unregister)\w*\s*\([^;\n]*\b{n}\b", re.I,
+)
 
 
 def call(obj, name, *args):
@@ -49,7 +65,6 @@ def child_count(node): return call(node, "child_count")
 def child(node, i): return call(node, "child", i)
 def parent(node): return call(node, "parent")
 def is_missing(node): return call(node, "is_missing")
-def has_error(node): return call(node, "has_error")
 def field(node, name): return call(node, "child_by_field_name", name)
 
 
@@ -59,290 +74,433 @@ def children(node):
 
 def walk(node):
     yield node
-    for c in children(node):
-        yield from walk(c)
+    for item in children(node):
+        yield from walk(item)
+
+
+def ancestors(node):
+    item = parent(node)
+    while item is not None:
+        yield item
+        item = parent(item)
 
 
 def text(source_b: bytes, node) -> str:
     return source_b[start_byte(node):end_byte(node)].decode("utf-8", "replace")
 
 
-def line_of(source_b: bytes, node) -> int:
-    return source_b.count(b"\n", 0, start_byte(node)) + 1
+def line_of(source_b: bytes, node_or_offset) -> int:
+    offset = node_or_offset if isinstance(node_or_offset, int) else start_byte(node_or_offset)
+    return source_b.count(b"\n", 0, offset) + 1
 
 
 def contains_kind(node, kinds: set[str]) -> bool:
-    return any(kind(n) in kinds for n in walk(node))
+    return any(kind(item) in kinds for item in walk(node))
 
 
-def declarator_name(source_b: bytes, node) -> tuple[str, object] | None:
-    """Return the declared identifier, following only the declarator field."""
-    k = kind(node)
-    if k in {"identifier", "field_identifier"}:
+def declarator_name(source_b: bytes, node):
+    if node is None:
+        return None
+    if kind(node) in {"identifier", "field_identifier"}:
         return text(source_b, node), node
-    d = field(node, "declarator")
-    if d is not None:
-        return declarator_name(source_b, d)
-    if k == "qualified_identifier":
-        named = [n for n in children(node) if kind(n) in {"identifier", "field_identifier"}]
-        return (text(source_b, named[-1]), named[-1]) if named else None
-    # Grammar recovery sometimes omits fields; only follow declarator-shaped children.
-    for c in children(node):
-        if kind(c) in DECLARATOR_KINDS:
-            got = declarator_name(source_b, c)
-            if got:
-                return got
+    nested = field(node, "declarator")
+    if nested is not None:
+        return declarator_name(source_b, nested)
+    if kind(node) == "qualified_identifier":
+        names = [item for item in children(node) if kind(item) in {"identifier", "field_identifier"}]
+        return (text(source_b, names[-1]), names[-1]) if names else None
+    for item in children(node):
+        if kind(item) in DECLARATOR_KINDS:
+            result = declarator_name(source_b, item)
+            if result:
+                return result
     return None
 
 
-def ancestor(node, wanted: set[str]):
-    p = parent(node)
-    while p is not None:
-        if kind(p) in wanted:
-            return p
-        p = parent(p)
-    return None
+def recovered_function_name(source_b: bytes, error_node):
+    head = text(source_b, error_node)[:700]
+    match = re.match(
+        r"(?s)\s*(?:[A-Z_]\w*\s+|static\s+|inline\s+|const\s+)*"
+        r"[\w:<>*& ]+?\s+(\w+)\s*\([^;{}]*\)\s*(?:try\s*)?\{", head,
+    )
+    return match.group(1) if match else None
 
 
-def named_scope(source_b: bytes, decl) -> tuple[str, bool]:
-    cls = ancestor(decl, {"class_specifier", "struct_specifier", "union_specifier"})
-    fn = ancestor(decl, {"function_definition", "lambda_expression"})
-    ns = ancestor(decl, {"namespace_definition"})
-    if cls is not None:
-        name = field(cls, "name")
-        return "class:" + (text(source_b, name) if name else "<anonymous>"), False
-    if fn is not None:
-        d = field(fn, "declarator")
-        got = declarator_name(source_b, d) if d else None
-        return "function-local:" + (got[0] if got else "<lambda>"), True
-    if ns is not None:
-        name = field(ns, "name")
-        return ("namespace:" + text(source_b, name), False) if name else ("anonymous-namespace", False)
-    # In preprocessor-alternative regions tree-sitter can recover an otherwise
-    # valid function as one ERROR node while retaining its child declarations.
-    # The ERROR node is still a structural boundary; recover only an unambiguous
-    # leading function signature so those children are not mislabeled file scope.
-    err = ancestor(decl, {"ERROR"})
-    if err is not None:
-        head = text(source_b, err)[:500]
-        match = re.match(r"(?s)\s*(?:[A-Z_]\w*\s+|static\s+|inline\s+|const\s+)*[\w:<>*& ]+?\s+(\w+)\s*\([^;{}]*\)\s*(?:try\s*)?\{", head)
-        if match:
-            return "function-local:" + match.group(1), True
+def named_scope(source_b: bytes, decl):
+    """Return the nearest lexical storage scope; methods beat their class."""
+    for item in ancestors(decl):
+        item_kind = kind(item)
+        if item_kind == "lambda_expression":
+            return "function-local:<lambda>", True
+        if item_kind == "function_definition":
+            result = declarator_name(source_b, field(item, "declarator"))
+            return "function-local:" + (result[0] if result else "<function>"), True
+        if item_kind == "ERROR":
+            name = recovered_function_name(source_b, item)
+            if name:
+                return "function-local:" + name, True
+        if item_kind in {"class_specifier", "struct_specifier", "union_specifier"}:
+            name = field(item, "name")
+            return "class:" + (text(source_b, name) if name else "<anonymous>"), False
+        if item_kind == "namespace_definition":
+            name = field(item, "name")
+            return ("namespace:" + text(source_b, name), False) if name else ("anonymous-namespace", False)
     return "file", False
 
 
-def base_type(source_b: bytes, decl, first_declarator) -> str:
+def storage_specifiers(source_b: bytes, decl):
+    return {
+        text(source_b, item).strip()
+        for item in children(decl)
+        if kind(item) == "storage_class_specifier"
+        and text(source_b, item).strip() in {"static", "thread_local", "extern"}
+    }
+
+
+def direct_qualifiers(source_b: bytes, node):
+    return {
+        text(source_b, item).strip()
+        for item in children(node)
+        if kind(item) == "type_qualifier"
+    }
+
+
+def declarator_core(node):
+    return field(node, "declarator") if kind(node) == "init_declarator" else node
+
+
+def is_top_level_immutable(source_b: bytes, decl, declarator):
+    """Distinguish const object/pointer from const pointee/template argument."""
+    declaration_qualifiers = direct_qualifiers(source_b, decl)
+    core = declarator_core(declarator)
+    if "constexpr" in declaration_qualifiers:
+        return True
+    if kind(core) == "pointer_declarator":
+        return "const" in direct_qualifiers(source_b, core)
+    if kind(core) == "reference_declarator":
+        return True  # the binding cannot be reseated; pointee mutability is not binding mutability
+    return "const" in declaration_qualifiers
+
+
+def base_type(source_b: bytes, decl, first_declarator):
     pieces = []
-    for c in children(decl):
-        if start_byte(c) >= start_byte(first_declarator):
+    for item in children(decl):
+        if start_byte(item) >= start_byte(first_declarator):
             break
-        if kind(c) not in {"storage_class_specifier", "attribute_specifier", "attribute_declaration"}:
-            value = " ".join(text(source_b, c).split())
+        if kind(item) not in {"storage_class_specifier", "attribute_specifier", "attribute_declaration"}:
+            value = " ".join(text(source_b, item).split())
             if value and value not in {",", ";"}:
                 pieces.append(value)
     return " ".join(pieces) or "<parser-unresolved>"
 
 
+def initializer_free_type(source_b: bytes, decl, first_declarator, declarator, name_node):
+    base = base_type(source_b, decl, first_declarator)
+    core = declarator_core(declarator)
+    shape = text(source_b, core)
+    before = " ".join(shape[:start_byte(name_node) - start_byte(core)].split())
+    after = " ".join(shape[end_byte(name_node) - start_byte(core):].split())
+    return " ".join(part for part in (base, before + after) if part).strip()
+
+
 def declaration_rows(source_b: bytes, decl):
-    raw = text(source_b, decl)
     scope, local = named_scope(source_b, decl)
-    storage = {
-        text(source_b, c).strip()
-        for c in children(decl)
-        if kind(c) == "storage_class_specifier" and text(source_b, c).strip() in {"static", "thread_local", "extern"}
-    }
+    storage = storage_specifiers(source_b, decl)
     if scope.startswith("class:") and "static" not in storage:
         return []
     if local and not ({"static", "thread_local"} & storage):
         return []
-    if not local and scope == "file" and "extern" in storage and "=" not in raw:
-        return []
 
-    direct = children(decl)
     type_node = field(decl, "type")
     type_end = end_byte(type_node) if type_node else start_byte(decl)
-    declarators = [c for c in direct if kind(c) in DECLARATOR_KINDS and start_byte(c) >= type_end]
-    # field_by_name returns only the first of repeated declarator fields; direct children preserve all objects.
+    declarators = [
+        item for item in children(decl)
+        if kind(item) in DECLARATOR_KINDS and start_byte(item) >= type_end
+    ]
     rows = []
-    for d in declarators:
-        if contains_kind(d, FUNCTIONISH):
+    for declarator in declarators:
+        core = declarator_core(declarator)
+        if contains_kind(core, FUNCTIONISH):
             continue
-        got = declarator_name(source_b, d)
-        if not got:
+        result = declarator_name(source_b, core)
+        if not result:
             continue
-        name, name_node = got
-        if name in {"static", "thread_local"}:
-            continue
-        typ = base_type(source_b, decl, declarators[0])
-        shape = text(source_b, d)
-        before = " ".join(shape[:max(0, start_byte(name_node) - start_byte(d))].split())
-        after = " ".join(shape[max(0, end_byte(name_node) - start_byte(d)):].split("=", 1)[0].split())
-        if before or after:
-            typ = " ".join((typ, before + after)).strip()
-        rows.append((name, typ, scope, storage, name_node, raw, line_of(source_b, decl)))
+        name, name_node = result
+        initialized = kind(declarator) == "init_declarator"
+        if "extern" in storage and not initialized and not scope.startswith("class:"):
+            continue  # declaration only; no storage definition in this translation unit
+        rows.append({
+            "name": name,
+            "type": initializer_free_type(source_b, decl, declarators[0], declarator, name_node),
+            "scope": scope,
+            "storage": storage,
+            "name_node": name_node,
+            "decl_line": line_of(source_b, decl),
+            "immutable": is_top_level_immutable(source_b, decl, declarator),
+        })
     return rows
 
 
-def evidence(lines: list[str], name: str, decl_line: int) -> tuple[str, str, str]:
-    token = re.compile(r"\b" + re.escape(name) + r"\b")
-    writes, reads = [], []
-    wr = re.compile(WRITE_RE.pattern.format(n=re.escape(name)))
-    reset = re.compile(RESET_RE.pattern.format(n=re.escape(name)), re.I)
-    resets = []
-    for i, ln in enumerate(lines, 1):
-        if not token.search(ln) or i == decl_line:
+def code_mask(source_b: bytes):
+    """Mask comments and quoted literals while preserving byte offsets/newlines."""
+    out = bytearray(source_b)
+    i, state, quote = 0, "code", 0
+    while i < len(source_b):
+        if state == "code" and source_b[i:i + 2] == b"//":
+            out[i:i + 2] = b"  "; i += 2; state = "line"; continue
+        if state == "code" and source_b[i:i + 2] == b"/*":
+            out[i:i + 2] = b"  "; i += 2; state = "block"; continue
+        if state == "code" and source_b[i] in (34, 39):
+            quote = source_b[i]; out[i] = 32; i += 1; state = "quote"; continue
+        if state == "line":
+            if source_b[i] == 10: state = "code"
+            else: out[i] = 32
+            i += 1; continue
+        if state == "block":
+            if source_b[i:i + 2] == b"*/": out[i:i + 2] = b"  "; i += 2; state = "code"
+            else:
+                if source_b[i] != 10: out[i] = 32
+                i += 1
             continue
-        target = writes if wr.search(ln) else reads
-        if len(target) < 3:
-            target.append(f"L{i}:{' '.join(ln.strip().split())[:120]}")
-        if reset.search(ln) and len(resets) < 3:
-            resets.append(f"L{i}:{' '.join(ln.strip().split())[:120]}")
-    return (" | ".join(writes) or "none found", " | ".join(reads) or "none found", " | ".join(resets))
+        if state == "quote":
+            if source_b[i] == 92 and i + 1 < len(source_b):
+                if source_b[i] != 10: out[i] = 32
+                if source_b[i + 1] != 10: out[i + 1] = 32
+                i += 2; continue
+            if source_b[i] == quote: out[i] = 32; i += 1; state = "code"; continue
+            if source_b[i] != 10: out[i] = 32
+            i += 1; continue
+        i += 1
+    return bytes(out)
 
 
-def classify(name: str, typ: str, scope: str, storage: set[str], raw: str, reset: str):
-    immutable = bool(re.search(r"\b(const|constexpr|constinit)\b", raw)) and "mutable" not in raw
-    mutability = "immutable" if immutable else "mutable"
+def enclosing_recovered_function(source_b: bytes, node):
+    if kind(node) == "ERROR" and recovered_function_name(source_b, node):
+        return True
+    return any(kind(item) == "ERROR" and recovered_function_name(source_b, item) for item in ancestors(node))
+
+
+def recovery_coverage(source_b: bytes, root, declarations):
+    """Prove every recovery site unable to hide a census declaration, or fail."""
+    gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
+    declaration_spans = [(start_byte(item), end_byte(item)) for item in declarations]
+    function_spans = [
+        (start_byte(item), end_byte(item)) for item in walk(root)
+        if kind(item) in {"function_definition", "lambda_expression"}
+    ]
+    recovered_functions = [
+        item for item in gaps if kind(item) == "ERROR" and recovered_function_name(source_b, item)
+    ]
+
+    failures = []
+    masked = code_mask(source_b)
+    for match in re.finditer(rb"\b(?:static|thread_local)\b", masked):
+        pos = match.start()
+        if any(begin <= pos < end for begin, end in declaration_spans):
+            continue
+        # A static function's storage marker is not an object declaration.
+        if any(begin <= pos < end for begin, end in function_spans):
+            continue
+        if any(start_byte(item) <= pos < end_byte(item)
+               and pos < source_b.find(b"{", start_byte(item), end_byte(item))
+               for item in recovered_functions):
+            continue
+        failures.append((line_of(source_b, pos), "unparsed storage-duration marker"))
+
+    categories = Counter()
+    for gap in gaps:
+        ancestor_kinds = {kind(item) for item in ancestors(gap)}
+        if {"function_definition", "lambda_expression"} & ancestor_kinds or enclosing_recovered_function(source_b, gap):
+            categories["function-region-marker-covered"] += 1
+        elif "preproc_if" in ancestor_kinds or text(source_b, gap).lstrip().startswith("#"):
+            categories["preprocessor-expression"] += 1
+        else:
+            # Namespace/file recovery can hide an implicit-static object of any
+            # user type or initializer spelling. There is no lexical exemption.
+            failures.append((line_of(source_b, gap), f"unproved {kind(gap)} recovery at namespace/file scope"))
+    return gaps, categories, failures
+
+
+def lexical_evidence(lines, name, decl_line):
+    """Return explicitly unscoped candidates; never claim C++ binding resolution."""
+    token = re.compile(r"\b" + re.escape(name) + r"\b")
+    writer = re.compile(WRITE_RE.pattern.format(n=re.escape(name)))
+    reset = re.compile(RESET_RE.pattern.format(n=re.escape(name)), re.I)
+    writes, reads, resets = [], [], []
+    for number, line in enumerate(lines, 1):
+        if number == decl_line or not token.search(line):
+            continue
+        excerpt = f"L{number}:{' '.join(line.strip().split())[:120]}"
+        target = writes if writer.search(line) else reads
+        if len(target) < 3: target.append(excerpt)
+        if reset.search(line) and len(resets) < 3: resets.append(excerpt)
+    prefix = "unscoped lexical candidate: "
+    return (
+        prefix + " | ".join(writes) if writes else "none found by unscoped lexical scan",
+        prefix + " | ".join(reads) if reads else "none found by unscoped lexical scan",
+        resets,
+    )
+
+
+def classify(row, reset_candidates):
+    immutable = row["immutable"]
+    typ, scope, storage, name = row["type"], row["scope"], row["storage"], row["name"]
     if "thread_local" in storage:
-        sync = "thread-local"
+        synchronization = "thread-local"
     elif re.search(r"\b(atomic|mutex|once_flag|semaphore)\b", typ):
-        sync = "intrinsic:" + ("atomic" if "atomic" in typ else "lock primitive")
+        synchronization = "intrinsic:" + ("atomic" if "atomic" in typ else "lock primitive")
     else:
-        sync = "none evident"
+        synchronization = "none evident"
     lower = (name + " " + typ).lower()
-    if scope.startswith("class:"):
-        owner = scope
-    elif "thread_local" in storage:
-        owner = "thread"
-    elif re.search(r"tensor|host_ptr|k_base|alloc", lower):
-        owner = "tensor/allocation identity or registry"
-    elif re.search(r"device|gpu|queue|stream", lower):
-        owner = "device/process slot"
-    elif re.search(r"model|layer|expert|moe|weight|kv", lower):
-        owner = "model/layer semantic state (review required)"
-    else:
-        owner = "process or function lifetime (review required)"
+    if scope.startswith("class:"): owner = scope
+    elif "thread_local" in storage: owner = "thread"
+    elif re.search(r"tensor|host_ptr|k_base|alloc", lower): owner = "tensor/allocation identity or registry"
+    elif re.search(r"device|gpu|queue|stream", lower): owner = "device/process slot"
+    elif re.search(r"model|layer|expert|moe|weight|kv", lower): owner = "model/layer semantic state (review required)"
+    else: owner = "process or function lifetime (review required)"
     if immutable:
-        disposition = "not applicable: immutable"
-    elif reset:
-        disposition = "reset/teardown evidence: " + reset
+        disposition = "not applicable: immutable binding"
+    elif reset_candidates:
+        disposition = "lifecycle not inferred; unscoped lexical reset candidate: " + " | ".join(reset_candidates)
     else:
-        disposition = "no reset/teardown evidence found"
-    return mutability, sync, owner, disposition
+        disposition = "lifecycle not inferred; no binding-resolved reset analysis"
+    return "immutable binding" if immutable else "mutable", synchronization, owner, disposition
 
 
-def parser():
-    try:
-        from importlib.metadata import version
-        from tree_sitter_language_pack import get_parser
-        versions = f"tree_sitter_language_pack={version('tree-sitter-language-pack')}, tree-sitter={version('tree-sitter')}"
-        return get_parser("cpp"), f"tree-sitter-cpp ABI 15 ({versions})"
-    except Exception as exc:
-        raise SystemExit(f"ERROR: tree-sitter C++ parser unavailable: {exc}")
+def get_parser_checked():
+    found_pack, found_ts = version("tree-sitter-language-pack"), version("tree-sitter")
+    if (found_pack, found_ts) != (PARSER_PACK_VERSION, TREE_SITTER_VERSION):
+        raise RuntimeError(
+            f"parser dependency mismatch: require tree-sitter-language-pack=={PARSER_PACK_VERSION} "
+            f"and tree-sitter=={TREE_SITTER_VERSION}; found {found_pack} and {found_ts}"
+        )
+    from tree_sitter_language_pack import get_parser
+    return get_parser("cpp"), f"tree-sitter-cpp ABI 15 (language-pack={found_pack}, tree-sitter={found_ts})"
 
 
-def main() -> int:
+def parse_source(parser, source):
+    source_b = source.encode()
+    root = call(parser.parse(source), "root_node")
+    declarations = [item for item in walk(root) if kind(item) in DECL_KINDS]
+    rows = [row for decl in declarations for row in declaration_rows(source_b, decl)]
+    gaps, categories, failures = recovery_coverage(source_b, root, declarations)
+    return source_b, rows, gaps, categories, failures
+
+
+def self_test(parser):
+    source = """
+struct C {
+    static int member;
+    void method() { static int local{1}; auto fn = [] { static int lambda_local = 2; }; }
+};
+static const int * const_pointee;
+static int * const const_pointer = nullptr;
+static std::vector<const int *> mutable_container{};
+static const std::atomic<int> immutable_atomic{0};
+namespace one { static std::vector<int> same; void f() { static std::vector<int> same; same.clear(); } }
+namespace two { static std::vector<int> same; }
+void direct_fn() { static Widget direct{3}; }
+static int first, * second, third{3};
+namespace ext { extern int declaration_only; extern int definition = 1; }
+"""
+    _, rows, gaps, _, failures = parse_source(parser, source)
+    assert not gaps and not failures
+    by_name = {}
+    for row in rows: by_name.setdefault(row["name"], []).append(row)
+    assert by_name["member"][0]["scope"] == "class:C"
+    assert by_name["local"][0]["scope"] == "function-local:method"
+    assert by_name["lambda_local"][0]["scope"] == "function-local:<lambda>"
+    assert not by_name["const_pointee"][0]["immutable"]
+    assert by_name["const_pointer"][0]["immutable"]
+    assert not by_name["mutable_container"][0]["immutable"]
+    assert by_name["immutable_atomic"][0]["immutable"]
+    assert by_name["direct"][0]["type"] == "Widget"
+    assert all(name in by_name for name in ("first", "second", "third"))
+    assert "declaration_only" not in by_name and "definition" in by_name
+    same_rows = by_name["same"]
+    lines = source.splitlines()
+    for row in same_rows:
+        writes, _, resets = lexical_evidence(lines, "same", row["decl_line"])
+        _, _, _, disposition = classify(row, resets)
+        assert writes.startswith("unscoped lexical candidate:") or writes.startswith("none found by")
+        assert not disposition.startswith("reset/teardown evidence:")
+
+    broken = "namespace broken { Widget implicit_global{; }"
+    _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
+    assert broken_gaps and broken_failures, "namespace recovery must fail closed for implicit/direct-init globals"
+    print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern")
+
+
+def main():
+    parser, parser_name = get_parser_checked()
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", default="docs/backend/sycl-static-storage-inventory.csv")
-    ap.add_argument("--check", action="store_true", help="verify the committed inventory is reproducible")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = ap.parse_args()
-    p, parser_name = parser()
-    all_rows, reports, unsafe_gaps = [], [], []
-    explicit_static_nonlocal_declarations = set()
-    reconciliation = {"explicit_static_nonlocal_objects": 0, "implicit_nonlocal_objects": 0,
-                      "function_local_objects": 0, "class_static_objects": 0}
+    if args.self_test:
+        self_test(parser)
+        return 0
 
+    all_rows, reports, failures = [], [], []
+    declaration_ids = set()
+    reconciliation = Counter()
     for rel in FILES:
-        path = args.repo / rel
-        source = path.read_text(encoding="utf-8")
-        source_b = source.encode()
-        tree = p.parse(source)
-        root = call(tree, "root_node")
-        gaps = [n for n in walk(root) if kind(n) == "ERROR" or is_missing(n)]
-        declarations = [n for n in walk(root) if kind(n) in DECL_KINDS]
-        parsed = []
-        for decl in declarations:
-            parsed.extend(declaration_rows(source_b, decl))
-
-        # Fail closed when parser recovery hides a possible static-storage declaration.
-        covered_spans = [(start_byte(n), end_byte(n)) for n in declarations]
-        marker = re.compile(rb"\b(?:static|thread_local)\b")
-        uncovered = []
-        for m in marker.finditer(source_b):
-            line_start = source_b.rfind(b"\n", 0, m.start()) + 1
-            prefix = source_b[line_start:m.start()].lstrip()
-            if prefix.startswith(b"//") or prefix.startswith(b"*") or prefix.startswith(b"/*"):
-                continue
-            if source_b[m.end():m.end()+1] == b"_":  # static_cast/static_assert
-                continue
-            if not any(a <= m.start() < b for a, b in covered_spans):
-                line = source_b.count(b"\n", 0, m.start()) + 1
-                snippet = source_b[line_start:source_b.find(b"\n", m.end())].decode("utf-8", "replace").strip()
-                # Function definitions/prototypes and prose are reconciled lexical leads, not objects.
-                if not re.search(r"\b(static|thread_local)\s+(?:const\s+)?(?:bool|char|short|int|long|float|double|auto|std::|sycl::|ggml_|[A-Za-z_]\w*\s*[*&])", snippet):
-                    continue
-                marker_tail = snippet[snippet.find(m.group().decode()):]
-                open_paren = marker_tail.find("(")
-                equals = marker_tail.find("=")
-                if open_paren >= 0 and (equals < 0 or open_paren < equals or "operator" in marker_tail[:open_paren]):
-                    # A function signature has '(' before any initializer. Function-local
-                    # objects using direct initialization are rare here and are caught by
-                    # the structurally parsed declaration nodes.
-                    continue
-                uncovered.append((line, snippet))
-        if uncovered:
-            unsafe_gaps.extend(f"{rel}:{ln}:{snip}" for ln, snip in uncovered)
-
+        source = (args.repo / rel).read_text(encoding="utf-8")
+        source_b, parsed, gaps, gap_categories, file_failures = parse_source(parser, source)
+        failures.extend(f"{rel}:{line}:{reason}" for line, reason in file_failures)
         lines = source.splitlines()
-        for name, typ, scope, storage, name_node, raw, decl_line in parsed:
-            ln = line_of(source_b, name_node)
-            writes, reads, resets = evidence(lines, name, ln)
-            mut, sync, owner, disposition = classify(name, typ, scope, storage, raw, resets)
-            if scope.startswith("function-local:"):
-                reconciliation["function_local_objects"] += 1
-            elif scope.startswith("class:"):
-                reconciliation["class_static_objects"] += 1
+        for row in parsed:
+            writes, reads, resets = lexical_evidence(lines, row["name"], row["decl_line"])
+            mutability, synchronization, owner, disposition = classify(row, resets)
+            scope, storage = row["scope"], row["storage"]
+            if scope.startswith("function-local:"): reconciliation["function_local_objects"] += 1
+            elif scope.startswith("class:"): reconciliation["class_static_objects"] += 1
             elif "static" in storage:
                 reconciliation["explicit_static_nonlocal_objects"] += 1
-                explicit_static_nonlocal_declarations.add((rel, decl_line))
-            else:
-                reconciliation["implicit_nonlocal_objects"] += 1
+                declaration_ids.add((rel, row["decl_line"]))
+            else: reconciliation["implicit_nonlocal_objects"] += 1
             all_rows.append({
-                "file": rel, "line": ln, "symbol": name, "type": typ, "scope": scope,
-                "mutability": mut, "synchronization": sync, "writer_evidence": writes,
-                "reader_evidence": reads, "owner_identity": owner,
-                "reset_teardown_disposition": disposition,
+                "file": rel, "line": line_of(source_b, row["name_node"]), "symbol": row["name"],
+                "type": row["type"], "scope": scope, "mutability": mutability,
+                "synchronization": synchronization, "writer_evidence": writes, "reader_evidence": reads,
+                "owner_identity": owner, "reset_teardown_disposition": disposition,
             })
-        reports.append((rel, len(parsed), len(gaps), len(uncovered), hashlib.sha256(source_b).hexdigest()))
+        reports.append((rel, len(parsed), len(gaps), dict(gap_categories), hashlib.sha256(source_b).hexdigest()))
 
-    if unsafe_gaps:
-        print("ERROR: parser coverage gate found storage-duration markers outside parsed declarations:", file=sys.stderr)
-        print("\n".join(unsafe_gaps), file=sys.stderr)
+    if failures:
+        print("ERROR: fail-closed recovery coverage rejected the census:", file=sys.stderr)
+        print("\n".join(failures), file=sys.stderr)
         return 2
 
-    all_rows.sort(key=lambda r: (FILES.index(r["file"]), int(r["line"]), r["symbol"]))
-    from io import StringIO
-    buf = StringIO(newline="")
-    writer = csv.DictWriter(buf, fieldnames=COLUMNS, lineterminator="\n")
+    all_rows.sort(key=lambda row: (FILES.index(row["file"]), int(row["line"]), row["symbol"]))
+    buffer = StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=COLUMNS, lineterminator="\n")
     writer.writeheader(); writer.writerows(all_rows)
-    rendered = buf.getvalue()
-    out = args.repo / args.output
+    rendered = buffer.getvalue()
+    output = args.repo / args.output
     if args.check:
-        if not out.exists() or out.read_text(encoding="utf-8") != rendered:
+        if not output.exists() or output.read_text(encoding="utf-8") != rendered:
             print(f"ERROR: {args.output} is stale; regenerate without --check", file=sys.stderr)
             return 1
     else:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered, encoding="utf-8")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
 
     print(f"parser={parser_name}")
-    for rel, rows, gaps, unsafe, sha in reports:
-        print(f"{rel}: rows={rows} raw_parse_gaps={gaps} unsafe_storage_gaps={unsafe} sha256={sha}")
-    print(f"inventory_rows={len(all_rows)} lexical_candidate_leads=371 (ticket input; method/SHA unspecified, not treated as a historical census)")
-    print(f"explicit_static_nonlocal_declarations={len(explicit_static_nonlocal_declarations)}")
-    print("reconciliation=" + ",".join(f"{key}:{value}" for key, value in reconciliation.items()))
+    for rel, rows, gaps, categories, sha in reports:
+        print(f"{rel}: rows={rows} recovery_nodes={gaps} recovery_proof={categories} sha256={sha}")
+    print(f"inventory_rows={len(all_rows)} lexical_candidate_leads=371 (input lacks method/SHA; not a census)")
+    print(f"explicit_static_nonlocal_declarations={len(declaration_ids)}")
+    print("reconciliation=" + ",".join(f"{key}:{reconciliation[key]}" for key in (
+        "explicit_static_nonlocal_objects", "implicit_nonlocal_objects", "function_local_objects", "class_static_objects")))
     return 0
 
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (AssertionError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2)
