@@ -403,21 +403,19 @@ connected the failures back. `acdb192d4` restored preserve-and-continue for
 leased weight entries; `4afdb6d9f` made whole-zone resets refuse the reset when
 live registered allocations prevent safe partial preservation.
 
-Two things this does **not** license:
+This does **not** license a general loosening. `mem_handle`'s destructor is still
+the sole release point, and reclaiming memory that still has a live handle is
+still forbidden. Current weight reclaim is ownership- and mode-aware and must use
+`weight_entry_reclaimable()`: it preserves active leases, entries owned by a live
+model even when `in_use_count == 0`, and unattributed entries when the reclaim
+mode and live-model mask require preservation. Only entries that predicate
+permits may be reclaimed.
 
-- **It is a scoped exception, not a general loosening.** `mem_handle`'s destructor
-  is still the sole release point, and reclaiming memory that still has a live
-  handle is still forbidden. `acdb192d4` *refuses to reclaim* — the opposite of a
-  forced reap.
-- **It costs leak detection at that site, knowingly.** That scan can no longer
-  distinguish "another live model owns this" from "something leaked it"; both now
-  warn and preserve. A future real leak will surface as a growing
-  `entries_preserved` count and eventual VRAM pressure, not a loud abort. Scoping
-  the reset per model would have kept both properties but is structurally
-  impossible: `unified-cache-key.hpp` deliberately excludes `model_id` from
-  `cache_id_equal` for GGUF weights, and the primary call site
-  (`ggml_backend_sycl_set_model_loading`) runs before any tensor of the incoming
-  model exists. See `llama.cpp-ljb9`.
+Leak diagnosis remains separate from legitimate concurrency. An attributed
+entry that is still leased but has no live model owner is reported as an
+ownerless leaked lease; outside mid-load replan it may abort when
+`GGML_SYCL_STRICT_LEASES=1`. Do not classify that state as another model's valid
+ownership, and do not infer reclaimability from `in_use_count` alone.
 
 Raw pointers are not ownership tokens and must not model allocation state. They
 are only transient ABI views resolved from `mem_handle` for immediate kernel
@@ -871,11 +869,14 @@ reached only during PP will show zero activity. Use `-p 512` when you need them.
 **2. Multiple live models are supported.** This section previously claimed that
 passing two `-m` flags aborts at the model switch with a leaked model-weight
 `mem_handle` lease. That described the regression introduced by `9a0670712`, not
-the ownership contract. Since `acdb192d4`, model-weight reset preserves and warns
-about entries still leased by another live model while reclaiming unreferenced
-entries. Since `4afdb6d9f`, host and device whole-zone resets refuse a reset that
-would reclaim live registered allocations. Neither path force-reclaims another
-model's memory, and the warning alone is not evidence of a leak.
+the ownership contract. Current model-weight reclaim preserves active leases,
+live-model-owned entries even when `in_use_count == 0`, and unattributed entries
+when required by the reclaim mode and live-model mask; it reclaims only entries
+permitted by `weight_entry_reclaimable()`. Attributed leases with no live model
+owner are diagnosed separately and may abort under `GGML_SYCL_STRICT_LEASES=1`.
+Since `4afdb6d9f`, host and device whole-zone resets refuse a reset that would
+reclaim live registered allocations. Neither path force-reclaims another model's
+memory.
 
 ### GPT-OSS Prompt Template Rule
 
