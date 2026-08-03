@@ -44,6 +44,12 @@ ggml_add_backend_library(ggml-sycl
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 
+# Non-DL builds preserve the optimized CPU traits and full graph fallback.
+# DL modules remain completely independent of ggml-cpu.
+if (NOT GGML_BACKEND_DL)
+    target_link_libraries(ggml-sycl PRIVATE ggml-cpu)
+endif()
+
 option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
 option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
 option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
@@ -230,6 +236,8 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
+    add_test(NAME sycl-fallback-propagation
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fallback-propagation.py)
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.

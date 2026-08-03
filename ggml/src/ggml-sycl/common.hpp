@@ -47,6 +47,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <exception>
 
 struct ggml_backend_sycl_context;
 
@@ -84,6 +85,14 @@ struct ggml_sycl_fa_graph_snapshot {
     int32_t      use_paged_attn         = 0;
     int32_t      block_size             = 0;
     int32_t      max_blocks_per_seq     = 0;
+};
+
+class ggml_sycl_fallback_error final : public std::exception {
+public:
+    explicit ggml_sycl_fallback_error(const char * reason) noexcept : reason_(reason ? reason : "SYCL fallback failed") {}
+    const char * what() const noexcept override { return reason_; }
+private:
+    const char * reason_;
 };
 
 bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const char * reason);

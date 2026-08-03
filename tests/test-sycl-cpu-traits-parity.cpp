@@ -27,6 +27,7 @@ int main() {
     }
 
     for (ggml_type type : types) {
+        ggml_quantize_init(type);
         const auto * base = ggml_sycl_get_baseline_type_traits_cpu(type);
         const auto * cpu  = ggml_get_type_traits_cpu(type);
         const int64_t expected_nrows = type == GGML_TYPE_Q8_K ? 0 : 1;
@@ -44,6 +45,10 @@ int main() {
                 std::fprintf(stderr, "quantizer mismatch for %s\n", ggml_type_name(type));
                 return 1;
             }
+        } else if (const auto * generic = ggml_get_type_traits(type); generic && generic->from_float_ref) {
+            // Exercise state-initialized vec-dot-only IQ3_XXS/IQ3_S/IQ2_S
+            // with nonzero packed data rather than a vacuous all-zero block.
+            generic->from_float_ref(input.data(), qb.data(), n);
         }
         if (!base->vec_dot) {
             continue;
@@ -59,14 +64,16 @@ int main() {
         float sb = 0.0f, sc = 0.0f;
         base->vec_dot(n, &sb, 0, qb.data(), 0, qv.data(), 0, 1);
         cpu->vec_dot(n, &sc, 0, qb.data(), 0, qv.data(), 0, 1);
-        // The zero-initialized lhs intentionally executes every vec-dot-only
-        // IQ type whose canonical from_float is null.
+        // This includes nonzero initialized IQ3/IQ2_S rows and zero-safe rows
+        // for formats whose reference quantizer requires an importance matrix.
         const float tolerance = 2e-5f * std::max(1.0f, std::fabs(sc));
         if (!std::isfinite(sb) || !std::isfinite(sc) || std::fabs(sb - sc) > tolerance) {
             std::fprintf(stderr, "vec_dot mismatch for %s: %.9g vs %.9g\n", ggml_type_name(type), sb, sc);
             return 1;
         }
     }
+
+    ggml_quantize_free();
 
     if (ggml_sycl_get_baseline_type_traits_cpu(static_cast<ggml_type>(-1)) != nullptr ||
         ggml_sycl_get_baseline_type_traits_cpu(static_cast<ggml_type>(GGML_TYPE_COUNT)) != nullptr) {

@@ -53,8 +53,32 @@ static void row_to_float(const ggml_type_traits * traits, const void * src, floa
 }
 
 template<enum ggml_type Type>
-static size_t element_offset(int element) {
-    return static_cast<size_t>(element / ggml_blck_size(Type)) * ggml_type_size(Type);
+static size_t element_offset(int64_t element) {
+    GGML_ASSERT(element >= 0);
+    const size_t block = static_cast<size_t>(element) / static_cast<size_t>(ggml_blck_size(Type));
+    const size_t size  = ggml_type_size(Type);
+    GGML_ASSERT(size == 0 || block <= SIZE_MAX / size);
+    return block * size;
+}
+
+template<enum ggml_type Type>
+static float packed_value(const void * row, int64_t i) {
+    if constexpr (Type == GGML_TYPE_F32) {
+        return static_cast<const float *>(row)[i];
+    } else if constexpr (Type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(row)[i]);
+    } else if constexpr (Type == GGML_TYPE_BF16) {
+        return ggml_bf16_to_fp32(static_cast<const ggml_bf16_t *>(row)[i]);
+    } else if constexpr (Type == GGML_TYPE_Q8_0) {
+        const auto & b = static_cast<const block_q8_0 *>(row)[i / QK8_0];
+        return ggml_fp16_to_fp32(b.d) * b.qs[i % QK8_0];
+    } else if constexpr (Type == GGML_TYPE_Q8_1) {
+        const auto & b = static_cast<const block_q8_1 *>(row)[i / QK8_1];
+        return ggml_fp16_to_fp32(b.d) * b.qs[i % QK8_1];
+    } else {
+        const auto & b = static_cast<const block_q8_K *>(row)[i / QK_K];
+        return b.d * b.qs[i % QK_K];
+    }
 }
 
 template<enum ggml_type X, enum ggml_type Y>
@@ -64,23 +88,23 @@ static void vec_dot_ref(int n, float * s, size_t bs, const void * vx, size_t bx,
     // block loop. All scratch is fixed-size stack storage: every supported
     // block size divides QK_K, so each conversion receives complete blocks.
     const ggml_type_traits * x_traits = ggml_get_type_traits(X);
-    const ggml_type_traits * y_traits = ggml_get_type_traits(Y);
     const size_t xrow = bx ? bx : ggml_row_size(X, n);
     const size_t yrow = by ? by : ggml_row_size(Y, n);
     const size_t sout = bs ? bs : sizeof(float);
     std::array<float, k_vec_dot_tile> x{};
-    std::array<float, k_vec_dot_tile> y{};
 
     for (int row = 0; row < nrc; ++row) {
-        const auto * xbase = static_cast<const uint8_t *>(vx) + row * xrow;
-        const auto * ybase = static_cast<const uint8_t *>(vy) + row * yrow;
+        const size_t urow = static_cast<size_t>(row);
+        GGML_ASSERT((xrow == 0 || urow <= SIZE_MAX / xrow) && (yrow == 0 || urow <= SIZE_MAX / yrow) &&
+                    (sout == 0 || urow <= SIZE_MAX / sout));
+        const auto * xbase = static_cast<const uint8_t *>(vx) + urow * xrow;
+        const auto * ybase = static_cast<const uint8_t *>(vy) + urow * yrow;
         float sum = 0.0f;
-        for (int offset = 0; offset < n; offset += k_vec_dot_tile) {
-            const int count = std::min(k_vec_dot_tile, n - offset);
+        for (int64_t offset = 0; offset < static_cast<int64_t>(n); offset += k_vec_dot_tile) {
+            const int64_t count = std::min<int64_t>(k_vec_dot_tile, static_cast<int64_t>(n) - offset);
             row_to_float<X>(x_traits, xbase + element_offset<X>(offset), x.data(), count);
-            row_to_float<Y>(y_traits, ybase + element_offset<Y>(offset), y.data(), count);
-            for (int i = 0; i < count; ++i) {
-                sum += x[static_cast<size_t>(i)] * y[static_cast<size_t>(i)];
+            for (int64_t i = 0; i < count; ++i) {
+                sum += x[static_cast<size_t>(i)] * packed_value<Y>(ybase, offset + i);
             }
         }
         *reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(s) + row * sout) = sum;
@@ -135,5 +159,10 @@ const ggml_type_traits_cpu * ggml_sycl_get_baseline_type_traits_cpu(enum ggml_ty
 }
 
 const ggml_type_traits_cpu * ggml_sycl_get_type_traits_cpu(enum ggml_type type) noexcept {
+#ifndef GGML_BACKEND_DL
+    const int index = static_cast<int>(type);
+    return index >= 0 && index < GGML_TYPE_COUNT ? ggml_get_type_traits_cpu(type) : nullptr;
+#else
     return ggml_sycl_get_baseline_type_traits_cpu(type);
+#endif
 }

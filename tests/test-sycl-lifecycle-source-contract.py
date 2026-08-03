@@ -368,8 +368,8 @@ checks = {
         re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
     "bound transaction uses explicit value check": "txn.value != 0 && lifecycle_find_candidate_placement_plan(txn.value)" in cache_cpp,
     "DL SYCL module has private CPU traits and no CPU linkage":
-        "target_link_libraries(ggml-sycl PRIVATE ggml-cpu)" not in
-            (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+        re.search(r"if \(NOT GGML_BACKEND_DL\).*?target_link_libraries\(ggml-sycl PRIVATE ggml-cpu\).*?endif",
+                  (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(), re.S)
     and 'if (backend STREQUAL "ggml-cpu")' not in (root / "ggml/src/CMakeLists.txt").read_text()
     and "add_library(${backend} MODULE ${ARGN})" in (root / "ggml/src/CMakeLists.txt").read_text()
     and "ggml_sycl_get_type_traits_cpu" in
