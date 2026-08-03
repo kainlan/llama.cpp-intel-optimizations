@@ -37,10 +37,12 @@ checks = {
     "rollback effect replay": "error::EFFECT_FAILED" in cpp and "poisoned_after_prepare" in cpp,
     "finalize poison authority": "poisoned_after_prepare" in cpp and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN" in cpp,
-    "fallible pre-finalize restoration": backend.index("restore_latest_live_plan())") < backend.index("finalize_teardown(ticket, true)"),
+    "fallible pre-finalize restoration": backend.index("teardown_owner_effects(owner)") < backend.index("finalize_teardown(ticket, true)"),
     "durable quarantine reaper": all(x in backend for x in ("g_sycl_quarantine_tokens", "ggml_sycl_quarantine_reap", "model_quarantine_token")),
     "late poison cleanup authority": "cleanup_required" in hpp and "finalize_cleanup" in cpp,
     "exact quarantine validation": "is_quarantined" in hpp and "slot_generation == token.slot_generation" in backend,
+    "no all-device graph sweep": "release_graph_replay_leases_all_devices" not in backend,
+    "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend and "max_passes" in backend,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

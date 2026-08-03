@@ -131,7 +131,8 @@ if (BUILD_TESTING)
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
-                  latest-live-restoration restore-failure-quarantine effect-failure-quarantine begin-allocation-failure
+                  latest-live-restoration busy-deferred-quarantine restore-failure-quarantine effect-failure-quarantine
+                  begin-allocation-failure
                   null-output stale-token-after-reuse)
         add_test(NAME sycl-lifecycle-h2-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
     endforeach()

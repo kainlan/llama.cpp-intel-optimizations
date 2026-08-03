@@ -130,6 +130,7 @@ public:
     error finalize_teardown(const teardown_ticket & ticket, bool effects_ok) noexcept;
     error teardown(ModelToken token);
     bool            is_quarantined(ModelToken token) const noexcept;
+    error           defer_quarantine(ModelToken token) noexcept;
 
     std::shared_ptr<const ModelState> find(ModelId model) const;
     std::shared_ptr<const ModelState> last_success() const;

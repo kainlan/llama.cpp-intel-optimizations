@@ -411,6 +411,31 @@ bool Registry::is_quarantined(ModelToken token) const noexcept {
     }
 }
 
+error Registry::defer_quarantine(ModelToken token) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (token.model.value == 0 || token.load.value == 0 || token.owner.slot >= model_slot_count) {
+            return error::STALE_IDENTITY;
+        }
+        auto model = models_.find(token.model.value);
+        if (model == models_.end() || !(model->second.token == token)) {
+            return error::STALE_IDENTITY;
+        }
+        if (model->second.phase == model_phase::QUARANTINED) {
+            return error::OK;
+        }
+        if (model->second.phase != model_phase::LIVE) {
+            return error::BUSY;
+        }
+        model->second.phase           = model_phase::QUARANTINED;
+        model->second.teardown_result = error::EFFECT_FAILED;
+        cv_.notify_all();
+        return error::OK;
+    } catch (...) {
+        return error::EFFECT_FAILED;
+    }
+}
+
 error Registry::teardown(ModelToken token) {
     auto ticket = prepare_teardown(token);
     return ticket.finisher ? finalize_teardown(ticket, true) : ticket.code;

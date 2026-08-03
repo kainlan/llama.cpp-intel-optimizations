@@ -233,6 +233,15 @@ static void run_case(const std::string & name, test_mutation mutation) {
         r.end(c.txn, false);
         require(r.latest_live()->token == a, "failed C changed A restoration authority");
         require(r.teardown(a) == error::OK && !r.latest_live(), "A teardown left stale restoration authority");
+    } else if (name == "busy-deferred-quarantine") {
+        Registry r;
+        auto     model = commit_one(r);
+        require(r.defer_quarantine(model) == error::OK, "LIVE token was not atomically deferred");
+        require(r.is_quarantined(model) && !r.find(model.model), "deferred token remained ghost LIVE");
+        auto stale = model;
+        stale.owner.generation++;
+        require(r.defer_quarantine(stale) == error::STALE_IDENTITY, "stale deferred token accepted");
+        require(r.teardown(model) == error::OK, "deferred quarantine did not reap");
     } else if (name == "restore-failure-quarantine") {
         Registry r;
         auto     model    = commit_one(r);
