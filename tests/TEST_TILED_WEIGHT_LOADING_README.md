@@ -117,7 +117,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest -R test-tiled-weight-loading -V
 ## Requirements
 
 The tests require:
-- **GPT-OSS 20B Q8_0 MoE model** at `/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf`
+- **GPT-OSS 20B Q8_0 MoE model** at `/models/gpt-oss-20b-Q8_0.gguf`
 - **Intel GPU** with SYCL support
 - **llama-completion binary** built in `build/bin/`
 - **ONEAPI_DEVICE_SELECTOR** set to select GPU

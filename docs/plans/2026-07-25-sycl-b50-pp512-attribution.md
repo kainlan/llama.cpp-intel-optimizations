@@ -126,7 +126,7 @@ for window in 1 2; do
   for i in 1 2 3 4; do
     echo "=== window $window run $i ===" >> /tmp/b50-pp-attrib/baseline.txt
     timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-      ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
       -p 512 -n 0 -r 3 2>&1 | tee -a /tmp/b50-pp-attrib/baseline.txt \
       | grep -iE 'pp512|free|VRAM'
   done
@@ -137,7 +137,7 @@ done
 
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -200,7 +200,7 @@ There is **no** dispatch route-tally facility in this backend — a search for `
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_DEBUG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 64 -n 0 -r 1 > /tmp/b50-pp-attrib/debug-sample.log 2>&1
 grep -oE '^\[[A-Z0-9_-]+\]' /tmp/b50-pp-attrib/debug-sample.log | sort | uniq -c | sort -rn | head -30
 ```
@@ -432,7 +432,7 @@ Answers the binary question this plan's cheapest hypothesis rests on: are the GP
 source /opt/intel/oneapi/setvars.sh --force
 mkdir -p /tmp/b50-pp-attrib/routes
 timeout 1200 env ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_DEBUG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 0 -r 1 > /tmp/b50-pp-attrib/routes/head.log 2>&1
 python3 scripts/count-sycl-dispatch-routes.py /tmp/b50-pp-attrib/routes/head.log \
   | tee /tmp/b50-pp-attrib/routes/head.counts
@@ -507,7 +507,7 @@ timeout 1200 env ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   GGML_SYCL_KERNEL_PROFILE=1 \
   GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/b50-pp-attrib/kernels/head.json \
   GGML_SYCL_KERNEL_PROFILE_TOP_N=40 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 0 -r 3 2>&1 | tee /tmp/b50-pp-attrib/kernels/head.bench
 ```
 
@@ -583,7 +583,7 @@ for flag in "GGML_SYCL_ONEDNN_PP=0" "GGML_SYCL_UNIFIED_SOA=0" \
       if [ "$arm" = treatment ]; then EXTRA="$flag"; else EXTRA=""; fi
       echo "=== $name pair $i arm $arm ===" >> "$out"
       timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 $EXTRA \
-        ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+        ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
         -p 512 -n 0 -r 3 2>&1 | tee -a "$out" | grep -iE 'pp512|free'
     done
   done
@@ -594,7 +594,7 @@ done
 
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 <FLAG> ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -777,7 +777,7 @@ TMPDIR=/tmp ./scripts/sycl-build.sh llama-bench || exit 125   # 125 = skip, unbu
 total=0
 for i in 1 2 3 4; do
   v=$(timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-      ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
       -p 512 -n 0 -r 3 2>/dev/null | grep -oE 'pp512[^0-9]*[0-9.]+' | grep -oE '[0-9.]+$')
   total=$(echo "$total + $v" | bc -l)
 done
@@ -825,7 +825,7 @@ git commit -m "docs(sycl): bisect B50 PP512 regression to originating commit"
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown.
 
-**Environment:** This host — Arc Pro B50 (Battlemage G21, 128 CU, ~16 GB, `level_zero:1`, `0000:07:00.0`, `renderD130`), Linux 7.1.2, oneAPI 2026.1, patched compute-runtime 26.22/BMG. Model: `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` (12 GB).
+**Environment:** This host — Arc Pro B50 (Battlemage G21, 128 CU, ~16 GB, `level_zero:1`, `0000:07:00.0`, `renderD130`), Linux 7.1.2, oneAPI 2026.1, patched compute-runtime 26.22/BMG. Model: `/models/gpt-oss-20b-mxfp4.gguf` (12 GB).
 
 **Steps Claude runs itself:**
 
@@ -853,14 +853,14 @@ git commit -m "docs(sycl): bisect B50 PP512 regression to originating commit"
    ```bash
    source /opt/intel/oneapi/setvars.sh --force
    timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 0 -r 3
+     -m /models/gpt-oss-20b-mxfp4.gguf -p 512 -n 0 -r 3
    ```
    Expected: a pp512 value within the mean ± 2 sd recorded in `BASELINE VERDICT:`.
 
 5. **Correctness gate passes** — this plan changes no inference code, so it must:
    ```bash
    timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
+     -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
      --no-display-prompt --chat-template-kwargs '{"reasoning_effort":"medium"}' \
      --reasoning-format none --reasoning-budget 0 \
      -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' -n 48 --seed 42 --temp 0

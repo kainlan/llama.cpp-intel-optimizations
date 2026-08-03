@@ -305,7 +305,7 @@ git commit -m "fix(sycl): use proper F32↔F16 conversion and Q8_0 scales in XMX
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on --no-conversation \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -317,7 +317,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 ```bash
 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on --no-conversation \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -336,7 +336,7 @@ Expected: Output should match XMX path output
 ```bash
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -347,7 +347,7 @@ Record: pp512 t/s, tg128 t/s
 ```bash
 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 

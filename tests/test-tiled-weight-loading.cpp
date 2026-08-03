@@ -7,7 +7,7 @@
 // 4. Testing environment variable controls
 //
 // IMPORTANT: This is an integration test that requires:
-// - A GPT-OSS 20B Q8_0 MoE model at /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf
+// - A GPT-OSS 20B Q8_0 MoE model at /models/gpt-oss-20b-Q8_0.gguf
 // - Intel GPU with SYCL support
 // - Built llama-completion binary
 //
@@ -145,7 +145,7 @@ bool test_model_loads_with_xmx_moe(TestStats& stats) {
     fprintf(stderr, "\n[Test 1] Model Loads with GGML_SYCL_XMX_MOE=1\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";
@@ -183,7 +183,7 @@ bool test_tiled_conversion_occurs(TestStats& stats) {
     fprintf(stderr, "\n[Test 2] Tiled Conversion Occurs (GGML_SYCL_DEBUG=1)\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";
@@ -247,7 +247,7 @@ bool test_inference_correctness(TestStats& stats) {
     fprintf(stderr, "\n[Test 3] Inference Correctness\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";
@@ -297,7 +297,7 @@ bool test_fallback_path(TestStats& stats) {
     fprintf(stderr, "\n[Test 4] Fallback Path (GGML_SYCL_XMX_MOE unset)\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";
@@ -334,7 +334,7 @@ bool test_no_crashes(TestStats& stats) {
     fprintf(stderr, "\n[Test 5] No Crashes or Fatal Errors\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";
@@ -396,7 +396,7 @@ bool test_memory_allocation(TestStats& stats) {
     fprintf(stderr, "\n[Test 7] Memory Allocation\n");
 
     const char* model = getenv("TEST_MODEL_PATH");
-    if (!model) model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    if (!model) model = "/models/gpt-oss-20b-Q8_0.gguf";
 
     const char* binary = getenv("TEST_LLAMA_COMPLETION");
     if (!binary) binary = "./build/bin/llama-completion";

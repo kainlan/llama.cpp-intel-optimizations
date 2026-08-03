@@ -61,7 +61,7 @@ env -u ONEAPI_DEVICE_SELECTOR \
   LD_LIBRARY_PATH=build/bin:$LD_LIBRARY_PATH \
   SYCL_DEVICE_FILTER=level_zero:gpu \
   timeout 180 ./build/bin/llama-batched \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 0 -np 4 -n 16 -p "Hello"
 ```
 

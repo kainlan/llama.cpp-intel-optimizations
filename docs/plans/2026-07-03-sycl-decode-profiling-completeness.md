@@ -151,7 +151,7 @@ The current trace also shows `mxfp4.quantize.activation_q8_soa` raw events have 
 ### Non-negotiable execution constraints
 
 - Active checkout is `/Apps/llama.cpp-mxfp4-tg-runtime`; do not implement in `/Apps/llama.cpp`.
-- Worker agents must not run B50/B580/model gates, `/Storage/GenAI/models`, `llama-bench`, `sycl-kernel-bench`, VTune, `sycl-ls`, `/dev/dri`/DRM probes, `lsof`, P2P probes, or real harness execution.
+- Worker agents must not run B50/B580/model gates, `/models`, `llama-bench`, `sycl-kernel-bench`, VTune, `sycl-ls`, `/dev/dri`/DRM probes, `lsof`, P2P probes, or real harness execution.
 - Lead owns executable validation, model gates, synthetic runs, VTune profiling, and `/Storage` access.
 - If a task builds SYCL targets, source oneAPI as:
 
@@ -1842,7 +1842,7 @@ git commit -m "test(sycl): validate decode profiling completeness gates"
 
 **Gotchas:**
 
-- Do not run `llama-bench`, `/Storage/GenAI/models`, `sycl-ls`, VTune, DRM probes, or `/dev/dri` probes.
+- Do not run `llama-bench`, `/models`, `sycl-ls`, VTune, DRM probes, or `/dev/dri` probes.
 - If unrelated source tests fail, record the exact unrelated failure and stop for lead triage instead of broadening task scope.
 
 ---
@@ -1856,7 +1856,7 @@ git commit -m "test(sycl): validate decode profiling completeness gates"
 
 **Description:**
 
-Lead reruns the approved B50 GPT-OSS FA-on profile script and determines whether profiling is complete enough to drive optimization. This task is lead-owned only because it accesses `/Storage/GenAI/models` and runs real GPU/model workloads.
+Lead reruns the approved B50 GPT-OSS FA-on profile script and determines whether profiling is complete enough to drive optimization. This task is lead-owned only because it accesses `/models` and runs real GPU/model workloads.
 
 **Acceptance Criteria:**
 

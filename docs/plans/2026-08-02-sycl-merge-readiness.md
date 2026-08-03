@@ -432,7 +432,7 @@ Architecture runs once here. **Do not rerun `test-thread-safety`:** Task 12d is 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 run_gpu mistral-completion \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
   2>&1 | tee /tmp/mistral-gate.log
 mistral_rc=${PIPESTATUS[0]}
@@ -441,7 +441,7 @@ grep -q '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' /tmp/mistral-gate.log
 
 ONEAPI_DEVICE_SELECTOR=level_zero:1 run_gpu gptoss-chat timeout 60 \
   ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -485,28 +485,28 @@ mkdir -p artifacts/perf-final
 for run in 1 2 3 4 5; do
   ONEAPI_DEVICE_SELECTOR=level_zero:0 run_gpu b70-mistral \
     env GGML_SYCL_OP_TIMEOUT_MS=180000 ./build/bin/llama-bench -v \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+    -m /models/mistral-7b-v0.1.Q4_0.gguf \
     -p 512 -n 128 -fa 1 -r 5 \
     2>&1 | tee "artifacts/perf-final/b70-mistral-$run.log"
   test "${PIPESTATUS[0]}" -eq 0
 
   ONEAPI_DEVICE_SELECTOR=level_zero:0 run_gpu b70-gptoss timeout 60 \
     env GGML_SYCL_OP_TIMEOUT_MS=180000 ./build/bin/llama-bench -v \
-    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -m /models/gpt-oss-20b-mxfp4.gguf \
     -p 512 -n 128 -fa 1 -r 5 \
     2>&1 | tee "artifacts/perf-final/b70-gptoss-$run.log"
   test "${PIPESTATUS[0]}" -eq 0
 
   ONEAPI_DEVICE_SELECTOR=level_zero:1 run_gpu b50-mistral \
     ./build/bin/llama-bench -v \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+    -m /models/mistral-7b-v0.1.Q4_0.gguf \
     -p 512 -n 128 -fa 1 -r 5 \
     2>&1 | tee "artifacts/perf-final/b50-mistral-$run.log"
   test "${PIPESTATUS[0]}" -eq 0
 
   ONEAPI_DEVICE_SELECTOR=level_zero:1 run_gpu b50-gptoss timeout 60 \
     ./build/bin/llama-bench -v \
-    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -m /models/gpt-oss-20b-mxfp4.gguf \
     -p 512 -n 128 -fa 1 -r 5 \
     2>&1 | tee "artifacts/perf-final/b50-gptoss-$run.log"
   test "${PIPESTATUS[0]}" -eq 0

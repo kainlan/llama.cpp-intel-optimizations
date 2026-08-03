@@ -121,7 +121,7 @@ ninja -C build -j $(nproc)
 Normal model (fits in VRAM — should see "no changes needed" from params_fit):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68. Should see `llama_params_fit: no changes needed` in log.
 
@@ -129,7 +129,7 @@ Low VRAM test:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `llama_params_fit` should reduce n_gpu_layers. Output may or may not be correct yet (budget alignment not done).
@@ -239,7 +239,7 @@ ninja -C build -j $(nproc)
 Normal model:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68 (all layers on GPU, graphs+persistent TG active)
 
@@ -247,7 +247,7 @@ Low VRAM (CPU offload):
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output with reduced n_gpu_layers. Some layers on CPU.
@@ -347,7 +347,7 @@ Low VRAM test — should see CPU weight stats in output:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Log shows "CPU-resident weights: N tensors, X MB"
@@ -384,7 +384,7 @@ Comprehensive verification and benchmark comparison between CPU offload and GPU 
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68. All layers on GPU.
 
@@ -393,7 +393,7 @@ Expected: PP512 >= 1200, TG128 >= 68. All layers on GPU.
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, ...` (correct output)
@@ -403,7 +403,7 @@ Expected: `6, 7, 8, 9, 10, ...` (correct output)
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Record PP512 and TG128 numbers. Compare with GPU streaming results.
 
@@ -415,7 +415,7 @@ Test at 20%, 40%, 60%, 80% VRAM budget and record TG throughput for each.
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 'Hello, my name is' -n 10 --seed 42 --temp 0
 ```
 

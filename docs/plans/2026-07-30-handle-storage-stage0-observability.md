@@ -551,7 +551,7 @@ Expected: build exit 0; gate exits 0 with no output (GREEN).
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>/dev/null | grep -E '^ ?1, 2'
 ```
 
@@ -599,7 +599,7 @@ The decisive unknown for the whole architecture plan: does `data_handle[dev]` ac
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_HANDLE_STRICT=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 \
   | tee /tmp/strict-mistral.log | grep -E '^ ?1, 2'
 grep -c 'mismatch' /tmp/strict-mistral.log
@@ -612,7 +612,7 @@ Expected: ` 1, 2, 3, 4, 5, 6, 7, 8, 9, 10`, then a mismatch count (0 or more).
 ```bash
 GGML_SYCL_HANDLE_STRICT=1 ONEAPI_DEVICE_SELECTOR=level_zero:0,1 timeout 600 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   --split-mode row -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 \
   | tee /tmp/strict-split.log | grep -E '^ ?1, 2'
 grep -c 'mismatch' /tmp/strict-split.log
@@ -712,7 +712,7 @@ git commit -m "docs(sycl): document GGML_SYCL_HANDLE_STRICT"
    ```bash
    source /opt/intel/oneapi/setvars.sh --force
    ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
-     -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+     -m /models/mistral-7b-v0.1.Q4_0.gguf \
      -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>/dev/null | grep -E '^ ?1, 2'
    ```
    Expected: ` 1, 2, 3, 4, 5, 6, 7, 8, 9, 10` (stops at 10 on EOS).
@@ -720,7 +720,7 @@ git commit -m "docs(sycl): document GGML_SYCL_HANDLE_STRICT"
 4. Strict mode does not change correctness and does not spam:
    ```bash
    GGML_SYCL_HANDLE_STRICT=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 \
-     ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+     ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
      -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | tee /tmp/e2e-strict.log | grep -E '^ ?1, 2'
    grep -c 'mismatch' /tmp/e2e-strict.log
    ```

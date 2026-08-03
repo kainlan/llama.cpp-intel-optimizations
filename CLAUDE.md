@@ -634,7 +634,7 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 ## Development Workflow (Machine-Specific)
 
 ### Model Locations
-Models are stored in `/Storage/GenAI/models/`:
+Models are stored on the local SSD in `/models/`:
 
 **Mistral 7B variants** (standard benchmark model):
 - `mistral-7b-v0.1.Q4_0.gguf` (3.9G) - **Default for benchmarks**
@@ -785,7 +785,7 @@ source /opt/intel/oneapi/setvars.sh --force
 # passing gate read as a failure.)
 # Any other output (###..., repetition, <unk>) = broken path; fix before commit.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # GPT-OSS B50 chat correctness gate. With --no-display-prompt the prompt echo
@@ -800,7 +800,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -809,7 +809,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
 
 # Benchmark prompt processing (PP) and token generation (TG)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 
 # Test backend operations (after modifying ggml operators)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
@@ -858,7 +858,7 @@ code**; an empty baseline proves nothing and voids the before/after.
 
 ```bash
 timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 -v 2>&1 | grep ...
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 -v 2>&1 | grep ...
 ```
 
 Note `-p 0 -n 4` triggers planning but does **no prompt processing**, so paths

@@ -6,7 +6,7 @@
 
 ## Evidence
 
-- **model_path**: /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+- **model_path**: /models/gpt-oss-20b-mxfp4.gguf
 - **n_ctx**: 1024
 - **n_ubatch**: 512
 - **fa_type**: AUTO

@@ -12,7 +12,7 @@ PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-MODEL="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
+MODEL="/models/gpt-oss-20b-Q8_0.gguf"
 BASELINE=250  # t/s - conservative threshold (master achieves ~280 t/s)
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 

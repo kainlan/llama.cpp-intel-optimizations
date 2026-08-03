@@ -18,7 +18,7 @@
 # Environment:
 #   ONEAPI_DEVICE_SELECTOR - GPU device (default: level_zero:0)
 #   LLAMA_BIN_DIR - Path to build/bin directory (default: ./build/bin)
-#   MODEL_DIR - Path to model directory (default: /Storage/GenAI/models)
+#   MODEL_DIR - Path to model directory (default: /models)
 #
 
 set -e
@@ -47,7 +47,7 @@ elif [ -x "./llama-completion" ]; then
 else
     LLAMA_BIN_DIR="./build/bin"  # Fallback
 fi
-MODEL_DIR="${MODEL_DIR:-/Storage/GenAI/models}"
+MODEL_DIR="${MODEL_DIR:-/models}"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 # Model paths

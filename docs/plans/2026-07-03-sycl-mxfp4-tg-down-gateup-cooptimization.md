@@ -16,7 +16,7 @@
 
 **Non-negotiable constraints:**
 - Active checkout for execution: `/Apps/llama.cpp-mxfp4-tg-runtime`, branch `feature/sycl-mxfp4-tg-runtime`.
-- Workers must not run B50/B580/model gates, `/Storage/GenAI/models`, `llama-bench`, `sycl-kernel-bench`, VTune, `sycl-ls`, `/dev/dri`/DRM probes, `lsof`, P2P probes, or real harness execution.
+- Workers must not run B50/B580/model gates, `/models`, `llama-bench`, `sycl-kernel-bench`, VTune, `sycl-ls`, `/dev/dri`/DRM probes, `lsof`, P2P probes, or real harness execution.
 - Lead-only validation uses FA-on and the baseline env: `GGML_SYCL_MOE_PHASE_MATERIALIZE=1`, `GGML_SYCL_MOE_PHASE_BULK_XMX=1`, `GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`, `-fa 1`.
 - The correct legacy MXFP4 route profile env is `GGML_SYCL_MXFP4_TG_PROFILE=1`; do not use `GGML_SYCL_MOE_TG_PROFILE`.
 - Do not trust VTune computing-task totals for decode; use named SYCL event profiler CSV/JSON/stderr.
@@ -391,7 +391,7 @@ fi
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 stamp=$(date +%Y%m%d_%H%M%S)
 out_root=${SYCL_DOWN_VARIANT_PROFILE_OUT:-/tmp/sycl_down_variant_profile_${stamp}}
-model=${SYCL_GPTOSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}
+model=${SYCL_GPTOSS_MODEL:-/models/gpt-oss-20b-mxfp4.gguf}
 bench=${SYCL_LLAMA_BENCH:-${repo_root}/build/bin/llama-bench}
 
 variants=(
@@ -945,7 +945,7 @@ GGML_SYCL_MOE_PHASE_MATERIALIZE=1 \
 GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -976,7 +976,7 @@ GGML_SYCL_KERNEL_PROFILE_FORMAT=both \
 GGML_SYCL_KERNEL_PROFILE_TOP_N=80 \
 GGML_SYCL_MXFP4_TG_PROFILE=1 \
 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -fa 1 -p 512 -n 128 -r 1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -fa 1 -p 512 -n 128 -r 1 \
   > "$out/bench.stdout" 2> "$out/bench.stderr"
 if [[ -f sycl-kernels.csv ]]; then mv sycl-kernels.csv "$out/sycl-kernels.csv"; fi
 python3 scripts/parse-sycl-kernel-profile.py "$out/sycl-kernels.csv" > "$out/parse.stdout"
@@ -1022,7 +1022,7 @@ git commit -m "test(sycl): record mxfp4 tg cooptimization validation"
 
 > Run after all task tests pass and before declaring the campaign complete. Owned by the lead at teardown.
 
-**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, Intel oneAPI, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, model `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, FA-on GPT-OSS run.
+**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, Intel oneAPI, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, model `/models/gpt-oss-20b-mxfp4.gguf`, FA-on GPT-OSS run.
 
 **Steps Claude runs itself:** Task 5 commands. The lead session may run them because it has permission for `/Storage`, B50, `llama-bench`, `llama-cli`, and oneAPI executable validation.
 

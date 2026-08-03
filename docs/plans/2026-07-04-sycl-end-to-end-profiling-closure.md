@@ -838,7 +838,7 @@ Expected GREEN: dry-run prints all artifacts and tests pass.
 
 - The worker implementing this task must not pass `--execute`.
 - Do not call `sycl-ls`, inspect `/dev/dri`, or use `lsof` as a health probe.
-- The dry-run string may mention `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, but dry-run must not touch it.
+- The dry-run string may mention `/models/gpt-oss-20b-mxfp4.gguf`, but dry-run must not touch it.
 
 #### Commit
 
@@ -1685,7 +1685,7 @@ git commit -m "tasks(sycl): validate profiling closure pipeline"
 
 > Run AFTER all task tests pass, BEFORE declaring the implementation complete. Owned by the lead at teardown.
 
-**Environment:** `/Apps/llama.cpp` on branch `feature/sycl-mxfp4-tg-runtime`, Intel oneAPI 2025.3, Arc B580/B50 workstation. B50 GPT-OSS validation uses `ONEAPI_DEVICE_SELECTOR=level_zero:1`, `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, FA-on, and the three safe MoE phase knobs.
+**Environment:** `/Apps/llama.cpp` on branch `feature/sycl-mxfp4-tg-runtime`, Intel oneAPI 2025.3, Arc B580/B50 workstation. B50 GPT-OSS validation uses `ONEAPI_DEVICE_SELECTOR=level_zero:1`, `/models/gpt-oss-20b-mxfp4.gguf`, FA-on, and the three safe MoE phase knobs.
 
 **Steps Claude runs itself:**
 

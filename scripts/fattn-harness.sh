@@ -33,7 +33,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${PROJECT_DIR}/build"
 RESULTS_FILE="${SCRIPT_DIR}/fattn-harness-results.txt"
 
-MODEL_MISTRAL_Q4="${LLAMA_COMPLETION_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
+MODEL_MISTRAL_Q4="${LLAMA_COMPLETION_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 PASS=0

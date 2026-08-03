@@ -492,7 +492,7 @@ Fix any compilation errors. Common issues:
 NEW_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v pti | tr '\n' ':' | sed 's/:$//')
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -504,7 +504,7 @@ Expected: output contains `6, 7, 8, 9, 10`. Retention mode should NOT activate (
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 -fit off
 ```
 
@@ -516,7 +516,7 @@ Expected: correct output. Stderr should show CPU layer classification and retain
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 -fit off
 ```
 
@@ -582,7 +582,7 @@ sleep 60
 
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 Expected: PP512 >= 1200, TG128 >= 68 (no regression from activation retention changes — retention is inactive when all layers are GPU).
@@ -595,7 +595,7 @@ sleep 30
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 64 --seed 42 --temp 0 -ngl 99 -fit off \
   2>/tmp/bench_40_err.txt
 
@@ -611,7 +611,7 @@ sleep 30
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 64 --seed 42 --temp 0 -ngl 99 -fit off \
   2>/tmp/bench_30_err.txt
 
@@ -626,7 +626,7 @@ sleep 30
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 64 --seed 42 --temp 0 \
   2>/tmp/bench_40_fitparams_err.txt
 

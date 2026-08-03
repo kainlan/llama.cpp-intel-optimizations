@@ -873,7 +873,7 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # 1. Correctness (single GPU, deterministic)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p "The capital of France is" -n 20 --seed 42 --temp 0
 # Expected: coherent continuation
 
@@ -881,7 +881,7 @@ sleep 60
 
 # 2. Multi-device expert parallelism
 ONEAPI_DEVICE_SELECTOR="level_zero:0,1" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p "1, 2, 3, 4, 5," -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10"
 
@@ -889,7 +889,7 @@ sleep 60
 
 # 3. Performance benchmark
 ONEAPI_DEVICE_SELECTOR="level_zero:0,1" ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -c 4096 -n 32
 # Target: TG > 15 tok/s
 
@@ -897,7 +897,7 @@ sleep 60
 
 # 4. Regression check (non-MoE model)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Target: PP512 >= 1300, TG128 >= 68
 
 # 5. Unit tests

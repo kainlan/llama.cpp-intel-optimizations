@@ -58,7 +58,7 @@ GPT-OSS 20B MoE layer, host-resident MXFP4 expert →
 ```bash
 timeout 60 sh -c 'ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   GGML_SYCL_VRAM_BUDGET_PCT=30 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 64 -n 32 -r 1'
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 64 -n 32 -r 1'
 ```
 
 **Result:** EXIT=134 (SIGABRT) after 44s. Model loaded, inference began, crashed on CPU-side ADD_ID assertion.
@@ -88,7 +88,7 @@ timeout 60 sh -c 'ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 ```bash
 timeout 120 sh -c 'ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" \
   GGML_SYCL_VRAM_BUDGET_PCT=0 GGML_SYCL_CPU_OFFLOAD=1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-completion -m /models/gpt-oss-20b-mxfp4.gguf \
   -p "Hello" -n 8 --seed 42 --temp 0'
 ```
 

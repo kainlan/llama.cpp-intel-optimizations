@@ -510,7 +510,7 @@ Files to modify:
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 

@@ -462,7 +462,7 @@ EOF
 **Depends on:** Task 4
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` or `cpu-dispatch.cpp` — depending on root cause.
-- Test: run `llama-bench` / `llama-completion` against `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` with `timeout 60`.
+- Test: run `llama-bench` / `llama-completion` against `/models/gpt-oss-20b-mxfp4.gguf` with `timeout 60`.
 
 **Description:**
 
@@ -487,7 +487,7 @@ If Task 4 made the gate changes correctly, the wedge should be gone. This task v
 timeout 60 sh -c 'ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -m /models/gpt-oss-20b-mxfp4.gguf \
     -p 64 -n 32 -r 1' 2>&1 | tail -40
 sudo dmesg -T | tail -30
 ```
@@ -506,7 +506,7 @@ Note what you see — if the system stabilizes after 60s, great; if it doesn't, 
 ```bash
 timeout 120 sh -c 'ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   GGML_SYCL_VRAM_BUDGET_PCT=0 GGML_SYCL_CPU_OFFLOAD=1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-completion -m /models/gpt-oss-20b-mxfp4.gguf \
   -p "Hello" -n 8 --seed 42 --temp 0'
 ```
 Must emit ≥ 1 coherent token; must not hang the GPU.
@@ -581,13 +581,13 @@ Run the full GPT-OSS 20B test matrix on three VRAM-budget tiers: 100% (all weigh
 2. **Sanity on Mistral 7B Q4_0** (ensure nothing regressed):
    ```bash
    ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-     -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+     -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
    ```
    Target: PP512 ≥ 1480, TG128 ≥ 80.
 3. **GPT-OSS 20B 100% VRAM** (base case, no budget):
    ```bash
    timeout 300 sh -c 'ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-     ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 64 -n 32 -r 2'
+     ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 64 -n 32 -r 2'
    ```
 4. **GPT-OSS 20B 50% budget:** add `GGML_SYCL_VRAM_BUDGET_PCT=50`.
 5. **GPT-OSS 20B 0% budget:** add `GGML_SYCL_VRAM_BUDGET_PCT=0 GGML_SYCL_CPU_OFFLOAD=1`.

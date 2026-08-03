@@ -31,7 +31,7 @@ static const char * pick_model_path(int argc, char ** argv) {
     if (env && *env) {
         return env;
     }
-    const char * fallback = "/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf";
+    const char * fallback = "/models/mistral-7b-v0.1.Q4_0.gguf";
     if (std::filesystem::exists(fallback)) {
         return fallback;
     }
@@ -70,7 +70,7 @@ int main(int argc, char ** argv) {
         // where the path happens to resolve, and it bakes a machine-specific model
         // path into CMake. This works anywhere and needs no registration change.
         // Note pick_model_path() already falls back to a hardcoded
-        // /Storage/GenAI/models path, so on this host the skip does not fire.
+        // /models path, so on this host the skip does not fire.
         std::fprintf(stderr,
                      "SKIP: model not found (set LLAMA_SYCL_TEST_MODEL or pass --model) "
                      "-- NO MODEL WAS LOADED AND NOTHING WAS VERIFIED.\n");

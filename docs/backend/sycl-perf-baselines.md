@@ -79,7 +79,7 @@ Each rule below cost a round of discarded measurements.
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=<sel> GGML_SYCL_OP_TIMEOUT_MS=180000 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -fa 1 -r 5 -v
 ```
 

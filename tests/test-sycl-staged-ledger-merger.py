@@ -17,7 +17,7 @@ def manifest(stage: str, root: str, build_sha: str = "abc123") -> dict[str, obje
         "stage": stage,
         "artifact_root": root,
         "build_sha": build_sha,
-        "model": {"path": "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
+        "model": {"path": "/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
         "device_selector": "level_zero:1",
         "fa": 1,
         "moe_knobs": {

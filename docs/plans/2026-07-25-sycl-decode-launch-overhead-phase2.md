@@ -182,7 +182,7 @@ env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   GGML_SYCL_MOE_PHASE_MATERIALIZE=1 GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
   GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
   timeout 900 ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -m /models/gpt-oss-20b-mxfp4.gguf \
     -ngl 99 -fa 1 -p 0 -n 128 -r 1 -v \
   > "$OUT/bench.stdout" 2> "$OUT/bench.stderr"
 uptime > "$OUT/load.after"
@@ -392,7 +392,7 @@ ldd build/bin/llama-completion | grep -cE 'libggml-sycl|libsycl'
 
 # 1. Mistral completion gate — output must start "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # 2. ctest — THROTTLED, and with the GPU-allocating family excluded.
@@ -436,7 +436,7 @@ ctest --test-dir build -R unpin-event --output-on-failure
 uptime; pgrep -af 'codescout|ninja|icpx|ffmpeg'
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   timeout 900 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128
 
 # 4. After ANY crash, forced stop, or OOM above, the GPU state is suspect and
 #    every number from step 3 is invalid until this is clean:

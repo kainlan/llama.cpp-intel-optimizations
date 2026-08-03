@@ -89,13 +89,13 @@ ninja -C build -j $(nproc)
 
 # Correctness (deterministic output)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected output: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 
 # Performance benchmark
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Targets: PP512 >= 1200 tok/s, TG128 >= 68 tok/s
 ```
 
@@ -221,7 +221,7 @@ size_t unified_cache_weight_bytes(int device);
 ```bash
 ninja -C build -j $(nproc)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Must output: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ```
@@ -360,7 +360,7 @@ Find the destructor body and add `free_staging_buffer();` before other cleanup.
 ```bash
 ninja -C build -j $(nproc)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Must output: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ```
@@ -474,13 +474,13 @@ ninja -C build -j $(nproc)
 
 # Standard model — no underflow should appear
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | grep -i underflow
 # Expected: no output (no underflow warnings)
 
 # Performance
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Targets: PP512 >= 1200, TG128 >= 68
 ```
 
@@ -576,13 +576,13 @@ ninja -C build -j $(nproc)
 
 # Standard model — should work identically
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 
 # Performance
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Targets: PP512 >= 1200, TG128 >= 68
 ```
 
@@ -673,13 +673,13 @@ ninja -C build -j $(nproc)
 
 # Standard model — no staging buffer activated
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 
 # GPT-OSS 20B — should attempt staging buffer
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | head -50
 # Expected: [STAGING] log messages, may still OOM but should get further
 ```
@@ -771,7 +771,7 @@ ninja -C build -j $(nproc)
 
 # Run and check diagnostic log
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 2>&1 | grep "Budget summary"
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 2>&1 | grep "Budget summary"
 # Expected: Budget summary with consistent numbers
 ```
 
@@ -823,16 +823,16 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # Test 1: Mistral 7B correctness (must pass)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Test 2: Mistral 7B performance (must pass)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 
 # Test 3: GPT-OSS 20B end-to-end (best effort)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 120 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | tee /tmp/gptoss-test.txt
 
 # Check budget summary

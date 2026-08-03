@@ -19,7 +19,7 @@ set -e
 TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
-MODEL_PATH="${1:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
+MODEL_PATH="${1:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 PORT=8099
 SERVER_LOG="/tmp/test_unified_kv_server.log"
 RESULT_DIR="/tmp/test_unified_kv_results"

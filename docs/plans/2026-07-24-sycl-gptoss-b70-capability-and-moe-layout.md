@@ -426,7 +426,7 @@ Delete the local name-based detection in `unified-kernel.cpp` and route `XMXConf
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 0 -n 8 -fa 1 -r 1 2>&1 | grep -c "does not support ESIMD dpas"
 ```
 Expected BEFORE: `1` (the message is printed).
@@ -668,7 +668,7 @@ The planner's down-I8 upgrade pass computes `skip_not_down`, `skip_already_i8`, 
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_MOE_LAYOUT_DEBUG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 0 -n 4 -fa 1 -r 1 2>&1 | grep -c "MOE-LAYOUT"
 ```
 Expected BEFORE: `0`.
@@ -748,7 +748,7 @@ Mirror Task 6 for the gate/up pass (`~16482`), and add a single per-role summary
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_MOE_LAYOUT_DEBUG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 0 -n 4 -fa 1 -r 1 2>&1 | grep "MOE-LAYOUT.*summary"
 ```
 Expected BEFORE: no output.
@@ -837,7 +837,7 @@ A diagnosis task, not an implementation one. With Tasks 6–7 shipped, run the m
 
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
-M=/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+M=/models/gpt-oss-20b-mxfp4.gguf
 run() { ONEAPI_DEVICE_SELECTOR=$1 GGML_SYCL_MOE_LAYOUT_DEBUG=1 ${@:2} \
   ./build/bin/llama-bench -m $M -p 0 -n 4 -fa 1 -r 1 2>&1 | grep "MOE-LAYOUT"; }
 
@@ -1038,7 +1038,7 @@ Run the full same-build validation across both real GPUs and record the post-cha
 
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
-M=/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+M=/models/gpt-oss-20b-mxfp4.gguf
 for sel in level_zero:1 level_zero:0; do
   echo "=== $sel ==="
   timeout 1800 env ONEAPI_DEVICE_SELECTOR=$sel GGML_SYCL_OP_TIMEOUT_MS=180000 \
@@ -1067,7 +1067,7 @@ git commit -m "docs(sycl): refresh perf baselines for B70/B50 on driver 26.27"
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown.
 
-**Environment:** This host — Arc Pro B70 (`level_zero:0`, Battlemage G31, 256 CU, 31 GB) and Arc Pro B50 (`level_zero:1`, Battlemage G21, 128 CU, 16 GB), Intel compute-runtime `26.27.39122.12`, oneAPI DPC++ 2026.1, model `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`.
+**Environment:** This host — Arc Pro B70 (`level_zero:0`, Battlemage G31, 256 CU, 31 GB) and Arc Pro B50 (`level_zero:1`, Battlemage G21, 128 CU, 16 GB), Intel compute-runtime `26.27.39122.12`, oneAPI DPC++ 2026.1, model `/models/gpt-oss-20b-mxfp4.gguf`.
 
 **Steps Claude runs itself:**
 

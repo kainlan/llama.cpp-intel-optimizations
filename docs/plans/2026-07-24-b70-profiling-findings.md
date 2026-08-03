@@ -518,13 +518,13 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # Clean-card baseline (repeat >=5 times; a single run is not a baseline)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -r 5 -v
 
 # Reproduce the confounded budget on a clean card
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   GGML_SYCL_VRAM_BUDGET_PCT=42 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -r 5 -v
 
 # Any A/B on this backend must be INTERLEAVED and paired -- see section 4.4. Blocked runs
@@ -534,7 +534,7 @@ for i in 1 2 3 4 5 6; do
   for arm in default legacy; do
     if [ "$arm" = legacy ]; then FL=(GGML_SYCL_UNIFIED_FORCE_LEGACY=1); else FL=(); fi
     env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 "${FL[@]}" \
-      ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
       -p 512 -n 128 -r 5 -v
   done
 done   # then paired t-test on the per-pair differences
@@ -543,7 +543,7 @@ done   # then paired t-test on the per-pair differences
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   GGML_SYCL_KERNEL_PROFILE=1 GGML_SYCL_KERNEL_PROFILE_FORMAT=json \
   GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/prof.json \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 128 -r 1 -v
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 128 -r 1 -v
 python3 scripts/parse-sycl-kernel-profile.py /tmp/prof.json \
   --geometry gpt-oss-20b --peak-gbs 529.6 --top-kernels 12
 ```

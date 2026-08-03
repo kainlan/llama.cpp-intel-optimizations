@@ -136,7 +136,7 @@ The pp512 cost is a **gradient, not a threshold** — monotonic and small beyond
 source /opt/intel/oneapi/setvars.sh --force
 timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=$CAP GGML_SYCL_MOE_LAYOUT_DEBUG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -fa 1 -r 1 -v -o csv > run.csv 2> run.log
 ```
 

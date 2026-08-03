@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 BENCH="${BENCH:-./build/bin/llama-bench}"
 SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUTDIR="${OUTDIR:-/tmp/sycl-moe-layout-compare.$(date +%Y%m%d-%H%M%S)}"
@@ -28,7 +28,7 @@ benchmarking. This avoids comparing a requested AOS/SOA knob when the executed
 MoE kernel still routes through a different layout.
 
 Environment:
-  MODEL                 GGUF path, default /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+  MODEL                 GGUF path, default /models/gpt-oss-20b-mxfp4.gguf
   BENCH                 llama-bench path, default ./build/bin/llama-bench
   ONEAPI_DEVICE_SELECTOR default level_zero:1
   OUTDIR                log output directory

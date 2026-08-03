@@ -312,7 +312,7 @@ ninja -C build -j $(nproc)
 
 # 1. Correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # MUST output: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
@@ -320,20 +320,20 @@ sleep 30
 
 # 2. Performance
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # MUST: PP512 >= 1200, TG128 >= 68
 
 sleep 30
 
 # 3. Longer generation stability
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'The quick brown fox' -n 50 --seed 42 --temp 0
 
 # 4. Legacy path
 GGML_SYCL_PERSISTENT_TG=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 

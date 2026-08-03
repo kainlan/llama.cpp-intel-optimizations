@@ -180,14 +180,14 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # Legacy mode (should work as before)
 GGML_SYCL_TENSOR_SPLIT=13 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10" and log line showing single-device split
 
 # New 3-device mode (should log discovery)
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: log "SYCL 3-device split: Arc B580 + Arc Pro B50 + CPU (60%/32%/8%)"
 # Output may be wrong (weight distribution not done yet) — that's OK for Task 1
@@ -335,7 +335,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 # Test that existing single-device path still works
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expect: PP512 >= 1200, TG128 >= 68 (no regression)
 ```
 
@@ -420,7 +420,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 GGML_SYCL_TENSOR_SPLIT=13 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10" (identical to before)
 ```
@@ -609,14 +609,14 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # 3-device correctness
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # GPU-only split (no CPU)
 GGML_SYCL_SPLIT_RATIO="65,35,0" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 ```
@@ -711,14 +711,14 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # Correctness
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # Performance
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
 # Expect: TG128 > 90 tok/s (batched should eliminate per-op sync overhead)
 ```
 
@@ -767,7 +767,7 @@ ninja -C build -j $(nproc)
 
 # 1. GPU-only baseline (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expect: PP512 >= 1200, TG128 >= 68
 
 sleep 45  # Thermal cooldown (Arc B580 throttles aggressively)
@@ -775,7 +775,7 @@ sleep 45  # Thermal cooldown (Arc B580 throttles aggressively)
 # 2. Correctness test
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
@@ -786,7 +786,7 @@ for ratio in "65,35,0" "60,32,8" "55,30,15" "50,25,25"; do
   echo "=== SPLIT_RATIO=$ratio ==="
   GGML_SYCL_SPLIT_RATIO="$ratio" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
     ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
   sleep 45  # Thermal cooldown
 done
 # Expect: best TG128 > 90 tok/s
@@ -794,14 +794,14 @@ done
 # 4. Legacy mode still works
 GGML_SYCL_TENSOR_SPLIT=13 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # 5. Auto-detect
 GGML_SYCL_SPLIT_RATIO=auto ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
 # Expect: reasonable performance, log shows detected ratios
 ```
 

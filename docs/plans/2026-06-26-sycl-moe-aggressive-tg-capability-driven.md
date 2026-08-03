@@ -1071,7 +1071,7 @@ codescout task comment add llama.cpp-kr62 --author lead --body "Aggressive TG va
 
 ## End-to-End Validation (on the user's machine) — MANDATORY
 
-**Environment:** `/Apps/llama.cpp` on this workstation, Intel oneAPI sourced from `/opt/intel/oneapi/setvars.sh`, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, B580 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:0`, models under `/Storage/GenAI/models/`.
+**Environment:** `/Apps/llama.cpp` on this workstation, Intel oneAPI sourced from `/opt/intel/oneapi/setvars.sh`, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, B580 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:0`, models under `/models/`.
 
 **Steps Claude runs itself:**
 

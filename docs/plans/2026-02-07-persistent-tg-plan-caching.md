@@ -81,16 +81,16 @@ ninja -C /Apps/llama.cpp/build -j $(nproc)
 
 # Correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 /Apps/llama.cpp/build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # TG benchmark (target: ~76 tok/s)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 /Apps/llama.cpp/build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
 
 # PP benchmark (must stay ~1300 tok/s)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 /Apps/llama.cpp/build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0
 ```
 
 ---
@@ -693,7 +693,7 @@ git commit -m "sycl: integrate plan caching in extract_persistent_plan"
 ## Verification
 
 1. **Build**: `source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)`
-2. **Correctness**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
-3. **TG benchmark**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128` — target: significantly faster than 1.77 tok/s
-4. **PP benchmark**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0` — must stay ~1300 tok/s
+2. **Correctness**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
+3. **TG benchmark**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128` — target: significantly faster than 1.77 tok/s
+4. **PP benchmark**: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0` — must stay ~1300 tok/s
 5. **Disable test**: `GGML_SYCL_PERSISTENT_TG=0` should use legacy dispatch correctly

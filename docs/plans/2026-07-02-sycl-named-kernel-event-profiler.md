@@ -1276,7 +1276,7 @@ git commit -m "docs(sycl): document named kernel profile artifacts"
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown.
 
-**Environment:** This workstation, Intel oneAPI sourced, Intel Arc B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`. This validation is model-free and does not access `/Storage/GenAI/models`.
+**Environment:** This workstation, Intel oneAPI sourced, Intel Arc B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`. This validation is model-free and does not access `/models`.
 
 **Steps Claude runs itself:**
 

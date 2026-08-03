@@ -201,7 +201,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # Correctness
 GGML_SYCL_TENSOR_SPLIT=13 GGML_SYCL_DISABLE_GRAPH=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 ```
@@ -305,7 +305,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # Correctness
 GGML_SYCL_TENSOR_SPLIT=13 GGML_SYCL_DISABLE_GRAPH=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 ```
@@ -325,7 +325,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 # 1. GPU-only baseline
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 ~72 tok/s
 
 sleep 45
@@ -335,14 +335,14 @@ for pct in 5 8 10 13 15 20 25; do
   echo "=== TENSOR_SPLIT=$pct ==="
   GGML_SYCL_TENSOR_SPLIT=$pct \
     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
   sleep 45
 done
 
 # 3. Correctness
 GGML_SYCL_TENSOR_SPLIT=13 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 ```

@@ -632,7 +632,7 @@ Run: `cmake --build build -j$(nproc)`
 
 **Step 4: Test with real model**
 
-Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p "Hello" -n 5`
+Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p "Hello" -n 5`
 
 Expected: Log shows "SYCL tensor inventory: N tensors, X.XX GB"
 
@@ -718,7 +718,7 @@ git commit -am "test(sycl): add cache hit rate tests"
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_DEBUG=1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 -p "1, 2, 3, 4, 5," -n 15 --seed 42 --temp 0
 ```
 

@@ -590,7 +590,7 @@ static bool try_xmx_sorted_moe(
 
 # Test that existing path still works
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -780,7 +780,7 @@ static bool try_xmx_sorted_moe(
 ```bash
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0
 ```
 
@@ -813,13 +813,13 @@ Note: Q8_0 scale handling incomplete, expect incorrect output."
 # Current path (baseline)
 echo "=== Current ESIMD/oneDNN path ==="
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 
 # XMX sorted path (experimental)
 echo "=== XMX sorted path ==="
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -828,12 +828,12 @@ GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench 
 ```bash
 # Reference output
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # XMX path
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -844,7 +844,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10..." from both.
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   vtune -collect gpu-hotspots -result-dir /tmp/vtune_xmx_moe -- \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 0 -ngl 99 -fa 1
 ```
 

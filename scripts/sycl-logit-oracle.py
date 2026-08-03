@@ -99,13 +99,13 @@ Usage
 Capture a reference and a candidate, then compare them::
 
     ./scripts/sycl-logit-oracle.py capture \\
-        --model /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \\
+        --model /models/mistral-7b-v0.1.Q4_0.gguf \\
         --device level_zero:1 --out /tmp/before.json
 
     # ... rebuild with the change ...
 
     ./scripts/sycl-logit-oracle.py capture \\
-        --model /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \\
+        --model /models/mistral-7b-v0.1.Q4_0.gguf \\
         --device level_zero:1 --out /tmp/after.json
 
     ./scripts/sycl-logit-oracle.py compare /tmp/before.json /tmp/after.json

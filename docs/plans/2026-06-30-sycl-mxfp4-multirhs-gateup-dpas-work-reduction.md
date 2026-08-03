@@ -94,7 +94,7 @@ digraph dependencies {
 - New route label must be `multirhs-gateup`.
 - New env flag must be `GGML_SYCL_MOE_GATEUP_MULTIRHS=1`.
 - Runtime route must remain default-off and disabled for PP, graph recording, and any grouped batch whose routed entries do not share one expert.
-- No worker may run `/Storage/GenAI/models`, B50/B580 model gates, `llama-bench`, `llama-cli`, `sycl-kernel-bench` executable, `sycl-ls`, `/dev/dri`, DRM fdinfo, `lsof`, direct P2P probes, or real harness execution.
+- No worker may run `/models`, B50/B580 model gates, `llama-bench`, `llama-cli`, `sycl-kernel-bench` executable, `sycl-ls`, `/dev/dri`, DRM fdinfo, `lsof`, direct P2P probes, or real harness execution.
 - Lead owns Tasks 6 and 8 and all GPU/model/synthetic validation. These tasks must not be delegated to worker teammates.
 - Preserve unified-cache `mem_handle` ownership. Raw pointers are transient ABI views only.
 - Do not add persistent duplicate gate/up VRAM layouts.
@@ -509,7 +509,7 @@ git commit -m "test(sycl): add multi-RHS gateup evidence gates"
 
 - The harness must not create `OUT_DIR` in dry-run mode.
 - Do not source oneAPI or run model binaries in dry-run tests.
-- Keep `MODEL=/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` as inert printed text only.
+- Keep `MODEL=/models/gpt-oss-20b-mxfp4.gguf` as inert printed text only.
 
 ---
 

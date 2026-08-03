@@ -392,7 +392,7 @@ public:
 ```bash
 # Should see NO "using CPU memory" warnings
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-120b-Q4_0.gguf \
+  -m /models/gpt-oss-120b-Q4_0.gguf \
   -ngl 99 --lazy-moe -p "Hello" -n 10
 ```
 

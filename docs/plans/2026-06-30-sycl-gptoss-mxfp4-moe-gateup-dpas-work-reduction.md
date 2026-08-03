@@ -111,7 +111,7 @@ digraph dependencies {
   - `profile.mxfp4_tg.path.singlecol-gateup > 0`;
   - `profile.mxfp4_tg.gateup_glu_ms_x1000 <= 4200` on representative TG profile rows.
 - If the candidate does not meet the synthetic proof gate or full B50 gate, it remains default-off and documented as rejected. Do not lower the target by redefining success.
-- Workers must not run `/Storage/GenAI/models`, B50/B580 model gates, `sycl-ls`, `/dev/dri` probes, DRM fdinfo, direct P2P probes, or real harness execution.
+- Workers must not run `/models`, B50/B580 model gates, `sycl-ls`, `/dev/dri` probes, DRM fdinfo, direct P2P probes, or real harness execution.
 - Lead owns all real GPU/model validation.
 - Preserve unified-cache `mem_handle` ownership. Raw pointers are transient ABI views only.
 - Do not add persistent duplicate gate/up VRAM layouts.
@@ -375,7 +375,7 @@ Create `scripts/sycl-gptoss-moe-gateup-work-reduction-gates.sh`:
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUT_DIR="${OUT_DIR:-/tmp/sycl_gptoss_moe_gateup_work_reduction_$(date +%Y%m%d_%H%M%S)}"
 RUN=0
@@ -630,7 +630,7 @@ git commit -m "test(sycl): capture MXFP4 gateup work-reduction source facts"
 **Gotchas:**
 
 - This task must not add a failing test. It is a source-facts guardrail, not the candidate contract.
-- Do not reference `/Storage/GenAI/models` in this test.
+- Do not reference `/models` in this test.
 - Do not assert exact line numbers; assert stable source facts.
 
 ---

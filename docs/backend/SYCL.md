@@ -1025,7 +1025,7 @@ Use the helper script to run PP/TG separately with unified-cache CPU offload and
 
 ```bash
 ./scripts/sycl-cpu-offload-bench-vtune.sh \
-  --model /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  --model /models/mistral-7b-v0.1.Q4_0.gguf \
   --profile nonstream-cpuoffload
 ```
 

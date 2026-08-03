@@ -36,7 +36,7 @@ run
 info registers
 bt 15
 quit') --args ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 1
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128 -r 1
 ```
 
 Deterministic: three separate runs, all reproduce. PP512 completes

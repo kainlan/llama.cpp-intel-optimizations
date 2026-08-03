@@ -28,10 +28,10 @@ RESULTS_FILE="${RESULTS_DIR}/benchmark_${TIMESTAMP}.txt"
 RESULTS_JSON="${RESULTS_DIR}/benchmark_${TIMESTAMP}.json"
 
 # Models to benchmark
-MODEL_MISTRAL_Q4="/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf"
-MODEL_MISTRAL_Q8="/Storage/GenAI/models/mistral-7b-v0.1.Q8_0.gguf"
-MODEL_GPT_OSS_20B="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
-MODEL_GPT2="/Storage/GenAI/models/gpt2.Q8_0.gguf"
+MODEL_MISTRAL_Q4="/models/mistral-7b-v0.1.Q4_0.gguf"
+MODEL_MISTRAL_Q8="/models/mistral-7b-v0.1.Q8_0.gguf"
+MODEL_GPT_OSS_20B="/models/gpt-oss-20b-Q8_0.gguf"
+MODEL_GPT2="/models/gpt2.Q8_0.gguf"
 
 # GPU selector for Intel Arc
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"

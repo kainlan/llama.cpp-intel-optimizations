@@ -477,13 +477,13 @@ Before committing to approximate approach, measure impact:
 ```bash
 # Baseline
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-perplexity \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -f /path/to/wikitext-2-raw/wiki.test.raw
 
 # Tensor split 13%
 GGML_SYCL_TENSOR_SPLIT=13 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-perplexity \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -f /path/to/wikitext-2-raw/wiki.test.raw
 ```
 
@@ -500,7 +500,7 @@ Run tensor split at various percentages with Phase 1 optimizations:
 for pct in 5 8 10 13 15 18 20 25; do
   echo "=== TENSOR_SPLIT=$pct ==="
   GGML_SYCL_TENSOR_SPLIT=$pct ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-    ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+    ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
   sleep 30  # thermal cooldown
 done
 ```

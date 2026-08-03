@@ -29,7 +29,7 @@ CommandResult run_command(const char* cmd) {
 
 ```cpp
 bool test_model_loads_with_xmx_moe(TestStats& stats) {
-    const char* model = "/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf";
+    const char* model = "/models/gpt-oss-20b-Q8_0.gguf";
     const char* binary = "/Apps/llama.cpp/.worktrees/sycl-coalescing/build/bin/llama-completion";
 
     if (!model_exists(model)) {

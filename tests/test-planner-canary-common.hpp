@@ -105,11 +105,11 @@ inline void add(findings & f, const std::string & k, const std::string & v) {
 // Default model paths (override via env vars MISTRAL_PATH / GPTOSS_PATH if needed).
 inline std::string mistral_path() {
     const char * p = std::getenv("MISTRAL_PATH");
-    return p ? p : "/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf";
+    return p ? p : "/models/mistral-7b-v0.1.Q4_0.gguf";
 }
 inline std::string gptoss_path() {
     const char * p = std::getenv("GPTOSS_PATH");
-    return p ? p : "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf";
+    return p ? p : "/models/gpt-oss-20b-mxfp4.gguf";
 }
 
 }  // namespace planner_canary

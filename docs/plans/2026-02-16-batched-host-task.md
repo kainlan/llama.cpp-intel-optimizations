@@ -582,34 +582,34 @@ ninja -C build -j $(nproc)
 
 # 1. GPU-only correctness (HOST_COMPUTE not active → batching inactive)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # 2. HOST_COMPUTE + CPU offload 43% — mixed GPU/CPU layers
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=43 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # 3. HOST_COMPUTE + CPU offload 30% — all CPU layers
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # 4. GPU-only performance (wait 30s between runs)
 LD_LIBRARY_PATH="build/bin:$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v pti | tr '\n' ':' | sed 's/:$//')" \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expect: PP512 >= 1200, TG128 >= 68 (no regression)
 
 # 5. HOST_COMPUTE TG performance
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
 # Before: baseline per-op host_task rate
 # After: expect improvement from 480→~64 host_task submissions
 ```

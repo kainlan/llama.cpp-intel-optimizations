@@ -76,13 +76,13 @@ ninja -C build -j $(nproc)
 
 # Correctness test
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
 
 # Performance benchmark (wait 30s between runs for thermal cooldown)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
 ```
 
 ---
@@ -220,7 +220,7 @@ Actually, check the header — it may already be declared there.
 ```bash
 source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10` ... (normal output, no regression — new code not yet called)
@@ -466,14 +466,14 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 # GPU-only baseline (tensor split disabled)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10" (normal, unaffected)
 
 # Tensor split with CPU placeholder (output will be WRONG — expected!)
 GGML_SYCL_TENSOR_SPLIT=13 GGML_SYCL_DISABLE_GRAPH=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0
 # Expected: GARBAGE output (CPU portion is zeros — this is correct for Task 2)
 # This verifies the path executes without crashing.
@@ -553,14 +553,14 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 # GPU-only baseline
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10"
 
 # Tensor split correctness (MUST match GPU-only output)
 GGML_SYCL_TENSOR_SPLIT=13 GGML_SYCL_DISABLE_GRAPH=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10" (MUST MATCH)
 
@@ -569,7 +569,7 @@ for pct in 10 15 20 25; do
   echo "=== TENSOR_SPLIT=$pct ==="
   GGML_SYCL_TENSOR_SPLIT=$pct GGML_SYCL_DISABLE_GRAPH=1 \
     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+    -m /models/mistral-7b-v0.1.Q4_0.gguf \
     -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 done
 # Expected: ALL produce "6, 7, 8, 9, 10"
@@ -579,7 +579,7 @@ done
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68 (no regression)
 ```
 
@@ -802,7 +802,7 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 # Correctness with graph replay + tensor split
 GGML_SYCL_TENSOR_SPLIT=13 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: "6, 7, 8, 9, 10" (MUST MATCH GPU-only)
 
@@ -811,14 +811,14 @@ for pct in 10 13 15 20 25; do
   echo "=== TENSOR_SPLIT=$pct ==="
   GGML_SYCL_TENSOR_SPLIT=$pct ONEAPI_DEVICE_SELECTOR=level_zero:0 \
     ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
   sleep 30
 done
 # Expected: best TG128 > 70 tok/s (exceeds graph-only baseline)
 
 # GPU-only regression check
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68
 ```
 

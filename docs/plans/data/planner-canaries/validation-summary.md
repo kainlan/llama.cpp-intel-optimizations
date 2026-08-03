@@ -66,7 +66,7 @@ remain open proof/work areas.
   PP == TG; GPT-OSS 20B baseline reproduces with the 17-op active
   SWA+MoE-extended set. Quantization format does NOT perturb op enumeration (expected
   — dequant is internal to MUL_MAT, not a separate op).
-- **Architecture-coverage caveat**: `/Storage/GenAI/models/` has only
+- **Architecture-coverage caveat**: `/models/` has only
   Mistral 7B v0.1 (dense/full-attention, `n_swa=0`) and GPT-OSS 20B
   (active alternating SWA + MoE: `sliding_window=128`, `n_swa=128`,
   12 SWA layers + 12 non-SWA layers) as runnable architecture families.
@@ -278,7 +278,7 @@ synthesis. **Owners needed: backend implementer.**
 
 - **Task 2 architecture coverage** (P2, this team): re-run D0.2
   generalization on a state-space model (Mamba / RWKV / SSM) once a
-  GGUF is present at `/Storage/GenAI/models/`. GPT-OSS 20B provides
+  GGUF is present at `/models/`. GPT-OSS 20B provides
   active SWA+MoE coverage (`sliding_window=128`, `n_swa=128`), so an
   independent SWA family such as Gemma 2 or Mixtral is useful hardening
   but no longer the primary gap. The "single-shape sizing generalizes

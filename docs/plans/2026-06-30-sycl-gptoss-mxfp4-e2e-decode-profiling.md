@@ -288,7 +288,7 @@ Add a small C++ profiling utility that is default-off, CPU-only until called by 
 - [ ] `GGML_SYCL_E2E_TG_PROFILE` is default-off and enabled only by a nonzero env string.
 - [ ] Stage names are stable and include `dispatch`, `cpu_dispatch`, `non_moe_matmul`, `moe`, `attention`, `kv`, `elementwise`, `graph`, `cache`, `transfer`, and `other`.
 - [ ] `GGML_OP_MUL_MAT_ID` classifies as `moe`, `GGML_OP_FLASH_ATTN_EXT` classifies as `attention`, KV-named `GGML_OP_SET_ROWS` classifies as `kv`, and `GGML_OP_MUL_MAT` classifies as `non_moe_matmul`.
-- [ ] Unit test does not construct a `sycl::device`, does not touch `/Storage/GenAI/models`, and does not require `ONEAPI_DEVICE_SELECTOR`.
+- [ ] Unit test does not construct a `sycl::device`, does not touch `/models`, and does not require `ONEAPI_DEVICE_SELECTOR`.
 
 **Implementation Guide:**
 
@@ -1215,7 +1215,7 @@ Write this exact content to `scripts/sycl-gptoss-e2e-profile-matrix.sh`:
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUT_DIR="${OUT_DIR:-/tmp/sycl_gptoss_e2e_profile_$(date +%Y%m%d_%H%M%S)}"
 RUN=0
@@ -1391,7 +1391,7 @@ git commit -m "test(sycl): add GPT-OSS E2E decode profiling matrix"
 **Gotchas:**
 
 - The script must default to dry-run. A worker running the script with no arguments must not execute a model.
-- Do not bake `/Storage/GenAI/models` access into tests. The path is only in the dry-run command and lead-owned real command.
+- Do not bake `/models` access into tests. The path is only in the dry-run command and lead-owned real command.
 - Do not add multi-GPU to the default matrix. It must require `--include-multigpu` and lead approval.
 - Keep `GGML_SYCL_MOE_BLOCK_GRAPHLETS` absent from the default env. Previous MoE graphlet changes regressed correctness/performance.
 

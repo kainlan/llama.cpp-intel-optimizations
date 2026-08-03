@@ -36,7 +36,7 @@ REQUIRED_DRY_RUN_STRINGS = [
     "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",
     "GGML_SYCL_MOE_PHASE_BULK_XMX=1",
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1",
-    "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf",
+    "/models/gpt-oss-20b-mxfp4.gguf",
     "./build/bin/llama-bench",
     "-ngl 99",
     "-fa 1",

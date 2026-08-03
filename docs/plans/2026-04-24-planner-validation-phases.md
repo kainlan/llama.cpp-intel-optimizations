@@ -73,9 +73,9 @@ Tasks 1, 2, 3, 4 can all start in parallel. Tasks 5, 6, 7 wait for Task 4 (E1 RC
 ## Canonical Inputs
 
 Same as previous canary session:
-- Mistral 7B Q4_0: `/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf`
-- GPT-OSS 20B MXFP4: `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`
-- Additional models for Task 2 (D0.2 generalization): any Llama 3.2, Qwen 2.5, state-space models under `/Storage/GenAI/models/` — task detects what's available.
+- Mistral 7B Q4_0: `/models/mistral-7b-v0.1.Q4_0.gguf`
+- GPT-OSS 20B MXFP4: `/models/gpt-oss-20b-mxfp4.gguf`
+- Additional models for Task 2 (D0.2 generalization): any Llama 3.2, Qwen 2.5, state-space models under `/models/` — task detects what's available.
 - Device selector: `ONEAPI_DEVICE_SELECTOR=level_zero:0`
 - B50 policy: do NOT dispatch to device 1 (PCI disable per CLAUDE.md memory).
 
@@ -246,7 +246,7 @@ D0.2 PASSed on Mistral 7B (13 op types) and GPT-OSS 20B (17 op types). Extend to
 
 **Acceptance Criteria:**
 
-- [ ] Runs existing D0.2 canary against at least 3 additional GGUFs from `/Storage/GenAI/models/` (pick what's available — Llama 3.x, Qwen 2.x, Gemma, state-space model if present)
+- [ ] Runs existing D0.2 canary against at least 3 additional GGUFs from `/models/` (pick what's available — Llama 3.x, Qwen 2.x, Gemma, state-space model if present)
 - [ ] For each model, captures PP op set + TG op set, checks equality
 - [ ] Writes `d0.2-generalization.md` aggregating the extra runs with clear per-model rows
 - [ ] Reports overall: "generalization holds" if all pass, "generalization breaks on <model>" if any fails
@@ -256,11 +256,11 @@ D0.2 PASSed on Mistral 7B (13 op types) and GPT-OSS 20B (17 op types). Extend to
 
 ```bash
 # 1. Survey available models
-ls /Storage/GenAI/models/*.gguf | head -20
+ls /models/*.gguf | head -20
 
 # 2. For each candidate model, run existing canary with env overrides
 # (The D0.2 canary uses MISTRAL_PATH and GPTOSS_PATH as env overrides — reuse that)
-for model in "/Storage/GenAI/models/<model1>.gguf" "/Storage/GenAI/models/<model2>.gguf"; do
+for model in "/models/<model1>.gguf" "/models/<model2>.gguf"; do
     echo "=== $(basename $model) ==="
     MISTRAL_PATH="$model" GPTOSS_PATH="" \
       ONEAPI_DEVICE_SELECTOR=opencl:cpu timeout 300 \
@@ -653,13 +653,13 @@ Modify the enum order or the bin-packer's priority comparison in 1-2 branches, r
 # Baseline (current order)
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 \
   2>&1 | tee /tmp/bench-baseline.log
 
 # Variant 1: swap ATTENTION and FFN
 # (rebuild with the modified enum)
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 \
   2>&1 | tee /tmp/bench-variant1.log
 ```
 

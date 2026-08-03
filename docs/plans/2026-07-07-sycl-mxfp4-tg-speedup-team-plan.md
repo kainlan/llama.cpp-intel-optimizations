@@ -1018,7 +1018,7 @@ GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2 scripts/sycl-gptoss-decode-timeline-profil
   --execute --i-understand-this-runs-gpu-models \
   --out-root "$ROOT/tile2" \
   --device-selector level_zero:1 \
-  --model /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+  --model /models/gpt-oss-20b-mxfp4.gguf
 ```
 
 Use `tile4` instead if the matrix shows `tile4` is faster.

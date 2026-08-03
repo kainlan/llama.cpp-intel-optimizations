@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${SYCL_GPTOSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${SYCL_GPTOSS_MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 OUT_ROOT="${SYCL_DOWN_VARIANT_PROFILE_OUT:-/tmp/sycl_down_variant_profile_$(date +%Y%m%d_%H%M%S)}"
 BENCH="${SYCL_LLAMA_BENCH:-${ROOT_DIR}/build/bin/llama-bench}"
 EXECUTE=0

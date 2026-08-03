@@ -28,7 +28,7 @@ With `GGML_SYCL_CPU_EXPERT_TG=0` all 69 MXFP4 MUL_MAT_ID tests pass.
 20B canary:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p "1, 2, 3, 4, 5," -n 30 --seed 42 --temp 0
 ```
 Currently produces garbled output. Gate 4.

@@ -1194,14 +1194,14 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # 1. Mistral 7B regression check (non-MoE model — all optimizations should be no-ops)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68
 
 sleep 30
 
 # 2. 120B correctness (deterministic output with all phases enabled)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 'The capital of France is' -n 10 --seed 42 --temp 0
 # Expected: coherent, deterministic output
 
@@ -1209,7 +1209,7 @@ sleep 60
 
 # 3. 120B single-GPU performance (Phase 1+2+4)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
 # Expected: TG >= 5 tok/s (from 2.36 baseline)
 
 sleep 60
@@ -1217,14 +1217,14 @@ sleep 60
 # 4. 120B dual-GPU performance (Phase 1+2+3+4)
 GGML_SYCL_MOE_MULTI_GPU=1 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0,1" ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
 # Expected: TG >= 8 tok/s
 
 sleep 60
 
 # 5. 20B MoE regression check
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128
 # Expected: PP512 >= 27, TG128 >= 2
 
 sleep 60
@@ -1233,12 +1233,12 @@ sleep 60
 # Phase 1 only (pool):
 GGML_SYCL_MOE_PREGATE=0 GGML_SYCL_MOE_MULTI_GPU=0 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
 
 # 7. Legacy path (MoE hybrid disabled completely)
 GGML_SYCL_MOE_HYBRID=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf -p 16 -n 32
 ```
 
 **Notes for implementer:**

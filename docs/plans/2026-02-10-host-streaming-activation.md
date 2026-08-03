@@ -266,13 +266,13 @@ Verify flag behavior:
 ```bash
 # Default (no env var): model fits → g_model_exceeds_vram=false
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | grep SYCL-BUDGET
 
 # 30% budget: model exceeds → g_model_exceeds_vram=true
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | grep SYCL-BUDGET
 ```
 
@@ -429,7 +429,7 @@ ninja -C build -j $(nproc)
 Performance (no evictions, graphs should still work):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68 (has_evictions is false → graphs active)
 
@@ -437,7 +437,7 @@ Low budget (evictions likely):
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0
 ```
 Expected: No crash (but output may still be wrong until Tasks 3-4 are done).
@@ -587,7 +587,7 @@ Auto-activation with low budget:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | grep -E "LAYER-STREAM|SYCL-BUDGET"
 ```
 Expected: "[SYCL-BUDGET] Layer streaming enabled" in logs. Output may still be wrong (Task 4 needed for non-layer tensors).
@@ -595,7 +595,7 @@ Expected: "[SYCL-BUDGET] Layer streaming enabled" in logs. Output may still be w
 No regression:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68
 
@@ -728,7 +728,7 @@ With Tasks 1-3 applied, low budget should now produce correct output:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, ...` (correct output, may be slow ~3-4 tok/s)
@@ -812,7 +812,7 @@ Verify budget shows streaming allocation:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | grep -E "BUDGET|STREAM"
 ```
 Expected: Budget log shows streaming buffer bytes.
@@ -856,7 +856,7 @@ Comprehensive verification that host weight streaming works end-to-end across di
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
@@ -865,7 +865,7 @@ Expected: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68
 
@@ -876,7 +876,7 @@ Wait 30+ seconds between runs (Arc B580 thermal throttling).
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output (same as default). Will be slow (~3-4 tok/s).
@@ -886,7 +886,7 @@ Expected: Correct output (same as default). Will be slow (~3-4 tok/s).
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output.
@@ -896,7 +896,7 @@ Expected: Correct output.
 ```bash
 GGML_SYCL_FORCE_STREAMING=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output, streaming active even though model fits.
@@ -906,7 +906,7 @@ Expected: Correct output, streaming active even though model fits.
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'Hello' -n 1 --seed 42 --temp 0 2>/tmp/stream_debug.txt
 ```
 Check `/tmp/stream_debug.txt` for:
@@ -920,7 +920,7 @@ Check `/tmp/stream_debug.txt` for:
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 'Hello, my name is' -n 5 --seed 42 --temp 0
 ```
 Expected: Coherent output or graceful failure message. May take a long time per token.
@@ -946,12 +946,12 @@ ninja -C build -j $(nproc)
 
 # Quick correctness (no streaming)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Performance (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 ## Key Design Decisions

@@ -1309,7 +1309,7 @@ GGML_SYCL_MOE_ROUTE_LOG=1 \
 GGML_SYCL_MXFP4_TG_PROFILE=1 \
 GGML_SYCL_MXFP4_PP_PROFILE=1 \
 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -1333,7 +1333,7 @@ GGML_SYCL_MOE_ROUTE_LOG=1 \
 GGML_SYCL_MXFP4_TG_PROFILE=1 \
 GGML_SYCL_MXFP4_PP_PROFILE=1 \
 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -fa 1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -fa 1 \
   -p 512 -n 128 \
   > "$LOG_DIR/bench.stdout" 2> "$LOG_DIR/bench.stderr"
 
@@ -1375,7 +1375,7 @@ git commit -m "test(sycl): record single XMX_TILED gateup validation"
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown.
 
-**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, Intel oneAPI sourced, Arc Pro B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, model `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, patched Level Zero runtime on this workstation.
+**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, Intel oneAPI sourced, Arc Pro B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, model `/models/gpt-oss-20b-mxfp4.gguf`, patched Level Zero runtime on this workstation.
 
 **Steps Claude runs itself:** Task 7 commands above. Claude can run them from the lead session because the lead owns B50/model validation.
 

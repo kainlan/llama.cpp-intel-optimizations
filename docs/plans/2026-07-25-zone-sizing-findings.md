@@ -27,7 +27,7 @@ Observation only — no sizing arithmetic changed.
 
 ```bash
 timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/<model>.gguf -p 0 -n 4 -r 1 -v 2>&1 | grep '\[SYCL-PLAN\]'
+  -m /models/<model>.gguf -p 0 -n 4 -r 1 -v 2>&1 | grep '\[SYCL-PLAN\]'
 ```
 
 > `-v` is **required**. `llama-bench` installs a null log callback, so every

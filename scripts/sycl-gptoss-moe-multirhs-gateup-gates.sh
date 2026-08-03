@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUT_DIR="${OUT_DIR:-/tmp/sycl_gptoss_moe_multirhs_gateup_$(date +%Y%m%d_%H%M%S)}"
 RUN=0

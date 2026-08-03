@@ -55,7 +55,7 @@ run whose SYCL teardown hasn't released everything:
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -r 1
 ```
 

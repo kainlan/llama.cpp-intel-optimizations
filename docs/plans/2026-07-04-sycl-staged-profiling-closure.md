@@ -147,7 +147,7 @@ def manifest(stage: str, root: str, build_sha: str = "abc123") -> dict[str, obje
         "stage": stage,
         "artifact_root": root,
         "build_sha": build_sha,
-        "model": {"path": "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
+        "model": {"path": "/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
         "device_selector": "level_zero:1",
         "fa": 1,
         "moe_knobs": {
@@ -631,7 +631,7 @@ def manifest(stage: str, root: str, build_sha: str = "abc123") -> dict[str, obje
         "stage": stage,
         "artifact_root": root,
         "build_sha": build_sha,
-        "model": {"path": "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
+        "model": {"path": "/models/gpt-oss-20b-mxfp4.gguf", "size": 12101000000},
         "device_selector": "level_zero:1",
         "fa": 1,
         "moe_knobs": {
@@ -877,7 +877,7 @@ Expected: dry-run exits 0 and tests pass.
 
 - Do not copy the monolithic VTune wrapping from `scripts/sycl-gptoss-full-attribution-profile.sh:209-216` into `run_base_stage`.
 - Keep dry-run free of side effects; tests assert output root does not exist.
-- The script may mention `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` in dry-run command text, but must not access it in dry-run.
+- The script may mention `/models/gpt-oss-20b-mxfp4.gguf` in dry-run command text, but must not access it in dry-run.
 
 #### Commit
 
@@ -1331,7 +1331,7 @@ git commit -m "tasks(sycl): validate staged profiling closure"
 
 ## End-to-End Validation on the User's Machine
 
-**Environment:** `/Apps/llama.cpp` on this workstation, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, GPT-OSS 20B MXFP4 model at `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, oneAPI sourced with the required `set +u` wrapper.
+**Environment:** `/Apps/llama.cpp` on this workstation, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, GPT-OSS 20B MXFP4 model at `/models/gpt-oss-20b-mxfp4.gguf`, oneAPI sourced with the required `set +u` wrapper.
 
 **Steps Claude runs itself:**
 
@@ -1382,7 +1382,7 @@ git commit -m "tasks(sycl): validate staged profiling closure"
    GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
    GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
    ./build/bin/llama-bench \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+     -m /models/gpt-oss-20b-mxfp4.gguf \
      -ngl 99 -fa 1 -p 512 -n 128 -r 1
    ```
    Expected: PP/TG rows are recorded; this plan does not require TG >=45 because it is not an optimization plan.

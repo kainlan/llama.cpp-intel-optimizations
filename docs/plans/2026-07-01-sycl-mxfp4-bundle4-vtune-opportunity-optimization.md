@@ -101,7 +101,7 @@ Add `mxfp4_pair_glu_xmx_tiled_bundle4_packed_r8_m2` as a benchmark-only route th
 - [ ] The new route is listed in `tools/sycl-kernel-bench/main.cpp` CLI help.
 - [ ] The route name still drives `parse_moe_xmx_tiled_bundle4()` through the existing `_xmx_tiled_bundle4` substring parser at `tools/sycl-kernel-bench/benchmark_harness.hpp:127-128`.
 - [ ] The route does not contain `_bias` or `_sparse32`, so existing harness parsing at `tools/sycl-kernel-bench/benchmark_harness.hpp:1241-1242` leaves `sparse_expert_slots=false` and `use_bias=false`.
-- [ ] No SYCL executable, VTune, model gate, `sycl-ls`, `/dev/dri` probe, or `/Storage/GenAI/models` path is run by the implementer.
+- [ ] No SYCL executable, VTune, model gate, `sycl-ls`, `/dev/dri` probe, or `/models` path is run by the implementer.
 
 **Implementation Guide:**
 
@@ -893,7 +893,7 @@ Expected: pytest passes, `git diff --check` emits no output, and the docs commit
 
 **Gotchas:**
 
-- Only the lead may run `sycl-kernel-bench`, VTune, B50/B580 selectors, model gates, `sycl-ls`, `/dev/dri` probes, or `/Storage/GenAI/models` paths.
+- Only the lead may run `sycl-kernel-bench`, VTune, B50/B580 selectors, model gates, `sycl-ls`, `/dev/dri` probes, or `/models` paths.
 - Use `set +u` before sourcing oneAPI; restore `set -u` afterward.
 - If VTune labels the adapter as `Battlemage G21 [Arc B580]` while the command used `ONEAPI_DEVICE_SELECTOR=level_zero:1`, document the caveat and avoid B50-specific absolute VTune claims.
 - A benchmark win does not authorize production runtime promotion. It authorizes a new reviewed runtime plan only if the `10%` speedup gate and correctness gate pass.

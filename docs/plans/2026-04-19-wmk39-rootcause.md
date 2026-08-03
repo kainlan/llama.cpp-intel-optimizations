@@ -91,7 +91,7 @@ The failing canary on HEAD of `feature/sycl-coalescing` is:
 
 ```
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -m /models/gpt-oss-20b-mxfp4.gguf \
     -p '1, 2, 3, 4, 5,' -n 128 --seed 42 --temp 0
 ```
 

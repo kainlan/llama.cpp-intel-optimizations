@@ -518,7 +518,7 @@ Expected: no recent GT reset. If a reset appears, STOP and report — numbers ta
 
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 0 -n 8 2>&1 | grep -iE 'free|VRAM|budget' | head
 ```
 
@@ -537,7 +537,7 @@ for i in 1 2 3 4 5 6; do
     fi
     echo "=== pair $i arm $arm ===" >> /tmp/hostoverhead/pairs.txt
     timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 $EXTRA \
-      ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
       -p 0 -n 128 -r 3 2>&1 | tee -a /tmp/hostoverhead/pairs.txt | grep -E 'tg128|free'
   done
 done
@@ -548,7 +548,7 @@ done
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_TIMELINE=timeline+events \
   GGML_SYCL_TIMELINE_OUTPUT=/tmp/hostoverhead/gate.json \
-  ./build/bin/llama-cli -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  ./build/bin/llama-cli -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -813,7 +813,7 @@ git commit -m "docs(sycl): select and write phase-2 plan for decode host overhea
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown.
 
-**Environment:** This host — Arc Pro B70 (Battlemage G31, 256 CU, ~32.6 GB, `level_zero:0`, `0000:03:00.0`) and Arc Pro B50 (G21, 128 CU, ~16 GB, `level_zero:1`), Linux 7.1.2, oneAPI 2026.1, patched compute-runtime. Model: `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` (12 GB).
+**Environment:** This host — Arc Pro B70 (Battlemage G31, 256 CU, ~32.6 GB, `level_zero:0`, `0000:03:00.0`) and Arc Pro B50 (G21, 128 CU, ~16 GB, `level_zero:1`), Linux 7.1.2, oneAPI 2026.1, patched compute-runtime. Model: `/models/gpt-oss-20b-mxfp4.gguf` (12 GB).
 
 **Steps Claude runs itself:**
 
@@ -846,7 +846,7 @@ git commit -m "docs(sycl): select and write phase-2 plan for decode host overhea
    ```bash
    source /opt/intel/oneapi/setvars.sh --force
    timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
+     -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
      --no-display-prompt --chat-template-kwargs '{"reasoning_effort":"medium"}' \
      --reasoning-format none --reasoning-budget 0 \
      -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' -n 48 --seed 42 --temp 0

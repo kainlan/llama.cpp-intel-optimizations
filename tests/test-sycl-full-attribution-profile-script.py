@@ -18,7 +18,7 @@ REQUIRED_DRY_RUN_STRINGS = [
     "DRY RUN",
     "--execute --i-understand-this-runs-gpu-models-and-profilers",
     "./build/bin/llama-bench",
-    "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf",
+    "/models/gpt-oss-20b-mxfp4.gguf",
     "ONEAPI_DEVICE_SELECTOR=level_zero:1",
     "GGML_SYCL_E2E_TG_PROFILE=1",
     "GGML_SYCL_TIMELINE=timeline+events",

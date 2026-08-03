@@ -376,7 +376,7 @@ Find the dispatch logic and add layout.mode check alongside existing optimize_fe
 **Step 3: Build and test**
 
 Run: `./scripts/quick-rebuild.sh`
-Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
+Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
 Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 
 **Step 4: Commit**
@@ -404,7 +404,7 @@ Add after `pre_reorder_all_tensors(sycl_ctx, cgraph);` (line 15145):
 
 **Step 2: Build and test with MoE model**
 
-Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0`
+Run: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0`
 Expected: Correct output, no OOM
 
 **Step 3: Commit**
@@ -458,7 +458,7 @@ git commit -m "feat(sycl): update release_extra_gpu for unified layout cleanup"
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
@@ -467,7 +467,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct counting, no OOM error
@@ -477,11 +477,11 @@ Expected: Correct counting, no OOM error
 ```bash
 # Before (baseline)
 GGML_SYCL_LAYOUT_OVERRIDE=aos ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p 512 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p 512 -n 128
 
 # After (optimized)
 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p 512 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -ngl 99 -p 512 -n 128
 ```
 
 **Step 4: Document results and commit**

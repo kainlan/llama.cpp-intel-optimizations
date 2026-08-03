@@ -615,14 +615,14 @@ Verify the complete pressure hierarchy works correctly and benchmark all paths:
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200 tok/s, TG128 >= 68 tok/s
 ```
 
 2. **Test correctness baseline**:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>/dev/null
 # Record output
 ```
@@ -631,7 +631,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | tee /tmp/cpu_offload.log
 # Verify: fit_params log shows reduced n_gpu_layers
 # Verify: output matches baseline
@@ -641,7 +641,7 @@ GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Record: PP and TG with CPU offload
 ```
 
@@ -649,7 +649,7 @@ GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 GGML_SYCL_FORCE_STREAMING=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | tee /tmp/streaming.log
 # Verify: layer streaming log shows buffer allocation
 # Verify: output matches baseline
@@ -659,7 +659,7 @@ GGML_SYCL_VRAM_BUDGET_PCT=30 GGML_SYCL_FORCE_STREAMING=1 ONEAPI_DEVICE_SELECTOR=
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=30 GGML_SYCL_FORCE_STREAMING=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Record: PP and TG with streaming
 ```
 
@@ -794,7 +794,7 @@ git commit -m "sycl: KV cache host fallback when VRAM tight (Level 1 pressure hi
 - `ggml_backend_sycl_host_buffer_type()` returns host pinned buffer — this is the key. SYCL USM means GPU kernels can read host memory directly through PCIe without explicit DMA.
 - The KV cache constructor (`llama-kv-cache.cpp:138-150`) calls `ggml_backend_sycl_kv_buffer_type_from_dev(dev)` which calls `ggml_backend_sycl_kv_buffer_type(device)` — so our change propagates automatically.
 - **Performance impact**: TG will be slower (attention reads KV through PCIe at ~28 GB/s vs ~224 GB/s). PP is less affected (compute-bound). This is expected — the tradeoff is full context vs speed.
-- For testing: `GGML_SYCL_KV_HOST=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
+- For testing: `GGML_SYCL_KV_HOST=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
 - Mistral 7B Q4_0 (3.9 GB weights) with default context (131K tokens) would have ~8 GB KV cache — total ~12 GB, just barely fitting on Arc B580 (12 GB). With `KV_HOST=1`, weights stay in VRAM, KV goes to host, freeing ~8 GB VRAM.
 - The `unified_cache_should_offload_kv()` function needs to be called AFTER `set_tensor_inventory()` populates the budget — verify call order in `llama-kv-cache.cpp` constructor.
 

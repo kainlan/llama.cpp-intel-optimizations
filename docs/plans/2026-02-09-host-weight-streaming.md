@@ -693,7 +693,7 @@ The new files will be auto-included via the CMakeLists.txt glob. Verify zero war
 Quick smoke test (no streaming expected — module is not wired in yet):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, ...` (correct output, no regression)
@@ -786,7 +786,7 @@ ninja -C build -j $(nproc)
 Normal model (no streaming, graphs should still work):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68 (graphs and persistent TG active)
 
@@ -794,7 +794,7 @@ Low VRAM (streaming mode — graphs disabled, per-op dispatch):
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Still produces output (even if wrong — streaming isn't wired yet). Confirms graph disable doesn't crash.
@@ -927,7 +927,7 @@ ninja -C build -j $(nproc)
 Normal model (no streaming):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output, no streaming messages in stderr.
@@ -936,7 +936,7 @@ Low VRAM (streaming active):
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | head -50
 ```
 Expected: Layer streaming messages in stderr. Output may still be wrong (pointer resolution not yet wired — that's Task 4).
@@ -1182,7 +1182,7 @@ ninja -C build -j $(nproc)
 Correctness (normal VRAM):
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
@@ -1191,7 +1191,7 @@ Low VRAM streaming:
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: Correct output (same sequence). Will be slow (~3-4 tok/s) but correct.
@@ -1199,7 +1199,7 @@ Expected: Correct output (same sequence). Will be slow (~3-4 tok/s) but correct.
 Performance regression:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68
 
@@ -1243,7 +1243,7 @@ Comprehensive verification that host weight streaming works correctly across all
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
@@ -1252,7 +1252,7 @@ Expected: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 Expected: PP512 >= 1200, TG128 >= 68
 
@@ -1262,7 +1262,7 @@ Wait 30+ seconds between runs to avoid thermal throttling on Arc B580.
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 'Hello, my name is' -n 10 --seed 42 --temp 0
 ```
 Expected: Coherent output (may take a minute+ per token due to streaming).
@@ -1273,7 +1273,7 @@ If it hangs, that may be a pre-existing MoE issue — document and move on.
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=10 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'Hello' -n 1 --seed 42 --temp 0
 ```
 Expected: Either produces output or fails gracefully (no crash, no hang).
@@ -1283,7 +1283,7 @@ Expected: Either produces output or fails gracefully (no crash, no hang).
 ```bash
 GGML_SYCL_VRAM_BUDGET_PCT=40 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'Hello' -n 1 --seed 42 --temp 0 2>/tmp/stream_debug.txt
 ```
 Check `/tmp/stream_debug.txt` for:
@@ -1313,12 +1313,12 @@ ninja -C build -j $(nproc)
 
 # Quick correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Performance (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 ## Key Design Decisions

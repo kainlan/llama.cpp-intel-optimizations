@@ -239,7 +239,7 @@ GGML_SYCL_DEBUG("[XMX MoE] Layout %d not supported, falling back\n", layout);
 # Default coalesced mode with XMX MoE
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 # Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
 ```
@@ -250,7 +250,7 @@ for mode in aos soa coalesced; do
   echo "=== Mode: $mode ==="
   GGML_SYCL_LAYOUT_OVERRIDE=$mode GGML_SYCL_XMX_MOE=1 \
     ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+    -m /models/gpt-oss-20b-Q8_0.gguf \
     -p 512 -n 128 -ngl 99 -fa 1
 done
 ```

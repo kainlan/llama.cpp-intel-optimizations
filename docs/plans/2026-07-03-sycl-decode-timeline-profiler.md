@@ -1433,7 +1433,7 @@ execute=0
 ack=0
 out_root="/tmp/sycl_decode_timeline_$(date +%Y%m%d_%H%M%S)"
 device_selector="level_zero:1"
-model="/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf"
+model="/models/gpt-oss-20b-mxfp4.gguf"
 # Decode-step window. -p 512 -n 128 issues one graph-compute per PP chunk and
 # per decode token; set --token-start past the prefill graph-computes to keep
 # prompt-processing spans OUT of what is meant to be a decode trace (Task 4D).
@@ -1534,7 +1534,7 @@ Real execution requires the lead to pass both explicit flags:
 bash scripts/sycl-gptoss-decode-timeline-profile.sh --execute --i-understand-this-runs-gpu-models
 ```
 
-Workers must not run this script with `--execute`, must not access `/Storage/GenAI/models`, and must not run B50/B580 model gates. Worker validation is limited to CTest, Python parser/source tests, and dry-run command generation.
+Workers must not run this script with `--execute`, must not access `/models`, and must not run B50/B580 model gates. Worker validation is limited to CTest, Python parser/source tests, and dry-run command generation.
 ```
 
 **Verify GREEN:**
@@ -1573,7 +1573,7 @@ git commit -m "docs(sycl): document decode timeline profiling workflow"
 **File scope:**
 - Create or modify: `activation/sycl-decode-timeline-profiler-validation.md`
 
-**Description:** Validate that the feature is safe when disabled, emits parseable artifacts when enabled, and produces a real lead-only B50 GPT-OSS timeline that can guide the next optimization target. This task is not assignable to worker agents because it uses oneAPI binaries, `/Storage/GenAI/models`, and real GPU/model execution.
+**Description:** Validate that the feature is safe when disabled, emits parseable artifacts when enabled, and produces a real lead-only B50 GPT-OSS timeline that can guide the next optimization target. This task is not assignable to worker agents because it uses oneAPI binaries, `/models`, and real GPU/model execution.
 
 **Acceptance Criteria:**
 - [ ] All new C++ CTest targets pass.
@@ -1675,7 +1675,7 @@ git commit -m "test(sycl): validate decode timeline profiler"
 
 > Run AFTER all task tests pass, BEFORE declaring the feature done. Owned by the lead at teardown.
 
-**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, branch `feature/sycl-mxfp4-tg-runtime`, Intel oneAPI sourced, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, GPT-OSS model at `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`.
+**Environment:** `/Apps/llama.cpp-mxfp4-tg-runtime`, branch `feature/sycl-mxfp4-tg-runtime`, Intel oneAPI sourced, B50 selected with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, GPT-OSS model at `/models/gpt-oss-20b-mxfp4.gguf`.
 
 **Steps Claude runs itself as lead:**
 

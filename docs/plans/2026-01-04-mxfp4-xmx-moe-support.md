@@ -131,7 +131,7 @@ git commit -m "feat(sycl): add MXFP4 type dispatch in XMX MoE path"
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -141,7 +141,7 @@ Expected: Performance matches baseline (~280 t/s pp, ~31 t/s tg)
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -151,7 +151,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10..."
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 

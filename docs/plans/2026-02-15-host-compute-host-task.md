@@ -131,7 +131,7 @@ Expected: Build succeeds (0 errors). Warnings about unused variables are OK.
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -650,7 +650,7 @@ Expected: 0 errors. If build fails, check for missing `#include "cpu-dispatch.hp
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -661,7 +661,7 @@ Expected output contains: `6, 7, 8, 9, 10`
 ```bash
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=43 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -672,7 +672,7 @@ Expected: Same output as GPU-only.
 ```bash
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -683,7 +683,7 @@ Expected: Same output.
 ```bash
 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -695,7 +695,7 @@ Expected: Same output (staging path unchanged).
 NEW_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v pti | tr '\n' ':' | sed 's/:$//')
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 Expected: PP512 >= 1200 tok/s, TG128 >= 68 tok/s (no regression).
@@ -708,7 +708,7 @@ Expected: PP512 >= 1200 tok/s, TG128 >= 68 tok/s (no regression).
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" \
   GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
 ```
 
 Baseline (staging path without HOST_COMPUTE): ~1.5 tok/s at 30% VRAM.

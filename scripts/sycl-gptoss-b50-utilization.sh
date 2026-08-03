@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH="${BENCH:-$ROOT/build/bin/llama-bench}"
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUTDIR="${OUTDIR:-/tmp/b50-gptoss-util.$(date +%Y%m%d-%H%M%S)}"
 

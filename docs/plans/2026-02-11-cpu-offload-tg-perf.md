@@ -200,21 +200,21 @@ source /opt/intel/oneapi/setvars.sh --force && ninja -C build -j $(nproc)
 
 # GPU-only (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # CPU offload (42% budget)
 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: correct output, TG > 1.5 tok/s (was 1.11)
 
 # Thread count test
 GGML_SYCL_CPU_THREADS=4 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: correct output (fewer threads = slower but still correct)
 ```
@@ -486,14 +486,14 @@ The ONLY thing we need is `staging_drain()` to ensure the async flush of Q compl
 # Count transitions with debug
 GGML_SYCL_DEBUG=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0 2>&1 | grep -c 'CPU→GPU\|GPU→CPU'
 # Before: ~14 per token, After: ~2 per token (only at GPU/CPU layer boundary)
 
 # Correctness
 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 ```
@@ -516,33 +516,33 @@ NEW_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v pti | tr '\n' ':' | s
 
 # 1. GPU-only correctness (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10"
 
 # 2. GPU-only performance (wait 60s for thermal cooldown)
 LD_LIBRARY_PATH="build/bin:$NEW_PATH" ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expect: PP512 >= 1200, TG128 >= 68
 
 # 3. CPU offload 42% VRAM
 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: correct output, TG >= 2.5 tok/s (was 1.11)
 
 # 4. CPU offload 30% VRAM (all CPU layers)
 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: correct output, TG >= 2.0 tok/s (was 0.96)
 
 # 5. Thread count verification
 GGML_SYCL_CPU_THREADS=1 GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_VRAM_BUDGET_PCT=42 \
   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:0' ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: correct output, ~1.11 tok/s (single-thread baseline)
 ```

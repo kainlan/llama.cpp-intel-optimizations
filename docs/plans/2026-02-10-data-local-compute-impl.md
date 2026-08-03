@@ -705,7 +705,7 @@ Validate the data-local CPU compute path end-to-end. Compare outputs between def
 set -e
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-MODEL=/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf
+MODEL=/models/mistral-7b-v0.1.Q4_0.gguf
 PROMPT='1, 2, 3, 4, 5,'
 COMMON_ARGS="-m $MODEL -p '$PROMPT' -n 15 --seed 42 --temp 0"
 

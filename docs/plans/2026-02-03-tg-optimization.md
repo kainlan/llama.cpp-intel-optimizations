@@ -101,7 +101,7 @@ Run: `ninja -C build ggml-sycl`
 
 **Step 3: Test with debug output**
 
-Run: `GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 32 2>&1 | grep -i graph`
+Run: `GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 32 2>&1 | grep -i graph`
 
 **Step 4: Commit**
 
@@ -136,11 +136,11 @@ if (ctx.warmup_decode_n_nodes == 0 && is_decode) {
 
 **Step 3: Test graph capture after warmup**
 
-Run: `GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 64`
+Run: `GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 64`
 
 **Step 4: Benchmark improvement**
 
-Run: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3`
+Run: `ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3`
 
 **Step 5: Commit**
 
@@ -579,7 +579,7 @@ case KernelType::PERSISTENT_TG: {
 
 **Step 3: Test dispatch**
 
-Run: `GGML_SYCL_DEBUG=1 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 16`
+Run: `GGML_SYCL_DEBUG=1 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 16`
 
 **Step 4: Commit**
 
@@ -600,7 +600,7 @@ git commit -m "sycl: Integrate persistent TG kernel with dispatch"
 
 ```bash
 GGML_SYCL_GRAPH=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > baseline_no_graph.txt
 ```
 
@@ -608,7 +608,7 @@ GGML_SYCL_GRAPH=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 ```bash
 GGML_SYCL_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > with_graph.txt
 ```
 
@@ -628,7 +628,7 @@ diff baseline_no_graph.txt with_graph.txt
 
 ```bash
 GGML_SYCL_PERSISTENT_TG=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > baseline_no_persistent.txt
 ```
 
@@ -636,7 +636,7 @@ GGML_SYCL_PERSISTENT_TG=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 ```bash
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > with_persistent.txt
 ```
 
@@ -656,14 +656,14 @@ diff baseline_no_persistent.txt with_persistent.txt
 
 ```bash
 GGML_SYCL_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3
 ```
 
 **Step 2: Benchmark persistent kernel**
 
 ```bash
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 -r 3
 ```
 
 **Step 3: Compare launch counts**
@@ -671,7 +671,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 ```bash
 ZE_ENABLE_TRACING_LAYER=1 GGML_SYCL_GRAPH=0 GGML_SYCL_PERSISTENT_TG=0 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 8 2>&1 | \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 8 2>&1 | \
   grep -c zeKernel
 ```
 

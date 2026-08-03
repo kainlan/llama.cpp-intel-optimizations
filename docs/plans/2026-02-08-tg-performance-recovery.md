@@ -88,13 +88,13 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # Correctness (must match expected output)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected output includes: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
 # Performance benchmark
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Targets: PP512 >= 1300 tok/s, TG128 >= 70 tok/s
 
 # WARNING: ONEAPI_DEVICE_SELECTOR=level_zero:0 is REQUIRED (multi-GPU hangs without it)
@@ -227,12 +227,12 @@ ninja -C build -j $(nproc)
 
 # Correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Diagnostic TG run
 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 0 -n 128 > /tmp/tg-diag.txt 2>&1
 
 # Extract diagnostics
@@ -463,12 +463,12 @@ ninja -C build -j $(nproc)
 
 # Correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Performance (no regression)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 **Commit:**
@@ -591,12 +591,12 @@ ninja -C build -j $(nproc)
 
 # Correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Performance
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 **Commit:**
@@ -723,16 +723,16 @@ ninja -C build -j $(nproc)
 
 # Correctness (CRITICAL — kernel change must produce identical output)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Performance
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 
 # Verify MMVQ path is taken (check debug output for first few matmuls)
 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 0 -n 32 > /tmp/kernel-path.txt 2>&1
 grep -c 'mul_mat_vec_q' /tmp/kernel-path.txt  # Should show MMVQ kernel calls
 ```
@@ -793,7 +793,7 @@ ninja -C build -j $(nproc)
 for i in 1 2 3; do
   echo "=== Run $i ==="
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+    -m /models/mistral-7b-v0.1.Q4_0.gguf \
     -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 done
 ```
@@ -806,7 +806,7 @@ All 3 runs must produce identical output.
 for i in 1 2 3; do
   echo "=== Benchmark Run $i ==="
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 done
 ```
 
@@ -814,7 +814,7 @@ done
 
 ```bash
 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 0 -n 128 > /tmp/final-diag.txt 2>&1
 grep 'TG-DIAG' /tmp/final-diag.txt
 grep 'TIMING' /tmp/final-diag.txt
@@ -824,7 +824,7 @@ grep 'TIMING' /tmp/final-diag.txt
 
 ```bash
 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
 ```
 
 6. **Report results in this format:**

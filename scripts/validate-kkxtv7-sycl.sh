@@ -14,8 +14,8 @@ Modes:
 Environment overrides:
   BUILD_DIR       Build directory (default: build)
   LOG_ROOT        Parent log directory (default: artifacts/kkxtv7-sycl)
-  GPT_OSS_MODEL   GPT-OSS model path (default: /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf)
-  MISTRAL_MODEL   Mistral model path (default: /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf)
+  GPT_OSS_MODEL   GPT-OSS model path (default: /models/gpt-oss-20b-mxfp4.gguf)
+  MISTRAL_MODEL   Mistral model path (default: /models/mistral-7b-v0.1.Q4_0.gguf)
   QUICK_TIMEOUT   Timeout for synthetic gates (default: 5m)
   SMOKE_TIMEOUT   Timeout for p16/n4 model gates (default: 20m)
   FULL_TIMEOUT    Timeout for full benchmark gates (default: 60m)
@@ -40,8 +40,8 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 mode="quick"
 BUILD_DIR="${BUILD_DIR:-build}"
 LOG_ROOT="${LOG_ROOT:-${ROOT_DIR}/artifacts/kkxtv7-sycl}"
-GPT_OSS_MODEL="${GPT_OSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
-MISTRAL_MODEL="${MISTRAL_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
+GPT_OSS_MODEL="${GPT_OSS_MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
+MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 QUICK_TIMEOUT="${QUICK_TIMEOUT:-5m}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-20m}"
 FULL_TIMEOUT="${FULL_TIMEOUT:-60m}"

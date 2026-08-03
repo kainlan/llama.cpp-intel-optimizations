@@ -286,13 +286,13 @@ ninja -C build -j $(nproc)
 # 1. Correctness (deterministic output)
 GGML_SYCL_SPLIT_RATIO="60,32,8" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expect: "6, 7, 8, 9, 10" (matches single-GPU output)
 
 # 2. No regression (GPU-only baseline)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expect: PP512 >= 1200, TG128 >= 68
 
 # 3. Performance sweep
@@ -300,7 +300,7 @@ for ratio in "65,35,0" "60,32,8" "55,30,15" "50,25,25"; do
   echo "=== SPLIT_RATIO=$ratio ==="
   GGML_SYCL_SPLIT_RATIO="$ratio" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
     ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 16 -n 128
   sleep 30  # Thermal cooldown
 done
 # Expect: best TG128 > 90 tok/s
@@ -308,7 +308,7 @@ done
 # 4. Large model (Tier 3 overflow)
 GGML_SYCL_SPLIT_RATIO="auto" ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -p 'Hello,' -n 10 --seed 42 --temp 0
 # Expect: correct output, no crash
 ```

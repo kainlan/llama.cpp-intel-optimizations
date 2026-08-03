@@ -105,7 +105,7 @@ digraph dependencies {
 
 ### Non-negotiable constraints
 
-- Workers must not run `/Storage/GenAI/models`, `llama-bench`, `llama-cli`, `sycl-kernel-bench` executable, B50/B580 model gates, `sycl-ls`, `/dev/dri`, DRM fdinfo, `lsof`, direct P2P probes, or real harness execution.
+- Workers must not run `/models`, `llama-bench`, `llama-cli`, `sycl-kernel-bench` executable, B50/B580 model gates, `sycl-ls`, `/dev/dri`, DRM fdinfo, `lsof`, direct P2P probes, or real harness execution.
 - Lead owns every B50 synthetic/model run and every `sycl-kernel-bench` execution.
 - Runtime route remains default-off and unwired until lead Task 6 records `layout-v2-authorized`.
 - Do not add a persistent duplicate gate/up VRAM layout. V2 is benchmark-only until planner-owned lifecycle proof passes.

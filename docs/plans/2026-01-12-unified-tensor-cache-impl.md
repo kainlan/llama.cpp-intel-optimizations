@@ -1540,7 +1540,7 @@ if (ggml_backend_is_sycl(model.backend)) {
 ```bash
 cmake --build build -j$(nproc)
 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-cli -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-cli -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 -p "Hello" -n 5 2>&1 | grep -E "(tiered|inventory|placement)"
 ```
 
@@ -1594,7 +1594,7 @@ if (tensor_cache && tensor_cache->is_tiered_enabled()) {
 
 ```bash
 GGML_SYCL_TIERED_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-cli -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  ./build/bin/llama-cli -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --lazy-moe -p "Hello" -n 10 2>&1 | grep -E "(tier|cache|VRAM)"
 ```
 
@@ -1637,12 +1637,12 @@ void test_full_pipeline() {
 ```bash
 # Small model - should NOT enable tiered
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 -p "Hello" -n 10
 
 # Large MoE model - SHOULD enable tiered
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --lazy-moe -p "Hello" -n 10
 ```
 
@@ -1672,7 +1672,7 @@ ctest --test-dir build -R "vram-pool|tensor-class|unified-tensor-cache|tiered" -
 
 # Integration test with GPT-OSS-20B
 GGML_SYCL_TIERED_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-cli -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  ./build/bin/llama-cli -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --lazy-moe -p "The quick brown fox" -n 50
 
 # Expected output:

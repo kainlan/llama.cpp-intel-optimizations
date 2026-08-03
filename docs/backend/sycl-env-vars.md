@@ -226,19 +226,19 @@ Testing persistent TG modes:
 ```bash
 # Phase mode (default when persistent TG enabled)
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -n 128
 
 # DAG mode (disable phase, enable DAG)
 GGML_SYCL_PERSISTENT_TG=1 GGML_SYCL_PERSISTENT_TG_PHASE=0 GGML_SYCL_PERSISTENT_TG_DAG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -n 128
 
 # Correctness check — must pass the Mistral completion gate.
 # Output is "1, 2, 3, 4, 5, 6, 7, 8, 9, 10" and STOPS at 10 (EOS).
 # This line used to say "ends 6..15" -- unreachable at -n 15, so a passing
 # gate reads as a failure and sends you hunting a nonexistent TG bug.
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 

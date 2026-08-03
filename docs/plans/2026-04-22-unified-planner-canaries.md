@@ -67,8 +67,8 @@ README append is the only shared-file risk. Mitigation: each task appends under 
 
 Every canary uses the same inputs for reproducibility:
 
-- **Mistral 7B Q4_0**: `/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf`
-- **GPT-OSS 20B MXFP4**: `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`
+- **Mistral 7B Q4_0**: `/models/mistral-7b-v0.1.Q4_0.gguf`
+- **GPT-OSS 20B MXFP4**: `/models/gpt-oss-20b-mxfp4.gguf`
 - **Canonical prompt (D0.5 only)**: `-p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
 - **Canonical ctx values**: `-c 4096` (default small), `-c 32768` (stress)
 
@@ -184,8 +184,8 @@ struct llama_model * load_metadata_only(const char * model_path);
 std::string sizes_to_json(const std::vector<backend_sizes> & sizes);
 
 // Path constants (canonical test inputs).
-inline const char * kMistral7B  = "/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf";
-inline const char * kGptOss20B  = "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf";
+inline const char * kMistral7B  = "/models/mistral-7b-v0.1.Q4_0.gguf";
+inline const char * kGptOss20B  = "/models/gpt-oss-20b-mxfp4.gguf";
 
 } // namespace canary
 ```
@@ -546,7 +546,7 @@ source /opt/intel/oneapi/setvars.sh --force > /dev/null
 
 BUILD_DIR="${BUILD_DIR:-$(git rev-parse --show-toplevel)/build}"
 BIN="$BUILD_DIR/bin/llama-completion"
-MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
+MODEL="${MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
 PROMPT='1, 2, 3, 4, 5,'
 
 run_completion() {
@@ -736,7 +736,7 @@ set -euo pipefail
 source /opt/intel/oneapi/setvars.sh --force > /dev/null
 
 BIN="${BUILD_DIR:-$(git rev-parse --show-toplevel)/build}/bin/llama-completion"
-MODEL="${MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
+MODEL="${MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 PROMPT='1, 2, 3, 4, 5,'
 
 run_single() {

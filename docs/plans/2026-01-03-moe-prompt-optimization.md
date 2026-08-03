@@ -33,7 +33,7 @@ source /opt/intel/oneapi/setvars.sh --force
 cd /Apps/llama.cpp/.worktrees/master-benchmark
 ONEAPI_DEVICE_SELECTOR=level_zero:1 vtune -collect gpu-hotspots \
   -result-dir /tmp/vtune_moe_master -- \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 0 -ngl 99 -fa 1
 ```
 
@@ -45,7 +45,7 @@ Expected: See oneDNN GEMM kernels dominating GPU time.
 cd /Apps/llama.cpp/.worktrees/sycl-coalescing
 ONEAPI_DEVICE_SELECTOR=level_zero:1 vtune -collect gpu-hotspots \
   -result-dir /tmp/vtune_moe_coalescing -- \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 0 -ngl 99 -fa 1
 ```
 
@@ -81,7 +81,7 @@ source /opt/intel/oneapi/setvars.sh --force
 BASELINE=250  # t/s - conservative threshold
 
 RESULT=$(ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 0 -ngl 99 -fa 1 2>&1 | grep "pp512" | awk '{print $NF}' | cut -d'±' -f1)
 
 echo "MoE pp512: ${RESULT} t/s (target >= ${BASELINE})"
@@ -161,7 +161,7 @@ Benchmark: GPT-OSS 20B Q8_0
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 0 -n 128 -ngl 99 -fa 1
 ```
 
@@ -171,7 +171,7 @@ Expected: tg128 ≥ 31 t/s (same as before change).
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -220,12 +220,12 @@ If threshold differs from 32, update and commit.
 ```bash
 echo "=== GPT-OSS 20B Q8_0 ==="
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 
 echo "=== Mistral 7B Q4_0 ==="
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -233,7 +233,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 

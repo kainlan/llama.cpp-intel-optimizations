@@ -629,7 +629,7 @@ git commit -m "refactor(sycl): replace host iteration with fused XMX MoE dispatc
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -641,7 +641,7 @@ Expected output: `1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
 ```bash
 GGML_SYCL_DEBUG=1 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1 | grep -E "(graph|XMX)"
 ```
@@ -661,7 +661,7 @@ Document test results in a follow-up commit message if all tests pass.
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -672,7 +672,7 @@ Record: ESIMD+graphs pp512 t/s (target: ~671 t/s)
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 

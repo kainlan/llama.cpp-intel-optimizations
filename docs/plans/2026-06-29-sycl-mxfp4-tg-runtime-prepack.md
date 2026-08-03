@@ -54,7 +54,7 @@ Dry-run suite ranking still points to fused-layer/prepack-style routes, but the 
 - Do not add direct `sycl::malloc_device`, `sycl::malloc_host`, `sycl::free`, raw TLSF allocation, or side caches outside unified-cache implementation.
 - No blocking D2H copies on the hot path.
 - No route that can hard-fail the device (`UR_RESULT_ERROR_DEVICE_LOST`, Level Zero error 20) may remain reachable except as a rejected diagnostic in a commit that is then removed.
-- Workers must not run B50/B580 model gates, `sycl-ls`, `/Storage/GenAI/models`, multi-GPU selectors, direct P2P checks, or non-dry-run GPU probes. Lead only.
+- Workers must not run B50/B580 model gates, `sycl-ls`, `/models`, multi-GPU selectors, direct P2P checks, or non-dry-run GPU probes. Lead only.
 
 ## Route Shape
 
@@ -193,7 +193,7 @@ export GGML_SYCL_MOE_PHASE_BULK_XMX=1
 export GGML_SYCL_MOE_DOWN_SUM_DIRECT=1
 export GGML_SYCL_MOE_GATEUP_PREPACK=1
 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -211,7 +211,7 @@ export GGML_SYCL_MOE_PHASE_BULK_XMX=1
 export GGML_SYCL_MOE_DOWN_SUM_DIRECT=1
 export GGML_SYCL_MOE_GATEUP_PREPACK=1
 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -ngl 99 -fa 1 -p 512 -n 128 -r 3
 ```
 
@@ -227,7 +227,7 @@ export GGML_SYCL_MOE_GATEUP_PREPACK=1
 export GGML_SYCL_MXFP4_TG_PROFILE=1
 export GGML_SYCL_MOE_PROFILE=1
 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -ngl 99 -fa 1 -p 64 -n 32 -r 1
 ```
 

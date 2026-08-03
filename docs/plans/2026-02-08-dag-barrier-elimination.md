@@ -214,7 +214,7 @@ Verify DAG mode produces identical output to legacy barrier mode. Both modes exe
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 Expected output should contain: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15`
@@ -222,14 +222,14 @@ Expected output should contain: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15`
 **Test 2: Legacy barriers (DAG disabled)**
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=1 GGML_SYCL_PERSISTENT_TG_DAG=0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
 **Test 3: Standard dispatch (persistent kernel off)**
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -243,7 +243,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 - CRITICAL: Use `ONEAPI_DEVICE_SELECTOR=level_zero:0` — without it the system hangs on multi-GPU
 - If DAG mode hangs: likely a dependency cycle or missing reset. Check `reset_dag_counters()` runs before each token.
 - If output differs: likely a memory ordering issue. The `acq_rel` on `tiles_done.fetch_add()` must happen-before successor's `ready_counter.load()`.
-- Model path: `/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf`
+- Model path: `/models/mistral-7b-v0.1.Q4_0.gguf`
 
 ---
 
@@ -263,21 +263,21 @@ Benchmark DAG mode performance and verify no PP regression. The key metrics are:
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
 ```
 Target: ≥76 tok/s. Baseline with barriers: 1.71 tok/s.
 
 **Benchmark 2: TG with legacy barriers (comparison)**
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=1 GGML_SYCL_PERSISTENT_TG_DAG=0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128
 ```
 Expected: ~1.71 tok/s (unchanged from before).
 
 **Benchmark 3: PP regression check**
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0
 ```
 Target: ~1300 tok/s.
 
@@ -286,7 +286,7 @@ Target: ~1300 tok/s.
 for wgs in 4 8 16 32 40 64; do
   ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=1 \
   GGML_SYCL_PERSISTENT_TG_N_WGS=$wgs \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 2>&1 | tail -1
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 0 -n 128 2>&1 | tail -1
 done
 ```
 
@@ -348,11 +348,11 @@ static bool env_persistent_tg_enabled() {
 ```bash
 # Default (persistent TG now ON):
 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 
 # Opt-out still works:
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_PERSISTENT_TG=0 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 **Acceptance Criteria:**

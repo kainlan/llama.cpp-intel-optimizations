@@ -17,7 +17,7 @@ meaningless until this is fixed.
 | item | value |
 |---|---|
 | Card | Arc Pro B70, `level_zero:0`, PCI `0000:03:00.0` |
-| Model | `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` |
+| Model | `/models/gpt-oss-20b-mxfp4.gguf` |
 | Command | `llama-bench -p 0 -n 128 -r 3 -v -o csv` |
 | **Clean arm env** | *(no timeline variable set)* |
 | **Profiled arm env** | `GGML_SYCL_TIMELINE=timeline+events`, `GGML_SYCL_TIMELINE_OUTPUT=/tmp/hostoverhead/t_<pair>.json` |
@@ -236,7 +236,7 @@ per-token budget derived from a different instrument that did work.
 | item | value |
 |---|---|
 | Card | Arc Pro B70, `level_zero:0`, PCI `0000:03:00.0` |
-| Model | `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` |
+| Model | `/models/gpt-oss-20b-mxfp4.gguf` |
 | Binary under test | **`baaf652e1` (build 12145)** — identical for all runs |
 | Repo HEAD at capture | `f8ec00b93` (binary is one commit behind; `f8ec00b93` touched only `scripts/parse-sycl-timeline.py` and a test, and the parser runs from the working tree, so it is current) |
 | Free VRAM | **32600.7 MB** on every capture run and on the `baseline_*` round; **32598.5 MB** on the `dec_*` round — both match the ~32.6 GB expectation (see "Which artifact prefix is which" below) |
@@ -391,7 +391,7 @@ timeout 1800 env GGML_SYCL_OP_TIMEOUT_MS=180000 \
   GGML_SYCL_KERNEL_PROFILE_FORMAT=both GGML_SYCL_KERNEL_PROFILE_RAW=1 \
   GGML_SYCL_KERNEL_PROFILE_TOP_N=80 GGML_SYCL_KERNEL_PROFILE_FLUSH=window \
   GGML_SYCL_MOE_PHASE_MATERIALIZE=1 GGML_SYCL_MOE_PHASE_BULK_XMX=1 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
     -ngl 99 -fa 1 -p 0 -n 128 -r 1 -v \
   >/tmp/decode-attrib/primary-decode/bench.stdout \
   2>/tmp/decode-attrib/primary-decode/bench.stderr
@@ -2270,7 +2270,7 @@ needed to reach the rest.
 ### Step 4 — Roofline: the bytes have to move, and there is only one place they can move
 
 Weight bytes read per decode step, from the GGUF tensor table
-(`/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, 24 layers, 32 experts, 4 used;
+(`/models/gpt-oss-20b-mxfp4.gguf`, 24 layers, 32 experts, 4 used;
 experts MXFP4 = 17 B per 32 weights, attention and both embedding matrices Q8_0 =
 34 B per 32):
 

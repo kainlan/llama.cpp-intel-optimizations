@@ -255,7 +255,7 @@ Every subsequent task's predicate and every byte figure in this plan depends on 
 source /opt/intel/oneapi/setvars.sh --force
 mkdir -p /tmp/zone-sizing
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E '\[SYCL-PLAN\]' | tee /tmp/zone-sizing/before.txt
 grep -c 'inventory top' /tmp/zone-sizing/before.txt
 ```
@@ -319,7 +319,7 @@ with:
 TMPDIR=/tmp ./scripts/sycl-build.sh
 for m in gpt-oss-20b-mxfp4 mistral-7b-v0.1.Q4_0; do
   timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/${m}.gguf -p 0 -n 4 -r 1 2>&1 \
+    -m /models/${m}.gguf -p 0 -n 4 -r 1 2>&1 \
     | grep -E '\[SYCL-PLAN\]' | tee /tmp/zone-sizing/${m}.plan.txt
 done
 grep 'inventory top-8' /tmp/zone-sizing/*.plan.txt
@@ -675,7 +675,7 @@ The first consumers repointed. Two lines size oneDNN allocations from the global
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E 'ONEDNN zone raised|inventory top-8' | tee /tmp/zone-sizing/onednn-before.txt
 ```
 
@@ -747,7 +747,7 @@ Update the comment at `unified-cache.hpp:481` from `Sized as max_tensor_bytes ×
 TMPDIR=/tmp ./scripts/sycl-build.sh
 ctest --test-dir build -R zone-sizing -V
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E 'ONEDNN zone raised|oneDNN scratchpad' | tee /tmp/zone-sizing/onednn-after.txt
 diff /tmp/zone-sizing/onednn-before.txt /tmp/zone-sizing/onednn-after.txt
 ```
@@ -758,7 +758,7 @@ Expected: the scratchpad figure is strictly smaller than step 1's, and the new `
 
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
   --no-display-prompt --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
   -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' -n 48 --seed 42 --temp 0
@@ -770,7 +770,7 @@ Also gate Mistral, since its inventory differs:
 
 ```bash
 timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -818,7 +818,7 @@ git commit -m "feat(sycl): size the oneDNN scratchpad from oneDNN-eligible tenso
 
 ```bash
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E 'Host staging zone|SYCL-PLAN' | tee /tmp/zone-sizing/cpuquant-before.txt
 ```
 
@@ -847,7 +847,7 @@ with:
 TMPDIR=/tmp ./scripts/sycl-build.sh
 ctest --test-dir build -R zone-sizing -V
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E 'CPU quant buffers|Host staging zone' | tee /tmp/zone-sizing/cpuquant-after.txt
 ```
 
@@ -894,7 +894,7 @@ git commit -m "feat(sycl): size CPU quant buffers from quant-eligible tensors"
 
 ```bash
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
   | grep -E 'DMA staging pool' | tee /tmp/zone-sizing/dma-before.txt
 ```
 
@@ -976,7 +976,7 @@ Read the function body with `read_symbol` before editing. **Do not write the GRE
 
 ```bash
 timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 64 -n 4 -r 1 2>&1 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -p 64 -n 4 -r 1 2>&1 \
   | grep -iE 'onednn|scratch|zone' | tee /tmp/zone-sizing/grow-red.txt
 ```
 
@@ -1189,7 +1189,7 @@ source /opt/intel/oneapi/setvars.sh --force
 for dev in 0 1; do
   for m in gpt-oss-20b-mxfp4 mistral-7b-v0.1.Q4_0; do
     timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:${dev} GGML_SYCL_OP_TIMEOUT_MS=180000 \
-      ./build/bin/llama-bench -m /Storage/GenAI/models/${m}.gguf -p 0 -n 4 -r 1 2>&1 \
+      ./build/bin/llama-bench -m /models/${m}.gguf -p 0 -n 4 -r 1 2>&1 \
       | grep -E 'SYCL-PLAN|ONEDNN zone|MOE-LAYOUT|granted|free' \
       > /tmp/zone-sizing/after-dev${dev}-${m}.txt
   done
@@ -1210,7 +1210,7 @@ Expected before this plan: 6/24 granted on the B50. Record the after figure.
 for i in 1 2 3 4 5 6; do
   for build in before after; do
     timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-      ./build-${build}/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      ./build-${build}/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf \
       -p 512 -n 128 -r 3 2>&1 | grep -iE 'pp512|tg128|free' \
       >> /tmp/zone-sizing/throughput-${build}.txt
   done
@@ -1349,7 +1349,7 @@ git commit -m "docs(sycl): document path-scoped zone sizing and the underestimat
    ```bash
    source /opt/intel/oneapi/setvars.sh --force
    timeout 600 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+     -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
      | grep -E 'inventory top-8|oneDNN scratchpad|CPU quant buffers|DMA staging pool'
    ```
    Expected: each sizing line shows its path-scoped figure **strictly below** the global max it prints alongside.
@@ -1357,7 +1357,7 @@ git commit -m "docs(sycl): document path-scoped zone sizing and the underestimat
 3. **GPT-OSS MoE correctness gate:**
    ```bash
    timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-     -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
+     -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -cnv -st --simple-io \
      --no-display-prompt --chat-template-kwargs '{"reasoning_effort":"medium"}' \
      --reasoning-format none --reasoning-budget 0 \
      -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' -n 48 --seed 42 --temp 0
@@ -1367,7 +1367,7 @@ git commit -m "docs(sycl): document path-scoped zone sizing and the underestimat
 4. **Mistral dense correctness gate:**
    ```bash
    timeout 300 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-     -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+     -m /models/mistral-7b-v0.1.Q4_0.gguf \
      -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
    ```
    Expected: output starts `1, 2, 3, 4, 5, 6, 7, 8, 9, 10`
@@ -1389,7 +1389,7 @@ git commit -m "docs(sycl): document path-scoped zone sizing and the underestimat
 7. **B70 sanity — the larger card must also plan correctly:**
    ```bash
    timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
-     ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
+     ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 2>&1 \
      | grep -E 'free|SYCL-PLAN|under-estimated'
    ```
    Expected: free VRAM ≈32.6 GB, sizing lines present, no underestimate warnings.

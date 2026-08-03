@@ -68,13 +68,13 @@ ninja -C build -j $(nproc)
 
 # Correctness test (deterministic output)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected stdout: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,"
 
 # Performance benchmark
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Targets: PP512 >= 1200 tok/s, TG128 >= 68 tok/s
 ```
 
@@ -294,7 +294,7 @@ source /opt/intel/oneapi/setvars.sh --force
 ninja -C build -j $(nproc)
 # Correctness (budget summary appears in stderr)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Verify: output still "6, 7, 8, 9, 10, ..."
 # Verify: budget summary now shows "Runtime breakdown" with category lines
@@ -743,11 +743,11 @@ This is the safest approach — only track after both allocations confirmed non-
 source /opt/intel/oneapi/setvars.sh --force
 ninja -C build -j $(nproc)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Verify correct output
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Verify PP512 >= 1200, TG128 >= 68
 ```
 
@@ -896,20 +896,20 @@ ninja -C build -j $(nproc)
 
 # Test 1: Normal mode — no behavioral change
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Test 2: Strict mode with normal budget — should work identically
 GGML_SYCL_MEMORY_STRICT=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # Test 3: Strict mode with low budget — should fail gracefully (not crash)
 GGML_SYCL_MEMORY_STRICT=1 GGML_SYCL_VRAM_BUDGET_PCT=10 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'Hello' -n 1 --seed 42 --temp 0 2>&1
 # Expected: graceful error messages, no segfault or OOM abort
 ```
@@ -1098,7 +1098,7 @@ In `get_rows_stable_ptr` (modified in Task 2):
 source /opt/intel/oneapi/setvars.sh --force
 ninja -C build -j $(nproc)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>&1
 # Verify: budget summary now shows category breakdown with KV_CACHE, COMPUTE, etc.
 # Verify: UNTAGGED line should be smaller (most bytes now categorized)
@@ -1154,7 +1154,7 @@ ninja -C build -j $(nproc)
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 2>/tmp/budget_summary.txt
 ```
 
@@ -1173,7 +1173,7 @@ Check `/tmp/budget_summary.txt` for:
 ```bash
 GGML_SYCL_MEMORY_STRICT=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -1185,7 +1185,7 @@ Should produce identical output — strict mode is only active when budget is ex
 GGML_SYCL_MEMORY_STRICT=1 GGML_SYCL_VRAM_BUDGET_PCT=10 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 'Hello' -n 1 --seed 42 --temp 0 2>&1 | head -50
 ```
 
@@ -1197,7 +1197,7 @@ Expected: error messages about budget exceeded and/or host fallback. NOT a segfa
 # Wait 60 seconds if other tests just ran (thermal throttling prevention)
 sleep 60
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 ```
 
 Targets: PP512 >= 1200, TG128 >= 68.

@@ -399,7 +399,7 @@ git commit -m "feat(sycl): integrate token pre-quantization in XMX MoE dispatch"
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -411,7 +411,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10..." (correct counting)
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -421,7 +421,7 @@ Expected: Performance similar to or better than fused ESIMD path
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -605,7 +605,7 @@ git commit -m "feat(sycl): update MXFP4 dispatch to use pre-quantized tokens"
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -616,7 +616,7 @@ Expected: ~42 t/s tg128 (no regression)
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```

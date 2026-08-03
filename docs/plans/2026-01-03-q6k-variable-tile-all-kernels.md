@@ -158,7 +158,7 @@ for (int t = 0; t < num_tiles; t++) {
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q6_K.gguf \
+  -m /models/mistral-7b-v0.1.Q6_K.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 5 --seed 42 --temp 0
 ```
@@ -498,7 +498,7 @@ case GGML_TYPE_Q6_K:
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q6_K.gguf \
+  -m /models/mistral-7b-v0.1.Q6_K.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -509,7 +509,7 @@ Expected output: `6, 7, 8, 9, 10, 11, 12, 13, 14, 15,`
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=soa ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q6_K.gguf \
+  -m /models/mistral-7b-v0.1.Q6_K.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -520,7 +520,7 @@ Expected: Same output as coalesced
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 --flash-attn on \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
@@ -530,12 +530,12 @@ GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
 ```bash
 # SoA baseline
 GGML_SYCL_LAYOUT_OVERRIDE=soa ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q6_K.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q6_K.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 
 # Variable tile coalesced
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q6_K.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q6_K.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 

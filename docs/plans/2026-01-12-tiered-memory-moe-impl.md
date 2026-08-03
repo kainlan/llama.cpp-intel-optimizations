@@ -559,7 +559,7 @@ Expected: All tests pass, including `test_host_cache_uses_pool`
 ```bash
 # Should see "Allocated pinned chunk" messages, NO "using CPU memory" warnings
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf \
+  -m /models/gpt-oss-20b-Q8_0.gguf \
   -ngl 99 --lazy-moe -p "Hello" -n 10 2>&1 | grep -E "(pinned chunk|CPU memory)"
 ```
 
@@ -1157,7 +1157,7 @@ After completing Tasks 1-4:
 ```bash
 # Full integration test with GPT-OSS-120B
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-120b-Q4_0.gguf \
+  -m /models/gpt-oss-120b-Q4_0.gguf \
   -ngl 99 --lazy-moe \
   -p "The quick brown fox" -n 50
 

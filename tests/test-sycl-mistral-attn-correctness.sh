@@ -12,7 +12,7 @@
 #
 # Environment:
 #   LLAMA_BIN_DIR          Path to llama binaries (default: ./build-sycl/bin, then ./build/bin)
-#   MODEL_DIR              Model directory (default: /Storage/GenAI/models)
+#   MODEL_DIR              Model directory (default: /models)
 #   MISTRAL_MODEL          Full model path override
 #   ONEAPI_DEVICE_SELECTOR SYCL device selector (default: level_zero:0)
 #
@@ -53,7 +53,7 @@ else
     LLAMA_BIN_DIR=./build-sycl/bin
 fi
 
-MODEL_DIR="${MODEL_DIR:-/Storage/GenAI/models}"
+MODEL_DIR="${MODEL_DIR:-/models}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-${MODEL_DIR}/mistral-7b-v0.1.Q4_0.gguf}"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 EXPECTED="6, 7, 8, 9, 10"

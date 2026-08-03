@@ -36,7 +36,7 @@ if [[ -z "${SYCL_OFFLOAD_BENCH_CMD:-}" ]]; then
   cat >&2 <<'EOF'
 SYCL_OFFLOAD_BENCH_CMD is required for live run.
 Example:
-  SYCL_OFFLOAD_BENCH_CMD="ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:cpu' GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_OFFLOAD_STATS=1 GGML_SYCL_VRAM_BUDGET_PCT=35 ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 32 --tg-batch 4 -ngl 99 -fa 0"
+  SYCL_OFFLOAD_BENCH_CMD="ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:cpu' GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_OFFLOAD_STATS=1 GGML_SYCL_VRAM_BUDGET_PCT=35 ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 32 --tg-batch 4 -ngl 99 -fa 0"
 
 Optional:
   SYCL_OFFLOAD_BENCH_ITERATIONS=2      # repeat run to catch intermittent crashes

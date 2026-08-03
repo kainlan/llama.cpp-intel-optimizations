@@ -25,7 +25,7 @@ source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 vtune -collect gpu-hotspots \
   -knob gpu-sampling-interval=1 \
   -result-dir benchmark_results/vtune_soa_baseline \
-  -- ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -- ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 
 vtune -report summary -r benchmark_results/vtune_soa_baseline
@@ -167,7 +167,7 @@ static reorder_mode get_reorder_mode() {
 ```bash
 ./scripts/quick-rebuild.sh ggml-sycl.cpp
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 --flash-attn on -p "Hi" -n 1 --seed 42 --temp 0
 ```
 Expected: Runs (falls back to SoA since coalesced kernels don't exist yet)
@@ -445,12 +445,12 @@ Expected: PASS
 ```bash
 # SoA output
 GGML_SYCL_LAYOUT_OVERRIDE=soa ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > /tmp/soa.txt
 
 # Coalesced output
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 --flash-attn on -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 > /tmp/coalesced.txt
 
 diff /tmp/soa.txt /tmp/coalesced.txt
@@ -475,7 +475,7 @@ git commit -m "test(sycl): Q4_0 coalesced DMMV test passing"
 
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -483,7 +483,7 @@ GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
 
 ```bash
 GGML_SYCL_LAYOUT_OVERRIDE=soa ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 
@@ -493,7 +493,7 @@ GGML_SYCL_LAYOUT_OVERRIDE=soa ONEAPI_DEVICE_SELECTOR=level_zero:1 \
 GGML_SYCL_LAYOUT_OVERRIDE=coalesced ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   vtune -collect gpu-hotspots -knob gpu-sampling-interval=1 \
   -result-dir benchmark_results/vtune_coalesced_q4_0 \
-  -- ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -- ./build/bin/llama-bench -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p 512 -n 128 -ngl 99 -fa 1
 ```
 

@@ -13,7 +13,7 @@
 #
 # Requirements:
 #   - Built llama-cli binary
-#   - Model files in /Storage/GenAI/models/
+#   - Model files in /models/
 #   - Intel GPU with SYCL support
 #
 
@@ -24,8 +24,8 @@ TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
 LLAMA_CLI="./build/bin/llama-cli"
-MISTRAL_MODEL="/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf"
-GPTOSS_MODEL="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
+MISTRAL_MODEL="/models/mistral-7b-v0.1.Q4_0.gguf"
+GPTOSS_MODEL="/models/gpt-oss-20b-Q8_0.gguf"
 DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 # Parse arguments

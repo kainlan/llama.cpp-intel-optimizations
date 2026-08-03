@@ -633,7 +633,7 @@ Run: `cmake --build build -j 16`
 ```bash
 GGML_SYCL_DEBUG=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10..." with MXFP4 kernel messages
@@ -644,7 +644,7 @@ Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10..." with MXFP4 kernel messages
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_XMX_MOE_TILED=1 GGML_SYCL_DEBUG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 Expected: Same output as baseline, with "XMX MXFP4 tiled" in debug messages
@@ -664,7 +664,7 @@ git commit --allow-empty -m "test: verify XMX MXFP4 tiled kernel correctness"
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
+  -m /models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
 ```
 
 Record: pp512 t/s, tg128 t/s
@@ -675,7 +675,7 @@ Record: pp512 t/s, tg128 t/s
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_XMX_MOE_TILED=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
+  -m /models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
 ```
 
 Compare: Should be within 10% of baseline (ideally faster)
@@ -710,7 +710,7 @@ git commit -m "docs: add GGML_SYCL_XMX_MOE_TILED to env var table"
 GGML_SYCL_XMX_MOE=1 GGML_SYCL_XMX_MOE_TILED=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 Expected: "graphs reused = N" where N > 0

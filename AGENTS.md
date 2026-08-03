@@ -67,7 +67,7 @@ GGML_SYCL_DEVICE=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 vtune -collect gpu-offload -knob enable-stack-collection=true \
   -result-dir /tmp/vtune_llama \
   -- ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 8 --tg-batch 4 -ngl 99 -fa 1
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 8 --tg-batch 4 -ngl 99 -fa 1
 ```
 
 If VTune only shows memcpy tasks, use PTI and UR tracers for kernel time and

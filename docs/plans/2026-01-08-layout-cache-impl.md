@@ -372,7 +372,7 @@ Update statuses inline as tasks complete.
     - `source /opt/intel/oneapi/setvars.sh --force`
     - `cmake --build build --config Release -j $(nproc)`
   - Run:
-    - `ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 GGML_SYCL_XMX_MOE_TILED=1 ./build/bin/llama-completion -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
+    - `ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 GGML_SYCL_XMX_MOE_TILED=1 ./build/bin/llama-completion -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`
   - Verify:
     - output matches a known baseline
     - logs confirm XMX tiled path is active

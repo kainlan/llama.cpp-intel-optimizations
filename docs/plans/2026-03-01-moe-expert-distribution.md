@@ -615,7 +615,7 @@ Allocate model-scale pinned memory from pinned_chunk_pool in 8 GB chunks (e.g. ~
 # Can be done with existing infrastructure — just configure host budget high
 GGML_SYCL_HOST_BUDGET_PCT=50 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -sys "Hello" -c 512 -n 1 -p "test"
 # Check logs for: "Allocated pinned chunk N (size=8192.0 MB, total=XX.X GB)"
 # Should see multiple 8GB chunks allocated without failure (count depends on model size)
@@ -633,7 +633,7 @@ Verify that the existing `ensure_cached_layout()` → SOA conversion → device 
 # with tracing enabled:
 GGML_SYCL_DEBUG=2 GGML_SYCL_CPU_EXPERT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -c 512 -n 5 -p "Hello" 2>&1 | grep -E 'MOE_EXPERT|expert.*layout|expert.*cached'
 ```
 
@@ -650,7 +650,7 @@ Verify that CPU vec_dot (AVX2/AVX-VNNI) works correctly when reading from `sycl:
 GGML_SYCL_CPU_EXPERT_TG=1 GGML_SYCL_VRAM_BUDGET_PCT=5 \
   ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu" \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p "1, 2, 3," -n 10 --seed 42 --temp 0
 # Verify: correct output (not garbage), no SEGFAULT
 ```
@@ -667,7 +667,7 @@ source /opt/intel/oneapi/setvars.sh --force
 # Phase 1: PP correctness after removing sync stalls (must not crash)
 GGML_SYCL_CPU_EXPERT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -sys "You are a helpful assistant." -c 4096 -n 20 \
   -p "What is the capital of France?"
 
@@ -676,7 +676,7 @@ sleep 60
 # Phase 2: Multi-device expert parallelism TG
 GGML_SYCL_CPU_EXPERT_TG=1 ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -c 4096 -n 32
 # Target: TG > 15 tok/s (up from 3.1)
 
@@ -685,7 +685,7 @@ sleep 60
 # Phase 2: Multi-device PP
 GGML_SYCL_CPU_EXPERT_TG=1 ONEAPI_DEVICE_SELECTOR="level_zero:0,1" \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -c 4096 -p 64
 # Target: PP > 40 tok/s (up from 2.5)
 
@@ -693,6 +693,6 @@ sleep 60
 
 # Regression: Mistral 7B must not regress
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Target: PP512 >= 1300, TG128 >= 68
 ```

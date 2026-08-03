@@ -481,7 +481,7 @@ source /opt/intel/oneapi/setvars.sh --force >/tmp/oneapi-setvars.log 2>&1
 export LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:${LD_LIBRARY_PATH}
 export ONEAPI_DEVICE_SELECTOR=level_zero:1
 ./build-sycl/bin/test-thread-safety \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -ngl 99 -p '1, 2, 3,' -n 4 -c 128 -ub 32 -np 2
 ```
 

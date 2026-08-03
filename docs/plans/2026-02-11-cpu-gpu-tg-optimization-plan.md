@@ -234,28 +234,28 @@ ninja -C build -j $(nproc)
 
 # Test 1: Default (all VRAM) correctness
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # Expected: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
 # Test 2: 30% VRAM budget (CPU offload active)
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -fit off
 # Expected: same correct sequence
 
 # Test 3: Benchmark (wait 30s for thermal cooldown)
 sleep 30
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68
 
 # Test 4: CPU offload benchmark
 sleep 30
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -fa off
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -fa off
 # Expected: TG128 >= 5 tok/s (was 1.67)
 ```
 
@@ -577,31 +577,31 @@ source /opt/intel/oneapi/setvars.sh --force
 
 # 1. Default (all VRAM)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # 2. CPU offload (30% budget)
 GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -fit off
 
 # 3. HOST_COMPUTE mode
 GGML_SYCL_HOST_COMPUTE=1 GGML_SYCL_VRAM_BUDGET_PCT=30 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -fit off
 
 # === Performance Benchmarks (30s cooldown between each) ===
 
 # 4. Default benchmark (no regression check)
 sleep 30 && ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 
 # 5. CPU offload benchmark (improvement check)
 sleep 30 && GGML_SYCL_VRAM_BUDGET_PCT=30 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -fa off
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -fa off
 ```
 
 ### Expected Results

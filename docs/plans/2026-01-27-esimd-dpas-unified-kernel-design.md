@@ -272,18 +272,18 @@ if (m_global < M && n_global < N) {
 ```bash
 # Compare FP16 ESIMD vs scalar baseline
 GGML_SYCL_XMX_UNIFIED=1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > esimd_fp16.txt
 
 GGML_SYCL_XMX_UNIFIED=0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > scalar.txt
 
 diff esimd_fp16.txt scalar.txt  # Must be identical
 
 # Compare INT8 ESIMD vs scalar baseline
 GGML_SYCL_XMX_UNIFIED=1 GGML_SYCL_XMX_INT8=1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > esimd_int8.txt
 
 diff esimd_int8.txt scalar.txt  # Must be identical
@@ -294,15 +294,15 @@ diff esimd_int8.txt scalar.txt  # Must be identical
 ```bash
 # Baseline (scalar)
 GGML_SYCL_XMX_UNIFIED=0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 
 # FP16 ESIMD
 GGML_SYCL_XMX_UNIFIED=1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 
 # INT8 ESIMD
 GGML_SYCL_XMX_UNIFIED=1 GGML_SYCL_XMX_INT8=1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 ```
 
 ### Batch Size Sweep
@@ -617,18 +617,18 @@ if (use_esimd_dpas() && cfg.supported && cfg.supports_fp16) {
 ```bash
 # Test correctness
 GGML_SYCL_XMX_ESIMD=1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > esimd.txt
 
 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > baseline.txt
 
 diff esimd.txt baseline.txt  # Must be identical
 
 # Benchmark
 GGML_SYCL_XMX_ESIMD=1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 ```
 
 ---
@@ -788,7 +788,7 @@ SYCL_ESIMD_FUNCTION void esimd_matmul_int8_kernel(
 ```bash
 # INT8 correctness test
 GGML_SYCL_XMX_ESIMD=1 GGML_SYCL_XMX_INT8=1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 -ngl 99 > int8.txt
 
 diff int8.txt baseline.txt  # Should be identical or very close
@@ -802,7 +802,7 @@ for path in "FP16" "INT8"; do
   fi
   echo "=== $path ==="
   GGML_SYCL_XMX_ESIMD=1 ./build/bin/llama-bench \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+    -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 done
 ```
 
@@ -922,12 +922,12 @@ SYCL_ESIMD_FUNCTION simd<T, N> global_load_prefetch(const T* ptr, const T* prefe
 source /opt/intel/oneapi/setvars.sh
 vtune -collect gpu-hotspots -- \
   env GGML_SYCL_XMX_ESIMD=1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 
 # GPU compute extended (for XVE stall analysis)
 vtune -collect gpu-compute-extended -- \
   env GGML_SYCL_XMX_ESIMD=1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -ngl 99
 ```
 
 **Key metrics to check**:

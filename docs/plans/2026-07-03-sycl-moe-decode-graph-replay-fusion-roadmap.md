@@ -161,7 +161,7 @@ negligible.
 ## Constraints (same as `j69a`)
 
 - Active checkout: `/Apps/llama.cpp-mxfp4-tg-runtime`, branch `feature/sycl-mxfp4-tg-runtime`.
-- Workers must not run B50/B580/model gates, `/Storage/GenAI/models`, `llama-bench`,
+- Workers must not run B50/B580/model gates, `/models`, `llama-bench`,
   `sycl-kernel-bench`, VTune, `sycl-ls`, `/dev/dri`/DRM probes, `lsof`, P2P probes,
   or real harness execution. Lead owns all executable/hardware validation.
 - Every runtime variant fails closed behind an explicit `GGML_SYCL_*` env; defaults

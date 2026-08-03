@@ -278,13 +278,13 @@ static bool use_xmx_moe = getenv("GGML_SYCL_XMX_MOE")
 # Baseline: ESIMD path
 GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 
 # XMX MXFP4 path
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
   ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 

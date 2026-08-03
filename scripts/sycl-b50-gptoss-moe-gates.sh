@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-B50_GPTOSS_MODEL="/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf"
-B580_MISTRAL_MODEL="/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf"
+B50_GPTOSS_MODEL="/models/gpt-oss-20b-mxfp4.gguf"
+B580_MISTRAL_MODEL="/models/mistral-7b-v0.1.Q4_0.gguf"
 B50_SELECTOR="level_zero:1"
 B580_SELECTOR="level_zero:0"
 MODEL="$B50_GPTOSS_MODEL"

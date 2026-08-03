@@ -711,7 +711,7 @@ ninja -C build -j $(nproc)
 # 2. Baseline measurement (CPU-TG disabled, current behavior)
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=0 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 16 -n 32
 # Expected: PP16 ~3.9 tok/s, TG32 ~2.67 tok/s (current performance)
 
@@ -720,7 +720,7 @@ sleep 30
 # 3. CPU-TG measurement (Phase 1 feature)
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 16 -n 32
 # Expected: TG32 >= 8 tok/s (3x improvement minimum)
 
@@ -729,7 +729,7 @@ sleep 30
 # 4. Correctness check — generate text and verify coherence
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 'The quick brown fox' -n 50 --seed 42 --temp 0
 # Expected: coherent English text, not garbage/repetition
 
@@ -738,7 +738,7 @@ sleep 30
 # 5. Stability test — longer generation
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 'Write a short story about a robot learning to cook.' -n 100 --seed 42 --temp 0
 # Expected: No crash, no hang, coherent output
 
@@ -746,7 +746,7 @@ sleep 30
 
 # 6. Non-MoE model regression check (Mistral 7B)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68 (no regression)
 ```
 
@@ -935,7 +935,7 @@ ninja -C build -j $(nproc)
 
 # 1. Non-MoE regression check (Mistral 7B Q4_0)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
 # Expected: PP512 >= 1200, TG128 >= 68
 
 sleep 30
@@ -943,7 +943,7 @@ sleep 30
 # 2. MoE baseline (Phase 1 disabled)
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=0 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 16 -n 32
 # Expected: PP16 ~3.9, TG32 ~2.67
 
@@ -952,7 +952,7 @@ sleep 30
 # 3. MoE with CPU expert TG (Phase 1)
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 16 -n 32
 # Expected: TG32 >= 8 (3x improvement minimum)
 
@@ -962,7 +962,7 @@ sleep 30
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   GGML_SYCL_EXPERT_EVICT_ALPHA=0.7 GGML_SYCL_EXPERT_PREDICT_DEPTH=3 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 16 -n 32
 # Expected: PP16 improved over baseline
 
@@ -971,7 +971,7 @@ sleep 30
 # 5. Correctness verification
 GGML_SYCL_MOE_HYBRID=1 GGML_SYCL_CPU_EXPERT_TG=1 \
   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
+  -m /models/gpt-oss-120b-mxfp4-00001-of-00003.gguf \
   -p 'The quick brown fox' -n 50 --seed 42 --temp 0
 # Expected: coherent text output
 ```

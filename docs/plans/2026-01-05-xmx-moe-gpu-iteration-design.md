@@ -174,7 +174,7 @@ Pre-allocate for max experts (64) to enable graph recording.
 Test command (graphs enabled by default):
 ```bash
 GGML_SYCL_XMX_MOE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 
@@ -249,7 +249,7 @@ if (g_ggml_sycl_graph_recording) {
 Test MXFP4 path with graphs enabled:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
+  -m /models/gpt-oss-20b-Q8_0.gguf -ngl 99 --flash-attn on \
   --no-conversation -p 'Count from 1 to 5:' -n 15 --seed 42 --temp 0
 ```
 
@@ -258,7 +258,7 @@ Expected: "graphs reused = N" (N > 0), correct output "1, 2, 3, 4, 5, 6, 7, 8, 9
 Benchmark:
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
+  -m /models/gpt-oss-20b-Q8_0.gguf -p 512 -n 128 -ngl 99 -fa 1
 ```
 
 Target: Match ESIMD+graphs performance (~671 t/s pp512)

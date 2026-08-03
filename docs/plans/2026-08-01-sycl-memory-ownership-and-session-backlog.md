@@ -476,7 +476,7 @@ git merge --no-ff w4/xmx-cluster -m "merge: XMX dispatch flag fixes (wvbw, cwev,
 ./scripts/sycl-build.sh
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 ```
 
@@ -1000,7 +1000,7 @@ git diff HEAD --name-only                                          # expect empt
 
 # 2. Mistral correctness gate (B50)
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  -m /models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
 # 3. The race — ONE run. It loads 3 models across GPUs; a loop drove Shmem
@@ -1025,7 +1025,7 @@ ctest --test-dir build --output-on-failure -j 1 -LE 'residency|mem-handle|cache'
 
 # 6. GPT-OSS chat correctness
 timeout 120 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -1033,7 +1033,7 @@ timeout 120 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
 
 # 7. No leak under sustained load — the property the epic must not break
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -r 5
+  -m /models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128 -r 5
 sleep 5; grep -E '^(MemAvailable|Shmem):' /proc/meminfo
 
 # 8. GPU health — dmesg is privilege-denied for this user
