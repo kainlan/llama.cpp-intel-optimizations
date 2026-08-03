@@ -898,7 +898,7 @@ static ::GlobalAliases::F absolute;
     return source
 
 
-def self_test(parser, repo):
+def self_test(parser):
     compiler_source = compile_fixture_declarations()
     _, compiler_rows, _, _, compiler_failures = parse_source(parser, compiler_source)
     assert not compiler_failures
@@ -1049,7 +1049,9 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
         "class-alias", "ordinary-name-hiding",
     }
     for fixture, broken in negative_fixtures.items():
-        _, broken_rows, broken_gaps, _, broken_failures = parse_source(parser, broken)
+        broken_b, broken_rows, broken_gaps, _, broken_failures = parse_source(parser, broken)
+        if fixture == "recovered-function-tail":
+            assert recovered_function_regions(broken_b, broken_gaps), "fixture must exercise recovered function bounds"
         if fixture in alias_failures:
             assert broken_failures, f"{fixture} must fail closed"
         else:
@@ -1063,24 +1065,23 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
             "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
         }:
             assert any(reason == "unproved recovery tail after function body" for _, reason in broken_failures)
-    audited = (repo / FILES[0]).read_text(encoding="utf-8")
-    audited_b, audited_rows, _, _, audited_failures = parse_source(parser, audited)
-    assert not audited_failures
-    expected_file_scopes = {
-        93499: "ggml_backend_sycl_interface",
-        94640: "ggml_backend_sycl_device_interface",
-        94700: "ggml_backend_sycl_reg_interface",
-        94801: "g_sycl_seq_ids_cache",
-        94857: "g_sycl_device_token_cache",
-    }
-    actual_file_scopes = {
-        line_of(audited_b, row["name_node"]): (row["name"], row["scope"])
-        for row in audited_rows
-        if line_of(audited_b, row["name_node"]) in expected_file_scopes
-    }
-    assert actual_file_scopes == {
-        line: (symbol, "file") for line, symbol in expected_file_scopes.items()
-    }, f"recovered function tail scopes: {actual_file_scopes}"
+    # Keep recovery-tail scope coverage synthetic.  This used to parse the live
+    # ggml-sycl.cpp and select declarations by historical line number, coupling
+    # parser validation to the audited source snapshot rather than parser behavior.
+    recovered_tail_source = """
+static void recovered_tail() { expression template #if SYNTHETIC }
+static int recovered_file_tail;
+namespace recovered_tail_namespace { static int recovered_namespace_tail; }
+"""
+    shifted_recovered_tail_source = "// unrelated line shift\n\n\n" + recovered_tail_source
+    for fixture_source in (recovered_tail_source, shifted_recovered_tail_source):
+        _, recovered_rows, recovered_gaps, _, recovered_failures = parse_source(parser, fixture_source)
+        assert recovered_gaps and not recovered_failures
+        recovered_scopes = {row["name"]: row["scope"] for row in recovered_rows}
+        assert recovered_scopes == {
+            "recovered_file_tail": "file",
+            "recovered_namespace_tail": "namespace:recovered_tail_namespace",
+        }, f"synthetic recovered function tail scopes: {recovered_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
           "function-pointer-object-scopes,member-pointer-object-scopes,function-type-aliases,"
           "declaration-position-aliases,relative-qualified-aliases,"
@@ -1090,7 +1091,7 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
           "unproved-function-alias,unknown-qualified-alias,alias-template,inline-namespace-alias,"
           "resolved-inline-namespace-ambiguity,"
           "namespace-alias,local-alias,class-alias,ordinary-name-hiding,"
-          "ambiguous-direct-class-member,g++-c++17-pedantic,file-tail-scopes")
+          "ambiguous-direct-class-member,g++-c++17-pedantic,synthetic-file-tail-scopes,line-shift-independent")
 
 
 def main():
@@ -1102,7 +1103,7 @@ def main():
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = ap.parse_args()
     if args.self_test:
-        self_test(parser, args.repo)
+        self_test(parser)
         return 0
 
     all_rows, reports, failures = [], [], []
