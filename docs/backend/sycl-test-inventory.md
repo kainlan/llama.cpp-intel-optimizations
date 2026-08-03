@@ -198,6 +198,107 @@ Evidence keys: historical references are `git show 3c8f296fd:tests/CMakeLists.tx
 
 **Completeness check:** 41 GREEN + 22 RED + 1 guard-hidden RED = 64/64 rows. Historical shape within the 22: eight source rows with active ctest registrations under `GGML_SYCL` (11 CTest names, because `test-mmvq-q8-0-streaming-bench.cpp` registered four), five `GGML_SYCL` targets explicitly not wired to ctest, one commented-out block, one `GGML_SYCL && FALSE` registration, and seven names absent entirely. The separate exception is another `GGML_SYCL && FALSE` registration. No status in this section asserts safety, usefulness, or a future disposition.
 
+## Task 4b: execution-hazard classification (static audit)
+
+This classification is an execution characteristic, **not** Task 4c's final restore/manual/delete disposition. In particular, `never-test` below means that the current source is obsolete or a self-contained debug/mock rather than an executable production regression test; Task 4c still owns what happens to the file. `host-only` means the source neither initializes a SYCL backend/queue nor allocates/submits device work. Linking SYCL code does not alone change that class when the tested path is CPU-side policy, bookkeeping, layout, or compile-time behavior. `GPU serial` means SYCL backend/queue initialization, device allocation, submission, a backend graph compute, or an indirect call that initializes device-manager state. **Normatively, every `GPU serial` row is lead-only and must execute serially, one at a time.** This is a required scheduling contract, not a claim that live CTest metadata currently enforces it. `manual` identifies an opt-in benchmark, standalone hardware experiment, or special-instrumentation run. `parser` is reserved for tests whose subject is parsing text/artifacts; none of these 64 sources has that execution shape.
+
+Classes are mutually exclusive. Apply this precedence when a source has more than one characteristic: **model-loading > manual > never-test > GPU serial > host-only > parser**. The higher operational constraint wins: model hazards dominate all other execution details; an intentionally manual benchmark remains manual even when it uses GPUs; a current obsolete/mock source remains never-test even if it constructs SYCL objects; device reachability dominates host-only; and parser is the final text/artifact-only fallback. This makes the aggregate counts deterministic.
+
+**Evidence pin:** Task 4a provenance is pinned at merge `e015e1e0c`. Task 4b source and live-CMake evidence was audited through branch tip `284a78bee` immediately before this documentation-only coherence correction; because the correction changes only this inventory, the audited source/CMake content is identical at the resulting branch tip.
+
+At that pinned live snapshot, **31 Task 4a GREEN rows are classified `GPU serial`, and all 31 lack CTest `RUN_SERIAL` enforcement**. Their live registration does not waive the lead-only/one-at-a-time contract. Existing `hostonly` labels are also stale where noted below. Task 17 owns label and scheduling remediation; Task 4b records the hazard and does not edit CMake.
+
+Evidence keys used in the table:
+
+- **H:** a literal static scan of the 10 host-only sources found zero occurrences of the direct/runtime markers `ggml_backend_sycl_init`, `ggml_sycl_get_device`, `sycl::queue`, `ggml_backend_graph_compute`, `ggml_backend_sycl_buffer_type`, `ggml_backend_sycl_kv_buffer_type`, `gpu_selector`, `malloc_device`, `parallel_for`, `single_task`, or `.submit(` **and** the indirect device/cache APIs `ggml_backend_sycl_get_device_memory`, `get_unified_cache_for_device`, `ensure_cached_alloc`, or `ggml_backend_sycl_get_weight_cache_key`. The indirect list is load-bearing: the two unified-memory sources do not spell a queue or kernel launch but require a real device cache and allocate against its VRAM budget; likewise, the three weight-key sources enter the SYCL registry/device path under default evictability. This deliberately uses a stricter execution test than restoration commits `f87b6f410`/`d27a6fe19`, whose no-direct-kernel filter also admitted sources that initialize a backend, execute a graph, or reach the device through cache/key APIs.
+- **G:** the cited source line directly initializes a SYCL backend/queue, obtains a device buffer type, allocates/submits device work, executes a backend graph, or enters one of those device paths indirectly. For weight keys, `ggml_backend_sycl_get_weight_cache_key` at `ggml-sycl.cpp:9563–9589` calls `ggml_backend_sycl_reg` for a default-evictable host tensor; registry initialization at `ggml-sycl.cpp:94710–94739` enters `ggml_sycl_info`, enumerates devices, sets each device, and obtains its SYCL device object/manager state.
+- **M:** the cited source header makes the run opt-in/manual, a benchmark, a standalone hardware experiment, or dependent on a special instrumentation build.
+- **N:** the cited source either reimplements the purported production helper locally or includes the removed `expert-cache.hpp`; it is not a production-path test in its current form.
+- **L:** model/model-file loading evidence is expanded in the dedicated five-row hazard table below.
+
+| source row | hazard class | static source evidence |
+|---|---|---|
+| `tests/test-cold-start.cpp` | **host-only** | H |
+| `tests/test-dmmv-q4-0-coalesced.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 308; `ggml_backend_sycl_init` at line 739 |
+| `tests/test-dmmv-q6k-coalesced.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 81; `ggml_backend_sycl_init` at line 171 |
+| `tests/test-fattn-thread-local.cpp` | **GPU serial** | G: lines 27–46 construct SYCL queues; lines 49–78 touch and clean up thread-local device buffers |
+| `tests/test-ggml-sycl-soa.cpp` | **GPU serial** | G: backend graph computes begin at lines 115/315; SYCL backend initialization begins at lines 174/244 |
+| `tests/test-layout-bytes.cpp` | **GPU serial** | G: lines 32–38 pin a Level Zero selector and initialize the SYCL backend |
+| `tests/test-mmq-q6k-gpu.cpp` | **GPU serial** | G: `ggml_backend_sycl_init` at line 89; `ggml_backend_graph_compute` at line 384 |
+| `tests/test-moe-mini-graph.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 234; `ggml_backend_sycl_init` at line 269 |
+| `tests/test-moe-mul-mat-id.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 142; `ggml_backend_sycl_init` at line 244 |
+| `tests/test-moe-mul-mat-id-q4q8.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 175; `ggml_backend_sycl_init` at line 285 |
+| `tests/test-mul-mat-host-streaming.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 119; `ggml_backend_sycl_init` at line 144 |
+| `tests/test-onednn-fallback.cpp` | **host-only** | H |
+| `tests/test-onednn-woq.cpp` | **GPU serial** | G: line 193 initializes the SYCL backend and lines 200–212 require its SYCL/oneDNN queue |
+| `tests/test-q6k-dispatch.cpp` | **GPU serial** | G: SYCL backend initialization at lines 95/234; graph compute at lines 177/306 |
+| `tests/test-q8-0-layout-cache-path.cpp` | **GPU serial** | G: `ggml_backend_sycl_init` at line 77; `ggml_backend_graph_compute` at line 168 |
+| `tests/test-q8-0-layout-cache-path-mmvq.cpp` | **GPU serial** | G: `ggml_backend_sycl_init` at line 80; `ggml_backend_graph_compute` at line 171 |
+| `tests/test-sycl-cpu-dispatch.cpp` | **host-only** | H |
+| `tests/test-sycl-fattn-onednn-materialization.cpp` | **GPU serial** | G: line 132 obtains device 0's default queue for the materialization case |
+| `tests/test-sycl-fattn-xmx-policy.cpp` | **host-only** | H |
+| `tests/test-sycl-kernel-selection.cpp` | **GPU serial** | G: lines 49/103 initialize the SYCL backend for selection cases |
+| `tests/test-sycl-kv-planned-device-materialization.cpp` | **GPU serial** | G: lines 28–37 pin two Level Zero devices; line 102 obtains the device KV buffer type and line 103 allocates it |
+| `tests/test-sycl-moe-expert-parallelism.cpp` | **host-only** | H; source lines 3–8 explicitly call these CPU-side data-structure tests with no GPU dependency |
+| `tests/test-sycl-moe-handle-resolution.cpp` | **GPU serial** | G: queue-driven resolution cases begin at lines 50/94/123/184 and main constructs a queue at lines 376–381 |
+| `tests/test-sycl-moe-identity-hash.cpp` | **GPU serial** | G: lines 119/178/253/324/385 call `ggml_backend_sycl_get_weight_cache_key`, entering the default-evictability SYCL registry/device initialization chain documented above |
+| `tests/test-sycl-moe-q8-scratch.cpp` | **GPU serial** | G: lines 73–78 pin Level Zero and initialize the SYCL backend before device-VRAM scratch allocation |
+| `tests/test-sycl-onednn-packed-cache.cpp` | **GPU serial** | G: line 18 initializes the SYCL backend; line 152 obtains its device queue |
+| `tests/test-sycl-orchestrator.cpp` | **GPU serial** | G: graph computes at lines 271/342; SYCL backend initialization at line 373 |
+| `tests/test-sycl-prestage-routed-experts.cpp` | **host-only** | H; source lines 7–10 explicitly say the standalone routing-logic test does not require the SYCL runtime |
+| `tests/test-sycl-unified-cache.cpp` | **GPU serial** | G: lines 815–820 require device-0 memory; lines 90–180 obtain its unified cache and allocate weight/expert entries into VRAM with `ensure_cached_alloc` |
+| `tests/test-sycl-unified-memory-e2e.cpp` | **GPU serial** | G: lines 870–875 require device-0 memory; lines 94–201 obtain its unified cache and allocate attention/KV/expert entries against VRAM (the model workload is simulated, the allocations are not) |
+| `tests/test-sycl-weight-key-stability.cpp` | **GPU serial** | G: lines 67/85 call `ggml_backend_sycl_get_weight_cache_key`, entering the default-evictability SYCL registry/device initialization chain documented above |
+| `tests/test-sycl-weight-key-uniqueness.cpp` | **GPU serial** | G: lines 109/133/165–166 call `ggml_backend_sycl_get_weight_cache_key`, entering the default-evictability SYCL registry/device initialization chain documented above |
+| `tests/test-sycl-xmx-unified-correctness.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 204; `ggml_backend_sycl_init` at line 257 |
+| `tests/test-tensor-classification.cpp` | **host-only** | H |
+| `tests/test-tiered-dispatch.cpp` | **GPU serial** | G: the dispatch cases repeatedly initialize the SYCL backend, beginning at lines 50/96/142/186 |
+| `tests/test-unified-cache-concurrent.cpp` | **GPU serial** | G: queue-driven cache stress cases begin at lines 31/86/144 and main constructs the queue at line 222 |
+| `tests/test-unified-cache-integrity.cpp` | **GPU serial** | G: line 98 obtains the device queue and line 157 initializes the SYCL backend |
+| `tests/test-xmx-host-streaming.cpp` | **GPU serial** | G: `ggml_backend_graph_compute` at line 133; `ggml_backend_sycl_init` at line 218 |
+| `tests/test-xmx-kernel-config.cpp` | **host-only** | H |
+| `tests/test-xmx-quant-loaders.cpp` | **host-only** | H |
+| `tests/test-xmx-unified-kernel.cpp` | **host-only** | H |
+| `tests/mini-context-prototype.cpp` | **model-loading** | L1 |
+| `tests/test-cpu-gpu-soa-interaction.cpp` | **GPU serial** | G: lines 176, 243, 308, 408, and 501 select a GPU queue; lines 71–166 define direct SYCL reorder/DMMV work |
+| `tests/test-expert-routing-roundtrip.cpp` | **manual** | M: lines 7–12 give standalone `icpx` build and two-GPU run instructions; lines 29–54 require two GPUs/queues |
+| `tests/test-mmvq-q8-0-streaming-bench.cpp` | **manual** | M: lines 1–19 say opt-in benchmark and define benchmark-only environment knobs/modes |
+| `tests/test-moe-expert-placement.cpp` | **manual** | M: lines 1–19 identify a micro-benchmark with standalone manual build/run instructions |
+| `tests/test-mxfp4-xmx-tiled.cpp` | **GPU serial** | G: lines 1–8 require GPU-vs-CPU conversion on one SYCL device; line 119 selects the GPU queue |
+| `tests/test-pinned-chunk-pool.cpp` | **GPU serial** | G: lines 17–24 construct a SYCL queue and a pool whose first case allocates 1 GiB (the file repeats queue-backed allocation cases) |
+| `tests/test-planner-canary-cpy-visibility.cpp` | **model-loading** | L2 |
+| `tests/test-planner-canary-direct-load.cpp` | **model-loading** | L3 |
+| `tests/test-planner-canary-pp-tg-union.cpp` | **model-loading** | L4 |
+| `tests/test-planner-canary-skeleton-determinism.cpp` | **model-loading** | L5 |
+| `tests/test-q6k-56block-debug.cpp` | **never-test** | N: lines 1–3 call it a debug test; lines 11–24 locally redefine the block and tile helper instead of calling production code |
+| `tests/test-q6k-layout-debug.cpp` | **never-test** | N: lines 1–25 locally redefine the Q6_K block and “same as common.hpp” tile helpers |
+| `tests/test-q6k-reorder-dispatch.cpp` | **GPU serial** | G: lines 245/293 initialize the SYCL backend and lines 479/613 select GPU queues |
+| `tests/test-q6k-variable-reorder.cpp` | **never-test** | N: lines 7–24 locally redefine the Q6_K block and inline the helper under test |
+| `tests/test-sycl-expert-cache-bandwidth.cpp` | **manual** | M: lines 1–14 identify a two-device bandwidth/latency microbenchmark and give its manual selector |
+| `tests/test-sycl-expert-prefetch.cpp` | **GPU serial** | G: lines 1–6 require real asynchronous H2D DMA through a SYCL device; lines 27–30 select a GPU queue |
+| `tests/test-sycl-fattn-onednn-descriptors.cpp` | **GPU serial** | G: lines 127–151 allocate/copy device data through the oneDNN/SYCL stream |
+| `tests/test-sycl-race-conditions.cpp` | **manual** | M: lines 7–14 require a separate ThreadSanitizer configure/build to observe the race property |
+| `tests/test-sycl-set-rows-owner-routing.cpp` | **GPU serial** | G: line 284 obtains the device-0 queue and the following cases allocate/execute owner-routed SET_ROWS work |
+| `tests/test-tile-decomposition.cpp` | **never-test** | N: lines 5–24 explicitly inline/reimplement the helpers purportedly under test |
+| `tests/test-unified-dispatch-integration.cpp` | **GPU serial** | G: lines 128, 203, 331, 447, 573, and 714 construct SYCL queues for dispatch cases |
+| `tests/test-expert-cache.cpp` | **never-test** | N: line 11 includes removed `expert-cache.hpp`; Task 4a records the pre-wipe block was already under `FALSE` with “removed (replaced by unified cache + placement table)” |
+
+### The five model-loading hazards — no ordinary parallel CTest registration
+
+These are the **exact five** model/model-file-loading hazards. They **must not enter ordinary parallel CTest registration**. Any eventual execution remains lead-only and serial, with the repository's model-loading safeguards; Task 4c decides the final disposition and Task 4b does not register them.
+
+| evidence key / source | exact source evidence |
+|---|---|
+| **L1** `tests/mini-context-prototype.cpp` | Lines 12–16 define two full-weight worker loads plus a metadata-only load; line 169 calls `llama_model_load_from_file`, line 183 calls `llama_init_from_model`, and line 231 `execl`s each worker. |
+| **L2** `tests/test-planner-canary-cpy-visibility.cpp` | Lines 22–24 say one process loads Mistral 7B and decodes repeatedly; lines 391–392 log and call `llama_model_load_from_file`, and line 411 calls `llama_init_from_model`. |
+| **L3** `tests/test-planner-canary-direct-load.cpp` | This deliberately bypasses llama's loader but still consumes a real model file: lines 38–45 require the Mistral fixture, lines 69–78 `mmap` it and take source bytes from that mapping, and lines 83–158 initialize the SYCL backend and transfer/verify those bytes in a device tensor. Default fixture paths are in `tests/test-planner-canary-common.hpp:105–112`. |
+| **L4** `tests/test-planner-canary-pp-tg-union.cpp` | Lines 16–22 specify fork/exec workers that each load a model/context; line 175 calls `llama_model_load_from_file`, line 204 calls `llama_new_context_with_model`, and lines 311/381–382 run workers across available model fixtures/shapes. |
+| **L5** `tests/test-planner-canary-skeleton-determinism.cpp` | Lines 3–10 delegate to the mini-context proof with `real-A`/`real-B` full weight loads; lines 46–55 fork/exec that binary, and lines 82–103 locate it and iterate available model fixtures. This inherits L1's full-weight loads. |
+
+**Task 4b counts:** 10 host-only + 39 GPU serial + 5 model-loading + 5 manual + 5 never-test + 0 parser = **64/64**. This independently reconciles with Task 4a's 41 GREEN + 23 RED = 64 source rows: the hazard and provenance axes are complete but intentionally do not imply one another.
+
+**Static completeness check:** the classification table contains each Task 4a source row exactly once (64 unique names; no missing names and no extras), and the six class counts sum to 64. The dedicated hazard table contains exactly five unique names, all five are classified `model-loading` in the complete table, and no other row has that class. No CMake or disposition change is made here.
+
 
 ## Two instances named in the ticket
 
@@ -493,7 +594,7 @@ a preceding `#undef NDEBUG` or a gtest include. 28 files matched; triage:
 | `tests/test-archs-exclude.cpp`, `test-archs-table.cpp`, `test-chat.cpp`, `test-rope.cpp` | 1 each | not SYCL-specific (general llama.cpp tests, out of this ticket's `tests/`+`ggml/src/ggml-sycl/tests/` SYCL-behaviour scope); not individually re-verified this pass |
 | `tests/test-grammar-llguidance.cpp` | 4 | registered via `llama_build_and_test`; general (non-SYCL), not re-verified |
 | `tests/test-quantize-stats.cpp` | 1 | registered via `llama_build` only (no `llama_test`/`add_test` found for it — may not even run as a test); general, not SYCL, not re-verified |
-| 17 remaining files (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | **unregistered anywhere** (confirmed against both `CMakeLists.txt` files) — part of `llama.cpp-0igs`'s 186-file dead-source population. Several are clearly SYCL/MoE-backend tests despite lacking a `sycl-` prefix (`tile-decomposition`, `vram-pool`, `pinned-chunk-pool`, `xmx-unified-kernel`, `test-sycl-prestage-routed-experts` itself). Would need **both** registration and the same `#undef NDEBUG` fix if restored — noting this so `llama.cpp-0igs` doesn't rediscover the NDEBUG half of the problem file-by-file the way `llama.cpp-4jlv`/`c17b010af`/`d4cccba5e`/`d4608ec7e` each rediscovered the registration half in isolation |
+| 17 files in the mechanical scan's **pre-restoration historical snapshot** (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | At that historical scan point all 17 were unregistered. At the Task 4b pinned live snapshot, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, and `test-xmx-unified-kernel` are now actively registered; the other 14 remain absent from live registration (including the false-guarded/obsolete `test-expert-cache`). This row records the original NDEBUG finding, not a current registration audit or Task 4c disposition. Any remaining bare-assert source would need an NDEBUG-proof failure path before a future registration. |
 
 ## Four more ctest/grep traps, found during `llama.cpp-0igs` restoration batches
 
@@ -516,25 +617,31 @@ Extending the trap list already in this doc (`ctest -R` on zero matches,
   confirmed by `-fsyntax-only`), not a casualty of it. A line-level match is
   not the same claim as "this target builds when CMake processes this file."
 - **`-LE` is an unanchored regex over LABELS too, not just `-E` over test
-  names.** 9 of batch 1's 13 restored tests carried LABELS containing the
-  bare words `cache` or `mem-handle`, colliding with CLAUDE.md's
-  throttled-sweep denylist (`-LE 'residency|mem-handle|cache'`) despite being
-  confirmed host-only and deserving none of the GPU-memory hazard the
-  denylist exists for. The first fix (`32a70dcf3`) renamed them to
-  `cache-hostonly` / `mem-handle-hostonly` and was verified by checking that
-  no label *equalled* a denylisted word — the right property, checked with
-  the wrong operator. `ctest -LE` matches by regex/substring exactly the way
-  `-R`/`-E` already do over test names (this doc's own earlier trap: `-E
-  "test-llama-archs"` also excludes `test-llama-archs-table`), so `cache`
-  still matched inside `cache-hostonly` and 11 of 41 restored tests stayed
-  silently excluded. Nobody had written that `-L`/`-LE` share that semantic
-  with `-R`/`-E`, so the fix repeated the exact defect class it was fixing.
-  Corrected in `b7555cc73` by dropping the hazard word entirely rather than
-  suffixing it (bare `hostonly` + subsystem word, no shared substring with
-  the denylist at all), and verified with `re.search` over every label
-  string instead of equality — 0 of 41 collide. `llama.cpp-0igs` itself
-  documents the underlying failure mode (`impl-5exz`: 5 of 9 un-guarded
-  tests similarly affected); batch 1's original rate was worse, 9 of 13.
+  names.** Historically, 9 of batch 1's 13 restored tests carried LABELS
+  containing the bare words `cache` or `mem-handle`, colliding with
+  CLAUDE.md's throttled-sweep denylist (`-LE
+  'residency|mem-handle|cache'`). The restoration pass called those nine
+  host-only; Task 4b's stricter indirect-device audit reclassifies **8 of the
+  9 as GPU serial** (only `test-tensor-classification` remains host-only).
+  The first fix (`32a70dcf3`) renamed the labels to `cache-hostonly` /
+  `mem-handle-hostonly` and was verified by checking that no label *equalled*
+  a denylisted word — the right property, checked with the wrong operator.
+  `ctest -LE` matches by regex/substring exactly the way `-R`/`-E` already do
+  over test names (this doc's own earlier trap: `-E "test-llama-archs"` also
+  excludes `test-llama-archs-table`), so `cache` still matched inside
+  `cache-hostonly` and 11 of 41 restored tests stayed silently excluded.
+  Nobody had written that `-L`/`-LE` share that semantic with `-R`/`-E`, so
+  the fix repeated the exact defect class it was fixing. Corrected in
+  `b7555cc73` by dropping the hazard word entirely rather than suffixing it
+  (bare `hostonly` + subsystem word, no shared substring with the denylist at
+  all), and verified with `re.search` over every label string instead of
+  equality — 0 of 41 collide. At the pinned live snapshot, the `hostonly`
+  labels retained by those eight GPU rows — and by the two GPU-serial unified
+  memory rows restored in batch 2 — are stale hazard metadata; Task 17 owns
+  correcting labels and adding serial scheduling enforcement. This Task 4b
+  audit does not edit CMake. `llama.cpp-0igs` itself documents the underlying
+  failure mode (`impl-5exz`: 5 of 9 un-guarded tests similarly affected);
+  batch 1's original rate was worse, 9 of 13.
 - **`-fsyntax-only` proves compilation, not linking.** `test-onednn-woq.cpp`
   compiled clean but failed to link (`undefined reference to
   dnnl_primitive_destroy`, `DSO missing from command line`): it includes two
