@@ -19,8 +19,8 @@ active registrations and 23 inactive registrations. Redirected here by the
 lead: exhaustively mutation-verifying the whole
 remaining population (~65–70 more registered C++ tests, ~90 Python/shell
 gates) has falling marginal value and is not what gates *this* merge — the
-question that matters is how much of `llama.cpp-0igs`'s ~147-file backlog is
-actually merge-relevant.
+question that matters is how many of `llama.cpp-0igs`'s **approximately 147
+pending C++ source rows** are actually merge-relevant.
 
 **Method:**
 1. Changed surface: `git diff --name-only master...HEAD -- ggml/src/ggml-sycl/ src/`
@@ -51,8 +51,11 @@ actually merge-relevant.
    meant to be ctest targets — almost certainly not a real restoration
    candidate, though not individually confirmed.
 
-**So: 64, not 147.** Full sorted list (all under `tests/`, all pre-existing
-at `3c8f296fd`): `mini-context-prototype`, `test-cold-start`,
+**So: 64 of approximately 147 pending C++ source rows.** The exact 147
+historical `add_test()` calls are supporting endpoint evidence, not a
+one-to-one denominator equivalent to source rows. Full sorted list (all under
+`tests/`, all pre-existing at `3c8f296fd`): `mini-context-prototype`,
+`test-cold-start`,
 `test-cpu-gpu-soa-interaction`, `test-dmmv-q4-0-coalesced`,
 `test-dmmv-q6k-coalesced`, `test-expert-cache`,
 `test-expert-routing-roundtrip`, `test-fattn-thread-local`,
@@ -303,16 +306,17 @@ These are the **exact five** model/model-file-loading hazards. They **must not e
 ## Task 4c: restoration dispositions (actionability audit, not registration acceptance)
 
 This table disposes the exact 64-row changed-surface population identified for
-`llama.cpp-0igs`; it does **not** enlarge or finally accept that scope. The
-original `0igs` endpoint evidence was 147 historical `add_test()` calls at
-`3c8f296fd` versus 6 at its then-HEAD, a loss of 141 registrations and a
-roughly 147-C++-file restoration backlog after early batches. The Task 4 filter
-intersected that backlog with this branch's changed surface and found 65 topical
-hits, exactly 64 of which existed before the wipe. Therefore this audit is
-**64/147 merge-relevant rows** (a topical floor), with the other roughly 83
-remaining under `llama.cpp-0igs` (assigned owner: `lead`) as post-merge debt.
-This reconciles the two figures; it does not claim that 64 registrations are
-accepted or that the 83 are irrelevant forever.
+`llama.cpp-0igs`; it does **not** enlarge or finally accept that scope. The Task
+4 filter intersected the pending C++ source population with this branch's
+changed surface and found 65 topical hits, exactly 64 of which existed before
+the wipe. Therefore this audit covers **64 of approximately 147 pending C++
+source rows** (a topical floor), with the other roughly 83 assigned to `lead`
+under `llama.cpp-0igs` as post-merge debt. Separately, the exact endpoint
+evidence is 147 historical `add_test()` calls at `3c8f296fd` versus 6 at the
+then-HEAD, a loss of 141 registrations. Those call counts support the wipe
+finding; they are not asserted to be a one-to-one denominator equivalent to
+source rows. This does not claim that 64 registrations are accepted or that the
+83 are irrelevant forever.
 
 The disposition is a source-level recommendation. **Task 16
 (`llama.cpp-o2hp`) remains the authority that records the exact accepted and
@@ -338,83 +342,115 @@ restore candidate because it historically exposed four CTest modes and Task
 14 supplied the missing skip/failure contract; that does not turn other
 standalone benchmarks into ordinary tests.
 
-| source row | Task 4a state | Task 4b hazard | exactly one disposition | exact owner / next action |
+Action keys below are normative and keep each row compact without dropping its
+owner or next action:
+
+- **RC-L (live restore candidate):** `llama.cpp-o2hp` explicitly accepts or
+  declines the row. If accepted, preserve its live target and process it through
+  Task 17's exact sequential chain: `llama.cpp-m2ke` (17a target/link topology)
+  → `llama.cpp-vohe` (17b oneDNN guards) → `llama.cpp-cidw` (17c skip code,
+  safe labels, and serial properties) → `llama.cpp-kdfh` (17d final
+  registration/selection audit). Then `llama.cpp-8kyi` (Task 19) performs the
+  lead-only serial runtime acceptance.
+- **RC-I (inactive restore candidate):** `llama.cpp-o2hp` explicitly accepts or
+  declines the row. If accepted, the same
+  `llama.cpp-m2ke` → `llama.cpp-vohe` → `llama.cpp-cidw` → `llama.cpp-kdfh`
+  chain registers and audits it, then `llama.cpp-8kyi` performs lead-only
+  serial runtime acceptance.
+- **M-MODEL (manual-only model load):** `lead`, assigned through
+  `llama.cpp-0igs`, keeps the row out of ordinary CTest and documents one
+  lead-only, serial, safeguarded model run; `llama.cpp-o2hp` records the
+  ordinary-registration decline.
+- **M-OPTIN (manual-only diagnostic/benchmark):** `lead`, assigned through
+  `llama.cpp-0igs`, retains an opt-in manual procedure and does not add ordinary
+  CTest registration; `llama.cpp-o2hp` records the registration decline.
+- **D-LOCAL (deleted/never-test local reimplementation):** `lead`, assigned
+  through `llama.cpp-0igs`, deletes the self-contained local-helper
+  reimplementation with its Task 4b per-file reason; `llama.cpp-o2hp` declines
+  the current source.
+- **D-OBSOLETE (deleted/never-test obsolete source):** `lead`, assigned through
+  `llama.cpp-0igs`, deletes the source that includes removed
+  `expert-cache.hpp`, preserving that reason; `llama.cpp-o2hp` records the
+  decline.
+- **P-PIN (named pinned-pool task):** `lead`, assigned through
+  `llama.cpp-32dg8.20`, updates the source to the canonical pinned-pool API
+  while preserving allocation, reuse, capacity, and failure checks; it then
+  returns to `llama.cpp-o2hp`, and the lead performs the task's build/GPU proof.
+
+| source row | Task 4a state | Task 4b hazard | exactly one disposition | action key |
 |---|---|---|---|---|
-| `tests/test-cold-start.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-dmmv-q4-0-coalesced.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-dmmv-q6k-coalesced.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-fattn-thread-local.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-ggml-sycl-soa.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-layout-bytes.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-mmq-q6k-gpu.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-moe-mini-graph.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-moe-mul-mat-id.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-moe-mul-mat-id-q4q8.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-mul-mat-host-streaming.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-onednn-fallback.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-onednn-woq.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-q6k-dispatch.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-q8-0-layout-cache-path.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-q8-0-layout-cache-path-mmvq.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-cpu-dispatch.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-fattn-onednn-materialization.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-fattn-xmx-policy.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-kernel-selection.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-kv-planned-device-materialization.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-moe-expert-parallelism.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-moe-handle-resolution.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-moe-identity-hash.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-moe-q8-scratch.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-onednn-packed-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-orchestrator.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-prestage-routed-experts.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-unified-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-unified-memory-e2e.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-weight-key-stability.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-weight-key-uniqueness.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-xmx-unified-correctness.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-tensor-classification.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-tiered-dispatch.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-unified-cache-concurrent.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-unified-cache-integrity.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-xmx-host-streaming.cpp` | GREEN/live | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-xmx-kernel-config.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-xmx-quant-loaders.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-xmx-unified-kernel.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/mini-context-prototype.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-cpu-gpu-soa-interaction.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-expert-routing-roundtrip.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-mmvq-q8-0-streaming-bench.cpp` | RED/inactive | manual | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-moe-expert-placement.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-mxfp4-xmx-tiled.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-pinned-chunk-pool.cpp` | RED/inactive | GPU serial | **named tracker task: `llama.cpp-32dg8.20`** | `llama.cpp-32dg8.20` (assigned owner: `lead`): update to the canonical pinned-pool API, preserve allocation/reuse/capacity/failure checks, then return the source to `llama.cpp-o2hp`; lead performs the task’s build/GPU proof. |
-| `tests/test-planner-canary-cpy-visibility.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-direct-load.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-pp-tg-union.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-skeleton-determinism.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-q6k-56block-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-q6k-layout-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-q6k-reorder-dispatch.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-q6k-variable-reorder.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-sycl-expert-cache-bandwidth.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-sycl-expert-prefetch.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-fattn-onednn-descriptors.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-race-conditions.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-sycl-set-rows-owner-routing.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-tile-decomposition.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-unified-dispatch-integration.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-expert-cache.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete the obsolete source (removed `expert-cache.hpp`) with this recorded reason; `llama.cpp-o2hp` records the decline. |
+| `tests/test-cold-start.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-dmmv-q4-0-coalesced.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-dmmv-q6k-coalesced.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-fattn-thread-local.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-ggml-sycl-soa.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-layout-bytes.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-mmq-q6k-gpu.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-moe-mini-graph.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-moe-mul-mat-id.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-moe-mul-mat-id-q4q8.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-mul-mat-host-streaming.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-onednn-fallback.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-onednn-woq.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-q6k-dispatch.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-q8-0-layout-cache-path.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-q8-0-layout-cache-path-mmvq.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-cpu-dispatch.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-sycl-fattn-onednn-materialization.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-fattn-xmx-policy.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-sycl-kernel-selection.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-kv-planned-device-materialization.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-moe-expert-parallelism.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-sycl-moe-handle-resolution.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-moe-identity-hash.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-moe-q8-scratch.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-onednn-packed-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-orchestrator.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-prestage-routed-experts.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-sycl-unified-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-unified-memory-e2e.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-weight-key-stability.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-weight-key-uniqueness.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-sycl-xmx-unified-correctness.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-tensor-classification.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-tiered-dispatch.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-unified-cache-concurrent.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-unified-cache-integrity.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-xmx-host-streaming.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
+| `tests/test-xmx-kernel-config.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-xmx-quant-loaders.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-xmx-unified-kernel.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/mini-context-prototype.cpp` | RED/inactive | model-loading | **manual-only** | **M-MODEL** |
+| `tests/test-cpu-gpu-soa-interaction.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-expert-routing-roundtrip.cpp` | RED/inactive | manual | **manual-only** | **M-OPTIN** |
+| `tests/test-mmvq-q8-0-streaming-bench.cpp` | RED/inactive | manual | **restore candidate** | **RC-I** |
+| `tests/test-moe-expert-placement.cpp` | RED/inactive | manual | **manual-only** | **M-OPTIN** |
+| `tests/test-mxfp4-xmx-tiled.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-pinned-chunk-pool.cpp` | RED/inactive | GPU serial | **named tracker task: `llama.cpp-32dg8.20`** | **P-PIN** |
+| `tests/test-planner-canary-cpy-visibility.cpp` | RED/inactive | model-loading | **manual-only** | **M-MODEL** |
+| `tests/test-planner-canary-direct-load.cpp` | RED/inactive | model-loading | **manual-only** | **M-MODEL** |
+| `tests/test-planner-canary-pp-tg-union.cpp` | RED/inactive | model-loading | **manual-only** | **M-MODEL** |
+| `tests/test-planner-canary-skeleton-determinism.cpp` | RED/inactive | model-loading | **manual-only** | **M-MODEL** |
+| `tests/test-q6k-56block-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-LOCAL** |
+| `tests/test-q6k-layout-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-LOCAL** |
+| `tests/test-q6k-reorder-dispatch.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-q6k-variable-reorder.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-LOCAL** |
+| `tests/test-sycl-expert-cache-bandwidth.cpp` | RED/inactive | manual | **manual-only** | **M-OPTIN** |
+| `tests/test-sycl-expert-prefetch.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-sycl-fattn-onednn-descriptors.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-sycl-race-conditions.cpp` | RED/inactive | manual | **manual-only** | **M-OPTIN** |
+| `tests/test-sycl-set-rows-owner-routing.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-tile-decomposition.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-LOCAL** |
+| `tests/test-unified-dispatch-integration.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
+| `tests/test-expert-cache.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-OBSOLETE** |
 
 **Disposition counts:** 49 restore candidates + 9 manual-only + 5
-deleted/never-test + 1 named tracker task = **64/64 unique rows**. The 49
-restore candidates are 41 live and 8 inactive; “live” is provenance, not Task
-16 acceptance. Deferred ownership is explicit above: Task 16 owns every final
-accept/decline record, Task 17/17d owns accepted CMake metadata/audit, Task 19
-owns runtime proof, `llama.cpp-32dg8.20` (assigned owner: `lead`) owns the
-pinned-pool rewrite, and `llama.cpp-0igs` (assigned owner: `lead`) owns all
-manual/deletion
-follow-through and the other ~83 rows. The unaccepted restoration-scope policy
-in `llama.cpp-awcp` is the remaining owner-decision blocker.
+deleted/never-test + 1 named tracker task = **64/64 unique rows**. The action
+keys independently reconcile as 41 RC-L + 8 RC-I + 5 M-MODEL + 4 M-OPTIN + 4
+D-LOCAL + 1 D-OBSOLETE + 1 P-PIN = **64/64**. “Live” is provenance, not Task
+16 acceptance. The legend is the single source for downstream ownership and
+sequencing; the unaccepted restoration-scope policy in `llama.cpp-awcp` remains
+the owner-decision blocker.
 
 
 ## Two instances named in the ticket
@@ -645,25 +681,34 @@ The remaining 66 pytest-style files and the other 3 script-style files
 pytest / direct invocation as appropriate) but not individually
 mutation-tested this pass.
 
-## Coordination finding that changes the shape of this ticket
+## Historical coordination context for `llama.cpp-0igs`
 
-**`llama.cpp-0igs`** (P1, currently `open`, owner `impl-0igs` died in the
-2026-08-01 host reboot — lease released, task ownerless) already tracks a much
-larger version of this exact problem: **141 `add_test()` registrations in
+At the 2026-08-01 snapshot, the prior `llama.cpp-0igs` implementer's lease had
+ended after a host reboot. That historical owner gap explained why this audit
+originally called for reassignment; it is no longer current. The ticket remains
+open and is now assigned to `lead` (without an active worker lease).
+
+The historical endpoint evidence remains: **141 `add_test()` registrations in
 `tests/CMakeLists.txt` were wiped wholesale** near commit `4974bf53c` (the
-earlier attribution to `d3dce4e0a` was retracted in that ticket as an unsound
-topological-walk artifact — see its own METHOD WARNING). `3c8f296fd` had 147
-registrations; HEAD had 6 before that ticket's batches 1–3 restored 68. **~147
-C++ restorations remain deferred** in that ticket's own notes (~142 raw
-`add_executable` blocks each needing an `ocloc` device link against the shared
-`build/`).
+earlier attribution to `d3dce4e0a` was retracted as an unsound topological-walk
+artifact; see `llama.cpp-0igs`'s METHOD WARNING). `3c8f296fd` had exactly 147
+`add_test()` calls and the then-HEAD had 6 before batches 1–3 restored 68. Those
+registration-call counts support the wipe finding; they are not a one-to-one
+source-row denominator. The pending work is approximately 147 C++ source rows,
+of which Task 4c disposes 64 as merge-relevant and leaves roughly 83 as
+post-merge debt.
 
-This is not a coincidence with this ticket's two "confirmed instances" — a test
-that isn't registered at all is the most extreme case of "cannot fail" there
-is. **The bulk of that problem is `llama.cpp-0igs`'s scope, not re-litigated
-file-by-file here**, but this pass independently found and fixed two directly
-on-theme members of that same 186-file dead-source population (both call real
-production code, neither is a mock):
+Current ownership is concrete: `lead` owns, through `llama.cpp-0igs`, the 9
+manual-only actions, 5 deletion actions, and roughly 83 post-merge source rows.
+The pinned-pool row is sequenced separately through open task
+`llama.cpp-32dg8.20`, also assigned to `lead`, before returning to Task 16.
+
+This overlap explains this ticket's two "confirmed instances" — a test that is
+not registered at all is the most extreme case of "cannot fail." **The bulk of
+that problem remains `llama.cpp-0igs`'s scope, not re-litigated file-by-file
+here**, but this pass independently found and fixed two directly on-theme
+members of that same 186-file dead-source population (both call real production
+code, neither is a mock):
 
 - **`tests/test-sycl-tensor-usage.cpp`** — calls `ggml_sycl_get_tensor_usage()`
   (`ggml-sycl.cpp:9525`, the cached wrapper around `infer_tensor_usage()`) on
@@ -684,10 +729,9 @@ production code, neither is a mock):
   `blk.` + `attn_`/`ffn_`, everything else falls to "other" including the
   router gate, which the test explicitly documents as "treated as dense").
 
-**Recommendation to the lead:** either reassign `llama.cpp-0igs` to a live
-owner or fold its remaining ~147-file backlog into this epic's scope
-explicitly — right now it sits ownerless and directly overlaps this ticket's
-mandate.
+**Current handoff:** no reassignment recommendation remains. `lead` is the
+assigned owner for `llama.cpp-0igs` and `llama.cpp-32dg8.20`; the exact split and
+sequencing are recorded above and in the Task 4c action-key legend.
 
 ## Mechanical scan: bare `assert()` without `#undef NDEBUG`
 
