@@ -1660,7 +1660,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     const bool resolved_sycl_weight_owner =
-        params.n_gpu_layers > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
+        this->n_gpu_layers() > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
             return llama_model_dev_is_sycl(device.dev);
         });
     llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);

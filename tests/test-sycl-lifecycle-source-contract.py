@@ -163,7 +163,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 8,
+        "ggml_sycl_global_plan_snapshot": 7,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -321,6 +321,7 @@ checks = {
     and (root / "src/llama-model-loader.cpp").read_text().index("register_identity(tensor") <
         (root / "src/llama-model-loader.cpp").read_text().index("register_host_weight(selected_layer_dev"),
     "CPU classified before lifecycle begin": "resolved_sycl_weight_owner" in llama
+    and "this->n_gpu_layers() > 0" in llama
     and "llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner" in llama
     and "if (sycl_model_loading_guard.active)" in llama,
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
@@ -337,7 +338,19 @@ checks = {
     ))
     and "llama_kv_cache_sycl_hooks_for" in (root / "src/llama-kv-cache.cpp").read_text()
     and "llama_recurrent_sycl_kv_buft" in (root / "src/llama-memory-recurrent.cpp").read_text()
-    and "llama_context_sycl_compute_procs" in (root / "src/llama-context.cpp").read_text(),
+    and "llama_context_sycl_compute_procs" in (root / "src/llama-context.cpp").read_text()
+    and "hooks.device_index" in (root / "src/llama-context.cpp").read_text()
+    and "hooks.has_active_plan" in (root / "src/llama-context.cpp").read_text(),
+    "zero owner skips SYCL context activation": "if (owner.model_id == 0 || owner.load_txn_id == 0)" in
+    (root / "src/llama-context.cpp").read_text(),
+    "no global host registry clear on load": "Host-weight rows are exact-owner state" in backend
+    and "ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);" not in
+        re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
+    "transaction-scoped cache ownership promotion": "pending_load_txn_id" in cache_hpp
+    and "pair.second.pending_load_txn_id != load_txn_id" in cache_cpp
+    and "unified_cache_note_model_load_begin" in backend
+    and "unified_cache_note_model_load_abort" in backend
+    and "unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value)" in backend,
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
     (root / "src/llama-context.cpp").read_text()
     and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()

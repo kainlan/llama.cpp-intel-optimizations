@@ -2037,6 +2037,27 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_globa
     return std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
 }
 
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_identity_plan_snapshot() {
+    const auto candidate = ggml_sycl_bound_load_candidate();
+    return candidate ? candidate : ggml_sycl_global_plan_snapshot();
+}
+
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    if (!snapshot) {
+        return {};
+    }
+    if (snapshot->model_id != 0) {
+        return {
+            { snapshot->model_id },
+            { snapshot->load_txn_id },
+            { snapshot->slot, snapshot->slot_generation }
+        };
+    }
+    const auto loading = ggml_sycl::lifecycle::global_registry().current_active_token();
+    return loading.load.value == snapshot->load_txn_id ? loading : ggml_sycl::lifecycle::ModelToken{};
+}
+
 static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_global_plan_owner() {
     return ggml_sycl::global_placement_plan_owner();
 }
@@ -8573,15 +8594,11 @@ const void * ggml_sycl_lookup_host_weight_ptr_by_name(const char * name) {
         return nullptr;
     }
 
-    const auto snapshot = ggml_sycl_global_plan_snapshot();
+    const auto snapshot = ggml_sycl_identity_plan_snapshot();
     if (!snapshot) {
         return nullptr;
     }
-    const ggml_sycl::lifecycle::ModelToken owner{
-        { snapshot->model_id },
-        { snapshot->load_txn_id },
-        { snapshot->slot, snapshot->slot_generation }
-    };
+    const auto                  owner = ggml_sycl_identity_owner(snapshot);
     std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
     const std::string           key = ggml_sycl_owner_name_key(owner, name);
     auto                        it  = g_sycl_host_weight_extras.find(key);
@@ -9399,16 +9416,8 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // this must not be left to the per-field writer alone.
             ggml_sycl_reset_model_load_scratch_state(true);
 
-            // A new outer model load is the ownership boundary for the previous
-            // model's tensor extras. Release the registry's references before
-            // resetting cache entries so smart handles can drop their refs and the
-            // arena can actually reclaim old weight-zone allocations. Do not touch
-            // tensor->extra here: the previous model may already have freed the
-            // tensor objects, and the buffer owner has its own extra reference.
-            // Clearing only the registry leaves those handles live until process
-            // teardown and can force the next plan to "recover" by demoting
-            // planned device experts to host.
-            ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);
+            // Host-weight rows are exact-owner state. Never clear another LIVE
+            // model at a new-load boundary; abort/teardown erase only their token.
 
             // Eager arena reservation: create the unified cache (and its VRAM arena)
             // BEFORE any KV/compute buffer allocations can steal VRAM.  The cache
@@ -9570,6 +9579,7 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
     ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
+    ggml_sycl::unified_cache_note_model_load_abort(owner.load.value);
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     ggml_sycl_erase_weight_identities_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
@@ -9592,6 +9602,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
             return ggml_sycl_lifecycle_c_result(result.code);
         }
         txn->id = result.txn.value;
+        ggml_sycl::unified_cache_note_model_load_begin(result.txn.value);
         // no_alloc intentionally never invokes the planner, so stage an
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
@@ -9777,7 +9788,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_lifecycle_c_result(failed.code);
         }
 
-        ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot);
+        ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value);
         const auto                                                actual = ggml_sycl_lifecycle_actual_snapshot();
         std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> plan_snapshot;
         if (!ggml_sycl::lifecycle_publish_placement_plan(ticket.token.model.value, ticket.token.load.value,
@@ -10308,15 +10319,8 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     ggml_sycl_weight_identity identity{};
 
     if (!name.empty() && name != "unknown") {
-        const auto                             snapshot = ggml_sycl_global_plan_snapshot();
-        const ggml_sycl::lifecycle::ModelToken owner =
-            snapshot ?
-                ggml_sycl::lifecycle::ModelToken{
-                    { snapshot->model_id },
-                    { snapshot->load_txn_id },
-                    { snapshot->slot, snapshot->slot_generation }
-        } :
-                ggml_sycl::lifecycle::ModelToken{};
+        const auto snapshot = ggml_sycl_identity_plan_snapshot();
+        const auto owner    = ggml_sycl_identity_owner(snapshot);
         auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
         if (name_it != g_sycl_weight_identities_by_name.end()) {
             identity          = name_it->second;

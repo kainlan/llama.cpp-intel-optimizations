@@ -107,7 +107,9 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
 struct llama_context_sycl_dl_compute_hooks {
     decltype(&ggml_backend_sycl_host_compute_buffer_type)        host_compute  = nullptr;
     decltype(&ggml_backend_sycl_cpu_offload_compute_buffer_type) cpu_compute   = nullptr;
-    decltype(&ggml_backend_sycl_cpu_offload_available)           cpu_available = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_available)           cpu_available   = nullptr;
+    decltype(&ggml_backend_sycl_has_active_placement_plan)       has_active_plan = nullptr;
+    int                                                          device_index    = -1;
 };
 
 static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
@@ -119,12 +121,23 @@ static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml
     if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
         return hooks;
     }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            hooks.device_index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (hooks.device_index < 0) {
+        return {};
+    }
     hooks.host_compute = reinterpret_cast<decltype(hooks.host_compute)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_compute_buffer_type"));
     hooks.cpu_compute = reinterpret_cast<decltype(hooks.cpu_compute)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_compute_buffer_type"));
     hooks.cpu_available = reinterpret_cast<decltype(hooks.cpu_available)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_available"));
+    hooks.has_active_plan = reinterpret_cast<decltype(hooks.has_active_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
     return hooks;
 }
 
@@ -397,7 +410,10 @@ llama_context::llama_context(
             auto runtime_context_fn = llama_context_sycl_runtime_proc(dev);
 #    endif
             if (runtime_context_fn) {
-                const auto &                owner = model.get_sycl_model_token();
+                const auto & owner = model.get_sycl_model_token();
+                if (owner.model_id == 0 || owner.load_txn_id == 0) {
+                    continue;
+                }
                 const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                       owner.slot_generation };
                 auto                        rc    = GGML_SYCL_LIFECYCLE_BUSY;
@@ -477,7 +493,7 @@ llama_context::llama_context(
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
 
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+#ifdef GGML_USE_SYCL
         int sycl_gpu_idx = 0;
 #endif
         for (auto & backend : backends) {
@@ -538,7 +554,7 @@ llama_context::llama_context(
             else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 const auto hooks = llama_context_sycl_compute_procs(dev);
                 if (hooks.host_compute && hooks.cpu_compute && hooks.cpu_available) {
-                    const int sycl_dev = sycl_gpu_idx++;
+                    const int sycl_dev = hooks.device_index;
                     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
                         buft = hooks.host_compute(sycl_dev);
                     } else if (const char * env = std::getenv("GGML_SYCL_HOST_COMPUTE"); env && std::atoi(env) != 0) {
@@ -569,6 +585,16 @@ llama_context::llama_context(
 #ifdef GGML_USE_SYCL
         if (pipeline_parallel && llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan()) {
             pipeline_parallel = false;
+        }
+#elif defined(GGML_BACKEND_DL)
+        if (pipeline_parallel) {
+            for (const auto & backend : backends) {
+                const auto hooks = llama_context_sycl_compute_procs(ggml_backend_get_device(backend.get()));
+                if (hooks.has_active_plan && hooks.has_active_plan()) {
+                    pipeline_parallel = false;
+                    break;
+                }
+            }
         }
 #endif
 

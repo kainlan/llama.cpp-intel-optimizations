@@ -43,6 +43,12 @@
 
 namespace ggml_sycl {
 
+static std::atomic<uint64_t> g_pending_load_txn_id{ 0 };
+
+uint64_t unified_cache_pending_load_txn() noexcept {
+    return g_pending_load_txn_id.load(std::memory_order_acquire);
+}
+
 namespace {
 std::mutex                                                                   g_lifecycle_plan_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
@@ -7746,7 +7752,16 @@ size_t unified_cache::owner_tagged_entry_count() const {
     return n;
 }
 
-void unified_cache::note_model_load_end(uint32_t slot) {
+void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto & pair : entries_) {
+        if (pair.second.pending_load_txn_id == load_txn_id) {
+            pair.second.pending_load_txn_id = 0;
+        }
+    }
+}
+
+void unified_cache::note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
     if (slot >= MODEL_SLOT_COUNT) {
         // No slot was available (more than 32 concurrent models).  Leaving the
         // entries untagged is the safe outcome: weight_entry_reclaimable() keeps
@@ -7759,13 +7774,14 @@ void unified_cache::note_model_load_end(uint32_t slot) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     live_model_mask_ |= bit;
     size_t tagged = 0;
-    // Claim everything this model can now resolve, which is more than what it
-    // staged: two llama_models over the same GGUF dedupe to one entry (model_id
-    // is deliberately excluded from cache_id_equal for GGUF weights), so an
-    // entry an earlier model created must gain this model's bit too.
+    // Promote only entries created or staged by this exact load transaction.
     for (auto & pair : entries_) {
+        if (pair.second.pending_load_txn_id != load_txn_id) {
+            continue;
+        }
         pair.second.owner_mask |= bit;
         pair.second.owner_tagged = true;
+        pair.second.pending_load_txn_id = 0;
         tagged++;
     }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] model slot %u claimed %zu weight entries (live mask 0x%08x)\n", slot, tagged,
@@ -13943,13 +13959,30 @@ void unified_cache_set_live_model_mask(uint32_t mask) {
     }
 }
 
-void unified_cache_note_model_load_end(uint32_t slot) {
+void unified_cache_note_model_load_begin(uint64_t load_txn_id) {
+    g_pending_load_txn_id.store(load_txn_id, std::memory_order_release);
+}
+
+void unified_cache_note_model_load_abort(uint64_t load_txn_id) {
+    uint64_t expected = load_txn_id;
+    (void) g_pending_load_txn_id.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
-            cache->note_model_load_end(slot);
+            cache->note_model_load_abort(load_txn_id);
         }
     }
+}
+
+void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
+    std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+    for (auto & [device_id, cache] : g_device_caches) {
+        if (cache) {
+            cache->note_model_load_end(slot, load_txn_id);
+        }
+    }
+    uint64_t expected = load_txn_id;
+    (void) g_pending_load_txn_id.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
 }
 
 size_t unified_cache_release_model_slot(uint32_t slot) {
