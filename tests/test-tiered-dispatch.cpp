@@ -70,7 +70,8 @@ void run_placement_case(ggml_backend_t backend,
                         const char *   label,
                         size_t         count,
                         size_t         bytes_per_tensor,
-                        bool           expect_host) {
+                        bool           expect_host,
+                        bool           exercise_multi_device_clear = false) {
     // This outer boundary must invalidate the preceding model's verdict before
     // the incoming inventory is known.
     ggml_backend_sycl_set_model_loading(true);
@@ -86,11 +87,19 @@ void run_placement_case(ggml_backend_t backend,
     check(verdict == oracle, "tiered query disagrees with independent planned-target oracle");
     check(ggml_backend_sycl_has_tensor_cache(backend), "unified cache gate unavailable for planned model");
 
+    if (exercise_multi_device_clear) {
+        check(ggml_backend_sycl_has_active_placement_plan(), "planner plan was not active before completion clear");
+        check(ggml_backend_sycl_test_complete_multi_device_plan_clear(),
+              "production multi-device completion helper did not clear plan");
+        check(!ggml_backend_sycl_has_active_placement_plan(),
+              "multi-device completion left global placement plan active");
+        check(ggml_backend_sycl_is_tiered_enabled(backend) == oracle,
+              "planner-host verdict did not survive demonstrated global-plan clear");
+    }
+
     ggml_backend_sycl_set_model_loading(false);
-    // Multi-device preload may clear g_has_placement_plan after copying the plan
-    // into device caches. The published current-model verdict must survive it.
     check(ggml_backend_sycl_is_tiered_enabled(backend) == oracle,
-          "planner verdict did not survive model-load completion/global-plan clear");
+          "planner verdict did not survive model-load completion");
 
     std::printf("PASS: %s (%zu tensors, %.1f MiB each, planner_host=%s)\n", label, count,
                 bytes_per_tensor / (1024.0 * 1024.0), oracle ? "true" : "false");
@@ -99,14 +108,19 @@ void run_placement_case(ggml_backend_t backend,
 }  // namespace
 
 int main() {
-    ggml_backend_t backend = ggml_backend_sycl_init(0);
-    if (!backend) {
+    const int device_count = ggml_backend_sycl_get_device_count();
+    if (device_count <= 0) {
         std::fprintf(stderr, "SKIP: no SYCL device\n");
         return 77;
     }
 
-    size_t    aggregate_device_bytes = 0;
-    const int device_count           = std::max(1, ggml_backend_sycl_get_device_count());
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    if (!backend) {
+        std::fprintf(stderr, "FAIL: SYCL device was enumerated but backend initialization failed\n");
+        return 1;
+    }
+
+    size_t aggregate_device_bytes = 0;
     for (int device = 0; device < device_count; ++device) {
         size_t free_bytes  = 0;
         size_t total_bytes = 0;
@@ -125,7 +139,7 @@ int main() {
     // even GGML_SYCL_MAX_DEVICES device budgets, forcing planner host targets.
     run_placement_case(backend, "all-device-first", 4, 4096, false);
     const size_t over_budget_tensor = std::max<size_t>(aggregate_device_bytes, 1024 * 1024);
-    run_placement_case(backend, "over-budget-second", 64, over_budget_tensor, true);
+    run_placement_case(backend, "over-budget-second", 64, over_budget_tensor, true, true);
     run_placement_case(backend, "all-device-third", 4, 4096, false);
 
     ggml_backend_free(backend);
