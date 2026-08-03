@@ -2,7 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 #    include "ggml-sycl.h"
 #endif
 #include "llama-arch.h"
@@ -100,6 +100,21 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
     if (llama_context_sycl_hooks_enabled() && sched != nullptr && llama_context_has_sycl_backend(backends)) {
         ggml_backend_sycl_set_sched_placement_plan(sched);
     }
+}
+#endif
+
+#if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
+static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
 }
 #endif
 
@@ -348,17 +363,22 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            if (llama_context_dev_is_sycl(dev)) {
+#    ifdef GGML_USE_SYCL
+            auto runtime_context_fn =
+                llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_set_runtime_context_for_model : nullptr;
+#    else
+            auto runtime_context_fn = llama_context_sycl_runtime_proc(dev);
+#    endif
+            if (runtime_context_fn) {
                 const auto &                owner = model.get_sycl_model_token();
                 const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                       owner.slot_generation };
                 auto                        rc    = GGML_SYCL_LIFECYCLE_BUSY;
                 for (int attempt = 0; attempt < 3 && rc == GGML_SYCL_LIFECYCLE_BUSY; ++attempt) {
-                    rc = ggml_backend_sycl_set_runtime_context_for_model(backend.get(), token, cparams.n_ctx,
-                                                                         cparams.n_ubatch, cparams.n_seq_max);
+                    rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max);
                 }
                 if (rc != GGML_SYCL_LIFECYCLE_OK) {
                     throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));

@@ -9298,17 +9298,24 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_model_token token) {
     try {
-        const auto owner    = ggml_sycl_cpp_token(token);
-        auto &     registry = ggml_sycl::lifecycle::global_registry();
-        if (!registry.is_quarantined(owner)) {
-            const auto deferred = registry.defer_quarantine(owner);
-            if (deferred != ggml_sycl::lifecycle::error::OK) {
-                return ggml_sycl_lifecycle_c_result(deferred);
-            }
+        const auto owner = ggml_sycl_cpp_token(token);
+        if (owner.model.value == 0 || owner.load.value == 0 ||
+            owner.owner.slot >= ggml_sycl::lifecycle::model_slot_count) {
+            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
-        return ggml_sycl_quarantine_enqueue(token) ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
+        // Queue first: BUSY from a concurrent load/update/drain must never make
+        // a destructor drop its only exact owner token. The reaper owns retries
+        // until teardown reaches a terminal DEAD/stale result.
+        if (!ggml_sycl_quarantine_enqueue(token)) {
+            return GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
+        }
+        auto & registry = ggml_sycl::lifecycle::global_registry();
+        if (!registry.is_quarantined(owner)) {
+            (void) registry.defer_quarantine(owner);
+        }
+        return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
-        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        return ggml_sycl_quarantine_enqueue(token) ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
 }
 
@@ -9696,11 +9703,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         auto       state  = std::make_shared<const ggml_sycl::lifecycle::ModelState>(ggml_sycl::lifecycle::ModelState{
             ticket.token, ggml_sycl::lifecycle::model_phase::LIVE, publication.planned_host_bytes,
             publication.actual_host_bytes, publication.verdict });
-        auto       result = registry->finalize_end(ticket, true, publication, std::move(state));
-        if (result.committed) {
+        // Three-phase commit: prepare_end reserved the COMMITTING token and all
+        // fallible publication state above; publish cache-first/global-last
+        // while waiters still observe COMMITTING; only finalize_end makes LIVE
+        // terminal state visible and notifies duplicate load_end callers.
+        {
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
             ggml_sycl_publish_prepared_plan_locked(prepared_publication);
         }
+        auto result             = registry->finalize_end(ticket, true, publication, std::move(state));
         g_load_candidate_txn_id = 0;
         if (result.cleanup_required) {
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
@@ -9711,6 +9722,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             } catch (...) {
             }
             result = registry->finalize_cleanup(ticket, cleanup_ok);
+            (void) ggml_sycl_restore_latest_live_plan();
         }
         if (result.committed || (!result.committed && model)) {
             ggml_sycl_export_token(result.token, model);

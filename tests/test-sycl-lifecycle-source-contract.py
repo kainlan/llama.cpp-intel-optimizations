@@ -264,6 +264,14 @@ checks = {
     and "--entry.live_update_count" in cpp,
     "fallible pre-finalize restoration": backend.index("teardown_owner_effects(owner)")
     < backend.index("finalize_teardown(ticket, true)"),
+    "busy quarantine queues before defer": backend.index("if (!ggml_sycl_quarantine_enqueue(token))")
+    < backend.index("(void) registry.defer_quarantine(owner)"),
+    "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
+    < backend.index("registry->finalize_end(ticket, true, publication"),
+    "DL context model-bound route": "llama_context_sycl_runtime_proc" in
+    (root / "src/llama-context.cpp").read_text()
+    and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()
+    and "runtime_context_fn(backend.get(), token" in (root / "src/llama-context.cpp").read_text(),
     "durable quarantine reaper": all(
         x in backend
         for x in (
