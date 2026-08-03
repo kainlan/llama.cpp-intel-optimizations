@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 #include <sycl/sycl.hpp>
@@ -53,7 +54,7 @@ static int g_tests_passed = 0;
         return;                                  \
     } while (0)
 
-#define TEST_SKIP(msg)                           \
+#define TEST_OPTIONAL_SKIP(msg)                  \
     do {                                         \
         fprintf(stderr, "SKIPPED: %s\n", msg);   \
         g_tests_passed++;                        \
@@ -707,7 +708,7 @@ static void test_unified_kernel_numeric_large_sampled() {
 
     const char * env = std::getenv("GGML_SYCL_UNIFIED_LARGE_TEST");
     if (!env || std::atoi(env) == 0) {
-        TEST_SKIP("set GGML_SYCL_UNIFIED_LARGE_TEST=1 to run large numeric test");
+        TEST_OPTIONAL_SKIP("set GGML_SYCL_UNIFIED_LARGE_TEST=1 to run large numeric test");
     }
 
     try {
@@ -845,12 +846,6 @@ static void test_unified_kernel_numeric_large_sampled() {
 static void test_production_path_uses_unified_dispatch() {
     TEST_BEGIN("production_path_uses_unified_dispatch");
 
-    // Check if unified dispatch is enabled via environment
-    const char* env = std::getenv("GGML_SYCL_UNIFIED_DISPATCH");
-    if (!env || std::atoi(env) != 1) {
-        TEST_SKIP("GGML_SYCL_UNIFIED_DISPATCH=1 not set");
-    }
-
     // This test verifies that when GGML_SYCL_UNIFIED_DISPATCH=1 is set,
     // the production ggml_sycl_mul_mat() function will call the unified
     // dispatch path instead of the legacy DMMV/MMVQ/MMQ kernel cascade.
@@ -893,6 +888,15 @@ static void test_production_path_uses_unified_dispatch() {
 // =============================================================================
 
 int main() {
+    // The executable is specifically an enabled-path integration test.  Gate
+    // before running any subtest so a disabled unified dispatch cannot produce
+    // a vacuous pass after exercising only direct-kernel helpers.
+    const char * env = std::getenv("GGML_SYCL_UNIFIED_DISPATCH");
+    if (!env || std::strcmp(env, "1") != 0) {
+        fprintf(stderr, "SKIP: GGML_SYCL_UNIFIED_DISPATCH=1 is required.\n");
+        return 77;
+    }
+
     fprintf(stderr, "\n=== Unified Dispatch Integration Tests ===\n\n");
 
     // Run tests
