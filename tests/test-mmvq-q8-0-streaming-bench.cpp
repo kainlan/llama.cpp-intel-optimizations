@@ -517,7 +517,7 @@ static int run_mmq_bench() {
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
         std::fprintf(stderr, "SKIP: Could not initialize SYCL backend\n");
-        return 0;
+        return 77;  // ctest SKIP_RETURN_CODE: this mode requires a SYCL backend
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -623,7 +623,7 @@ int main() {
     const char * enable = std::getenv("GGML_SYCL_MMVQ_BENCH");
     if (!enable || std::atoi(enable) == 0) {
         std::printf("SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run\n");
-        return 0;
+        return 77;  // ctest SKIP_RETURN_CODE: the opt-in benchmark is disabled
     }
 
     const char * mode = parse_env_str("GGML_SYCL_MMVQ_BENCH_MODE", "manual");
