@@ -187,13 +187,13 @@ Line numbers are review aids and may drift; the symbols/behaviors are the gate.
 | `ggml-sycl.cpp:9093-9199` | atomic nesting depth; outer entry resets scratch/reserves slot; outer `false` preloads and publishes LIVE | no transaction ID or failure channel; clamp can turn protocol failure into completion: `viu2` |
 | `ggml-sycl.cpp:9244-9273` | pending KV layer masks are per-device FIFO queues | foundation keys: `1q72`; focused pending-mask migration: `y36c` |
 | `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | model/load foundation: `viu2`; reporting consumer: `x3ou` |
-| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | epoch/token foundation: `1q72`; backing: `tudj`; teardown: `o6jx` |
+| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | epoch/token foundation: `1q72`; backing: `32dg8.15.12`; teardown: `o6jx` |
 | `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | identity: `viu2`; teardown consumer: `o6jx` |
-| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `tudj` owns deletion, logical generation/refcount reservation, and event backing |
-| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | lock/backing foundation: `tudj`; focused MoE consumers use its API |
-| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/lock foundation: `tudj` |
-| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | context owner: `1q72`; lock/backing protocol: `tudj` |
-| `common.hpp:4614-4615`, `ggml-sycl.cpp:32784-32791` | `control_host_allocs_mutex` protects a vector whose clear destroys `mem_handle`s while locked | extract primitive: `1q72`; outside-lock teardown: `o6jx`; rank/retention: `tudj` |
+| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `32dg8.15.12` exclusively owns deletion, logical generation/refcount reservation, and event backing |
+| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | lock/backing foundation: `32dg8.15.12`; focused MoE consumers use its API |
+| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/lock foundation: `32dg8.15.12` |
+| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | context owner: `1q72`; lock/backing protocol: `32dg8.15.12` |
+| `common.hpp:4614-4615`, `ggml-sycl.cpp:32784-32791` | `control_host_allocs_mutex` protects a vector whose clear destroys `mem_handle`s while locked | extract primitive: `1q72`; outside-lock teardown: `o6jx`; rank/retention: `32dg8.15.12` |
 
 Recheck these anchors without relying on a size-limited index:
 
@@ -252,27 +252,29 @@ H8/M7 must cover every operation/rank and each named lock alias.
 |---|---|
 | `viu2` | model/load registry foundation: ModelId, slots/generations, LoadTxnId, checked nesting/rollback |
 | `1q72` | context/session/GraphEpoch foundation, InvocationId/device tokens, aggregate state, control extract API |
-| `tudj` | async backing/event payload, oneDNN logical reservations, exhaustive lock protocol |
-| `o6jx` | owner-targeted model/context/session reset and teardown integration |
+| `32dg8.15.12` | exclusive async backing/event payload, oneDNN logical reservations, exhaustive lock protocol; consumes `1q72` and `.15.13` |
+| `tudj` | closed duplicate of `.15.12`; no path ownership or DAG edge |
+| `o6jx` | owner-targeted model/context/session reset and teardown integration; consumes `32dg8.15.12` |
 | `nn6z` | focused MoE discovery/popularity consumer only |
-| `nlww` | focused MoE bias/activation consumer only |
+| `nlww` | focused MoE bias/activation consumer of `viu2`/`1q72`/`32dg8.15.12` only |
 | `vbeb` | focused layer-stream manager consumer only |
 | `y36c` | focused pending KV-mask consumer only |
-| `x3ou` | focused diagnostics/reporting consumer only |
+| `x3ou` | focused diagnostics/reporting consumer of `1q72`/`32dg8.15.12`/`o6jx` only |
 | `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
-| `t5nq` | OPEN with merged reviewed packed-K-sidecar-event-teardown code; awaits live GPU failpoint/retry/teardown gate; consumes `1q72`/`tudj`/`o6jx` and owns no lifecycle foundation |
+| `t5nq` | OPEN with merged reviewed packed-K-sidecar-event-teardown code; no foundation prerequisites; may close after its live GPU failpoint/retry/teardown gate; `otry` revalidates after foundations |
 | `otry` | final convergence after every foundation and focused child |
 | `hcyp` | closed merged prerequisite: self-test line-drift repair only; no census ownership |
 | `jwy4` | after `otry` and `hcyp`, owns final audit script/fixtures, CSV, source hashes/count prose refresh together |
 | `k7b0` | downstream closure after `jwy4` |
 
-Canonical §12.8 is authoritative. Foundation chain: `viu2 → 1q72 → tudj →
-o6jx`. Focused consumers retain only their subsystem scopes. Exact convergence
-edge: `{viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
-→ otry`; closed `h5m4` and OPEN `t5nq` are focused proof gates, not foundation
-implementers. `t5nq` blocks `otry` until its live GPU failpoint/retry/teardown
-gate passes; its reviewed code is already merged. `32dg8.15.13 → tudj` remains a
-prerequisite. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
+Canonical §12.8 is authoritative. Foundation edges are `viu2 → 1q72`,
+`{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`; `.15.12` is the exclusive async
+backing/event-lease/oneDNN/lock foundation and `tudj` is a closed duplicate.
+Focused consumers retain only their subsystem scopes. Exact convergence edge:
+`{viu2, 1q72, 32dg8.15.12, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
+→ otry`. Closed `h5m4` and OPEN `t5nq` are focused proof gates, not foundation
+implementers. `t5nq` has no foundation prerequisite and may close after its live
+GPU gate; `otry` revalidates packed-K guarantees after foundations. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
 `0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact tail:
 all foundations/focused children → `otry → jwy4 → k7b0`, with closed prerequisite
 `hcyp → jwy4`. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus

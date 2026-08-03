@@ -163,8 +163,8 @@ state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner regist
 → L4 cache/queue registry → L5 allocator/work ordering; the canonical table
 includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue,
 backend-context, and `control_host_allocs_mutex` locks. The target deletes the
-oneDNN global `unique_lock` registry. Foundation owner `tudj` deletes it and
-freezes a logical
+oneDNN global `unique_lock` registry. Exclusive foundation owner
+`32dg8.15.12` deletes it and freezes a logical
 `{device, generation, reservation_id}` API: brief same-thread keyed-mutex
 transitions increment/decrement reservation refcounts, while event payloads carry
 only logical reservation/backing handles. Cross-thread completion takes/releases
@@ -186,15 +186,18 @@ non-conformances to migrate, not licensed exceptions to preserve or descriptions
 of supported concurrency.
 
 Canonical §12.8-§12.10 assigns foundations only to `viu2` (model/load), `1q72`
-(context/session/GraphEpoch/tokens), `tudj` (async backing/oneDNN/locks), and
-`o6jx` (owner-targeted teardown), in that order. Existing focused IDs retain
+(context/session/GraphEpoch/tokens), `32dg8.15.12` (exclusive async backing/event
+leases/oneDNN/locks), and `o6jx` (owner-targeted teardown). Exact foundation
+edges are `viu2 → 1q72` and `{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`;
+`tudj` is a closed duplicate with no ownership or edge. Existing focused IDs retain
 their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
 `vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics. Closed
 Closed `h5m4` remains the TLS-reset proof gate. `t5nq` is OPEN with merged
 reviewed packed-K-sidecar code awaiting its live GPU failpoint/retry/teardown
-gate; it remains a focused gate, not a foundation implementer. Exact tail is `all foundations/focused children → otry → jwy4 →
-k7b0`, with closed self-test line-drift prerequisite `hcyp → jwy4`; `.15.13 →
-tudj` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
+gate; that gate has no foundation prerequisites and may close now. `otry`, not
+`t5nq`, revalidates packed-K guarantees after foundations. Exact tail is `all foundations/focused children → otry → jwy4 →
+k7b0`, with closed self-test line-drift prerequisite `hcyp → jwy4`; `{1q72, .15.13} →
+.15.12 → o6jx` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
 census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
 mutations, and lock controls remain canonical.
 

@@ -513,7 +513,7 @@ temporarily allowed but must be audited for multi-GPU callers:
 | `llama.cpp-32dg8.15.9` | P9 — Make 32dg8 implementation beads junior-ready | all |
 | `llama.cpp-32dg8.15.10` | Historical P1-FIX evidence — superseded for live context ownership by `1q72`/`o6jx` (§12.8) | §5.1, §5.2, §5.3 |
 | `llama.cpp-32dg8.15.11` | P2-FIX — `mem_handle` device identity | §1.3, §7.2, §9.4 |
-| `llama.cpp-32dg8.15.12` | P3-FIX — in-flight handle lease lifetime | §1.3, §4 |
+| `llama.cpp-32dg8.15.12` | Exclusive async backing/event-lease/oneDNN/lock foundation | §1.3, §4, §12.7-§12.10 |
 | `llama.cpp-32dg8.15.13` | P4-FIX — canonical event-returning memory ops | §6.2 |
 | `llama.cpp-32dg8.15.14` | P5-FIX — allocation site inventory | §3, §9.1 |
 | `llama.cpp-32dg8.15.15` | P6-FIX — dispatch router vertical slice | §2, §4, §9.2 |
@@ -804,7 +804,7 @@ The target lock inventory and mandatory order is concrete:
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
 This table is exhaustive for locks touched by the lifecycle, graph, cache,
-staging, pool, and event-retention paths in scope. Foundation owner `tudj` must update it in the
+staging, pool, and event-retention paths in scope. Foundation owner `32dg8.15.12` must update it in the
 same commit when migration introduces or discovers another such lock; an
 unclassified lock is a failing census item, not implicitly L5.
 
@@ -818,12 +818,12 @@ nested with per-device execution locks, and `g_cache_rw_mutex` must be dropped
 before a per-cache L4 lock is acquired. Snapshot/revalidate bridges these cases.
 The target **deletes** `g_onednn_scratch_lock_mutex` and
 `g_onednn_scratch_locks`; no global registry or async payload may store a
-`std::unique_lock`/mutex ownership token. Foundation `tudj` supplies a logical
+`std::unique_lock`/mutex ownership token. Foundation `32dg8.15.12` supplies a logical
 `onednn_scratch_reservation { device, generation, reservation_id }` API. Acquire
 briefly locks that device's surviving keyed `onednn_scratch_mutex_`, validates
 or creates the current logical generation without allocating, increments its
 reservation refcount, snapshots backing handles, and unlocks on the same thread.
-Growth/allocation remains a two-phase outside-lock operation. `tudj` retains the
+Growth/allocation remains a two-phase outside-lock operation. `32dg8.15.12` retains the
 logical reservation and backing handles in each registered event payload.
 Completion may run on another thread: it briefly takes the keyed mutex itself,
 rejects a stale generation/reservation, decrements the refcount, marks the
@@ -913,28 +913,28 @@ subsystem scopes and do not implement lifecycle foundations:
 ```text
 viu2 (ModelId/SlotGeneration/LoadTxnId + load registry)
   └──> 1q72 (ContextId/SessionId/GraphEpoch + execution tokens/aggregate)
-         └──> tudj (async backing leases + oneDNN/lock protocol)
-                └──> o6jx (owner-targeted context/model teardown integration)
+
+{1q72, 32dg8.15.13} ──> 32dg8.15.12 (async backing/event leases/oneDNN/locks)
+                           └──> o6jx (owner-targeted context/model teardown)
 
 viu2 ───────────────────────────────────────────────> nn6z (MoE discovery/popularity)
-{viu2, 1q72, tudj} ─────────────────────────────────> nlww (MoE bias/activation)
+{viu2, 1q72, 32dg8.15.12} ─────────────────────────> nlww (MoE bias/activation)
 {viu2, 1q72, o6jx} ─────────────────────────────────> vbeb (layer-stream manager)
 {1q72, o6jx} ───────────────────────────────────────> y36c (pending KV-mask)
-{viu2, 1q72, tudj, o6jx} ───────────────────────────> x3ou (diagnostics)
+{viu2, 1q72, 32dg8.15.12, o6jx} ───────────────────> x3ou (diagnostics)
 
 {1q72, o6jx} --preserve/revalidate--> h5m4 (merged TLS-worker-reset gate)
-{1q72, tudj, o6jx} --live-gate--> t5nq (OPEN merged reviewed packed-K-sidecar gate)
-32dg8.15.13 (event-returning memory-op surface) ─────> tudj
-{viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
-  └──> otry ──> jwy4 ──> k7b0
+t5nq (OPEN merged reviewed packed-K-sidecar live GPU gate; no prerequisites)
+{viu2, 1q72, 32dg8.15.12, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
+  └──> otry (revalidates packed-K after foundations) ──> jwy4 ──> k7b0
 hcyp (closed self-test line-drift repair prerequisite) ────────────> jwy4
 ```
 
 This graph is acyclic. Closed `h5m4` supplies merged proof evidence. OPEN
-`t5nq` has merged reviewed packed-K-sidecar code but still awaits its live GPU
-failpoint/retry/teardown gate. Both retain focused regression-gate scope only;
-foundation owners must preserve/re-run them without assigning either lifecycle
-foundation implementation. `otry` starts only after every foundation
+`t5nq` has merged reviewed packed-K-sidecar code but still awaits its independent
+live GPU failpoint/retry/teardown gate; it has no foundation prerequisites and
+may close now. Both retain focused regression-gate scope only. After foundations
+land, `otry`—not `t5nq`—revalidates packed-K guarantees. `otry` starts only after every foundation
 and focused child listed above. Final-census owner `jwy4` starts after `otry` and
 closed self-test prerequisite `hcyp`; `k7b0` starts only after `jwy4`.
 
@@ -942,15 +942,15 @@ closed self-test prerequisite `hcyp`; `k7b0` starts only after `jwy4`.
 |---|---|---|
 | `viu2` | model/load IDs, slot generations, load nesting/commit/abort, planner publication | H1-H4/H10/G1, M1-M3 |
 | `1q72` | context/session/reset IDs and state; GraphEpoch/InvocationId; device tokens and OPEN/SEALED aggregate; control-allocation registry/extract primitive | H6-H7/H11/H13, G3-G7 token/epoch phases, M6a/M6e |
-| `tudj` | event payload/backing leases, logical oneDNN reservation, exhaustive lock protocol/instrumentation | H7-H8/H12, G5a/G6/G7 backing phases, M6b-d/M7 |
-| `o6jx` | exact-owner model/context/session reset and teardown callers; drain→wait→extract→destroy→finish | H3/H5/H14, G2-G5b, M4-M5 |
+| `32dg8.15.12` | exclusive event payload/backing leases, logical oneDNN reservation, exhaustive lock protocol/instrumentation | consumes `1q72` and `.15.13`; H7-H8/H12, G5a/G6/G7 backing phases, M6b-d/M7 |
+| `o6jx` | exact-owner model/context/session reset and teardown callers consuming `32dg8.15.12`; drain→wait→extract→destroy→finish | H3/H5/H14, G2-G5b, M4-M5 |
 | `nn6z` | MoE discovery/popularity only; consumes `viu2` model/load identity | subsystem tests plus lifecycle identity integration; no registry ownership |
-| `nlww` | MoE bias/activation only; consumes `viu2`/`1q72`/`tudj` APIs | subsystem event/backing tests; no context registry ownership |
+| `nlww` | MoE bias/activation only; consumes `viu2`/`1q72`/`32dg8.15.12` APIs | subsystem event/backing tests; no context registry ownership |
 | `vbeb` | layer-stream manager only; consumes model/context identities and `o6jx` teardown hooks | manager teardown tests; no GraphEpoch/token ownership |
 | `y36c` | pending KV-mask only; consumes `1q72` context/session keys and `o6jx` cleanup hooks | keyed queue/reset tests; no general teardown ownership |
-| `x3ou` | diagnostics/reporting only; consumes immutable snapshots from all foundations | H9/M8 and identity-reporting audit; no lifecycle mutation |
+| `x3ou` | diagnostics/reporting only; consumes immutable snapshots from `1q72`/`32dg8.15.12`/`o6jx` | H9/M8 and identity-reporting audit; no lifecycle mutation |
 | `h5m4` | **closed merged gate:** TLS worker reset proof/fix | `1q72`/`o6jx` preserve and revalidate it; no new implementation ownership |
-| `t5nq` | **OPEN merged reviewed scope:** packed-K sidecar event teardown proof/fix | consumes `1q72`/`tudj`/`o6jx`; reviewed code is merged, but the live GPU failpoint/retry/teardown gate must pass before closure; no lifecycle-foundation ownership |
+| `t5nq` | **OPEN merged reviewed scope:** packed-K sidecar event teardown proof/fix | no foundation prerequisites; may close when its live GPU failpoint/retry/teardown gate passes; `otry` later revalidates packed-K after foundations |
 | `otry` | final convergence after all foundations and focused children | integrated payload/lock/teardown convergence corrections |
 | `hcyp` | **closed merged prerequisite:** self-test line-drift repair only | existing parser self-test is green; no final-census ownership |
 | `jwy4` | final audit script/fixtures, generated CSV, source-hash/count prose | consumes `otry` and `hcyp`; refreshes all artifacts atomically at final HEAD |
@@ -977,8 +977,9 @@ new exclusive owner:
 |---|---|
 | `32dg8.2` preload/placement consumption | not lifecycle ownership; `viu2` supersedes load/publication assumptions while preserving planner consumption |
 | historical `32dg8.15.10` context proof/guard | `1q72` owns registry primitives; `o6jx` owns teardown callers |
-| `32dg8.15.12` in-flight handle lifetime | prerequisite evidence consumed by `tudj`; not owned by closed TLS gate `h5m4` |
-| `32dg8.15.13` event-returning memory ops | explicit prerequisite edge to `tudj`, which owns lifecycle payload/retention integration |
+| `32dg8.15.12` in-flight handle lifetime | expanded exclusive async backing/event-lease/oneDNN/lock foundation; consumes `1q72` and `.15.13` |
+| `32dg8.15.13` event-returning memory ops | prerequisite to `.15.12`, which exclusively owns lifecycle payload/retention integration |
+| `tudj` duplicate foundation proposal | **closed duplicate** superseded by `32dg8.15.12`; owns no path and has no DAG edge |
 | current bare-slot ownership/reclaim (`0qlw` history) | `viu2` owns generated identity; `o6jx` consumes it |
 | current all-device graph cleanup (`2wv5` history) | `1q72` owns epoch attribution; `o6jx` removes the sweep |
 | current load scratch reset history | mitigation until `viu2` transaction rollback supersedes it; downstream `k7b0` does not own this foundation |
@@ -1002,7 +1003,7 @@ test names, not claims that they exist now**.
 | H5 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | reset/teardown touches only target model/context/session/epoch |
 | H6 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | stale slot generation and stale/retiring graph callback cannot mutate current state |
 | H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | one bound context/epoch; OPEN/SEALED counters and incomplete per-device terminal sets retain each device's handles/root independently |
-| H8 | host (`tudj`) | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-global-registry-absent,onednn-reservation-acquire,onednn-reservation-complete,onednn-reservation-cross-thread-complete,onednn-reservation-stale-generation,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; oneDNN global-registry absence and cross-thread logical completion pass; named MoE/pipeline/backend-context/control-host positive controls fire |
+| H8 | host (`32dg8.15.12`) | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-global-registry-absent,onednn-reservation-acquire,onednn-reservation-complete,onednn-reservation-cross-thread-complete,onednn-reservation-stale-generation,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; oneDNN global-registry absence and cross-thread logical completion pass; named MoE/pipeline/backend-context/control-host positive controls fire |
 | H9 | host | `ctest --test-dir build -R '^sycl-lifecycle-tier-reporting$' --output-on-failure` | changing verdict changes report only, never route/reset |
 | H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case model-id-overflow --case load-txn-id-overflow --case slot-generation-overflow --case invocation-id-counter-overflow` | 33rd slot is side-effect-free before LOADING; common checked counter refuses InvocationId wrap; model/load IDs never wrap; exhausted slot retires; `viu2` owns common primitive fixture |
 | H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case invocation-id-overflow --case reentrant --case cross-context-rejected --case cross-epoch-rejected --case busy --case wait-cancel --case multi-device --case aggregate-terminals --case fast-first-terminal-before-final-registration --case join-create-failure --case submit-exception-known --case submit-exception-uncertain` | `1q72` owns cases; one bound context/epoch, owner mismatch before side effects, one token/device, nonwrapping invocation, OPEN→SEALED gating, registered producer/submit counts, fast-terminal race resistance, independent device roots, and drain/quarantine fallback |
@@ -1013,7 +1014,7 @@ test names, not claims that they exist now**.
 | G2 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-multi-live$' --output-on-failure` | A remains runnable after B load, injected failed load, and B teardown on same device |
 | G3 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | clearing context/session 1 preserves context/session 2 KV on same device |
 | G4 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | unequal `n_ctx`, interleaved slot lifetime, no cross-reset |
-| G5a | GPU P2/P3 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-token-busy$' --output-on-failure` | `1q72` owns token phase: delayed terminal keeps second owner `DEVICE_BUSY`; no teardown is called; rerun after `tudj` async-backing integration |
+| G5a | GPU P2/P3 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-token-busy$' --output-on-failure` | `1q72` owns token phase: delayed terminal keeps second owner `DEVICE_BUSY`; no teardown is called; rerun after `32dg8.15.12` async-backing integration |
 | G5b | GPU P5 | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-teardown-wait$' --output-on-failure` | `o6jx` owns teardown phase: teardown enters DRAINING, waits outside locks, preserves owners before terminal completion, then reaches DEAD |
 | G6 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | retiring epoch releases old resources but cannot mutate replacement epoch |
 | G7 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICES=0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-multidevice-aggregate$' --output-on-failure` | `1q72` owner; one ContextId/GraphEpoch across two physical UUIDs, per-device terminal sets; delayed device cannot release either root incorrectly; cross-context injection returns `INVOCATION_OWNER_MISMATCH` |
@@ -1105,9 +1106,9 @@ unowned mutable model/context/session/graph/invocation state. The historical
 | P0 inventory | slot/load globals, planner scratch, pending KV FIFO, graph clear, cache owner masks | Every mutable site assigned one exclusive owner in §12.8 |
 | P1 model/load foundation | model load begin/nested exit/preload/failure; slot/ID registry | `viu2`: H1-H4/H10/G1 and M1-M3 pass |
 | P2 context/execution foundation | context/session/graph registries, control extract API, InvocationId/device token/aggregate | `1q72`: H6-H7/H11/H13 and token/epoch GPU gates pass; named handoff to `o6jx` lands |
-| P3 async/lock foundation | event/backing payload, delete oneDNN global registry, logical reservation, exhaustive lock protocol | `tudj`: H7-H8/H12, split M6/M7, backing GPU phases pass; consumes `.15.13` API |
+| P3 async/lock foundation | event/backing payload, delete oneDNN global registry, logical reservation, exhaustive lock protocol | `32dg8.15.12`: consumes `1q72` and `.15.13`; H7-H8/H12, split M6/M7, backing GPU phases pass |
 | P4 teardown foundation | exact-owner model/context/session reset and teardown integration | `o6jx`: begin drain → unlocked wait → L4 extract → unlocked destruction → finish; H3/H5/H14/G2-G5b/M4-M5 pass |
-| P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; closed `h5m4` is revalidated and OPEN `t5nq` passes its live GPU failpoint/retry/teardown gate |
+| P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; closed `h5m4` is revalidated; prerequisite-free OPEN `t5nq` passes its live GPU failpoint/retry/teardown gate; `otry` later revalidates packed-K after foundations |
 | P6 final convergence | integrated foundation + every focused subsystem payload/lock/teardown census | `otry` starts after `o6jx` and all focused children; owns only convergence corrections |
 | P6R reporting | planner/tier API readers within diagnostics scope | `x3ou` proves reporting-only H9/M8 behavior |
 | P7 final audit | `jwy4` script fixtures, CSV, source hashes/count prose after `otry` and closed `hcyp` self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
