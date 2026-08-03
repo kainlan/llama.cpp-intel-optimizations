@@ -915,20 +915,22 @@ nn6z (model/load/slot foundation; owns G1)
   ├──> nlww (context/session ownership + control-allocation extract API)
   │      └──> vbeb (GraphEpoch + top-level device token + aggregate seal)
   │             └──> h5m4 (allocation/backing/control-host event leases)
-  │                    └──> otry (final payload/lock convergence census)
-  │                           └──> y36c (drain/extract/unlocked destruction)
+  │                    └──> y36c (teardown integration: drain/extract/destroy)
+  │                           └──> otry (final post-integration convergence)
   └──> x3ou (reporting-only tier verdict)
 
 32dg8.15.13 (event-returning memory-op surface) ──> h5m4
 t5nq (logical oneDNN reservation/event API) ─────> h5m4
-h5m4 ────────────────────────────────────────────> otry
+h5m4 ────────────────────────────────────────────> y36c ──> otry
 main self-test repair ──> hcyp
 
 t5nq consumes lock inventories from nn6z/nlww/vbeb and lands the logical oneDNN
 reservation/event API before h5m4 integrates it. `h5m4` consumes that frozen API
 and does not edit its locks. New convergence child `otry` exclusively owns the
-post-integration payload/lock census and any integration-only corrections after
-h5m4; `t5nq` has no post-h5 work. `otry` and h5m4 both precede y36c.
+final post-integration payload/lock census and convergence corrections only
+after `y36c` integrates teardown. `t5nq` has no post-h5 work. The exact live
+chain is `t5nq → h5m4 → y36c → otry`; no edge points from `otry` back to an
+implementation child.
 (all implementation children) ──> hcyp final census
 ```
 
@@ -937,10 +939,10 @@ h5m4; `t5nq` has no post-h5 work. `otry` and h5m4 both precede y36c.
 | `nn6z` | slot/ID registry; model-load begin/nesting/commit/abort; planner publication | checked nonwrapping IDs, side-effect-free slot exhaustion, rollback; H1-H4, H10, **G1**, M1-M3 |
 | `nlww` | `ContextId`/`SessionId`/`SessionResetEpoch` types and registries; state-transition primitives; context/session create+publish; KV/arena keys; implementation of control-allocation extract primitive | named transition/extract API handoff, nonwrapping/ABA tests; H5-H6, H13-H14, G3-G4 |
 | `vbeb` | `GraphEpoch`/`InvocationId` registries; per-device token acquisition/copy; one-context/epoch per invocation; per-device aggregate retention; record/replay epoch plumbing | retiring isolation, owner-mismatch rejection, quarantine, busy/wait/multi-device; H7, H11, H13, G5a/G6/G7, M6a/M6e |
-| `h5m4` | consumes frozen oneDNN reservation API; event payload retention for reservation/backing handles plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA | allocation lifetime through sealed aggregate completion; control handles remain leased until extraction after drain; H7, H12, rerun G5a, G6/G7, M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d |
 | `t5nq` | pre-integration only: delete oneDNN global registry; implement logical generation/refcount reservation acquire/completion API and lock probes; instrument `control_host_allocs_mutex` | sentinel/tie-break, named alias, and every no-under-lock prohibition; H8, M7 |
-| `otry` | post-h5 convergence only: final event-payload/lock census, verify global registry absence and no async mutex ownership; integration corrections | all h5 payload paths plus H8/M7 cross-thread/absence gates; no redesign of frozen t5 API |
-| `y36c` | drain/reset/teardown **callers and orchestration only**; cache owner removal | after event drain calls `nlww` control-allocation extract API and destroys returned handles outside locks; never edits registry primitives; H3-H6, H14, G2-G4/G5b, M4-M5 |
+| `h5m4` | consumes frozen oneDNN reservation API; event payload retention for reservation/backing handles plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA | allocation lifetime through sealed aggregate completion; control handles remain leased until extraction after drain; H7, H12, rerun G5a, G6/G7, M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d |
+| `y36c` | teardown integration: drain/reset/teardown callers, event-wait/extract/destroy sequence, cache owner removal | consumes `nlww`/`vbeb`/`h5m4`; never edits registry primitives; H3-H6, H14, G2-G4/G5b, M4-M5 |
+| `otry` | final convergence after y36c: event-payload/lock census, verify registry absence/no async mutex ownership, integration corrections | all h5+y36c paths and H8/M7 cross-thread/absence gates; no redesign of frozen t5 API |
 | `x3ou` | tier-verdict record/public reporting and reader audit | no routing/reset readers; H9, M8 |
 | `hcyp` | `scripts/audit-sycl-static-storage.py`, its self-test fixtures, `docs/backend/sycl-static-storage-inventory.csv`, and final census/count prose in this audit | starts after main's self-test repair; refreshes all four artifacts together at final HEAD and makes `--self-test`/`--check` clean |
 
@@ -1094,8 +1096,8 @@ historical 5793 census is not accepted as final evidence.
 | P3 graph/execution foundation | graph compute, checked InvocationId, one-context/epoch binding, device token, per-device aggregate/quarantine, record/replay/retiring epochs | `vbeb` H11/G5a/G7/M6a/M6e passes, including fast-terminal-before-final-registration; G5a contains no teardown |
 | P3L lock API handoff | delete oneDNN global registry; logical generation/refcount reservation transitions under brief keyed lock | `t5nq` absence/acquire/same- and cross-thread completion H8/M7 pass; frozen API handed to `h5m4`; t5 ends |
 | P4 allocation event foundation | `.15.13` event surface handoff, ordinary I/O/pointer-table/sidecar/control-host, DIRECT/ARENA backing, logical oneDNN reservation/backing | `h5m4` consumes frozen API; H7/H12/G6/G7 and split M6 pass; rerun G5a |
-| P4C convergence | final integrated event-payload and lock census | `otry` owns all post-h5 corrections; proves no global registry/async mutex ownership and all H8/M7 gates |
-| P5 teardown | `y36c` legacy drain/reset/teardown callers and cache reclaim | begin drain → unlocked terminal wait → L4 extract → unlocked batch destruction → finish; H14 and G5b pass |
+| P5 teardown integration | `y36c` legacy drain/reset/teardown callers and cache reclaim | consumes P2-P4; begin drain → unlocked terminal wait → L4 extract → unlocked batch destruction → finish; H14 and G5b pass |
+| P5C final convergence | integrated event-payload, teardown, and lock census | `otry` starts only after y36c; proves no global registry/async mutex ownership, runs all H8/M7 gates, owns convergence corrections |
 | P6 reporting | planner/tier API and all readers | `x3ou` proves report-only behavior |
 | P7 final audit | `hcyp` script fixtures, CSV, source hashes/count prose after main self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
 

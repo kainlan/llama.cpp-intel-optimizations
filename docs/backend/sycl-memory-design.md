@@ -187,8 +187,9 @@ of supported concurrency.
 Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
 registry primitives/create/publish/extract; `y36c` owns legacy callers and the
 fixed drain→wait→extract→destroy→finish sequence), DAG (`nn6z → nlww → vbeb →
-h5m4 → otry → y36c`, `t5nq logical-reservation API → h5m4`, `.15.13 → h5m4`);
-`t5nq` has no post-h5 work and `otry` owns final payload/lock convergence, G1/G7 ownership, token-only G5a versus teardown-only G5b,
+h5m4 → y36c → otry`, `t5nq logical-reservation API → h5m4`, `.15.13 → h5m4`);
+`t5nq` has no post-h5 work, `y36c` owns teardown integration, and `otry` starts
+afterward for final payload/lock/teardown convergence, G1/G7 ownership, token-only G5a versus teardown-only G5b,
 legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
 independent ordinary/sidecar/pointer-table M6 mutants, the OPEN-before-seal race
 mutant, and L1-L5/C/D M7 with separate global-registry-absence and cross-thread

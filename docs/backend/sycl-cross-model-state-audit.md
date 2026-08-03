@@ -253,17 +253,18 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
 | `nlww` | context/session/reset-epoch registries and state primitives/create/publish; implements named control-host-allocation extract API |
 | `vbeb` | graph/invocation identities, one context/epoch, OPEN/SEALED producer+submit accounting, one token/device, aggregate+quarantine; owns H11/G5a/G7/M6e |
-| `h5m4` | consumes frozen t5 API and event-retains logical oneDNN reservation/backing plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA |
-| `otry` | sole post-h5 convergence owner: final payload/lock census, absence of global registry/async mutex ownership, integration fixes |
 | `t5nq` | pre-h5 only: deletes global registry, freezes logical generation/refcount acquire/completion API, inventories control mutex; no post-h5 work |
-| `y36c` | exact order: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
+| `h5m4` | consumes frozen t5 API and event-retains logical oneDNN reservation/backing plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA |
+| `y36c` | teardown integration after h5: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
+| `otry` | final post-y36c convergence owner: payload/lock/teardown census, registry/async-mutex absence, integration fixes |
 | `x3ou` | all tier-verdict readers are reporting-only |
 | `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
 Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
-vbeb → h5m4 → otry → y36c`, with explicit `t5nq logical-reservation API →
-h5m4` and `32dg8.15.13 → h5m4` edges. `t5nq` ends at handoff; `otry` owns the
-post-h5 lock/payload census. It supersedes stale `32dg8.2` ownership
+vbeb → h5m4 → y36c → otry`, with explicit `t5nq logical-reservation API →
+h5m4` and `32dg8.15.13 → h5m4` edges. `t5nq` ends at handoff; `y36c` owns
+teardown integration; `otry` starts afterward and owns the final convergence
+census. No edge returns from `otry` to an implementation child. It supersedes stale `32dg8.2` ownership
 assumptions and treats historical `.15.10` as superseded by `nlww`/`y36c` while
 mapping `.15.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
 editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
