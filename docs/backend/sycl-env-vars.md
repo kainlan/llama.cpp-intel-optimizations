@@ -28,12 +28,16 @@ before treating any result as an active setting.
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
 `GGML_SYCL_DISABLE_GRAPH` controls graph replay, not graph-compute concurrency.
-Current SYCL graph execution is serialized across the entire process by the
-process-global graph-compute mutex, including graphs targeting different
-devices. The process-global `unified_cache_set_graph_compute_active(bool)` flag
-is an eviction guard, not a per-device concurrency control. Same-device
-concurrent inference also remains unsupported for the distinct context/arena
-ownership reasons documented in the canonical contract §5.
+The process-global graph-compute mutex serializes `graph_compute` entry-point
+calls and their submission work across the process. It does not serialize
+completion of submitted device work: pure-GPU decode may return with kernels
+still in flight, so device execution, especially on different devices, may
+overlap after mutex release. Do not infer supported concurrent inference or
+cache safety from that overlap. The process-global
+`unified_cache_set_graph_compute_active(bool)` flag is an eviction guard, not a
+per-device concurrency control. Same-device concurrent inference also remains
+unsupported for the distinct context/arena ownership reasons documented in the
+canonical contract §5.
 
 ## Experimental (opt-in, off by default)
 

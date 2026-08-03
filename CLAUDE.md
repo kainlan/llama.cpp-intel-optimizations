@@ -392,12 +392,15 @@ reference or stale owner that must be fixed.
 is a defect only when its **owner is gone**. Several `llama_model` objects may
 remain loaded at once, so **another live model's lease is correct, not leaked**,
 and a *new model's load* is not a quiescent point for anybody else's weights.
-This lifetime rule does not promise concurrent inference. Current SYCL graph
-execution is serialized across the entire process by the process-global
-`g_sycl_graph_compute_mutex`, including graphs targeting different devices; do
-not infer cross-device graph parallelism. Separately, same-device concurrent
-inference remains unsupported because context-keyed KV/RUNTIME arena ownership
-is absent (canonical contract §5).
+This lifetime rule does not promise concurrent inference. The process-global
+`g_sycl_graph_compute_mutex` serializes `graph_compute` entry-point calls and
+their submission work across the process. It does not serialize completion of
+submitted device work: pure-GPU decode may return with kernels still in flight,
+so device execution, especially on different devices, may overlap after mutex
+release. Do not infer supported concurrent inference or cache safety from that
+overlap. Separately, same-device concurrent inference remains unsupported
+because context-keyed KV/RUNTIME arena ownership is absent (canonical contract
+§5).
 
 Getting this backwards cost real time. `9a0670712` ("sycl: checkpoint unified
 memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
@@ -879,9 +882,11 @@ the previous model before loading one with different model parameters
 teardown and the next load; it does not test simultaneously loaded models or
 contexts. Multiple model/context objects may remain alive, and their live weight
 ownership must be preserved as described under **SYCL Memory Ownership** above.
-Current SYCL graph execution is process-wide serialized, including across
-devices; separately, same-device concurrent inference remains unsupported
-(canonical contract §5).
+Process-global `graph_compute` entry-point submission is serialized, but
+pure-GPU decode may return with kernels in flight and device execution may then
+overlap, especially across devices. That overlap does not establish supported
+concurrent inference or cache safety; same-device concurrent inference remains
+separately unsupported (canonical contract §5).
 
 ### GPT-OSS Prompt Template Rule
 
