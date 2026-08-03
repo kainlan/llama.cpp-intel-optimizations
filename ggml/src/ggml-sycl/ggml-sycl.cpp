@@ -72,13 +72,13 @@
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
 #endif
+#include "e2e-profile.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
-#include "model-lifecycle.hpp"
 #include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
@@ -88,17 +88,14 @@
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
 #include "ggml-sycl/element_wise.hpp"
-#include "e2e-profile.hpp"
-#include "sycl-kernel-profiler.hpp"
-#include "sycl-timeline.hpp"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
-#include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/mmq.hpp"
+#include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -110,6 +107,9 @@
 #include "ggml-sycl/set_rows_paged.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "model-lifecycle.hpp"
+#include "sycl-kernel-profiler.hpp"
+#include "sycl-timeline.hpp"
 
 #include <sycl/half_type.hpp>
 
@@ -536,22 +536,25 @@ static void ggml_sycl_sequence_graphlet_summary_report(const char * phase, bool 
     if (!force && !ggml_sycl_graph_diag_enabled()) {
         return;
     }
-    const uint64_t records            = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_record);
-    const uint64_t replays            = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_replay);
-    const uint64_t direct_replays     = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_replay_calls);
-    const uint64_t segmented_replays  = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_segmented_replay_calls);
-    const uint64_t failures           = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures);
-    const uint64_t submit_calls       = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_calls);
-    const uint64_t submit_ns        = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_ns);
-    const uint64_t drain_ns         = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_ns);
-    const uint64_t refresh_ns       = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_ns);
-    const uint64_t match_ns         = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_ns);
-    const uint64_t direct_gap_ns    = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ns);
-    const uint64_t deferred_replays = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_deferred_replays);
-    const uint64_t direct_gap_ops   = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ops);
-    const uint64_t refresh_calls    = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_calls);
-    const uint64_t match_hits       = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_hits);
-    const uint64_t match_misses     = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_misses);
+    const uint64_t records = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_record);
+    const uint64_t replays = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_replay);
+    const uint64_t direct_replays =
+        ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_replay_calls);
+    const uint64_t segmented_replays =
+        ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_segmented_replay_calls);
+    const uint64_t failures      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures);
+    const uint64_t submit_calls  = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_calls);
+    const uint64_t submit_ns     = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_ns);
+    const uint64_t drain_ns      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_ns);
+    const uint64_t refresh_ns    = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_ns);
+    const uint64_t match_ns      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_ns);
+    const uint64_t direct_gap_ns = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ns);
+    const uint64_t deferred_replays =
+        ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_deferred_replays);
+    const uint64_t direct_gap_ops = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ops);
+    const uint64_t refresh_calls  = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_calls);
+    const uint64_t match_hits     = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_hits);
+    const uint64_t match_misses   = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_misses);
     if (records == 0 && replays == 0 && failures == 0 && submit_ns == 0 && drain_ns == 0 && refresh_ns == 0 &&
         match_ns == 0 && direct_gap_ns == 0) {
         return;
@@ -570,14 +573,14 @@ static void ggml_sycl_sequence_graphlet_summary_report(const char * phase, bool 
             "sequence_graphlet_deferred_replay=%llu "
             "pending=%d\n",
             phase ? phase : "?", (unsigned long long) records, (unsigned long long) replays,
-            (unsigned long long) failures, submit_ns / 1000000.0, drain_ns / 1000000.0,
-            refresh_ns / 1000000.0, match_ns / 1000000.0, direct_gap_ns / 1000000.0,
-            (unsigned long long) records, (unsigned long long) replays, (unsigned long long) direct_replays,
-            (unsigned long long) segmented_replays, (unsigned long long) failures, (unsigned long long) submit_calls,
-            (unsigned long long) submit_ns, (unsigned long long) drain_ns, (unsigned long long) refresh_ns,
-            (unsigned long long) match_ns, (unsigned long long) direct_gap_ns, (unsigned long long) refresh_calls,
-            (unsigned long long) match_hits, (unsigned long long) match_misses, (unsigned long long) direct_gap_ops,
-            (unsigned long long) deferred_replays, g_moe_sequence_graphlet_pending_replays);
+            (unsigned long long) failures, submit_ns / 1000000.0, drain_ns / 1000000.0, refresh_ns / 1000000.0,
+            match_ns / 1000000.0, direct_gap_ns / 1000000.0, (unsigned long long) records, (unsigned long long) replays,
+            (unsigned long long) direct_replays, (unsigned long long) segmented_replays, (unsigned long long) failures,
+            (unsigned long long) submit_calls, (unsigned long long) submit_ns, (unsigned long long) drain_ns,
+            (unsigned long long) refresh_ns, (unsigned long long) match_ns, (unsigned long long) direct_gap_ns,
+            (unsigned long long) refresh_calls, (unsigned long long) match_hits, (unsigned long long) match_misses,
+            (unsigned long long) direct_gap_ops, (unsigned long long) deferred_replays,
+            g_moe_sequence_graphlet_pending_replays);
 }
 
 static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, const ggml_backend_sycl_context * ctx) {
@@ -588,23 +591,25 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
     const uint64_t direct_drain_ns   = ggml_sycl_graph_diag_load(g_graph_diag_counters.direct_graphlet_drain_ns);
     const uint64_t direct_replays    = ggml_sycl_graph_diag_load(g_graph_diag_counters.direct_graphlet_replay);
     const uint64_t direct_drain_wait = ggml_sycl_graph_diag_load(g_graph_diag_counters.direct_graphlet_drain_waits);
-    const uint64_t block_submit_ns    = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_submit_ns);
-    const uint64_t block_drain_ns     = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_drain_ns);
-    const uint64_t block_replays      = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_replay);
-    const uint64_t block_attempts     = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_attempts);
-    const uint64_t block_drain_wait   = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_drain_waits);
-    const uint64_t sequence_submit_calls  = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_calls);
-    const uint64_t sequence_submit_ns     = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_ns);
-    const uint64_t sequence_drain_ns      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_ns);
-    const uint64_t sequence_replays       = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_replay);
+    const uint64_t block_submit_ns   = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_submit_ns);
+    const uint64_t block_drain_ns    = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_drain_ns);
+    const uint64_t block_replays     = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_replay);
+    const uint64_t block_attempts    = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_attempts);
+    const uint64_t block_drain_wait  = ggml_sycl_graph_diag_load(g_graph_diag_counters.block_graphlet_drain_waits);
+    const uint64_t sequence_submit_calls =
+        ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_calls);
+    const uint64_t sequence_submit_ns = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_submit_ns);
+    const uint64_t sequence_drain_ns  = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_ns);
+    const uint64_t sequence_replays   = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_replay);
     const uint64_t sequence_direct_replays =
         ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_replay_calls);
     const uint64_t sequence_segmented_replays =
         ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_segmented_replay_calls);
-    const uint64_t sequence_waits         = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_waits);
-    const uint64_t sequence_refresh_ns    = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_ns);
-    const uint64_t sequence_match_ns      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_ns);
-    const uint64_t sequence_direct_gap_ns = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ns);
+    const uint64_t sequence_waits      = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_drain_waits);
+    const uint64_t sequence_refresh_ns = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_refresh_ns);
+    const uint64_t sequence_match_ns   = ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_match_ns);
+    const uint64_t sequence_direct_gap_ns =
+        ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_direct_gap_ns);
     fprintf(stderr,
             "[GRAPH-DIAG] phase=%s use_graph=%d has_exec=%d moe_rerecord=%d seg_valid=%d "
             "calls=%llu pp=%llu tg=%llu disabled=%llu "
@@ -654,17 +659,13 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
             (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_record),
             (unsigned long long) sequence_replays, (unsigned long long) sequence_submit_calls,
             (unsigned long long) sequence_direct_replays, (unsigned long long) sequence_segmented_replays,
-            sequence_submit_ns / 1000000.0, sequence_drain_ns / 1000000.0,
-            (unsigned long long) sequence_waits, g_moe_sequence_graphlet_pending_replays,
-            sequence_refresh_ns / 1000000.0, sequence_match_ns / 1000000.0, sequence_direct_gap_ns / 1000000.0,
+            sequence_submit_ns / 1000000.0, sequence_drain_ns / 1000000.0, (unsigned long long) sequence_waits,
+            g_moe_sequence_graphlet_pending_replays, sequence_refresh_ns / 1000000.0, sequence_match_ns / 1000000.0,
+            sequence_direct_gap_ns / 1000000.0,
             (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures));
     if (ggml_sycl::e2e_tg_profile_enabled()) {
-        ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::GRAPH,
-                                         use_graph ? "use_graph_1" : "use_graph_0",
-                                         0.0,
-                                         0.0,
-                                         0,
-                                         1);
+        ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::GRAPH, use_graph ? "use_graph_1" : "use_graph_0", 0.0,
+                                         0.0, 0, 1);
     }
     ggml_sycl_sequence_graphlet_summary_report(phase, false);
 }
@@ -684,8 +685,8 @@ static void ggml_sycl_moe_aggregation_diag(ggml_backend_sycl_context * sycl_ctx,
     if (log_count.fetch_add(1, std::memory_order_relaxed) >= 4096) {
         return;
     }
-    fprintf(stderr, "[SYCL-MOE-AGGREGATION] path=%s result=%s aggregation_reject=%s\n",
-            path ? path : "unknown", result ? result : "unknown", reason ? reason : "none");
+    fprintf(stderr, "[SYCL-MOE-AGGREGATION] path=%s result=%s aggregation_reject=%s\n", path ? path : "unknown",
+            result ? result : "unknown", reason ? reason : "none");
 }
 
 #endif
@@ -767,6 +768,9 @@ static void ggml_sycl_record_weight_load_summary(int    device,
     state.have_actual_weights         = true;
 }
 
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_owner(
+    const ggml_sycl::unified_cache * cache);
+
 static void ggml_sycl_log_load_summary(int          device,
                                        size_t       kv_device_bytes,
                                        size_t       kv_host_bytes,
@@ -795,9 +799,10 @@ static void ggml_sycl_log_load_summary(int          device,
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!actual_weights && cache && cache->has_placement_plan()) {
-        const auto & plan   = cache->get_placement_plan();
-        weight_device_bytes = plan.weight_vram_bytes;
-        weight_host_bytes   = plan.weight_host_bytes;
+        const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
+        const auto & plan       = *plan_owner;
+        weight_device_bytes     = plan.weight_vram_bytes;
+        weight_host_bytes       = plan.weight_host_bytes;
     }
 
     const char * weight_basis   = actual_weights ? "actual" : "planned";
@@ -1989,16 +1994,59 @@ static std::atomic<bool> g_moe_multi_gpu_active{ false };
 // applied in preload_model_weights).  It is declared before MoE initialization
 // so secondary setup can follow the already-computed smart-handle plan.
 // Lifecycle publication authority. C++17 atomic shared_ptr free functions are
-// used because std::atomic<std::shared_ptr<T>> is C++20-only. The legacy
-// mutable candidate below exists only while a load transaction prepares a plan.
+// used because std::atomic<std::shared_ptr<T>> is C++20-only. There is no
+// mutable process-global plan: builders publish a fresh immutable snapshot.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_publication;
-static ggml_sycl::placement_plan g_placement_plan;
-static bool                      g_has_placement_plan = false;
-static std::atomic<bool>         g_current_model_planner_host_placement{ false };
+static std::atomic<uint64_t>                                     g_provisional_plan_version{ UINT64_C(1) << 63 };
+static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {
     return std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
 }
+
+static bool ggml_sycl_has_global_plan() {
+    const auto snapshot = ggml_sycl_global_plan_snapshot();
+    return snapshot && snapshot->plan;
+}
+
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_global_plan_owner() {
+    static const auto empty    = std::make_shared<const ggml_sycl::placement_plan>();
+    const auto        snapshot = ggml_sycl_global_plan_snapshot();
+    return snapshot && snapshot->plan ? snapshot->plan : empty;
+}
+
+// Mixed publications fail closed. Lifecycle publications have all three
+// identity fields; provisional load-time publications are validated by exact
+// snapshot identity. A cache-only test plan remains readable when no global
+// authority exists.
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_owner(
+    const ggml_sycl::unified_cache * cache) {
+    static const auto empty = std::make_shared<const ggml_sycl::placement_plan>();
+    if (!cache) {
+        return empty;
+    }
+    const auto cached = cache->get_placement_plan_snapshot();
+    if (!cached || !cached->plan) {
+        return empty;
+    }
+    const auto global = ggml_sycl_global_plan_snapshot();
+    if (!global) {
+        return cached->plan;
+    }
+    return ggml_sycl::lifecycle_plan_snapshot_matches(global, cached) ? cached->plan : empty;
+}
+
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_make_provisional_plan_snapshot(
+    ggml_sycl::placement_plan plan) {
+    auto       snapshot   = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>();
+    const auto token      = ggml_sycl::lifecycle::global_registry().current_active_token();
+    snapshot->model_id    = token.model.value;
+    snapshot->load_txn_id = token.load.value;
+    snapshot->version     = g_provisional_plan_version.fetch_add(1, std::memory_order_relaxed);
+    snapshot->plan        = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
+    return snapshot;
+}
+
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
 static bool ggml_sycl_placement_plan_uses_other_device(const ggml_sycl::placement_plan & plan, int current_device);
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan);
@@ -3101,7 +3149,8 @@ static void moe_prestage_popular_experts() {
             // says an expert is not on device, skip its staging to avoid
             // exhausting the WEIGHT zone on MoE models.
             if (cache->has_placement_plan()) {
-                const auto & pp                  = cache->get_placement_plan();
+                const auto   pp_owner            = ggml_sycl_cache_plan_owner(cache);
+                const auto & pp                  = *pp_owner;
                 auto         check_expert_tensor = [&](const moe_expert_meta * meta) -> bool {
                     if (!meta || !meta->tensor || !meta->tensor->name) {
                         return true;
@@ -3354,7 +3403,7 @@ static void moe_prestage_popular_experts() {
                             continue;
                         }
                         const auto placement =
-                            sec_cache->get_placement_plan().lookup_expert_placement(tname, meta->expert_idx);
+                            (*ggml_sycl_cache_plan_owner(sec_cache)).lookup_expert_placement(tname, meta->expert_idx);
                         if (!placement.found() || !placement.on_device) {
                             continue;
                         }
@@ -3736,7 +3785,7 @@ static sycl::event ggml_sycl_fill_xmx_tiled(sycl::queue &                    que
                                             size_t                           src_size,
                                             const void *                     ctx_void,
                                             const std::vector<sycl::event> & deps);
-static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_info(const moe_xmx_fused::MXFPXMXLayoutInfo & info);
+static size_t      ggml_sycl_xmx_tiled_bundle4_bytes_for_info(const moe_xmx_fused::MXFPXMXLayoutInfo & info);
 
 static void ggml_sycl_invalidate_moe_full_local_probe(ggml_tensor_extra_gpu * extra, int device);
 static void ggml_sycl_invalidate_moe_layout_caches(ggml_tensor_extra_gpu * extra, int device);
@@ -3775,7 +3824,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     // and exhaust the WEIGHT zone on MoE models that exceed VRAM.
     if (cache->has_placement_plan() && meta->tensor && meta->tensor->name) {
         const std::string tname(meta->tensor->name);
-        if (!cache->get_placement_plan().expert_on_device(tname, expert_idx, device_id)) {
+        if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(tname, expert_idx, device_id)) {
             return nullptr;  // Expert planned for host — caller handles host fallback
         }
     }
@@ -3840,7 +3889,9 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
         return;
     }
 
-    const auto &     plan               = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto &     plan               = *plan_owner;
     constexpr size_t min_kv_zone        = 64ull * 1024ull * 1024ull;
     constexpr size_t scratch_headroom   = 32ull * 1024ull * 1024ull;
     // KV is co-located with attention weights via the plan. If a layer's attention
@@ -4065,10 +4116,10 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
 
     if (sycl::queue * q = ggml_sycl::get_shared_context_queue(target_device)) {
         (void) ggml_sycl::unified_cache_register_for_queue(target_device, *q);
-        if (g_has_placement_plan) {
+        if (ggml_sycl_has_global_plan()) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);
                 cache && !cache->has_placement_plan()) {
-                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
             }
         }
         return true;
@@ -4086,9 +4137,9 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
             continue;
         }
         (void) ggml_sycl::unified_cache_register_for_queue(d, *q_d);
-        if (g_has_placement_plan) {
+        if (ggml_sycl_has_global_plan()) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(d); cache && !cache->has_placement_plan()) {
-                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
             }
         }
         ++n_registered;
@@ -4141,16 +4192,16 @@ static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys(c
     return keys;
 }
 
-static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue &                         queue,
-                                                                  int                                   device,
-                                                                  const ggml_tensor *                   src0,
-                                                                  int                                   expert_id,
-                                                                  const moe_expert_meta &               meta,
-                                                                  const ggml_sycl_xmx_tiled_fill_ctx &  tiled_ctx,
-                                                                  const void *                          staged_ptr,
-                                                                  size_t                                staged_bytes,
-                                                                  sycl::event                           staged_event,
-                                                                  bool                                  stage_from_soa);
+static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue &                        queue,
+                                                                  int                                  device,
+                                                                  const ggml_tensor *                  src0,
+                                                                  int                                  expert_id,
+                                                                  const moe_expert_meta &              meta,
+                                                                  const ggml_sycl_xmx_tiled_fill_ctx & tiled_ctx,
+                                                                  const void *                         staged_ptr,
+                                                                  size_t                               staged_bytes,
+                                                                  sycl::event                          staged_event,
+                                                                  bool                                 stage_from_soa);
 
 static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0,
                                                         ggml_sycl_cache_id  key,
@@ -4238,15 +4289,15 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
             log_fail("xmx-tiled-non-mxfp4", meta);
             return false;
         }
-        const auto cfg  = moe_xmx_fused::MXFPXMXConfig::from_device(device);
-        const auto info = moe_xmx_fused::MXFPXMXLayoutInfo::compute(meta->ne1, meta->ne0, cfg);
+        const auto   cfg         = moe_xmx_fused::MXFPXMXConfig::from_device(device);
+        const auto   info        = moe_xmx_fused::MXFPXMXLayoutInfo::compute(meta->ne1, meta->ne0, cfg);
         const size_t tiled_bytes = layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ?
                                        ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
                                        static_cast<size_t>(info.total_bytes);
         if (tiled_bytes == 0) {
-            log_fail(layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ? "xmx-tiled-bundle4-empty-layout" :
-                                                            "xmx-tiled-empty-layout",
-                     meta);
+            log_fail(
+                layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ? "xmx-tiled-bundle4-empty-layout" : "xmx-tiled-empty-layout",
+                meta);
             return false;
         }
         dst_bytes           = tiled_bytes;
@@ -4410,8 +4461,8 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         return false;
     }
     if (layout == GGML_LAYOUT_XMX_TILED) {
-        ggml_sycl_validate_xmx_tiled_materialization_original(*q, device, src0, expert_id, *meta, tiled_ctx,
-                                                              staged.ptr, dst_bytes, staged.event, stage_from_soa);
+        ggml_sycl_validate_xmx_tiled_materialization_original(*q, device, src0, expert_id, *meta, tiled_ctx, staged.ptr,
+                                                              dst_bytes, staged.event, stage_from_soa);
     }
     auto resolved_storage = storage_handle.resolve(device);
     if (!resolved_storage.ptr || !resolved_storage.on_device || resolved_storage.layout != layout) {
@@ -4563,7 +4614,7 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
     bool                            current_device_planned_alternate = false;
     if (plan_cache && plan_cache->has_placement_plan() && src0->name && src0->name[0] != '\0') {
         const auto placement =
-            plan_cache->get_placement_plan().lookup_expert_placement(std::string(src0->name), expert_id);
+            (*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);
         if (placement.found()) {
             route.plan_found               = true;
             route.planned_device_residency = placement.on_device;
@@ -4914,7 +4965,7 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
     unified_cache * plan_cache = get_unified_cache_for_device(device);
     if (plan_cache && plan_cache->has_placement_plan() && src0->name && src0->name[0] != '\0') {
         const auto placement =
-            plan_cache->get_placement_plan().lookup_expert_placement(std::string(src0->name), expert_id);
+            (*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);
         if (placement.found()) {
             std::array<ggml_layout_mode, 4> candidates{};
             size_t                          n_candidates  = 0;
@@ -5706,15 +5757,15 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
     }
 
     ggml_sycl::alloc_request req{};
-    req.queue                               = &queue;
-    req.device                              = device;
-    req.size                                = bytes;
-    req.intent.role                         = ggml_sycl::alloc_role::EXPERT_STAGING;
-    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
-    req.intent.cohort_id                    = cohort_id;
-    req.intent.constraints.must_host_pinned = true;
-    req.intent.constraints.use_pinned_pool  = true;
-    const bool pointer_table_payload = cohort_id && std::strcmp(cohort_id, "moe_transient_ptr_table") == 0;
+    req.queue                                    = &queue;
+    req.device                                   = device;
+    req.size                                     = bytes;
+    req.intent.role                              = ggml_sycl::alloc_role::EXPERT_STAGING;
+    req.intent.category                          = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                         = cohort_id;
+    req.intent.constraints.must_host_pinned      = true;
+    req.intent.constraints.use_pinned_pool       = true;
+    const bool pointer_table_payload             = cohort_id && std::strcmp(cohort_id, "moe_transient_ptr_table") == 0;
     // Command graphs capture the host source pointer for the replayed H2D copy.
     // Reset-scoped SCRATCH/STAGING zone slices would stay live across the next
     // host_zone_reset(), so graph-recorded payloads must use standalone
@@ -6174,10 +6225,12 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
         // Also reserve on secondary GPUs (for Phase 2 prestage)
         if (g_moe_multi_gpu_active.load(std::memory_order_acquire) ||
-            (g_has_placement_plan && ggml_sycl_placement_plan_needs_moe_secondary_devices(g_placement_plan))) {
+            (ggml_sycl_has_global_plan() &&
+             ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {
             const int total_gpus = ggml_sycl_info().total_gpu_count;
             for (int d = 1; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
-                if (g_has_placement_plan && !ggml_sycl_placement_plan_uses_device(g_placement_plan, d)) {
+                if (ggml_sycl_has_global_plan() &&
+                    !ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {
                     continue;
                 }
                 ggml_sycl::unified_cache * sec_cache = ggml_sycl::get_unified_cache_for_device(d);
@@ -6308,9 +6361,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     if (device == 0) {
         const char * moe_opt_in = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
         const int    total_gpus = ggml_sycl_info().total_gpu_count;
-        const bool   plan_known = g_has_placement_plan;
+        const bool   plan_known = ggml_sycl_has_global_plan();
         const bool   plan_needs_secondary =
-            plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices(g_placement_plan);
+            plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));
         const bool multi_gpu_requested = total_gpus >= 2 && (!moe_opt_in || std::atoi(moe_opt_in) != 0);
         const bool multi_gpu_on        = multi_gpu_requested && plan_known && plan_needs_secondary;
 
@@ -6373,7 +6426,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     {
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
         if (cache && cache->has_placement_plan()) {
-            const auto & plan                 = cache->get_placement_plan();
+            const auto   plan_owner           = ggml_sycl_cache_plan_owner(cache);
+            const auto & plan                 = *plan_owner;
             const bool   plan_needs_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
             if (plan_needs_secondary && !g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
                 g_moe_multi_gpu_active.store(true, std::memory_order_release);
@@ -6441,7 +6495,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         // --- Phase 2: distribute experts to secondary GPUs --------------------
         // Two strategies, selected by unified cache planner availability:
         //
-        // PLANNER-DRIVEN (preferred): When g_placement_plan has multi_device=true
+        // PLANNER-DRIVEN (preferred): When (*ggml_sycl_global_plan_owner()) has multi_device=true
         // and expert_device map is populated, each expert's target device comes
         // from the planner.  The planner considers ALL model weights (dense + KV
         // + MoE) holistically, avoiding the greedy trap where Phase 2 fills a
@@ -6490,13 +6544,14 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
 
             // Check the unified cache for a multi-device placement plan with
             // per-expert device assignments.  The cache stores a copy of the
-            // global g_placement_plan set by compute_and_store_plan_for_inventory().
-            ggml_sycl::unified_cache * plan_cache = ggml_sycl::get_unified_cache_for_device(device);
-            const bool                 use_planner =
-                plan_cache && plan_cache->has_placement_plan() && plan_cache->get_placement_plan().multi_device;
+            // global (*ggml_sycl_global_plan_owner()) set by compute_and_store_plan_for_inventory().
+            ggml_sycl::unified_cache * plan_cache  = ggml_sycl::get_unified_cache_for_device(device);
+            const bool                 use_planner = plan_cache && plan_cache->has_placement_plan() &&
+                                     (*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;
 
             if (use_planner) {
-                const auto & plan_ref = plan_cache->get_placement_plan();
+                const auto   plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);
+                const auto & plan_ref       = *plan_ref_owner;
                 GGML_LOG_INFO("[MOE-PHASE2] Using planner-driven role-specific expert distribution\n");
 
                 // device_id → index into budgets vector
@@ -8384,8 +8439,8 @@ static std::atomic<int> g_sycl_backend_refcount{ 0 };
 // Host-backed weight extras (Strategy B): track for cleanup on backend teardown.
 // The registry key is stable tensor metadata, not the ggml_tensor object address.
 struct sycl_host_weight_extra_entry {
-    ggml_tensor *           tensor = nullptr;  // cleanup/preload metadata only
-    ggml_tensor_extra_gpu * extra  = nullptr;
+    ggml_tensor *                    tensor = nullptr;  // cleanup/preload metadata only
+    ggml_tensor_extra_gpu *          extra  = nullptr;
     // Model slot that registered this row (llama.cpp-0qlw).  The registry holds
     // an extra ref, and through it a weight lease, so model teardown must drop
     // exactly its own rows -- otherwise the leases it left behind read as leaks.
@@ -8434,10 +8489,7 @@ const void * ggml_sycl_lookup_host_weight_ptr_by_name(const char * name) {
     return nullptr;
 }
 
-bool ggml_sycl_lookup_moe_expert_source_by_name(const char *  name,
-                                                int           expert_idx,
-                                                const void ** ptr,
-                                                size_t *      bytes) {
+bool ggml_sycl_lookup_moe_expert_source_by_name(const char * name, int expert_idx, const void ** ptr, size_t * bytes) {
     if (ptr) {
         *ptr = nullptr;
     }
@@ -9028,41 +9080,62 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecycle::error e) {
     using E = ggml_sycl::lifecycle::error;
     switch (e) {
-        case E::OK:              return GGML_SYCL_LIFECYCLE_OK;
-        case E::NESTED:          return GGML_SYCL_LIFECYCLE_NESTED;
-        case E::ABORTED:         return GGML_SYCL_LIFECYCLE_ABORTED;
-        case E::SLOT_EXHAUSTED:  return GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
-        case E::ID_EXHAUSTED:    return GGML_SYCL_LIFECYCLE_ID_EXHAUSTED;
-        case E::LOAD_BUSY:       return GGML_SYCL_LIFECYCLE_LOAD_BUSY;
-        case E::WRONG_TRANSACTION:return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
-        case E::DEPTH_UNDERFLOW: return GGML_SYCL_LIFECYCLE_DEPTH_UNDERFLOW;
-        case E::DEPTH_OVERFLOW:  return GGML_SYCL_LIFECYCLE_DEPTH_OVERFLOW;
-        case E::MISSING_SUCCESS: return GGML_SYCL_LIFECYCLE_MISSING_SUCCESS;
-        case E::POISONED:        return GGML_SYCL_LIFECYCLE_POISONED;
-        case E::NOT_FOUND:       return GGML_SYCL_LIFECYCLE_NOT_FOUND;
-        case E::STALE_IDENTITY:  return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
-        case E::NULL_OUTPUT:     return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
-        case E::ALLOCATION_FAILED:return GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED;
-        case E::EFFECT_FAILED:   return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        case E::OK:
+            return GGML_SYCL_LIFECYCLE_OK;
+        case E::NESTED:
+            return GGML_SYCL_LIFECYCLE_NESTED;
+        case E::ABORTED:
+            return GGML_SYCL_LIFECYCLE_ABORTED;
+        case E::SLOT_EXHAUSTED:
+            return GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
+        case E::ID_EXHAUSTED:
+            return GGML_SYCL_LIFECYCLE_ID_EXHAUSTED;
+        case E::LOAD_BUSY:
+            return GGML_SYCL_LIFECYCLE_LOAD_BUSY;
+        case E::WRONG_TRANSACTION:
+            return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+        case E::DEPTH_UNDERFLOW:
+            return GGML_SYCL_LIFECYCLE_DEPTH_UNDERFLOW;
+        case E::DEPTH_OVERFLOW:
+            return GGML_SYCL_LIFECYCLE_DEPTH_OVERFLOW;
+        case E::MISSING_SUCCESS:
+            return GGML_SYCL_LIFECYCLE_MISSING_SUCCESS;
+        case E::POISONED:
+            return GGML_SYCL_LIFECYCLE_POISONED;
+        case E::NOT_FOUND:
+            return GGML_SYCL_LIFECYCLE_NOT_FOUND;
+        case E::STALE_IDENTITY:
+            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        case E::NULL_OUTPUT:
+            return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+        case E::ALLOCATION_FAILED:
+            return GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED;
+        case E::EFFECT_FAILED:
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
         case E::BUSY:
             return GGML_SYCL_LIFECYCLE_BUSY;
-        case E::OK_ALREADY_DEAD: return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
+        case E::OK_ALREADY_DEAD:
+            return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
     }
     return GGML_SYCL_LIFECYCLE_ABORTED;
 }
 
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_token token) {
-    return {{token.model_id}, {token.load_txn_id}, {token.slot, token.slot_generation}};
+    return {
+        { token.model_id },
+        { token.load_txn_id },
+        { token.slot, token.slot_generation }
+    };
 }
 
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
-    const uint32_t slot = owner.owner.slot;
-    const size_t rows = ggml_sycl_release_host_weight_extras_for_owner(owner);
+    const uint32_t slot      = owner.owner.slot;
+    const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
     // Graph replay teardown is deliberately not swept across all devices here;
     // slot-scoped graph ownership belongs to downstream 1q72/o6jx.
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
-    const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
+    const size_t   reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
     GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
                   reclaimed);
 }
@@ -9099,7 +9172,7 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
-    const auto owner = ggml_sycl_cpp_token(token);
+    const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
     try {
@@ -9135,7 +9208,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_model_token token) {
     try {
-        const auto owner = ggml_sycl_cpp_token(token);
+        const auto owner    = ggml_sycl_cpp_token(token);
         auto &     registry = ggml_sycl::lifecycle::global_registry();
         if (!registry.is_quarantined(owner)) {
             const auto deferred = registry.defer_quarantine(owner);
@@ -9160,7 +9233,7 @@ static void ggml_sycl_quarantine_reap() noexcept {
             g_sycl_quarantine_count = 0;
         }
         for (size_t i = 0; i < count; ++i) {
-            const auto rc = ggml_backend_sycl_model_unloaded_token(pending[i]);
+            const auto rc       = ggml_backend_sycl_model_unloaded_token(pending[i]);
             const bool terminal = rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD ||
                                   rc == GGML_SYCL_LIFECYCLE_NOT_FOUND || rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
             if (!terminal) {
@@ -9235,8 +9308,8 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // Eager arena reservation: create the unified cache (and its VRAM arena)
             // BEFORE any KV/compute buffer allocations can steal VRAM.  The cache
             // constructor reserves the arena when vram_arena_enabled().
-            const int total_gpus = ggml_sycl_info().total_gpu_count;
-            const uint32_t live_mask = ggml_sycl::lifecycle::global_registry().live_mask();
+            const int      total_gpus = ggml_sycl_info().total_gpu_count;
+            const uint32_t live_mask  = ggml_sycl::lifecycle::global_registry().live_mask();
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
                 if (cache) {
@@ -9256,7 +9329,9 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
     if (outer) {
         g_sycl_in_model_load.store(false, std::memory_order_release);
         ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
-        if (g_sycl_abort_load_exit) return;
+        if (g_sycl_abort_load_exit) {
+            return;
+        }
 
         // --- Compute Arena: reserve VRAM for compute scratch BEFORE weight preload ---
         // This guarantees FP16 attention scratch has VRAM even after weights fill budget.
@@ -9280,18 +9355,19 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
         }
 
         ggml_sycl_preload_model_weights();
-
     }
 }
 
 static void ggml_sycl_export_token(const ggml_sycl::lifecycle::ModelToken & in, ggml_sycl_model_token * out) {
-    if (out) *out = {in.model.value, in.load.value, in.owner.slot, in.owner.generation};
+    if (out) {
+        *out = { in.model.value, in.load.value, in.owner.slot, in.owner.generation };
+    }
 }
 
 struct ggml_sycl_lifecycle_actual_data {
     uint64_t host_bytes   = 0;
     uint64_t device_bytes = 0;
-    bool have_actual = false;
+    bool     have_actual  = false;
 };
 
 static ggml_sycl_lifecycle_actual_data ggml_sycl_lifecycle_actual_snapshot() {
@@ -9332,13 +9408,13 @@ static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_fr
 
 struct ggml_sycl_plan_restoration_bundle {
     struct cache_replacement {
-        ggml_sycl::unified_cache * cache = nullptr;
+        ggml_sycl::unified_cache * cache        = nullptr;
         bool                       participates = false;
     };
 
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
-    std::vector<cache_replacement> caches;
-    bool                           host_placement = false;
+    std::vector<cache_replacement>                            caches;
+    bool                                                      host_placement = false;
 };
 
 static bool ggml_sycl_prepare_latest_live_plan(ggml_sycl_plan_restoration_bundle & bundle) noexcept {
@@ -9350,7 +9426,7 @@ static bool ggml_sycl_prepare_latest_live_plan(ggml_sycl_plan_restoration_bundle
         bundle.snapshot       = snapshot;
         const bool have_plan  = snapshot && snapshot->plan;
         bundle.host_placement = have_plan && snapshot->planned_host_bytes > 0;
-        const int total_gpus = ggml_sycl_info().total_gpu_count;
+        const int total_gpus  = ggml_sycl_info().total_gpu_count;
         bundle.caches.reserve(std::min(total_gpus, GGML_SYCL_MAX_DEVICES));
         for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
             auto * cache = ggml_sycl::get_unified_cache_for_device(d);
@@ -9374,13 +9450,6 @@ static void ggml_sycl_publish_restored_plan(ggml_sycl_plan_restoration_bundle &&
     // sees the old complete publication or retries after the new authority.
     for (auto & item : bundle.caches) {
         item.cache->set_placement_plan_snapshot(item.participates ? bundle.snapshot : nullptr);
-    }
-    if (bundle.snapshot && bundle.snapshot->plan) {
-        g_placement_plan     = *bundle.snapshot->plan;
-        g_has_placement_plan = true;
-    } else {
-        g_placement_plan     = {};
-        g_has_placement_plan = false;
     }
     g_current_model_planner_host_placement.store(bundle.host_placement, std::memory_order_release);
     std::atomic_store_explicit(&g_placement_publication, std::move(bundle.snapshot), std::memory_order_release);
@@ -9423,7 +9492,9 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
-    if (!txn) return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    if (!txn) {
+        return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    }
     ggml_sycl::lifecycle::Registry *   registry = nullptr;
     ggml_sycl::lifecycle::begin_result result;
     try {
@@ -9446,7 +9517,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         const auto ticket = registry ? registry->prepare_end(result.txn, false) : ggml_sycl::lifecycle::finish_ticket{};
         if (ticket.finisher) {
             bool cleanup_ok = true;
-            try { ggml_sycl_abort_owner_effects(ticket.token); } catch (...) { cleanup_ok = false; }
+            try {
+                ggml_sycl_abort_owner_effects(ticket.token);
+            } catch (...) {
+                cleanup_ok = false;
+            }
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
             if (!failed.committed && registry->is_quarantined(failed.token)) {
                 ggml_sycl_model_token quarantined{};
@@ -9480,8 +9555,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_l
     }
 }
 
-ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
-        ggml_sycl_load_txn txn, bool explicit_success, ggml_sycl_model_token * model) {
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
+                                                            bool                    explicit_success,
+                                                            ggml_sycl_model_token * model) {
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
     ggml_sycl::lifecycle::finish_ticket ticket;
     try {
@@ -9523,23 +9599,24 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
         }
 
         ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot);
-        const auto actual = ggml_sycl_lifecycle_actual_snapshot();
+        const auto                                                actual = ggml_sycl_lifecycle_actual_snapshot();
         std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> plan_snapshot;
         if (!ggml_sycl::lifecycle_publish_placement_plan(ticket.token.model.value, ticket.token.load.value,
                                                          ticket.token.owner.slot, ticket.token.owner.generation,
                                                          actual.host_bytes, actual.device_bytes, actual.have_actual,
-                                                         &plan_snapshot) || !plan_snapshot) {
+                                                         &plan_snapshot) ||
+            !plan_snapshot) {
             throw std::bad_alloc();
         }
         ggml_sycl_plan_restoration_bundle publication_bundle;
         publication_bundle.snapshot       = plan_snapshot;
         publication_bundle.host_placement = plan_snapshot->plan && plan_snapshot->planned_host_bytes > 0;
-        const int publication_devices = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        const int publication_devices     = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
         for (int d = 0; d < publication_devices; ++d) {
             auto * cache = ggml_sycl::get_unified_cache_for_device(d);
             if (cache) {
-                publication_bundle.caches.push_back({ cache, plan_snapshot->plan &&
-                    ggml_sycl_placement_plan_uses_device(*plan_snapshot->plan, d) });
+                publication_bundle.caches.push_back(
+                    { cache, plan_snapshot->plan && ggml_sycl_placement_plan_uses_device(*plan_snapshot->plan, d) });
             }
         }
         ggml_sycl_publish_restored_plan(std::move(publication_bundle));
@@ -9565,7 +9642,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
     } catch (...) {
         g_sycl_abort_load_exit = false;
         if (ticket.finisher) {
-            try { ggml_sycl_abort_owner_effects(ticket.token); } catch (...) { }
+            try {
+                ggml_sycl_abort_owner_effects(ticket.token);
+            } catch (...) {
+            }
             const auto failed = registry->finalize_end(ticket, false);
             if (model && failed.token.model.value != 0) {
                 ggml_sycl_export_token(failed.token, model);
@@ -9577,21 +9657,28 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
 
 void ggml_backend_sycl_set_model_loading(bool loading) {
     // Legacy callers receive abort-default semantics and no last-success token.
-    GGML_LOG_WARN("[SYCL] deprecated bool model-load boundary called (%s); transaction is abort-default; migrate to explicit begin/end\n",
-                  loading ? "begin" : "end");
+    GGML_LOG_WARN(
+        "[SYCL] deprecated bool model-load boundary called (%s); transaction is abort-default; migrate to explicit "
+        "begin/end\n",
+        loading ? "begin" : "end");
     static thread_local ggml_sycl_load_txn legacy{};
-    static thread_local uint64_t depth = 0;
+    static thread_local uint64_t           depth = 0;
     if (loading) {
-        const auto rc = depth == 0 ? ggml_backend_sycl_model_load_begin(&legacy)
-                                   : ggml_backend_sycl_model_load_enter_nested(legacy);
-        if (rc == GGML_SYCL_LIFECYCLE_OK) ++depth;
-        else GGML_LOG_ERROR("[SYCL] deprecated model-load begin failed: result=%d\n", (int) rc);
+        const auto rc = depth == 0 ? ggml_backend_sycl_model_load_begin(&legacy) :
+                                     ggml_backend_sycl_model_load_enter_nested(legacy);
+        if (rc == GGML_SYCL_LIFECYCLE_OK) {
+            ++depth;
+        } else {
+            GGML_LOG_ERROR("[SYCL] deprecated model-load begin failed: result=%d\n", (int) rc);
+        }
     } else if (depth != 0) {
         const auto rc = ggml_backend_sycl_model_load_end(legacy, false, nullptr);
         if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED) {
             GGML_LOG_ERROR("[SYCL] deprecated model-load abort failed: result=%d\n", (int) rc);
         }
-        if (--depth == 0) legacy = {};
+        if (--depth == 0) {
+            legacy = {};
+        }
     }
 }
 
@@ -9818,7 +9905,7 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
             GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
         }
-        const auto owner = ggml_sycl::lifecycle::global_registry().current_active_token();
+        const auto                   owner = ggml_sycl::lifecycle::global_registry().current_active_token();
         sycl_host_weight_extra_entry new_entry{ tensor, extra, owner };
         auto                         insert = g_sycl_host_weight_extras.emplace(key, new_entry);
         if (!insert.second) {
@@ -10219,8 +10306,7 @@ static void ggml_sycl_reset_model_load_scratch_state() {
         g_placement_envelope                                   = ggml_sycl_placement_envelope{};
         g_placement_envelope_set                               = false;
         g_moe_expert_vram_reserve.fill(0);
-        g_placement_plan     = ggml_sycl::placement_plan{};
-        g_has_placement_plan = false;
+        std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
         g_current_model_planner_host_placement.store(false, std::memory_order_release);
     }
     {
@@ -10236,7 +10322,7 @@ static void ggml_sycl_reset_model_load_scratch_state() {
 }
 
 bool ggml_backend_sycl_has_active_placement_plan(void) {
-    return g_has_placement_plan;
+    return ggml_sycl_has_global_plan();
 }
 
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id) {
@@ -10346,7 +10432,7 @@ void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched) {
     // No-op placeholder: the unified cache planner manages placement
     // independently via compute_placement_plan().  The scheduler hook
     // exists so llama-context.cpp can trigger plan computation, but
-    // the actual plan is stored in g_placement_plan (SYCL backend local).
+    // the actual plan is stored in (*global_plan) (SYCL backend local).
     // A future implementation may pass the scheduler's layer split
     // information here for multi-backend coordination.
 }
@@ -10527,9 +10613,8 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
     // this budget feeds into happens. This call is safe here (unlike in that
     // deadlock-sensitive path): placement-plan computation only runs during
     // model load, well after ggml_sycl_info()'s static init has completed.
-    const bool   host_unified =
-        (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
-        ggml_sycl_info().devices[ctx->device].host_unified_memory;
+    const bool   host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
+                              ggml_sycl_info().devices[ctx->device].host_unified_memory;
     const size_t base_mem      = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
     const size_t base_headroom = 0;
 
@@ -10559,11 +10644,12 @@ int test_physical_device_count() {
 }
 
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer) {
-    g_placement_plan                 = plan;
-    g_placement_plan.kv_per_layer    = kv_per_layer;
-    g_placement_plan.planner_n_ctx   = 1;
-    g_placement_plan.multi_device    = true;
-    g_has_placement_plan             = true;
+    placement_plan next = plan;
+    next.kv_per_layer   = kv_per_layer;
+    next.planner_n_ctx  = 1;
+    next.multi_device   = true;
+    auto snapshot       = ggml_sycl_make_provisional_plan_snapshot(std::move(next));
+    std::atomic_store_explicit(&g_placement_publication, std::move(snapshot), std::memory_order_release);
     g_model_n_layer                  = n_layers;
     g_placement_kv_info              = {};
     g_placement_kv_info.n_layer      = n_layers;
@@ -10574,10 +10660,9 @@ void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, 
 }
 
 void test_clear_kv_placement_plan() {
-    g_placement_plan     = placement_plan{};
-    g_has_placement_plan = false;
-    g_model_n_layer      = 0;
-    g_placement_kv_info  = {};
+    std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
+    g_model_n_layer     = 0;
+    g_placement_kv_info = {};
 }
 }  // namespace ggml_sycl
 
@@ -10602,8 +10687,10 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
 static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
+    ggml_sycl::placement_plan plan_candidate;
+    bool                      have_plan = false;
     if (!ggml_sycl::vram_arena_enabled()) {
-        g_has_placement_plan = false;
+        std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
         g_current_model_planner_host_placement.store(false, std::memory_order_release);
         return;
     }
@@ -10670,7 +10757,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 info.device_count, info.total_gpu_count);
         }
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        g_placement_plan =
+        plan_candidate =
             ggml_sycl::compute_multi_device_plan(budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer),
                                                  gpu_mode, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -10680,7 +10767,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             size_t alt_entries = 0;
             size_t alt_layouts = 0;
             size_t alt_soa     = 0;
-            for (const ggml_sycl::placement_entry & entry : g_placement_plan.entries) {
+            for (const ggml_sycl::placement_entry & entry : plan_candidate.entries) {
                 if (entry.expert_id < 0) {
                     continue;
                 }
@@ -10707,12 +10794,12 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                     g_placement_kv_info.n_ubatch, g_placement_kv_info.n_expert_used, envelope_arg ? 1 : 0,
                     envelope_arg ? envelope_arg->n_ubatch : 0, static_cast<int>(gpu_mode));
         }
-        g_has_placement_plan = true;
+        have_plan = true;
         GGML_LOG_INFO(
             "[SYCL] Multi-device placement plan computed: %zu entries, "
             "%.1f MB device + %.1f MB host (%d GPUs)\n",
-            g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
-            g_placement_plan.host_bytes / (1024.0 * 1024.0), info.total_gpu_count);
+            plan_candidate.entries.size(), plan_candidate.vram_bytes / (1024.0 * 1024.0),
+            plan_candidate.host_bytes / (1024.0 * 1024.0), info.total_gpu_count);
     } else {
         // P4: Single-device placement.  Use the actual arena reservation as the
         // planner input. compute_placement_plan() owns the arena zone charge
@@ -10734,28 +10821,31 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 zone_overhead / (1024.0 * 1024.0));
         }
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        g_placement_plan     = ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
-                                                                 g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
-        g_has_placement_plan = true;
+        plan_candidate = ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
+                                                           g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+        have_plan      = true;
         GGML_LOG_INFO(
             "[SYCL] Placement plan computed: %zu entries, "
             "%.1f MB device + %.1f MB host\n",
-            g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
-            g_placement_plan.host_bytes / (1024.0 * 1024.0));
+            plan_candidate.entries.size(), plan_candidate.vram_bytes / (1024.0 * 1024.0),
+            plan_candidate.host_bytes / (1024.0 * 1024.0));
     }
+
+    const auto plan_snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan_candidate));
+    std::atomic_store_explicit(&g_placement_publication, plan_snapshot, std::memory_order_release);
+    const auto & plan = *plan_snapshot->plan;
 
     // Stage a full immutable transaction-owned candidate. Process-global and
     // per-cache copies remain legacy execution routing, not model identity.
     const auto active_plan_owner = ggml_sycl::lifecycle::global_registry().current_active_token();
-    if (active_plan_owner.load.value != 0 && g_has_placement_plan) {
-        ggml_sycl::lifecycle_stage_placement_plan(active_plan_owner.load.value,
-                                                  ggml_sycl::placement_plan(g_placement_plan));
+    if (active_plan_owner.load.value != 0 && have_plan) {
+        ggml_sycl::lifecycle_stage_placement_plan(active_plan_owner.load.value, ggml_sycl::placement_plan(plan));
     }
 
     // Publish only after the authoritative plan is complete. Keep this verdict
-    // independent of g_has_placement_plan because S1 preload deliberately clears
+    // independent of have_plan because S1 preload deliberately clears
     // a multi-device global plan after copying it into device caches.
-    const bool planner_host_placement = g_has_placement_plan && g_placement_plan.host_bytes > 0;
+    const bool planner_host_placement = have_plan && plan.host_bytes > 0;
     g_current_model_planner_host_placement.store(planner_host_placement, std::memory_order_release);
 
     // PLACE-4 G1 (llama.cpp-2egrd polish): single-line summary of plan-driven
@@ -10766,10 +10856,10 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // line ("model buffer size = NN MiB") reports SYCL_Host for the whole model
     // because weights load via mmap-backed host buft regardless of where the
     // unified cache stages them.
-    if (g_has_placement_plan) {
+    if (have_plan) {
         size_t device_bytes = 0, host_bytes = 0;
         size_t device_count = 0, host_count = 0;
-        for (const auto & entry : g_placement_plan.entries) {
+        for (const auto & entry : plan.entries) {
             if (entry.on_device) {
                 device_bytes += entry.dst_size;
                 device_count++;
@@ -10786,15 +10876,15 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // before KV init.  This must replace an earlier pre-create_tensor plan: the
     // late inventory pass runs after arena reservation and can materially change
     // weight-zone capacity.  S1 materialization must follow this final plan.
-    if (g_has_placement_plan) {
-        const bool plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(g_placement_plan);
+    if (have_plan) {
+        const bool plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
         for (int d = 0; d < ggml_sycl_info().total_gpu_count; d++) {
-            if (!ggml_sycl_placement_plan_uses_device(g_placement_plan, d)) {
+            if (!ggml_sycl_placement_plan_uses_device(plan, d)) {
                 continue;
             }
             auto * cache = ggml_sycl::get_unified_cache_for_device(d);
             if (cache) {
-                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+                cache->set_placement_plan_snapshot(plan_snapshot);
                 GGML_SYCL_DEBUG("[SYCL] Early plan store for device %d\n", d);
             }
         }
@@ -10808,7 +10898,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
             int n_registered = 0;
             for (int d = 0; d < info.total_gpu_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
-                if (!ggml_sycl_placement_plan_uses_device(g_placement_plan, d)) {
+                if (!ggml_sycl_placement_plan_uses_device(plan, d)) {
                     continue;
                 }
                 sycl::queue * q_d = ggml_sycl::get_shared_context_queue(d);
@@ -10841,7 +10931,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
 // Compute placement plan early — before create_tensor in the llama loader.
 // Populates inventory globals and runs the planner so create_tensor's
-// per-tensor buft selection can consult g_placement_plan.  Skips the
+// per-tensor buft selection can consult (*global_plan).  Skips the
 // late-only side effects (layer-streaming setup, host-pinned pre-allocate,
 // headroom reserve) that depend on state populated by create_tensor.
 void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
@@ -11035,14 +11125,24 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     g_placement_kv_info.n_ctx            = n_ctx;
     g_placement_kv_info.n_ctx_is_runtime = true;
 
-    if (g_has_placement_plan) {
-        g_placement_plan.update_runtime_kv_sizes(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
-                                                 g_placement_kv_info.kv_bytes_per_swa_layer());
-    }
-
-    if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
-        cache->update_placement_plan_runtime_kv(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
-                                                g_placement_kv_info.kv_bytes_per_swa_layer());
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (current && current->plan) {
+        auto next_plan = ggml_sycl::placement_plan(*current->plan);
+        next_plan.update_runtime_kv_sizes(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
+                                          g_placement_kv_info.kv_bytes_per_swa_layer());
+        auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
+        next->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
+        next->version = g_provisional_plan_version.fetch_add(1, std::memory_order_relaxed);
+        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
+        for (int d = 0; d < ggml_sycl_info().total_gpu_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (auto * cache = ggml_sycl::get_unified_cache_for_device(d)) {
+                const auto cached = cache->get_placement_plan_snapshot();
+                if (cached.get() == current.get()) {
+                    cache->set_placement_plan_snapshot(immutable);
+                }
+            }
+        }
+        std::atomic_store_explicit(&g_placement_publication, std::move(immutable), std::memory_order_release);
     }
 
     if (g_placement_kv_info.valid()) {
@@ -11134,13 +11234,11 @@ int ggml_backend_sycl_planned_target_device(const char * tensor_name) {
         return GGML_SYCL_PLANNED_NO_PLAN;
     }
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-    if (!g_has_placement_plan) {
+    const auto                  plan_owner = ggml_sycl_global_plan_owner();
+    if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {
         return GGML_SYCL_PLANNED_NO_PLAN;
     }
-    if (!g_placement_plan.has_dense_entry(tensor_name)) {
-        return GGML_SYCL_PLANNED_NO_PLAN;
-    }
-    return g_placement_plan.get_target_device(tensor_name);
+    return plan_owner->get_target_device(tensor_name);
 }
 
 // ggml_backend_sycl_model_exceeds_vram removed — unified non-blocking cache
@@ -12601,9 +12699,9 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
 
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 static thread_local std::unordered_set<int>                   g_moe_precomputed_down_layer_skip;
-static thread_local bool                                      g_moe_segmented_graph_dispatch_active = false;
+static thread_local bool                                      g_moe_segmented_graph_dispatch_active            = false;
 thread_local bool                                             g_moe_descriptor_dispatch_graph_recording_active = false;
-static thread_local const char *                              g_moe_descriptor_recording_detail_stage = "idle";
+static thread_local const char *                              g_moe_descriptor_recording_detail_stage          = "idle";
 
 struct moe_precomputed_skip_key {
     const ggml_tensor * tensor = nullptr;
@@ -13042,7 +13140,9 @@ static bool ggml_sycl_moe_tensor_has_secondary_device_route(const ggml_tensor * 
         return false;
     }
 
-    const auto &  plan        = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto &  plan        = *plan_owner;
     const int64_t n_experts_i = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
     for (int64_t e = 0; e < n_experts_i; ++e) {
         for (int d = 0; d < info.total_gpu_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
@@ -14529,7 +14629,7 @@ static bool ggml_sycl_moe_fusion_enabled() {
         }
         return false;
     };
-    if (g_has_placement_plan || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+    if (ggml_sycl_has_global_plan() || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
         static std::atomic<bool> warned{ false };
         if (!warned.exchange(true, std::memory_order_acq_rel)) {
             GGML_LOG_INFO("[MOE-FUSION] Disabled under planned or multi-device residency\n");
@@ -17553,11 +17653,12 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
         }
         return cache->moe_tensor_has_host_experts(src0->name ? src0->name : "", n_experts, device);
     }
-    if (g_has_placement_plan) {
+    const auto plan_owner = ggml_sycl_global_plan_owner();
+    if (ggml_sycl_has_global_plan()) {
         if (known) {
             *known = true;
         }
-        return g_placement_plan.has_host_experts(src0->name ? src0->name : "", n_experts, device);
+        return plan_owner->has_host_experts(src0->name ? src0->name : "", n_experts, device);
     }
     return false;
 }
@@ -18492,24 +18593,20 @@ static bool ggml_sycl_moe_gateup_bundle4_enabled() {
     return enabled;
 }
 
-static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_dims(ggml_type type,
-                                                         int64_t   ncols,
-                                                         int64_t   nrows,
-                                                         int       device) {
+static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_dims(ggml_type type, int64_t ncols, int64_t nrows, int device) {
 #if SYCL_XMX_MOE_AVAILABLE
-    if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || device < 0 ||
-        device >= ggml_sycl_info().device_count) {
+    if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || device < 0 || device >= ggml_sycl_info().device_count) {
         return 0;
     }
-    const auto & caps = ggml_sycl_info().devices[device].xmx_caps;
-    const int    tiles_n = caps.optimal_tiles_n > 0 ? caps.optimal_tiles_n : 0;
+    const auto & caps         = ggml_sycl_info().devices[device].xmx_caps;
+    const int    tiles_n      = caps.optimal_tiles_n > 0 ? caps.optimal_tiles_n : 0;
     const size_t tile_n_total = caps.N * static_cast<size_t>(tiles_n);
     if (!caps.supported || !caps.supports_int8 || caps.K != GGML_SYCL_MXFP4_MOE_XMX_K ||
         tile_n_total != GGML_SYCL_MXFP4_MOE_XMX_N || (ncols % static_cast<int64_t>(caps.K)) != 0) {
         return 0;
     }
-    constexpr size_t bundle_groups = 4;
-    constexpr size_t bundle_bytes  = 1088;
+    constexpr size_t bundle_groups   = 4;
+    constexpr size_t bundle_bytes    = 1088;
     const size_t     n_tile_groups_k = static_cast<size_t>(ncols / static_cast<int64_t>(caps.K));
     const size_t     n_tile_groups_n = (static_cast<size_t>(nrows) + tile_n_total - 1) / tile_n_total;
     const size_t     n_bundles_n     = (n_tile_groups_n + bundle_groups - 1) / bundle_groups;
@@ -18660,8 +18757,9 @@ static bool ggml_sycl_onednn_pp_safe_for_current_placement() {
     if (!single_routable_device && g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
         return false;
     }
-    if (g_has_placement_plan && g_placement_plan.multi_device &&
-        ggml_sycl_placement_plan_needs_secondary_devices(g_placement_plan) && !single_routable_device) {
+    const auto plan_owner = ggml_sycl_global_plan_owner();
+    if (ggml_sycl_has_global_plan() && plan_owner->multi_device &&
+        ggml_sycl_placement_plan_needs_secondary_devices(*plan_owner) && !single_routable_device) {
         return false;
     }
     return true;
@@ -19859,7 +19957,8 @@ static bool ggml_sycl_moe_decode_down_i8_selected_candidate(const ggml_tensor * 
     if (n_experts <= 0) {
         return false;
     }
-    const auto &      plan        = cache->get_placement_plan();
+    const auto        plan_owner  = ggml_sycl_cache_plan_owner(cache);
+    const auto &      plan        = *plan_owner;
     const std::string tensor_name = src0->name;
     for (int64_t e = 0; e < n_experts; ++e) {
         const auto placement = plan.lookup_expert_placement(tensor_name, static_cast<int>(e));
@@ -20104,9 +20203,9 @@ static bool ggml_sycl_moe_decode_xmx_tiled_supported(const ggml_tensor * src0, i
 }
 
 static bool ggml_sycl_moe_aggressive_partial_tg_xmx_supported(const ggml_tensor * src0,
-                                                             int                 device,
-                                                             size_t              selected_rows,
-                                                             int64_t             n_tokens) {
+                                                              int                 device,
+                                                              size_t              selected_rows,
+                                                              int64_t             n_tokens) {
     if (!moe_aggressive_partial_tg_env_enabled() || n_tokens > 1 || selected_rows == 0 ||
         selected_rows >= GGML_SYCL_MXFP4_MOE_XMX_N) {
         return false;
@@ -20282,8 +20381,9 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
     bool   plan_has_secondary_device = false;
     size_t plan_local_device_count   = 0;
     if (src0 && src0->name && src0->name[0] != '\0') {
-        const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        const auto &  plan      = cache->get_placement_plan();
+        const int64_t n_experts  = src0->ne[2] > 0 ? src0->ne[2] : 1;
+        const auto    plan_owner = ggml_sycl_cache_plan_owner(cache);
+        const auto &  plan       = *plan_owner;
         for (int64_t e = 0; e < n_experts; ++e) {
             const auto placement = plan.lookup_expert_placement(std::string(src0->name), static_cast<int>(e));
             if (placement.found() && placement.on_device && placement.target_device != device) {
@@ -20474,8 +20574,7 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
             }
             continue;
         }
-        if (n_tokens > 1 && src0 && src0->type == GGML_TYPE_MXFP4 &&
-            candidate == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        if (n_tokens > 1 && src0 && src0->type == GGML_TYPE_MXFP4 && candidate == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                 static std::atomic<int> logged_prompt_bundle4_skip{ 0 };
                 const int               n = logged_prompt_bundle4_skip.fetch_add(1, std::memory_order_relaxed);
@@ -20906,8 +21005,8 @@ test_moe_down_sum_direct_final_result test_moe_down_sum_direct_final_policy(
         return reject_direct_final_for_test("layout");
     }
     const bool env_ok = layout_xmx ? in.env_enabled :
-                        layout_i8 ? (in.dpas_direct_final_env_enabled && in.dpas_direct_final_i8_enabled) :
-                                    (in.dpas_direct_final_env_enabled && in.dpas_direct_final_dpas_enabled);
+                        layout_i8  ? (in.dpas_direct_final_env_enabled && in.dpas_direct_final_i8_enabled) :
+                                     (in.dpas_direct_final_env_enabled && in.dpas_direct_final_dpas_enabled);
     if (!env_ok) {
         return reject_direct_final_for_test("env");
     }
@@ -21113,10 +21212,9 @@ test_moe_same_expert_grouping_result test_moe_build_same_expert_grouping(
     if (!in.entries) {
         return test_moe_same_expert_grouping_reject("metadata");
     }
-    if (in.entry_count <= 0 || in.expected_entries <= 0 || in.entry_count != in.expected_entries ||
-        in.n_tokens <= 0 || in.n_experts <= 0 || in.max_lanes <= 0 ||
-        in.entry_count > std::numeric_limits<int32_t>::max() || in.n_tokens > std::numeric_limits<int32_t>::max() ||
-        in.n_experts > std::numeric_limits<int32_t>::max()) {
+    if (in.entry_count <= 0 || in.expected_entries <= 0 || in.entry_count != in.expected_entries || in.n_tokens <= 0 ||
+        in.n_experts <= 0 || in.max_lanes <= 0 || in.entry_count > std::numeric_limits<int32_t>::max() ||
+        in.n_tokens > std::numeric_limits<int32_t>::max() || in.n_experts > std::numeric_limits<int32_t>::max()) {
         return test_moe_same_expert_grouping_reject("shape");
     }
     if (!in.out_groups || !in.out_entry_indices || in.out_group_capacity <= 0 ||
@@ -21140,11 +21238,11 @@ test_moe_same_expert_grouping_result test_moe_build_same_expert_grouping(
     }
 
     std::vector<uint8_t> used(static_cast<size_t>(in.entry_count), 0);
-    int64_t             groups                = 0;
-    int64_t             grouped_entries       = 0;
-    int32_t             max_group_lanes       = 0;
-    bool                has_lane_filled_group = false;
-    uint64_t            signature             = 1469598103934665603ull;
+    int64_t              groups                = 0;
+    int64_t              grouped_entries       = 0;
+    int32_t              max_group_lanes       = 0;
+    bool                 has_lane_filled_group = false;
+    uint64_t             signature             = 1469598103934665603ull;
     for (int64_t i = 0; i < in.entry_count; ++i) {
         if (used[static_cast<size_t>(i)]) {
             continue;
@@ -21152,7 +21250,7 @@ test_moe_same_expert_grouping_result test_moe_build_same_expert_grouping(
         if (groups >= in.out_group_capacity) {
             return test_moe_same_expert_grouping_reject("capacity");
         }
-        const auto & seed   = in.entries[i];
+        const auto &  seed  = in.entries[i];
         const int64_t start = grouped_entries;
         int32_t       count = 0;
         for (int64_t j = i; j < in.entry_count && count < in.max_lanes; ++j) {
@@ -21175,8 +21273,13 @@ test_moe_same_expert_grouping_result test_moe_build_same_expert_grouping(
     if (grouped_entries != in.entry_count) {
         return test_moe_same_expert_grouping_reject("metadata");
     }
-    return { has_lane_filled_group, has_lane_filled_group ? "none" : "lanes", groups, grouped_entries,
-             max_group_lanes, has_lane_filled_group, signature };
+    return { has_lane_filled_group,
+             has_lane_filled_group ? "none" : "lanes",
+             groups,
+             grouped_entries,
+             max_group_lanes,
+             has_lane_filled_group,
+             signature };
 }
 
 static bool test_moe_scratch_plan_mul_fits(size_t a, size_t b, size_t * out) {
@@ -21195,8 +21298,7 @@ test_moe_direct_final_scratch_plan_result test_moe_direct_final_scratch_plan(
         return { false, "shape", 0, false };
     }
     size_t token_ids = 0;
-    if (!test_moe_scratch_plan_mul_fits(static_cast<size_t>(in.n_tokens), static_cast<size_t>(in.n_ids),
-                                        &token_ids)) {
+    if (!test_moe_scratch_plan_mul_fits(static_cast<size_t>(in.n_tokens), static_cast<size_t>(in.n_ids), &token_ids)) {
         return { false, "overflow", 0, false };
     }
     size_t elements = 0;
@@ -21379,8 +21481,7 @@ static test_moe_gateup_prepack_policy_result test_moe_gateup_prepack_policy_reje
     return { false, reason, "fallback" };
 }
 
-test_moe_gateup_prepack_policy_result test_moe_gateup_prepack_policy(
-    const test_moe_gateup_prepack_policy_input & in) {
+test_moe_gateup_prepack_policy_result test_moe_gateup_prepack_policy(const test_moe_gateup_prepack_policy_input & in) {
     g_test_moe_gateup_prepack_candidates.fetch_add(1, std::memory_order_relaxed);
 
     if (!test_moe_gateup_prepack_enabled_from_env(in.prepack_env)) {
@@ -21650,32 +21751,32 @@ static moe_default_fast_path_policy moe_default_fast_path_policy_from_flags(bool
 namespace ggml_sycl {
 test_moe_default_fast_path_policy_result test_moe_default_fast_path_policy(
     const test_moe_default_fast_path_policy_input & in) {
-    const auto out = moe_default_fast_path_policy_from_flags(in.default_fast_path_enabled, in.decode_phase,
-                                                             in.has_limited_graph, in.safe_baseline_enabled,
-                                                             in.sequence_identity_stable, in.aggregation_available,
-                                                             in.fusion_metadata_complete, in.fusion_kernel_proven,
-                                                             in.unsafe_fused_q8_requested, in.context_quarantined);
+    const auto out = moe_default_fast_path_policy_from_flags(
+        in.default_fast_path_enabled, in.decode_phase, in.has_limited_graph, in.safe_baseline_enabled,
+        in.sequence_identity_stable, in.aggregation_available, in.fusion_metadata_complete, in.fusion_kernel_proven,
+        in.unsafe_fused_q8_requested, in.context_quarantined);
     return { out.attempt_sequence, out.attempt_fusion, out.reason, out.selected_path };
 }
 }  // namespace ggml_sycl
 
 static moe_default_fast_path_policy moe_default_fast_path_policy_for_decode(ggml_backend_sycl_context * sycl_ctx,
                                                                             const ggml_tensor *         node,
-                                                                            bool                        identity_stable) {
+                                                                            bool identity_stable) {
     const bool default_fast_path_enabled = moe_default_fast_path_runtime_enabled();
-    const bool has_graph = sycl_ctx && ggml_sycl_get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
-    const bool safe_baseline = moe_default_fast_path_safe_baseline_enabled();
-    const bool unsafe_fused_q8 = moe_sequence_graphlets_env_on("GGML_SYCL_MOE_GLU_Q8_FUSED_XMX");
+    const bool has_graph =
+        sycl_ctx && ggml_sycl_get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
+    const bool safe_baseline       = moe_default_fast_path_safe_baseline_enabled();
+    const bool unsafe_fused_q8     = moe_sequence_graphlets_env_on("GGML_SYCL_MOE_GLU_Q8_FUSED_XMX");
     const bool context_quarantined = sycl_ctx && sycl_ctx->moe_default_fast_path_quarantined;
-    const bool aggregation_available = !sycl_ctx || (!sycl_ctx->moe_sequence_graphs_disabled && !sycl_ctx->moe_block_graphs_disabled);
+    const bool aggregation_available =
+        !sycl_ctx || (!sycl_ctx->moe_sequence_graphs_disabled && !sycl_ctx->moe_block_graphs_disabled);
     // The direct-final MXFP4 kernel remains a rejecting stub until a separate correctness proof lands.
     // Keep fusion out of the default composition until it is independently proven by Task 8 gates.
     const bool fusion_metadata_complete = false;
     const bool fusion_kernel_proven     = false;
-    return moe_default_fast_path_policy_from_flags(default_fast_path_enabled, true, has_graph, safe_baseline,
-                                                  identity_stable && node != nullptr, aggregation_available,
-                                                  fusion_metadata_complete, fusion_kernel_proven, unsafe_fused_q8,
-                                                  context_quarantined);
+    return moe_default_fast_path_policy_from_flags(
+        default_fast_path_enabled, true, has_graph, safe_baseline, identity_stable && node != nullptr,
+        aggregation_available, fusion_metadata_complete, fusion_kernel_proven, unsafe_fused_q8, context_quarantined);
 }
 
 static bool moe_sequence_graphlets_xmx_down_enabled() {
@@ -21709,7 +21810,9 @@ static uint64_t moe_sequence_graphlet_mode_hash() {
         h ^= v;
         h *= 1099511628211ULL;
     };
-    auto mix_env = [&](const char * name) { mix(moe_sequence_graphlets_env_on(name) ? 1 : 0); };
+    auto mix_env = [&](const char * name) {
+        mix(moe_sequence_graphlets_env_on(name) ? 1 : 0);
+    };
     mix_env("GGML_SYCL_MOE_PHASE_MATERIALIZE");
     mix_env("GGML_SYCL_MOE_PHASE_BULK_XMX");
     mix_env("GGML_SYCL_MOE_DOWN_XMX_TILED");
@@ -23048,17 +23151,17 @@ static bool ggml_sycl_xmx_tiled_validate_fill_take() {
     return false;
 }
 
-static bool ggml_sycl_fill_xmx_tiled_host_cpu(void *                               host_dst,
-                                              size_t                               dst_size,
-                                              const void *                         src,
-                                              size_t                               src_size,
-                                              const ggml_sycl_xmx_tiled_fill_ctx & ctx);
+static bool   ggml_sycl_fill_xmx_tiled_host_cpu(void *                               host_dst,
+                                                size_t                               dst_size,
+                                                const void *                         src,
+                                                size_t                               src_size,
+                                                const ggml_sycl_xmx_tiled_fill_ctx & ctx);
 static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_info(const moe_xmx_fused::MXFPXMXLayoutInfo & info);
-static bool   ggml_sycl_reorder_mxfp4_to_xmx_bundle4_layout(const uint8_t *                         src_qs,
-                                                             const uint8_t *                         src_e,
-                                                             uint8_t *                               dst,
-                                                             const moe_xmx_fused::MXFPXMXLayoutInfo & info,
-                                                             size_t                                  dst_size);
+static bool   ggml_sycl_reorder_mxfp4_to_xmx_bundle4_layout(const uint8_t *                          src_qs,
+                                                            const uint8_t *                          src_e,
+                                                            uint8_t *                                dst,
+                                                            const moe_xmx_fused::MXFPXMXLayoutInfo & info,
+                                                            size_t                                   dst_size);
 
 static sycl::event ggml_sycl_fill_xmx_tiled(sycl::queue & queue,
                                             void *        dst,
@@ -23097,8 +23200,8 @@ static sycl::event ggml_sycl_fill_xmx_tiled(sycl::queue & queue,
             if (!deps.empty()) {
                 queue.ext_oneapi_submit_barrier(deps).wait_and_throw();
             }
-            std::vector<uint8_t> src_host;
-            const void *         host_src  = src;
+            std::vector<uint8_t>   src_host;
+            const void *           host_src  = src;
             const sycl::usm::alloc src_alloc = ggml_sycl_get_alloc_type(src);
             if (src_alloc == sycl::usm::alloc::device) {
                 src_host.resize(src_size);
@@ -23118,7 +23221,7 @@ static sycl::event ggml_sycl_fill_xmx_tiled(sycl::queue & queue,
                     const size_t soa_e_bytes     = nblocks;
                     const size_t soa_expert_size = soa_qs_bytes + soa_e_bytes;
                     if (soa_expert_size != 0 && src_size >= soa_expert_size * static_cast<size_t>(ctx->n_experts)) {
-                        ok = true;
+                        ok                       = true;
                         const uint8_t * soa_base = static_cast<const uint8_t *>(host_src);
                         for (int64_t e = 0; e < ctx->n_experts; ++e) {
                             const uint8_t * expert_soa = soa_base + static_cast<size_t>(e) * soa_expert_size;
@@ -23134,7 +23237,8 @@ static sycl::event ggml_sycl_fill_xmx_tiled(sycl::queue & queue,
                     }
                 }
             } else {
-                ok = ggml_sycl_fill_xmx_tiled_host_cpu(bundle_host.data(), bundle_host.size(), host_src, src_size, *ctx);
+                ok =
+                    ggml_sycl_fill_xmx_tiled_host_cpu(bundle_host.data(), bundle_host.size(), host_src, src_size, *ctx);
             }
             if (!ok) {
                 GGML_LOG_ERROR("[SYCL] XMX tiled bundle4 host materialization failed\n");
@@ -23416,8 +23520,7 @@ static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_info(const moe_xmx_fused::MX
     }
     constexpr size_t bundle_groups = 4;
     constexpr size_t bundle_bytes  = 1088;
-    const size_t     n_bundles_n =
-        (static_cast<size_t>(info.n_tile_groups_n) + bundle_groups - 1) / bundle_groups;
+    const size_t     n_bundles_n   = (static_cast<size_t>(info.n_tile_groups_n) + bundle_groups - 1) / bundle_groups;
     return static_cast<size_t>(info.n_tile_groups_k) * n_bundles_n * bundle_bytes;
 #else
     GGML_UNUSED(info);
@@ -23425,11 +23528,11 @@ static size_t ggml_sycl_xmx_tiled_bundle4_bytes_for_info(const moe_xmx_fused::MX
 #endif
 }
 
-static bool ggml_sycl_reorder_mxfp4_to_xmx_bundle4_layout(const uint8_t *                         src_qs,
-                                                          const uint8_t *                         src_e,
-                                                          uint8_t *                               dst,
+static bool ggml_sycl_reorder_mxfp4_to_xmx_bundle4_layout(const uint8_t *                          src_qs,
+                                                          const uint8_t *                          src_e,
+                                                          uint8_t *                                dst,
                                                           const moe_xmx_fused::MXFPXMXLayoutInfo & info,
-                                                          size_t                                  dst_size) {
+                                                          size_t                                   dst_size) {
 #if SYCL_XMX_MOE_AVAILABLE
     if (!src_qs || !src_e || !dst) {
         return false;
@@ -23449,25 +23552,25 @@ static bool ggml_sycl_reorder_mxfp4_to_xmx_bundle4_layout(const uint8_t *       
 
     const size_t payload_group_bytes = static_cast<size_t>(info.tile_n_total) * packed_bytes;
     const size_t payload_slab_bytes  = bundle_groups * payload_group_bytes;
-    const size_t n_bundles_n =
-        (static_cast<size_t>(info.n_tile_groups_n) + bundle_groups - 1) / bundle_groups;
+    const size_t n_bundles_n         = (static_cast<size_t>(info.n_tile_groups_n) + bundle_groups - 1) / bundle_groups;
 
     std::memset(dst, 0, expected_dst_size);
     for (int64_t tg_k = 0; tg_k < info.n_tile_groups_k; ++tg_k) {
         for (int64_t tg_n = 0; tg_n < info.n_tile_groups_n; ++tg_n) {
             const size_t bundle          = static_cast<size_t>(tg_n) / bundle_groups;
             const size_t group_in_bundle = static_cast<size_t>(tg_n) % bundle_groups;
-            uint8_t *    dst_bundle = dst + (static_cast<size_t>(tg_k) * n_bundles_n + bundle) * bundle_bytes;
-            uint8_t *    dst_payload = dst_bundle + group_in_bundle * payload_group_bytes;
-            uint8_t *    dst_scales  = dst_bundle + payload_slab_bytes + group_in_bundle * static_cast<size_t>(info.tile_n_total);
+            uint8_t *    dst_bundle      = dst + (static_cast<size_t>(tg_k) * n_bundles_n + bundle) * bundle_bytes;
+            uint8_t *    dst_payload     = dst_bundle + group_in_bundle * payload_group_bytes;
+            uint8_t *    dst_scales =
+                dst_bundle + payload_slab_bytes + group_in_bundle * static_cast<size_t>(info.tile_n_total);
 
             for (int64_t tn = 0; tn < info.tile_n_total; ++tn) {
                 const int64_t out_row = tg_n * info.tile_n_total + tn;
                 if (out_row >= info.n_rows) {
                     continue;
                 }
-                const int64_t src_block_idx = out_row * n_k_blocks + tg_k;
-                const uint8_t * src_qs_block = src_qs + static_cast<size_t>(src_block_idx) * packed_bytes;
+                const int64_t   src_block_idx = out_row * n_k_blocks + tg_k;
+                const uint8_t * src_qs_block  = src_qs + static_cast<size_t>(src_block_idx) * packed_bytes;
                 std::memcpy(dst_payload + static_cast<size_t>(tn) * packed_bytes, src_qs_block, packed_bytes);
                 dst_scales[static_cast<size_t>(tn)] = src_e[src_block_idx];
             }
@@ -23496,8 +23599,8 @@ static bool ggml_sycl_fill_xmx_tiled_host_cpu(void *                            
     if (ctx.n_experts <= 0 || ctx.info.total_bytes == 0) {
         return false;
     }
-    const size_t expert_bytes = ctx.bundle4 ? ggml_sycl_xmx_tiled_bundle4_bytes_for_info(ctx.info) :
-                                             static_cast<size_t>(ctx.info.total_bytes);
+    const size_t expert_bytes =
+        ctx.bundle4 ? ggml_sycl_xmx_tiled_bundle4_bytes_for_info(ctx.info) : static_cast<size_t>(ctx.info.total_bytes);
     if (expert_bytes == 0) {
         return false;
     }
@@ -23557,7 +23660,7 @@ namespace ggml_sycl {
 
 static bool ggml_sycl_xmx_tiled_materialize_original_validate_take() {
     static std::atomic<int> remaining{ []() {
-        const char * env = std::getenv("GGML_SYCL_XMX_TILED_VALIDATE_MATERIALIZATION_ORIGINAL");
+        const char *        env = std::getenv("GGML_SYCL_XMX_TILED_VALIDATE_MATERIALIZATION_ORIGINAL");
         return env ? std::max(0, std::atoi(env)) : 0;
     }() };
 
@@ -23629,12 +23732,10 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
                                  ::ggml_sycl_layout_mode_name(GGML_LAYOUT_AOS),
                 single_xmx_gateup ? 1 : 0, ref_ok ? 1 : 0, mismatches, first_mismatch, first_expected, first_actual);
     } catch (const std::exception & e) {
-        fprintf(stderr,
-                "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE] tensor=%s expert=%d device=%d failed=%s\n",
+        fprintf(stderr, "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE] tensor=%s expert=%d device=%d failed=%s\n",
                 src0 && src0->name ? src0->name : "?", expert_id, device, e.what());
     } catch (...) {
-        fprintf(stderr,
-                "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE] tensor=%s expert=%d device=%d failed=unknown\n",
+        fprintf(stderr, "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE] tensor=%s expert=%d device=%d failed=unknown\n",
                 src0 && src0->name ? src0->name : "?", expert_id, device);
     }
 #else
@@ -23770,10 +23871,9 @@ static void ggml_sycl_drop_non_target_cache_entries(ggml_sycl::unified_cache * c
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,              GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,   GGML_LAYOUT_MXFP4_DPAS,       GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,         GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS,    GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
 
     };
     for (ggml_layout_mode mode : layouts) {
@@ -23804,10 +23904,9 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
     }
 
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,              GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,   GGML_LAYOUT_MXFP4_DPAS,       GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,         GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS,    GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
     };
 
     for (ggml_layout_mode mode : layouts) {
@@ -23838,10 +23937,9 @@ static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * 
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,              GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,   GGML_LAYOUT_MXFP4_DPAS,       GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,         GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS,    GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
     };
     for (ggml_layout_mode mode : layouts) {
         if (mode == target) {
@@ -23981,8 +24079,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
         if (expert_layout_bytes == 0) {
             return false;
         }
-        xmx_info.tile_n     = info.tile_n_total;
-        xmx_info.tile_k     = info.tiles_k_per_group;
+        xmx_info.tile_n = info.tile_n_total;
+        xmx_info.tile_k = info.tiles_k_per_group;
 
         xmx_info.n_tile_groups = info.n_tile_groups_k * info.n_tile_groups_n;
         tiled_ctx.info         = info;
@@ -24032,7 +24130,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
         }
 
         if (cache->has_placement_plan() && !tname.empty()) {
-            const auto placement = cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(e));
+            const auto placement =
+                (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));
             if (!placement.found()) {
                 continue;
             }
@@ -24091,6 +24190,10 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 }
 
 static void ggml_sycl_preload_model_weights() {
+    const auto   global_plan_snapshot = ggml_sycl_global_plan_snapshot();
+    const auto   global_plan_owner    = global_plan_snapshot ? global_plan_snapshot->plan : nullptr;
+    const auto * global_plan          = global_plan_owner.get();
+
     // Initialize CPU dispatch buffers once at model load time
     // This eliminates per-token resize() calls during inference
     ggml_sycl_cpu_dispatch_buffers_init();
@@ -24155,7 +24258,7 @@ static void ggml_sycl_preload_model_weights() {
             const int          device = extra ? extra->layout.device_id : 0;
             const tensor_usage usage  = ggml_sycl_get_tensor_usage(tensor);
             const bool         is_moe = usage == tensor_usage::MOE_EXPERT_WEIGHT;
-            if (is_moe && g_has_placement_plan && g_placement_plan.multi_device) {
+            if (is_moe && global_plan != nullptr && (*global_plan).multi_device) {
                 const int n_devs = std::min<int>(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
                 for (int d = 0; d < n_devs; ++d) {
                     items.push_back({ tensor, d, true });
@@ -24167,7 +24270,7 @@ static void ggml_sycl_preload_model_weights() {
 
         // P4.5: For multi-device plans, route items to their planned target device.
         // Override the default device_id from tensor extras with the plan's assignment.
-        if (g_has_placement_plan && g_placement_plan.multi_device) {
+        if (global_plan != nullptr && (*global_plan).multi_device) {
             for (auto & item : items) {
                 if (item.is_moe) {
                     continue;
@@ -24175,7 +24278,7 @@ static void ggml_sycl_preload_model_weights() {
                 if (!item.tensor->name[0]) {
                     continue;
                 }
-                int target = g_placement_plan.get_target_device(std::string(item.tensor->name));
+                int target = (*global_plan).get_target_device(std::string(item.tensor->name));
                 if (target >= 0) {
                     item.device = target;
                 }
@@ -24192,7 +24295,7 @@ static void ggml_sycl_preload_model_weights() {
                     if (d == item.device) {
                         continue;
                     }
-                    if (g_placement_plan.dense_alternate_on_device(tname, d)) {
+                    if ((*global_plan).dense_alternate_on_device(tname, d)) {
                         alternate_dense_items.push_back({ item.tensor, d, false });
                     }
                 }
@@ -24214,14 +24317,14 @@ static void ggml_sycl_preload_model_weights() {
         // The plan's entries[] are pre-sorted by priority.  Build a name→rank map
         // and use it to order the per-device index lists so high-priority weights
         // (attention, embedding, output) fill the arena weight zone first.
-        if (g_has_placement_plan && !g_placement_plan.entries.empty()) {
+        if (global_plan != nullptr && !(*global_plan).entries.empty()) {
             std::unordered_map<std::string, size_t> plan_rank;
-            plan_rank.reserve(g_placement_plan.entries.size());
-            for (size_t r = 0; r < g_placement_plan.entries.size(); ++r) {
+            plan_rank.reserve((*global_plan).entries.size());
+            for (size_t r = 0; r < (*global_plan).entries.size(); ++r) {
                 // For per-expert MoE entries, use the first (highest priority)
                 // entry's rank as representative for tensor-level sorting.
-                if (plan_rank.find(g_placement_plan.entries[r].name) == plan_rank.end()) {
-                    plan_rank[g_placement_plan.entries[r].name] = r;
+                if (plan_rank.find((*global_plan).entries[r].name) == plan_rank.end()) {
+                    plan_rank[(*global_plan).entries[r].name] = r;
                 }
             }
             const size_t unranked = plan_rank.size();  // sentinel: after all ranked entries
@@ -24241,7 +24344,7 @@ static void ggml_sycl_preload_model_weights() {
         const auto t_start = std::chrono::steady_clock::now();
 
         const bool use_isolated_preload_queues =
-            g_has_placement_plan && g_placement_plan.multi_device && ggml_sycl_info().total_gpu_count > 1;
+            global_plan != nullptr && (*global_plan).multi_device && ggml_sycl_info().total_gpu_count > 1;
 
         for (auto & [device, indices] : items_by_device) {
             sycl::queue *              stream_ptr = nullptr;
@@ -24281,8 +24384,8 @@ static void ggml_sycl_preload_model_weights() {
             // ownership rule here would keep them and reintroduce the TLSF
             // fragmentation the comment above warns about (llama.cpp-0qlw).
             cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::MID_LOAD_REPLAN);
-            if (g_has_placement_plan) {
-                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+            if (global_plan != nullptr) {
+                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
             }
 
             // Track dense weight cache keys for pinning + data_device update after finalize
@@ -24446,8 +24549,8 @@ static void ggml_sycl_preload_model_weights() {
                         bool        mixed_planned_layout       = false;
                         layout_mode planned_device_layout      = preload_layout;
                         for (int64_t pe = 0; pe < n_experts; ++pe) {
-                            const auto placement =
-                                cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(pe));
+                            const auto placement = (*ggml_sycl_cache_plan_owner(cache))
+                                                       .lookup_expert_placement(tname, static_cast<int>(pe));
                             if (!placement.found() || !placement.on_device || placement.target_device != device) {
                                 continue;
                             }
@@ -24484,8 +24587,8 @@ static void ggml_sycl_preload_model_weights() {
                         if (i8_expert_bytes > 0) {
                             if (have_plan) {
                                 for (int64_t pe = 0; pe < n_experts; ++pe) {
-                                    const auto placement = cache->get_placement_plan().lookup_expert_placement(
-                                        tname, static_cast<int>(pe));
+                                    const auto placement = (*ggml_sycl_cache_plan_owner(cache))
+                                                               .lookup_expert_placement(tname, static_cast<int>(pe));
                                     if (placement.found() && placement.on_device && placement.target_device == device) {
                                         planned_device_experts++;
                                     }
@@ -24557,8 +24660,8 @@ static void ggml_sycl_preload_model_weights() {
                     } else if (preload_layout == GGML_LAYOUT_XMX_TILED ||
                                preload_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
 #if SYCL_XMX_MOE_AVAILABLE
-                        const auto cfg  = moe_xmx_fused::MXFPXMXConfig::from_device(device);
-                        const auto info = moe_xmx_fused::MXFPXMXLayoutInfo::compute(nrows, ncols, cfg);
+                        const auto cfg      = moe_xmx_fused::MXFPXMXConfig::from_device(device);
+                        const auto info     = moe_xmx_fused::MXFPXMXLayoutInfo::compute(nrows, ncols, cfg);
                         expert_layout_bytes = preload_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ?
                                                   ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
                                                   static_cast<size_t>(info.total_bytes);
@@ -24601,11 +24704,11 @@ static void ggml_sycl_preload_model_weights() {
 
                         if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
 #if SYCL_XMX_MOE_AVAILABLE
-                            const auto cfg  = moe_xmx_fused::MXFPXMXConfig::from_device(device);
-                            const auto info = moe_xmx_fused::MXFPXMXLayoutInfo::compute(nrows, ncols, cfg);
+                            const auto   cfg         = moe_xmx_fused::MXFPXMXConfig::from_device(device);
+                            const auto   info        = moe_xmx_fused::MXFPXMXLayoutInfo::compute(nrows, ncols, cfg);
                             const size_t tiled_bytes = layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ?
-                                                            ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
-                                                            static_cast<size_t>(info.total_bytes);
+                                                           ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
+                                                           static_cast<size_t>(info.total_bytes);
                             if (tiled_bytes != 0) {
                                 out_bytes               = tiled_bytes;
                                 out_tiled_ctx.info      = info;
@@ -24753,8 +24856,8 @@ static void ggml_sycl_preload_model_weights() {
                         if (have_plan) {
                             bool have_device_layout = false;
                             for (int64_t e = 0; e < n_experts; ++e) {
-                                const auto placement =
-                                    cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(e));
+                                const auto placement = (*ggml_sycl_cache_plan_owner(cache))
+                                                           .lookup_expert_placement(tname, static_cast<int>(e));
                                 if (!placement.found()) {
                                     return false;
                                 }
@@ -24904,8 +25007,8 @@ static void ggml_sycl_preload_model_weights() {
                         // alternates are staged on their target devices; host-
                         // planned experts are copied into the host arena.
                         if (have_plan) {
-                            const auto placement =
-                                cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(e));
+                            const auto placement = (*ggml_sycl_cache_plan_owner(cache))
+                                                       .lookup_expert_placement(tname, static_cast<int>(e));
                             if (s1_trace) {
                                 fprintf(stderr,
                                         "[S1-TRACE] tensor=%s expert=%lld device=%d have_plan=1 "
@@ -25161,9 +25264,10 @@ static void ggml_sycl_preload_model_weights() {
                     ggml_sycl::placement_alternate_layout dense_alternate_layout{};
                     const std::string dense_name = tensor->name[0] != '\0' ? std::string(tensor->name) : std::string();
                     if (cache->has_placement_plan() && !dense_name.empty()) {
-                        dense_planned_on_this_device   = cache->plan_on_this_device(dense_name, device);
-                        dense_alternate_on_this_device = cache->get_placement_plan().dense_alternate_on_device(
-                            dense_name, device, &dense_alternate_layout);
+                        dense_planned_on_this_device = cache->plan_on_this_device(dense_name, device);
+                        dense_alternate_on_this_device =
+                            (*ggml_sycl_cache_plan_owner(cache))
+                                .dense_alternate_on_device(dense_name, device, &dense_alternate_layout);
                     }
 
                     // P4/P4.5: Skip device upload for host-planned dense weights.
@@ -25469,8 +25573,8 @@ static void ggml_sycl_preload_model_weights() {
                     local_experts.reserve(static_cast<size_t>(n_experts));
                     if (have_plan) {
                         for (int64_t e = 0; e < n_experts; ++e) {
-                            const auto placement =
-                                cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(e));
+                            const auto placement = (*ggml_sycl_cache_plan_owner(cache))
+                                                       .lookup_expert_placement(tname, static_cast<int>(e));
                             if (placement.found() && placement.on_device && placement.target_device == device) {
                                 local_experts.push_back(static_cast<int>(e));
                             }
@@ -25703,10 +25807,6 @@ static void ggml_sycl_preload_model_weights() {
             ggml_sycl::unified_cache_seal_layout_pool(device);
         }
 
-        // P4.5: Clear multi-device plan after all device caches received it.
-        // The current-model host-placement verdict is intentionally separate.
-        ggml_sycl::clear_completed_multi_device_global_plan(g_has_placement_plan, g_placement_plan.multi_device);
-
         const auto t_end   = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
@@ -25871,16 +25971,15 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     const bool strict_aos = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(tensor->type) &&
                             target == GGML_LAYOUT_AOS;
     layout_mode resolved = strict_aos ? GGML_LAYOUT_AOS : ggml_sycl_adjust_layout_for_tensor(tensor, target, device);
-    const bool  host_layout_supported =
-        (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA || resolved == GGML_LAYOUT_COALESCED ||
-         resolved == GGML_LAYOUT_MXFP4_I8 || resolved == GGML_LAYOUT_MXFP4_DPAS ||
-         resolved == GGML_LAYOUT_XMX_GEMM_TILED || resolved == GGML_LAYOUT_XMX_TILED ||
-         resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4);
+    const bool  host_layout_supported = (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA ||
+                                        resolved == GGML_LAYOUT_COALESCED || resolved == GGML_LAYOUT_MXFP4_I8 ||
+                                        resolved == GGML_LAYOUT_MXFP4_DPAS || resolved == GGML_LAYOUT_XMX_GEMM_TILED ||
+                                        resolved == GGML_LAYOUT_XMX_TILED || resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4);
     // Only prefer host placement when VRAM budget is actually exceeded AND GPU
     // streaming is the fallback (no CPU offload). When the model fits in VRAM,
     // let the cache upload everything to device for maximum performance.
     // GGML_SYCL_FORCE_VRAM=1 overrides this to always prefer VRAM (for debugging).
-    bool prefer_host_default = ggml_backend_sycl_weights_evictable() && !src_is_device &&
+    bool        prefer_host_default   = ggml_backend_sycl_weights_evictable() && !src_is_device &&
                                ggml_sycl::unified_cache_is_budget_exceeded(device) && !ggml_sycl_force_vram_enabled() &&
                                !ggml_sycl_cpu_offload_available();
     // For reordered/tiled layouts, prefer device placement to avoid non-USM host pointers
@@ -25932,23 +26031,23 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
 #if SYCL_XMX_MOE_AVAILABLE
         const int64_t in_dim = tensor->ne[0];
 
-        const int64_t out_dim   = tensor->ne[1];
-        const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
-        const auto    cfg       = moe_xmx_fused::MXFPXMXConfig::from_device(device);
-        const auto    info      = moe_xmx_fused::MXFPXMXLayoutInfo::compute(out_dim, in_dim, cfg);
+        const int64_t out_dim      = tensor->ne[1];
+        const int64_t n_experts    = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
+        const auto    cfg          = moe_xmx_fused::MXFPXMXConfig::from_device(device);
+        const auto    info         = moe_xmx_fused::MXFPXMXLayoutInfo::compute(out_dim, in_dim, cfg);
         const size_t  expert_bytes = resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4 ?
                                          ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
                                          static_cast<size_t>(info.total_bytes);
         if (expert_bytes == 0) {
             return nullptr;
         }
-        dst_size                = expert_bytes * static_cast<size_t>(n_experts);
-        xmx_info.tile_n         = info.tile_n_total;
-        xmx_info.tile_k         = info.tiles_k_per_group;
-        xmx_info.n_tile_groups  = info.n_tile_groups_k * info.n_tile_groups_n;
-        tiled_ctx.info          = info;
-        tiled_ctx.n_experts     = n_experts;
-        tiled_ctx.bundle4       = resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4;
+        dst_size               = expert_bytes * static_cast<size_t>(n_experts);
+        xmx_info.tile_n        = info.tile_n_total;
+        xmx_info.tile_k        = info.tiles_k_per_group;
+        xmx_info.n_tile_groups = info.n_tile_groups_k * info.n_tile_groups_n;
+        tiled_ctx.info         = info;
+        tiled_ctx.n_experts    = n_experts;
+        tiled_ctx.bundle4      = resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4;
 #else
         return nullptr;
 
@@ -26281,9 +26380,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     const bool buffer_is_host_pinned = ctx->managed_meta.tier == ggml_sycl::alloc_tier::HOST_PINNED;
     const bool s1_canonical_host_src = is_weight_buffer && ggml_backend_sycl_weights_evictable() &&
                                        (ggml_backend_buffer_is_host(buffer) || buffer_is_host_pinned);
-    if (do_reorder && (adjusted_layout == GGML_LAYOUT_AOS || adjusted_layout == GGML_LAYOUT_XMX_TILED ||
-                       adjusted_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ||
-                       adjusted_layout == GGML_LAYOUT_XMX_GEMM_TILED)) {
+    if (do_reorder &&
+        (adjusted_layout == GGML_LAYOUT_AOS || adjusted_layout == GGML_LAYOUT_XMX_TILED ||
+         adjusted_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 || adjusted_layout == GGML_LAYOUT_XMX_GEMM_TILED)) {
         do_reorder = false;
     }
     if (do_reorder && is_weight_buffer) {
@@ -28574,15 +28673,17 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         n_layers = 32;  // Fallback: assume 32 layers (common for 7B models)
     }
 
-    auto &                            mgr        = ggml_sycl::get_kv_tier_manager(device);
-    const ggml_sycl::placement_plan * kv_plan    = nullptr;
-    ggml_sycl::placement_plan         cache_plan;
-    auto *                            plan_cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (g_has_placement_plan && !g_placement_plan.kv_device.empty()) {
-        kv_plan = &g_placement_plan;
+    auto &                            mgr                  = ggml_sycl::get_kv_tier_manager(device);
+    const ggml_sycl::placement_plan * kv_plan              = nullptr;
+    auto *                            plan_cache           = ggml_sycl::get_unified_cache_for_device(device);
+    const auto                        cache_kv_plan_owner  = ggml_sycl_cache_plan_owner(plan_cache);
+    const auto                        global_kv_plan_owner = ggml_sycl_global_plan_owner();
+    if (global_kv_plan_owner && !global_kv_plan_owner->kv_device.empty()) {
+        kv_plan = global_kv_plan_owner.get();
     } else if (plan_cache && plan_cache->has_placement_plan()) {
-        cache_plan = plan_cache->get_placement_plan();
-        if (!cache_plan.kv_device.empty()) kv_plan = &cache_plan;
+        if (!cache_kv_plan_owner->kv_device.empty()) {
+            kv_plan = cache_kv_plan_owner.get();
+        }
     }
 
     const std::vector<uint8_t> explicit_layer_mask     = ggml_sycl_pop_kv_layer_mask(device);
@@ -40696,7 +40797,7 @@ static int ggml_sycl_planned_layer_device_for_simple_consumer(const ggml_tensor 
         return -1;
     }
 
-    const int planned_device = cache->get_placement_plan().get_layer_device(layer_id);
+    const int planned_device = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);
     if (planned_device < 0 || planned_device >= ggml_sycl_routable_device_count()) {
         return -1;
     }
@@ -40714,20 +40815,22 @@ static bool ggml_sycl_current_plan_needs_secondary_devices(int current_device) {
     if (current_device >= 0 && current_device < GGML_SYCL_MAX_DEVICES) {
         if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(current_device);
             cache && cache->has_placement_plan()) {
-            return ggml_sycl_placement_plan_uses_other_device(cache->get_placement_plan(), current_device);
+            return ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);
         }
     }
-    return g_has_placement_plan && ggml_sycl_placement_plan_uses_other_device(g_placement_plan, current_device);
+    return ggml_sycl_has_global_plan() &&
+           ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);
 }
 
 static bool ggml_sycl_current_plan_is_single_device_for_graph(int current_device) {
     if (current_device >= 0 && current_device < GGML_SYCL_MAX_DEVICES) {
         if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(current_device);
             cache && cache->has_placement_plan()) {
-            return !ggml_sycl_placement_plan_uses_other_device(cache->get_placement_plan(), current_device);
+            return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);
         }
     }
-    return g_has_placement_plan && !ggml_sycl_placement_plan_uses_other_device(g_placement_plan, current_device);
+    return ggml_sycl_has_global_plan() &&
+           !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);
 }
 
 static thread_local int g_sycl_simple_consumer_route_depth = 0;
@@ -43640,7 +43743,8 @@ static size_t ggml_sycl_layout_bytes_for_tensor(const ggml_tensor * tensor, layo
             }
         case GGML_LAYOUT_XMX_TILED_BUNDLE4:
             {
-                const size_t bytes = ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, tensor->ne[1], layout, device);
+                const size_t bytes =
+                    ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, tensor->ne[1], layout, device);
                 const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
                 return bytes != 0 ? bytes * static_cast<size_t>(n_experts) : ggml_nbytes(tensor);
             }
@@ -44287,7 +44391,7 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     if (table_index >= 0) {
         const auto * bufs = ggml_sycl::moe_get_inference_buffers(device);
         if (bufs && bufs->expert_ptr_tables_handle && table_index < bufs->n_tables && bufs->table_bytes >= bytes) {
-            const size_t table_offset = static_cast<size_t>(table_index) * bufs->table_bytes;
+            const size_t          table_offset = static_cast<size_t>(table_index) * bufs->table_bytes;
             ggml_sycl::mem_handle table_handle = bufs->expert_ptr_tables_handle->slice(table_offset, bufs->table_bytes);
             const auto            resolved     = table_handle.resolve(device);
             if (table_handle.valid() && table_handle.has_stable_owner_identity() && resolved.ptr &&
@@ -44579,8 +44683,9 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_selected(const ggml_tenso
         return 0;
     }
 
-    const std::vector<int> selected = ggml_sycl_moe_unique_expert_ids(ids_host, n_experts);
-    const auto &           plan     = cache->get_placement_plan();
+    const std::vector<int> selected   = ggml_sycl_moe_unique_expert_ids(ids_host, n_experts);
+    const auto             plan_owner = ggml_sycl_cache_plan_owner(cache);
+    const auto &           plan       = *plan_owner;
     const std::string      tensor_name(src0->name ? src0->name : "");
     size_t                 considered   = 0;
     size_t                 materialized = 0;
@@ -44755,8 +44860,9 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor(ggml_backend_s
         return a.expert_id < b.expert_id;
     });
 
-    const int         topk = std::min<int>(ggml_sycl_moe_down_i8_hotset_topk(), ranked.size());
-    const auto &      plan = cache->get_placement_plan();
+    const int         topk       = std::min<int>(ggml_sycl_moe_down_i8_hotset_topk(), ranked.size());
+    const auto        plan_owner = ggml_sycl_cache_plan_owner(cache);
+    const auto &      plan       = *plan_owner;
     const std::string tensor_name(src0->name ? src0->name : "");
     size_t            materialized = 0;
     size_t            considered   = 0;
@@ -45678,10 +45784,9 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         (role_for_phase == MOE_TENSOR_GATE || role_for_phase == MOE_TENSOR_UP || role_for_phase == MOE_TENSOR_DOWN);
     const int64_t n_tokens_for_phase = ids ? ids->ne[1] : 1;
     const bool    selected_decode_materializable =
-        n_tokens_for_phase <= 1 &&
-        (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
-         layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_XMX_TILED ||
-         layout == GGML_LAYOUT_XMX_TILED_BUNDLE4);
+        n_tokens_for_phase <= 1 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
+                                    layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS ||
+                                    layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4);
     const bool allow_planned_phase_materialize =
         plan_active && !exact_layout_required && mxfp4_moe_phase_layout &&
         ((n_tokens_for_phase > 1 && layout == GGML_LAYOUT_SOA) || selected_decode_materializable);
@@ -46536,7 +46641,8 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
     bool              have_layout = false;
     layout_mode       planned     = GGML_LAYOUT_AOS;
     for (int64_t e = 0; e < n_experts; ++e) {
-        const auto placement = cache->get_placement_plan().lookup_expert_placement(tensor_name, static_cast<int>(e));
+        const auto placement =
+            (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tensor_name, static_cast<int>(e));
         if (!placement.found() || !placement.on_device || placement.target_device != device) {
             return false;
         }
@@ -46559,7 +46665,7 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
 // phase-layout materialization when the device supports that path.
 static bool ggml_sycl_moe_plan_pp_soa_promoted(int device) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    return cache && cache->has_placement_plan() && cache->get_placement_plan().moe_pp_soa_promoted;
+    return cache && cache->has_placement_plan() && (*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;
 }
 
 // Tensors whose decode XMX_TILED rematerialization failed (e.g. WEIGHT-zone
@@ -46930,10 +47036,11 @@ static bool ggml_sycl_release_moe_tensor_phase_layouts_except_two(const ggml_ten
                                                                   int                 device,
                                                                   layout_mode         keep_layout_a,
                                                                   layout_mode         keep_layout_b) {
-    static constexpr layout_mode k_phase_layouts[] = { GGML_LAYOUT_SOA,       GGML_LAYOUT_COALESCED,
-                                                       GGML_LAYOUT_MXFP4_I8,  GGML_LAYOUT_XMX_TILED,
-                                                       GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_MXFP4_DPAS };
-    bool                         released          = false;
+    static constexpr layout_mode k_phase_layouts[] = {
+        GGML_LAYOUT_SOA,       GGML_LAYOUT_COALESCED,         GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_XMX_TILED_BUNDLE4, GGML_LAYOUT_MXFP4_DPAS
+    };
+    bool released = false;
     for (layout_mode layout : k_phase_layouts) {
         if (layout == keep_layout_a || layout == keep_layout_b) {
             continue;
@@ -47132,15 +47239,15 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
     // up front, then rebuild the whole tensor or roll back to SOA. Source SOA is
     // released per expert only after XMX materialization has consumed it.
     const bool released_target_ptr_table = ggml_sycl_release_moe_tensor_layout(src0, device, target_layout);
-    const bool target_is_tiled = target_layout == GGML_LAYOUT_XMX_TILED ||
-                                 target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
+    const bool target_is_tiled =
+        target_layout == GGML_LAYOUT_XMX_TILED || target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
     const bool released_source_ptr_table =
         target_is_tiled ? ggml_sycl_release_moe_ptr_table_leases_for_layout(src0, extra, device, GGML_LAYOUT_SOA) :
                           false;
     const bool released_conflicts =
-        target_is_tiled ? ggml_sycl_release_moe_tensor_phase_layouts_except_two(src0, device, target_layout,
-                                                                                GGML_LAYOUT_SOA) :
-                          ggml_sycl_release_moe_tensor_phase_layouts_except(src0, device, target_layout);
+        target_is_tiled ?
+            ggml_sycl_release_moe_tensor_phase_layouts_except_two(src0, device, target_layout, GGML_LAYOUT_SOA) :
+            ggml_sycl_release_moe_tensor_phase_layouts_except(src0, device, target_layout);
     if ((released_target_ptr_table || released_source_ptr_table || released_conflicts) &&
         ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> phase_release_log{ 0 };
@@ -47207,8 +47314,9 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
         std::vector<ggml_sycl_cache_id> bulk_keys;
         bulk_keys.reserve(expert_count);
         for (int64_t e = 0; e < n_experts; ++e) {
-            const auto placement = cache->get_placement_plan().lookup_expert_placement(
-                std::string(src0->name ? src0->name : ""), static_cast<int>(e));
+            const auto placement =
+                (*ggml_sycl_cache_plan_owner(cache))
+                    .lookup_expert_placement(std::string(src0->name ? src0->name : ""), static_cast<int>(e));
             if (!placement.found() || !placement.on_device || placement.target_device != device) {
                 rollback_to_soa("bulk-xmx-placement-mismatch");
                 return false;
@@ -47261,7 +47369,7 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
         }
 
         const size_t dst_total_bytes = dst_expert_bytes * expert_count;
-        const bool   bulk_complete = bulk_result.ok && bulk_result.ptr && bulk_handles.size() == expert_count;
+        const bool   bulk_complete   = bulk_result.ok && bulk_result.ptr && bulk_handles.size() == expert_count;
         if (!bulk_complete) {
             const bool chunked_fallback = ggml_sycl_moe_single_xmx_chunked_fallback_allowed(
                 src0->name, target_layout, /*bulk_materialization_ok=*/false);
@@ -47344,8 +47452,9 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
         std::vector<ggml_sycl_cache_id> bulk_keys;
         bulk_keys.reserve(expert_count);
         for (int64_t e = 0; e < n_experts; ++e) {
-            const auto placement = cache->get_placement_plan().lookup_expert_placement(
-                std::string(src0->name ? src0->name : ""), static_cast<int>(e));
+            const auto placement =
+                (*ggml_sycl_cache_plan_owner(cache))
+                    .lookup_expert_placement(std::string(src0->name ? src0->name : ""), static_cast<int>(e));
             if (!placement.found() || !placement.on_device || placement.target_device != device) {
                 rollback_to_soa("bulk-down-i8-placement-mismatch");
                 return false;
@@ -47492,8 +47601,9 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
     }
 
     for (int64_t e = 0; e < n_experts; ++e) {
-        const auto placement = cache->get_placement_plan().lookup_expert_placement(
-            std::string(src0->name ? src0->name : ""), static_cast<int>(e));
+        const auto placement =
+            (*ggml_sycl_cache_plan_owner(cache))
+                .lookup_expert_placement(std::string(src0->name ? src0->name : ""), static_cast<int>(e));
         if (!placement.found() || !placement.on_device || placement.target_device != device) {
             rollback_to_soa("placement-mismatch");
             return false;
@@ -47562,7 +47672,8 @@ static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * 
     std::vector<int> grouped_experts[GGML_SYCL_MAX_DEVICES];
     size_t           planned_count  = 0;
     bool             all_on_current = true;
-    const auto &     plan           = plan_cache->get_placement_plan();
+    const auto       plan_owner     = ggml_sycl_cache_plan_owner(plan_cache);
+    const auto &     plan           = *plan_owner;
     for (int64_t e = 0; e < n_experts; ++e) {
         const auto placement =
             plan.lookup_expert_placement(std::string(src0->name ? src0->name : ""), static_cast<int>(e));
@@ -47598,8 +47709,8 @@ static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * 
             failed_devices++;
             continue;
         }
-        if (!cache->has_placement_plan() && g_has_placement_plan) {
-            cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+        if (!cache->has_placement_plan() && ggml_sycl_has_global_plan()) {
+            cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
         }
         if (!cache->has_placement_plan()) {
             failed_devices++;
@@ -47618,12 +47729,11 @@ static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * 
             const ggml_sycl_cache_id layout_key =
                 ggml_sycl_layout_specific_moe_expert_cache_key(base_key, target_layout);
             sycl::event event;
-            if (!ggml_sycl::ggml_sycl_materialize_planned_expert_layout(src0, layout_key, expert_id, d, target_layout,
-                                                                        &event,
-                                                                        /*remember_storage_handle=*/true,
-                                                                        /*release_conflicting_layouts_ok=*/
-                                                                        target_layout == GGML_LAYOUT_XMX_TILED ||
-                                                                            target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4)) {
+            if (!ggml_sycl::ggml_sycl_materialize_planned_expert_layout(
+                    src0, layout_key, expert_id, d, target_layout, &event,
+                    /*remember_storage_handle=*/true,
+                    /*release_conflicting_layouts_ok=*/
+                    target_layout == GGML_LAYOUT_XMX_TILED || target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4)) {
                 failed_devices++;
                 break;
             }
@@ -61149,17 +61259,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t n_ids_pair = ids->ne[0];
                 const size_t  ids_n_elem = static_cast<size_t>(ids->ne[1] * n_ids_pair);
                 struct moe_pair_runtime_layout_cache_key {
-                    ggml_sycl_cache_id current_id      = {};
-                    ggml_sycl_cache_id partner_id      = {};
-                    int                device          = -1;
-                    int64_t            n_tokens        = 0;
-                    size_t             selected_rows   = 0;
-                    bool               has_override    = false;
-                    layout_mode        override_layout = GGML_LAYOUT_AOS;
-                    bool               has_plan        = false;
+                    ggml_sycl_cache_id current_id                = {};
+                    ggml_sycl_cache_id partner_id                = {};
+                    int                device                    = -1;
+                    int64_t            n_tokens                  = 0;
+                    size_t             selected_rows             = 0;
+                    bool               has_override              = false;
+                    layout_mode        override_layout           = GGML_LAYOUT_AOS;
+                    bool               has_plan                  = false;
                     bool               aggressive_partial_tg_xmx = false;
-                    uint64_t           current_gen     = 0;
-                    uint64_t           partner_gen     = 0;
+                    uint64_t           current_gen               = 0;
+                    uint64_t           partner_gen               = 0;
 
                     bool operator==(const moe_pair_runtime_layout_cache_key & other) const {
                         return ggml_sycl::detail::cache_id_equal(current_id, other.current_id) &&
@@ -61218,12 +61328,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     current_extra_layout && partner_extra_layout && current_cache_id.valid && partner_cache_id.valid;
                 moe_pair_runtime_layout_cache_key layout_cache_key{};
                 if (layout_cacheable) {
-                    layout_cache_key.current_id      = current_cache_id;
-                    layout_cache_key.partner_id      = partner_cache_id;
-                    layout_cache_key.device          = ctx.device;
-                    layout_cache_key.n_tokens        = ne12;
-                    layout_cache_key.selected_rows   = ids_n_elem;
-                    layout_cache_key.has_override    = has_override;
+                    layout_cache_key.current_id                = current_cache_id;
+                    layout_cache_key.partner_id                = partner_cache_id;
+                    layout_cache_key.device                    = ctx.device;
+                    layout_cache_key.n_tokens                  = ne12;
+                    layout_cache_key.selected_rows             = ids_n_elem;
+                    layout_cache_key.has_override              = has_override;
                     layout_cache_key.override_layout           = override_layout;
                     layout_cache_key.has_plan                  = gate_up_has_plan;
                     layout_cache_key.aggressive_partial_tg_xmx = aggressive_partial_tg_xmx_candidate;
@@ -61395,14 +61505,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const char * env = std::getenv("GGML_SYCL_MOE_DEVICE_GROUPING");
                     return env ? std::atoi(env) != 0 : 0;
                 }();
-                const bool grouped_xmx_ids_required = !g_ggml_sycl_graph_recording &&
-                                                      xmx_grouped_pp_enabled != 0 &&
+                const bool grouped_xmx_ids_required = !g_ggml_sycl_graph_recording && xmx_grouped_pp_enabled != 0 &&
                                                       pair_layout == GGML_LAYOUT_XMX_TILED && ne12 > 1;
-                const bool host_ids_required = !g_ggml_sycl_graph_recording &&
-                                               ((grouped_xmx_ids_required && device_grouping_enabled == 0) ||
-                                                ggml_sycl_moe_row_agg_debug_enabled() ||
-                                                ggml_sycl_moe_group_profile_enabled() || path_trace_enabled > 1 ||
-                                                direct_xmx_ids_required != 0);
+                const bool host_ids_required =
+                    !g_ggml_sycl_graph_recording &&
+                    ((grouped_xmx_ids_required && device_grouping_enabled == 0) ||
+                     ggml_sycl_moe_row_agg_debug_enabled() || ggml_sycl_moe_group_profile_enabled() ||
+                     path_trace_enabled > 1 || direct_xmx_ids_required != 0);
                 auto host_profile_plan_detail_last = host_profile_clock::now();
                 host_profile_plan_pred_us += host_profile_elapsed_us(host_profile_last, host_profile_plan_detail_last);
 
@@ -61821,10 +61930,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int current_ptr_table_layer_hash =
                     plan.current.weight ? moe_cache_layer_id(plan.current.weight->name) : layer_hash;
                 const void * const * current_ptrs =
-                    all_local_pair_tables ?
-                        all_local_current_ptrs :
-                        moe_fusion_upload_ptrs_from_handles(ctx, plan.current, current_ptr_table_layer_hash,
-                                                            pair_layout);
+                    all_local_pair_tables ? all_local_current_ptrs :
+                                            moe_fusion_upload_ptrs_from_handles(
+                                                ctx, plan.current, current_ptr_table_layer_hash, pair_layout);
                 trace_pair_stage("upload-current-ptrs-done");
                 trace_pair_stage("upload-partner-ptrs-begin");
                 const void * const * partner_ptrs =
@@ -61924,7 +62032,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         bool          used_direct_down_sum        = false;
                         int           direct_down_sum_final_idx   = -1;
                         ggml_tensor * direct_down_sum_final       = nullptr;
-                        auto xmx_tiled_grouped_pp_reason = [&]() -> const char * {
+                        auto          xmx_tiled_grouped_pp_reason = [&]() -> const char * {
                             if (pair_layout != GGML_LAYOUT_XMX_TILED) {
                                 return "not-xmx-tiled";
                             }
@@ -62185,9 +62293,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             }
                         }
                         const bool full_gpu_cover = gate_up_dispatch_entries == static_cast<int>(ids_n_elem) &&
-                                                    (all_local_pair_tables ||
-                                                     (plan.gate.handles.size() == ids_n_elem &&
-                                                      plan.up.handles.size() == ids_n_elem));
+                                                    (all_local_pair_tables || (plan.gate.handles.size() == ids_n_elem &&
+                                                                               plan.up.handles.size() == ids_n_elem));
                         const bool use_device_grouped_moe_decode =
                             (moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route) &&
                             xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr &&
@@ -62198,11 +62305,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             (full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 && ids_device_nb1 > 0 &&
                              pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 && pair.glu_dst->ne[2] <= 1);
                         const int32_t * pair_ids_host_arg = use_device_ids_for_pair_glu ? nullptr : ids_data;
-                        const int64_t pair_ids_host_count_arg =
+                        const int64_t   pair_ids_host_count_arg =
                             use_device_ids_for_pair_glu ? 0 : static_cast<int64_t>(ids_n_elem);
                         if (path_trace_enabled != 0 && use_device_ids_for_pair_glu) {
-                            fprintf(stderr,
-                                    "[MOE-PAIR] cur=%s reason=pair-glu-device-ids layout=%s entries=%lld\n",
+                            fprintf(stderr, "[MOE-PAIR] cur=%s reason=pair-glu-device-ids layout=%s entries=%lld\n",
                                     tname, ggml_sycl_layout_mode_name(pair_layout),
                                     (long long) gate_up_dispatch_entries);
                         }
@@ -63011,36 +63117,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             (down_full_table_pp_direct_ids || down_selected_table_batch_order) ?
                                                 down_ids_host_arg :
                                             direct_down_sum_specialized_needs_host ? ids_data :
-                                                                                    nullptr;
+                                                                                     nullptr;
                                         const int64_t direct_down_sum_ids_host_count =
                                             (down_full_table_pp_direct_ids || down_selected_table_batch_order) ?
                                                 down_ids_host_count_arg :
                                             direct_down_sum_specialized_needs_host ? static_cast<int64_t>(ids_n_elem) :
-                                                                                    0;
+                                                                                     0;
                                         const bool direct_down_sum_layout_ready =
                                             (down_layout == GGML_LAYOUT_SOA &&
                                              (down_full_table_direct_ids || down_full_table_pp_direct_ids)) ||
                                             ((down_layout == GGML_LAYOUT_XMX_TILED ||
                                               direct_down_sum_dpas_direct_final_layout) &&
-                                             direct_down_sum_ids_host && direct_down_sum_ids_host_count ==
-                                                                            static_cast<int64_t>(down_entries));
+                                             direct_down_sum_ids_host &&
+                                             direct_down_sum_ids_host_count == static_cast<int64_t>(down_entries));
                                         const bool direct_down_sum_final_candidate =
                                             down_cached_q8_direct_ids && direct_down_sum_layout_ready &&
                                             pair.weighted_dst && pair.moe_weights && pair.down_sum_final_index >= 0 &&
                                             pair.down_sum_final;
                                         mxfp4_moe_direct_final_metadata direct_final_metadata{};
-                                        const bool direct_final_metadata_complete =
+                                        const bool                      direct_final_metadata_complete =
                                             ne12 == 1 && ids_device != nullptr && direct_down_sum_ids_host != nullptr &&
                                             direct_down_sum_ids_host_count == static_cast<int64_t>(down_entries) &&
                                             down_entries == ids_n_elem && pair.moe_weights != nullptr &&
                                             ids_device_nb0 > 0 && ids_device_nb1 > 0;
                                         if (direct_final_metadata_complete) {
-                                            direct_final_metadata.expert_ids_device          = ids_device;
-                                            direct_final_metadata.expert_ids_nb0             = ids_device_nb0;
-                                            direct_final_metadata.expert_ids_nb1             = ids_device_nb1;
-                                            direct_final_metadata.expert_ids_host            = direct_down_sum_ids_host;
-                                            direct_final_metadata.entries                    = static_cast<int64_t>(down_entries);
-                                            direct_final_metadata.expected_entries           = static_cast<int64_t>(down_entries);
+                                            direct_final_metadata.expert_ids_device = ids_device;
+                                            direct_final_metadata.expert_ids_nb0    = ids_device_nb0;
+                                            direct_final_metadata.expert_ids_nb1    = ids_device_nb1;
+                                            direct_final_metadata.expert_ids_host   = direct_down_sum_ids_host;
+                                            direct_final_metadata.entries          = static_cast<int64_t>(down_entries);
+                                            direct_final_metadata.expected_entries = static_cast<int64_t>(down_entries);
                                             direct_final_metadata.token_major_deterministic  = true;
                                             direct_final_metadata.route_weights_device_valid = true;
                                         }
@@ -63055,27 +63161,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 return env && std::atoi(env) != 0;
                                             }();
                                             static const bool direct_final_fused_q8_unsafe = []() {
-                                                const char * env =
-                                                    std::getenv("GGML_SYCL_MOE_GLU_Q8_FUSED_XMX_UNSAFE");
+                                                const char * env = std::getenv("GGML_SYCL_MOE_GLU_Q8_FUSED_XMX_UNSAFE");
                                                 return env && std::atoi(env) != 0;
                                             }();
                                             const auto & direct_final_xmx_caps =
                                                 ggml_sycl_info().devices[ctx.device].xmx_caps;
                                             const bool direct_final_q8_capacity_ok =
-                                                pair.glu_dst && ggml_sycl_moe_down_sum_cached_q8_capacity_ok(
-                                                                    pair.down_weight, plan.glu_output.handle,
-                                                                    ctx.device, pair.glu_dst->ne[0],
-                                                                    static_cast<int64_t>(down_entries));
+                                                pair.glu_dst &&
+                                                ggml_sycl_moe_down_sum_cached_q8_capacity_ok(
+                                                    pair.down_weight, plan.glu_output.handle, ctx.device,
+                                                    pair.glu_dst->ne[0], static_cast<int64_t>(down_entries));
                                             const bool direct_final_fused_q8_quarantined =
                                                 direct_final_fused_q8_requested && !direct_final_fused_q8_unsafe;
-                                            const bool direct_final_device_xmx_ok = direct_final_xmx_caps.supported &&
-                                                                                    direct_final_xmx_caps.supports_int8;
+                                            const bool direct_final_device_xmx_ok =
+                                                direct_final_xmx_caps.supported && direct_final_xmx_caps.supports_int8;
                                             const char * direct_final_probe_reason = [&]() -> const char * {
                                                 if (ne12 != 1) {
                                                     return "tokens";
                                                 }
-                                                if (!direct_down_sum_ids_host || direct_down_sum_ids_host_count !=
-                                                                                     static_cast<int64_t>(down_entries)) {
+                                                if (!direct_down_sum_ids_host ||
+                                                    direct_down_sum_ids_host_count !=
+                                                        static_cast<int64_t>(down_entries)) {
                                                     return "ids";
                                                 }
                                                 if (!pair.down_sum_final || pair.down_sum_final_index < 0) {
@@ -64087,8 +64193,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const std::string          tname_fast_str(tname_layer);
             ggml_sycl::unified_cache * plan_cache_fast = ggml_sycl::get_unified_cache_for_device(ctx.device);
             const bool                 have_plan_fast  = plan_cache_fast && plan_cache_fast->has_placement_plan();
-            const auto &               plan_fast =
-                have_plan_fast ? plan_cache_fast->get_placement_plan() : ggml_sycl::placement_plan{};
+            const auto                 plan_fast_owner = ggml_sycl_cache_plan_owner(plan_cache_fast);
+            const auto &               plan_fast       = *plan_fast_owner;
 
             // Check placement table for GPU0-cached experts.
             // Experts get staged to VRAM during PP via the hybrid dispatch path
@@ -65411,7 +65517,9 @@ cpu_tg_fallthrough:
             return false;
         }
 
-        const auto & plan = plan_cache->get_placement_plan();
+        const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);
+
+        const auto & plan = *plan_owner;
         for (int64_t e = 0; e < n_exp; ++e) {
             const auto placement = plan.lookup_expert_placement(tname, static_cast<int>(e));
             if (!placement.found() || !placement.on_device || placement.target_device != ctx.device) {
@@ -65425,14 +65533,15 @@ cpu_tg_fallthrough:
             return false;
         }
         auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-        return g_has_placement_plan || (plan_cache && plan_cache->has_placement_plan());
+        return ggml_sycl_has_global_plan() || (plan_cache && plan_cache->has_placement_plan());
     }();
     const bool planner_needs_cross_device_execution_for_primary_fastpaths = [&]() -> bool {
         auto * plan_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx.device);
         if (plan_cache && plan_cache->has_placement_plan()) {
-            return ggml_sycl_placement_plan_needs_secondary_devices(plan_cache->get_placement_plan());
+            return ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_cache_plan_owner(plan_cache)));
         }
-        return g_has_placement_plan && ggml_sycl_placement_plan_needs_secondary_devices(g_placement_plan);
+        return ggml_sycl_has_global_plan() &&
+               ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));
     }();
     const bool planner_primary_fastpath_guard_active =
         g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_info().total_gpu_count > 1;
@@ -65537,7 +65646,9 @@ cpu_tg_fallthrough:
                 return false;
             }
 
-            const auto & plan = plan_cache->get_placement_plan();
+            const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);
+
+            const auto & plan = *plan_owner;
             for (int64_t e = 0; e < n_exp; ++e) {
                 const auto placement = plan.lookup_expert_placement(tname, static_cast<int>(e));
                 if (!placement.found() || !placement.on_device || placement.target_device != ctx.device) {
@@ -65551,7 +65662,7 @@ cpu_tg_fallthrough:
                 return false;
             }
             auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-            return g_has_placement_plan || (plan_cache && plan_cache->has_placement_plan());
+            return ggml_sycl_has_global_plan() || (plan_cache && plan_cache->has_placement_plan());
         }();
         auto try_mmvq_layout = [&](layout_mode layout) -> bool {
             if (has_override && layout != override_layout) {
@@ -65984,8 +66095,8 @@ cpu_tg_fallthrough:
     // Detect host-resident weights including SYCL HOST_PINNED buffers
     bool   host_weights  = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     auto * route_cache   = ggml_sycl::get_unified_cache(*stream);
-    if (route_cache && !route_cache->has_placement_plan() && g_has_placement_plan) {
-        route_cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+    if (route_cache && !route_cache->has_placement_plan() && ggml_sycl_has_global_plan()) {
+        route_cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
     }
     const bool has_placement_plan         = route_cache && route_cache->has_placement_plan();
     bool       plan_has_cpu_experts       = false;
@@ -65994,7 +66105,8 @@ cpu_tg_fallthrough:
         const std::string tname(src0->name);
         const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
         plan_has_cpu_experts    = route_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device);
-        const auto & plan       = route_cache->get_placement_plan();
+        const auto   plan_owner = ggml_sycl_cache_plan_owner(route_cache);
+        const auto & plan       = *plan_owner;
         for (int64_t e = 0; e < n_exp; ++e) {
             const auto placement = plan.lookup_expert_placement(tname, static_cast<int>(e));
             if (placement.found() && placement.on_device && placement.target_device != ctx.device) {
@@ -66963,9 +67075,9 @@ cpu_tg_fallthrough:
             const std::string          tname_hybrid_str(src0->name ? src0->name : "");
             ggml_sycl::unified_cache * plan_cache_hybrid = ggml_sycl::get_unified_cache_for_device(ctx.device);
             const bool                 have_plan_hybrid  = plan_cache_hybrid && plan_cache_hybrid->has_placement_plan();
-            const auto &               plan_hybrid =
-                have_plan_hybrid ? plan_cache_hybrid->get_placement_plan() : ggml_sycl::placement_plan{};
-            auto planned_route_layout_for_expert = [&](int32_t expert_id, layout_mode fallback) -> layout_mode {
+            const auto                 plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);
+            const auto &               plan_hybrid       = *plan_hybrid_owner;
+            auto planned_route_layout_for_expert         = [&](int32_t expert_id, layout_mode fallback) -> layout_mode {
                 if (!have_plan_hybrid || tname_hybrid_str.empty()) {
                     return fallback;
                 }
@@ -68484,11 +68596,11 @@ cpu_tg_fallthrough:
             const bool   pp_plan_needs_secondary       = has_placement_plan && use_expert_cache && [&]() {
                 auto * plan_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx.device);
                 if (plan_cache && plan_cache->has_placement_plan()) {
-                    return ggml_sycl_placement_plan_moe_needs_other_device(plan_cache->get_placement_plan(),
+                    return ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_cache_plan_owner(plan_cache)),
                                                                                    ctx.device);
                 }
-                return g_has_placement_plan &&
-                       ggml_sycl_placement_plan_moe_needs_other_device(g_placement_plan, ctx.device);
+                return ggml_sycl_has_global_plan() &&
+                       ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);
             }();
             const bool pp_multi_gpu_execution_active =
                 g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_routable_device_count() > 1;
@@ -71684,7 +71796,9 @@ static void build_layer_device_map(int device) {
         return;
     }
 
-    const auto & plan = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto & plan = *plan_owner;
     for (const auto & [layer_id, target_device] : plan.layer_device) {
         if (layer_id >= 0 && static_cast<size_t>(layer_id) < g_layer_on_cpu.size()) {
             g_layer_on_cpu[layer_id] = target_device < 0;
@@ -71737,7 +71851,9 @@ static void seed_layer_plan_classification(int device) {
         return;
     }
 
-    const auto & plan = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto & plan = *plan_owner;
     for (const auto & [layer_id, target_device] : plan.layer_device) {
         if (layer_id < 0 || static_cast<size_t>(layer_id) >= g_layer_classified.size()) {
             continue;
@@ -71997,8 +72113,9 @@ static bool ggml_sycl_mul_mat_weight_resolves_to_host(const ggml_backend_sycl_co
     }
     if (src0->name[0] != '\0') {
         if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device); cache && cache->has_placement_plan()) {
-            const auto & plan     = cache->get_placement_plan();
-            const int    layer_id = ggml_sycl::extract_layer_id(src0->name);
+            const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
+            const auto & plan       = *plan_owner;
+            const int    layer_id   = ggml_sycl::extract_layer_id(src0->name);
             if (layer_id >= 0) {
                 auto layer_it = plan.layer_device.find(layer_id);
                 if (layer_it != plan.layer_device.end()) {
@@ -72217,8 +72334,9 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
                 bool have_plan_decision = false;
                 if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
                     cache && cache->has_placement_plan()) {
-                    const auto & plan = cache->get_placement_plan();
-                    auto         it   = plan.layer_device.find(layer_id);
+                    const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
+                    const auto & plan       = *plan_owner;
+                    auto         it         = plan.layer_device.find(layer_id);
                     if (it != plan.layer_device.end()) {
                         on_cpu             = it->second < 0;
                         have_plan_decision = true;
@@ -72307,10 +72425,16 @@ static inline bool should_force_gpu_dispatch(const ggml_tensor * dst) {
     }
 }
 
-static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor, int device,
-                                                      const char * tensor_name, const char * op_name);
-static std::string ggml_sycl_timeline_node_metadata(const ggml_tensor * node, int device, int node_idx, int n_nodes,
-                                                    const char * node_name, const char * op_name);
+static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor,
+                                                      int                 device,
+                                                      const char *        tensor_name,
+                                                      const char *        op_name);
+static std::string ggml_sycl_timeline_node_metadata(const ggml_tensor * node,
+                                                    int                 device,
+                                                    int                 node_idx,
+                                                    int                 n_nodes,
+                                                    const char *        node_name,
+                                                    const char *        op_name);
 
 static thread_local bool g_sycl_timeline_graph_spans_enabled = false;
 
@@ -72375,22 +72499,17 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     }
 
     auto e2e_record_early_handled_route = [&]() {
-        std::string                                    early_route_timeline_metadata;
+        std::string                                   early_route_timeline_metadata;
         std::optional<ggml_sycl::sycl_timeline_scope> early_route_timeline_scope;
         if (g_sycl_timeline_graph_spans_enabled) {
             early_route_timeline_metadata = ggml_sycl_timeline_tensor_metadata(
                 dst, ctx.device, dst ? dst->name : nullptr, dst ? ggml_op_name(dst->op) : nullptr);
-            early_route_timeline_scope.emplace("ggml.op", "early_handled_route",
-                                               early_route_timeline_metadata.c_str(),
+            early_route_timeline_scope.emplace("ggml.op", "early_handled_route", early_route_timeline_metadata.c_str(),
                                                ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ });
         }
         if (ggml_sycl::e2e_tg_profile_enabled()) {
-            ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage_from_op(dst->op, dst->name),
-                                             ggml_op_name(dst->op),
-                                             0.0,
-                                             0.0,
-                                             0,
-                                             1);
+            ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage_from_op(dst->op, dst->name), ggml_op_name(dst->op),
+                                             0.0, 0.0, 0, 1);
             ggml_sycl::e2e_tg_profile_flush_if_ready(stderr);
         }
     };
@@ -72445,12 +72564,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         !(ggml_sycl_hybrid_dispatch_enabled() && should_force_gpu_dispatch(dst))) {
         if (ggml_sycl_compute_forward_cpu(ctx, dst)) {
             if (ggml_sycl::e2e_tg_profile_enabled()) {
-                ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::CPU_DISPATCH,
-                                                 ggml_op_name(dst->op),
-                                                 0.0,
-                                                 0.0,
-                                                 0,
-                                                 1);
+                ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::CPU_DISPATCH, ggml_op_name(dst->op), 0.0, 0.0,
+                                                 0, 1);
                 ggml_sycl::e2e_tg_profile_flush_if_ready(stderr);
             }
             return true;
@@ -72552,11 +72667,11 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         dt.switch_us = dt.elapsed_us();
     }
 
-    std::string                                    compute_forward_timeline_metadata;
+    std::string                                   compute_forward_timeline_metadata;
     std::optional<ggml_sycl::sycl_timeline_scope> compute_forward_timeline_scope;
     if (g_sycl_timeline_graph_spans_enabled) {
-        compute_forward_timeline_metadata = ggml_sycl_timeline_tensor_metadata(dst, ctx.device, dst->name,
-                                                                               ggml_op_name(dst->op));
+        compute_forward_timeline_metadata =
+            ggml_sycl_timeline_tensor_metadata(dst, ctx.device, dst->name, ggml_op_name(dst->op));
         compute_forward_timeline_scope.emplace("ggml.op", "compute_forward", compute_forward_timeline_metadata.c_str(),
                                                ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ });
     }
@@ -75462,10 +75577,10 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
     ggml_backend_sycl_context *          sycl_ctx,
     ggml_cgraph *                        cgraph,
     int                                  node_idx,
-    std::vector<ggml_sycl::mem_handle> * out_retained_handles        = nullptr,
+    std::vector<ggml_sycl::mem_handle> * out_retained_handles         = nullptr,
     bool                                 require_descriptor_supported = true,
-    const char **                        out_reject_reason           = nullptr,
-    std::string *                        out_reject_detail           = nullptr);
+    const char **                        out_reject_reason            = nullptr,
+    std::string *                        out_reject_detail            = nullptr);
 static void moe_graph_mark_fused_pair_skips_for_node(const ggml_tensor * node, int device);
 static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context * sycl_ctx,
                                                      ggml_cgraph *               cgraph,
@@ -78465,14 +78580,14 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
         return false;
     }
 
-    ggml_sycl::unified_cache *        cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    ggml_sycl::placement_plan         cache_plan;
-    const ggml_sycl::placement_plan * plan  = nullptr;
+    ggml_sycl::unified_cache *        cache             = ggml_sycl::get_unified_cache_for_device(ctx.device);
+    const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
+    const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
+    const ggml_sycl::placement_plan * plan              = nullptr;
     if (cache && cache->has_placement_plan()) {
-        cache_plan = cache->get_placement_plan();
-        plan = &cache_plan;
-    } else if (g_has_placement_plan) {
-        plan = &g_placement_plan;
+        plan = cache_plan_owner.get();
+    } else if (ggml_sycl_has_global_plan()) {
+        plan = global_plan_owner.get();
     }
     if (!plan || plan->candidate_layer_blocks.size() < 2 || active_stats.blocks > 1) {
         if (trace) {
@@ -79083,13 +79198,13 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph(ggml_back
         return stats;
     }
 
-    ggml_sycl::placement_plan         cache_plan;
-    const ggml_sycl::placement_plan * plan_ptr = nullptr;
+    const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
+    const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
+    const ggml_sycl::placement_plan * plan_ptr          = nullptr;
     if (cache && cache->has_placement_plan()) {
-        cache_plan = cache->get_placement_plan();
-        plan_ptr = &cache_plan;
-    } else if (g_has_placement_plan) {
-        plan_ptr = &g_placement_plan;
+        plan_ptr = cache_plan_owner.get();
+    } else if (ggml_sycl_has_global_plan()) {
+        plan_ptr = global_plan_owner.get();
     }
     if (!plan_ptr) {
         if (dump_plan) {
@@ -79410,7 +79525,7 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
         op_name   = node ? ggml_op_name(node->op) : "";
     }
 
-    std::string                                    wait_timeline_metadata;
+    std::string                                   wait_timeline_metadata;
     std::optional<ggml_sycl::sycl_timeline_scope> wait_timeline_scope;
     if (timeline_wait_span_enabled) {
         try {
@@ -79522,9 +79637,10 @@ static void ggml_sycl_graph_boundary_reset_arenas(ggml_backend_sycl_context * sy
     }
 }
 
-static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor, int device,
-                                                      const char * tensor_name = nullptr,
-                                                      const char * op_name     = nullptr) {
+static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor,
+                                                      int                 device,
+                                                      const char *        tensor_name = nullptr,
+                                                      const char *        op_name     = nullptr) {
     std::string metadata;
     metadata.reserve(160);
     metadata += "device=";
@@ -79533,7 +79649,7 @@ static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor
     metadata += tensor ? (op_name ? op_name : ggml_op_name(tensor->op)) : "(null)";
     metadata += ";tensor=";
     metadata += (tensor && tensor_name && tensor_name[0] != '\0') ? tensor_name :
-                (tensor && tensor->name[0] != '\0')              ? tensor->name :
+                (tensor && tensor->name[0] != '\0')               ? tensor->name :
                                                                     "(null)";
     metadata += ";type=";
     metadata += tensor ? ggml_type_name(tensor->type) : "(null)";
@@ -79554,8 +79670,12 @@ static std::string ggml_sycl_timeline_tensor_metadata(const ggml_tensor * tensor
     return metadata;
 }
 
-static std::string ggml_sycl_timeline_node_metadata(const ggml_tensor * node, int device, int node_idx, int n_nodes,
-                                                    const char * node_name, const char * op_name) {
+static std::string ggml_sycl_timeline_node_metadata(const ggml_tensor * node,
+                                                    int                 device,
+                                                    int                 node_idx,
+                                                    int                 n_nodes,
+                                                    const char *        node_name,
+                                                    const char *        op_name) {
     std::string metadata = ggml_sycl_timeline_tensor_metadata(node, device, node_name, op_name);
     metadata += ";node_idx=";
     metadata += std::to_string(node_idx);
@@ -79577,9 +79697,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     struct timeline_graph_span_flag_guard {
         bool previous = false;
+
         explicit timeline_graph_span_flag_guard(bool enabled) : previous(g_sycl_timeline_graph_spans_enabled) {
             g_sycl_timeline_graph_spans_enabled = enabled;
         }
+
         ~timeline_graph_span_flag_guard() { g_sycl_timeline_graph_spans_enabled = previous; }
     } timeline_graph_span_flag_guard_(timeline_spans_enabled);
 
@@ -79609,7 +79731,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 auto * cache = ggml_sycl::get_unified_cache_for_device(device);
                 if (cache) {
                     try {
-                        char bcs_queue_drain_timeline_metadata[64];
+                        char                                          bcs_queue_drain_timeline_metadata[64];
                         std::optional<ggml_sycl::sycl_timeline_scope> bcs_queue_drain_timeline_scope;
                         if (g_sycl_timeline_graph_spans_enabled) {
                             std::snprintf(bcs_queue_drain_timeline_metadata, sizeof(bcs_queue_drain_timeline_metadata),
@@ -79625,7 +79747,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     } catch (...) {
                     }
                     try {
-                        char dma_queue_drain_timeline_metadata[64];
+                        char                                          dma_queue_drain_timeline_metadata[64];
                         std::optional<ggml_sycl::sycl_timeline_scope> dma_queue_drain_timeline_scope;
                         if (g_sycl_timeline_graph_spans_enabled) {
                             std::snprintf(dma_queue_drain_timeline_metadata, sizeof(dma_queue_drain_timeline_metadata),
@@ -79662,7 +79784,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     compute_impl_guard _reentry_guard(sycl_ctx->device);
 
-    std::string graph_timeline_metadata;
+    std::string  graph_timeline_metadata;
     const char * graph_timeline_metadata_cstr = "";
     if (timeline_spans_enabled) {
         graph_timeline_metadata =
@@ -79688,8 +79810,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ctx->invalidate_moe_sequence_graphs();
             g_moe_sequence_graphlet_skip_current_compute = true;
             if (ggml_sycl_graph_diag_enabled()) {
-                fprintf(stderr,
-                        "[SYCL-MOE-SEQUENCE-GRAPHLET] skipping first post-PP decode graph before recording\n");
+                fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] skipping first post-PP decode graph before recording\n");
             }
         }
 
@@ -80090,7 +80211,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // gate (ggml_can_fuse_subgraph) trusts cgraph->use_counts, built once during graph
     // construction; this prints what it actually saw at each match so it can be
     // hand-counted against gemma3n.cpp's real consumers for the same tensor.
-    static const bool fusion_use_count_debug = getenv("GGML_SYCL_FUSION_USE_COUNT_DEBUG") != nullptr;
+    static const bool   fusion_use_count_debug  = getenv("GGML_SYCL_FUSION_USE_COUNT_DEBUG") != nullptr;
     // Diagnostic (llama.cpp-81gx): the use_count instrumentation above showed bit1 firing
     // on FIVE distinct chains in gemma3n, not the two (laurel_post_norm, per_layer_proj_norm)
     // originally identified from source, all with correct use_count=1. This lets one chain
@@ -80101,8 +80222,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // cb("norm_w", il) never fires and the MUL keeps ggml's default (unhelpful) name; only the
     // ADD gets an explicit cb(tmp, "laurel_out", il) downstream in gemma3n.cpp. So
     // GGML_SYCL_FUSION_SKIP_MUL=laurel_out is the way to target that chain specifically.
-    static const char * fusion_skip_mul_prefix = getenv("GGML_SYCL_FUSION_SKIP_MUL");
-    static int          fusion_skip_count      = 0;
+    static const char * fusion_skip_mul_prefix  = getenv("GGML_SYCL_FUSION_SKIP_MUL");
+    static int          fusion_skip_count       = 0;
     // Diagnostic (llama.cpp-81gx): a mutation A/B on gemma3n proved ggml_sycl_fusion_
     // operand_view_offset_safe is what fixes it (guard in -> OK, guard out -> FAIL), but
     // the SAME mutation left test-rms-norm-mul-add-broadcast's Cases A/B/C unchanged in
@@ -81261,7 +81382,8 @@ gpu_dispatch:
                 g_sycl_submit_count_during_recording.fetch_add(1, std::memory_order_relaxed);
             }
 #ifdef GGML_SYCL_GRAPH
-            if (moe_graph_try_sequence_graphlet_for_node(sycl_ctx, cgraph, i, node, &direct_moe_graph_hash_for_compute)) {
+            if (moe_graph_try_sequence_graphlet_for_node(sycl_ctx, cgraph, i, node,
+                                                         &direct_moe_graph_hash_for_compute)) {
                 g_graph_diag_counters.sequence_graphlet_direct_replay_calls.fetch_add(1, std::memory_order_relaxed);
                 ggml_sycl_moe_aggregation_diag(sycl_ctx, "direct-sequence", "replay", "none");
                 continue;
@@ -81383,14 +81505,13 @@ gpu_dispatch:
                 ggml_sycl::set_graph_retained_handle_sink(nullptr);
                 g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
 
-                std::string node_timeline_metadata;
+                std::string                                   node_timeline_metadata;
                 std::optional<ggml_sycl::sycl_timeline_scope> node_timeline_scope;
                 if (timeline_spans_enabled) {
                     node_timeline_metadata = ggml_sycl_timeline_node_metadata(
                         node, sycl_ctx->device, i, cgraph->n_nodes, node->name, ggml_op_name(node->op));
-                    node_timeline_scope.emplace(
-                        "ggml.op", "compute_forward_node", node_timeline_metadata.c_str(),
-                        ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ });
+                    node_timeline_scope.emplace("ggml.op", "compute_forward_node", node_timeline_metadata.c_str(),
+                                                ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ });
                 }
                 bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
                 if (!ok) {
@@ -81453,19 +81574,19 @@ gpu_dispatch:
             }
 
 #ifdef GGML_SYCL_GRAPH
-            const bool sequence_direct_gap_timing = g_moe_sequence_graphlet_pending_replays > 0 &&
-                                                    ggml_sycl_sequence_graphlet_timing_enabled();
+            const bool sequence_direct_gap_timing =
+                g_moe_sequence_graphlet_pending_replays > 0 && ggml_sycl_sequence_graphlet_timing_enabled();
             std::chrono::high_resolution_clock::time_point t_sequence_direct_gap_start;
             if (sequence_direct_gap_timing) {
                 t_sequence_direct_gap_start = std::chrono::high_resolution_clock::now();
             }
 #endif
             ggml_sycl_moe_residual_add_id_skip_clear_last();
-            std::string node_timeline_metadata;
+            std::string                                   node_timeline_metadata;
             std::optional<ggml_sycl::sycl_timeline_scope> node_timeline_scope;
             if (timeline_spans_enabled) {
-                node_timeline_metadata = ggml_sycl_timeline_node_metadata(
-                    node, sycl_ctx->device, i, cgraph->n_nodes, node->name, ggml_op_name(node->op));
+                node_timeline_metadata = ggml_sycl_timeline_node_metadata(node, sycl_ctx->device, i, cgraph->n_nodes,
+                                                                          node->name, ggml_op_name(node->op));
                 node_timeline_scope.emplace("ggml.op", "compute_forward_node", node_timeline_metadata.c_str(),
                                             ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ });
             }
@@ -82408,7 +82529,8 @@ static bool moe_graph_descriptor_candidate_debug_enabled() {
 }
 
 static const moe_layer_persistent_descriptor * moe_graph_descriptor_for_dispatch_node(
-    const ggml_backend_sycl_context * sycl_ctx, const ggml_tensor * node) {
+    const ggml_backend_sycl_context * sycl_ctx,
+    const ggml_tensor *               node) {
     if (!sycl_ctx || !node || !node->src[0]) {
         return nullptr;
     }
@@ -82426,9 +82548,9 @@ static const moe_layer_persistent_descriptor * moe_graph_descriptor_for_dispatch
 static bool moe_graph_descriptor_ready_events_complete(const moe_layer_persistent_descriptor & descriptor,
                                                        const char **                           out_role,
                                                        size_t *                                out_pending) {
-    size_t      pending    = 0;
-    const char * first_role = nullptr;
-    auto count_pending = [&](const moe_layer_persistent_role_descriptor & role, const char * role_name) {
+    size_t       pending       = 0;
+    const char * first_role    = nullptr;
+    auto         count_pending = [&](const moe_layer_persistent_role_descriptor & role, const char * role_name) {
         for (const sycl::event & event : role.ready_events) {
             if (!pp_moe_onednn_event_complete(event)) {
                 if (!first_role) {
@@ -82491,15 +82613,14 @@ static bool moe_graph_descriptor_moe_dispatch_supported(const ggml_backend_sycl_
     if (!gate_up_layout_supported(descriptor->up.layout)) {
         return reject(moe_graph_descriptor_candidate_reject::BAD_UP_LAYOUT);
     }
-    const bool xmx_tiled_down_allowed = descriptor->down.layout == GGML_LAYOUT_XMX_TILED &&
-                                        (moe_first_arrival_graphlet_xmx_down_enabled() ||
-                                         moe_sequence_graphlets_xmx_down_enabled());
+    const bool xmx_tiled_down_allowed =
+        descriptor->down.layout == GGML_LAYOUT_XMX_TILED &&
+        (moe_first_arrival_graphlet_xmx_down_enabled() || moe_sequence_graphlets_xmx_down_enabled());
     if (descriptor->down.layout != GGML_LAYOUT_SOA && descriptor->down.layout != GGML_LAYOUT_MXFP4_I8 &&
         !xmx_tiled_down_allowed) {
         if (out_reject && descriptor->down.layout == GGML_LAYOUT_XMX_TILED && moe_default_fast_path_runtime_enabled() &&
             ggml_sycl_graph_diag_enabled()) {
-            fprintf(stderr,
-                    "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%s reason=bad-down-layout-xmx-safe-mode\n",
+            fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%s reason=bad-down-layout-xmx-safe-mode\n",
                     node->name ? node->name : "?");
         }
         return reject(moe_graph_descriptor_candidate_reject::BAD_DOWN_LAYOUT);
@@ -82626,34 +82747,34 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
         }
         return true;
     };
-    const char * identity_reject_reason          = nullptr;
-    int          identity_reject_expert          = -1;
-    const char * identity_reject_expected_layout = nullptr;
-    const char * identity_reject_actual_layout   = nullptr;
-    int          identity_reject_on_device       = -1;
-    int          identity_reject_handle_device   = -999;
-    int          identity_reject_handle_kind     = -1;
-    size_t       identity_reject_handle_size     = 0;
-    uint64_t     identity_reject_generation      = 0;
-    bool         identity_reject_table_checked   = false;
-    int          identity_reject_table_valid     = -1;
-    int          identity_reject_table_handle_valid = -1;
-    int          identity_reject_table_on_device = -1;
+    const char * identity_reject_reason              = nullptr;
+    int          identity_reject_expert              = -1;
+    const char * identity_reject_expected_layout     = nullptr;
+    const char * identity_reject_actual_layout       = nullptr;
+    int          identity_reject_on_device           = -1;
+    int          identity_reject_handle_device       = -999;
+    int          identity_reject_handle_kind         = -1;
+    size_t       identity_reject_handle_size         = 0;
+    uint64_t     identity_reject_generation          = 0;
+    bool         identity_reject_table_checked       = false;
+    int          identity_reject_table_valid         = -1;
+    int          identity_reject_table_handle_valid  = -1;
+    int          identity_reject_table_on_device     = -1;
     int          identity_reject_table_handle_device = -999;
     int          identity_reject_table_handle_kind   = -1;
-    size_t       identity_reject_table_size      = 0;
-    size_t       identity_reject_table_handle_size = 0;
-    uint64_t     identity_reject_table_generation = 0;
-    const char * identity_reject_table_layout    = nullptr;
-    auto         set_identity_reject             = [&](const char * reason) {
+    size_t       identity_reject_table_size          = 0;
+    size_t       identity_reject_table_handle_size   = 0;
+    uint64_t     identity_reject_table_generation    = 0;
+    const char * identity_reject_table_layout        = nullptr;
+    auto         set_identity_reject                 = [&](const char * reason) {
         identity_reject_reason = reason;
         return false;
     };
     auto capture_table_reject = [&](const ggml_tensor_extra_gpu * extra, const ggml_sycl::mem_handle & table_handle) {
-        identity_reject_table_checked      = true;
-        identity_reject_table_valid        = extra && extra->moe_device_table_valid[sycl_ctx->device] ? 1 : 0;
-        identity_reject_table_handle_valid = table_handle.valid() ? 1 : 0;
-        identity_reject_table_size         = extra ? extra->moe_expert_ptrs_size[sycl_ctx->device] : 0;
+        identity_reject_table_checked       = true;
+        identity_reject_table_valid         = extra && extra->moe_device_table_valid[sycl_ctx->device] ? 1 : 0;
+        identity_reject_table_handle_valid  = table_handle.valid() ? 1 : 0;
+        identity_reject_table_size          = extra ? extra->moe_expert_ptrs_size[sycl_ctx->device] : 0;
         identity_reject_table_handle_device = table_handle.device();
         identity_reject_table_handle_kind   = static_cast<int>(table_handle.kind());
         identity_reject_table_handle_size   = table_handle.size();
@@ -82697,15 +82818,15 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
             const ggml_sycl::mem_handle & handle        = role.expert_handles[i];
             const char *                  handle_reason = nullptr;
             if (!mix_handle(handle, true, &handle_reason)) {
-                const auto resolved              = handle.resolve(sycl_ctx->device);
-                identity_reject_expert           = static_cast<int>(i);
-                identity_reject_expected_layout  = ggml_sycl_layout_mode_name(role.layout);
-                identity_reject_actual_layout    = ggml_sycl_layout_mode_name(resolved.layout);
-                identity_reject_on_device        = resolved.on_device ? 1 : 0;
-                identity_reject_handle_device    = handle.device();
-                identity_reject_handle_kind      = static_cast<int>(handle.kind());
-                identity_reject_handle_size      = handle.size();
-                identity_reject_generation       = handle.generation();
+                const auto resolved             = handle.resolve(sycl_ctx->device);
+                identity_reject_expert          = static_cast<int>(i);
+                identity_reject_expected_layout = ggml_sycl_layout_mode_name(role.layout);
+                identity_reject_actual_layout   = ggml_sycl_layout_mode_name(resolved.layout);
+                identity_reject_on_device       = resolved.on_device ? 1 : 0;
+                identity_reject_handle_device   = handle.device();
+                identity_reject_handle_kind     = static_cast<int>(handle.kind());
+                identity_reject_handle_size     = handle.size();
+                identity_reject_generation      = handle.generation();
                 return set_identity_reject(handle_reason ? handle_reason : "role-handle");
             }
         }
@@ -82729,18 +82850,17 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
                         identity_reject_handle_device, identity_reject_handle_kind, identity_reject_handle_size,
                         (unsigned long long) identity_reject_generation, node->name ? node->name : "?");
             } else if (identity_reject_table_checked) {
-                fprintf(stderr,
-                        "[SYCL-MOE-GRAPHLET] identity rejected layer=%d role=%s reason=%s "
-                        "table_valid=%d table_handle_valid=%d table_on_device=%d table_handle_device=%d "
-                        "table_handle_kind=%d table_size=%zu table_handle_size=%zu table_handle_generation=%llu "
-                        "table_layout=%s node=%s\n",
-                        layer, role, identity_reject_reason ? identity_reject_reason : "unknown",
-                        identity_reject_table_valid, identity_reject_table_handle_valid,
-                        identity_reject_table_on_device, identity_reject_table_handle_device,
-                        identity_reject_table_handle_kind, identity_reject_table_size,
-                        identity_reject_table_handle_size, (unsigned long long) identity_reject_table_generation,
-                        identity_reject_table_layout ? identity_reject_table_layout : "?",
-                        node->name ? node->name : "?");
+                fprintf(
+                    stderr,
+                    "[SYCL-MOE-GRAPHLET] identity rejected layer=%d role=%s reason=%s "
+                    "table_valid=%d table_handle_valid=%d table_on_device=%d table_handle_device=%d "
+                    "table_handle_kind=%d table_size=%zu table_handle_size=%zu table_handle_generation=%llu "
+                    "table_layout=%s node=%s\n",
+                    layer, role, identity_reject_reason ? identity_reject_reason : "unknown",
+                    identity_reject_table_valid, identity_reject_table_handle_valid, identity_reject_table_on_device,
+                    identity_reject_table_handle_device, identity_reject_table_handle_kind, identity_reject_table_size,
+                    identity_reject_table_handle_size, (unsigned long long) identity_reject_table_generation,
+                    identity_reject_table_layout ? identity_reject_table_layout : "?", node->name ? node->name : "?");
             } else {
                 fprintf(stderr, "[SYCL-MOE-GRAPHLET] identity rejected layer=%d role=%s reason=%s node=%s\n", layer,
                         role, identity_reject_reason ? identity_reject_reason : "unknown",
@@ -82820,7 +82940,7 @@ static uint64_t moe_graph_sequence_dispatch_identity_signature(ggml_backend_sycl
 
     const char * reject_role   = nullptr;
     const char * reject_reason = nullptr;
-    auto reject = [&](const char * role, const char * reason) {
+    auto         reject        = [&](const char * role, const char * reason) {
         reject_role   = role;
         reject_reason = reason;
         return false;
@@ -82863,8 +82983,7 @@ static uint64_t moe_graph_sequence_dispatch_identity_signature(ggml_backend_sycl
         return true;
     };
     auto mix_descriptor_tensor = [&](const ggml_sycl::moe_layer_persistent_tensor_descriptor & desc,
-                                     const ggml_tensor *                                        expected,
-                                     const char *                                               role) {
+                                     const ggml_tensor * expected, const char * role) {
         if (desc.tensor != expected) {
             return reject(role, "descriptor-tensor-mismatch");
         }
@@ -82899,8 +83018,7 @@ static uint64_t moe_graph_sequence_dispatch_identity_signature(ggml_backend_sycl
     if (ggml_sycl_graph_diag_enabled()) {
         static std::atomic<int> logged{ 0 };
         if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
-            fprintf(stderr,
-                    "[SYCL-MOE-SEQUENCE-GRAPHLET] identity rejected node=%s role=%s reason=%s\n",
+            fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] identity rejected node=%s role=%s reason=%s\n",
                     node->name ? node->name : "?", reject_role ? reject_role : "unknown",
                     reject_reason ? reject_reason : "unknown");
         }
@@ -83142,11 +83260,11 @@ static void moe_graph_snapshot_extra_state(ggml_tensor_extra_gpu * extra,
     }
 }
 
-static void moe_graph_restore_extra_state(ggml_tensor_extra_gpu *         extra,
-                                          void * const *                  data_device,
-                                          const ggml_sycl::mem_handle *   data_handle,
-                                          const size_t *                  data_device_size,
-                                          bool                            valid) {
+static void moe_graph_restore_extra_state(ggml_tensor_extra_gpu *       extra,
+                                          void * const *                data_device,
+                                          const ggml_sycl::mem_handle * data_handle,
+                                          const size_t *                data_device_size,
+                                          bool                          valid) {
     if (!valid || !extra) {
         return;
     }
@@ -83157,8 +83275,8 @@ static void moe_graph_restore_extra_state(ggml_tensor_extra_gpu *         extra,
     }
 }
 
-static void moe_graph_snapshot_tensor_publish_state(
-    ggml_tensor * tensor, std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
+static void moe_graph_snapshot_tensor_publish_state(ggml_tensor *                                    tensor,
+                                                    std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
     if (!tensor) {
         return;
     }
@@ -83183,8 +83301,8 @@ static void moe_graph_snapshot_tensor_publish_state(
     snapshots.push_back(std::move(snapshot));
 }
 
-static void moe_graph_snapshot_fused_pair_publish_state(
-    const moe_gate_up_pair & pair, std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
+static void moe_graph_snapshot_fused_pair_publish_state(const moe_gate_up_pair &                         pair,
+                                                        std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
     moe_graph_snapshot_tensor_publish_state(pair.gate_dst, snapshots);
     moe_graph_snapshot_tensor_publish_state(pair.up_dst, snapshots);
     moe_graph_snapshot_tensor_publish_state(pair.gate_biased, snapshots);
@@ -83196,13 +83314,13 @@ static void moe_graph_snapshot_fused_pair_publish_state(
     moe_graph_snapshot_tensor_publish_state(pair.down_sum_final, snapshots);
 }
 
-static void moe_graph_snapshot_cgraph_publish_state(
-    const ggml_cgraph * cgraph, std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
+static void moe_graph_snapshot_cgraph_publish_state(const ggml_cgraph *                              cgraph,
+                                                    std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
     if (!cgraph) {
         return;
     }
     std::unordered_set<ggml_tensor *> snapshotted;
-    auto snapshot_once = [&](ggml_tensor * tensor) {
+    auto                              snapshot_once = [&](ggml_tensor * tensor) {
         if (!tensor || snapshotted.find(tensor) != snapshotted.end()) {
             return;
         }
@@ -83221,8 +83339,7 @@ static void moe_graph_snapshot_cgraph_publish_state(
     }
 }
 
-static void moe_graph_restore_tensor_publish_state(
-    const std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
+static void moe_graph_restore_tensor_publish_state(const std::vector<moe_graph_tensor_publish_snapshot> & snapshots) {
     for (auto it = snapshots.rbegin(); it != snapshots.rend(); ++it) {
         const moe_graph_tensor_publish_snapshot & snapshot = *it;
         if (snapshot.tensor) {
@@ -83269,8 +83386,8 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         set_record_reject("bad-args");
         return nullptr;
     }
-    ggml_tensor *             node            = cgraph->nodes[node_idx];
-    const moe_gate_up_pair *  pair_for_record = moe_graph_fused_pair_for_dispatch_node(node);
+    ggml_tensor *            node            = cgraph->nodes[node_idx];
+    const moe_gate_up_pair * pair_for_record = moe_graph_fused_pair_for_dispatch_node(node);
     if (!pair_for_record) {
         set_record_reject("not-dispatch");
         return nullptr;
@@ -83279,14 +83396,16 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         set_record_reject("descriptor-unsupported");
         return nullptr;
     }
-    const moe_layer_persistent_descriptor * descriptor_for_record = moe_graph_descriptor_for_dispatch_node(sycl_ctx, node);
+    const moe_layer_persistent_descriptor * descriptor_for_record =
+        moe_graph_descriptor_for_dispatch_node(sycl_ctx, node);
     if (!descriptor_for_record || !descriptor_for_record->complete()) {
         set_record_reject("descriptor-missing");
         return nullptr;
     }
-    const char * pending_ready_role = nullptr;
+    const char * pending_ready_role   = nullptr;
     size_t       pending_ready_events = 0;
-    if (!moe_graph_descriptor_ready_events_complete(*descriptor_for_record, &pending_ready_role, &pending_ready_events)) {
+    if (!moe_graph_descriptor_ready_events_complete(*descriptor_for_record, &pending_ready_role,
+                                                    &pending_ready_events)) {
         set_record_reject("ready-events-pending");
         char detail[128];
         std::snprintf(detail, sizeof(detail), "role=%s,pending=%zu",
@@ -83311,30 +83430,30 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
     std::vector<moe_graph_tensor_publish_snapshot> tensor_publish_snapshots;
     moe_graph_snapshot_fused_pair_publish_state(*pair_for_record, tensor_publish_snapshots);
 
-    const auto saved_mmid_skip                   = g_moe_precomputed_mmid_skip;
-    const auto saved_node_skip                   = g_moe_precomputed_node_skip;
-    const auto saved_residual_add_id_skip        = g_moe_precomputed_residual_add_id_skip;
-    const auto saved_down_layer_skip             = g_moe_precomputed_down_layer_skip;
-    const auto saved_down_sum_fusion_disabled    = g_moe_down_sum_fusion_disabled;
-    const auto saved_precomputed_down_sum_final  = g_moe_precomputed_down_sum_final;
-    const auto saved_last_residual_add_id_tensor = g_moe_last_residual_add_id_skip_tensor;
-    const auto saved_last_residual_add_id_kind       = g_moe_last_residual_add_id_skip_kind;
-    const auto saved_down_shadow                     = g_moe_down_shadow;
-    const auto saved_down_sum_shadow_entries         = g_moe_down_sum_shadow_entries;
-    const auto saved_persistent_moe_descriptors      = sycl_ctx->persistent_moe_descriptors;
-    const bool saved_persistent_descriptors_static   = sycl_ctx->persistent_moe_descriptors_static_valid;
-    auto       restore_precomputed_state             = [&]() {
-        g_moe_precomputed_mmid_skip            = saved_mmid_skip;
-        g_moe_precomputed_node_skip            = saved_node_skip;
-        g_moe_precomputed_residual_add_id_skip = saved_residual_add_id_skip;
-        g_moe_precomputed_down_layer_skip      = saved_down_layer_skip;
-        g_moe_down_sum_fusion_disabled         = saved_down_sum_fusion_disabled;
-        g_moe_precomputed_down_sum_final       = saved_precomputed_down_sum_final;
-        g_moe_last_residual_add_id_skip_tensor = saved_last_residual_add_id_tensor;
-        g_moe_last_residual_add_id_skip_kind          = saved_last_residual_add_id_kind;
-        g_moe_down_shadow                             = saved_down_shadow;
-        g_moe_down_sum_shadow_entries                 = saved_down_sum_shadow_entries;
-        sycl_ctx->persistent_moe_descriptors          = saved_persistent_moe_descriptors;
+    const auto saved_mmid_skip                     = g_moe_precomputed_mmid_skip;
+    const auto saved_node_skip                     = g_moe_precomputed_node_skip;
+    const auto saved_residual_add_id_skip          = g_moe_precomputed_residual_add_id_skip;
+    const auto saved_down_layer_skip               = g_moe_precomputed_down_layer_skip;
+    const auto saved_down_sum_fusion_disabled      = g_moe_down_sum_fusion_disabled;
+    const auto saved_precomputed_down_sum_final    = g_moe_precomputed_down_sum_final;
+    const auto saved_last_residual_add_id_tensor   = g_moe_last_residual_add_id_skip_tensor;
+    const auto saved_last_residual_add_id_kind     = g_moe_last_residual_add_id_skip_kind;
+    const auto saved_down_shadow                   = g_moe_down_shadow;
+    const auto saved_down_sum_shadow_entries       = g_moe_down_sum_shadow_entries;
+    const auto saved_persistent_moe_descriptors    = sycl_ctx->persistent_moe_descriptors;
+    const bool saved_persistent_descriptors_static = sycl_ctx->persistent_moe_descriptors_static_valid;
+    auto       restore_precomputed_state           = [&]() {
+        g_moe_precomputed_mmid_skip                       = saved_mmid_skip;
+        g_moe_precomputed_node_skip                       = saved_node_skip;
+        g_moe_precomputed_residual_add_id_skip            = saved_residual_add_id_skip;
+        g_moe_precomputed_down_layer_skip                 = saved_down_layer_skip;
+        g_moe_down_sum_fusion_disabled                    = saved_down_sum_fusion_disabled;
+        g_moe_precomputed_down_sum_final                  = saved_precomputed_down_sum_final;
+        g_moe_last_residual_add_id_skip_tensor            = saved_last_residual_add_id_tensor;
+        g_moe_last_residual_add_id_skip_kind              = saved_last_residual_add_id_kind;
+        g_moe_down_shadow                                 = saved_down_shadow;
+        g_moe_down_sum_shadow_entries                     = saved_down_sum_shadow_entries;
+        sycl_ctx->persistent_moe_descriptors              = saved_persistent_moe_descriptors;
         sycl_ctx->persistent_moe_descriptors_static_valid = saved_persistent_descriptors_static;
         moe_graph_restore_tensor_publish_state(tensor_publish_snapshots);
     };
@@ -83370,8 +83489,7 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
                 try {
                     graph->end_recording();
                 } catch (const std::exception & exc) {
-                    GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph cleanup end_recording failed: %s\n",
-                                  exc.what());
+                    GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph cleanup end_recording failed: %s\n", exc.what());
                 } catch (...) {
                     GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph cleanup end_recording failed\n");
                 }
@@ -83397,21 +83515,21 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         g_ggml_sycl_graph_recording = true;
         g_recording_graph_ptr       = &moe_graph;
         g_recording_queue_ptr       = stream;
-        recording_stage = "begin-recording";
+        recording_stage             = "begin-recording";
         recording_guard.begin();
 
         struct direct_descriptor_dispatch_scope {
-            bool previous_segmented        = false;
-            bool previous_descriptor       = false;
-            bool previous_graph_recording  = false;
+            bool previous_segmented       = false;
+            bool previous_descriptor      = false;
+            bool previous_graph_recording = false;
 
             direct_descriptor_dispatch_scope() :
                 previous_segmented(g_moe_segmented_graph_dispatch_active),
                 previous_descriptor(g_moe_descriptor_capture_decode_phase),
                 previous_graph_recording(g_moe_descriptor_dispatch_graph_recording_active) {
-                g_moe_segmented_graph_dispatch_active                  = true;
-                g_moe_descriptor_capture_decode_phase                  = true;
-                g_moe_descriptor_dispatch_graph_recording_active       = true;
+                g_moe_segmented_graph_dispatch_active            = true;
+                g_moe_descriptor_capture_decode_phase            = true;
+                g_moe_descriptor_dispatch_graph_recording_active = true;
             }
 
             ~direct_descriptor_dispatch_scope() {
@@ -83438,7 +83556,7 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         }
 
         recording_stage = "finalize";
-        auto exec = moe_graph.finalize();
+        auto exec       = moe_graph.finalize();
         restore_precomputed_state();
         GGML_SYCL_DEBUG("[SYCL-SEG-MOE] Recorded descriptor MoE graph at node %d (%s)\n", node_idx,
                         node->name ? node->name : "?");
@@ -83454,12 +83572,12 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         restore_precomputed_state();
         const char * reason = recording_failure_reason ? recording_failure_reason : "sycl-exception";
         set_record_reject(reason);
-        set_record_detail(std::string(recording_stage ? recording_stage : "unknown") + "/" +
-                          (g_moe_descriptor_recording_detail_stage ? g_moe_descriptor_recording_detail_stage :
-                                                                     "unknown") +
-                          ":" + exc.what());
-        GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph recording failed at node %d (%s) reason=%s: %s\n",
-                      node_idx, node ? (node->name ? node->name : "?") : "?", reason, exc.what());
+        set_record_detail(
+            std::string(recording_stage ? recording_stage : "unknown") + "/" +
+            (g_moe_descriptor_recording_detail_stage ? g_moe_descriptor_recording_detail_stage : "unknown") + ":" +
+            exc.what());
+        GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph recording failed at node %d (%s) reason=%s: %s\n", node_idx,
+                      node ? (node->name ? node->name : "?") : "?", reason, exc.what());
     } catch (const std::exception & exc) {
         clear_recording_state();
         // Recording failure means no executable graph was produced. Restore the
@@ -83471,12 +83589,12 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         restore_precomputed_state();
         const char * reason = recording_failure_reason ? recording_failure_reason : "exception";
         set_record_reject(reason);
-        set_record_detail(std::string(recording_stage ? recording_stage : "unknown") + "/" +
-                          (g_moe_descriptor_recording_detail_stage ? g_moe_descriptor_recording_detail_stage :
-                                                                     "unknown") +
-                          ":" + exc.what());
-        GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph recording failed at node %d (%s) reason=%s: %s\n",
-                      node_idx, node ? (node->name ? node->name : "?") : "?", reason, exc.what());
+        set_record_detail(
+            std::string(recording_stage ? recording_stage : "unknown") + "/" +
+            (g_moe_descriptor_recording_detail_stage ? g_moe_descriptor_recording_detail_stage : "unknown") + ":" +
+            exc.what());
+        GGML_LOG_WARN("[SYCL-SEG-MOE] Descriptor MoE graph recording failed at node %d (%s) reason=%s: %s\n", node_idx,
+                      node ? (node->name ? node->name : "?") : "?", reason, exc.what());
     }
     return nullptr;
 }
@@ -83494,7 +83612,8 @@ static const sycl_ex::command_graph<sycl_ex::graph_state::executable> * moe_grap
     const uint64_t identity_hash = moe_graph_sequence_dispatch_identity_signature(sycl_ctx, node);
     if (identity_hash == 0) {
         if (ggml_sycl_graph_diag_enabled()) {
-            fprintf(stderr, "[SYCL-SEG-MOE] Descriptor MoE graph replay skipped at node %d reason=identity\n", node_idx);
+            fprintf(stderr, "[SYCL-SEG-MOE] Descriptor MoE graph replay skipped at node %d reason=identity\n",
+                    node_idx);
         }
         return nullptr;
     }
@@ -83511,7 +83630,8 @@ static bool moe_graph_sequence_record_reject_is_incomplete_capture(const char * 
     return record_reject && std::strncmp(record_reject, "skip-incomplete-", 16) == 0;
 }
 
-static bool moe_graph_sequence_record_reject_is_nonfatal(const char * record_reject, const std::string & record_detail) {
+static bool moe_graph_sequence_record_reject_is_nonfatal(const char *        record_reject,
+                                                         const std::string & record_detail) {
     if (moe_graph_sequence_record_reject_is_incomplete_capture(record_reject)) {
         // Semantic capture incompleteness means the descriptor graph did not include the whole
         // fused MoE unit (partner/GLU/down). Treat it as a real sequence-recording failure so
@@ -83528,9 +83648,9 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
                                                      ggml_tensor *               node,
                                                      uint64_t *                  graph_hash_cache) {
     if (!sycl_ctx || !cgraph || !node || !graph_hash_cache || !moe_default_fast_path_runtime_enabled() ||
-        !g_moe_descriptor_capture_decode_phase || g_moe_segmented_graph_dispatch_active || g_ggml_sycl_graph_recording ||
-        g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled || sycl_ctx->moe_graphs_disabled ||
-        sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID ||
+        !g_moe_descriptor_capture_decode_phase || g_moe_segmented_graph_dispatch_active ||
+        g_ggml_sycl_graph_recording || g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled ||
+        sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID ||
         ggml_sycl_moe_precomputed_mmid_skip_pending(node, sycl_ctx->device)) {
         return false;
     }
@@ -83548,8 +83668,7 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         sycl_ctx->invalidate_moe_sequence_graphs();
         g_moe_sequence_graphlet_skip_current_compute = true;
         if (ggml_sycl_graph_diag_enabled()) {
-            fprintf(stderr,
-                    "[SYCL-MOE-SEQUENCE-GRAPHLET] skipping first post-PP decode graph before recording\n");
+            fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] skipping first post-PP decode graph before recording\n");
         }
     }
     if (g_moe_sequence_graphlet_skip_current_compute) {
@@ -83602,8 +83721,8 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
                                                   sycl_ctx->moe_sequence_graph_failed_nodes.end());
     if (first_failed_it != sycl_ctx->moe_sequence_graph_failed_nodes.end()) {
         const bool current_failed = std::find(sycl_ctx->moe_sequence_graph_failed_nodes.begin(),
-                                              sycl_ctx->moe_sequence_graph_failed_nodes.end(), node_idx) !=
-                                    sycl_ctx->moe_sequence_graph_failed_nodes.end();
+                                              sycl_ctx->moe_sequence_graph_failed_nodes.end(),
+                                              node_idx) != sycl_ctx->moe_sequence_graph_failed_nodes.end();
         if (ggml_sycl_graph_diag_enabled()) {
             if (current_failed) {
                 fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%d reason=record-failed\n", node_idx);
@@ -83615,9 +83734,9 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         }
         return false;
     }
-    const char * ptr_table_reject = nullptr;
-    const bool timeline_graphlet_spans = g_sycl_timeline_graph_spans_enabled;
-    std::string graphlet_timeline_metadata;
+    const char * ptr_table_reject        = nullptr;
+    const bool   timeline_graphlet_spans = g_sycl_timeline_graph_spans_enabled;
+    std::string  graphlet_timeline_metadata;
     if (timeline_graphlet_spans) {
         graphlet_timeline_metadata = ggml_sycl_timeline_node_metadata(node, sycl_ctx->device, node_idx, cgraph->n_nodes,
                                                                       node->name, ggml_op_name(node->op));
@@ -83685,11 +83804,12 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
             fprintf(stderr,
                     "[SYCL-MOE-DEFAULT-POLICY] selected_path=%s reason=%s attempt_sequence=%d attempt_fusion=%d\n",
                     default_policy.selected_path ? default_policy.selected_path : "baseline-fallback",
-                    default_policy.reason ? default_policy.reason : "unknown",
-                    default_policy.attempt_sequence ? 1 : 0, default_policy.attempt_fusion ? 1 : 0);
+                    default_policy.reason ? default_policy.reason : "unknown", default_policy.attempt_sequence ? 1 : 0,
+                    default_policy.attempt_fusion ? 1 : 0);
         } else if (policy_log_index == SYCL_MOE_DEFAULT_POLICY_LOG_LIMIT) {
             fprintf(stderr,
-                    "[SYCL-MOE-DEFAULT-POLICY] logging suppressed after %d lines; final graphdiag summaries remain parseable\n",
+                    "[SYCL-MOE-DEFAULT-POLICY] logging suppressed after %d lines; final graphdiag summaries remain "
+                    "parseable\n",
                     SYCL_MOE_DEFAULT_POLICY_LOG_LIMIT);
         }
     }
@@ -83698,15 +83818,13 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         return false;
     }
 
-    const ggml_backend_sycl_context::moe_sequence_graph_reject_key record_reject_key{
-        node_idx, graph_hash, identity_hash, mode_hash
-    };
+    const ggml_backend_sycl_context::moe_sequence_graph_reject_key record_reject_key{ node_idx, graph_hash,
+                                                                                      identity_hash, mode_hash };
     if (std::find(sycl_ctx->moe_sequence_graph_ineligible_nodes.begin(),
-                  sycl_ctx->moe_sequence_graph_ineligible_nodes.end(), record_reject_key) !=
-        sycl_ctx->moe_sequence_graph_ineligible_nodes.end()) {
+                  sycl_ctx->moe_sequence_graph_ineligible_nodes.end(),
+                  record_reject_key) != sycl_ctx->moe_sequence_graph_ineligible_nodes.end()) {
         if (ggml_sycl_graph_diag_enabled()) {
-            fprintf(stderr,
-                    "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%d reason=record-ineligible identity=%llu\n",
+            fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%d reason=record-ineligible identity=%llu\n",
                     node_idx, (unsigned long long) identity_hash);
         }
         return false;
@@ -83727,7 +83845,7 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
                     return it->exec_graph.get();
                 }
                 sequence_identity_mismatch = true;
-                it = sycl_ctx->moe_sequence_graphs.erase(it);
+                it                         = sycl_ctx->moe_sequence_graphs.erase(it);
                 continue;
             }
             ++it;
@@ -83751,27 +83869,26 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         finish_match_timing(exec_graph != nullptr);
         if (!exec_graph && sequence_identity_mismatch) {
             if (ggml_sycl_graph_diag_enabled()) {
-                fprintf(stderr,
-                        "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%d reason=transient-identity-mismatch\n",
+                fprintf(stderr, "[SYCL-MOE-SEQUENCE-GRAPHLET] reject node=%d reason=transient-identity-mismatch\n",
                         node_idx);
             }
             return false;
         }
         if (!exec_graph) {
-            std::vector<ggml_sycl::mem_handle> retained_handles;
-            const char *                        record_reject = nullptr;
-            std::string                         record_detail;
+            std::vector<ggml_sycl::mem_handle>                                        retained_handles;
+            const char *                                                              record_reject = nullptr;
+            std::string                                                               record_detail;
             std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> recorded;
             if (timeline_graphlet_spans) {
                 GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_record",
                                          graphlet_timeline_metadata.c_str());
                 recorded = moe_graph_record_moe_dispatch_graph(sycl_ctx, cgraph, node_idx, &retained_handles,
-                                                               /*require_descriptor_supported=*/true,
-                                                               &record_reject, &record_detail);
+                                                               /*require_descriptor_supported=*/true, &record_reject,
+                                                               &record_detail);
             } else {
                 recorded = moe_graph_record_moe_dispatch_graph(sycl_ctx, cgraph, node_idx, &retained_handles,
-                                                               /*require_descriptor_supported=*/true,
-                                                               &record_reject, &record_detail);
+                                                               /*require_descriptor_supported=*/true, &record_reject,
+                                                               &record_detail);
             }
             if (!recorded) {
                 if (ggml_sycl_graph_diag_enabled()) {
@@ -83825,8 +83942,7 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
             submit_start = std::chrono::high_resolution_clock::now();
         }
         if (timeline_graphlet_spans) {
-            GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay",
-                                     graphlet_timeline_metadata.c_str());
+            GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay", graphlet_timeline_metadata.c_str());
             sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
         } else {
             sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
@@ -83851,14 +83967,16 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         g_graph_diag_counters.sequence_graphlet_failures.fetch_add(1, std::memory_order_relaxed);
         sycl_ctx->moe_default_fast_path_quarantined       = true;
         sycl_ctx->moe_default_fast_path_quarantine_reason = "replay-exception";
-        GGML_LOG_WARN("[SYCL-MOE-SEQUENCE-GRAPHLET] replay failed: %s; quarantining default fast path for this context\n",
-                      exc.what());
+        GGML_LOG_WARN(
+            "[SYCL-MOE-SEQUENCE-GRAPHLET] replay failed: %s; quarantining default fast path for this context\n",
+            exc.what());
     } catch (const std::exception & exc) {
         g_graph_diag_counters.sequence_graphlet_failures.fetch_add(1, std::memory_order_relaxed);
         sycl_ctx->moe_default_fast_path_quarantined       = true;
         sycl_ctx->moe_default_fast_path_quarantine_reason = "replay-exception";
-        GGML_LOG_WARN("[SYCL-MOE-SEQUENCE-GRAPHLET] replay failed: %s; quarantining default fast path for this context\n",
-                      exc.what());
+        GGML_LOG_WARN(
+            "[SYCL-MOE-SEQUENCE-GRAPHLET] replay failed: %s; quarantining default fast path for this context\n",
+            exc.what());
     }
 
     sycl_ctx->invalidate_moe_sequence_graphs();
@@ -84231,8 +84349,8 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
         ~segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = previous_segmented; }
     } segmented_scope;
 
-    uint64_t sequence_graph_hash_cache = replay_graph_hash;
-    auto try_sequence_graphlet_for_segmented_moe = [&](int node_idx, ggml_tensor * moe_node) {
+    uint64_t sequence_graph_hash_cache               = replay_graph_hash;
+    auto     try_sequence_graphlet_for_segmented_moe = [&](int node_idx, ggml_tensor * moe_node) {
         if (!moe_node) {
             return false;
         }
@@ -84256,7 +84374,8 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                 g_moe_segmented_graph_dispatch_active = previous_segmented;
             }
         } sequence_scope;
-        return moe_graph_try_sequence_graphlet_for_node(sycl_ctx, cgraph, node_idx, moe_node, &sequence_graph_hash_cache);
+        return moe_graph_try_sequence_graphlet_for_node(sycl_ctx, cgraph, node_idx, moe_node,
+                                                            &sequence_graph_hash_cache);
     };
 
     // Merged schedule: segments and MoE ops in node-index order.
@@ -84300,7 +84419,8 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
             if (node) {
                 g_graph_diag_counters.seg_moe_dispatches.fetch_add(1, std::memory_order_relaxed);
                 if (try_sequence_graphlet_for_segmented_moe(node_idx, node)) {
-                    g_graph_diag_counters.sequence_graphlet_segmented_replay_calls.fetch_add(1, std::memory_order_relaxed);
+                    g_graph_diag_counters.sequence_graphlet_segmented_replay_calls.fetch_add(1,
+                                                                                             std::memory_order_relaxed);
                     ggml_sycl_moe_aggregation_diag(sycl_ctx, "segmented-sequence", "replay", "none");
                     if (ggml_sycl_graph_diag_enabled()) {
                         static std::atomic<int> sequence_segmented_replay_log{ 0 };
@@ -84398,7 +84518,8 @@ static const char * moe_aggregation_selected_decision() {
                 static std::atomic<int> logged{ 0 };
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
                     fprintf(stderr,
-                            "[SYCL-MOE-AGGREGATION] decision_auto=block-graphlet source=promotion-candidate-explicit-block\n");
+                            "[SYCL-MOE-AGGREGATION] decision_auto=block-graphlet "
+                            "source=promotion-candidate-explicit-block\n");
                 }
             }
             return "block-graphlet";
@@ -84409,9 +84530,8 @@ static const char * moe_aggregation_selected_decision() {
         if (ggml_sycl_graph_diag_enabled()) {
             static std::atomic<int> logged{ 0 };
             if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                fprintf(stderr,
-                        "[SYCL-MOE-AGGREGATION] decision_override_reject=%s value=%s selected=none\n",
-                        reason, override_env);
+                fprintf(stderr, "[SYCL-MOE-AGGREGATION] decision_override_reject=%s value=%s selected=none\n", reason,
+                        override_env);
             }
         }
     };
@@ -84497,17 +84617,16 @@ static bool moe_graph_block_span_should_record(const std::vector<int> & moe_node
     return end_node - start_node >= MIN_NON_MOE_BLOCK_GRAPHLET_NODES;
 }
 
-static bool moe_graph_block_graphs_match(ggml_backend_sycl_context * sycl_ctx,
-                                         const ggml_cgraph *         cgraph,
-                                         uint64_t                    graph_hash,
-                                         bool                        is_decode_phase,
-                                         int                         block_size,
-                                         uint64_t                    mode_hash,
+static bool moe_graph_block_graphs_match(ggml_backend_sycl_context *   sycl_ctx,
+                                         const ggml_cgraph *           cgraph,
+                                         uint64_t                      graph_hash,
+                                         bool                          is_decode_phase,
+                                         int                           block_size,
+                                         uint64_t                      mode_hash,
                                          const std::vector<uint64_t> & dispatch_identities) {
     if (!sycl_ctx || !cgraph || !sycl_ctx->moe_block_graphs_valid ||
         sycl_ctx->moe_block_graphs_n_nodes != cgraph->n_nodes || sycl_ctx->moe_block_graphs_hash != graph_hash ||
-        sycl_ctx->moe_block_graphs_mode_hash != mode_hash ||
-        sycl_ctx->moe_block_graphs_is_decode != is_decode_phase ||
+        sycl_ctx->moe_block_graphs_mode_hash != mode_hash || sycl_ctx->moe_block_graphs_is_decode != is_decode_phase ||
         sycl_ctx->moe_block_graphs_block_size != block_size ||
         sycl_ctx->moe_block_graphs_dispatch_identities != dispatch_identities || sycl_ctx->moe_block_graphs.empty()) {
         return false;
@@ -84521,10 +84640,9 @@ static bool moe_graph_block_graphs_match(ggml_backend_sycl_context * sycl_ctx,
             return false;
         }
         std::vector<uint64_t> block_dispatch_identities;
-        const uint64_t identity_hash = moe_graph_block_identity_signature(sycl_ctx, cgraph, block.start_node,
-                                                                          block.end_node, block.moe_nodes, mode_hash,
-                                                                          is_decode_phase, block_size,
-                                                                          &block_dispatch_identities);
+        const uint64_t        identity_hash =
+            moe_graph_block_identity_signature(sycl_ctx, cgraph, block.start_node, block.end_node, block.moe_nodes,
+                                               mode_hash, is_decode_phase, block_size, &block_dispatch_identities);
         if (identity_hash == 0 || identity_hash != block.identity_hash || block.mode_hash != mode_hash ||
             block.dispatch_identities != block_dispatch_identities) {
             return false;
@@ -84631,35 +84749,37 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
 
     std::vector<moe_graph_tensor_publish_snapshot> tensor_publish_snapshots;
     moe_graph_snapshot_cgraph_publish_state(cgraph, tensor_publish_snapshots);
-    const auto saved_mmid_skip                   = g_moe_precomputed_mmid_skip;
-    const auto saved_node_skip                   = g_moe_precomputed_node_skip;
-    const auto saved_residual_add_id_skip        = g_moe_precomputed_residual_add_id_skip;
-    const auto saved_down_layer_skip             = g_moe_precomputed_down_layer_skip;
-    const auto saved_down_sum_fusion_disabled    = g_moe_down_sum_fusion_disabled;
-    const auto saved_precomputed_down_sum_final  = g_moe_precomputed_down_sum_final;
-    const auto saved_last_residual_add_id_tensor = g_moe_last_residual_add_id_skip_tensor;
-    const auto saved_last_residual_add_id_kind   = g_moe_last_residual_add_id_skip_kind;
-    const auto saved_down_shadow                 = g_moe_down_shadow;
-    const auto saved_down_sum_shadow_entries     = g_moe_down_sum_shadow_entries;
-    const auto saved_persistent_moe_descriptors  = sycl_ctx->persistent_moe_descriptors;
+    const auto saved_mmid_skip                     = g_moe_precomputed_mmid_skip;
+    const auto saved_node_skip                     = g_moe_precomputed_node_skip;
+    const auto saved_residual_add_id_skip          = g_moe_precomputed_residual_add_id_skip;
+    const auto saved_down_layer_skip               = g_moe_precomputed_down_layer_skip;
+    const auto saved_down_sum_fusion_disabled      = g_moe_down_sum_fusion_disabled;
+    const auto saved_precomputed_down_sum_final    = g_moe_precomputed_down_sum_final;
+    const auto saved_last_residual_add_id_tensor   = g_moe_last_residual_add_id_skip_tensor;
+    const auto saved_last_residual_add_id_kind     = g_moe_last_residual_add_id_skip_kind;
+    const auto saved_down_shadow                   = g_moe_down_shadow;
+    const auto saved_down_sum_shadow_entries       = g_moe_down_sum_shadow_entries;
+    const auto saved_persistent_moe_descriptors    = sycl_ctx->persistent_moe_descriptors;
     const bool saved_persistent_descriptors_static = sycl_ctx->persistent_moe_descriptors_static_valid;
     auto       restore_block_recording_state       = [&]() {
-        g_moe_precomputed_mmid_skip            = saved_mmid_skip;
-        g_moe_precomputed_node_skip            = saved_node_skip;
-        g_moe_precomputed_residual_add_id_skip = saved_residual_add_id_skip;
-        g_moe_precomputed_down_layer_skip      = saved_down_layer_skip;
-        g_moe_down_sum_fusion_disabled         = saved_down_sum_fusion_disabled;
-        g_moe_precomputed_down_sum_final       = saved_precomputed_down_sum_final;
-        g_moe_last_residual_add_id_skip_tensor = saved_last_residual_add_id_tensor;
-        g_moe_last_residual_add_id_skip_kind   = saved_last_residual_add_id_kind;
-        g_moe_down_shadow                      = saved_down_shadow;
-        g_moe_down_sum_shadow_entries          = saved_down_sum_shadow_entries;
-        sycl_ctx->persistent_moe_descriptors   = saved_persistent_moe_descriptors;
+        g_moe_precomputed_mmid_skip                       = saved_mmid_skip;
+        g_moe_precomputed_node_skip                       = saved_node_skip;
+        g_moe_precomputed_residual_add_id_skip            = saved_residual_add_id_skip;
+        g_moe_precomputed_down_layer_skip                 = saved_down_layer_skip;
+        g_moe_down_sum_fusion_disabled                    = saved_down_sum_fusion_disabled;
+        g_moe_precomputed_down_sum_final                  = saved_precomputed_down_sum_final;
+        g_moe_last_residual_add_id_skip_tensor            = saved_last_residual_add_id_tensor;
+        g_moe_last_residual_add_id_skip_kind              = saved_last_residual_add_id_kind;
+        g_moe_down_shadow                                 = saved_down_shadow;
+        g_moe_down_sum_shadow_entries                     = saved_down_sum_shadow_entries;
+        sycl_ctx->persistent_moe_descriptors              = saved_persistent_moe_descriptors;
         sycl_ctx->persistent_moe_descriptors_static_valid = saved_persistent_descriptors_static;
         moe_graph_restore_tensor_publish_state(tensor_publish_snapshots);
     };
+
     struct block_recording_restore_guard {
         decltype(restore_block_recording_state) & restore;
+
         ~block_recording_restore_guard() { restore(); }
     } restore_guard{ restore_block_recording_state };
 
@@ -84714,9 +84834,9 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
         }
 
         std::vector<uint64_t> span_dispatch_identities;
-        const uint64_t identity_hash = moe_graph_block_identity_signature(sycl_ctx, cgraph, span_start, span_end,
-                                                                          span_moe_nodes, mode_hash, is_decode_phase,
-                                                                          block_size, &span_dispatch_identities);
+        const uint64_t        identity_hash =
+            moe_graph_block_identity_signature(sycl_ctx, cgraph, span_start, span_end, span_moe_nodes, mode_hash,
+                                               is_decode_phase, block_size, &span_dispatch_identities);
         if (identity_hash == 0) {
             if (ggml_sycl_graph_diag_enabled()) {
                 fprintf(stderr,
@@ -84890,14 +85010,14 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
         first_moe   = next_first_moe;
     }
 
-    sycl_ctx->moe_block_graphs            = std::move(recorded_blocks);
-    sycl_ctx->moe_block_graphs_n_nodes    = cgraph->n_nodes;
-    sycl_ctx->moe_block_graphs_hash       = graph_hash;
-    sycl_ctx->moe_block_graphs_mode_hash  = mode_hash;
-    sycl_ctx->moe_block_graphs_is_decode  = is_decode_phase;
-    sycl_ctx->moe_block_graphs_block_size = block_size;
+    sycl_ctx->moe_block_graphs                     = std::move(recorded_blocks);
+    sycl_ctx->moe_block_graphs_n_nodes             = cgraph->n_nodes;
+    sycl_ctx->moe_block_graphs_hash                = graph_hash;
+    sycl_ctx->moe_block_graphs_mode_hash           = mode_hash;
+    sycl_ctx->moe_block_graphs_is_decode           = is_decode_phase;
+    sycl_ctx->moe_block_graphs_block_size          = block_size;
     sycl_ctx->moe_block_graphs_dispatch_identities = std::move(dispatch_identities);
-    sycl_ctx->moe_block_graphs_valid      = !sycl_ctx->moe_block_graphs.empty();
+    sycl_ctx->moe_block_graphs_valid               = !sycl_ctx->moe_block_graphs.empty();
     GGML_LOG_INFO("[SYCL-MOE-BLOCK-GRAPHLET] recorded %zu block graphlets for %zu MoE dispatches (block_size=%d)\n",
                   sycl_ctx->moe_block_graphs.size(), moe_indices.size(), block_size);
     return sycl_ctx->moe_block_graphs_valid;
@@ -84948,18 +85068,18 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "first-post-pp");
         return false;
     }
-    const moe_graph_dispatch_plan block_dispatch_plan = moe_graph_collect_dispatch_indices(cgraph);
+    const moe_graph_dispatch_plan block_dispatch_plan  = moe_graph_collect_dispatch_indices(cgraph);
     const std::vector<int> &      block_dispatch_nodes = block_dispatch_plan.dispatch_indices;
     if (block_dispatch_nodes.empty() || moe_graph_descriptor_moe_dispatch_candidate_count(sycl_ctx, cgraph) == 0) {
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "no-candidates");
         return false;
     }
 
-    const uint64_t mode_hash = moe_sequence_graphlet_mode_hash();
+    const uint64_t        mode_hash = moe_sequence_graphlet_mode_hash();
     std::vector<uint64_t> dispatch_identities;
     dispatch_identities.reserve(block_dispatch_nodes.size());
-    ggml_tensor * first_candidate_node = nullptr;
-    auto collect_block_dispatch_identities = [&]() -> bool {
+    ggml_tensor * first_candidate_node              = nullptr;
+    auto          collect_block_dispatch_identities = [&]() -> bool {
         dispatch_identities.clear();
         for (int idx : block_dispatch_nodes) {
             if (idx < 0 || idx >= cgraph->n_nodes) {
@@ -85000,7 +85120,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
 
     try {
         if (moe_graph_block_graphs_match(sycl_ctx, cgraph, graph_hash, is_decode_phase, block_size, mode_hash,
-                                          dispatch_identities)) {
+                                         dispatch_identities)) {
             moe_graph_replay_block_graphs(sycl_ctx, cgraph);
             ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "replay", "none");
             return true;
@@ -85023,14 +85143,14 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "record-failed");
     } catch (const sycl::exception & exc) {
         g_graph_diag_counters.block_graphlet_failures.fetch_add(1, std::memory_order_relaxed);
-        sycl_ctx->moe_default_fast_path_quarantined = true;
+        sycl_ctx->moe_default_fast_path_quarantined       = true;
         sycl_ctx->moe_default_fast_path_quarantine_reason = "replay-exception";
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "context-quarantined");
         GGML_LOG_WARN("[SYCL-MOE-BLOCK-GRAPHLET] replay failed: %s; disabling block graphlets for this context\n",
                       exc.what());
     } catch (const std::exception & exc) {
         g_graph_diag_counters.block_graphlet_failures.fetch_add(1, std::memory_order_relaxed);
-        sycl_ctx->moe_default_fast_path_quarantined = true;
+        sycl_ctx->moe_default_fast_path_quarantined       = true;
         sycl_ctx->moe_default_fast_path_quarantine_reason = "replay-exception";
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "context-quarantined");
         GGML_LOG_WARN("[SYCL-MOE-BLOCK-GRAPHLET] replay failed: %s; disabling block graphlets for this context\n",
@@ -92565,12 +92685,12 @@ normal_dispatch:
     // contains only VRAM-resident layers whose pointers are stable — the
     // exceeds/evictions concern applies only to host-streamed layers which
     // are handled by the individual CPU suffix dispatch.
-    constexpr int MIN_GPU_PREFIX_NODES = 50;
-    const int     total_n_nodes        = cgraph->n_nodes;  // Save before any truncation
-    int           gpu_prefix_end       = -1;               // -1 = full graph (no prefix mode)
-    bool          use_sycl_graph       = false;
-    bool          graph_diag_reported  = false;
-    auto graph_diag_report_once = [&]() {
+    constexpr int MIN_GPU_PREFIX_NODES   = 50;
+    const int     total_n_nodes          = cgraph->n_nodes;  // Save before any truncation
+    int           gpu_prefix_end         = -1;               // -1 = full graph (no prefix mode)
+    bool          use_sycl_graph         = false;
+    bool          graph_diag_reported    = false;
+    auto          graph_diag_report_once = [&]() {
         if (graph_diag_reported) {
             return;
         }
@@ -92723,7 +92843,7 @@ normal_dispatch:
                          !sycl_ctx->graphs_disabled && check_graph_compatibility(*sycl_ctx, cgraph) &&
                          !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
     }
-    if (use_sycl_graph && cached_is_decode && g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph)) {
+    if (use_sycl_graph && cached_is_decode && ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) {
         static std::atomic<bool> logged{ false };
         bool disable_decode_graph_host_inputs = getenv("GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS") != nullptr;
         bool host_input_debug                 = getenv("GGML_SYCL_GRAPH_HOST_INPUT_DEBUG") != nullptr;
@@ -92859,7 +92979,7 @@ normal_dispatch:
         static std::atomic<int> logged{ 0 };
         const int               log_index = logged.fetch_add(1, std::memory_order_relaxed);
         if (log_index < 16 || (log_index % 64) == 0) {
-            const bool has_host_inputs = g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph);
+            const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);
             fprintf(stderr,
                     "[SYCL-SEG-MOE-POLICY] use_graph=%d candidates=%d free_vram=%.1fMB headroom_ok=%d "
                     "segments_match=%d moe_rerecord=%d has_host_inputs=%d graphs_disabled=%d moe_graphs_disabled=%d\n",
@@ -92978,7 +93098,7 @@ normal_dispatch:
         if ((g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) && !diag_tp_logged.exchange(true)) {
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: tensor-parallel mode active\n");
         }
-        if (g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph) &&
+        if (ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph) &&
             !diag_placement_host_logged.exchange(true)) {
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: placement plan + host intermediates in decode graph\n");
         }
@@ -92992,7 +93112,7 @@ normal_dispatch:
         if (!sycl_ctx->exec_graph && !sycl_ctx->graphs_disabled && !g_ggml_sycl_disable_graph &&
             !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
             !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) && !g_split_config.enabled &&
-            gpu_prefix_end < 0 && !(g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph)) &&
+            gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&
             !sycl_ctx->moe_graphs_disabled && !diag_compat_logged.exchange(true)) {
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: check_graph_compatibility() returned false\n");
         }
@@ -93043,6 +93163,7 @@ normal_dispatch:
 
     struct graph_diag_report_guard {
         decltype(graph_diag_report_once) & report_once;
+
         ~graph_diag_report_guard() { report_once(); }
     } graph_diag_guard{ graph_diag_report_once };
 
@@ -93091,7 +93212,7 @@ normal_dispatch:
         }
 
         if (is_prompt_phase &&
-            ((g_has_placement_plan || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&
+            ((ggml_sycl_has_global_plan() || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&
              ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID))) {
             // Placement-planned MoE PP must use the direct executor.  The direct
             // path builds selected-ID pointer tables and materializes prompt
@@ -93725,8 +93846,8 @@ normal_dispatch:
     // retained by the barrier event below instead of being released immediately.
     const bool queue_in_order =
         sycl_ctx && sycl_ctx->stream() && sycl_ctx->stream()->has_property<sycl::property::queue::in_order>();
-    const bool has_pending_non_defer_graphlets = g_moe_direct_graphlet_pending_replays > 0 ||
-                                                 g_moe_block_graphlet_pending_replays > 0;
+    const bool has_pending_non_defer_graphlets =
+        g_moe_direct_graphlet_pending_replays > 0 || g_moe_block_graphlet_pending_replays > 0;
     const bool can_defer_exit_wait = cached_is_decode && gpu_prefix_end < 0 && queue_in_order &&
                                      !ggml_sycl_cpu_offload_enabled() && !g_split_config.enabled &&
                                      !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
@@ -93761,8 +93882,8 @@ normal_dispatch:
 #ifdef GGML_SYCL_GRAPH
     if (g_moe_direct_graphlet_pending_replays > 0 || g_moe_block_graphlet_pending_replays > 0 ||
         g_moe_sequence_graphlet_pending_replays > 0) {
-        const auto     t_exit_wait_end        = std::chrono::high_resolution_clock::now();
-        const uint64_t wait_ns                = ggml_sycl_graph_diag_elapsed_ns(t_exit_wait, t_exit_wait_end);
+        const auto     t_exit_wait_end         = std::chrono::high_resolution_clock::now();
+        const uint64_t wait_ns                 = ggml_sycl_graph_diag_elapsed_ns(t_exit_wait, t_exit_wait_end);
         const bool     sequence_drain_deferred = can_defer_exit_wait && sycl_ctx->last_graph_event_deferred_decode;
         if (g_moe_direct_graphlet_pending_replays > 0) {
             ggml_sycl_graph_diag_add_ns(g_graph_diag_counters.direct_graphlet_drain_ns, wait_ns);
@@ -94646,7 +94767,9 @@ static bool ggml_sycl_layer_has_host_gate_weight(int layer_id, int device) {
         return false;
     }
 
-    const auto & plan             = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto & plan             = *plan_owner;
     const auto   gate_weight_name = std::string("blk.") + std::to_string(layer_id) + ".ffn_gate_inp.weight";
 
     if (!plan.has_dense_entry(gate_weight_name)) {
@@ -94731,7 +94854,9 @@ static bool ggml_sycl_moe_tensor_all_experts_on_host(const ggml_tensor * tensor,
         return false;
     }
 
-    const auto &  plan      = cache->get_placement_plan();
+    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
+    const auto &  plan      = *plan_owner;
     const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
     for (int64_t expert_id = 0; expert_id < n_experts; ++expert_id) {
         if (plan.expert_on_device(tensor->name, static_cast<int>(expert_id), device)) {
@@ -94877,7 +95002,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
         return n04bq_tr_final(false, "no_layer_id");
     }
 
-    const int  layer_dev = cache->get_placement_plan().get_layer_device(layer_id);
+    const int  layer_dev = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);
     const bool ret       = layer_dev < 0;
     return n04bq_tr_final(ret, ret ? "layer_device<0" : "layer_device>=0");
 }

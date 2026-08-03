@@ -20,8 +20,12 @@
 
 #include "common.hpp"
 
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <thread>
 
 // expert_tensor_role and its helpers live in namespace ggml_sycl
 // (unified-cache.hpp:43), while tensor_usage / infer_tensor_usage resolve
@@ -33,6 +37,60 @@ namespace {
 
 int n_pass = 0;
 int n_fail = 0;
+
+void check_concurrent_snapshot_publication() {
+    using snapshot_ptr = std::shared_ptr<const lifecycle_plan_snapshot>;
+    snapshot_ptr                authority;
+    std::array<snapshot_ptr, 2> caches;
+    std::atomic<bool>           stop{ false };
+    std::atomic<int>            mixed_accepted{ 0 };
+
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto global = std::atomic_load_explicit(&authority, std::memory_order_acquire);
+            if (!global) {
+                continue;
+            }
+            for (auto & slot : caches) {
+                const auto cached = std::atomic_load_explicit(&slot, std::memory_order_acquire);
+                if (lifecycle_plan_snapshot_matches(global, cached) &&
+                    (cached->plan->weight_host_bytes != cached->version || cached->model_id != 77 ||
+                     cached->load_txn_id != 88)) {
+                    mixed_accepted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+
+    for (uint64_t version = 1; version <= 20000; ++version) {
+        auto plan               = std::make_shared<placement_plan>();
+        plan->weight_host_bytes = version;
+        auto next               = std::make_shared<lifecycle_plan_snapshot>();
+        next->model_id          = 77;
+        next->load_txn_id       = 88;
+        next->slot              = 3;
+        next->slot_generation   = 9;
+        next->version           = version;
+        next->plan              = std::move(plan);
+        snapshot_ptr immutable  = std::move(next);
+        // Cache-first/global-last is the production restore order. Readers may
+        // reject an in-flight mixture, but must never accept it as coherent.
+        std::atomic_store_explicit(&caches[0], immutable, std::memory_order_release);
+        std::atomic_store_explicit(&caches[1], immutable, std::memory_order_release);
+        if ((version % 127) == 0) {
+            std::atomic_store_explicit(&authority, snapshot_ptr{}, std::memory_order_release);
+        }
+        std::atomic_store_explicit(&authority, std::move(immutable), std::memory_order_release);
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+    if (mixed_accepted.load(std::memory_order_relaxed) == 0) {
+        n_pass++;
+    } else {
+        printf("FAIL concurrent snapshot publication accepted a mixed version\n");
+        n_fail++;
+    }
+}
 
 void check_usage(const char * name, tensor_usage expected) {
     const tensor_usage got = infer_tensor_usage(name);
@@ -58,6 +116,8 @@ void check_role(const char * name, expert_tensor_role expected) {
 }  // namespace
 
 int main() {
+    check_concurrent_snapshot_publication();
+
     // Lifecycle snapshots own one full plan per model, not one summary per
     // device cache. This also verifies explicit no-plan publication and plan
     // deletion without requiring a GPU queue.

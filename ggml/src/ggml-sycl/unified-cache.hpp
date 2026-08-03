@@ -1026,17 +1026,30 @@ struct lifecycle_plan_snapshot {
     std::shared_ptr<const placement_plan> plan;
 };
 
+// Read-entry identity validation. A pointer-identical publication is always
+// coherent. Otherwise every version and model-token component must match;
+// callers fail closed when this returns false.
+inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycle_plan_snapshot> & authority,
+                                            const std::shared_ptr<const lifecycle_plan_snapshot> & cache) noexcept {
+    return authority && cache && authority->plan && cache->plan &&
+           (authority.get() == cache.get() ||
+            (authority->version == cache->version && authority->model_id == cache->model_id &&
+             authority->load_txn_id == cache->load_txn_id && authority->slot == cache->slot &&
+             authority->slot_generation == cache->slot_generation));
+}
+
 void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan);
 void lifecycle_stage_no_placement_plan(uint64_t load_txn_id);
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
-bool                                           lifecycle_publish_placement_plan(uint64_t model_id,
-                                                                                uint64_t load_txn_id,
-                                                                                uint32_t slot,
-                                                                                uint64_t slot_generation,
-                                                                                uint64_t actual_host_bytes,
-                                                                                uint64_t actual_device_bytes,
-                                                                                bool     have_actual,
-                                                                                std::shared_ptr<const lifecycle_plan_snapshot> * published_out = nullptr) noexcept;
+bool lifecycle_publish_placement_plan(
+    uint64_t                                         model_id,
+    uint64_t                                         load_txn_id,
+    uint32_t                                         slot,
+    uint64_t                                         slot_generation,
+    uint64_t                                         actual_host_bytes,
+    uint64_t                                         actual_device_bytes,
+    bool                                             have_actual,
+    std::shared_ptr<const lifecycle_plan_snapshot> * published_out = nullptr) noexcept;
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
@@ -1551,8 +1564,8 @@ struct unified_cache_entry {
     // decisions actually need.  owner_tagged distinguishes "no owner left"
     // (reclaimable) from "never attributed to any model" (e.g. materialized at
     // runtime, outside a load) -- the latter is kept while any model is live.
-    uint32_t              owner_mask   = 0;
-    bool                  owner_tagged = false;
+    uint32_t              owner_mask            = 0;
+    bool                  owner_tagged          = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -2203,8 +2216,8 @@ class unified_cache {
     }
 
     void set_placement_plan(placement_plan && plan) {
-        auto snapshot    = std::make_shared<lifecycle_plan_snapshot>();
-        snapshot->plan   = std::make_shared<const placement_plan>(std::move(plan));
+        auto snapshot     = std::make_shared<lifecycle_plan_snapshot>();
+        snapshot->plan    = std::make_shared<const placement_plan>(std::move(plan));
         snapshot->version = placement_plan_local_version_.fetch_add(1, std::memory_order_relaxed) + 1;
         set_placement_plan_snapshot(std::move(snapshot));
     }
@@ -2213,7 +2226,9 @@ class unified_cache {
 
     void update_placement_plan_runtime_kv(uint32_t n_ctx, size_t kv_per_layer, size_t kv_per_swa_layer) {
         auto current = get_placement_plan_snapshot();
-        if (!current || !current->plan) return;
+        if (!current || !current->plan) {
+            return;
+        }
         auto plan = std::make_shared<placement_plan>(*current->plan);
         plan->update_runtime_kv_sizes(n_ctx, kv_per_layer, kv_per_swa_layer);
         auto next     = std::make_shared<lifecycle_plan_snapshot>(*current);
@@ -2230,7 +2245,9 @@ class unified_cache {
     // P4.5: Check if tensor is assigned to THIS device in a multi-device plan.
     bool plan_on_this_device(const std::string & tensor_name, int this_device) const {
         auto snapshot = get_placement_plan_snapshot();
-        if (!snapshot || !snapshot->plan) return true;
+        if (!snapshot || !snapshot->plan) {
+            return true;
+        }
         return snapshot->plan->multi_device ? snapshot->plan->is_on_device(tensor_name, this_device) :
                                               snapshot->plan->is_on_device(tensor_name);
     }
@@ -2245,18 +2262,32 @@ class unified_cache {
         return snapshot && snapshot->plan && snapshot->plan->has_host_experts(tensor_name, n_experts, device_id);
     }
 
-    // Transitional value accessor: deliberately returns a copy, never an
-    // unprotected reference. New multi-step readers should retain the snapshot.
-    placement_plan get_placement_plan() const {
+    // Owning read API. The returned plan owner must be retained for the whole
+    // operation whenever references, pointers, iterators, or loops are derived
+    // from the plan. Returning a shared immutable empty plan keeps legacy
+    // no-plan semantics without a hot-path deep copy.
+    std::shared_ptr<const placement_plan> get_placement_plan_owner() const {
         auto snapshot = get_placement_plan_snapshot();
-        return snapshot && snapshot->plan ? *snapshot->plan : placement_plan{};
+        if (snapshot && snapshot->plan) {
+            return snapshot->plan;
+        }
+        static const auto empty = std::make_shared<const placement_plan>();
+        return empty;
     }
+
+    // Bounded, non-hot compatibility copy for common.hpp residency summaries.
+    // Execution readers must use get_placement_plan_owner().
+    placement_plan get_placement_plan() const { return *get_placement_plan_owner(); }
 
     bool demote_expert_placement_to_host(const std::string & tensor_name, int expert_id) {
         auto current = get_placement_plan_snapshot();
-        if (!current || !current->plan) return false;
+        if (!current || !current->plan) {
+            return false;
+        }
         auto plan = std::make_shared<placement_plan>(*current->plan);
-        if (!plan->demote_expert_placement_to_host(tensor_name, expert_id)) return false;
+        if (!plan->demote_expert_placement_to_host(tensor_name, expert_id)) {
+            return false;
+        }
         auto next     = std::make_shared<lifecycle_plan_snapshot>(*current);
         next->plan    = std::move(plan);
         next->version = placement_plan_local_version_.fetch_add(1, std::memory_order_relaxed) + 1;
