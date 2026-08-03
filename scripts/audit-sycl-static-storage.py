@@ -36,7 +36,6 @@ DECLARATOR_KINDS = {
     "reference_declarator", "array_declarator", "parenthesized_declarator",
     "qualified_identifier", "attributed_declarator",
 }
-FUNCTIONISH = {"function_declarator", "function_definition"}
 SCOPE_KINDS = {
     "function_definition", "lambda_expression", "class_specifier", "struct_specifier",
     "union_specifier", "namespace_definition", "ERROR",
@@ -92,10 +91,6 @@ def text(source_b: bytes, node) -> str:
 def line_of(source_b: bytes, node_or_offset) -> int:
     offset = node_or_offset if isinstance(node_or_offset, int) else start_byte(node_or_offset)
     return source_b.count(b"\n", 0, offset) + 1
-
-
-def contains_kind(node, kinds: set[str]) -> bool:
-    return any(kind(item) in kinds for item in walk(node))
 
 
 def declarator_name(source_b: bytes, node):
@@ -169,7 +164,7 @@ def declarator_core(node):
     return field(node, "declarator") if kind(node) == "init_declarator" else node
 
 
-def is_top_level_immutable(source_b: bytes, decl, declarator):
+def is_top_level_immutable(source_b: bytes, decl, declarator, name_node):
     """Distinguish const object/pointer from const pointee/template argument."""
     declaration_qualifiers = direct_qualifiers(source_b, decl)
     core = declarator_core(declarator)
@@ -179,6 +174,17 @@ def is_top_level_immutable(source_b: bytes, decl, declarator):
         return "const" in direct_qualifiers(source_b, core)
     if kind(core) == "reference_declarator":
         return True  # the binding cannot be reseated; pointee mutability is not binding mutability
+    if kind(core) == "function_declarator":
+        item = parent(name_node)
+        while item is not None and item != core:
+            item_kind = kind(item)
+            if item_kind == "pointer_declarator":
+                return "const" in direct_qualifiers(source_b, item)
+            if item_kind == "reference_declarator":
+                return True
+            if item_kind == "array_declarator":
+                break
+            item = parent(item)
     return "const" in declaration_qualifiers
 
 
@@ -203,6 +209,22 @@ def initializer_free_type(source_b: bytes, decl, first_declarator, declarator, n
     return " ".join(part for part in (base, before + after) if part).strip()
 
 
+def is_function_declaration(name_node, core):
+    """True when () binds to the name, not through an object pointer/reference/array."""
+    item = parent(name_node)
+    object_shapes = {"pointer_declarator", "reference_declarator", "array_declarator"}
+    while item is not None:
+        item_kind = kind(item)
+        if item_kind == "function_declarator":
+            return True
+        if item_kind in object_shapes:
+            return False
+        if item == core:
+            break
+        item = parent(item)
+    return False
+
+
 def declaration_rows(source_b: bytes, decl, recovered_regions):
     scope, local = named_scope(source_b, decl, recovered_regions)
     storage = storage_specifiers(source_b, decl)
@@ -215,17 +237,18 @@ def declaration_rows(source_b: bytes, decl, recovered_regions):
     type_end = end_byte(type_node) if type_node else start_byte(decl)
     declarators = [
         item for item in children(decl)
-        if kind(item) in DECLARATOR_KINDS and start_byte(item) >= type_end
+        if (kind(item) in DECLARATOR_KINDS or kind(item) == "function_declarator")
+        and start_byte(item) >= type_end
     ]
     rows = []
     for declarator in declarators:
         core = declarator_core(declarator)
-        if contains_kind(core, FUNCTIONISH):
-            continue
         result = declarator_name(source_b, core)
         if not result:
             continue
         name, name_node = result
+        if is_function_declaration(name_node, core):
+            continue
         initialized = kind(declarator) == "init_declarator"
         if "extern" in storage and not initialized and not scope.startswith("class:"):
             continue  # declaration only; no storage definition in this translation unit
@@ -236,7 +259,7 @@ def declaration_rows(source_b: bytes, decl, recovered_regions):
             "storage": storage,
             "name_node": name_node,
             "decl_line": line_of(source_b, decl),
-            "immutable": is_top_level_immutable(source_b, decl, declarator),
+            "immutable": is_top_level_immutable(source_b, decl, declarator, name_node),
         })
     return rows
 
@@ -528,6 +551,18 @@ namespace two { static std::vector<int> same; }
 void direct_fn() { static Widget direct{3}; }
 static int first, * second, third{3};
 namespace ext { extern int declaration_only; extern int definition = 1; }
+static int actual_function(int);
+static int (*file_function_pointer)(int);
+static int (&file_function_reference)(int) = target_function;
+struct FunctionPointers {
+    static int (*class_function_pointer)(int);
+    static int actual_method(int);
+};
+void pointer_owner() {
+    static int (*local_function_pointer)(int);
+    auto fn = [] { static int (*lambda_function_pointer)(int); };
+}
+static int (*function_pointer_array[3])(int);
 """
     _, rows, gaps, _, failures = parse_source(parser, source)
     assert not gaps and not failures
@@ -543,6 +578,18 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
     assert by_name["direct"][0]["type"] == "Widget"
     assert all(name in by_name for name in ("first", "second", "third"))
     assert "declaration_only" not in by_name and "definition" in by_name
+    assert "actual_function" not in by_name and "actual_method" not in by_name
+    function_objects = {
+        "file_function_pointer": ("int (*)(int)", "file", False),
+        "file_function_reference": ("int (&)(int)", "file", True),
+        "class_function_pointer": ("int (*)(int)", "class:FunctionPointers", False),
+        "local_function_pointer": ("int (*)(int)", "function-local:pointer_owner", False),
+        "lambda_function_pointer": ("int (*)(int)", "function-local:<lambda>", False),
+        "function_pointer_array": ("int (*[3])(int)", "file", False),
+    }
+    for name, expected in function_objects.items():
+        row = by_name[name][0]
+        assert (row["type"], row["scope"], row["immutable"]) == expected, (name, row)
     same_rows = by_name["same"]
     lines = source.splitlines()
     for row in same_rows:
@@ -589,6 +636,7 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
         line: (symbol, "file") for line, symbol in expected_file_scopes.items()
     }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
+          "function-pointer-object-scopes,"
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
           "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
           "template-lambda-wrong-close,nested-function-lambda-wrong-close,file-tail-scopes")

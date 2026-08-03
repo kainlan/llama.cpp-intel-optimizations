@@ -17,8 +17,10 @@ The generator pins and checks the C++ grammar ABI 15 through
 `tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
 different installed version. It walks C++
 `declaration` and `field_declaration` nodes rather than matching declaration
-text. Each declarator in a multi-object declaration becomes its own row. The
-scope walk includes file and named-namespace objects, anonymous-namespace
+text. Each declarator in a multi-object declaration becomes its own row. Actual
+function declarations are excluded by declarator binding shape, while
+pointer/reference-to-function objects (including arrays) remain census objects.
+The scope walk includes file and named-namespace objects, anonymous-namespace
 objects without the `static` spelling, function-local `static`/`thread_local`
 objects (including `bias_detect_flag`), and class/header static declarations.
 Every row includes an initializer-free AST-derived type and top-level binding
@@ -82,8 +84,12 @@ without writing output when a recovery node or storage marker lacks proof.
 pointer, mutable containers/atomics, repeated names in different bindings,
 initializer-free direct initialization, fail-closed namespace recovery,
 multi-object declarations, and namespaced `extern` declaration versus
-definition. Negative fixtures also require rejection of malformed recovery in
-a function body (`void f(){ static Widget x{; }`), across a structural
+definition. Positive function-object fixtures verify names, initializer-free
+types, scopes, and binding mutability for file/class/function/lambda function
+pointers, a function reference, and a function-pointer array, while actual
+function declarations remain excluded. Negative fixtures also require rejection
+of malformed recovery in a function body (`void f(){ static Widget x{; }`),
+across a structural
 preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
 in an oversized recovered-function `ERROR` tail containing a malformed implicit
 global. The parsed-function recovery fixture
