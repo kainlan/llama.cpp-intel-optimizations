@@ -145,21 +145,24 @@ or failure. Reset/teardown uses exact typed tickets, including reset epochs that
 prevent ABA.
 
 Allocation identity, semantic owner, and asynchronous use are distinct. One
-exclusive top-level token per device is copied into submits. Lifecycle authority
-is an aggregate with separate root retention and terminal-event sets for each
-`(ContextId, device)`, not one cross-context join. Join creation failure drains
-known events outside locks; uncertain submission quarantines roots/backing until
-queue quiescence is proven. Same-owner reentrancy copies the exact InvocationId;
-busy/wait and multi-device all-or-none rules remain explicit.
+exclusive top-level token per device is copied into submits. Each invocation binds exactly one `ContextId`/`GraphEpoch` across its devices;
+a cross-context/epoch submit fails before side effects. Lifecycle authority is
+an aggregate with separate root retention and terminal-event sets per device,
+not one cross-context join. Join creation failure drains known events outside
+locks; uncertain submission quarantines roots/backing until queue quiescence is
+proven. Same-owner reentrancy copies the exact InvocationId; busy/wait and
+multi-device all-or-none rules remain explicit.
 
 Every async pointer has a backing lifetime. Bare `DIRECT` requires a validated
 owner/backing lease and ARENA handles retain arena/chunk generation. A retiring
 `GraphEpoch` completion releases only old-epoch resources, never replacement
 state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner registries
-→ L4 cache → L5 allocator ordering; global/transitional same-rank co-holding is
-forbidden and completion/diagnostic locks are isolated. No wait of any kind,
-callback, blocking call, or final handle/token/backing destruction occurs under
-a listed lock. Tier verdicts are reporting-only.
+→ L4 cache/queue registry → L5 allocator/work ordering; the canonical table
+includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue, and
+backend-context locks. Global/transitional same-rank co-holding is forbidden and
+completion/diagnostic locks C/D are isolated. No wait, blocking allocation/device
+call, queue create/destroy, callback, or final handle/token/backing destruction
+occurs under a listed lock. Tier verdicts are reporting-only.
 
 **Current exceptions during migration.** Current code still has bare slot masks,
 process-global load/planner scratch, device-only pending-KV FIFO,
@@ -171,8 +174,9 @@ exceptions to preserve or descriptions of supported concurrency.
 Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
 registry primitives/create/publish; `y36c` owns legacy drain/reset/teardown
 callers), DAG (`nn6z → nlww → vbeb → h5m4 → y36c`, `t5nq` before teardown,
-`.15.13 → h5m4`), G1/G7 ownership, legacy supersession, H1-H14/G1-G7,
-hash-pinned distinct/shared fixtures, split M6/expanded M7, and final `hcyp`
+`.15.13 → h5m4`), G1/G7 ownership, token-only G5a versus teardown-only G5b,
+legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
+independent ordinary/sidecar/pointer-table M6 mutants and L1-L5/C/D M7, and final `hcyp`
 script+fixture+CSV+prose refresh after main's self-test repair.
 
 ## Path-scoped zone sizing

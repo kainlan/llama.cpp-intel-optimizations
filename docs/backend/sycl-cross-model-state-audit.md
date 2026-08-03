@@ -189,6 +189,10 @@ Line numbers are review aids and may drift; the symbols/behaviors are the gate.
 | `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
 | `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
 | `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
+| `unified-cache.cpp:11305-11394` | `g_onednn_scratch_lock_mutex` registry stores/destroys per-cache `unique_lock` values | global/same-rank co-hold and destruction-under-lock migration: `t5nq` |
+| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | blocking allocation/device/final-owner work under metadata lock: `t5nq`, `h5m4` |
+| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/device work must use reserve-create-publish: `t5nq` |
+| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | target snapshot must carry an owner lease: `nlww`, `t5nq` |
 
 Recheck these anchors without relying on a size-limited index:
 
@@ -198,6 +202,9 @@ awk 'NR>=9238 && NR<=9275 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
 awk 'NR>=9736 && NR<=10096 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
 awk 'NR>=85621 && NR<=85670 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
 awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.hpp
+awk 'NR>=11305 && NR<=11394 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.cpp
+awk 'NR>=13788 && NR<=14012 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.cpp
+awk 'NR>=14726 && NR<=14742 || NR>=17122 && NR<=17131 || NR>=76070 && NR<=76100 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
 ```
 
 ### Audit disposition by required identity
@@ -209,22 +216,28 @@ awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.
 | KV/RUNTIME/SCRATCH/oneDNN/staging | `ContextId`; KV rows also `SessionId` | exact context/session only; whole-device reset must refuse |
 | session reset | `(ContextId, SessionId, SessionResetEpoch)` | nonwrapping exact ticket; stale reset N cannot finish/reset N+1 |
 | recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
-| async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one token/device; aggregate retains separate roots/terminal sets per context/device; no cross-context join authority |
+| async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | invocation binds one ContextId/GraphEpoch across devices; per-device roots/terminal sets; cross-context/epoch submit rejected before side effects |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
 
 IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
 and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and
 without registry/planner/reset side effects; it cannot fall back to unattributed
 ownership. Context, session, graph, reset-ABA, retiring completion, and aggregate
-join-failure/quarantine behavior are canonical §12.2-§12.3.
+join-failure/quarantine behavior are canonical §12.2-§12.3. H14 explicitly
+distinguishes never-issued `SessionId`/`GraphEpoch` (`NOT_FOUND`) from stale,
+previously-issued identities (`STALE_IDENTITY`).
 
 The concrete ranks are lifecycle/ID (L1) → per-device execution registry (L2) →
 model/context/session/graph (L3) → all listed cache metadata locks (L4) → all
-listed zone/staging/pool/work locks (L5). Global/transitional locks use a
-sentinel for diagnostics and cannot co-hold a keyed same-rank lock. Completion C
-and diagnostics D are isolated. Every event/queue/future/condition wait,
-callback, blocking device call, and final handle/token/backing destruction is
-forbidden under L1-L5/C; audit evidence includes every H8/M7 pair.
+listed zone/staging/pool/work locks (L5). The canonical exhaustive table now
+includes `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`,
+`g_pipeline_copy_queue_mutex`, block-exec `copy_queue_mutex`, and
+`g_backend_context_by_device_mutex`, including their allocation/queue/final-owner
+under-lock hazards. Global/transitional locks use a sentinel and cannot co-hold
+a keyed same-rank lock. Completion C and diagnostics D are isolated. Every wait,
+callback, blocking allocation/device operation, queue construction/destruction,
+and final handle/token/backing destruction is forbidden under L1-L5/C/D;
+H8/M7 must cover every operation/rank and each named lock alias.
 
 ### Child and final-census gates
 
@@ -232,10 +245,10 @@ forbidden under L1-L5/C; audit evidence includes every H8/M7 pair.
 |---|---|
 | `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
 | `nlww` | context/session/reset-epoch registries and state primitives/create/publish; named ticket APIs only |
-| `vbeb` | graph/invocation identities, retiring isolation, one token/device, per-context/device aggregate+quarantine; owns G7 |
-| `h5m4` | submit payload retains handles/DIRECT/ARENA backing through each pair's terminal set |
+| `vbeb` | graph/invocation identities, one context/epoch per invocation, retiring isolation, one token/device, per-device aggregate+quarantine; owns G5a/G7 |
+| `h5m4` | independently retains ordinary I/O, sidecar, pointer-table, DIRECT-owner, and ARENA backing through each device terminal set; reruns G5a at P4 |
 | `t5nq` | exhaustive current/planned lock inventory, sentinel/tie-break, all wait/callback/blocking/final-destruction probes |
-| `y36c` | owns legacy drain/reset/teardown callers via `nlww` tickets; never edits context/session registry primitives |
+| `y36c` | owns legacy drain/reset/teardown callers and teardown-only G5b via `nlww` tickets; never edits context/session registry primitives |
 | `x3ou` | all tier-verdict readers are reporting-only |
 | `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
@@ -243,11 +256,11 @@ Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
 vbeb → h5m4 → y36c`, with `t5nq` also preceding `y36c` and an explicit
 `32dg8.15.13 → h5m4` API edge. It supersedes stale `32dg8.2` ownership
 assumptions and maps `.15.10/.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
-editing. The exact H1-H14/G1-G7 commands, distinct B plus shared-copy hash-pinned
-fixtures, same/multi-device UUID assertions, and executable/restoring split-M6
-and expanded-M7 hooks are canonical §12.9. Multiple LIVE models and sequential A→B→A are separate gates;
-neither proves overlapping execution, which must serialize/reject through the
-final-join-held token.
+editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
+shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
+M6 payload mutants, and L1-L5/C/D M7 hooks are canonical §12.9. Multiple LIVE
+models and sequential A→B→A are separate gates; neither proves overlapping
+execution, which must serialize/reject through per-device aggregate roots.
 
 **Census status now:** the checked-in inventory remains the historical
 `5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
