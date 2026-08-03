@@ -4,9 +4,9 @@
 // Verifies that the unified kernel dispatch path is connected to the
 // production mul_mat code path in ggml-sycl.cpp.
 //
-// This test ensures that when GGML_SYCL_UNIFIED_DISPATCH=1 is set,
-// the unified dispatch function is called instead of the legacy
-// DMMV/MMVQ/MMQ kernel cascade.
+// This test ensures that when GGML_SYCL_UNIFIED_DISPATCH is enabled
+// (unset or atoi(value) != 0), the unified dispatch function is called
+// instead of the legacy DMMV/MMVQ/MMQ kernel cascade.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <random>
 #include <vector>
 #include <sycl/sycl.hpp>
@@ -846,14 +845,14 @@ static void test_unified_kernel_numeric_large_sampled() {
 static void test_production_path_uses_unified_dispatch() {
     TEST_BEGIN("production_path_uses_unified_dispatch");
 
-    // This test verifies that when GGML_SYCL_UNIFIED_DISPATCH=1 is set,
-    // the production ggml_sycl_mul_mat() function will call the unified
-    // dispatch path instead of the legacy DMMV/MMVQ/MMQ kernel cascade.
+    // This test verifies that when GGML_SYCL_UNIFIED_DISPATCH is enabled
+    // (unset or atoi(value) != 0), the production ggml_sycl_mul_mat() function
+    // will call the unified dispatch path instead of the legacy kernel cascade.
     //
     // The integration was added to ggml-sycl.cpp at the start of
     // ggml_sycl_mul_mat() which checks:
-    // 1. Environment variable GGML_SYCL_UNIFIED_DISPATCH=1
-    // 2. Supported quantization type (Q4_0, Q8_0, Q6_K, Q4_K)
+    // 1. Environment variable GGML_SYCL_UNIFIED_DISPATCH is unset or atoi(value) != 0
+    // 2. Supported quantization type (Q4_0 or MXFP4)
     //
     // When both conditions are met, it calls:
     //   ggml_sycl::ggml_sycl_mul_mat_unified_default()
@@ -864,19 +863,19 @@ static void test_production_path_uses_unified_dispatch() {
     (void)func_ptr;  // Suppress unused warning
 
     // Verify should_use_unified helper exists
-    bool should_use_q4_0 = ggml_sycl::should_use_unified(GGML_TYPE_Q4_0);
-    bool should_use_q8_0 = ggml_sycl::should_use_unified(GGML_TYPE_Q8_0);
-    bool should_use_f16 = ggml_sycl::should_use_unified(GGML_TYPE_F16);
+    bool should_use_q4_0  = ggml_sycl::should_use_unified(GGML_TYPE_Q4_0);
+    bool should_use_mxfp4 = ggml_sycl::should_use_unified(GGML_TYPE_MXFP4);
+    bool should_use_q8_0  = ggml_sycl::should_use_unified(GGML_TYPE_Q8_0);
 
-    // Q4_0 and Q8_0 should be supported, F16 should not be (yet)
+    // dispatch.hpp currently supports Q4_0 and MXFP4; Q8_0 remains on the legacy path.
     if (!should_use_q4_0) {
         TEST_FAIL("should_use_unified(Q4_0) returned false, expected true");
     }
-    if (!should_use_q8_0) {
-        TEST_FAIL("should_use_unified(Q8_0) returned false, expected true");
+    if (!should_use_mxfp4) {
+        TEST_FAIL("should_use_unified(MXFP4) returned false, expected true");
     }
-    if (should_use_f16) {
-        TEST_FAIL("should_use_unified(F16) returned true, expected false");
+    if (should_use_q8_0) {
+        TEST_FAIL("should_use_unified(Q8_0) returned true, expected false");
     }
 
     // Integration verified - the code path is connected
@@ -892,8 +891,8 @@ int main() {
     // before running any subtest so a disabled unified dispatch cannot produce
     // a vacuous pass after exercising only direct-kernel helpers.
     const char * env = std::getenv("GGML_SYCL_UNIFIED_DISPATCH");
-    if (!env || std::strcmp(env, "1") != 0) {
-        fprintf(stderr, "SKIP: GGML_SYCL_UNIFIED_DISPATCH=1 is required.\n");
+    if (env && std::atoi(env) == 0) {
+        fprintf(stderr, "SKIP: GGML_SYCL_UNIFIED_DISPATCH is explicitly disabled.\n");
         return 77;
     }
 
