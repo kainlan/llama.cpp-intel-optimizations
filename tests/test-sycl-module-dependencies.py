@@ -28,7 +28,9 @@ else:
 
 if "ggml-cpu" in deps.lower() or "ggml_cpu" in deps.lower():
     raise SystemExit("SYCL module has a CPU DT_NEEDED/import dependency:\n" + deps)
-for forbidden in ("ggml_get_type_traits_cpu", "ggml_graph_plan", "ggml_graph_compute", "ggml_threadpool_new", "ggml_threadpool_free"):
+for forbidden in ("ggml_backend_reg_by_name", "ggml_backend_reg_get_proc_address", "ggml_backend_dev_init",
+                  "ggml_backend_graph_compute", "ggml_get_type_traits_cpu", "ggml_graph_plan",
+                  "ggml_graph_compute", "ggml_threadpool_new", "ggml_threadpool_free"):
     if forbidden in symbols:
         raise SystemExit(f"SYCL module directly imports forbidden CPU symbol {forbidden}")
 print("SYCL module dependency contract: PASS")

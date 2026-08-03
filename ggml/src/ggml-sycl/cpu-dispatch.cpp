@@ -984,6 +984,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             const int    K          = t0.K;
             const size_t row_stride = ggml_row_size(t0.type, K);
             const int    nb         = K / QK_MXFP4;
+            const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_MXFP4);
 
             // Collect Q8_0 activation pointers for all tokens in this group
             std::vector<const uint8_t *> act_ptrs(M);
@@ -1000,7 +1001,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             ggml_sycl_cpu_arena().execute([&] {
                 ggml_sycl_tbb::parallel_for(
                     ggml_sycl_tbb::blocked_range<int>(0, N, 4),
-                    [wptr, act_data, out_data, M, nb, row_stride, K](const ggml_sycl_tbb::blocked_range<int> & range) {
+                    [wptr, act_data, out_data, M, nb, row_stride, K, cpu_traits](const ggml_sycl_tbb::blocked_range<int> & range) {
                         constexpr int TILE_BLK = 16;
                         for (int r = range.begin(); r < range.end(); r++) {
                             const char * weight_row = (const char *) wptr + (size_t) r * row_stride;
@@ -1024,8 +1025,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
                             }
                             // Remainder: 1 activation at a time via vec_dot
                             for (; a < M; a++) {
-                                float        dot        = 0.0f;
-                                const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_MXFP4);
+                                float dot = 0.0f;
                                 cpu_traits->vec_dot(K, &dot, sizeof(float), weight_row, 0, act_data[a], 0, 1);
                                 out_data[a][r] = dot;
                             }
@@ -1037,8 +1037,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             for (int r = 0; r < N; r++) {
                 const char * weight_row = (const char *) wptr + (size_t) r * row_stride;
                 for (int a = 0; a < M; a++) {
-                    float        dot        = 0.0f;
-                    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_MXFP4);
+                    float dot = 0.0f;
                     cpu_traits->vec_dot(K, &dot, sizeof(float), weight_row, 0, act_ptrs[a], 0, 1);
                     out_ptrs[a][r] = dot;
                 }

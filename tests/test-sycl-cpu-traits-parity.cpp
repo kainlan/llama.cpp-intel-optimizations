@@ -20,7 +20,7 @@ static const ggml_type types[] = {
 
 int main() {
     ggml_cpu_init();
-    constexpr int n = 256;
+    constexpr int n = 512;
     std::vector<float> input(n);
     for (int i = 0; i < n; ++i) {
         input[i] = std::sin(float(i) * 0.17f) * 3.0f;
@@ -29,21 +29,21 @@ int main() {
     for (ggml_type type : types) {
         const auto * base = ggml_sycl_get_baseline_type_traits_cpu(type);
         const auto * cpu  = ggml_get_type_traits_cpu(type);
-        if (!base || !cpu || base->vec_dot_type != cpu->vec_dot_type || base->nrows != 1 ||
+        const int64_t expected_nrows = type == GGML_TYPE_Q8_K ? 0 : 1;
+        if (!base || !cpu || base->vec_dot_type != cpu->vec_dot_type || base->nrows != expected_nrows ||
             bool(base->from_float) != bool(cpu->from_float) || bool(base->vec_dot) != bool(cpu->vec_dot)) {
             std::fprintf(stderr, "field mismatch for %s\n", ggml_type_name(type));
             return 1;
         }
-        if (!base->from_float) {
-            continue;
-        }
-        std::vector<unsigned char> qb(ggml_row_size(type, n));
-        std::vector<unsigned char> qc(qb.size());
-        base->from_float(input.data(), qb.data(), n);
-        cpu->from_float(input.data(), qc.data(), n);
-        if (std::memcmp(qb.data(), qc.data(), qb.size()) != 0) {
-            std::fprintf(stderr, "quantizer mismatch for %s\n", ggml_type_name(type));
-            return 1;
+        std::vector<unsigned char> qb(ggml_row_size(type, n), 0);
+        if (base->from_float) {
+            std::vector<unsigned char> qc(qb.size());
+            base->from_float(input.data(), qb.data(), n);
+            cpu->from_float(input.data(), qc.data(), n);
+            if (std::memcmp(qb.data(), qc.data(), qb.size()) != 0) {
+                std::fprintf(stderr, "quantizer mismatch for %s\n", ggml_type_name(type));
+                return 1;
+            }
         }
         if (!base->vec_dot) {
             continue;
@@ -59,8 +59,10 @@ int main() {
         float sb = 0.0f, sc = 0.0f;
         base->vec_dot(n, &sb, 0, qb.data(), 0, qv.data(), 0, 1);
         cpu->vec_dot(n, &sc, 0, qb.data(), 0, qv.data(), 0, 1);
+        // The zero-initialized lhs intentionally executes every vec-dot-only
+        // IQ type whose canonical from_float is null.
         const float tolerance = 2e-5f * std::max(1.0f, std::fabs(sc));
-        if (!std::isfinite(sb) || std::fabs(sb - sc) > tolerance) {
+        if (!std::isfinite(sb) || !std::isfinite(sc) || std::fabs(sb - sc) > tolerance) {
             std::fprintf(stderr, "vec_dot mismatch for %s: %.9g vs %.9g\n", ggml_type_name(type), sb, sc);
             return 1;
         }

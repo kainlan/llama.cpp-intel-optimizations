@@ -663,12 +663,6 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
-    // Private backend-to-backend hook. This intentionally does not change the
-    // public CPU getter or its table and is resolved afresh by consumers.
-    if (strcmp(name, "ggml_backend_cpu_get_type_traits") == 0) {
-        return (void *)ggml_get_type_traits_cpu;
-    }
-
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
         return (void *)ggml_threadpool_new;

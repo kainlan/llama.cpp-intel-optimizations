@@ -1,44 +1,21 @@
 #include "cpu-traits-support.hpp"
 
-#include "ggml-backend.h"
 #include "ggml-quants.h"
 #include "ggml.h"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 namespace {
 
-using traits_getter = const ggml_type_traits_cpu * (*)(enum ggml_type);
-
-static void row_to_float(enum ggml_type type, const void * src, float * dst, int64_t n) {
-    if (type == GGML_TYPE_F32) {
-        std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
-        return;
-    }
-    if (type == GGML_TYPE_Q8_1) {
-        const auto * blocks = static_cast<const block_q8_1 *>(src);
-        for (int64_t i = 0; i < n / QK8_1; ++i) {
-            const float d = ggml_fp16_to_fp32(blocks[i].d);
-            for (int j = 0; j < QK8_1; ++j) {
-                dst[i * QK8_1 + j] = d * blocks[i].qs[j];
-            }
-        }
-        return;
-    }
-    if (type == GGML_TYPE_Q8_K) {
-        dequantize_row_q8_K(static_cast<const block_q8_K *>(src), dst, n);
-        return;
-    }
-    const auto * traits = ggml_get_type_traits(type);
-    if (traits && traits->to_float) {
-        traits->to_float(src, dst, n);
-    }
-}
+static_assert(QK_K % QK1_0 == 0 && QK_K % QK2_0 == 0 && QK_K % QK4_0 == 0 &&
+                  QK_K % QK4_1 == 0 && QK_K % QK5_0 == 0 && QK_K % QK5_1 == 0 &&
+                  QK_K % QK8_0 == 0 && QK_K % QK8_1 == 0 && QK_K % QK_MXFP4 == 0 &&
+                  QK_K % QK_NVFP4 == 0 && QK_K % QK4_NL == 0,
+              "portable vec-dot stack tile must be a multiple of every supported quant block");
+constexpr int k_vec_dot_tile = QK_K;
 
 static void from_float_f32(const float * src, void * dst, int64_t n) {
     std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
@@ -56,20 +33,55 @@ static void from_float_ref(const float * src, void * dst, int64_t n) {
     }
 }
 
+template<enum ggml_type Type>
+static void row_to_float(const ggml_type_traits * traits, const void * src, float * dst, int64_t n) {
+    if constexpr (Type == GGML_TYPE_F32) {
+        std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
+    } else if constexpr (Type == GGML_TYPE_Q8_1) {
+        const auto * blocks = static_cast<const block_q8_1 *>(src);
+        for (int64_t i = 0; i < n / QK8_1; ++i) {
+            const float d = ggml_fp16_to_fp32(blocks[i].d);
+            for (int j = 0; j < QK8_1; ++j) {
+                dst[i * QK8_1 + j] = d * blocks[i].qs[j];
+            }
+        }
+    } else if constexpr (Type == GGML_TYPE_Q8_K) {
+        dequantize_row_q8_K(static_cast<const block_q8_K *>(src), dst, n);
+    } else if (traits && traits->to_float) {
+        traits->to_float(src, dst, n);
+    }
+}
+
+template<enum ggml_type Type>
+static size_t element_offset(int element) {
+    return static_cast<size_t>(element / ggml_blck_size(Type)) * ggml_type_size(Type);
+}
+
 template<enum ggml_type X, enum ggml_type Y>
 static void vec_dot_ref(int n, float * s, size_t bs, const void * vx, size_t bx,
                         const void * vy, size_t by, int nrc) {
-    std::vector<float> x(static_cast<size_t>(n));
-    std::vector<float> y(static_cast<size_t>(n));
+    // Resolve immutable ggml-base conversion traits once, before every row and
+    // block loop. All scratch is fixed-size stack storage: every supported
+    // block size divides QK_K, so each conversion receives complete blocks.
+    const ggml_type_traits * x_traits = ggml_get_type_traits(X);
+    const ggml_type_traits * y_traits = ggml_get_type_traits(Y);
     const size_t xrow = bx ? bx : ggml_row_size(X, n);
     const size_t yrow = by ? by : ggml_row_size(Y, n);
     const size_t sout = bs ? bs : sizeof(float);
+    std::array<float, k_vec_dot_tile> x{};
+    std::array<float, k_vec_dot_tile> y{};
+
     for (int row = 0; row < nrc; ++row) {
-        row_to_float(X, static_cast<const uint8_t *>(vx) + row * xrow, x.data(), n);
-        row_to_float(Y, static_cast<const uint8_t *>(vy) + row * yrow, y.data(), n);
+        const auto * xbase = static_cast<const uint8_t *>(vx) + row * xrow;
+        const auto * ybase = static_cast<const uint8_t *>(vy) + row * yrow;
         float sum = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            sum += x[static_cast<size_t>(i)] * y[static_cast<size_t>(i)];
+        for (int offset = 0; offset < n; offset += k_vec_dot_tile) {
+            const int count = std::min(k_vec_dot_tile, n - offset);
+            row_to_float<X>(x_traits, xbase + element_offset<X>(offset), x.data(), count);
+            row_to_float<Y>(y_traits, ybase + element_offset<Y>(offset), y.data(), count);
+            for (int i = 0; i < count; ++i) {
+                sum += x[static_cast<size_t>(i)] * y[static_cast<size_t>(i)];
+            }
         }
         *reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(s) + row * sout) = sum;
     }
@@ -104,7 +116,8 @@ static std::array<ggml_type_traits_cpu, GGML_TYPE_COUNT> make_baseline() {
     TRAIT(IQ1_M, nullptr, (vec_dot_ref<GGML_TYPE_IQ1_M, GGML_TYPE_Q8_K>), Q8_K);
     TRAIT(IQ4_NL, (from_float_ref<GGML_TYPE_IQ4_NL>), (vec_dot_ref<GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0>), Q8_0);
     TRAIT(IQ4_XS, (from_float_ref<GGML_TYPE_IQ4_XS>), (vec_dot_ref<GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_K>), Q8_K);
-    TRAIT(Q8_K, from_float_q8_k, nullptr, Q8_K);
+    // Canonical Q8_K metadata has only from_float; all other fields are zero.
+    table[GGML_TYPE_Q8_K] = { from_float_q8_k, nullptr, static_cast<ggml_type>(0), 0 };
     TRAIT(BF16, (from_float_ref<GGML_TYPE_BF16>), (vec_dot_ref<GGML_TYPE_BF16, GGML_TYPE_BF16>), BF16);
     TRAIT(TQ1_0, (from_float_ref<GGML_TYPE_TQ1_0>), (vec_dot_ref<GGML_TYPE_TQ1_0, GGML_TYPE_Q8_K>), Q8_K);
     TRAIT(TQ2_0, (from_float_ref<GGML_TYPE_TQ2_0>), (vec_dot_ref<GGML_TYPE_TQ2_0, GGML_TYPE_Q8_K>), Q8_K);
@@ -122,18 +135,5 @@ const ggml_type_traits_cpu * ggml_sycl_get_baseline_type_traits_cpu(enum ggml_ty
 }
 
 const ggml_type_traits_cpu * ggml_sycl_get_type_traits_cpu(enum ggml_type type) noexcept {
-    const int index = static_cast<int>(type);
-    if (index < 0 || index >= GGML_TYPE_COUNT) {
-        return nullptr;
-    }
-    if (ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU")) {
-        auto getter = reinterpret_cast<traits_getter>(
-            ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_get_type_traits"));
-        if (getter) {
-            if (const ggml_type_traits_cpu * traits = getter(type)) {
-                return traits;
-            }
-        }
-    }
-    return &baseline[static_cast<size_t>(index)];
+    return ggml_sycl_get_baseline_type_traits_cpu(type);
 }
