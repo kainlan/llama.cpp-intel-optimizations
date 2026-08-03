@@ -33,7 +33,7 @@ COLUMNS = (
 DECL_KINDS = {"declaration", "field_declaration"}
 DECLARATOR_KINDS = {
     "identifier", "field_identifier", "init_declarator", "pointer_declarator",
-    "reference_declarator", "array_declarator", "parenthesized_declarator",
+    "reference_declarator", "pointer_type_declarator", "array_declarator", "parenthesized_declarator",
     "qualified_identifier", "attributed_declarator",
 }
 SCOPE_KINDS = {
@@ -96,13 +96,16 @@ def line_of(source_b: bytes, node_or_offset) -> int:
 def declarator_name(source_b: bytes, node):
     if node is None:
         return None
-    if kind(node) in {"identifier", "field_identifier"}:
+    if kind(node) in {"identifier", "field_identifier", "type_identifier"}:
         return text(source_b, node), node
     nested = field(node, "declarator")
     if nested is not None:
         return declarator_name(source_b, nested)
     if kind(node) == "qualified_identifier":
-        names = [item for item in children(node) if kind(item) in {"identifier", "field_identifier"}]
+        result = declarator_name(source_b, field(node, "name"))
+        if result:
+            return result
+        names = [item for item in children(node) if kind(item) in {"identifier", "field_identifier", "type_identifier"}]
         return (text(source_b, names[-1]), names[-1]) if names else None
     for item in children(node):
         if kind(item) in DECLARATOR_KINDS:
@@ -170,20 +173,21 @@ def is_top_level_immutable(source_b: bytes, decl, declarator, name_node):
     core = declarator_core(declarator)
     if "constexpr" in declaration_qualifiers:
         return True
-    if kind(core) == "pointer_declarator":
+    if kind(core) in {"pointer_declarator", "pointer_type_declarator"}:
         return "const" in direct_qualifiers(source_b, core)
     if kind(core) == "reference_declarator":
         return True  # the binding cannot be reseated; pointee mutability is not binding mutability
-    if kind(core) == "function_declarator":
+    if kind(core) in {"function_declarator", "qualified_identifier"}:
         item = parent(name_node)
         while item is not None and item != core:
             item_kind = kind(item)
-            if item_kind == "pointer_declarator":
+            if item_kind in {"pointer_declarator", "pointer_type_declarator"}:
                 return "const" in direct_qualifiers(source_b, item)
             if item_kind == "reference_declarator":
                 return True
             if item_kind == "array_declarator":
-                break
+                item = parent(item)
+                continue
             item = parent(item)
     return "const" in declaration_qualifiers
 
@@ -209,10 +213,76 @@ def initializer_free_type(source_b: bytes, decl, first_declarator, declarator, n
     return " ".join(part for part in (base, before + after) if part).strip()
 
 
+def declarator_path_kinds(name_node, core):
+    result = []
+    item = parent(name_node)
+    while item is not None:
+        result.append(kind(item))
+        if item == core:
+            break
+        item = parent(item)
+    return result
+
+
+def abstract_binding_kind(node):
+    """Return the innermost abstract declarator operator used by a type alias."""
+    declarator_kinds = {
+        "abstract_function_declarator", "abstract_pointer_declarator",
+        "abstract_reference_declarator", "abstract_array_declarator",
+        "abstract_parenthesized_declarator",
+    }
+    nested = field(node, "declarator")
+    if nested is None:
+        nested = next((item for item in children(node) if kind(item) in declarator_kinds), None)
+    if nested is not None:
+        return abstract_binding_kind(nested)
+    return kind(node) if kind(node) in declarator_kinds else None
+
+
+def function_type_aliases(source_b: bytes, root):
+    """Resolve visible using-aliases as function, object, or unknown."""
+    pending, resolved = {}, {}
+    for item in walk(root):
+        if kind(item) != "alias_declaration":
+            continue
+        name = next((child_item for child_item in children(item) if kind(child_item) == "type_identifier"), None)
+        descriptor = next((child_item for child_item in children(item) if kind(child_item) == "type_descriptor"), None)
+        if name is None or descriptor is None:
+            continue
+        alias = text(source_b, name)
+        if alias in resolved or alias in pending:
+            pending.pop(alias, None)
+            resolved[alias] = "unknown"
+            continue
+        abstract_kind = abstract_binding_kind(descriptor)
+        if abstract_kind is not None:
+            status = "function" if abstract_kind == "abstract_function_declarator" else "object"
+            resolved[alias] = status if alias not in resolved else "unknown"
+            continue
+        dependency = field(descriptor, "type")
+        if dependency is None:
+            dependency = next((part for part in children(descriptor) if kind(part) == "type_identifier"), None)
+        pending[alias] = text(source_b, dependency) if dependency is not None else None
+    changed = True
+    while changed:
+        changed = False
+        for alias, dependency in list(pending.items()):
+            if dependency not in pending and dependency not in resolved:
+                resolved[alias] = "object"
+            elif dependency in resolved:
+                resolved[alias] = resolved[dependency]
+            else:
+                continue
+            del pending[alias]
+            changed = True
+    resolved.update({alias: "unknown" for alias in pending})
+    return resolved
+
+
 def is_function_declaration(name_node, core):
     """True when () binds to the name, not through an object pointer/reference/array."""
     item = parent(name_node)
-    object_shapes = {"pointer_declarator", "reference_declarator", "array_declarator"}
+    object_shapes = {"pointer_declarator", "pointer_type_declarator", "reference_declarator", "array_declarator"}
     while item is not None:
         item_kind = kind(item)
         if item_kind == "function_declarator":
@@ -225,7 +295,7 @@ def is_function_declaration(name_node, core):
     return False
 
 
-def declaration_rows(source_b: bytes, decl, recovered_regions):
+def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures):
     scope, local = named_scope(source_b, decl, recovered_regions)
     storage = storage_specifiers(source_b, decl)
     if scope.startswith("class:") and "static" not in storage:
@@ -247,7 +317,19 @@ def declaration_rows(source_b: bytes, decl, recovered_regions):
         if not result:
             continue
         name, name_node = result
-        if is_function_declaration(name_node, core):
+        type_name = text(source_b, type_node) if type_node is not None and kind(type_node) == "type_identifier" else None
+        alias_status = aliases.get(type_name)
+        path_kinds = declarator_path_kinds(name_node, core)
+        indirect = {"pointer_declarator", "pointer_type_declarator", "reference_declarator"}
+        if alias_status == "unknown":
+            failures.append((line_of(source_b, decl), f"unproved function-type alias {type_name}"))
+            continue
+        if alias_status == "function":
+            if not any(item_kind in indirect for item_kind in path_kinds):
+                if "array_declarator" in path_kinds:
+                    failures.append((line_of(source_b, decl), f"invalid array of function-type alias {type_name}"))
+                continue
+        elif is_function_declaration(name_node, core):
             continue
         initialized = kind(declarator) == "init_declarator"
         if "extern" in storage and not initialized and not scope.startswith("class:"):
@@ -531,8 +613,14 @@ def parse_source(parser, source):
     declarations = [item for item in walk(root) if kind(item) in DECL_KINDS]
     gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
     recovered_regions = recovered_function_regions(source_b, gaps)
-    rows = [row for decl in declarations for row in declaration_rows(source_b, decl, recovered_regions)]
+    aliases = function_type_aliases(source_b, root)
+    declaration_failures = []
+    rows = [
+        row for decl in declarations
+        for row in declaration_rows(source_b, decl, recovered_regions, aliases, declaration_failures)
+    ]
     gaps, categories, failures = recovery_coverage(source_b, root, declarations, recovered_regions)
+    failures.extend(declaration_failures)
     return source_b, rows, gaps, categories, failures
 
 
@@ -563,6 +651,26 @@ void pointer_owner() {
     auto fn = [] { static int (*lambda_function_pointer)(int); };
 }
 static int (*function_pointer_array[3])(int);
+static int (* const const_function_pointer_array[2])(int);
+struct MemberTarget { int method(int); int data; };
+static int (MemberTarget::*file_member_function)(int);
+static int MemberTarget::*file_member_data;
+static int (MemberTarget::* const file_const_member_function_array[2])(int);
+struct MemberObjects {
+    static decltype(&MemberTarget::method) class_member_function;
+    static decltype(&MemberTarget::data) class_member_data;
+    static decltype(&MemberTarget::method) class_member_function_array[2];
+};
+void member_owner() {
+    static int (MemberTarget::*local_member_function)(int);
+    static int MemberTarget::*local_member_data;
+    static int MemberTarget::* const local_const_member_data_array[2];
+}
+using Function = int(int);
+using FunctionAlias = Function;
+static Function alias_hidden_function;
+static Function *alias_function_pointer;
+static FunctionAlias *alias_chain_function_pointer;
 """
     _, rows, gaps, _, failures = parse_source(parser, source)
     assert not gaps and not failures
@@ -586,10 +694,28 @@ static int (*function_pointer_array[3])(int);
         "local_function_pointer": ("int (*)(int)", "function-local:pointer_owner", False),
         "lambda_function_pointer": ("int (*)(int)", "function-local:<lambda>", False),
         "function_pointer_array": ("int (*[3])(int)", "file", False),
+        "const_function_pointer_array": ("int (* const[2])(int)", "file", True),
     }
     for name, expected in function_objects.items():
         row = by_name[name][0]
         assert (row["type"], row["scope"], row["immutable"]) == expected, (name, row)
+    member_objects = {
+        "file_member_function": ("int (MemberTarget::*)(int)", "file", False),
+        "file_member_data": ("int MemberTarget::*", "file", False),
+        "file_const_member_function_array": ("int (MemberTarget::* const[2])(int)", "file", True),
+        "class_member_function": ("decltype(&MemberTarget::method)", "class:MemberObjects", False),
+        "class_member_data": ("decltype(&MemberTarget::data)", "class:MemberObjects", False),
+        "class_member_function_array": ("decltype(&MemberTarget::method) [2]", "class:MemberObjects", False),
+        "local_member_function": ("int (MemberTarget::*)(int)", "function-local:member_owner", False),
+        "local_member_data": ("int MemberTarget::*", "function-local:member_owner", False),
+        "local_const_member_data_array": ("int MemberTarget::* const[2]", "function-local:member_owner", True),
+        "alias_function_pointer": ("Function *", "file", False),
+        "alias_chain_function_pointer": ("FunctionAlias *", "file", False),
+    }
+    for name, expected in member_objects.items():
+        row = by_name[name][0]
+        assert (row["type"], row["scope"], row["immutable"]) == expected, (name, row)
+    assert "alias_hidden_function" not in by_name
     same_rows = by_name["same"]
     lines = source.splitlines()
     for row in same_rows:
@@ -608,10 +734,19 @@ static int (*function_pointer_array[3])(int);
         "lambda-wrong-close": "static auto recovered = [] { x; x template #if X }\nWidget implicit_global{};",
         "template-lambda-wrong-close": "static auto recovered = []<typename T> { x; x template #if X }\nWidget implicit_global{};",
         "nested-function-lambda-wrong-close": "static void outer() { auto recovered = [] { x; x template #if X }\nstatic Widget hidden{}; }",
+        "function-alias-array": "using Function = int(int); static Function invalid[2];",
+        "unproved-function-alias": "using First = Second; using Second = First; static First * invalid;",
+        "ambiguous-function-alias": "namespace one { using Same = int(int); static Same fn; } namespace two { using Same = int; static Same object; }",
     }
+    alias_failures = {"function-alias-array", "unproved-function-alias", "ambiguous-function-alias"}
     for fixture, broken in negative_fixtures.items():
         _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
-        assert broken_gaps and broken_failures, f"{fixture} must fail closed"
+        if fixture in alias_failures:
+            assert broken_failures, f"{fixture} must fail closed"
+        else:
+            assert broken_gaps and broken_failures, f"{fixture} must fail closed"
+        if fixture in alias_failures:
+            assert any("function-type alias" in reason for _, reason in broken_failures)
         if fixture in {
             "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close",
             "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
@@ -636,10 +771,11 @@ static int (*function_pointer_array[3])(int);
         line: (symbol, "file") for line, symbol in expected_file_scopes.items()
     }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
-          "function-pointer-object-scopes,"
+          "function-pointer-object-scopes,member-pointer-object-scopes,function-type-aliases,"
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
           "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
-          "template-lambda-wrong-close,nested-function-lambda-wrong-close,file-tail-scopes")
+          "template-lambda-wrong-close,nested-function-lambda-wrong-close,function-alias-array,"
+          "unproved-function-alias,ambiguous-function-alias,file-tail-scopes")
 
 
 def main():

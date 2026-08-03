@@ -19,7 +19,11 @@ different installed version. It walks C++
 `declaration` and `field_declaration` nodes rather than matching declaration
 text. Each declarator in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
-pointer/reference-to-function objects (including arrays) remain census objects.
+pointer/reference-to-function and pointer-to-member function/data objects
+(including arrays) remain census objects. Function-type `using` aliases are
+resolved through alias chains: direct alias declarations remain excluded as
+functions, indirect pointer/reference objects are included, and unresolved or
+invalid array-of-function alias uses fail closed.
 The scope walk includes file and named-namespace objects, anonymous-namespace
 objects without the `static` spelling, function-local `static`/`thread_local`
 objects (including `bias_detect_flag`), and class/header static declarations.
@@ -86,8 +90,11 @@ initializer-free direct initialization, fail-closed namespace recovery,
 multi-object declarations, and namespaced `extern` declaration versus
 definition. Positive function-object fixtures verify names, initializer-free
 types, scopes, and binding mutability for file/class/function/lambda function
-pointers, a function reference, and a function-pointer array, while actual
-function declarations remain excluded. Negative fixtures also require rejection
+pointers, a function reference, a function-pointer array, and file/class/local
+pointer-to-member function/data objects and arrays. Const pointer elements are
+recognized through array declarators. Function-type alias fixtures include
+pointer objects while excluding direct function declarations; unresolved alias
+cycles and invalid arrays of aliased function type must fail closed. Negative fixtures also require rejection
 of malformed recovery in a function body (`void f(){ static Widget x{; }`),
 across a structural
 preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
