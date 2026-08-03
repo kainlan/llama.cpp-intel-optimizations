@@ -10,8 +10,8 @@
 
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
-    std::printf("GGML SYCL oneDNN not enabled; skipping test.\n");
-    return 0;
+    std::printf("SKIP: GGML SYCL oneDNN was not compiled in.\n");
+    return 77;
 }
 #else
 
@@ -134,10 +134,6 @@ template <typename T> static T * malloc_device_copy(sycl::queue & q, const std::
 }
 
 static bool run_case(const case_shape & sh) {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
-
     std::vector<sycl::half> Q((size_t) sh.H_q * sh.n_q * sh.D);
     std::vector<sycl::half> K((size_t) sh.H_kv * sh.n_kv * sh.k_stride, sycl::half(0.0f));
     std::vector<sycl::half> V((size_t) sh.H_kv * sh.n_kv * sh.v_stride, sycl::half(0.0f));
@@ -224,6 +220,28 @@ static bool run_case(const case_shape & sh) {
 }
 
 int main() {
+    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
+    }
+
+    std::vector<sycl::device> gpus;
+    try {
+        gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+    } catch (const sycl::exception & e) {
+        std::fprintf(stderr, "FAIL: SYCL GPU discovery failed: %s\n", e.what());
+        return 1;
+    }
+    if (gpus.empty()) {
+        std::printf("SKIP: no SYCL GPU device is available.\n");
+        return 77;
+    }
+
+    const sycl::device & device = gpus.front();
+    if (!device.has(sycl::aspect::usm_device_allocations) || !device.has(sycl::aspect::fp16)) {
+        std::printf("SKIP: SYCL GPU lacks device USM or fp16 required by the oneDNN path.\n");
+        return 77;
+    }
+
     bool ok = true;
     ok &= run_case({ "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16 });
     ok &= run_case({ "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16 });
