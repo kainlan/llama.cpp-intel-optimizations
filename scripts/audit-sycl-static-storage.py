@@ -457,7 +457,7 @@ def lookup_alias(source_b: bytes, node, type_node, aliases, hazards, ordinary):
         for candidate in candidates for hazard in hazards
     )
     resolved = visible_alias(aliases, candidates, start_byte(node), ordinary)
-    if hazardous and resolved is None:
+    if hazardous:
         resolved = {"status": "unknown", "immutable": False, "offset": start_byte(node)}
     return resolved, normalized_identity(spelling), candidates
 
@@ -1036,6 +1036,7 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
         "unknown-qualified-alias": "namespace N { using F = int(int); } static N::Missing object;",
         "alias-template": "template<class T> using Pointer = T *; static Pointer<int> object = {};",
         "inline-namespace-alias": "inline namespace I { using F = int(int); } static F function;",
+        "resolved-inline-namespace-ambiguity": "using F=int; inline namespace I { using F=int(int); } static F object;",
         "namespace-alias": "namespace N { using F = int(int); } namespace A = N; static A::F function;",
         "local-alias": "void owner() { using Local = int; static Local object; }",
         "class-alias": "struct Owner { using Local = int; static Local object; };",
@@ -1044,16 +1045,19 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
     }
     alias_failures = {
         "function-alias-array", "unproved-function-alias", "unknown-qualified-alias", "alias-template",
-        "inline-namespace-alias", "namespace-alias", "local-alias", "class-alias", "ordinary-name-hiding",
+        "inline-namespace-alias", "resolved-inline-namespace-ambiguity", "namespace-alias", "local-alias",
+        "class-alias", "ordinary-name-hiding",
     }
     for fixture, broken in negative_fixtures.items():
-        _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
+        _, broken_rows, broken_gaps, _, broken_failures = parse_source(parser, broken)
         if fixture in alias_failures:
             assert broken_failures, f"{fixture} must fail closed"
         else:
             assert broken_gaps and broken_failures, f"{fixture} must fail closed"
         if fixture in alias_failures:
             assert any("alias" in reason for _, reason in broken_failures)
+        if fixture == "resolved-inline-namespace-ambiguity":
+            assert not broken_rows
         if fixture in {
             "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close",
             "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
@@ -1084,6 +1088,7 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
           "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
           "template-lambda-wrong-close,nested-function-lambda-wrong-close,function-alias-array,"
           "unproved-function-alias,unknown-qualified-alias,alias-template,inline-namespace-alias,"
+          "resolved-inline-namespace-ambiguity,"
           "namespace-alias,local-alias,class-alias,ordinary-name-hiding,"
           "ambiguous-direct-class-member,g++-c++17-pedantic,file-tail-scopes")
 

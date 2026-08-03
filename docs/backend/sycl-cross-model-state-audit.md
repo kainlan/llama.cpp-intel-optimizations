@@ -33,7 +33,8 @@ scope, while leading `::` remains absolute. Function and object alias chains
 are accepted only when that bounded lookup proves them. Inline namespaces,
 namespace aliases, alias templates, unsupported local/class alias interactions,
 and unresolved hiding cause affected static declarations to fail closed rather
-than emit a guessed row. Object aliases carry compositional top-level binding cv
+than emit a guessed row. A hazard dominates even when bounded lookup also finds
+a visible ordinary alias, covering ambiguous inline-namespace injection. Object aliases carry compositional top-level binding cv
 through chains and arrays, so arrays of aliased `const` pointer elements are
 reported immutable.
 The scope walk includes file and named-namespace objects, anonymous-namespace
