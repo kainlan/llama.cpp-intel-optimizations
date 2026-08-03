@@ -810,6 +810,10 @@ GGML_BACKEND_API void ggml_backend_sycl_model_unloaded(uint32_t slot);
 // Generation-safe teardown used by migrated model owners.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(
     struct ggml_sycl_model_token model);
+// Transfer a quarantined full owner token to the backend reaper when RAII can
+// no longer retain it. Retries occur at safe lifecycle entry and shutdown.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(
+    struct ggml_sycl_model_token model);
 
 // Release all host-backed weight extras (layout metadata, accessors, etc.)
 // Call this when unloading a model to free SYCL resources associated with tensors.

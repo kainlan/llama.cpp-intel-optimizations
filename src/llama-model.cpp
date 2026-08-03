@@ -1380,9 +1380,11 @@ llama_model::~llama_model() {
             if (rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
                 sycl_model_token = {};
             } else {
-                LLAMA_LOG_ERROR("SYCL model teardown failed: model=%llu txn=%llu slot=%u generation=%llu result=%d\n",
+                const auto queued = ggml_backend_sycl_model_quarantine_token(token);
+                LLAMA_LOG_ERROR(
+                    "SYCL model teardown failed: model=%llu txn=%llu slot=%u generation=%llu result=%d quarantine=%d\n",
                     (unsigned long long) token.model_id, (unsigned long long) token.load_txn_id, token.slot,
-                    (unsigned long long) token.slot_generation, (int) rc);
+                    (unsigned long long) token.slot_generation, (int) rc, (int) queued);
             }
         }
     }

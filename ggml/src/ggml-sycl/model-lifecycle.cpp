@@ -11,7 +11,8 @@ Registry::Registry(uint64_t id_limit, uint64_t depth_limit, test_mutation mutati
 
 void Registry::poison_active_locked() {
     auto active = txns_.find(active_txn_);
-    if (active != txns_.end() && active->second.phase == finish_phase::ACTIVE) {
+    if (active != txns_.end() && active->second.phase != finish_phase::COMMITTED &&
+        active->second.phase != finish_phase::ABORTED) {
         active->second.poisoned = true;
     }
 }
@@ -160,6 +161,17 @@ void Registry::remember_terminal_locked(uint64_t) {
     // txns_ is the durable terminal identity table.
 }
 
+error Registry::validate_end(const finish_ticket & ticket) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = txns_.find(ticket.token.load.value);
+    if (!ticket.finisher || it == txns_.end() || active_txn_ != ticket.token.load.value ||
+        it->second.finish_serial != ticket.serial ||
+        (it->second.phase != finish_phase::COMMITTING && it->second.phase != finish_phase::ROLLING_BACK)) {
+        return error::STALE_IDENTITY;
+    }
+    return it->second.poisoned ? error::POISONED : error::OK;
+}
+
 end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok, publication_data publication,
                                   std::shared_ptr<const ModelState> prepared_state) noexcept {
     try {
@@ -174,8 +186,14 @@ end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok,
             return { error::STALE_IDENTITY };
         }
 
+        const bool poisoned_after_prepare = ticket.commit && txn.poisoned;
+        if (poisoned_after_prepare) {
+            effects_ok = false;
+        }
         bool  commit      = ticket.commit && effects_ok;
-        error result_code = !effects_ok ? error::EFFECT_FAILED : txn.finish_reason;
+        error result_code = poisoned_after_prepare ? error::POISONED :
+                            !effects_ok            ? error::EFFECT_FAILED :
+                                                     txn.finish_reason;
         if (commit) {
             try {
                 auto state = prepared_state ? std::move(prepared_state) :
@@ -240,6 +258,11 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     if (token.model.value == 0 || token.owner.slot >= model_slot_count) return {error::NOT_FOUND};
     if (active_txn_ != 0) {
         return { error::BUSY, token };
+    }
+    for (const auto & item : models_) {
+        if (item.first != token.model.value && item.second.phase == model_phase::TEARING_DOWN) {
+            return { error::BUSY, token };
+        }
     }
     auto txn = txns_.find(token.load.value);
     if (txn != txns_.end() && txn->second.token == token &&

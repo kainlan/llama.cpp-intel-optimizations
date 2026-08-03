@@ -9020,7 +9020,7 @@ uint32_t ggml_backend_sycl_model_slot_current(void) {
 // must run at MODEL teardown rather than backend-context teardown
 // (llama.cpp-2wv5).
 static void ggml_sycl_release_graph_replay_leases_all_devices();
-static void ggml_sycl_restore_latest_live_plan() noexcept;
+static bool ggml_sycl_restore_latest_live_plan() noexcept;
 
 static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecycle::error e) {
     using E = ggml_sycl::lifecycle::error;
@@ -9063,6 +9063,29 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
                   reclaimed);
 }
 
+static std::mutex                                                                g_sycl_quarantine_mutex;
+static std::array<ggml_sycl_model_token, ggml_sycl::lifecycle::model_slot_count> g_sycl_quarantine_tokens{};
+static size_t                                                                    g_sycl_quarantine_count = 0;
+
+static bool ggml_sycl_quarantine_enqueue(ggml_sycl_model_token token) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
+        for (size_t i = 0; i < g_sycl_quarantine_count; ++i) {
+            if (g_sycl_quarantine_tokens[i].model_id == token.model_id &&
+                g_sycl_quarantine_tokens[i].load_txn_id == token.load_txn_id) {
+                return true;
+            }
+        }
+        if (g_sycl_quarantine_count >= g_sycl_quarantine_tokens.size()) {
+            return false;
+        }
+        g_sycl_quarantine_tokens[g_sycl_quarantine_count++] = token;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void ggml_backend_sycl_model_unloaded(uint32_t slot) {
     // Bare slots cannot prove generation/owner identity. Keep this compatibility
     // wrapper fail-closed rather than risking teardown of a reused slot.
@@ -9075,19 +9098,60 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
     ggml_sycl::lifecycle::teardown_ticket ticket;
     try {
         ticket = registry.prepare_teardown(owner);
-        if (!ticket.finisher) return ggml_sycl_lifecycle_c_result(ticket.code);
+        if (!ticket.finisher) {
+            if (ticket.code == ggml_sycl::lifecycle::error::ALLOCATION_FAILED ||
+                ticket.code == ggml_sycl::lifecycle::error::EFFECT_FAILED) {
+                return ggml_sycl_restore_latest_live_plan() ? ggml_sycl_lifecycle_c_result(ticket.code) :
+                                                              GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+            }
+            return ggml_sycl_lifecycle_c_result(ticket.code);
+        }
         ggml_sycl_release_model_slot_resources(owner);
+        if (!ggml_sycl_restore_latest_live_plan()) {
+            (void) registry.finalize_teardown(ticket, false);
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
         const auto result = registry.finalize_teardown(ticket, true);
         if (result == ggml_sycl::lifecycle::error::OK) {
             // Full plans can be large; durable replay identity remains compact
             // in Registry::dead_ after this snapshot is deleted.
             ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value);
-            ggml_sycl_restore_latest_live_plan();
         }
         return ggml_sycl_lifecycle_c_result(result);
     } catch (...) {
+        (void) ggml_sycl_restore_latest_live_plan();
         if (ticket.finisher) (void) registry.finalize_teardown(ticket, false);
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_model_token token) {
+    if (token.model_id == 0 || token.load_txn_id == 0 || token.slot >= ggml_sycl::lifecycle::model_slot_count) {
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+    return ggml_sycl_quarantine_enqueue(token) ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
+}
+
+static void ggml_sycl_quarantine_reap() noexcept {
+    std::array<ggml_sycl_model_token, ggml_sycl::lifecycle::model_slot_count> pending{};
+    size_t                                                                    count = 0;
+    try {
+        {
+            std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
+            count = g_sycl_quarantine_count;
+            std::copy_n(g_sycl_quarantine_tokens.begin(), count, pending.begin());
+            g_sycl_quarantine_count = 0;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto rc = ggml_backend_sycl_model_unloaded_token(pending[i]);
+            if (rc != GGML_SYCL_LIFECYCLE_OK && rc != GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
+                (void) ggml_sycl_quarantine_enqueue(pending[i]);
+            }
+        }
+    } catch (...) {
+        for (size_t i = 0; i < count; ++i) {
+            (void) ggml_sycl_quarantine_enqueue(pending[i]);
+        }
     }
 }
 
@@ -9223,7 +9287,7 @@ static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_fr
     return data;
 }
 
-static void ggml_sycl_restore_latest_live_plan() noexcept {
+static bool ggml_sycl_restore_latest_live_plan() noexcept {
     try {
         const auto latest = ggml_sycl::lifecycle::global_registry().latest_live();
         const auto snapshot =
@@ -9249,9 +9313,9 @@ static void ggml_sycl_restore_latest_live_plan() noexcept {
                 cache->clear_placement_plan();
             }
         }
+        return true;
     } catch (...) {
-        // C lifecycle boundaries fail closed; never unwind lock/allocation
-        // failures through the ABI.
+        return false;
     }
 }
 
@@ -9261,11 +9325,14 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
     ggml_sycl_reset_model_load_scratch_state();
 
-    ggml_sycl_restore_latest_live_plan();
+    if (!ggml_sycl_restore_latest_live_plan()) {
+        throw std::runtime_error("failed to restore latest LIVE placement plan");
+    }
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     if (!txn) return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    ggml_sycl_quarantine_reap();
     auto & registry = ggml_sycl::lifecycle::global_registry();
     const auto result = registry.begin_outer();
     if (result.code != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result.code);
@@ -9332,6 +9399,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
             ggml_sycl_abort_owner_effects(ticket.token);
             return ggml_sycl_lifecycle_c_result(registry.finalize_end(ticket, true).code);
         }
+        const auto validation = registry.validate_end(ticket);
+        if (validation != ggml_sycl::lifecycle::error::OK) {
+            try {
+                ggml_sycl_abort_owner_effects(ticket.token);
+            } catch (...) {
+            }
+            const auto failed = registry.finalize_end(ticket, false);
+            if (model) {
+                ggml_sycl_export_token(failed.token, model);
+            }
+            return ggml_sycl_lifecycle_c_result(failed.code);
+        }
 
         ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot);
         const auto actual = ggml_sycl_lifecycle_actual_snapshot();
@@ -9350,7 +9429,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
             ticket.token, ggml_sycl::lifecycle::model_phase::LIVE, publication.planned_host_bytes,
             publication.actual_host_bytes, publication.verdict });
         const auto result = registry.finalize_end(ticket, true, publication, std::move(state));
-        if (result.committed) ggml_sycl_export_token(result.token, model);
+        if (result.committed) {
+            ggml_sycl_export_token(result.token, model);
+        } else {
+            ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
+            try {
+                ggml_sycl_abort_owner_effects(result.token);
+            } catch (...) {
+            }
+            if (model) {
+                ggml_sycl_export_token(result.token, model);
+            }
+        }
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
         g_sycl_abort_load_exit = false;
@@ -72962,6 +73052,7 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
+    ggml_sycl_quarantine_reap();
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();

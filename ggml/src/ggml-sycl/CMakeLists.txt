@@ -108,10 +108,17 @@ if (BUILD_TESTING)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
+    add_executable(test-sycl-lifecycle-public-api
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-api.cpp)
+    target_include_directories(test-sycl-lifecycle-public-api PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    add_test(NAME sycl-lifecycle-public-wrappers COMMAND test-sycl-lifecycle-public-api)
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
-                  concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown durable-replay waiter-rollover
+                  concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
+                  durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
-                  latest-live-restoration effect-failure-quarantine begin-allocation-failure null-output stale-token-after-reuse)
+                  latest-live-restoration restore-failure-quarantine effect-failure-quarantine begin-allocation-failure
+                  null-output stale-token-after-reuse)
         add_test(NAME sycl-lifecycle-h2-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
     endforeach()
     foreach(_case slot-exhaustion model-id-overflow load-txn-id-overflow slot-generation-overflow invocation-id-counter-overflow)
@@ -127,8 +134,6 @@ if (BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
-    add_test(NAME sycl-lifecycle-public-wrappers
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-wrappers.py)
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.

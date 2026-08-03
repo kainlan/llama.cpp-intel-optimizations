@@ -52,7 +52,7 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto     e = r.end(b.txn, false);
         require(e.code == error::MISSING_SUCCESS && !r.last_success(), "missing success published LIVE");
     } else if (name == "wrong-txn") {
-        Registry r;
+        Registry r(UINT64_MAX, UINT64_MAX, mutation);
         auto     b = r.begin_outer();
         require(r.end({ b.txn.value + 1 }, true).code == error::WRONG_TRANSACTION, "wrong txn accepted");
         require(!r.end(b.txn, true).committed, "wrong transaction did not poison outer");
@@ -62,9 +62,12 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto     ticket = r.prepare_end(b.txn, true);
         require(ticket.finisher, "no finisher");
         require(r.enter_nested(b.txn) == error::DEPTH_UNDERFLOW, "depth underflow accepted");
-        r.finalize_end(ticket, true);
+        require(r.validate_end(ticket) == error::POISONED, "post-prepare poison not authoritative");
+        auto failed = r.finalize_end(ticket, true);
+        require(failed.code == error::POISONED && !failed.committed, "depth underflow committed after prepare");
+        require(!r.find(b.token.model), "depth-underflow model became LIVE");
     } else if (name == "depth-overflow") {
-        Registry r(UINT64_MAX, 1);
+        Registry r(UINT64_MAX, 1, mutation);
         auto     b = r.begin_outer();
         require(r.enter_nested(b.txn) == error::DEPTH_OVERFLOW, "depth overflow accepted");
         require(!r.end(b.txn, true).committed, "poisoned transaction published LIVE");
@@ -117,6 +120,15 @@ static void run_case(const std::string & name, test_mutation mutation) {
         require(t.finisher, "no teardown finisher");
         require(r.begin_outer().code == error::LOAD_BUSY, "load raced teardown cache effects");
         require(r.finalize_teardown(t, true) == error::OK, "teardown finalize failed");
+    } else if (name == "concurrent-model-teardown") {
+        Registry r;
+        auto     a     = commit_one(r);
+        auto     b     = commit_one(r);
+        auto     first = r.prepare_teardown(a);
+        require(first.finisher, "first model teardown did not coordinate");
+        require(r.prepare_teardown(b).code == error::BUSY, "different model teardown raced cache effects");
+        require(r.finalize_teardown(first, true) == error::OK, "first model teardown failed");
+        require(r.teardown(b) == error::OK, "second model teardown did not retry");
     } else if (name == "concurrent-teardown") {
         Registry r;
         auto     model = commit_one(r);
@@ -210,6 +222,16 @@ static void run_case(const std::string & name, test_mutation mutation) {
         r.end(c.txn, false);
         require(r.latest_live()->token == a, "failed C changed A restoration authority");
         require(r.teardown(a) == error::OK && !r.latest_live(), "A teardown left stale restoration authority");
+    } else if (name == "restore-failure-quarantine") {
+        Registry r;
+        auto     model    = commit_one(r);
+        auto     teardown = r.prepare_teardown(model);
+        require(teardown.finisher, "restore failure had no teardown ticket");
+        require(r.finalize_teardown(teardown, false) == error::EFFECT_FAILED, "restore failure did not quarantine");
+        require(!r.find(model.model), "restore failure created ghost LIVE model");
+        auto retry = r.prepare_teardown(model);
+        require(retry.finisher && r.finalize_teardown(retry, true) == error::OK,
+                "restore failure quarantine was not retryable");
     } else if (name == "effect-failure-quarantine") {
         Registry r;
         auto     model    = commit_one(r);

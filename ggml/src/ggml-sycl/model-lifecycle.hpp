@@ -104,6 +104,7 @@ public:
     // prepare retains coordinator+slot in COMMITTING/ROLLING_BACK. Exactly one
     // caller receives finisher=true and performs effects without the lock.
     finish_ticket prepare_end(LoadTxnId txn, bool explicit_success, bool output_available = true);
+    error         validate_end(const finish_ticket & ticket) const;
     end_result finalize_end(const finish_ticket & ticket, bool effects_ok,
                             publication_data publication = {},
                             std::shared_ptr<const ModelState> prepared_state = {}) noexcept;

@@ -34,7 +34,11 @@ checks = {
     "latest live restoration": "global_registry().latest_live()" in backend and "explicit_no_plan" in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text(),
     "plan deletion on teardown": "lifecycle_erase_placement_plan" in backend,
     "dead metadata preallocated": "dead_.emplace" in cpp and cpp.index("dead_.emplace") < cpp.index("model->second.phase = model_phase::TEARING_DOWN"),
-    "rollback effect replay": "error result_code = !effects_ok ? error::EFFECT_FAILED" in cpp,
+    "rollback effect replay": "error::EFFECT_FAILED" in cpp and "poisoned_after_prepare" in cpp,
+    "finalize poison authority": "poisoned_after_prepare" in cpp and "validate_end" in hpp,
+    "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN" in cpp,
+    "fallible pre-finalize restoration": backend.index("restore_latest_live_plan())") < backend.index("finalize_teardown(ticket, true)"),
+    "durable quarantine reaper": all(x in backend for x in ("g_sycl_quarantine_tokens", "ggml_sycl_quarantine_reap", "model_quarantine_token")),
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
