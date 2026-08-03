@@ -20,8 +20,8 @@
 
 #if !SYCL_XMX_MOE_AVAILABLE
 int main() {
-    fprintf(stderr, "SYCL XMX matrix extension not available; skipping test.\n");
-    return 0;
+    fprintf(stderr, "SKIP: SYCL XMX matrix extension is unavailable in this build.\n");
+    return 77;
 }
 #else
 
@@ -83,8 +83,8 @@ int main() {
 
     const int device_id = 0;
     if (!info.devices[device_id].xmx_caps.supported) {
-        fprintf(stderr, "Device does not support XMX; skipping test.\n");
-        return 0;
+        fprintf(stderr, "SKIP: selected SYCL device does not support XMX.\n");
+        return 77;
     }
 
     moe_xmx_fused::MXFPXMXConfig cfg = moe_xmx_fused::MXFPXMXConfig::from_device(device_id);
@@ -124,12 +124,12 @@ int main() {
     uint8_t * d_tiled  = sycl::malloc_device<uint8_t>(tiled_bytes, q);
 
     if (!d_aos || !d_soa_qs || !d_soa_e || !d_tiled) {
-        fprintf(stderr, "Device allocation failed; skipping test.\n");
+        fprintf(stderr, "Device allocation failed.\n");
         if (d_aos) sycl::free(d_aos, q);
         if (d_soa_qs) sycl::free(d_soa_qs, q);
         if (d_soa_e) sycl::free(d_soa_e, q);
         if (d_tiled) sycl::free(d_tiled, q);
-        return 0;
+        return 1;
     }
 
     q.memcpy(d_aos, aos.data(), aos.size() * sizeof(aos[0])).wait();
