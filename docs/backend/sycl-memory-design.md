@@ -162,7 +162,10 @@ owner/backing lease and ARENA handles retain arena/chunk generation. A retiring
 state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner registries
 → L4 cache/queue registry → L5 allocator/work ordering; the canonical table
 includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue,
-backend-context, and `control_host_allocs_mutex` locks. Global/transitional same-rank co-holding is forbidden and
+backend-context, and `control_host_allocs_mutex` locks. The target deletes the
+oneDNN global `unique_lock` registry: `t5nq` returns a caller-owned RAII scratch
+lease acquired/released with no listed lock held, and `h5m4` retains it in the
+event payload. Global/transitional same-rank co-holding is forbidden and
 completion/diagnostic locks C/D are isolated. No wait, blocking allocation/device
 call, queue create/destroy, callback, or final handle/token/backing destruction
 occurs under a listed lock. Tier verdicts are reporting-only.
@@ -171,16 +174,18 @@ occurs under a listed lock. Tier verdicts are reporting-only.
 process-global load/planner scratch, device-only pending-KV FIFO,
 `g_sycl_graph_compute_mutex`, graph cleanup without model/epoch attribution,
 DIRECT/ARENA shapes without universal async backing retention, and void memory
-ops without terminal events. Current control-host cleanup also clears a vector
-of owning `mem_handle`s under its context mutex; target drain snapshots/moves the
-batch under lock and destroys it only after unlock and event drain. These are
+ops without terminal events. Current oneDNN scratch keeps keyed locks in a
+global same-rank registry, and current control-host cleanup clears owning
+`mem_handle`s under its context mutex. The sole target teardown order is: begin
+drain → wait for terminal context events outside locks → extract/move the control
+batch under L4 → unlock → destroy batch → finish drain. These are
 non-conformances to migrate, not licensed exceptions to preserve or descriptions
 of supported concurrency.
 
 Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
-registry primitives/create/publish; `y36c` owns legacy drain/reset/teardown
-callers), DAG (`nn6z → nlww → vbeb → h5m4 → y36c`, `t5nq` before teardown,
-`.15.13 → h5m4`), G1/G7 ownership, token-only G5a versus teardown-only G5b,
+registry primitives/create/publish/extract; `y36c` owns legacy callers and the
+fixed drain→wait→extract→destroy→finish sequence), DAG (`nn6z → nlww → vbeb →
+h5m4 → y36c`, `t5nq scratch-lease API → h5m4`, `.15.13 → h5m4`), G1/G7 ownership, token-only G5a versus teardown-only G5b,
 legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
 independent ordinary/sidecar/pointer-table M6 mutants, the OPEN-before-seal race
 mutant, and control-lock-aware L1-L5/C/D M7, and final `hcyp`

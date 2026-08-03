@@ -189,7 +189,7 @@ Line numbers are review aids and may drift; the symbols/behaviors are the gate.
 | `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
 | `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
 | `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
-| `unified-cache.cpp:11305-11394` | `g_onednn_scratch_lock_mutex` registry stores/destroys per-cache `unique_lock` values | global/same-rank co-hold and destruction-under-lock migration: `t5nq` |
+| `unified-cache.cpp:11305-11394` | global registry stores keyed per-cache `unique_lock` values, forcing contradictory same-rank co-holding | `t5nq` deletes registry and returns caller-owned RAII scratch lease; `h5m4` retains it through event completion |
 | `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | blocking allocation/device/final-owner work under metadata lock: `t5nq`, `h5m4` |
 | `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/device work must use reserve-create-publish: `t5nq` |
 | `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | target snapshot must carry an owner lease: `nlww`, `t5nq` |
@@ -237,7 +237,9 @@ includes `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`,
 `g_pipeline_copy_queue_mutex`, block-exec `copy_queue_mutex`, and
 `g_backend_context_by_device_mutex`, and
 `ggml_backend_sycl_context::control_host_allocs_mutex`, including their
-allocation/queue/final-owner under-lock hazards. Global/transitional locks use a sentinel and cannot co-hold
+allocation/queue/final-owner under-lock hazards. The oneDNN global lock registry is not ordered around the
+keyed mutex: it is deleted in favor of a caller-owned lease acquired/released
+with no listed lock held. Global/transitional locks use a sentinel and cannot co-hold
 a keyed same-rank lock. Completion C and diagnostics D are isolated. Every wait,
 callback, blocking allocation/device operation, queue construction/destruction,
 and final handle/token/backing destruction is forbidden under L1-L5/C/D;
@@ -250,16 +252,17 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
 | `nlww` | context/session/reset-epoch registries and state primitives/create/publish; implements named control-host-allocation extract API |
 | `vbeb` | graph/invocation identities, one context/epoch, OPEN/SEALED producer+submit accounting, one token/device, aggregate+quarantine; owns H11/G5a/G7/M6e |
-| `h5m4` | independently retains ordinary I/O, sidecar, pointer-table, control-host, DIRECT-owner, and ARENA backing through SEALED completion; reruns G5a at P4 |
-| `t5nq` | exhaustive inventory including `control_host_allocs_mutex`, sentinel/tie-break, H8/M7 alias and final-destruction probes |
-| `y36c` | after event drain invokes `nlww` control-allocation extraction and destroys returned handles unlocked; owns teardown-only G5b |
+| `h5m4` | retains ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA backing, and caller-owned oneDNN scratch lease through SEALED completion |
+| `t5nq` | deletes oneDNN global registry, owns rank-safe scratch-lease API, and inventories `control_host_allocs_mutex` with H8/M7 acquire/release aliases |
+| `y36c` | exact order: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
 | `x3ou` | all tier-verdict readers are reporting-only |
 | `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
 Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
-vbeb → h5m4 → y36c`, with `t5nq` also preceding `y36c` and an explicit
-`32dg8.15.13 → h5m4` API edge. It supersedes stale `32dg8.2` ownership
-assumptions and maps `.15.10/.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
+vbeb → h5m4 → y36c`, with explicit `t5nq scratch-lease API → h5m4` and
+`32dg8.15.13 → h5m4` edges; both `t5nq` and `h5m4` precede `y36c`. It supersedes stale `32dg8.2` ownership
+assumptions and treats historical `.15.10` as superseded by `nlww`/`y36c` while
+mapping `.15.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
 editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
 shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
 M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
