@@ -269,12 +269,19 @@ checks = {
     < backend.index("registry.defer_quarantine(owner)"),
     "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
     < backend.index("registry->finalize_end(ticket, true, publication"),
-    "DL early inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
+    "DL early and late inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
     and "hooks.stage_inventory(&inventory, &envelope, early)" in llama
     and "defined(GGML_BACKEND_DL)" in llama
     and "llama_model_sycl_compute_early_plan(ml, hparams, __func__)" in llama
     and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_inventory_plan\")" in llama
-    and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend,
+    and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend
+    and "llama_model_sycl_set_late_inventory(ml, hparams, __func__)" in llama
+    and "sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
+    and "if (sycl_model_backend && ml.use_mmap)" in llama
+    and "disabling mmap for SYCL weight layout upload" in llama
+    and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
+        "ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope"
+    ) == 2,
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
     (root / "src/llama-context.cpp").read_text()
     and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()

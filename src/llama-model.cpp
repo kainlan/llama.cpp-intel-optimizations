@@ -1911,9 +1911,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-#ifdef GGML_USE_SYCL
-    llama_model_sycl_set_late_inventory(ml, hparams, __func__);
-
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     bool has_sycl_weight_buft = false;
     for (const auto & [buft, _] : ml.ctx_map) {
         if (llama_model_buft_is_sycl(buft) || llama_model_buft_backend_is_sycl(buft)) {
@@ -1921,7 +1919,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             break;
         }
     }
-    if (has_sycl_weight_buft && ml.use_mmap) {
+    const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
+    if (sycl_model_backend) {
+        llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+    }
+    if (sycl_model_backend && ml.use_mmap) {
         LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
         ml.use_mmap = false;
     }
