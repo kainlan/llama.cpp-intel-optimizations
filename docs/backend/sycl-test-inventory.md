@@ -200,7 +200,13 @@ Evidence keys: historical references are `git show 3c8f296fd:tests/CMakeLists.tx
 
 ## Task 4b: execution-hazard classification (static audit)
 
-This classification is an execution characteristic, **not** Task 4c's final restore/manual/delete disposition. In particular, `never-test` below means that the current source is obsolete or a self-contained debug/mock rather than an executable production regression test; Task 4c still owns what happens to the file. `host-only` means the source neither initializes a SYCL backend/queue nor allocates/submits device work. Linking SYCL code does not alone change that class when the tested path is CPU-side policy, bookkeeping, layout, or compile-time behavior. `GPU serial` means SYCL backend/queue initialization, device allocation, submission, or a backend graph compute and therefore no parallel execution. `manual` identifies an opt-in benchmark, standalone hardware experiment, or special-instrumentation run. `parser` is reserved for tests whose subject is parsing text/artifacts; none of these 64 sources has that execution shape.
+This classification is an execution characteristic, **not** Task 4c's final restore/manual/delete disposition. In particular, `never-test` below means that the current source is obsolete or a self-contained debug/mock rather than an executable production regression test; Task 4c still owns what happens to the file. `host-only` means the source neither initializes a SYCL backend/queue nor allocates/submits device work. Linking SYCL code does not alone change that class when the tested path is CPU-side policy, bookkeeping, layout, or compile-time behavior. `GPU serial` means SYCL backend/queue initialization, device allocation, submission, a backend graph compute, or an indirect call that initializes device-manager state. **Normatively, every `GPU serial` row is lead-only and must execute serially, one at a time.** This is a required scheduling contract, not a claim that live CTest metadata currently enforces it. `manual` identifies an opt-in benchmark, standalone hardware experiment, or special-instrumentation run. `parser` is reserved for tests whose subject is parsing text/artifacts; none of these 64 sources has that execution shape.
+
+Classes are mutually exclusive. Apply this precedence when a source has more than one characteristic: **model-loading > manual > never-test > GPU serial > host-only > parser**. The higher operational constraint wins: model hazards dominate all other execution details; an intentionally manual benchmark remains manual even when it uses GPUs; a current obsolete/mock source remains never-test even if it constructs SYCL objects; device reachability dominates host-only; and parser is the final text/artifact-only fallback. This makes the aggregate counts deterministic.
+
+**Evidence pin:** Task 4a provenance is pinned at merge `e015e1e0c`. Task 4b source and live-CMake evidence was audited through branch tip `284a78bee` immediately before this documentation-only coherence correction; because the correction changes only this inventory, the audited source/CMake content is identical at the resulting branch tip.
+
+At that pinned live snapshot, **31 Task 4a GREEN rows are classified `GPU serial`, and all 31 lack CTest `RUN_SERIAL` enforcement**. Their live registration does not waive the lead-only/one-at-a-time contract. Existing `hostonly` labels are also stale where noted below. Task 17 owns label and scheduling remediation; Task 4b records the hazard and does not edit CMake.
 
 Evidence keys used in the table:
 
@@ -588,7 +594,7 @@ a preceding `#undef NDEBUG` or a gtest include. 28 files matched; triage:
 | `tests/test-archs-exclude.cpp`, `test-archs-table.cpp`, `test-chat.cpp`, `test-rope.cpp` | 1 each | not SYCL-specific (general llama.cpp tests, out of this ticket's `tests/`+`ggml/src/ggml-sycl/tests/` SYCL-behaviour scope); not individually re-verified this pass |
 | `tests/test-grammar-llguidance.cpp` | 4 | registered via `llama_build_and_test`; general (non-SYCL), not re-verified |
 | `tests/test-quantize-stats.cpp` | 1 | registered via `llama_build` only (no `llama_test`/`add_test` found for it — may not even run as a test); general, not SYCL, not re-verified |
-| 17 remaining files (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | **unregistered anywhere** (confirmed against both `CMakeLists.txt` files) — part of `llama.cpp-0igs`'s 186-file dead-source population. Several are clearly SYCL/MoE-backend tests despite lacking a `sycl-` prefix (`tile-decomposition`, `vram-pool`, `pinned-chunk-pool`, `xmx-unified-kernel`, `test-sycl-prestage-routed-experts` itself). Would need **both** registration and the same `#undef NDEBUG` fix if restored — noting this so `llama.cpp-0igs` doesn't rediscover the NDEBUG half of the problem file-by-file the way `llama.cpp-4jlv`/`c17b010af`/`d4cccba5e`/`d4608ec7e` each rediscovered the registration half in isolation |
+| 17 files in the mechanical scan's **pre-restoration historical snapshot** (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | At that historical scan point all 17 were unregistered. At the Task 4b pinned live snapshot, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, and `test-xmx-unified-kernel` are now actively registered; the other 14 remain absent from live registration (including the false-guarded/obsolete `test-expert-cache`). This row records the original NDEBUG finding, not a current registration audit or Task 4c disposition. Any remaining bare-assert source would need an NDEBUG-proof failure path before a future registration. |
 
 ## Four more ctest/grep traps, found during `llama.cpp-0igs` restoration batches
 
@@ -611,25 +617,31 @@ Extending the trap list already in this doc (`ctest -R` on zero matches,
   confirmed by `-fsyntax-only`), not a casualty of it. A line-level match is
   not the same claim as "this target builds when CMake processes this file."
 - **`-LE` is an unanchored regex over LABELS too, not just `-E` over test
-  names.** 9 of batch 1's 13 restored tests carried LABELS containing the
-  bare words `cache` or `mem-handle`, colliding with CLAUDE.md's
-  throttled-sweep denylist (`-LE 'residency|mem-handle|cache'`) despite being
-  confirmed host-only and deserving none of the GPU-memory hazard the
-  denylist exists for. The first fix (`32a70dcf3`) renamed them to
-  `cache-hostonly` / `mem-handle-hostonly` and was verified by checking that
-  no label *equalled* a denylisted word — the right property, checked with
-  the wrong operator. `ctest -LE` matches by regex/substring exactly the way
-  `-R`/`-E` already do over test names (this doc's own earlier trap: `-E
-  "test-llama-archs"` also excludes `test-llama-archs-table`), so `cache`
-  still matched inside `cache-hostonly` and 11 of 41 restored tests stayed
-  silently excluded. Nobody had written that `-L`/`-LE` share that semantic
-  with `-R`/`-E`, so the fix repeated the exact defect class it was fixing.
-  Corrected in `b7555cc73` by dropping the hazard word entirely rather than
-  suffixing it (bare `hostonly` + subsystem word, no shared substring with
-  the denylist at all), and verified with `re.search` over every label
-  string instead of equality — 0 of 41 collide. `llama.cpp-0igs` itself
-  documents the underlying failure mode (`impl-5exz`: 5 of 9 un-guarded
-  tests similarly affected); batch 1's original rate was worse, 9 of 13.
+  names.** Historically, 9 of batch 1's 13 restored tests carried LABELS
+  containing the bare words `cache` or `mem-handle`, colliding with
+  CLAUDE.md's throttled-sweep denylist (`-LE
+  'residency|mem-handle|cache'`). The restoration pass called those nine
+  host-only; Task 4b's stricter indirect-device audit reclassifies **8 of the
+  9 as GPU serial** (only `test-tensor-classification` remains host-only).
+  The first fix (`32a70dcf3`) renamed the labels to `cache-hostonly` /
+  `mem-handle-hostonly` and was verified by checking that no label *equalled*
+  a denylisted word — the right property, checked with the wrong operator.
+  `ctest -LE` matches by regex/substring exactly the way `-R`/`-E` already do
+  over test names (this doc's own earlier trap: `-E "test-llama-archs"` also
+  excludes `test-llama-archs-table`), so `cache` still matched inside
+  `cache-hostonly` and 11 of 41 restored tests stayed silently excluded.
+  Nobody had written that `-L`/`-LE` share that semantic with `-R`/`-E`, so
+  the fix repeated the exact defect class it was fixing. Corrected in
+  `b7555cc73` by dropping the hazard word entirely rather than suffixing it
+  (bare `hostonly` + subsystem word, no shared substring with the denylist at
+  all), and verified with `re.search` over every label string instead of
+  equality — 0 of 41 collide. At the pinned live snapshot, the `hostonly`
+  labels retained by those eight GPU rows — and by the two GPU-serial unified
+  memory rows restored in batch 2 — are stale hazard metadata; Task 17 owns
+  correcting labels and adding serial scheduling enforcement. This Task 4b
+  audit does not edit CMake. `llama.cpp-0igs` itself documents the underlying
+  failure mode (`impl-5exz`: 5 of 9 un-guarded tests similarly affected);
+  batch 1's original rate was worse, 9 of 13.
 - **`-fsyntax-only` proves compilation, not linking.** `test-onednn-woq.cpp`
   compiled clean but failed to link (`undefined reference to
   dnnl_primitive_destroy`, `DSO missing from command line`): it includes two
