@@ -336,7 +336,9 @@ test_unit_tests() {
     if [ -x "${LLAMA_BIN_DIR}/test-tiered-dispatch" ]; then
         echo "Running test-tiered-dispatch..."
         local exit_code=0
-        ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" "${LLAMA_BIN_DIR}/test-tiered-dispatch" || exit_code=$?
+        ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" \
+        GGML_SYCL_VRAM_ARENA="${GGML_SYCL_VRAM_ARENA-1}" \
+            "${LLAMA_BIN_DIR}/test-tiered-dispatch" || exit_code=$?
         if [ ${exit_code} -eq 0 ]; then
             echo -e "${GREEN}PASSED: test-tiered-dispatch${NC}"
             tests_passed=$((tests_passed + 1))

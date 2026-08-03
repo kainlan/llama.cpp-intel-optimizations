@@ -137,21 +137,11 @@ void check_initial_cache_stats(ggml_backend_t backend) {
     check(hits == 0 && misses == 0, "initial cache stats were not both zero");
 }
 
-bool prepare_arena_test_environment() {
+bool arena_contract_available() {
     const char * arena = std::getenv("GGML_SYCL_VRAM_ARENA");
-    if (arena && std::atoi(arena) != 0) {
-        std::fprintf(stderr, "SKIP: tiered-dispatch requires GGML_SYCL_VRAM_ARENA=0\n");
+    if (arena && std::atoi(arena) == 0) {
+        std::fprintf(stderr, "SKIP: tiered-dispatch requires the VRAM arena (GGML_SYCL_VRAM_ARENA=1)\n");
         return false;
-    }
-    if (!arena) {
-#if defined(_WIN32)
-        if (_putenv_s("GGML_SYCL_VRAM_ARENA", "0") != 0) {
-#else
-        if (setenv("GGML_SYCL_VRAM_ARENA", "0", 0) != 0) {
-#endif
-            std::fprintf(stderr, "SKIP: could not set GGML_SYCL_VRAM_ARENA=0\n");
-            return false;
-        }
     }
     return true;
 }
@@ -159,7 +149,7 @@ bool prepare_arena_test_environment() {
 }  // namespace
 
 int main() {
-    if (!prepare_arena_test_environment()) {
+    if (!arena_contract_available()) {
         return 77;
     }
 
