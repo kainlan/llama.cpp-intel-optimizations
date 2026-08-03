@@ -3153,3 +3153,42 @@ set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
     LABELS "sycl;fusion;rms-norm;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120)
+
+# Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
+# std::threads but no SYCL queue, links no backend library, and takes no -fsycl
+# options. A repeated handoff/reset cycle stress-tests the fixture and TLS reuse.
+add_executable(test-moe-layer-ids-worker-reset
+    tests/test-moe-layer-ids-worker-reset.cpp
+)
+target_include_directories(test-moe-layer-ids-worker-reset PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(test-moe-layer-ids-worker-reset PRIVATE Threads::Threads)
+add_test(NAME sycl-moe-worker-reset COMMAND test-moe-layer-ids-worker-reset)
+set_tests_properties(sycl-moe-worker-reset PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;host-only;tls"
+    TIMEOUT 30
+)
+
+# AST/control-flow contract plus executable mutation matrix. tree-sitter parses
+# active C++ nodes, so comments and literals cannot spoof reset/TLS/order checks.
+# Python is test-only: its absence must not break a clean SYCL configuration.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME sycl-moe-reset-source-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-layer-ids-source-contract.py
+            --source ${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
+            --header ${CMAKE_CURRENT_SOURCE_DIR}/moe-layer-ids-cache.hpp
+            --mutation-matrix
+    )
+    set_tests_properties(sycl-moe-reset-source-contract PROPERTIES
+        LABELS "sycl;moe;host-only;ast;mutation"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+else()
+    message(STATUS "ggml-sycl: Python3 not found; AST reset contract test is not registered")
+endif()
