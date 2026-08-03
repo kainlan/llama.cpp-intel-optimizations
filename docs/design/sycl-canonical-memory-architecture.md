@@ -1,8 +1,9 @@
 # Canonical SYCL Memory Architecture Contract
 
-*Status: in force since 2026-04-27; last updated 2026-08-03. All new SYCL backend
+*Status: in force since 2026-04-27; last updated 2026-08-04. All new SYCL backend
 code must comply. Migration tasks for existing non-conforming sites are tracked
-in `llama.cpp-32dg8`.*
+in `llama.cpp-32dg8`. Section 12 is the lifecycle authority: it states both the
+target contract and the non-conforming current implementation explicitly.*
 
 ---
 
@@ -552,3 +553,243 @@ prove server slots with different context sizes, explicit context-keyed arena
 ownership, or context-keyed resets for KV/RUNTIME/HOST zones. C1 remains open
 until those ownership keys or equivalent guards exist and the test matrix covers
 same-model contexts with different `n_ctx`/slot lifetimes.
+
+---
+
+## 12. Model lifecycle and asynchronous ownership contract
+
+### 12.1 Status and vocabulary
+
+This section is an **enforceable target contract**, not a description of APIs
+that exist today. A target name in backticks is a required identity or concept,
+not a claim that a C++ type or public API with that spelling has landed. Until
+all phases in §12.10 pass, current SYCL code is non-conforming where called out
+below and must retain the conservative restrictions in §5.
+
+| Identity | Required meaning and validity rule | Required owner/key |
+|---|---|---|
+| `ModelId` | Process-unique, monotonic identity for one model object; never a pointer and never reused during the process | All model-semantic plans, inventories, weights, diagnostics, and teardown |
+| `SlotGeneration` | Monotonic generation incremented whenever a bounded numeric slot is reserved; `(slot, generation)` is the only valid slot identity | Transitional cache owner masks/slot tables; a bare slot is never sufficient |
+| `LoadTxnId` | Process-unique identity for one **outermost** model-load attempt | Every load scratch write, allocation, registration, commit, and rollback |
+| `ContextId` | Process-unique identity for one inference context | KV, RUNTIME, SCRATCH, oneDNN, staging, and context teardown |
+| `SessionId` | Identity for one logical server sequence/session, namespaced by `ContextId`; not an allocation owner by itself | KV sequence rows and request diagnostics |
+| `GraphEpoch` | Monotonic counter namespaced by `ContextId`; incremented on record, invalidation, and clear so stale callbacks cannot affect a replacement graph | Recorded graph state, pointer tables, retained handles, and terminal events |
+
+Zero/wildcard/invalid identities must fail closed at mutating entry points. IDs
+must appear in debug ownership records and lifecycle logs. Address identity,
+`last_completed`, current-thread state, and device number are not substitutes.
+A bounded slot may be reused only after the old generation is DEAD and all its
+leases have drained; stale `(slot, generation)` operations are rejected.
+
+**Current implementation (audited source, 2026-08-04):**
+`ggml-sycl.cpp:8986-9199` has 32 bare ownership slots, process globals for one
+loading slot and one last-completed slot, and an atomic nesting depth. It has no
+slot generation, `ModelId`, or `LoadTxnId`; `ggml_backend_sycl_model_slot_current()`
+returns last completed rather than caller identity. Planner/inventory scratch at
+`ggml-sycl.cpp:9736-10096` is process-global. Pending KV masks at
+`ggml-sycl.cpp:9244-9273` are keyed only by device and FIFO order. Therefore
+those mechanisms are evidence of the migration need, not compliant identity APIs.
+
+### 12.2 Load and model state machines
+
+Required model states and the only legal transitions are:
+
+```text
+ABSENT --begin(LoadTxnId, ModelId, slot+generation)--> LOADING
+LOADING --commit outermost transaction--------------> LIVE
+LOADING --any failure/cancel/protocol violation------> ABORTING --> DEAD
+LIVE    --teardown(ModelId)--------------------------> TEARING_DOWN --> DEAD
+```
+
+A load transaction is `ACTIVE -> COMMITTED` or `ACTIVE -> ABORTED`; commit and
+abort are terminal and exactly once. Nested load calls belong to the same
+`LoadTxnId`, increment/decrement its checked depth, and cannot commit. The
+outermost successful exit may publish LIVE only after all planned state and
+ownership records are complete. **Abort is the default:** any inner failure,
+allocation/planner/preload failure, exception, cancellation, depth underflow,
+wrong transaction, or missing explicit success marks the transaction poisoned.
+Outermost unwind then rolls back only that transaction's allocations and scratch,
+releases its reserved slot generation, and publishes neither `last completed`
+nor LIVE. Rollback must be idempotent. A failure while another model is LIVE
+must leave that model byte-for-byte usable.
+
+Teardown first blocks new execution leases for the target `ModelId`, marks it
+TEARING_DOWN, invalidates its contexts/epochs, and then waits **without locks**
+for its event-held leases. It releases only matching owner records and finally
+marks DEAD. A second teardown is an idempotent no-op; teardown of an unknown or
+stale identity is an error, never a global sweep.
+
+**Current limitation:** the bool load boundary at `ggml-sycl.cpp:9093` clamps
+underflow and treats the outermost `false` as successful; it cannot identify or
+roll back a failed nested transaction. This behavior must not be documented as
+meeting the target state machine.
+
+### 12.3 Supported lifecycle matrix
+
+| Scenario | Object lifecycle target | Execution target |
+|---|---|---|
+| Sequential `A -> B -> A` (fresh A object on return) | Required; no semantic state from either prior load may be observed unless content-addressed and owner-safe | Required serially |
+| A and B both LIVE | Required, including deduplicated weights with both owners | Same-device overlap is not implied |
+| Multiple contexts for one model | Required, with distinct `ContextId` arenas/KV | Same-device overlap only under the execution-lease rule below |
+| Multiple server sessions | Required, with `(ContextId, SessionId)` KV attribution | Must not alias another session's reset |
+| Different-device execution | Permitted only after all touched process globals are model/context keyed | Event dependencies still required |
+| Same-device concurrent inference | **Target is serialization/rejection by an event-held device execution lease**, not overlapping execution | Unsupported today; no optimistic overlap |
+
+For a device, an execution lease is `(device, ModelId, ContextId, GraphEpoch)`.
+It is acquired before any context arena mutation or submission and remains held
+until the terminal `sycl::event` completes, including deferred copies and pure-GPU
+decode after the host call returns. A second incompatible lease on that device
+must wait outside all lifecycle/cache locks or return a defined busy result.
+Dropping a host mutex after enqueue does not release it. Different contexts may
+share immutable model weights, but never mutable KV/RUNTIME/SCRATCH ownership.
+
+### 12.4 Owner-targeted reset, graph invalidation, and teardown
+
+Every reset/clear/free operation must take an explicit owner tuple and match it:
+
+| Resource | Minimum reset key | Required behavior |
+|---|---|---|
+| Model load scratch | `LoadTxnId` | Clear/rollback only the attempt; committed model state is immutable |
+| Weight/cache owner | `ModelId` plus `(slot, SlotGeneration)` during slot migration | Remove only that owner; shared/deduplicated entries survive while any owner/lease remains |
+| KV and context arenas | `ContextId` (and `SessionId` for sequence rows) | Never reset every context on the device |
+| Recorded graph | `(ContextId, GraphEpoch)` | Clear only the matching epoch; stale clear/callback is ignored/rejected |
+| Device execution | terminal event for the exact execution lease | Lease releases only after completion, not after submission |
+
+`sycl_exec_graph_clear_active()` currently clears a supplied backend context, but
+model teardown calls an all-device graph-lease sweep because retained graph
+handles lack model attribution (`ggml-sycl.cpp:85621-85670`). That sweep is a
+known non-conformance: target teardown must not invalidate another live model's
+graph. Device-only FIFO ownership of pending KV masks is likewise forbidden.
+Whole-zone reset remains a refusal, not a force-free, if any non-target or
+in-flight allocation would be affected.
+
+### 12.5 Locking and waiting
+
+The mandatory lock order is:
+
+```text
+L1 identity/load registry
+  -> L2 model/context/graph registry
+    -> L3 unified-cache metadata
+      -> L4 zone/allocator metadata
+```
+
+Code may skip levels but never acquire upward while holding a lower level.
+Owner snapshots should be taken under L1/L2 and acted on after release rather
+than extending nested critical sections. No code may, while holding **any** of
+these locks: wait on a SYCL event/queue/future/condition variable; perform a
+blocking allocation or device call; invoke user callbacks; destroy a final
+`mem_handle`; or call teardown/reset code that can acquire another lifecycle
+lock. Event callbacks may enqueue an identity-tagged release for later handling;
+they must not take the hierarchy synchronously. Assertions and lock-rank tests
+must make violations observable.
+
+### 12.6 `mem_handle` and event-held leases
+
+Resolving a pointer requires a live `mem_handle`, but lexical handle lifetime is
+not enough for asynchronous work. Every submit must create an event lease that
+owns copies of all input/output/sidecar/pointer-table handles and the execution
+lease through the terminal event. Fan-out retains until the join event; graph
+recording retains by `(ContextId, GraphEpoch)` through the final replay event;
+error/cancel paths retain until submitted work completes. A completion handler
+may release only an exact identity/epoch match. No `sycl::free`, cache eviction,
+owner reset, slot reuse, or graph replacement may invalidate those handles first.
+
+The current `mem_handle` refcount protects allocations, but APIs that return no
+event and global graph lease clearing do not by themselves prove this rule. They
+remain migration sites, not exemptions.
+
+### 12.7 Tier verdict is reporting only
+
+A load's `planned_host_bytes`, `actual_host_bytes`, and tier verdict are immutable
+records keyed by `ModelId`/`LoadTxnId`. The verdict may drive logs, telemetry,
+and API reporting **only**. Dispatch, placement, allocation, reset, and teardown
+must use the placement plan and resolved handles, never a process-global
+"current model has host placement" boolean. An unknown/partial/aborted verdict
+must report UNKNOWN and cannot silently inherit the previous model's value.
+`g_current_model_planner_host_placement` at `ggml-sycl.cpp:9766-9769` is current
+load scratch and is not a compliant multi-model routing authority.
+
+### 12.8 Child acceptance requirements
+
+These child IDs are delivery boundaries; none may claim closure from a log-only
+or grep-only check.
+
+| Child | Required deliverable and acceptance evidence |
+|---|---|
+| `nn6z` | Introduce `ModelId`, `SlotGeneration`, and `LoadTxnId`; checked nesting, explicit commit, abort-default rollback; host tests H1-H4 and mutations M1-M3 |
+| `nlww` | Introduce `ContextId`/`SessionId`; key KV/RUNTIME/SCRATCH/pending masks and resets; host tests H5-H6 and GPU tests G3-G4 |
+| `vbeb` | Introduce `GraphEpoch` and same-device event-held execution lease across every submit/record/replay path; H7, G5, M6 |
+| `y36c` | Replace all-device/load-boundary cleanup with owner-targeted reset and teardown; prove shared entries survive; H3-H6, G2-G4, M4-M5 |
+| `t5nq` | Enforce lock ranks and no-wait/no-final-destruction-under-lock; deterministic contention test H8 and M7 |
+| `h5m4` | Make `mem_handle` leases event-held for kernels, copies, pointer tables, sidecars, and graphs; H7, G5-G6, M6 |
+| `x3ou` | Make tier verdict immutable and reporting-only; audit every reader; H9 and M8 |
+| `hcyp` | Regenerate the parser-grade static census at final source HEAD, classify every mutable row by the identities above, and make `--check` clean; it is the final gate, not an implementation child |
+
+### 12.9 Exact verification and mutation matrix
+
+The implementation children must add the named tests below. Names are **target
+test names, not claims that they exist now**.
+
+| ID | Class | Exact command | Required assertions |
+|---|---|---|---|
+| H1 | host | `ctest --test-dir build -R '^sycl-lifecycle-load-txn$' --output-on-failure` | nested success commits exactly once |
+| H2 | host | `ctest --test-dir build -R '^sycl-lifecycle-load-txn$' --output-on-failure` | inner failure poisons outer transaction; no LIVE publication |
+| H3 | host | `ctest --test-dir build -R '^sycl-lifecycle-multi-model$' --output-on-failure` | A and B LIVE; B load/abort cannot change A |
+| H4 | host | `ctest --test-dir build -R '^sycl-lifecycle-multi-model$' --output-on-failure` | sequential A→B→A gets fresh IDs/generations and identical A plan |
+| H5 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | reset/teardown touches only target model/context/session/epoch |
+| H6 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | stale slot generation and stale graph callback rejected |
+| H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | mocked incomplete event retains every handle and device lease |
+| H8 | host | `ctest --test-dir build -R '^sycl-lifecycle-lock-order$' --output-on-failure` | rank inversion and wait-under-lock deterministically fail |
+| H9 | host | `ctest --test-dir build -R '^sycl-lifecycle-tier-reporting$' --output-on-failure` | changing verdict changes report only, never route/reset |
+| G1 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure` | one process loads/runs/frees A→B→A |
+| G2 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-multi-live$' --output-on-failure` | A remains runnable after B load, failed load, and B teardown |
+| G3 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | clearing context/session 1 preserves context/session 2 KV |
+| G4 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | unequal `n_ctx`, interleaved slot lifetime, no cross-reset |
+| G5 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | delayed terminal event blocks same-device lease and teardown |
+| G6 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | graph clear/re-record cannot release old epoch before event completion |
+
+GPU commands are run once, serially by the lead session under the repository GPU
+safety rules; exit 77/SKIP is not a pass. Each GPU test must validate deterministic
+output and ownership diagnostics, not merely exit zero.
+
+| Mutation | Required intentional defect | Test that must fail (positive control) |
+|---|---|---|
+| M1 | reuse a slot without incrementing `SlotGeneration` | H4/H6 |
+| M2 | let nested child commit independently | H1 |
+| M3 | treat inner failure or missing success as commit | H2/G2 |
+| M4 | reset all device contexts instead of target `ContextId` | H5/G3 |
+| M5 | global graph clear on one-model teardown | H5/G2 |
+| M6 | release handles/execution lease at submit rather than terminal event | H7/G5/G6 |
+| M7 | wait on a mocked event while holding L1-L4 | H8 |
+| M8 | branch dispatch on tier verdict | H9 |
+
+A test has mutation specificity only if the listed mutant fails while its
+negative controls remain green. The final `hcyp` gate is exact:
+
+```sh
+python3 scripts/audit-sycl-static-storage.py --self-test
+python3 scripts/audit-sycl-static-storage.py
+python3 scripts/audit-sycl-static-storage.py --check
+```
+
+The regenerated audit must record current source commit/hash/counts, reconcile
+all new lifecycle statics, and contain no unowned mutable model/context/session/
+graph state. The historical 5793 census is not accepted as final evidence.
+
+### 12.10 Phased code-path plan (not implemented by this document)
+
+| Phase | Code paths to migrate | Exit criterion |
+|---|---|---|
+| P0 inventory | slot/load globals, planner scratch, pending KV FIFO, graph clear, cache owner masks | Every mutable site assigned an identity and child |
+| P1 transactions | model load begin/nested exit/preload/failure; slot registry | `nn6z` tests and rollback mutations pass |
+| P2 ownership | context creation/free, KV/RUNTIME/SCRATCH reservation, server sequence reset | `nlww` + `y36c` owner-reset tests pass |
+| P3 async | graph compute, memcpy/memset, direct/fallback, persistent-TG, command record/replay | `vbeb` + `h5m4` event tests pass |
+| P4 teardown/locks | model/context teardown, cache reclaim, graph invalidation, callbacks | owner-targeting and `t5nq` contention tests pass |
+| P5 reporting | planner/tier API and all readers | `x3ou` proves report-only behavior |
+| P6 final audit | parser census and source-anchor review at final HEAD | `hcyp` regeneration and `--check` pass; all H/G tests green |
+
+No phase may expose a target identity API as supported current behavior before
+its owning paths and tests land end-to-end. Compatibility shims must fail closed
+and carry the full identity tuple; a new ID wrapped around process-global state
+is not completion.

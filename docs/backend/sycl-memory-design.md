@@ -134,6 +134,39 @@ is the short form; this is the why):
   host-pinned pointer to a GPU kernel is slower (measured 1.6–2.6×) *and* breaks
   the tier abstraction. Let `resolve()` report residency and route accordingly.
 
+## Lifecycle identity and async lease boundary
+
+The enforceable lifecycle contract is canonical §12. Its types are **target
+concepts, not current APIs**: `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
+`ContextId`, `(ContextId, SessionId)`, and `(ContextId, GraphEpoch)`. Current
+bare slot masks, process-global load/planner scratch, per-device pending-KV FIFO,
+and all-device graph cleanup do not satisfy it.
+
+The concise rule is: allocation identity, semantic owner, and asynchronous use
+are three different things. A `mem_handle` identifies/leases an allocation; the
+model/context/session/graph identities say who may reset it; and an event-held
+execution lease says when async work is finished. A submit must retain every
+handle and `(device, ModelId, ContextId, GraphEpoch)` execution lease until its
+terminal event, not merely until the host function returns. Same-device
+inference must serialize or reject before mutable arena state is touched;
+multiple LIVE model objects and sequential A→B→A remain required and do not
+imply overlapping inference support.
+
+Loads are explicit abort-default transactions. Nested calls share one
+`LoadTxnId`; only a successful outermost commit publishes LIVE. Any nested
+failure, cancellation, protocol mismatch, or missing success rolls back only
+that transaction. Reset, graph clear, and teardown target exact owners and
+never sweep another model/context/device merely because the current structures
+lack attribution.
+
+Locks follow identity/load → model/context/graph → cache metadata → zone
+allocator. No event/queue wait, blocking device call, callback, or final handle
+destruction occurs under any of those locks. Tier verdicts are immutable
+reporting keyed to the load/model and never dispatch or reset authorities. See
+canonical §12.8-§12.10 for per-child requirements (`nn6z`, `nlww`, `vbeb`,
+`y36c`, `t5nq`, `h5m4`, `x3ou`, final census `hcyp`), exact tests, mutations,
+and the phased source plan.
+
 ## Path-scoped zone sizing
 
 `populate_host_zone_sizing` (`ggml/src/ggml-sycl/unified-cache.cpp`) once sized

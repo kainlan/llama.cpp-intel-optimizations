@@ -161,6 +161,98 @@ model execution. The sections below preserve the earlier targeted/manual audit;
 the generated census does not retroactively make their textual searches
 binding-resolved evidence.
 
+## Lifecycle-contract delta (39p5, docs-only)
+
+The authoritative target lifecycle is now §12 of
+[`sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md).
+It requires explicit `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
+`ContextId`, `(ContextId, SessionId)`, and `(ContextId, GraphEpoch)` identities;
+abort-default nested transactions; owner-targeted reset/teardown; lock ordering;
+and event-held memory/execution leases. These are **target requirements**, not
+names of current C++ APIs. The earlier audit language about a single structural
+outer load reset describes current mitigation only and must not be read as proof
+of a transaction or multi-model lifecycle.
+
+### Current source-anchor check
+
+Anchors below were checked against the source in this worktree on 2026-08-04.
+Line numbers are review aids and may drift; the symbols/behaviors are the gate.
+
+| Source anchor | Current behavior observed | Contract gap / child |
+|---|---|---|
+| `ggml-sycl.cpp:8986-9006` | process-global allocated/live bitmasks; 32 bare slots; conservative unattributed fallback | no `ModelId` or generation; ABA/attribution work: `nn6z` |
+| `ggml-sycl.cpp:9029-9032` | “current” API returns process-global last-completed slot | not caller/model identity: `nn6z` |
+| `ggml-sycl.cpp:9041-9083` | teardown releases a bare slot, then clears graph replay leases on every device | not owner/epoch targeted: `y36c`, `vbeb` |
+| `ggml-sycl.cpp:9093-9199` | atomic nesting depth; outer entry resets scratch/reserves slot; outer `false` preloads and publishes LIVE | no transaction ID or failure channel; clamp can turn protocol failure into completion: `nn6z` |
+| `ggml-sycl.cpp:9244-9273` | pending KV layer masks are per-device FIFO queues | no context/session attribution: `nlww` |
+| `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
+| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
+| `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
+
+Recheck these anchors without relying on a size-limited index:
+
+```sh
+awk 'NR>=8986 && NR<=9199 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=9238 && NR<=9275 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=9736 && NR<=10096 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=85621 && NR<=85670 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.hpp
+```
+
+### Audit disposition by required identity
+
+| State class | Required identity | Reset/teardown verdict |
+|---|---|---|
+| plan, tensor inventory, load diagnostics, temporary registrations | `LoadTxnId` until commit, then `ModelId` | rollback transaction only; never “clear current model” globally |
+| bounded weight owner slot | `ModelId` + `(slot, SlotGeneration)` | remove exact owner; preserve shared entry and all live/event leases |
+| KV/RUNTIME/SCRATCH/oneDNN/staging | `ContextId`; KV rows also `SessionId` | exact context/session only; whole-device reset must refuse |
+| recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | stale clear/callback rejected; old epoch drains its own terminal event |
+| async kernel/copy lifetime | exact mem handles plus `(device, ModelId, ContextId, GraphEpoch)` execution lease | release on terminal event, never host-submit return |
+| tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
+
+The required lock rank is identity/load registry → model/context/graph registry →
+unified-cache metadata → zone allocator metadata. Event/queue waits, callbacks,
+blocking device calls, and final handle destruction are forbidden while any
+ranked lock is held. Audit evidence must include deterministic lock-rank and
+wait-under-lock positive controls, not merely an absence grep.
+
+### Child and final-census gates
+
+| Child | Audit must prove |
+|---|---|
+| `nn6z` | transaction identity, checked nesting, abort-default rollback, generated slots, A→B→A |
+| `nlww` | context/session-keyed KV and arena state; no device FIFO attribution |
+| `vbeb` | epoch-keyed record/replay and same-device terminal-event execution lease |
+| `y36c` | owner-targeted reset/teardown; no all-device graph clear |
+| `t5nq` | lock rank and no waits/final destruction under locks |
+| `h5m4` | every raw pointer consumer has a handle lease through terminal event |
+| `x3ou` | all tier-verdict readers are reporting-only |
+| `hcyp` | final parser census regenerated at implementation HEAD and reconciled against all identities |
+
+The exact host/GPU test commands and mutation matrix M1-M8 are canonical §12.9
+and are incorporated here by reference rather than duplicated. In particular,
+multiple LIVE models and sequential A→B→A are separate gates; neither proves
+same-device overlapping execution, which must serialize/reject through the
+terminal-event lease.
+
+**Census status now:** the checked-in inventory remains the historical
+`5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
+worktree, `python3 scripts/audit-sycl-static-storage.py --check` reports it stale.
+That is expected before implementation and is an explicit open gate, not a pass.
+`hcyp` must run, at final source HEAD:
+
+```sh
+python3 scripts/audit-sycl-static-storage.py --self-test
+python3 scripts/audit-sycl-static-storage.py
+python3 scripts/audit-sycl-static-storage.py --check
+```
+
+It must update source SHA-256s, commit/count prose and CSV together; classify
+every new mutable lifecycle row by owner, synchronization and teardown; and
+leave no unowned model/context/session/graph semantic state. A refreshed count
+without reconciliation, or a green check against pre-implementation source,
+does not close `hcyp`.
+
 ---
 
 `test-llama-archs` loads ~131 architectures back-to-back in **one process**.
