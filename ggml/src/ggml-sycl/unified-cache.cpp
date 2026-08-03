@@ -68,24 +68,33 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
     g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
 }
 
-void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan) {
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info,
+                                    uint32_t                  model_n_layer) {
     if (load_txn_id == 0) {
         return;
     }
     auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
-    snapshot->load_txn_id = load_txn_id;
-    snapshot->plan        = std::make_shared<const placement_plan>(std::move(plan));
+    snapshot->load_txn_id   = load_txn_id;
+    snapshot->model_n_layer = model_n_layer;
+    snapshot->kv_info       = kv_info;
+    snapshot->plan          = std::make_shared<const placement_plan>(std::move(plan));
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
 
-void lifecycle_stage_no_placement_plan(uint64_t load_txn_id) {
+void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
+                                       const placement_kv_info & kv_info,
+                                       uint32_t                  model_n_layer) {
     if (load_txn_id == 0) {
         return;
     }
     auto snapshot              = std::make_shared<lifecycle_plan_snapshot>();
     snapshot->load_txn_id      = load_txn_id;
     snapshot->explicit_no_plan = true;
+    snapshot->model_n_layer    = model_n_layer;
+    snapshot->kv_info          = kv_info;
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
@@ -2907,8 +2916,11 @@ bool unified_cache::planned_materialization_allowed(const char *               o
                                                     const ggml_sycl_cache_id & key,
                                                     ggml_layout_mode           layout,
                                                     const char *               caller) const {
-    const auto plan_owner = coherent_cache_placement_plan_owner(this);
-    if (plan_owner->entries.empty()) {
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return false;
+    }
+    if (placement.coherence == placement_cache_coherence::GENUINE_NO_PLAN) {
         return true;
     }
     if (planned_materialization_active()) {
@@ -3058,6 +3070,9 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
     direct_stage_result result{};
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN(
@@ -3292,6 +3307,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
     direct_stage_result result{};
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN(
@@ -3630,6 +3648,9 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
     direct_stage_result result{};
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (keys.empty() || !src_ptr || src_size == 0 || expert_dst_size == 0) {
         return result;
     }
@@ -6061,6 +6082,9 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
 }
 
 void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     if (!key_id.valid) {
         return;
     }
@@ -6093,7 +6117,11 @@ void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void unified_cache::unpin_experts() {
-    if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
+    if (placement.coherence == placement_cache_coherence::MATCH) {
         // Placement-plan experts are model-load residency decisions.  Runtime
         // prestage/LRU helpers must not invalidate those smart-handle routes.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] ignoring expert unpin request while placement plan is active\n");
@@ -6108,6 +6136,9 @@ void unified_cache::unpin_experts() {
 }
 
 void unified_cache::unpin_all() {
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     for (auto & pair : entries_) {
         pair.second.pinned = false;
@@ -8111,7 +8142,7 @@ void unified_cache::update_reserved_bytes(size_t reserved_bytes) {
 void unified_cache::unpin_on_event(const ggml_sycl_cache_id & key_id,
                                    ggml_layout_mode           layout,
                                    const sycl::event &        event) {
-    if (!key_id.valid) {
+    if (!key_id.valid || cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return;
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);

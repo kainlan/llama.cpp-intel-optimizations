@@ -187,21 +187,30 @@ int main() {
     plan.weight_vram_bytes = 22;
     plan.multi_device      = true;
     plan.devices           = { 0, 1, 2 };
-    lifecycle_stage_placement_plan(1001, plan);
+    placement_kv_info kv_a{};
+    kv_a.n_layer  = 12;
+    kv_a.n_ctx    = 4096;
+    kv_a.n_ubatch = 512;
+    lifecycle_stage_placement_plan(1001, plan, kv_a, 12);
     if (!lifecycle_publish_placement_plan(2001, 1001, 3, 7, 0, 0, false)) {
         printf("FAIL lifecycle plan publish\n");
         n_fail++;
     } else {
         auto published = lifecycle_find_placement_plan(2001, 1001);
         if (published && published->planned_host_bytes == 11 && published->actual_host_bytes == 11 &&
-            published->verdict == lifecycle_plan_verdict::MIXED) {
+            published->verdict == lifecycle_plan_verdict::MIXED && published->model_n_layer == 12 &&
+            published->kv_info.n_ctx == 4096 && published->kv_info.n_ubatch == 512) {
             n_pass++;
         } else {
             printf("FAIL lifecycle multi-device single count\n");
             n_fail++;
         }
     }
-    lifecycle_stage_no_placement_plan(1002);
+    placement_kv_info kv_b{};
+    kv_b.n_layer  = 24;
+    kv_b.n_ctx    = 8192;
+    kv_b.n_ubatch = 1024;
+    lifecycle_stage_no_placement_plan(1002, kv_b, 24);
     if (!lifecycle_publish_placement_plan(2002, 1002, 4, 8, 99, 99, true)) {
         printf("FAIL lifecycle no-plan publish\n");
         n_fail++;
@@ -209,14 +218,33 @@ int main() {
         auto no_plan = lifecycle_find_placement_plan(2002, 1002);
         auto prior   = lifecycle_find_placement_plan(2001, 1001);
         if (no_plan && no_plan->explicit_no_plan && !no_plan->plan &&
-            no_plan->verdict == lifecycle_plan_verdict::UNKNOWN && no_plan->planned_host_bytes == 0 && prior) {
+            no_plan->verdict == lifecycle_plan_verdict::UNKNOWN && no_plan->planned_host_bytes == 0 &&
+            no_plan->model_n_layer == 24 && no_plan->kv_info.n_ctx == 8192 && prior && prior->model_n_layer == 12 &&
+            prior->kv_info.n_ctx == 4096) {
             n_pass++;
         } else {
             printf("FAIL lifecycle no-plan isolation\n");
             n_fail++;
         }
     }
+    // Simulate A runtime KV CAS while B is independently live. Removing B must
+    // leave lifecycle ownership pointing at A-prime geometry, not A's original
+    // process-global metadata or B's geometry.
+    auto a_before          = lifecycle_find_placement_plan(2001, 1001);
+    auto a_prime           = std::make_shared<lifecycle_plan_snapshot>(*a_before);
+    a_prime->kv_info.n_ctx = 6144;
+    a_prime->version       = lifecycle_next_plan_publication_id();
+    std::shared_ptr<const lifecycle_plan_snapshot> a_prime_immutable = a_prime;
+    const bool a_updated = lifecycle_replace_placement_plan(a_before, a_prime_immutable);
     lifecycle_erase_placement_plan(2002, 1002);
+    const auto restored_a = lifecycle_find_placement_plan(2001, 1001);
+    if (a_updated && restored_a.get() == a_prime_immutable.get() && restored_a->kv_info.n_ctx == 6144 &&
+        restored_a->model_n_layer == 12) {
+        n_pass++;
+    } else {
+        printf("FAIL A/B unload did not retain A-prime KV geometry\n");
+        n_fail++;
+    }
     lifecycle_erase_placement_plan(2001, 1001);
     if (lifecycle_published_placement_plan_count_for_test() == 0) {
         n_pass++;

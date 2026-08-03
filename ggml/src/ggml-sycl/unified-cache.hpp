@@ -1023,6 +1023,8 @@ struct lifecycle_plan_snapshot {
     uint64_t                              actual_host_bytes  = 0;
     lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
     bool                                  explicit_no_plan   = false;
+    uint32_t                              model_n_layer      = 0;
+    placement_kv_info                     kv_info;
     std::shared_ptr<const placement_plan> plan;
 };
 
@@ -1035,15 +1037,27 @@ inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycl
 }
 
 class unified_cache;
+enum class placement_cache_coherence : uint8_t { MATCH, GENUINE_NO_PLAN, TRANSIENT_MISMATCH };
+
+struct placement_cache_read {
+    placement_cache_coherence             coherence = placement_cache_coherence::GENUINE_NO_PLAN;
+    std::shared_ptr<const placement_plan> owner;
+};
 std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept;
 // Policy readers retain immutable global authority during cache-first publication.
 std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept;
 // Cache-local readers require exact shared-owner identity and fail closed.
 std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;
+placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
 
-void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan);
-void lifecycle_stage_no_placement_plan(uint64_t load_txn_id);
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info       = {},
+                                    uint32_t                  model_n_layer = 0);
+void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
+                                       const placement_kv_info & kv_info       = {},
+                                       uint32_t                  model_n_layer = 0);
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
 bool lifecycle_publish_placement_plan(
     uint64_t                                         model_id,
