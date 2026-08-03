@@ -78,6 +78,9 @@ GGML_BACKEND_API size_t ggml_backend_sycl_get_tp_data_offset(const char *    ten
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
+// Exact current-registry host buffer type for a specific SYCL device. Returns
+// NULL for foreign/stale devices; never falls back to a default device.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
 
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.

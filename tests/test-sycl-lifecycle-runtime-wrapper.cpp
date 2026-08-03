@@ -26,6 +26,13 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
+    LOAD_SYCL(ggml_backend_sycl_has_active_placement_plan)
+    LOAD_SYCL(ggml_backend_sycl_weights_evictable)
+    LOAD_SYCL(ggml_backend_sycl_host_buffer_type)
+    LOAD_SYCL(ggml_backend_sycl_host_buffer_type_for_device)
+    LOAD_SYCL(ggml_backend_sycl_register_host_weight_tensor)
+    LOAD_SYCL(ggml_backend_sycl_register_weight_identity)
+    LOAD_SYCL(ggml_backend_sycl_register_weight_usage)
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
     LOAD_SYCL(ggml_backend_sycl_model_load_end)
@@ -34,6 +41,18 @@ int main() {
 #else
 #    define CALL_SYCL(name) name
 #endif
+
+    // Allocation-parity procedures must resolve from the current registry in
+    // both static and DL modes. Null metadata calls are defined no-ops.
+    (void) CALL_SYCL(ggml_backend_sycl_weights_evictable)();
+    if (!CALL_SYCL(ggml_backend_sycl_host_buffer_type)() ||
+        CALL_SYCL(ggml_backend_sycl_host_buffer_type_for_device)(nullptr) != nullptr) {
+        std::fprintf(stderr, "missing exact SYCL host buffer type\n");
+        return 1;
+    }
+    CALL_SYCL(ggml_backend_sycl_register_host_weight_tensor)(nullptr, nullptr);
+    CALL_SYCL(ggml_backend_sycl_register_weight_identity)(nullptr, 0, 0, 0, 0);
+    CALL_SYCL(ggml_backend_sycl_register_weight_usage)(nullptr, GGML_SYCL_TENSOR_USAGE_UNKNOWN);
 
     ggml_sycl_model_token zero{};
     if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||
@@ -60,6 +79,26 @@ int main() {
     const auto abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(aborted, false, nullptr);
     if (abort_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && abort_rc != GGML_SYCL_LIFECYCLE_POISONED) {
         std::fprintf(stderr, "runtime abort returned %d\n", (int) abort_rc);
+        return 1;
+    }
+    // CPU-only and no_alloc ownership cancellation uses this abort path. More
+    // than the slot count must remain reusable rather than leaking speculative
+    // SYCL model ownership.
+    const bool authority_before_cpu_cancels = CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)();
+    for (int i = 0; i < 40; ++i) {
+        ggml_sycl_load_txn cpu_only{};
+        if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&cpu_only) != GGML_SYCL_LIFECYCLE_OK) {
+            std::fprintf(stderr, "speculative CPU lifecycle consumed slots at iteration %d\n", i);
+            return 1;
+        }
+        const auto cancel_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(cpu_only, false, nullptr);
+        if (cancel_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && cancel_rc != GGML_SYCL_LIFECYCLE_POISONED) {
+            std::fprintf(stderr, "speculative CPU lifecycle cancel returned %d\n", (int) cancel_rc);
+            return 1;
+        }
+    }
+    if (CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
+        std::fprintf(stderr, "speculative CPU lifecycle changed placement authority\n");
         return 1;
     }
 

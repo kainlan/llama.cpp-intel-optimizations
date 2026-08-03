@@ -10107,6 +10107,12 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
         return;
     }
 
+    if (model_id == 0) {
+        model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
+    }
+    if (model_id == 0) {
+        return;
+    }
     ggml_sycl::dispatch_tuning::ensure_model_loaded(model_id);
 
     const ggml_sycl_weight_identity identity = { file_idx, file_offs, tensor_nbytes, model_id };
@@ -32584,6 +32590,31 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
         /* .context  = */ nullptr,
     };
     return &ggml_backend_sycl_buffer_type_host;
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
+    if (!dev || ggml_backend_dev_backend_reg(dev) != ggml_backend_sycl_reg()) {
+        return nullptr;
+    }
+    auto * reg   = ggml_backend_dev_backend_reg(dev);
+    size_t index = 0;
+    while (index < ggml_backend_reg_dev_count(reg) && ggml_backend_reg_dev_get(reg, index) != dev) {
+        ++index;
+    }
+    if (index >= ggml_backend_reg_dev_count(reg) || index >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    static std::once_flag                                              initialized;
+    static std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> per_device{};
+    std::call_once(initialized, [&] {
+        const auto   prototype = *ggml_backend_sycl_host_buffer_type();
+        const size_t count     = std::min(ggml_backend_reg_dev_count(reg), (size_t) GGML_SYCL_MAX_DEVICES);
+        for (size_t i = 0; i < count; ++i) {
+            per_device[i]        = prototype;
+            per_device[i].device = ggml_backend_reg_dev_get(reg, i);
+        }
+    });
+    return per_device[index].device == dev ? &per_device[index] : nullptr;
 }
 
 // Host compute buffer type - uses SYCL host memory with SYCL buffer interface
@@ -95601,6 +95632,27 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
+    }
+    if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
+        return (void *) ggml_backend_sycl_has_active_placement_plan;
+    }
+    if (strcmp(name, "ggml_backend_sycl_weights_evictable") == 0) {
+        return (void *) ggml_backend_sycl_weights_evictable;
+    }
+    if (strcmp(name, "ggml_backend_sycl_host_buffer_type") == 0) {
+        return (void *) ggml_backend_sycl_host_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_host_buffer_type_for_device") == 0) {
+        return (void *) ggml_backend_sycl_host_buffer_type_for_device;
+    }
+    if (strcmp(name, "ggml_backend_sycl_register_host_weight_tensor") == 0) {
+        return (void *) ggml_backend_sycl_register_host_weight_tensor;
+    }
+    if (strcmp(name, "ggml_backend_sycl_register_weight_identity") == 0) {
+        return (void *) ggml_backend_sycl_register_weight_identity;
+    }
+    if (strcmp(name, "ggml_backend_sycl_register_weight_usage") == 0) {
+        return (void *) ggml_backend_sycl_register_weight_usage;
     }
     if (strcmp(name, "ggml_backend_sycl_stage_inventory_plan") == 0) {
         return (void *) ggml_backend_sycl_stage_inventory_plan;

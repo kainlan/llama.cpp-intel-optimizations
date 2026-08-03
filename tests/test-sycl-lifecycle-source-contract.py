@@ -282,6 +282,38 @@ checks = {
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
         "ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope"
     ) == 2,
+    "DL allocation and metadata parity": all(
+        f'LOAD_SYCL_PROC({field}, "{name}")' in (root / "src/llama-model-loader.cpp").read_text()
+        for field, name in (
+            ("weights_evictable", "ggml_backend_sycl_weights_evictable"),
+            ("host_buffer_type_for_device", "ggml_backend_sycl_host_buffer_type_for_device"),
+            ("register_host_weight", "ggml_backend_sycl_register_host_weight_tensor"),
+            ("register_identity", "ggml_backend_sycl_register_weight_identity"),
+            ("register_usage", "ggml_backend_sycl_register_weight_usage"),
+        )
+    )
+    and "defined(GGML_BACKEND_DL)" in (root / "src/llama-model-loader.cpp").read_text()
+    and "sycl_hooks.host_buffer_type_for_device(dev)" in (root / "src/llama-model-loader.cpp").read_text()
+    and "sycl_hooks.register_host_weight" in (root / "src/llama-model-loader.cpp").read_text()
+    and "allow_host_buft_with_mmap = true" in (root / "src/llama-model-loader.cpp").read_text()
+    and "prefer_host_weights && llama_model_loader_sycl_hooks_for(buft_dev).reg" in
+        (root / "src/llama-model-loader.cpp").read_text()
+    and "sycl_hooks.register_identity" in (root / "src/llama-model-loader.cpp").read_text()
+    and "sycl_hooks.register_usage" in (root / "src/llama-model-loader.cpp").read_text()
+    and all(f'strcmp(name, "{name}")' in backend for name in (
+        "ggml_backend_sycl_weights_evictable",
+        "ggml_backend_sycl_host_buffer_type",
+        "ggml_backend_sycl_host_buffer_type_for_device",
+        "ggml_backend_sycl_register_host_weight_tensor",
+        "ggml_backend_sycl_register_weight_identity",
+        "ggml_backend_sycl_register_weight_usage",
+    )),
+    "CPU speculative lifecycle cancellation": "sycl_model_loading_guard.cancel()" in llama
+    and "if (has_sycl_weight_buffer)" in llama
+    and "if (sycl_model_backend)" in llama
+    and "rollback_token.model_id != 0" in llama
+    and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
     (root / "src/llama-context.cpp").read_text()
     and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()

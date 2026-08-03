@@ -67,6 +67,8 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_activate_model_plan)           activate        = nullptr;
     decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context = nullptr;
     decltype(&ggml_backend_sycl_stage_inventory_plan)          stage_inventory = nullptr;
+    decltype(&ggml_backend_sycl_weights_evictable)             weights_evictable           = nullptr;
+    decltype(&ggml_backend_sycl_host_buffer_type_for_device)   host_buffer_type_for_device = nullptr;
 };
 
 static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
@@ -94,6 +96,10 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
         result.stage_inventory = reinterpret_cast<decltype(result.stage_inventory)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
+        result.weights_evictable = reinterpret_cast<decltype(result.weights_evictable)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_weights_evictable"));
+        result.host_buffer_type_for_device = reinterpret_cast<decltype(result.host_buffer_type_for_device)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_buffer_type_for_device"));
         break;
     }
     return result;
@@ -101,7 +107,8 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
 
 static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
     return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
-           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.stage_inventory;
+           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.stage_inventory &&
+           hooks.weights_evictable && hooks.host_buffer_type_for_device;
 }
 
 static bool llama_model_sycl_hooks_enabled() {
@@ -156,6 +163,26 @@ struct llama_model_sycl_loading_guard {
         if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
             rc != GGML_SYCL_LIFECYCLE_NESTED) {
             LLAMA_LOG_ERROR("SYCL model lifecycle abort failed: txn=%llu result=%d\n", (unsigned long long) txn.id, (int) rc);
+        }
+    }
+
+    void cancel() {
+        if (!active) {
+            return;
+        }
+        ggml_sycl_model_token rollback_token{};
+        const auto            rc = hooks.end(txn, false, outer ? &rollback_token : nullptr);
+        active                   = false;
+        if (outer && out_model) {
+            *out_model = rollback_token.model_id != 0 ?
+                             llama_sycl_model_token{ rollback_token.model_id, rollback_token.load_txn_id,
+                                                     rollback_token.slot, rollback_token.slot_generation } :
+                             llama_sycl_model_token{};
+        }
+        if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
+            rc != GGML_SYCL_LIFECYCLE_NESTED) {
+            throw std::runtime_error(format("SYCL model lifecycle cancel failed: txn=%llu result=%d",
+                                            (unsigned long long) txn.id, (int) rc));
         }
     }
 
@@ -1323,9 +1350,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
-#ifdef GGML_USE_SYCL
-    if (llama_model_dev_is_sycl(dev) && ggml_backend_sycl_weights_evictable()) {
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    const auto sycl_hooks = llama_model_sycl_hooks();
+    if (llama_model_sycl_hooks_enabled(sycl_hooks) && dev != nullptr &&
+        ggml_backend_dev_backend_reg(dev) == sycl_hooks.reg && sycl_hooks.weights_evictable()) {
+        ggml_backend_buffer_type_t host_buft = sycl_hooks.host_buffer_type_for_device(dev);
         if (host_buft != nullptr) {
             buft_list.emplace_back(dev, host_buft);
         }
@@ -2058,7 +2087,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (ml.no_alloc) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        sycl_model_loading_guard.finish(true);
+        if (sycl_model_backend) {
+            sycl_model_loading_guard.finish(true);
+        } else {
+            sycl_model_loading_guard.cancel();
+        }
 #endif
         return true;
     }
@@ -2083,7 +2116,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    sycl_model_loading_guard.finish(true);
+    if (has_sycl_weight_buffer) {
+        sycl_model_loading_guard.finish(true);
+    } else {
+        sycl_model_loading_guard.cancel();
+    }
 #endif
     return true;
 }
