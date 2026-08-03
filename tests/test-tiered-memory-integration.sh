@@ -316,12 +316,16 @@ test_unit_tests() {
     # Run tensor inventory API test
     if [ -x "${LLAMA_BIN_DIR}/test-tensor-inventory-api" ]; then
         echo "Running test-tensor-inventory-api..."
-        if ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" "${LLAMA_BIN_DIR}/test-tensor-inventory-api"; then
+        local exit_code=0
+        ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" "${LLAMA_BIN_DIR}/test-tensor-inventory-api" || exit_code=$?
+        if [ ${exit_code} -eq 0 ]; then
             echo -e "${GREEN}PASSED: test-tensor-inventory-api${NC}"
-            ((tests_passed++))
+            tests_passed=$((tests_passed + 1))
+        elif [ ${exit_code} -eq 77 ]; then
+            echo -e "${YELLOW}SKIPPED: test-tensor-inventory-api (exit 77)${NC}"
         else
-            echo -e "${RED}FAILED: test-tensor-inventory-api${NC}"
-            ((tests_failed++))
+            echo -e "${RED}FAILED: test-tensor-inventory-api (exit ${exit_code})${NC}"
+            tests_failed=$((tests_failed + 1))
         fi
         echo ""
     else
@@ -331,12 +335,18 @@ test_unit_tests() {
     # Run tiered dispatch test
     if [ -x "${LLAMA_BIN_DIR}/test-tiered-dispatch" ]; then
         echo "Running test-tiered-dispatch..."
-        if ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" "${LLAMA_BIN_DIR}/test-tiered-dispatch"; then
+        local exit_code=0
+        ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" \
+        GGML_SYCL_VRAM_ARENA="${GGML_SYCL_VRAM_ARENA-1}" \
+            "${LLAMA_BIN_DIR}/test-tiered-dispatch" || exit_code=$?
+        if [ ${exit_code} -eq 0 ]; then
             echo -e "${GREEN}PASSED: test-tiered-dispatch${NC}"
-            ((tests_passed++))
+            tests_passed=$((tests_passed + 1))
+        elif [ ${exit_code} -eq 77 ]; then
+            echo -e "${YELLOW}SKIPPED: test-tiered-dispatch (exit 77)${NC}"
         else
-            echo -e "${RED}FAILED: test-tiered-dispatch${NC}"
-            ((tests_failed++))
+            echo -e "${RED}FAILED: test-tiered-dispatch (exit ${exit_code})${NC}"
+            tests_failed=$((tests_failed + 1))
         fi
         echo ""
     else

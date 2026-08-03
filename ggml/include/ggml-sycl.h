@@ -263,8 +263,10 @@ GGML_BACKEND_API void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend
 // Backward-compatible helper for callers that only know n_ctx.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx);
 
-// Check if tiered memory mode is enabled for this backend.
-// Returns true if the unified cache system is active (always true by default).
+// Report actual tiered placement for the model currently being loaded/loaded.
+// Returns true only when its completed placement_plan has host_bytes > 0.
+// This is separate from unified-cache availability and resets at each outer
+// model-load boundary.
 GGML_BACKEND_API bool ggml_backend_sycl_is_tiered_enabled(ggml_backend_t backend);
 
 // ggml_backend_sycl_model_exceeds_vram removed — unified non-blocking cache
@@ -278,7 +280,8 @@ GGML_BACKEND_API size_t ggml_backend_sycl_get_vram_budget(ggml_backend_t backend
 // Returns 0 if budget is exceeded. Used by llama_params_fit.
 GGML_BACKEND_API size_t ggml_backend_sycl_get_vram_margin(ggml_backend_t backend);
 
-// Check if the tiered weight placement mode is enabled.
+// Check whether the unified tensor cache/dispatch gate is enabled. This is a
+// cache-capability query, independent of the current model's planner placement.
 GGML_BACKEND_API bool ggml_backend_sycl_has_tensor_cache(ggml_backend_t backend);
 
 // Feed actual compute buffer sizes (from ggml_backend_sched_get_buffer_size) back to
