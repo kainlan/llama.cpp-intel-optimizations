@@ -51,6 +51,13 @@ static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES == XMX_V2_DECODE_ACTIVE_
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK == fattn_v2_decode_gqa_slm<64>::K_PACKED_ELEMS,
               "Packed-K materializer byte count must match the proven ext_intel_packed ABI");
 
+void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint) {
+    const char * selected = std::getenv("GGML_SYCL_TEST_PACKED_K_FAIL_AFTER");
+    if (selected != nullptr && checkpoint != nullptr && std::strcmp(selected, checkpoint) == 0) {
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "packed-K partial-submit test failpoint");
+    }
+}
+
 ggml_sycl_fattn_xmx_packed_k::~ggml_sycl_fattn_xmx_packed_k() {
     reset();
 }
@@ -501,7 +508,9 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                 packed.reset();
                 return debug_reject("sidecar-handle-invalid", root);
             }
-            zero_event   = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
+            zero_event        = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
+            packed.ready_event = zero_event;
+            ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update");
             add_zero_dep = ggml_sycl_should_add_dependency(zero_event);
         } else {
             try {
@@ -1563,7 +1572,9 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         if (add_prev_dep) {
             zero_deps.push_back(previous_use);
         }
-        zero_event = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
+        zero_event       = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
+        out->ready_event = zero_event;
+        ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack");
         ggml_sycl_profile_label profile_label{};
         profile_label.name       = "fattn.pack";
         profile_label.category   = "fattn";
