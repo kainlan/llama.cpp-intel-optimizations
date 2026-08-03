@@ -241,15 +241,11 @@ A process may switch models sequentially, keep multiple `llama_model` objects
 alive, and create multiple contexts. Those object lifetimes are distinct from
 execution support: current planner globals are process-wide rather than keyed by
 model, and per-device arena state is not keyed by context. The graph-compute
-eviction guard is separate process-global state. Live ownership must therefore
-be safe across coexisting objects, but concurrent inference on the same SYCL
-device is not supported. The process-global graph-compute mutex additionally
-serializes `graph_compute` entry-point calls and their submission work across the
-process. It does not serialize completion of submitted device work: pure-GPU
-decode may return with kernels still in flight, so device execution, especially
-on different devices, may overlap after mutex release. That overlap does not
-establish supported concurrent inference or cache safety. The contract
-distinguishes:
+eviction guard and graph-compute mutex are separate process-global state. Live
+ownership must therefore be safe across coexisting objects, but concurrent
+inference on the same SYCL device is not supported. The mutex is not a
+process-wide submission or device-execution lock; §5.3 defines its narrower
+scope and the resulting overlap. The contract distinguishes:
 
 ### 5.1 Process-scoped (model) state
 
@@ -310,12 +306,14 @@ Keep these cases separate:
   `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
   the process-global `g_graph_compute_active` eviction guard
   (`unified-cache.cpp:303`). It is not per-device or per-context state.
-- Independently, the process-global `g_sycl_graph_compute_mutex` serializes
-  calls to the current graph-compute entry point and their submission work
-  (`ggml-sycl.cpp:91438`) across all SYCL devices in the process. Pure-GPU decode
-  may return and release the mutex with kernels still in flight, so device
-  execution, especially on different devices, may overlap. Do not infer
-  supported concurrent inference or cache safety from that overlap. The
+- Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
+  the current graph-compute entry point (`ggml-sycl.cpp:91438`) and protects
+  setup and graph management only while held. It is not a process-wide
+  submission lock: direct/fallback paths explicitly release it before
+  `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). Host submission and
+  device execution may therefore overlap across graph-compute calls and devices;
+  pure-GPU decode may also return with kernels still in flight. Do not infer
+  supported concurrent inference or cache safety from either overlap. The
   distinct same-device limitation remains: same-device concurrent inference is
   unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
@@ -384,14 +382,11 @@ forms above with the understanding that they are scheduled for replacement.
 ### 7.3 Multi-context / Multi-server slot
 
 The lifetime and execution distinctions in §5.3 apply. Contexts sharing a model
-may share its read-only `placement_plan` and WEIGHT entries. The process-global
-`g_sycl_graph_compute_mutex` serializes `graph_compute` entry-point calls and
-submission, not completion of device work; pure-GPU decode may return with
-kernels in flight, allowing device execution to overlap after mutex release,
-especially across devices. That overlap does not establish supported concurrent
-inference or cache safety. Separately, same-device concurrent inference remains
-unsupported until `llama.cpp-32dg8.15.10` delivers explicit context-keyed
-KV/RUNTIME arena ownership.
+may share its read-only `placement_plan` and WEIGHT entries, but the
+process-global mutex does not make host submission or device execution globally
+serial. Separately, same-device concurrent inference remains unsupported until
+`llama.cpp-32dg8.15.10` delivers explicit context-keyed KV/RUNTIME arena
+ownership.
 
 ---
 
