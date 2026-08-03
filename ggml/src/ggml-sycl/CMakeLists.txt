@@ -1064,10 +1064,6 @@ endif()
 # perturb a benchmark in progress.
 # =============================================================================
 
-# Backend-linked fixtures below cannot link a MODULE backend in dynamic mode.
-# The lifecycle runtime wrapper above has its own dlopen/dlsym path; the wider
-# accelerator fixture matrix remains a static-backend test suite.
-if (NOT GGML_BACKEND_DL)
 set(SYCL_LINK_ONLY_TEST_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
@@ -1229,6 +1225,7 @@ set_tests_properties(unified-cache-fast-path PROPERTIES
 
 # Evict accounting, realloc failure handling, unaligned hash.
 # LABELS drop the old "cache" -- see rule 2 above.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-bugs
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
 )
@@ -1257,6 +1254,9 @@ set_tests_properties(unified-cache-bugs PROPERTIES
 
 # Synthetic KV/view pointer resolution and handle publication.
 # LABELS drop the old "mem-handle" -- see rule 2 above.
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kv-view-resolution
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-resolution.cpp
 )
@@ -1286,6 +1286,8 @@ set_tests_properties(sycl-kv-view-resolution PROPERTIES
 # mem_handle eviction lifecycle (RESEARCH-A4, llama.cpp-2jmzn): cache_generation
 # bumps + entry removal across the sync and async eviction paths.
 # LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+endif() # static SYCL backend fixture
+
 add_executable(test-mem-handle-eviction
     tests/test-mem-handle-eviction.cpp
     unified-cache.cpp
@@ -1329,6 +1331,7 @@ set_tests_properties(mem-handle-eviction PROPERTIES
 # link ggml-sycl rather than compiling SYCL of their own. Do not add the
 # options as a cleanup -- if they are ever needed it will be because something
 # real changed, and that deserves its own commit.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-wrong-device
     tests/test-mem-handle-wrong-device.cpp
 )
@@ -1356,6 +1359,9 @@ set_tests_properties(mem-handle-wrong-device PROPERTIES
 # LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
 # Sets no compile/link options, same deliberate exception to rule 1 as
 # test-mem-handle-wrong-device above; the reasoning is written up there.
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-ops
     tests/test-mem-ops.cpp
 )
@@ -1386,6 +1392,8 @@ set_tests_properties(mem-ops PROPERTIES
 
 # Runtime allocation policy: reserve/allocate/rollback, tier selection, scoped
 # unified_alloc lifetime, offload-pool hit/miss accounting.
+endif() # static SYCL backend fixture
+
 add_executable(test-sycl-runtime-alloc
     tests/test-unified-runtime-alloc.cpp
     unified-cache.cpp
@@ -1440,6 +1448,7 @@ set(LAYOUT_CHOICE_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-layout-choice
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layout-choice.cpp
 )
@@ -1483,6 +1492,9 @@ set(MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-mem-handle-concurrent-resolve
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-concurrent-resolve.cpp
 )
@@ -1529,6 +1541,9 @@ set(GRAPH_RETENTION_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-graph-retention-scope
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-retention-scope.cpp
 )
@@ -1575,6 +1590,9 @@ set(TRANSIENT_INTENT_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-transient-alloc-intent-scope
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-transient-alloc-intent-scope.cpp
 )
@@ -1617,6 +1635,9 @@ set(TENSOR_PLACEMENT_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-tensor-placement
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-placement.cpp
 )
@@ -1652,6 +1673,9 @@ set_tests_properties(test-sycl-tensor-placement PROPERTIES
 #
 # CPU-only by construction: creates tensors through the CPU backend and never
 # touches a SYCL device or queue.
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-tensor-usage
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-usage.cpp
 )
@@ -1689,6 +1713,9 @@ set_tests_properties(test-sycl-tensor-usage PROPERTIES
 # ggml_sycl_info() enumerates, but the load-boundary reset path this test
 # exercises still expects a real device (mirrors test-layout-cache.cpp's
 # SKIP_RETURN_CODE convention below).
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-cross-model-weight-usage
     tests/test-cross-model-weight-usage.cpp
 )
@@ -1723,6 +1750,9 @@ set_tests_properties(cross-model-weight-usage PROPERTIES
 # out entirely, leaving `return 0` as the sole exit path (llama.cpp-0igs).
 # 50723136a already added the `#undef NDEBUG` fix to the source; only the
 # registration itself was missing.
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-tensor-placement
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-tensor-placement.cpp
 )
@@ -1811,7 +1841,9 @@ endforeach()
 # classification, fattn dispatch) and none submit device work directly in
 # the test itself (a cost/timing probe, see llama.cpp-u2mz).
 # ---------------------------------------------------------------------------
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-weight-key-stability
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-weight-key-stability.cpp
 )
@@ -1837,7 +1869,9 @@ set_tests_properties(test-sycl-weight-key-stability PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-tensor-classification
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-tensor-classification.cpp
 )
@@ -1863,7 +1897,9 @@ set_tests_properties(test-tensor-classification PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kv-planned-device-materialization
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-planned-device-materialization.cpp
 )
@@ -1889,7 +1925,9 @@ set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-q8-scratch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-q8-scratch.cpp
 )
@@ -1915,7 +1953,9 @@ set_tests_properties(test-sycl-moe-q8-scratch PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-onednn-packed-cache
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-packed-cache.cpp
 )
@@ -1941,7 +1981,9 @@ set_tests_properties(test-sycl-onednn-packed-cache PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-weight-key-uniqueness
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-weight-key-uniqueness.cpp
 )
@@ -1967,7 +2009,9 @@ set_tests_properties(test-sycl-weight-key-uniqueness PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-integrity
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-integrity.cpp
 )
@@ -1993,7 +2037,9 @@ set_tests_properties(test-unified-cache-integrity PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-fattn-onednn-materialization
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-onednn-materialization.cpp
 )
@@ -2019,7 +2065,9 @@ set_tests_properties(test-sycl-fattn-onednn-materialization PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-fattn-xmx-policy
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-xmx-policy.cpp
 )
@@ -2045,7 +2093,9 @@ set_tests_properties(test-sycl-fattn-xmx-policy PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kernel-selection
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kernel-selection.cpp
 )
@@ -2071,7 +2121,9 @@ set_tests_properties(test-sycl-kernel-selection PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-cold-start
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-cold-start.cpp
 )
@@ -2097,7 +2149,9 @@ set_tests_properties(test-cold-start PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-concurrent
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-concurrent.cpp
 )
@@ -2123,7 +2177,9 @@ set_tests_properties(test-unified-cache-concurrent PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-handle-resolution
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-handle-resolution.cpp
 )
@@ -2160,7 +2216,9 @@ set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
 # mistake on 9 of 13 tests (llama.cpp-u2mz/0igs); use *-hostonly or an
 # unrelated subsystem word instead.
 # ---------------------------------------------------------------------------
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-dmmv-q4-0-coalesced
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-dmmv-q4-0-coalesced.cpp
 )
@@ -2186,7 +2244,9 @@ set_tests_properties(test-dmmv-q4-0-coalesced PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-dmmv-q6k-coalesced
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-dmmv-q6k-coalesced.cpp
 )
@@ -2212,8 +2272,9 @@ set_tests_properties(test-dmmv-q6k-coalesced PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
-
+if (NOT GGML_BACKEND_DL)
 add_executable(test-fattn-thread-local
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-fattn-thread-local.cpp
 )
@@ -2239,7 +2300,9 @@ set_tests_properties(test-fattn-thread-local PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-ggml-sycl-soa
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-ggml-sycl-soa.cpp
 )
@@ -2265,7 +2328,9 @@ set_tests_properties(test-ggml-sycl-soa PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-layout-bytes
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-layout-bytes.cpp
 )
@@ -2291,7 +2356,9 @@ set_tests_properties(test-layout-bytes PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-mmq-q6k-gpu
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mmq-q6k-gpu.cpp
 )
@@ -2317,7 +2384,9 @@ set_tests_properties(test-mmq-q6k-gpu PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-mini-graph
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mini-graph.cpp
 )
@@ -2343,7 +2412,9 @@ set_tests_properties(test-moe-mini-graph PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-mul-mat-id
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mul-mat-id.cpp
 )
@@ -2369,7 +2440,9 @@ set_tests_properties(test-moe-mul-mat-id PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-mul-mat-id-q4q8
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-moe-mul-mat-id-q4q8.cpp
 )
@@ -2395,7 +2468,9 @@ set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
 )
@@ -2421,7 +2496,9 @@ set_tests_properties(test-mul-mat-host-streaming PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-onednn-fallback
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-onednn-fallback.cpp
 )
@@ -2447,7 +2524,9 @@ set_tests_properties(test-onednn-fallback PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-onednn-woq
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-onednn-woq.cpp
 )
@@ -2476,7 +2555,9 @@ set_tests_properties(test-onednn-woq PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-q6k-dispatch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q6k-dispatch.cpp
 )
@@ -2502,7 +2583,9 @@ set_tests_properties(test-q6k-dispatch PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-q8-0-layout-cache-path
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q8-0-layout-cache-path.cpp
 )
@@ -2528,7 +2611,9 @@ set_tests_properties(test-q8-0-layout-cache-path PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-q8-0-layout-cache-path-mmvq
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q8-0-layout-cache-path-mmvq.cpp
 )
@@ -2554,7 +2639,9 @@ set_tests_properties(test-q8-0-layout-cache-path-mmvq PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-cpu-dispatch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-dispatch.cpp
 )
@@ -2580,7 +2667,9 @@ set_tests_properties(test-sycl-cpu-dispatch PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-expert-parallelism
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-expert-parallelism.cpp
 )
@@ -2606,7 +2695,9 @@ set_tests_properties(test-sycl-moe-expert-parallelism PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-identity-hash
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-identity-hash.cpp
 )
@@ -2632,7 +2723,9 @@ set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-orchestrator
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-orchestrator.cpp
 )
@@ -2658,7 +2751,9 @@ set_tests_properties(test-sycl-orchestrator PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-prestage-routed-experts
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-prestage-routed-experts.cpp
 )
@@ -2684,7 +2779,9 @@ set_tests_properties(test-sycl-prestage-routed-experts PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-unified-cache
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-cache.cpp
 )
@@ -2710,7 +2807,9 @@ set_tests_properties(test-sycl-unified-cache PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-unified-memory-e2e
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-memory-e2e.cpp
 )
@@ -2736,7 +2835,9 @@ set_tests_properties(test-sycl-unified-memory-e2e PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-xmx-unified-correctness
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-xmx-unified-correctness.cpp
 )
@@ -2762,7 +2863,9 @@ set_tests_properties(test-sycl-xmx-unified-correctness PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-tiered-dispatch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-tiered-dispatch.cpp
 )
@@ -2789,7 +2892,9 @@ set_tests_properties(test-tiered-dispatch PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-xmx-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-host-streaming.cpp
 )
@@ -2815,7 +2920,9 @@ set_tests_properties(test-xmx-host-streaming PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-xmx-kernel-config
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-kernel-config.cpp
 )
@@ -2841,7 +2948,9 @@ set_tests_properties(test-xmx-kernel-config PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-xmx-quant-loaders
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-quant-loaders.cpp
 )
@@ -2867,7 +2976,9 @@ set_tests_properties(test-xmx-quant-loaders PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
+if (NOT GGML_BACKEND_DL)
 add_executable(test-xmx-unified-kernel
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-unified-kernel.cpp
 )
@@ -2917,6 +3028,9 @@ set(RESET_MODEL_WEIGHT_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-reset-model-weight-lease-preserve
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-reset-model-weight-lease-preserve.cpp
 )
@@ -2958,6 +3072,7 @@ set_tests_properties(sycl-reset-model-weight-lease-preserve PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
 
 add_executable(test-sycl-e2e-profile
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-e2e-profile.cpp
@@ -3201,6 +3316,7 @@ set_tests_properties(esimd-dpas-gate PROPERTIES
 # axis (llama.cpp-81gx, source committed c725c4a75, registration supplied by impl-w2).
 # Submits real device work, so ONEAPI_DEVICE_SELECTOR is pinned to the validation card
 # (level_zero:1) rather than left to whatever a bare ctest run picks up.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-rms-norm-mul-add-broadcast
     tests/test-rms-norm-mul-add-broadcast.cpp
 )
@@ -3222,6 +3338,8 @@ set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
 # Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
 # std::threads but no SYCL queue, links no backend library, and takes no -fsycl
 # options. A repeated handoff/reset cycle stress-tests the fixture and TLS reuse.
+endif() # static SYCL backend fixture
+
 add_executable(test-moe-layer-ids-worker-reset
     tests/test-moe-layer-ids-worker-reset.cpp
 )
@@ -3257,4 +3375,3 @@ if (Python3_Interpreter_FOUND)
 else()
     message(STATUS "ggml-sycl: Python3 not found; AST reset contract test is not registered")
 endif()
-endif() # NOT GGML_BACKEND_DL

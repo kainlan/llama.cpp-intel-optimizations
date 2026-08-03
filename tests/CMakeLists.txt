@@ -1258,7 +1258,7 @@ if (NOT WIN32)
     # files in tests/ pass, and these are the 4 that do not.
 endif()
 
-if (GGML_SYCL)
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-kernel-profiler.cpp)
     target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-sycl-kernel-profiler PRIVATE ggml-sycl)
@@ -1436,7 +1436,10 @@ endif()
 # the sweep runs it, which is the entire point of restoring it.
 if(GGML_SYCL)
     add_executable(test-sycl-fattn-onednn-gates test-sycl-fattn-onednn-gates.cpp)
-    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml ggml-cpu)
+    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml)
+    if (NOT GGML_BACKEND_DL)
+        target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml-cpu)
+    endif()
     target_include_directories(test-sycl-fattn-onednn-gates PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/include
         ${PROJECT_SOURCE_DIR}/ggml/src)

@@ -154,7 +154,10 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto teardown = std::async(std::launch::async, [&] { return r.prepare_teardown(model); });
         require(teardown.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
                 "teardown did not wait for runtime update");
+        require(r.prepare_live_update(model).code == error::BUSY, "update entered while teardown drained updates");
+        require(r.begin_outer().code == error::LOAD_BUSY, "load entered while teardown drained updates");
         require(r.finalize_live_update(update) == error::OK, "LIVE update finalize failed");
+        require(r.finalize_live_update(update) == error::STALE_IDENTITY, "duplicate update ticket was consumed twice");
         auto ticket = teardown.get();
         require(ticket.finisher && ticket.code == error::OK, "teardown did not resume after runtime update");
         require(r.finalize_teardown(ticket, true) == error::OK, "teardown after runtime update failed");

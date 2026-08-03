@@ -49,14 +49,13 @@ checks = {
     ),
     "checked IDs": "class CheckedCounter" in hpp and "ID_EXHAUSTED" in cpp,
     "explicit nested transaction": "enter_nested(LoadTxnId" in hpp,
-    "abort default guard": "ggml_backend_sycl_model_load_end(txn, false" in llama,
+    "abort default guard": "llama_model_sycl_hooks().end(txn, false" in llama,
     "noncopyable guard": "llama_model_sycl_loading_guard(const llama_model_sycl_loading_guard &) = delete"
     in llama,
     "explicit outer success": "sycl_model_loading_guard.finish(true)" in llama,
     "no-alloc success": "if (ml.no_alloc)" in llama
     and "sycl_model_loading_guard.finish(true)" in llama,
-    "generation-safe teardown": "ggml_backend_sycl_model_unloaded_token(token)"
-    in llama,
+    "generation-safe teardown": "llama_model_sycl_hooks().unload(token)" in llama,
     "no legacy llama guard": "ggml_backend_sycl_set_model_loading(" not in llama,
     "public null-output result": "GGML_SYCL_LIFECYCLE_NULL_OUTPUT" in public
     and "model != nullptr" in backend,
@@ -83,7 +82,7 @@ checks = {
         for x in (
             "g_tensor_inventory_mutex",
             "ggml_sycl_publish_plan_locked",
-            "set_placement_plan_snapshot(participates[i] ? snapshot : nullptr)",
+            "set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr)",
             "atomic_store_explicit(&g_placement_publication, snapshot",
         )
     ),
@@ -181,8 +180,8 @@ checks = {
     == 1,
     "abort reset preserves authority": "ggml_sycl_reset_model_load_scratch_state(true)" in backend
     and "if (!preserve_placement_authority)" in backend,
-    "global cache aliases aggregated": "unique_caches" in backend
-    and re.search(r"participates\[i\]\s*=\s*participates\[i\]\s*\|\|", backend),
+    "global cache aliases aggregated": "publication.caches" in backend
+    and re.search(r"publication\.participates\[i\]\s*=\s*publication\.participates\[i\]\s*\|\|", backend),
     "KV allocation retains one lifecycle owner": (
         lambda body: body.count("ggml_sycl_global_plan_snapshot()") == 1
         and "g_placement_kv_info" not in body
@@ -234,8 +233,12 @@ checks = {
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
     in cpp,
     "runtime update lease blocks teardown": "prepare_live_update" in hpp
-    and "active_live_updates" in hpp
-    and "current->second.active_live_updates == 0" in cpp,
+    and "live_update_serials" in hpp
+    and "current->second.live_update_count == 0" in cpp
+    and "model_phase::DRAINING_UPDATES" in cpp,
+    "update tickets exact one-shot": "next_live_update_serial == 0" in cpp
+    and "entry.live_update_serials[index] != ticket.serial" in cpp
+    and "--entry.live_update_count" in cpp,
     "fallible pre-finalize restoration": backend.index("teardown_owner_effects(owner)")
     < backend.index("finalize_teardown(ticket, true)"),
     "durable quarantine reaper": all(
@@ -254,6 +257,11 @@ checks = {
     not in backend,
     "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend
     and "max_passes" in backend,
+    "dynamic model lifecycle callbacks": "llama_model_sycl_hooks().begin" in llama
+    and "llama_model_sycl_hooks().end" in llama
+    and "llama_model_sycl_hooks().unload" in llama
+    and "ggml_backend_reg_get_proc_address" in llama
+    and "defined(GGML_BACKEND_DL)" in llama,
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()

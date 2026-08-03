@@ -2002,6 +2002,21 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_pub
 static std::mutex                                                g_tensor_inventory_mutex;
 static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };
 
+static_assert(std::is_nothrow_move_assignable<ggml_sycl::placement_kv_info>::value,
+              "prepared placement publication requires nonthrowing KV metadata commit");
+
+struct ggml_sycl_prepared_plan_publication {
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot>     snapshot;
+    std::array<ggml_sycl::unified_cache *, GGML_SYCL_MAX_DEVICES> caches{};
+    std::array<bool, GGML_SYCL_MAX_DEVICES>                       participates{};
+    ggml_sycl::placement_kv_info                                  kv_info;
+    uint32_t                                                      model_n_layer = 0;
+    int                                                           cache_count   = 0;
+};
+
+static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_locked(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
+static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept;
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {
@@ -9518,19 +9533,19 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 }
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
-    ggml_sycl_plan_restoration_bundle restoration;
-    {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-        if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-            throw std::runtime_error("failed to prepare latest LIVE placement plan");
-        }
-        ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
-        ggml_sycl_publish_plan_locked(restoration.snapshot);
-    }
+    ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
+    // Preserve the currently published owner while scratch is reset, then
+    // refetch latest-LIVE under the canonical writer lock and publish exactly
+    // once. No stale restoration bundle or restored->null->restored window.
     ggml_sycl_reset_model_load_scratch_state(true);
-    ggml_sycl_publish_restored_plan(restoration);
+    ggml_sycl_plan_restoration_bundle restoration;
+    std::lock_guard<std::mutex>       lock(g_tensor_inventory_mutex);
+    if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
+        throw std::runtime_error("failed to prepare latest LIVE placement plan");
+    }
+    ggml_sycl_publish_plan_locked(restoration.snapshot);
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
@@ -10398,42 +10413,47 @@ static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan
     return false;
 }
 
-static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
-    // Writer serialization is provided by g_tensor_inventory_mutex. Every
-    // extant cache is explicitly assigned the shared owner or null before the
-    // process authority changes.
-    if (snapshot) {
-        g_model_n_layer     = snapshot->model_n_layer;
-        g_placement_kv_info = snapshot->kv_info;
-    } else {
-        g_model_n_layer     = 0;
-        g_placement_kv_info = {};
-    }
-    const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-    std::array<ggml_sycl::unified_cache *, GGML_SYCL_MAX_DEVICES> unique_caches{};
-    std::array<bool, GGML_SYCL_MAX_DEVICES>                       participates{};
-    int                                                           unique_count = 0;
+static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_locked(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    ggml_sycl_prepared_plan_publication publication;
+    publication.snapshot      = snapshot;
+    publication.kv_info       = snapshot ? snapshot->kv_info : ggml_sycl::placement_kv_info{};
+    publication.model_n_layer = snapshot ? snapshot->model_n_layer : 0;
+    const int total           = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
     for (int d = 0; d < total; ++d) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(d);
         if (!cache) {
             continue;
         }
         int i = 0;
-        while (i < unique_count && unique_caches[i] != cache) {
+        while (i < publication.cache_count && publication.caches[i] != cache) {
             ++i;
         }
-        if (i == unique_count) {
-            unique_caches[unique_count++] = cache;
+        if (i == publication.cache_count) {
+            publication.caches[publication.cache_count++] = cache;
         }
-        participates[i] =
-            participates[i] || (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d));
+        publication.participates[i] =
+            publication.participates[i] ||
+            (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d));
     }
-    for (int i = 0; i < unique_count; ++i) {
-        unique_caches[i]->set_placement_plan_snapshot(participates[i] ? snapshot : nullptr);
+    return publication;
+}
+
+static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept {
+    const auto & snapshot = publication.snapshot;
+    g_model_n_layer       = publication.model_n_layer;
+    g_placement_kv_info   = std::move(publication.kv_info);
+    for (int i = 0; i < publication.cache_count; ++i) {
+        publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
     }
     g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
                                                  std::memory_order_release);
     std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release);
+}
+
+static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    auto publication = ggml_sycl_prepare_plan_publication_locked(snapshot);
+    ggml_sycl_publish_prepared_plan_locked(publication);
 }
 
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan) {
@@ -11243,12 +11263,15 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         return;
     }
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
+    // All potentially throwing cache discovery, alias aggregation, and KV
+    // metadata copying completes before lifecycle ownership changes.
+    auto prepared_publication = ggml_sycl_prepare_plan_publication_locked(immutable);
     // The live-update ticket prevents exact-token teardown from entering
     // TEARING_DOWN until this CAS/publication transaction finalizes.
     if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
         return;
     }
-    ggml_sycl_publish_plan_locked(immutable);
+    ggml_sycl_publish_prepared_plan_locked(prepared_publication);
 
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
@@ -95285,6 +95308,21 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_tp_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_tp_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_model_load_begin") == 0) {
+        return (void *) ggml_backend_sycl_model_load_begin;
+    }
+    if (strcmp(name, "ggml_backend_sycl_model_load_enter_nested") == 0) {
+        return (void *) ggml_backend_sycl_model_load_enter_nested;
+    }
+    if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
+        return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_model_unloaded_token") == 0) {
+        return (void *) ggml_backend_sycl_model_unloaded_token;
+    }
+    if (strcmp(name, "ggml_backend_sycl_model_quarantine_token") == 0) {
+        return (void *) ggml_backend_sycl_model_quarantine_token;
     }
     // SYCL doesn't support registering host memory, left here for reference
     // "ggml_backend_register_host_buffer"

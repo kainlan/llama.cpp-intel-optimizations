@@ -24,7 +24,8 @@ begin_result Registry::begin_outer() noexcept {
             return { error::LOAD_BUSY };
         }
         for (const auto & model : models_) {
-            if (model.second.phase == model_phase::TEARING_DOWN) {
+            if (model.second.phase == model_phase::DRAINING_UPDATES ||
+                model.second.phase == model_phase::TEARING_DOWN) {
                 return { error::LOAD_BUSY };
             }
         }
@@ -306,8 +307,15 @@ live_update_ticket Registry::prepare_live_update(ModelToken token) {
     if (model->second.phase != model_phase::LIVE) {
         return { error::BUSY, token };
     }
-    const uint64_t serial = ++model->second.live_update_serial;
-    ++model->second.active_live_updates;
+    if (model->second.next_live_update_serial == 0) {
+        return { error::ID_EXHAUSTED, token };
+    }
+    if (model->second.live_update_count == model->second.live_update_serials.size()) {
+        return { error::BUSY, token };
+    }
+    const uint64_t serial                                                = model->second.next_live_update_serial;
+    model->second.next_live_update_serial                                = serial == UINT64_MAX ? 0 : serial + 1;
+    model->second.live_update_serials[model->second.live_update_count++] = serial;
     return { error::OK, token, serial, true };
 }
 
@@ -318,11 +326,20 @@ error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept
             return ticket.code;
         }
         auto model = models_.find(ticket.token.model.value);
-        if (model == models_.end() || !(model->second.token == ticket.token) ||
-            model->second.active_live_updates == 0 || model->second.live_update_serial < ticket.serial) {
+        if (model == models_.end() || !(model->second.token == ticket.token)) {
             return error::STALE_IDENTITY;
         }
-        --model->second.active_live_updates;
+        auto &   entry = model->second;
+        uint32_t index = 0;
+        while (index < entry.live_update_count && entry.live_update_serials[index] != ticket.serial) {
+            ++index;
+        }
+        if (index == entry.live_update_count) {
+            return error::STALE_IDENTITY;
+        }
+        entry.live_update_serials[index]                       = entry.live_update_serials[entry.live_update_count - 1];
+        entry.live_update_serials[entry.live_update_count - 1] = 0;
+        --entry.live_update_count;
         cv_.notify_all();
         return error::OK;
     } catch (...) {
@@ -337,7 +354,8 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
         return { error::BUSY, token };
     }
     for (const auto & item : models_) {
-        if (item.first != token.model.value && item.second.phase == model_phase::TEARING_DOWN) {
+        if (item.first != token.model.value &&
+            (item.second.phase == model_phase::DRAINING_UPDATES || item.second.phase == model_phase::TEARING_DOWN)) {
             return { error::BUSY, token };
         }
     }
@@ -362,19 +380,26 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     if (model->second.phase == model_phase::LOADING) {
         return { error::BUSY, token };
     }
-    if (model->second.active_live_updates != 0) {
+    if (model->second.phase == model_phase::DRAINING_UPDATES || model->second.phase == model_phase::TEARING_DOWN) {
+        const uint64_t serial = model->second.teardown_serial;
         cv_.wait(lock, [&] {
             auto current = models_.find(token.model.value);
             return current == models_.end() || !(current->second.token == token) ||
-                   current->second.active_live_updates == 0;
+                   (current->second.phase != model_phase::DRAINING_UPDATES &&
+                    current->second.phase != model_phase::TEARING_DOWN);
         });
         model = models_.find(token.model.value);
-        if (model == models_.end() || !(model->second.token == token)) {
-            return { error::STALE_IDENTITY, token };
+        if (model != models_.end() && model->second.phase == model_phase::QUARANTINED) {
+            return { error::EFFECT_FAILED, token, serial, false };
         }
-        if (model->second.phase != model_phase::LIVE) {
-            return { error::BUSY, token };
-        }
+        auto dead = dead_.find(token.model.value);
+        return { dead != dead_.end() ? dead->second.second : error::EFFECT_FAILED, token, serial, false };
+    }
+    if (model->second.phase != model_phase::LIVE) {
+        return { error::BUSY, token };
+    }
+    if (next_finish_serial_ == 0) {
+        return { error::ID_EXHAUSTED, token };
     }
     // Reserve compact durable replay metadata before any unlocked teardown
     // effect can destroy the model or release its slot. Large placement plans
@@ -393,22 +418,22 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
             return { error::ALLOCATION_FAILED, token };
         }
     }
-    if (model->second.phase == model_phase::TEARING_DOWN) {
-        const uint64_t serial = model->second.teardown_serial;
-        cv_.wait(lock, [&] {
-            auto current = models_.find(token.model.value);
-            return current == models_.end() || current->second.phase != model_phase::TEARING_DOWN;
-        });
-        model = models_.find(token.model.value);
-        if (model != models_.end() && model->second.phase == model_phase::QUARANTINED) {
-            return { error::EFFECT_FAILED, token, serial, false };
-        }
-        auto dead = dead_.find(token.model.value);
-        return {dead != dead_.end() ? dead->second.second : error::EFFECT_FAILED, token, serial, false};
+    const uint64_t serial         = next_finish_serial_;
+    next_finish_serial_           = serial == UINT64_MAX ? 0 : serial + 1;
+    model->second.phase           = model_phase::DRAINING_UPDATES;
+    model->second.teardown_serial = serial;
+    cv_.notify_all();
+    cv_.wait(lock, [&] {
+        auto current = models_.find(token.model.value);
+        return current == models_.end() || !(current->second.token == token) || current->second.live_update_count == 0;
+    });
+    model = models_.find(token.model.value);
+    if (model == models_.end() || !(model->second.token == token) ||
+        model->second.phase != model_phase::DRAINING_UPDATES || model->second.teardown_serial != serial) {
+        return { error::STALE_IDENTITY, token, serial, false };
     }
     model->second.phase = model_phase::TEARING_DOWN;
-    model->second.teardown_serial = next_finish_serial_++;
-    return {error::OK, token, model->second.teardown_serial, true};
+    return { error::OK, token, serial, true };
 }
 
 error Registry::finalize_teardown(const teardown_ticket & ticket, bool effects_ok) noexcept {
@@ -474,7 +499,7 @@ error Registry::defer_quarantine(ModelToken token) noexcept {
         if (model->second.phase == model_phase::QUARANTINED) {
             return error::OK;
         }
-        if (model->second.active_live_updates != 0) {
+        if (model->second.live_update_count != 0) {
             return error::BUSY;
         }
         if (model->second.phase != model_phase::LIVE) {

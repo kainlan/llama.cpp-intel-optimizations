@@ -42,7 +42,7 @@ enum class error {
     EFFECT_FAILED,
     BUSY,
 };
-enum class model_phase { LOADING, LIVE, TEARING_DOWN, QUARANTINED, DEAD };
+enum class model_phase { LOADING, LIVE, DRAINING_UPDATES, TEARING_DOWN, QUARANTINED, DEAD };
 enum class tier_verdict { UNKNOWN, DEVICE, HOST, MIXED };
 enum class finish_phase { ACTIVE, COMMITTING, ROLLING_BACK, COMMITTED, ABORTED };
 
@@ -171,9 +171,10 @@ public:
         ModelToken                        token{};
         std::shared_ptr<const ModelState> state;
         model_phase phase = model_phase::LOADING;
-        uint64_t teardown_serial = 0;
-        uint64_t                          live_update_serial  = 0;
-        uint32_t                          active_live_updates = 0;
+        uint64_t                               teardown_serial         = 0;
+        uint64_t                               next_live_update_serial = 1;
+        std::array<uint64_t, model_slot_count> live_update_serials{};
+        uint32_t                               live_update_count = 0;
         error teardown_result = error::OK;
     };
 
