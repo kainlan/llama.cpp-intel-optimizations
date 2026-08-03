@@ -59,8 +59,13 @@ current inputs, 17 are confined to parsed function signature/storage spans and
 31 are in parsed or unambiguously recovered function bodies. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
-top-level constructs or the census fails. The same balanced bound controls
-scope attribution, preventing later file-scope declarations from inheriting the
+top-level constructs or the census fails. Parsed `function_definition` nodes
+containing recovery receive the same check when a recovered compound body lacks
+a real parsed closing delimiter: the body is lexically balanced and any
+parser-owned tail must independently validate. This prevents a recovery directive
+from expanding the parsed body over a following valid file-scope declaration.
+The same balanced bound controls scope attribution for recovered `ERROR`
+functions, preventing later file-scope declarations from inheriting the
 recovered function's scope. Only the signature span exempts a function's own
 `static` storage-class marker. Body recovery is accepted only when every
 `static`/`thread_local` marker in it independently belongs to a parsed
@@ -80,7 +85,10 @@ definition. Negative fixtures also require rejection of malformed recovery in
 a function body (`void f(){ static Widget x{; }`), across a structural
 preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
 in an oversized recovered-function `ERROR` tail containing a malformed implicit
-global. It also asserts that the declarations at `ggml-sycl.cpp` lines 93499,
+global. The exact parsed-function recovery fixture
+`static void recovered() { #wat x }\nWidget implicit_global{};` must also fail
+closed rather than silently dropping the valid global after assigning it local
+scope. It also asserts that the declarations at `ggml-sycl.cpp` lines 93499,
 94640, 94700, 94801, and 94857 retain file scope.
 
 ### Static high-risk highlights (no behavior changes in this census)
