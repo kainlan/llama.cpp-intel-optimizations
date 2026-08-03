@@ -163,7 +163,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 7,
+        "ggml_sycl_global_plan_snapshot": 8,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -296,7 +296,7 @@ checks = {
     and "sycl_hooks.host_buffer_type_for_device(dev)" in (root / "src/llama-model-loader.cpp").read_text()
     and "sycl_hooks.register_host_weight" in (root / "src/llama-model-loader.cpp").read_text()
     and "allow_host_buft_with_mmap = true" in (root / "src/llama-model-loader.cpp").read_text()
-    and "prefer_host_weights && llama_model_loader_sycl_hooks_for(buft_dev).reg" in
+    and "final_sycl_hooks.reg && final_sycl_hooks.weights_evictable" in
         (root / "src/llama-model-loader.cpp").read_text()
     and "sycl_hooks.register_identity" in (root / "src/llama-model-loader.cpp").read_text()
     and "sycl_hooks.register_usage" in (root / "src/llama-model-loader.cpp").read_text()
@@ -311,7 +311,7 @@ checks = {
     "CPU speculative lifecycle cancellation": "sycl_model_loading_guard.cancel()" in llama
     and "if (has_sycl_weight_buffer)" in llama
     and "if (sycl_model_backend)" in llama
-    and "rc == GGML_SYCL_LIFECYCLE_POISONED && rollback_token.model_id != 0" in llama
+    and "*out_model = rollback_token.model_id != 0" in llama
     and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "exact model-scoped weight identity": "ggml_sycl_owner_name_key" in backend
@@ -319,13 +319,23 @@ checks = {
     and "ggml_sycl_erase_weight_identities_for_owner" in backend
     and "register_identity(tensor" in (root / "src/llama-model-loader.cpp").read_text()
     and (root / "src/llama-model-loader.cpp").read_text().index("register_identity(tensor") <
-        (root / "src/llama-model-loader.cpp").read_text().index("register_host_weight(selected_layer_dev"),
+        (root / "src/llama-model-loader.cpp").read_text().index("register_host_weight(selected_final_dev"),
     "CPU classified before lifecycle begin": "resolved_sycl_weight_owner" in llama
     and "this->n_gpu_layers() > 0" in llama
     and "params.tensor_buft_overrides" in llama
     and "sycl_tensor_override" in llama
     and "llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner" in llama
     and "if (sycl_model_loading_guard.active)" in llama,
+    "final override device metadata": "selected_final_buft" in (root / "src/llama-model-loader.cpp").read_text()
+    and "selected_final_dev" in (root / "src/llama-model-loader.cpp").read_text()
+    and "llama_model_loader_sycl_hooks_for(selected_final_dev)" in
+        (root / "src/llama-model-loader.cpp").read_text(),
+    "host rows filtered before dereference": "ggml_sycl_host_row_authorized" in backend
+    and backend.count("if (!ggml_sycl_host_row_authorized(entry.second.owner))") >= 2
+    and "if (!ggml_sycl_host_row_authorized(it->second.owner))" in backend,
+    "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
+    and "stamp_pending_owner(entry_it->second)" in cache_cpp
+    and "stamp_pending_owner(it->second)" in cache_cpp,
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
     and "req.device = exact_device" in backend
     and "get_current_device_id()" not in re.search(

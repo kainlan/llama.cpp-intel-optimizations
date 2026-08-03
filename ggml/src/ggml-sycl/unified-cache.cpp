@@ -4837,6 +4837,7 @@ void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
             return nullptr;
         }
     }
+    stamp_pending_owner(entry);
     return entry.device_ptr;
 }
 
@@ -4844,7 +4845,7 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
     if (!key_id.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
@@ -4871,7 +4872,7 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
         }
         return nullptr;
     }
-    const auto & entry = entry_it->second;
+    auto & entry = entry_it->second;
     if (entry.retired || entry.layout != layout) {
         return nullptr;
     }
@@ -4888,6 +4889,7 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
     if (entry.location == cache_location::HOST_MMAP) {
         return nullptr;
     }
+    stamp_pending_owner(entry);
     return entry.device_ptr;
 }
 
@@ -4904,7 +4906,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
     if (!key_id.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
@@ -4946,6 +4948,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                 *out_has_event = true;
             }
         }
+        stamp_pending_owner(entry_it->second);
         return entry.device_ptr;
     }
     // IN_PROGRESS entries: return pointer + ready_event so the caller can
@@ -4959,6 +4962,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                 *out_has_event = true;
             }
         }
+        stamp_pending_owner(entry_it->second);
         return entry.device_ptr;
     }
     return nullptr;
@@ -5670,7 +5674,7 @@ void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_la
     if (!key.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_weight_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
     const unified_cache_key direct_expert_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
     auto                    entry_it          = entries_.find(direct_weight_key);
@@ -5698,6 +5702,7 @@ void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_la
     if (entry.host_resident) {
         return nullptr;
     }
+    stamp_pending_owner(entry_it->second);
     return entry.device_ptr;
 }
 
@@ -5710,7 +5715,7 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
     // This ensures the best available layout is returned, not whatever
     // id_to_key_ happens to point at (which can be ONEDNN_PACKED from PP).
     static const ggml_layout_mode       try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
     auto try_entry = [&](const unified_cache_key & ckey) {
         auto entry_it = entries_.find(ckey);
@@ -5730,6 +5735,7 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
         if (entry.location == cache_location::HOST_MMAP) {
             return false;
         }
+        stamp_pending_owner(entry_it->second);
         result.ptr       = entry.device_ptr;
         result.layout    = entry.layout;
         result.on_device = !entry.host_resident;

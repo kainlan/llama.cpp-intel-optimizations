@@ -2042,6 +2042,34 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_ident
     return candidate ? candidate : ggml_sycl_global_plan_snapshot();
 }
 
+static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
+                                 const ggml_sycl::lifecycle::ModelToken & b) noexcept {
+    return a.model.value == b.model.value && a.load.value == b.load.value && a.owner.slot == b.owner.slot &&
+           a.owner.generation == b.owner.generation;
+}
+
+static bool ggml_sycl_host_row_authorized(const ggml_sycl::lifecycle::ModelToken & owner) noexcept {
+    const auto candidate = ggml_sycl_bound_load_candidate();
+    if (candidate) {
+        return owner.load.value == candidate.value;
+    }
+    const auto active = ggml_sycl_global_plan_snapshot();
+    if (!active) {
+        return false;
+    }
+    const ggml_sycl::lifecycle::ModelToken expected{
+        { active->model_id },
+        { active->load_txn_id },
+        { active->slot, active->slot_generation }
+    };
+    if (!ggml_sycl_same_owner(owner, expected)) {
+        return false;
+    }
+    const auto state = ggml_sycl::lifecycle::global_registry().find(expected.model);
+    return state && state->phase == ggml_sycl::lifecycle::model_phase::LIVE &&
+           ggml_sycl_same_owner(state->token, expected);
+}
+
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
     if (!snapshot) {
@@ -8603,6 +8631,9 @@ const void * ggml_sycl_lookup_host_weight_ptr_by_name(const char * name) {
     const std::string           key = ggml_sycl_owner_name_key(owner, name);
     auto                        it  = g_sycl_host_weight_extras.find(key);
     if (it != g_sycl_host_weight_extras.end()) {
+        if (!ggml_sycl_host_row_authorized(it->second.owner)) {
+            return nullptr;
+        }
         const ggml_tensor * tensor = it->second.tensor;
         if (tensor == nullptr || tensor->name == nullptr) {
             return nullptr;
@@ -11333,6 +11364,9 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         {
             std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
             for (const auto & entry : g_sycl_host_weight_extras) {
+                if (!ggml_sycl_host_row_authorized(entry.second.owner)) {
+                    continue;
+                }
                 const ggml_tensor * tensor = entry.second.tensor;
                 if (tensor == nullptr || tensor->name == nullptr || tensor->name[0] == '\0') {
                     continue;
@@ -24656,6 +24690,9 @@ static void ggml_sycl_preload_model_weights() {
         std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
         weights.reserve(g_sycl_host_weight_extras.size());
         for (const auto & entry : g_sycl_host_weight_extras) {
+            if (!ggml_sycl_host_row_authorized(entry.second.owner)) {
+                continue;
+            }
             if (entry.second.tensor) {
                 weights.push_back(entry.second.tensor);
             }

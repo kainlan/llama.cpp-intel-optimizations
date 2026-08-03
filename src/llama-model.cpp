@@ -174,15 +174,15 @@ struct llama_model_sycl_loading_guard {
         const auto            rc = hooks.end(txn, false, outer ? &rollback_token : nullptr);
         active                   = false;
         if (outer && out_model) {
-            // Clean cancellation owns nothing. Preserve a token only when the
-            // backend reports poisoned cleanup so quarantine can finish it.
-            *out_model = rc == GGML_SYCL_LIFECYCLE_POISONED && rollback_token.model_id != 0 ?
+            // Any returned owner still requires quarantine/teardown cleanup,
+            // including EFFECT_FAILED. Only a zero rollback is a clean cancel.
+            *out_model = rollback_token.model_id != 0 ?
                              llama_sycl_model_token{ rollback_token.model_id, rollback_token.load_txn_id,
                                                      rollback_token.slot, rollback_token.slot_generation } :
                              llama_sycl_model_token{};
         }
-        if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
-            rc != GGML_SYCL_LIFECYCLE_NESTED) {
+        if (rollback_token.model_id == 0 && rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
+            rc != GGML_SYCL_LIFECYCLE_POISONED && rc != GGML_SYCL_LIFECYCLE_NESTED) {
             throw std::runtime_error(format("SYCL model lifecycle cancel failed: txn=%llu result=%d",
                                             (unsigned long long) txn.id, (int) rc));
         }

@@ -1161,8 +1161,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return it->second.get();
     };
 
-    ggml_backend_dev_t selected_layer_dev = nullptr;
-    llm_tensor         selected_tn_tensor = tn.tensor;
+    ggml_backend_dev_t         selected_final_dev  = nullptr;
+    ggml_backend_buffer_type_t selected_final_buft = nullptr;
+    llm_tensor                 selected_tn_tensor  = tn.tensor;
     bool               selected_bias      = false;
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
@@ -1241,7 +1242,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_dev_t layer_dev = buft_list->front().first;
-        selected_layer_dev           = layer_dev;
         selected_tn_tensor           = tn_tensor;
         selected_bias                = bias;
 
@@ -1294,7 +1294,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         bool   allow_host_buft_with_mmap = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (prefer_host_weights && llama_model_loader_sycl_hooks_for(buft_dev).reg) {
+        const auto final_sycl_hooks = llama_model_loader_sycl_hooks_for(buft_dev);
+        if (final_sycl_hooks.reg && final_sycl_hooks.weights_evictable && final_sycl_hooks.weights_evictable()) {
             allow_host_buft_with_mmap = true;
         }
 #endif
@@ -1305,6 +1306,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
+
+        selected_final_buft = buft;
+        selected_final_dev  = ggml_backend_buft_get_device(buft);
 
         if (buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {
@@ -1321,10 +1325,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     auto register_sycl_tensor_metadata = [&](ggml_tensor * tensor) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (!tensor || !selected_layer_dev) {
+        if (!tensor || !selected_final_buft || !selected_final_dev) {
             return;
         }
-        const auto sycl_hooks = llama_model_loader_sycl_hooks_for(selected_layer_dev);
+        const auto sycl_hooks = llama_model_loader_sycl_hooks_for(selected_final_dev);
         if (!sycl_hooks.reg || !sycl_hooks.weights_evictable || !sycl_hooks.register_host_weight ||
             !sycl_hooks.register_identity || !sycl_hooks.register_usage) {
             return;
@@ -1335,7 +1339,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             sycl_hooks.register_identity(tensor, weight->second.idx, weight->second.offs, ggml_nbytes(tensor), 0);
         }
         if (sycl_hooks.weights_evictable()) {
-            sycl_hooks.register_host_weight(selected_layer_dev, tensor);
+            sycl_hooks.register_host_weight(selected_final_dev, tensor);
         }
 
         auto usage_from_tensor = [](llm_tensor t) -> ggml_backend_sycl_tensor_usage {
