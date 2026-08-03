@@ -1,47 +1,21 @@
 # SYCL Backend Environment Variables (fork tuning)
 
-Full catalog of `GGML_SYCL_*` tuning/debug variables for this fork's SYCL
-backend. `CLAUDE.md` keeps only the handful of load-bearing performance
-opt-outs; everything else lives here.
+This is a curated catalog of the `GGML_SYCL_*` tuning and debugging variables
+most useful for this fork; it is not an exhaustive inventory. `CLAUDE.md` keeps
+only the handful of load-bearing performance opt-outs.
 
-There are **~600** `GGML_SYCL_*` variables in the tree (599 distinct quoted
-names under `ggml/src/ggml-sycl/` as of 2026-07-30); this file documents 50 of
-them. The header used to claim "240+", which is low by more than half.
-
-⚠️ **The recipe this section used to give was unsound and silently
-under-reported.** It was:
+To inventory names in the current source without depending on which environment
+accessor reads them, search string literals and allow digits:
 
 ```bash
-grep -rhoE 'getenv\("GGML_SYCL[A-Z_]*"' ggml/src/ggml-sycl/ | sort -u
+find ggml/src/ggml-sycl -type f \
+  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print0 \
+  | xargs -0 cat | grep -oE '"GGML_SYCL[A-Z0-9_]*"' | sort -u
 ```
 
-It finds 488 of 599 — missing ~111 (19%) while looking like it succeeded. Two
-independent defects:
-
-1. **`getenv\("` misses the wrappers.** This backend reads env through ~35
-   distinct accessors, not one: `get_sycl_env`, `mix_env`, `parse_env_int`,
-   `parse_env_mb_value`, `ggml_sycl_env_is_set`, the `ggml_sycl_dump_*_path`
-   family, and more. Vars read *only* via a wrapper are invisible — including
-   `GGML_SYCL_DISABLE_GRAPH` and `GGML_SYCL_DISABLE_DNN`, which `CLAUDE.md`
-   lists as load-bearing.
-2. **`[A-Z_]*` excludes digits**, so a name containing one never even reaches
-   the closing quote and is dropped entirely: `GGML_SYCL_FA_XMX_V1`,
-   `GGML_SYCL_DMMV_USE_Q8`, `GGML_SYCL_B50_LOCAL_AGG`,
-   `GGML_SYCL_DEBUG_SET_TENSOR_I32`, ...
-
-Match the **name**, not the accessor, and allow digits:
-
-```bash
-# Every GGML_SYCL_* string literal, whatever reads it.
-{ cat ggml/src/ggml-sycl/*.cpp ggml/src/ggml-sycl/*.hpp; } \
-  | grep -oE '"GGML_SYCL[A-Z0-9_]*"' | sort -u
-```
-
-Note the `cat ... | grep` form is deliberate: codescout's index **silently
-skips `ggml-sycl.cpp` as oversize** (it reports `skipped: {reason: "oversize"}`),
-and that file holds most of the env reads — so `search_text` alone will miss
-them. A command-position in-repo grep is redirected by a hook; a downstream
-pipe grep is not.
+The output includes every matching literal, including names retained only for
+compatibility, diagnostics, comments, or removal notices; confirm a live read
+before treating any result as an active setting.
 
 ## Performance-critical (all default ON, opt-out)
 
@@ -259,17 +233,14 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 | Variable | Effect |
 |----------|--------|
-| ~~`GGML_SYCL_UNIFIED_CACHE=0`~~ | **Removed by `9a0670712`.** Setting this name no longer disables anything; there is no replacement opt-out. |
-| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Select cache topology (`auto`, `global`, or `per_device`). This is distinct from the removed enable/disable variable and cannot disable the cache. |
+| ~~`GGML_SYCL_UNIFIED_CACHE=0`~~ | **Removed by `9a0670712` with optional cache enablement and its enable/disable branches.** Setting this name no longer disables anything; there is no replacement opt-out. |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Select cache topology (`auto`, `global`, or `per_device`) only; it cannot disable the cache. |
 | `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
 | `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction under memory pressure |
 | `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |
 
-The unified cache is intentionally always authoritative for SYCL memory. Commit
-`9a0670712` removed the `unified_cache_enabled()` environment check along with
-`GGML_SYCL_UNIFIED_CACHE=0`; the old name is not read, and no variable restores
-the legacy uncached path. `GGML_SYCL_UNIFIED_CACHE_MODE` remains supported only
-to choose the topology of the authoritative cache.
+For the architectural contract and migration history behind these two rows, see
+§1.2 and §9.3 of `docs/design/sycl-canonical-memory-architecture.md`.
 
 ## Debugging
 

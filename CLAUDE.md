@@ -366,10 +366,11 @@ GPU backends cache weights on-device for repeated inference:
 > dispatch, or eviction code. The rules below are the short form.
 
 The unified cache is the memory allocator for the SYCL backend. Its authority is
-not optional: `9a0670712` removed `GGML_SYCL_UNIFIED_CACHE=0`, the old name is
-no longer read, and there is no replacement opt-out. The distinct
-`GGML_SYCL_UNIFIED_CACHE_MODE` variable selects cache topology only. All SYCL
-backend GPU, host-pinned, staging, scratch, graph-temporary, KV, oneDNN, and
+not optional: `9a0670712` removed optional cache enablement and the enable/disable
+branches, including the now-unread `GGML_SYCL_UNIFIED_CACHE` opt-out. The distinct
+`GGML_SYCL_UNIFIED_CACHE_MODE` variable selects topology only; see the canonical
+contract §1.2 and §9.3 for details. All SYCL backend GPU, host-pinned, staging,
+scratch, graph-temporary, KV, oneDNN, and
 weight-layout allocations must flow through the unified-cache allocation APIs
 (`unified_alloc`, `unified_allocate`, cache materialization helpers, or wrappers
 that return `mem_handle`). Do not introduce direct `sycl::malloc_device`,
@@ -388,11 +389,11 @@ that still has a live handle; a live allocation at cleanup means a leaked
 reference or stale owner that must be fixed.
 
 ⚠️ **"At cleanup" is load-bearing, and was being read too broadly.** A live lease
-is a defect only when its **owner is gone**. Several `llama_model` objects may be
-loaded at once — that is supported public API, and `tests/test-thread-safety.cpp`
-exists to exercise it (it loads one model per GPU plus a CPU copy, then runs them
-concurrently). So **another live model's lease is correct, not leaked**, and a
-*new model's load* is not a quiescent point for anybody else's weights.
+is a defect only when its **owner is gone**. Several `llama_model` objects may
+remain loaded at once, so **another live model's lease is correct, not leaked**,
+and a *new model's load* is not a quiescent point for anybody else's weights.
+This lifetime rule does not promise concurrent inference: same-device concurrent
+SYCL graph compute remains unsupported (canonical contract §5).
 
 Getting this backwards cost real time. `9a0670712` ("sycl: checkpoint unified
 memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
@@ -868,19 +869,13 @@ timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
 Note `-p 0 -n 4` triggers planning but does **no prompt processing**, so paths
 reached only during PP will show zero activity. Use `-p 512` when you need them.
 
-**2. Multiple live models are supported.** This section previously claimed that
-passing two `-m` flags aborts at the model switch with a leaked model-weight
-`mem_handle` lease. That described the regression introduced by `9a0670712`, not
-the ownership contract. Current model-weight reclaim preserves active leases,
-live-model-owned entries even when `in_use_count == 0`, and unattributed entries
-when required by the reclaim mode and live-model mask; it reclaims only entries
-permitted by `weight_entry_reclaimable()`. Outside `MID_LOAD_REPLAN`, attributed
-leases with no live model owner are diagnosed separately and may abort under
-`GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are
-suppressed during `MID_LOAD_REPLAN`. Since `4afdb6d9f`, host and device
-whole-zone resets refuse a reset that would
-reclaim live registered allocations. Neither path force-reclaims another model's
-memory.
+**2. Multiple `-m` values are sequential model switches.** `llama-bench` frees
+the previous model before loading one with different model parameters
+(`tools/llama-bench/llama-bench.cpp:2278-2284`). Thus a multi-`-m` run checks
+teardown and the next load; it does not test simultaneously loaded models or
+contexts. Multiple model/context objects may remain alive, and their live weight
+ownership must be preserved as described under **SYCL Memory Ownership** above,
+but same-device concurrent inference is not supported (canonical contract §5).
 
 ### GPT-OSS Prompt Template Rule
 
@@ -1152,8 +1147,9 @@ semantic path times out on this store); there is no single standing task id.
 
 ### SYCL Environment Variables
 
-Full catalog (dispatch tuning, persistent-TG, memory hierarchy, cache,
-debugging — 240+ vars) is in **`docs/backend/sycl-env-vars.md`**. The
+The curated catalog (dispatch tuning, persistent-TG, memory hierarchy, cache,
+and debugging) is **`docs/backend/sycl-env-vars.md`**. Its accessor-independent
+literal-search command is the starting point for names not listed there. The
 load-bearing performance opt-outs (all default ON — flip to disable) that you
 most need to know:
 
@@ -1166,10 +1162,8 @@ most need to know:
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
 Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK=1`,
-`GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults),
-`GGML_SYCL_OP_TIMEOUT_MS=<N>` (abort before the xe GT-reset cascade). To find any
-var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
-(codescout `search_text`, or `grep -r`).
+`GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults), and
+`GGML_SYCL_OP_TIMEOUT_MS=<N>` (abort before the xe GT-reset cascade).
 
 ## CI and Validation
 
