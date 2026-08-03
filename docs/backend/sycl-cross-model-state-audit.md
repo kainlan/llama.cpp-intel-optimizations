@@ -23,15 +23,18 @@ children; any non-matching or ambiguous form still fails closed. Each declarator
 in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
 pointer/reference-to-function and pointer-to-member function/data objects
-(including arrays) remain census objects. Function-type `using` aliases are
-resolved through namespace-qualified identities and alias chains. Lookup is
-position-aware: only aliases declared before a declaration are visible, so a
-later same-name alias cannot retroactively shadow an earlier binding. Relative
-qualified names search enclosing namespace prefixes before global scope, while
-leading `::` remains absolute. Direct alias declarations remain excluded as
-functions, indirect pointer/reference objects are included, and unresolved
-qualified aliases or invalid array-of-function alias uses fail closed. Object aliases also carry top-level binding cv through
-chains and arrays, so an array whose aliased pointer elements are `const` is
+(including arrays) remain census objects. This is deliberately **not a general
+C++ frontend**: alias handling is a bounded proof for the five inputs listed
+below. It records declaration positions and lexical namespace/class/function/
+block identities, chooses the first nearest candidate and then its newest
+visible declaration, and treats relevant ordinary-name hiding conservatively.
+Relative qualified names search enclosing namespace prefixes before global
+scope, while leading `::` remains absolute. Function and object alias chains
+are accepted only when that bounded lookup proves them. Inline namespaces,
+namespace aliases, alias templates, unsupported local/class alias interactions,
+and unresolved hiding cause affected static declarations to fail closed rather
+than emit a guessed row. Object aliases carry compositional top-level binding cv
+through chains and arrays, so arrays of aliased `const` pointer elements are
 reported immutable.
 The scope walk includes file and named-namespace objects, anonymous-namespace
 objects without the `static` spelling, function-local `static`/`thread_local`
@@ -104,12 +107,14 @@ pointer-to-member function/data objects and arrays, including exact direct
 class-scope spellings recovered from the pinned grammar's `ERROR` shape. Const
 pointer elements are recognized through array declarators, and all positive
 const-array declarations include compiler-required `={}` initialization.
-Function-type alias fixtures cover declaration-position visibility, relative
-and absolute qualified identities/chains, and cv-bearing object aliases while
-excluding direct function declarations; unresolved aliases
-and invalid arrays of aliased function type must fail closed. A `g++ -std=c++17
--pedantic-errors -fsyntax-only` gate proves the positive fixture declarations
-are compiler-valid. Negative fixtures also require rejection
+One compiler-valid positive fixture source is both parsed and passed to `g++
+-std=c++17 -pedantic-errors -fsyntax-only`. It covers declaration-position
+visibility, nearest relative and absolute qualified identities/chains, direct
+function exclusion, and compositional cv-bearing object/array aliases. Exact
+negative fixtures require fail-closed results for alias templates, inline
+namespaces, namespace aliases, unsupported local/class aliases, ordinary-name
+hiding, unresolved aliases, and invalid arrays of aliased function type.
+Negative recovery fixtures also require rejection
 of malformed recovery in a function body (`void f(){ static Widget x{; }`),
 across a structural
 preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
