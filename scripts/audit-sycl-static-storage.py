@@ -387,14 +387,14 @@ def recovery_coverage(source_b: bytes, root, declarations, recovered_regions):
     failures = []
     masked = code_mask(source_b)
 
-    # A parsed function can still have a recovery-expanded compound_statement:
+    # A parsed function or lambda can still have a recovery-expanded compound_statement:
     # lexically balance its real body and reject any parser-owned tail that is
     # not independently structured. Otherwise a following file-scope object
     # can be swallowed as a non-static local and silently disappear.
     checked_parsed_bodies = set()
     for gap in gaps:
         function = parsed_function_context(gap)
-        if function is None or kind(function) != "function_definition":
+        if function is None:
             continue
         for body in (item for item in ancestors(gap) if kind(item) == "compound_statement"):
             body_span = (start_byte(body), end_byte(body))
@@ -558,12 +558,16 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
         "recovered-function-tail": "static void recovered() { #wat x }\nWidget implicit_global{;",
         "parsed-function-recovery-tail": "static void recovered() { #wat x }\nWidget implicit_global{};",
         "parsed-function-wrong-close": "static void recovered() { x; x template #if X }\nWidget implicit_global{};",
+        "lambda-wrong-close": "static auto recovered = [] { x; x template #if X }\nWidget implicit_global{};",
+        "template-lambda-wrong-close": "static auto recovered = []<typename T> { x; x template #if X }\nWidget implicit_global{};",
+        "nested-function-lambda-wrong-close": "static void outer() { auto recovered = [] { x; x template #if X }\nstatic Widget hidden{}; }",
     }
     for fixture, broken in negative_fixtures.items():
         _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
         assert broken_gaps and broken_failures, f"{fixture} must fail closed"
         if fixture in {
-            "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close"
+            "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close",
+            "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
         }:
             assert any(reason == "unproved recovery tail after function body" for _, reason in broken_failures)
     audited = (repo / FILES[0]).read_text(encoding="utf-8")
@@ -586,7 +590,8 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
     }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
-          "parsed-function-recovery-tail,parsed-function-wrong-close,file-tail-scopes")
+          "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
+          "template-lambda-wrong-close,nested-function-lambda-wrong-close,file-tail-scopes")
 
 
 def main():

@@ -59,9 +59,9 @@ current inputs, 17 are confined to parsed function signature/storage spans and
 31 are in parsed or unambiguously recovered function bodies. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
-top-level constructs or the census fails. Parsed `function_definition` nodes
-receive the same check for every compound body containing recovery, even when
-the AST supplies a non-missing closing delimiter: the body is lexically balanced
+top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
+check for every compound body containing recovery, even when the AST supplies a
+non-missing closing delimiter: the body is lexically balanced
 and any parser-owned tail must independently validate. This prevents recovery
 from expanding the parsed body over a following valid file-scope declaration by
 borrowing a brace from that declaration's initializer.
@@ -90,7 +90,11 @@ global. The parsed-function recovery fixture
 `static void recovered() { #wat x }\nWidget implicit_global{};` and the exact
 wrong-close fixture `static void recovered() { x; x template #if X }\nWidget
 implicit_global{};` must both fail closed rather than silently dropping the valid
-global after assigning it local scope. It also asserts that the declarations at
+global after assigning it local scope. Lambda coverage includes the exact
+file-scope fixture `static auto recovered = [] { x; x template #if X }\nWidget
+implicit_global{};`, its templated-lambda variant, and a nested-function lambda
+wrong-close fixture; each must fail closed rather than letting a recovery-expanded
+lambda compound hide static-storage declarations. It also asserts that the declarations at
 `ggml-sycl.cpp` lines 93499,
 94640, 94700, 94801, and 94857 retain file scope.
 
