@@ -269,6 +269,12 @@ checks = {
     < backend.index("registry.defer_quarantine(owner)"),
     "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
     < backend.index("registry->finalize_end(ticket, true, publication"),
+    "DL early inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
+    and "hooks.stage_inventory(&inventory, &envelope, early)" in llama
+    and "defined(GGML_BACKEND_DL)" in llama
+    and "llama_model_sycl_compute_early_plan(ml, hparams, __func__)" in llama
+    and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_inventory_plan\")" in llama
+    and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend,
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
     (root / "src/llama-context.cpp").read_text()
     and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()

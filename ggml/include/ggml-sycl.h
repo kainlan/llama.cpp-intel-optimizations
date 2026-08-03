@@ -783,6 +783,14 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_BUSY,
 };
 
+// Registry-resolved static/DL parity entry point. Applies the exact inventory
+// and placement envelope to every current SYCL device and stages the same
+// immutable load candidate used by direct static calls.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(
+    const struct ggml_sycl_tensor_inventory *   inventory,
+    const struct ggml_sycl_placement_envelope * envelope,
+    bool                                        early);
+
 // Explicit transaction API. begin reserves slot+generation and both IDs as one
 // side-effect-free operation. Nested calls must carry the outer transaction.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(

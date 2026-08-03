@@ -392,6 +392,9 @@ if (GGML_SYCL)
         "Canonical G1 fixture JSON (lead-populated external file is recommended)")
     llama_build(test-sycl-lifecycle-gpu-sequential.cpp)
     target_include_directories(test-sycl-lifecycle-gpu-sequential PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(NAME sycl-lifecycle-g1-parser
+        COMMAND test-sycl-lifecycle-gpu-sequential --self-test-parser)
+    set_tests_properties(sycl-lifecycle-g1-parser PROPERTIES LABELS "sycl;lifecycle;g1;host")
 
     set(G1_LAUNCH_ARGS --fixture ${LLAMA_SYCL_G1_FIXTURE})
     if (LLAMA_SYCL_G1_STRICT)

@@ -11359,6 +11359,40 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
     g_placement_envelope_set = true;
 }
 
+ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
+                                                                  const ggml_sycl_placement_envelope * envelope,
+                                                                  bool                                 early) {
+    if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    try {
+        bool applied = false;
+        for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
+            ggml_backend_t backend = ggml_backend_sycl_init(i);
+            if (!backend) {
+                continue;
+            }
+
+            struct backend_guard {
+                ggml_backend_t backend;
+
+                ~backend_guard() { ggml_backend_free(backend); }
+            } guard{ backend };
+
+            ggml_backend_sycl_set_placement_envelope(backend, envelope);
+            if (early) {
+                ggml_backend_sycl_compute_placement_plan_early(backend, inventory);
+            } else {
+                ggml_backend_sycl_set_tensor_inventory(backend, inventory);
+            }
+            applied = true;
+        }
+        return applied ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_NOT_FOUND;
+    } catch (...) {
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
+}
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
@@ -95567,6 +95601,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
+    }
+    if (strcmp(name, "ggml_backend_sycl_stage_inventory_plan") == 0) {
+        return (void *) ggml_backend_sycl_stage_inventory_plan;
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_begin") == 0) {
         return (void *) ggml_backend_sycl_model_load_begin;

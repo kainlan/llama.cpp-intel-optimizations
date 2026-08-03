@@ -3,10 +3,15 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <cerrno>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -23,12 +28,36 @@ struct options {
     float       temperature = 0.0f;
 };
 
+bool parse_int(const std::string & text, int & value) {
+    if (text.empty()) {
+        return false;
+    }
+    const char * begin  = text.data();
+    const char * end    = begin + text.size();
+    const auto   result = std::from_chars(begin, end, value);
+    return result.ec == std::errc{} && result.ptr == end;
+}
+
+bool parse_float(const std::string & text, float & value) {
+    if (text.empty()) {
+        return false;
+    }
+    char * end = nullptr;
+    errno      = 0;
+    value      = std::strtof(text.c_str(), &end);
+    return errno != ERANGE && end == text.c_str() + text.size() && std::isfinite(value);
+}
+
 bool parse(int argc, char ** argv, options & o) {
     if (argc < 3 || argc % 2 == 0) {
         return false;
     }
+    std::unordered_set<std::string> seen;
     for (int i = 1; i < argc; i += 2) {
         const std::string key = argv[i], value = argv[i + 1];
+        if (!seen.insert(key).second) {
+            return false;
+        }
         if (key == "--model-a") {
             o.a = value;
         } else if (key == "--model-b") {
@@ -38,19 +67,67 @@ bool parse(int argc, char ** argv, options & o) {
         } else if (key == "--prompt") {
             o.prompt = value;
         } else if (key == "--n-predict") {
-            o.n_predict = std::atoi(value.c_str());
+            if (!parse_int(value, o.n_predict) || o.n_predict <= 0) {
+                return false;
+            }
         } else if (key == "--seed") {
-            o.seed = std::atoi(value.c_str());
+            if (!parse_int(value, o.seed) || o.seed < 0) {
+                return false;
+            }
         } else if (key == "--temp") {
-            o.temperature = std::strtof(value.c_str(), nullptr);
+            if (!parse_float(value, o.temperature) || o.temperature < 0.0f || o.temperature > 2.0f) {
+                return false;
+            }
         } else if (key == "--run") {
             o.run = value;
         } else {
             return false;
         }
     }
-    return !o.a.empty() && !o.b.empty() && !o.a_shared.empty() && o.prompt == k_prompt && o.seed == k_seed &&
-           o.temperature == 0.0f && o.n_predict == k_n_predict && (o.run == "A" || o.run == "B" || o.run == "A,B,A");
+    return seen.size() == 8 && !o.a.empty() && !o.b.empty() && !o.a_shared.empty() && o.prompt == k_prompt &&
+           o.seed == k_seed && o.temperature == 0.0f && o.n_predict == k_n_predict &&
+           (o.run == "A" || o.run == "B" || o.run == "A,B,A");
+}
+
+bool parse_args(std::vector<std::string> args) {
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (std::string & arg : args) {
+        argv.push_back(arg.data());
+    }
+    options parsed;
+    return parse((int) argv.size(), argv.data(), parsed);
+}
+
+bool parser_self_test() {
+    const std::vector<std::string> valid = { "g1",     "--model-a",        "a.gguf",  "--model-b",
+                                             "b.gguf", "--model-a-shared", "as.gguf", "--prompt",
+                                             k_prompt, "--n-predict",      "8",       "--seed",
+                                             "42",     "--temp",           "0",       "--run",
+                                             "A,B,A" };
+    if (!parse_args(valid)) {
+        return false;
+    }
+    auto rejects = [&](std::vector<std::string> args) {
+        return !parse_args(std::move(args));
+    };
+    auto duplicate = valid;
+    duplicate.insert(duplicate.end(), { "--seed", "42" });
+    auto missing = valid;
+    missing.pop_back();
+    auto seed_junk     = valid;
+    seed_junk[12]      = "42x";
+    auto seed_overflow = valid;
+    seed_overflow[12]  = "999999999999999999999999";
+    auto predict_junk  = valid;
+    predict_junk[10]   = "8x";
+    auto temp_junk     = valid;
+    temp_junk[14]      = "0junk";
+    auto logical_junk  = valid;
+    logical_junk[16]   = "A,B,Ajunk";
+    return rejects(std::move(duplicate)) && rejects(std::move(missing)) && rejects(std::move(seed_junk)) &&
+           rejects(std::move(seed_overflow)) && rejects(std::move(predict_junk)) && rejects(std::move(temp_junk)) &&
+           rejects(std::move(logical_junk));
 }
 
 std::vector<llama_token> infer(const std::string & path, const options & o, ggml_backend_dev_t selected) {
@@ -142,6 +219,9 @@ void print_run(const char * label, const std::vector<llama_token> & tokens, bool
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--self-test-parser") {
+        return parser_self_test() ? 0 : 1;
+    }
     options o;
     if (!parse(argc, argv, o)) {
         return 2;

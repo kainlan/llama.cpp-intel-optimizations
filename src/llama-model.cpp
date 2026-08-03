@@ -66,6 +66,7 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_model_quarantine_token)  quarantine = nullptr;
     decltype(&ggml_backend_sycl_activate_model_plan)           activate        = nullptr;
     decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context = nullptr;
+    decltype(&ggml_backend_sycl_stage_inventory_plan)          stage_inventory = nullptr;
 };
 
 static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
@@ -91,6 +92,8 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_activate_model_plan"));
         result.runtime_context = reinterpret_cast<decltype(result.runtime_context)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
+        result.stage_inventory = reinterpret_cast<decltype(result.stage_inventory)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
         break;
     }
     return result;
@@ -98,7 +101,7 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
 
 static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
     return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
-           hooks.quarantine && hooks.activate && hooks.runtime_context;
+           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.stage_inventory;
 }
 
 static bool llama_model_sycl_hooks_enabled() {
@@ -172,7 +175,6 @@ struct llama_model_sycl_loading_guard {
     }
 };
 
-#    ifdef GGML_USE_SYCL
 static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     return llama_model_dev_is_sycl(dev);
@@ -271,22 +273,13 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
                                              const ggml_sycl_placement_envelope & envelope,
                                              bool                                 early) {
-    if (!llama_model_sycl_hooks_enabled()) {
+    const auto hooks = llama_model_sycl_hooks();
+    if (!llama_model_sycl_hooks_enabled(hooks)) {
         return;
     }
-
-    for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
-        ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
-        if (!sycl_backend) {
-            continue;
-        }
-        ggml_backend_sycl_set_placement_envelope(sycl_backend, &envelope);
-        if (early) {
-            ggml_backend_sycl_compute_placement_plan_early(sycl_backend, &inventory);
-        } else {
-            ggml_backend_sycl_set_tensor_inventory(sycl_backend, &inventory);
-        }
-        ggml_backend_free(sycl_backend);
+    const auto rc = hooks.stage_inventory(&inventory, &envelope, early);
+    if (rc != GGML_SYCL_LIFECYCLE_OK) {
+        throw std::runtime_error(format("SYCL inventory planning failed: early=%d result=%d", early, (int) rc));
     }
 }
 
@@ -403,8 +396,7 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     LLAMA_LOG_INFO("%s: SYCL tensor inventory: %zu tensors, %.2f GiB (enables unified placement before allocation)\n",
                    log_func, tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
 }
-#    endif  // GGML_USE_SYCL
-#endif      // GGML_USE_SYCL || GGML_BACKEND_DL
+#endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1640,7 +1632,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     llama_model_sycl_loading_guard sycl_model_loading_guard(true, &sycl_model_token);
 #endif
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     llama_model_sycl_compute_early_plan(ml, hparams, __func__);
 #endif
 

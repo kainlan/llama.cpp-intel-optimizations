@@ -25,6 +25,7 @@ int main() {
         }
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
+    LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
     LOAD_SYCL(ggml_backend_sycl_model_load_end)
@@ -64,7 +65,16 @@ int main() {
 
     ggml_sycl_load_txn    committed{};
     ggml_sycl_model_token token{};
+    ggml_sycl_tensor_inventory inventory{};
+    inventory.n_ctx    = 32;
+    inventory.n_ubatch = 8;
+    ggml_sycl_placement_envelope envelope{};
+    envelope.n_ctx           = 32;
+    envelope.n_ubatch        = 8;
+    envelope.n_seq_max       = 1;
+    envelope.flash_attn_type = -1;
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&committed) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_load_end)(committed, true, &token) != GGML_SYCL_LIFECYCLE_OK ||
         token.model_id == 0) {
         std::fprintf(stderr, "runtime no-allocation commit failed\n");
