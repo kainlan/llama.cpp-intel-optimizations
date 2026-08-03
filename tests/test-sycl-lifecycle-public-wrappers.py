@@ -9,7 +9,7 @@ backend = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 required = {
     "public full token": all(x in api for x in ("model_id;", "load_txn_id;", "slot_generation;")),
-    "public typed failures": all(x in api for x in ("LIFECYCLE_NULL_OUTPUT", "LIFECYCLE_ALLOCATION_FAILED", "LIFECYCLE_EFFECT_FAILED")),
+    "public typed failures": all(x in api for x in ("LIFECYCLE_NULL_OUTPUT", "LIFECYCLE_ALLOCATION_FAILED", "LIFECYCLE_EFFECT_FAILED", "LIFECYCLE_BUSY")),
     "wrapper two phase": all(x in backend for x in ("registry.prepare_end", "registry.finalize_end", "registry.prepare_teardown", "registry.finalize_teardown")),
     "wrapper terminal replay token": "ggml_sycl_export_token(ticket.replay.token, model)" in backend,
     "wrapper catches": backend.count("catch (...)") >= 5,

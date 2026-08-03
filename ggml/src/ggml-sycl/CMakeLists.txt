@@ -103,11 +103,14 @@ if (BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-load-txn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    find_package(Threads REQUIRED)
+    target_link_libraries(test-sycl-lifecycle-load-txn PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
-                  concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown bounded-tombstones begin-allocation-failure null-output stale-token-after-reuse)
+                  concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown durable-replay waiter-rollover
+                  committing-teardown load-effect-failure-quarantine effect-failure-quarantine begin-allocation-failure null-output stale-token-after-reuse)
         add_test(NAME sycl-lifecycle-h2-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
     endforeach()
     foreach(_case slot-exhaustion model-id-overflow load-txn-id-overflow slot-generation-overflow invocation-id-counter-overflow)

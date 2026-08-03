@@ -23,11 +23,26 @@ inline bool operator==(SlotToken a, SlotToken b) { return a.slot == b.slot && a.
 inline bool operator==(ModelToken a, ModelToken b) { return a.model == b.model && a.load == b.load && a.owner == b.owner; }
 
 enum class error {
-    OK, NESTED, ABORTED, OK_ALREADY_DEAD, SLOT_EXHAUSTED, ID_EXHAUSTED, LOAD_BUSY,
-    WRONG_TRANSACTION, DEPTH_UNDERFLOW, DEPTH_OVERFLOW, MISSING_SUCCESS, POISONED,
-    NOT_FOUND, STALE_IDENTITY, NULL_OUTPUT, ALLOCATION_FAILED, EFFECT_FAILED,
+    OK,
+    NESTED,
+    ABORTED,
+    OK_ALREADY_DEAD,
+    SLOT_EXHAUSTED,
+    ID_EXHAUSTED,
+    LOAD_BUSY,
+    WRONG_TRANSACTION,
+    DEPTH_UNDERFLOW,
+    DEPTH_OVERFLOW,
+    MISSING_SUCCESS,
+    POISONED,
+    NOT_FOUND,
+    STALE_IDENTITY,
+    NULL_OUTPUT,
+    ALLOCATION_FAILED,
+    EFFECT_FAILED,
+    BUSY,
 };
-enum class model_phase { LOADING, LIVE, TEARING_DOWN, DEAD };
+enum class model_phase { LOADING, LIVE, TEARING_DOWN, QUARANTINED, DEAD };
 enum class tier_verdict { UNKNOWN, DEVICE, HOST, MIXED };
 enum class finish_phase { ACTIVE, COMMITTING, ROLLING_BACK, COMMITTED, ABORTED };
 
@@ -124,6 +139,7 @@ private:
     };
     struct slot_state { uint64_t generation = 0; bool reserved = false; ModelId model{}; };
     struct model_entry {
+        ModelToken                        token{};
         std::shared_ptr<const ModelState> state;
         model_phase phase = model_phase::LOADING;
         uint64_t teardown_serial = 0;
@@ -143,14 +159,12 @@ private:
     std::array<slot_state, model_slot_count> slots_{};
     std::unordered_map<uint64_t, txn_state> txns_;
     std::unordered_map<uint64_t, model_entry> models_;
+    // Durable terminal identities prefer bounded row retention over identity reuse.
     std::unordered_map<uint64_t, std::pair<ModelToken, error>> dead_;
-    std::array<uint64_t, 256> terminal_order_{}, dead_order_{};
-    size_t terminal_cursor_ = 0, terminal_count_ = 0, dead_cursor_ = 0, dead_count_ = 0;
     std::shared_ptr<const ModelState> last_success_;
     uint64_t active_txn_ = 0;
     uint64_t publications_ = 0, rollbacks_ = 0;
-    bool fail_next_begin_allocation_ = false;
-    static constexpr size_t tombstone_limit_ = 256;
+    bool                                                       fail_next_begin_allocation_ = false;
 };
 
 Registry & global_registry();

@@ -6,7 +6,7 @@ bin="$build/bin/test-sycl-lifecycle-load-txn"
 case "$mutation" in
   M1) cases=(--case stale-generation); marker='stale slot generation accepted' ;;
   M2) cases=(--case nested-success); marker='nested load committed' ;;
-  M3) cases=(--case inner-failure); marker='poisoned transaction published LIVE' ;;
+  M3) cases=(--case inner-failure --case cancel --case wrong-txn --case depth-overflow); marker='poisoned transaction published LIVE' ;;
   *) echo "unsupported lifecycle mutation: $mutation" >&2; exit 2 ;;
 esac
 "$bin" "${cases[@]}"

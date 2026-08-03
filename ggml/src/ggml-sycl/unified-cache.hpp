@@ -1009,6 +1009,26 @@ struct placement_plan {
     size_t expert_placement_unclassified_count_ = 0;
 };
 
+// Immutable lifecycle-owned plan snapshots. A null plan with
+// explicit_no_plan=true is the published no_alloc/UNKNOWN outcome.
+struct lifecycle_plan_snapshot {
+    uint64_t                              model_id         = 0;
+    uint64_t                              load_txn_id      = 0;
+    uint32_t                              slot             = UINT32_MAX;
+    uint64_t                              slot_generation  = 0;
+    bool                                  explicit_no_plan = false;
+    std::shared_ptr<const placement_plan> plan;
+};
+
+void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan);
+void lifecycle_stage_no_placement_plan(uint64_t load_txn_id);
+void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+bool lifecycle_publish_placement_plan(uint64_t model_id,
+                                      uint64_t load_txn_id,
+                                      uint32_t slot,
+                                      uint64_t slot_generation) noexcept;
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
+
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.
 // vram_budget: available VRAM bytes for weights.
@@ -2163,6 +2183,11 @@ class unified_cache {
     void set_placement_plan(placement_plan && plan) {
         placement_plan_     = std::move(plan);
         has_placement_plan_ = true;
+    }
+
+    void clear_placement_plan() {
+        placement_plan_     = placement_plan{};
+        has_placement_plan_ = false;
     }
 
     void update_placement_plan_runtime_kv(uint32_t n_ctx, size_t kv_per_layer, size_t kv_per_swa_layer) {

@@ -9005,8 +9005,12 @@ static size_t ggml_sycl_release_host_weight_extras_for_owner(ggml_sycl::lifecycl
 }
 
 uint32_t ggml_backend_sycl_model_slot_current(void) {
-    const auto state = ggml_sycl::lifecycle::global_registry().last_success();
-    return state ? state->token.owner.slot : GGML_SYCL_MODEL_SLOT_NONE;
+    try {
+        const auto state = ggml_sycl::lifecycle::global_registry().last_success();
+        return state ? state->token.owner.slot : GGML_SYCL_MODEL_SLOT_NONE;
+    } catch (...) {
+        return GGML_SYCL_MODEL_SLOT_NONE;
+    }
 }
 
 // Forward declaration: defined later in this TU, right after
@@ -9035,6 +9039,8 @@ static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecy
         case E::NULL_OUTPUT:     return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
         case E::ALLOCATION_FAILED:return GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED;
         case E::EFFECT_FAILED:   return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        case E::BUSY:
+            return GGML_SYCL_LIFECYCLE_BUSY;
         case E::OK_ALREADY_DEAD: return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
     }
     return GGML_SYCL_LIFECYCLE_ABORTED;
@@ -9046,13 +9052,13 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
 
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot = owner.owner.slot;
-    const uint32_t live_after = ggml_sycl::lifecycle::global_registry().live_mask();
     const size_t rows = ggml_sycl_release_host_weight_extras_for_owner(owner);
     ggml_sycl_release_graph_replay_leases_all_devices();
-    ggml_sycl::unified_cache_set_live_model_mask(live_after);
+    // Clear only the dying bit under each cache lock. Publishing a whole mask
+    // from a prior registry read can erase a concurrently committed model bit.
     const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
-    GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed (live mask 0x%08x)\n",
-                  slot, rows, reclaimed, live_after);
+    GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
+                  reclaimed);
 }
 
 void ggml_backend_sycl_model_unloaded(uint32_t slot) {
@@ -9082,6 +9088,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
 static void ggml_sycl_reset_model_load_scratch_state();
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
+static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
 
 static thread_local bool g_sycl_abort_load_exit = false;
 
@@ -9197,9 +9204,33 @@ static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_sn
 }
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
+    ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
     ggml_sycl_reset_model_load_scratch_state();
+
+    // Restore A's legacy execution view after failed B. The immutable A
+    // snapshot itself was never replaced; token routing remains separate work.
+    const auto previous = ggml_sycl::lifecycle::global_registry().last_success();
+    const auto snapshot =
+        previous ? ggml_sycl::lifecycle_find_placement_plan(previous->token.model.value, previous->token.load.value) :
+                   nullptr;
+    if (snapshot && snapshot->plan) {
+        g_placement_plan     = *snapshot->plan;
+        g_has_placement_plan = true;
+    }
+    const int total_gpus = ggml_sycl_info().total_gpu_count;
+    for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+        if (!cache) {
+            continue;
+        }
+        if (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d)) {
+            cache->set_placement_plan(ggml_sycl::placement_plan(*snapshot->plan));
+        } else {
+            cache->clear_placement_plan();
+        }
+    }
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
@@ -9209,9 +9240,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
     if (result.code != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result.code);
     txn->id = result.txn.value;
     try {
+        // no_alloc intentionally never invokes the planner, so stage an
+        // explicit UNKNOWN/no-plan candidate before any load effects.
+        ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
+        g_sycl_in_model_load.store(false, std::memory_order_release);
+        ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
+        g_sycl_abort_load_exit = false;
         const auto ticket = registry.prepare_end(result.txn, false);
         if (ticket.finisher) {
             bool cleanup_ok = true;
@@ -9225,13 +9262,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
     auto & registry = ggml_sycl::lifecycle::global_registry();
-    const auto result = registry.enter_nested({txn.id});
-    if (result != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result);
     try {
+        const auto result = registry.enter_nested({ txn.id });
+        if (result != ggml_sycl::lifecycle::error::OK) {
+            return ggml_sycl_lifecycle_c_result(result);
+        }
         ggml_sycl_model_loading_effects(true, false);
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
-        (void) registry.poison({txn.id});
+        try {
+            (void) registry.poison({ txn.id });
+        } catch (...) {
+        }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
 }
@@ -9263,6 +9305,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
         auto state = std::make_shared<const ggml_sycl::lifecycle::ModelState>(
             ggml_sycl::lifecycle::ModelState{ticket.token, ggml_sycl::lifecycle::model_phase::LIVE,
                 publication.planned_host_bytes, publication.actual_host_bytes, publication.verdict});
+        if (!ggml_sycl::lifecycle_publish_placement_plan(ticket.token.model.value, ticket.token.load.value,
+                                                         ticket.token.owner.slot, ticket.token.owner.generation)) {
+            throw std::bad_alloc();
+        }
         const auto result = registry.finalize_end(ticket, true, publication, std::move(state));
         if (result.committed) ggml_sycl_export_token(result.token, model);
         return ggml_sycl_lifecycle_c_result(result.code);
@@ -10443,6 +10489,14 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             "%.1f MB device + %.1f MB host\n",
             g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
             g_placement_plan.host_bytes / (1024.0 * 1024.0));
+    }
+
+    // Stage a full immutable transaction-owned candidate. Process-global and
+    // per-cache copies remain legacy execution routing, not model identity.
+    const auto active_plan_owner = ggml_sycl::lifecycle::global_registry().current_active_token();
+    if (active_plan_owner.load.value != 0 && g_has_placement_plan) {
+        ggml_sycl::lifecycle_stage_placement_plan(active_plan_owner.load.value,
+                                                  ggml_sycl::placement_plan(g_placement_plan));
     }
 
     // Publish only after the authoritative plan is complete. Keep this verdict

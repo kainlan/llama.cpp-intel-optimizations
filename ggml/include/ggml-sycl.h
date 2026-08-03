@@ -774,6 +774,7 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
     GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED,
     GGML_SYCL_LIFECYCLE_EFFECT_FAILED,
+    GGML_SYCL_LIFECYCLE_BUSY,
 };
 
 // Explicit transaction API. begin reserves slot+generation and both IDs as one

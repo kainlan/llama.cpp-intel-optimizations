@@ -24,6 +24,12 @@ checks = {
     "C boundary catches": backend.count("catch (...)") >= 3,
     "full owner host rows": "ggml_sycl_release_host_weight_extras_for_owner" in backend,
     "mutation hooks": all(x in hpp for x in ("M1_SKIP_GENERATION", "M2_NESTED_COMMIT", "M3_CLEAR_POISON")),
+    "durable terminal identities": "tombstone_limit_" not in hpp and "txns_ is the durable terminal identity table" in cpp,
+    "waiters refind by id": "current = txns_.find(id.value)" in cpp,
+    "quarantine never live": cpp.count("model_phase::QUARANTINED") >= 3,
+    "committing teardown busy": "BUSY, token" in cpp,
+    "immutable full plan candidate": all(x in backend for x in ("lifecycle_stage_placement_plan", "lifecycle_publish_placement_plan", "lifecycle_abort_placement_plan")),
+    "atomic dying cache bit": "unified_cache_set_live_model_mask(live_after)" not in backend,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

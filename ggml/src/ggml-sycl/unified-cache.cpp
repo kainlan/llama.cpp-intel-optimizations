@@ -43,6 +43,75 @@
 
 namespace ggml_sycl {
 
+namespace {
+std::mutex                                                                   g_lifecycle_plan_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
+    g_lifecycle_plan_models;
+}  // namespace
+
+void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
+    snapshot->load_txn_id = load_txn_id;
+    snapshot->plan        = std::make_shared<const placement_plan>(std::move(plan));
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+}
+
+void lifecycle_stage_no_placement_plan(uint64_t load_txn_id) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot              = std::make_shared<lifecycle_plan_snapshot>();
+    snapshot->load_txn_id      = load_txn_id;
+    snapshot->explicit_no_plan = true;
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+}
+
+void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        g_lifecycle_plan_candidates.erase(load_txn_id);
+    } catch (...) {
+    }
+}
+
+bool lifecycle_publish_placement_plan(uint64_t model_id,
+                                      uint64_t load_txn_id,
+                                      uint32_t slot,
+                                      uint64_t slot_generation) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
+        if (candidate == g_lifecycle_plan_candidates.end()) {
+            return false;
+        }
+        auto published                                 = std::make_shared<lifecycle_plan_snapshot>(*candidate->second);
+        published->model_id                            = model_id;
+        published->slot                                = slot;
+        published->slot_generation                     = slot_generation;
+        g_lifecycle_plan_models[model_id][load_txn_id] = std::move(published);
+        g_lifecycle_plan_candidates.erase(candidate);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id) {
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    auto                        model = g_lifecycle_plan_models.find(model_id);
+    if (model == g_lifecycle_plan_models.end()) {
+        return nullptr;
+    }
+    auto plan = model->second.find(load_txn_id);
+    return plan == model->second.end() ? nullptr : plan->second;
+}
+
 const char * residency_reject_reason_name(residency_reject_reason reason) {
     switch (reason) {
         case residency_reject_reason::NONE:
