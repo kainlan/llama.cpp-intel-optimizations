@@ -166,9 +166,10 @@ binding-resolved evidence.
 The authoritative target lifecycle is now §12 of
 [`sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md).
 It requires explicit `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
-`ContextId`, `(ContextId, SessionId)`, and `(ContextId, GraphEpoch)` identities;
-abort-default nested transactions; owner-targeted reset/teardown; lock ordering;
-and event-held memory/execution leases. These are **target requirements**, not
+`ContextId`, `(ContextId, SessionId, SessionResetEpoch)`, `(ContextId,
+GraphEpoch)`, and `InvocationId` identities; abort-default nested transactions;
+owner-targeted reset/teardown; lock ordering; and aggregate event-held
+memory/execution leases. These are **target requirements**, not
 names of current C++ APIs. The earlier audit language about a single structural
 outer load reset describes current mitigation only and must not be read as proof
 of a transaction or multi-model lifecycle.
@@ -206,41 +207,45 @@ awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.
 | plan, tensor inventory, load diagnostics, temporary registrations | `LoadTxnId` until commit, then `ModelId` | rollback transaction only; never “clear current model” globally |
 | bounded weight owner slot | `ModelId` + `(slot, SlotGeneration)` | remove exact owner; preserve shared entry and all live/event leases |
 | KV/RUNTIME/SCRATCH/oneDNN/staging | `ContextId`; KV rows also `SessionId` | exact context/session only; whole-device reset must refuse |
+| session reset | `(ContextId, SessionId, SessionResetEpoch)` | nonwrapping exact ticket; stale reset N cannot finish/reset N+1 |
 | recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
-| async kernel/copy lifetime | exact mem/backing handles plus the copied top-level `(device, ModelId, ContextId, GraphEpoch, invocation)` token | one exclusive token/device; release only after final join, never host-submit return |
+| async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one token/device; aggregate retains separate roots/terminal sets per context/device; no cross-context join authority |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
 
-IDs/generations are checked and nonwrapping. Slot 33 fails with typed
-`SLOT_EXHAUSTED` before LOADING and without registry/planner/reset side effects;
-it cannot fall back to unattributed ownership. Context, session, and graph state
-machines and stale completion behavior are canonical §12.2.
+IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
+and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and
+without registry/planner/reset side effects; it cannot fall back to unattributed
+ownership. Context, session, graph, reset-ABA, retiring completion, and aggregate
+join-failure/quarantine behavior are canonical §12.2-§12.3.
 
 The concrete ranks are lifecycle/ID (L1) → per-device execution registry (L2) →
-model/context/session/graph (L3) → cache metadata/`rw_mutex_` (L4) → zone/chunk
-allocator (L5), with stable same-rank key ordering. The completion-queue lock is
-isolated and never co-held. Event/queue waits, callbacks, blocking device calls,
-and final handle/token/backing-lease destruction are forbidden under every lock.
-Audit evidence includes every M7 variant, not merely an absence grep.
+model/context/session/graph (L3) → all listed cache metadata locks (L4) → all
+listed zone/staging/pool/work locks (L5). Global/transitional locks use a
+sentinel for diagnostics and cannot co-hold a keyed same-rank lock. Completion C
+and diagnostics D are isolated. Every event/queue/future/condition wait,
+callback, blocking device call, and final handle/token/backing destruction is
+forbidden under L1-L5/C; audit evidence includes every H8/M7 pair.
 
 ### Child and final-census gates
 
 | Child | Audit must prove |
 |---|---|
-| `nn6z` | transaction identity, checked nesting, typed side-effect-free exhaustion, nonwrapping IDs, A→B→A; owns G1 |
-| `nlww` | context/session state machines and keyed KV/arena state; no device FIFO attribution |
-| `vbeb` | graph state machine, retiring-epoch isolation, one top-level token/device, reentrant/busy/wait/multi-device/final join |
-| `h5m4` | submit payload retains allocation/backing leases; async bare DIRECT rejected and ARENA backing required |
-| `t5nq` | concrete lock inventory/tie-break and wait/callback/blocking/final-destruction prohibitions |
-| `y36c` | owner-targeted reset/teardown consumes `vbeb` + `h5m4`; no all-device graph clear |
+| `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
+| `nlww` | context/session/reset-epoch registries and state primitives/create/publish; named ticket APIs only |
+| `vbeb` | graph/invocation identities, retiring isolation, one token/device, per-context/device aggregate+quarantine; owns G7 |
+| `h5m4` | submit payload retains handles/DIRECT/ARENA backing through each pair's terminal set |
+| `t5nq` | exhaustive current/planned lock inventory, sentinel/tie-break, all wait/callback/blocking/final-destruction probes |
+| `y36c` | owns legacy drain/reset/teardown callers via `nlww` tickets; never edits context/session registry primitives |
 | `x3ou` | all tier-verdict readers are reporting-only |
-| `hcyp` | final parser census regenerated at implementation HEAD and reconciled against all identities |
+| `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
 Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
-vbeb → h5m4 → y36c`, with `t5nq` also preceding `y36c`; it maps and supersedes
-overlapping `32dg8.15.10/.12/.13`, `0qlw`, `2wv5`, and `k7b0` lifecycle work.
-The exact H1-H12/G1-G6 commands, reproducible hash-checked model fixtures,
-same-physical-device assertions, and executable/restoring M1-M8 hooks are
-canonical §12.9. Multiple LIVE models and sequential A→B→A are separate gates;
+vbeb → h5m4 → y36c`, with `t5nq` also preceding `y36c` and an explicit
+`32dg8.15.13 → h5m4` API edge. It supersedes stale `32dg8.2` ownership
+assumptions and maps `.15.10/.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
+editing. The exact H1-H14/G1-G7 commands, distinct B plus shared-copy hash-pinned
+fixtures, same/multi-device UUID assertions, and executable/restoring split-M6
+and expanded-M7 hooks are canonical §12.9. Multiple LIVE models and sequential A→B→A are separate gates;
 neither proves overlapping execution, which must serialize/reject through the
 final-join-held token.
 
@@ -256,11 +261,15 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
-It must update source SHA-256s, commit/count prose and CSV together; classify
-every new mutable lifecycle row by owner, synchronization and teardown; and
-leave no unowned model/context/session/graph semantic state. A refreshed count
-without reconciliation, or a green check against pre-implementation source,
-does not close `hcyp`.
+Main owns the prerequisite repair that makes the existing self-test green.
+After that lands, `hcyp` exclusively owns final edits to
+`scripts/audit-sycl-static-storage.py`, its embedded/external self-test fixtures,
+`docs/backend/sycl-static-storage-inventory.csv`, and this document's source
+SHA-256/commit/count prose. It refreshes all four at one final implementation
+HEAD, classifies every new mutable lifecycle row by owner/synchronization/
+teardown, and leaves no unowned model/context/session/graph/invocation state. A
+CSV-only refresh, a count without reconciliation, or a green check against
+pre-implementation source does not close `hcyp`.
 
 ---
 

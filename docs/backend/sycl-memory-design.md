@@ -136,41 +136,44 @@ is the short form; this is the why):
 
 ## Lifecycle identity and async lease boundary
 
-The enforceable lifecycle contract is canonical §12. Its types are **target
-concepts, not current APIs**: `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
-`ContextId`, `(ContextId, SessionId)`, and `(ContextId, GraphEpoch)`. Current
-bare slot masks, process-global load/planner scratch, per-device pending-KV FIFO,
-and all-device graph cleanup do not satisfy it.
+**Target invariants (not current APIs or current behavior).** The enforceable
+contract is canonical §12: `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
+`ContextId`, `(ContextId, SessionId, SessionResetEpoch)`, `(ContextId,
+GraphEpoch)`, and `InvocationId`. IDs never wrap; slot 33 fails before LOADING.
+Loads abort by default on missing success, wrong txn, depth error, cancellation,
+or failure. Reset/teardown uses exact typed tickets, including reset epochs that
+prevent ABA.
 
-The concise rule is: allocation identity, semantic owner, and asynchronous use
-are three different things. One exclusive top-level token per device is acquired
-before mutable arena work, copied into every submit, and retained through the
-final join event. Same-owner reentrancy copies it; incompatible work returns
-BUSY or waits outside locks; multi-device acquisition is ascending/all-or-none.
-Multiple LIVE model objects and sequential A→B→A remain required and do not
-imply overlapping same-device inference.
+Allocation identity, semantic owner, and asynchronous use are distinct. One
+exclusive top-level token per device is copied into submits. Lifecycle authority
+is an aggregate with separate root retention and terminal-event sets for each
+`(ContextId, device)`, not one cross-context join. Join creation failure drains
+known events outside locks; uncertain submission quarantines roots/backing until
+queue quiescence is proven. Same-owner reentrancy copies the exact InvocationId;
+busy/wait and multi-device all-or-none rules remain explicit.
 
-Every async pointer also has a backing lifetime. Bare `DIRECT` is rejected for
-async work unless paired with a validated owner/backing lease; ARENA handles
-retain their arena/chunk generation lease. A retiring `GraphEpoch` completion
-releases only that old epoch's resources and cannot mutate the replacement
-context/session/epoch.
+Every async pointer has a backing lifetime. Bare `DIRECT` requires a validated
+owner/backing lease and ARENA handles retain arena/chunk generation. A retiring
+`GraphEpoch` completion releases only old-epoch resources, never replacement
+state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner registries
+→ L4 cache → L5 allocator ordering; global/transitional same-rank co-holding is
+forbidden and completion/diagnostic locks are isolated. No wait of any kind,
+callback, blocking call, or final handle/token/backing destruction occurs under
+a listed lock. Tier verdicts are reporting-only.
 
-Loads are explicit abort-default transactions. Nested calls share one
-`LoadTxnId`; only a successful outermost commit publishes LIVE. Wrong txn,
-depth underflow, cancellation, failure, or missing success rolls back exactly
-once. IDs/generations never wrap. The 33rd live slot returns a typed,
-side-effect-free error before LOADING; unattributed fallback is not allowed.
-Context/session/graph state machines and resets target exact owners.
+**Current exceptions during migration.** Current code still has bare slot masks,
+process-global load/planner scratch, device-only pending-KV FIFO,
+`g_sycl_graph_compute_mutex`, graph cleanup without model/epoch attribution,
+DIRECT/ARENA shapes without universal async backing retention, and void memory
+ops without terminal events. These are non-conformances to migrate, not licensed
+exceptions to preserve or descriptions of supported concurrency.
 
-Locks follow lifecycle/ID → device execution → model/context/session/graph →
-cache metadata → zone allocator, with deterministic same-rank ordering; the
-completion queue lock is isolated. No wait, blocking device call, callback, or
-final handle/token/backing destruction occurs under them. Tier verdicts are
-reporting-only. Canonical §12.8-§12.10 defines the non-overlapping child DAG
-(`nn6z → nlww → vbeb → h5m4 → y36c`, `t5nq` before teardown), G1 ownership,
-legacy supersession, exact H1-H12/G1-G6 fixtures/tests, executable M1-M8
-mutations, and final census `hcyp`.
+Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
+registry primitives/create/publish; `y36c` owns legacy drain/reset/teardown
+callers), DAG (`nn6z → nlww → vbeb → h5m4 → y36c`, `t5nq` before teardown,
+`.15.13 → h5m4`), G1/G7 ownership, legacy supersession, H1-H14/G1-G7,
+hash-pinned distinct/shared fixtures, split M6/expanded M7, and final `hcyp`
+script+fixture+CSV+prose refresh after main's self-test repair.
 
 ## Path-scoped zone sizing
 

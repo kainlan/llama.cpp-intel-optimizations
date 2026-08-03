@@ -288,9 +288,10 @@ Owned per inference context; reset between requests or at context free:
 **Invariant:** `arena_reserve` requests resets of KV + RUNTIME + HOST zones only
 for the owning device's cache. A reset proceeds only when the target zone has no
 live registered allocations; otherwise the reset is refused and existing
-allocations are preserved. It must not reset another context's zones. Until T1
-(`llama.cpp-32dg8.2`) adds explicit context ownership keys, callers must ensure
-single-active-context per device.
+allocations are preserved. It must not reset another context's zones. The
+historical `32dg8.2` is preload/placement work, not context-ownership work;
+until target child `nlww` adds explicit context/session ownership keys, callers
+must ensure single-active-context per device.
 
 ### 5.3 Multiple models, contexts, and server slots
 
@@ -573,14 +574,17 @@ below and must retain the conservative restrictions in §5.
 | `LoadTxnId` | Process-unique identity for one **outermost** model-load attempt | Every load scratch write, allocation, registration, commit, and rollback |
 | `ContextId` | Process-unique identity for one inference context | KV, RUNTIME, SCRATCH, oneDNN, staging, and context teardown |
 | `SessionId` | Identity for one logical server sequence/session, namespaced by `ContextId`; not an allocation owner by itself | KV sequence rows and request diagnostics |
+| `SessionResetEpoch` | Monotonic reset generation namespaced by `(ContextId, SessionId)`; incremented before every reset and never reused | Reset ticket/completion; prevents stale reset completion ABA |
 | `GraphEpoch` | Monotonic counter namespaced by `ContextId`; incremented on record, invalidation, and clear so stale callbacks cannot affect a replacement graph | Recorded graph state, pointer tables, retained handles, and terminal events |
+| `InvocationId` | Process-unique, monotonic identity for one top-level graph-compute invocation; nested reentrancy copies the same value | Per-device execution tokens, aggregate terminal retention, diagnostics |
 
 Zero/wildcard/invalid identities must fail closed at mutating entry points. IDs
 must appear in debug ownership records and lifecycle logs. Address identity,
 `last_completed`, current-thread state, and device number are not substitutes.
 All ID counters use checked, non-wrapping increment. Exhausted `ModelId`,
-`LoadTxnId`, `ContextId`, `SessionId`, or `GraphEpoch` space permanently returns
-the typed `ID_EXHAUSTED` error before mutation; it never wraps or reuses zero.
+`LoadTxnId`, `ContextId`, `SessionId`, `SessionResetEpoch`, `GraphEpoch`, or
+`InvocationId` space permanently returns the typed `ID_EXHAUSTED` error before
+mutation; it never wraps or reuses zero.
 An exhausted `SlotGeneration` permanently retires that numeric slot. A bounded
 slot may be reused only after the old generation is DEAD and all its leases have
 drained; stale `(slot, generation)` operations are rejected.
@@ -622,7 +626,8 @@ context: ABSENT --create(ModelId)--> ALLOCATING --publish--> LIVE
          LIVE --free/model teardown--> DRAINING --events drained--> DEAD
 
 session: ABSENT --open(ContextId)--> ACTIVE
-         ACTIVE --reset--> RESETTING --reset complete--> ACTIVE
+         ACTIVE --begin_reset(++SessionResetEpoch)--> RESETTING
+         RESETTING --finish_reset(exact epoch)--> ACTIVE
          ACTIVE/RESETTING --close/context drain--> CLOSING --> CLOSED
 
 graph:   NONE --record(ContextId,new GraphEpoch)--> RECORDING --> ACTIVE
@@ -645,8 +650,11 @@ LIVE leaves that model byte-for-byte usable.
 A context cannot publish LIVE until its owner model is LIVE. A session cannot
 be ACTIVE unless its context is LIVE. Context drain first prevents new sessions
 and graph epochs, then drains their events outside locks. Session reset is
-owner-targeted and cannot reset another session. IDs are never resurrected after
-DEAD/CLOSED/RETIRED.
+owner-targeted and cannot reset another session. `finish_reset` must present the
+exact nonwrapping `SessionResetEpoch`; delayed completion from reset N cannot
+complete/reset N+1, release its resources, or change ACTIVE/RESETTING state. On
+reset-epoch exhaustion the session returns `ID_EXHAUSTED` without leaving ACTIVE.
+IDs are never resurrected after DEAD/CLOSED/RETIRED.
 
 At graph replacement, the old epoch becomes RETIRING and a new epoch may become
 current. Completion of the retiring epoch releases **only resources retained by
@@ -678,34 +686,50 @@ meeting the target state machines.
 | Same-device concurrent inference | **Target is serialization/rejection by an event-held device execution lease**, not overlapping execution | Unsupported today; no optimistic overlap |
 
 There is exactly one top-level exclusive execution token per logical SYCL
-device. Its owner is `(device, ModelId, ContextId, GraphEpoch, invocation_id)`.
-The graph-compute entry acquires it **before** any context arena mutation or
-submission. Every kernel/copy/record/replay submit receives a ref-counted copy;
-the final join event retains the root copy. Releasing a child event copy cannot
-make the device available: the token becomes free only after the final join is
-complete and every copy is gone, including deferred copies and pure-GPU decode
-after the host call returns.
+device. Its owner is `(device, ModelId, ContextId, GraphEpoch, InvocationId)`.
+The graph-compute entry allocates the checked/nonwrapping `InvocationId` and
+acquires every required device token **before** any context arena mutation or
+submission. Every kernel/copy/record/replay submit receives a ref-counted token
+copy.
 
-Acquisition policy is explicit:
+Completion authority is an **aggregate retention record**, never one
+cross-context join event. It contains one root token and one terminal-event set
+for every `(ContextId, device)` touched by the invocation. Each pair's root is
+retained until all terminal events submitted for that pair complete. The
+aggregate is complete only when every pair is complete; one context/device event
+cannot release another pair's token, handles, arena backing, or retiring epoch.
+A backend-native join may optimize one pair but is not lifecycle authority.
 
-- same owner reentrancy within one top-level invocation returns another copy;
-  a nested call with a different invocation or epoch is not reentrant;
+Acquisition and failure policy is explicit:
+
+- same-owner reentrancy with the exact `InvocationId` returns another copy; a
+  nested call with a new/exhausted ID or different epoch is not reentrant;
 - incompatible `try_acquire` returns typed `DEVICE_BUSY` without touching arena,
-  queue, epoch, or completion state;
+  queue, epoch, aggregate, or completion state;
 - blocking `acquire` waits only outside all ranked locks and cancellation returns
   typed `CANCELLED`; implementations must not spin while holding partial state;
-- a multi-device graph atomically reserves all device IDs in ascending order or
-  none. On contention it releases the reservation set, then waits/retries outside
-  locks. Each device's submits retain its copy and the one final multi-device
-  join event retains all roots;
-- error after partial submission still forms/uses a terminal join for submitted
-  work. Error before submission releases all roots immediately.
+- a multi-device invocation atomically reserves all stable device IDs in
+  ascending order or none. On contention it releases the set, then waits/retries
+  outside locks. Aggregate roots remain independently keyed per context/device;
+- normal submission records each returned event in its pair before ownership can
+  escape. A submission exception before any enqueue releases that pair's unused
+  root immediately;
+- if join creation fails but terminal child events are known, retain the root and
+  drain those events individually outside locks. If an exception leaves enqueue
+  status/event identity uncertain, move that pair and all backing leases to a
+  per-device **quarantine**; perform `queue.wait_and_throw()` outside locks, then
+  publish a completion record. If drain throws, report the error but release only
+  after the runtime proves the queue quiescent; otherwise quarantine is retained
+  and the device remains unavailable. No catch path guesses completion;
+- aggregate construction failure after partial submission applies the same
+  drain/quarantine rule to every submitted pair and immediately releases only
+  provably unsubmitted roots.
 
 Dropping `g_sycl_graph_compute_mutex` or any host mutex after enqueue does not
-release this token. Different contexts may share immutable model weights, but
-never mutable KV/RUNTIME/SCRATCH ownership. The test diagnostics must record the
-physical device UUID/index for every acquisition so “same device” is asserted,
-not inferred from the selector.
+release a token. Different contexts may share immutable model weights, but never
+mutable KV/RUNTIME/SCRATCH ownership. Diagnostics record physical device UUID,
+logical index, `ContextId`, `GraphEpoch`, and `InvocationId` for every aggregate
+pair so same/multi-device behavior is asserted, not inferred from the selector.
 
 ### 12.4 Owner-targeted reset, graph invalidation, and teardown
 
@@ -731,21 +755,32 @@ in-flight allocation would be affected.
 
 The target lock inventory and mandatory order is concrete:
 
-| Rank | Target/current lock inventory | Same-rank tie-break |
+| Rank | Exhaustive lifecycle-path target/current lock inventory | Same-rank tie-break |
 |---|---|---|
-| L1 | lifecycle/ID/slot/load registry; current `g_sycl_model_slot_mutex` | one process lock |
-| L2 | per-device execution-token registry; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
-| L3 | model/context/session/graph registries; current `sycl_ctx->graph_mutex` and pending-KV registry lock | `(ModelId, ContextId, SessionId, GraphEpoch)` lexicographic, absent fields zero |
-| L4 | unified-cache metadata; current per-device `unified_cache::rw_mutex_` and global cache registry lock | ascending device ID, then cache instance ID |
-| L5 | arena/zone/chunk allocators, staging/pool locks | device ID, zone enum, then allocation address/ordinal |
-| isolated C | completion-queue mutex used only to push/pop completed identity records | never co-held with L1-L5 or another C lock |
+| L1 | planned `lifecycle_registry_mutex`; current `g_sycl_model_slot_mutex`, `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
+| L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
+| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
+| L4 | cache registries/metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `managed_host_pinned_buffers_mutex()` | device ID, cache instance ID, then listed lock ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
+| isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C; format records before taking D |
+
+This table is exhaustive for locks touched by the lifecycle, graph, cache,
+staging, pool, and event-retention paths in scope. `t5nq` must update it in the
+same commit when migration introduces or discovers another such lock; an
+unclassified lock is a failing census item, not implicitly L5.
 
 Code may skip ranks but never acquire a lower-numbered rank while holding a
-higher one. Two same-rank locks require the table's stable key order; pointer
-address is not a stable owner key except the final allocator-address tie-break.
-The execution-token lock protects acquisition bookkeeping only; it is not held
-for device execution. The completion lock protects queue mechanics only; pop a
-record, unlock, then compare identities/release resources.
+higher one. Two keyed same-rank locks require the stable key order; pointer
+address is not an owner key. A global/transitional lock has synthetic
+`GLOBAL_SENTINEL`, which sorts before every keyed lock **for diagnostics only**;
+co-holding a global/transitional lock and any other lock at the same rank is
+forbidden. In particular `g_sycl_graph_compute_mutex` must be replaced, not
+nested with per-device execution locks, and `g_cache_rw_mutex` must be dropped
+before a per-cache L4 lock is acquired. Snapshot/revalidate bridges these cases.
+The execution lock protects token bookkeeping only, not device execution. The
+completion/quarantine lock protects queue mechanics only; pop, unlock, then
+compare identities, wait, or release resources.
 
 Owner snapshots are taken under L1-L3 and acted on after release. No code may,
 while holding **any** listed lock: wait on a SYCL event/queue/future/condition
@@ -804,8 +839,11 @@ nn6z (model/load/slot foundation; owns G1)
   ├──> nlww (context/session ownership)
   │      └──> vbeb (GraphEpoch + top-level device token)
   │             └──> h5m4 (allocation/backing event leases)
-  │                    └──> y36c (owner-targeted reset/teardown)
+  │                    └──> y36c (owner-targeted reset/teardown callers)
   └──> x3ou (reporting-only tier verdict)
+
+32dg8.15.13 (event-returning memory-op surface) ──> h5m4
+main self-test repair ──> hcyp
 
 t5nq consumes the lock inventories from nn6z/nlww/vbeb/h5m4 and must precede y36c.
 (all implementation children) ──> hcyp final census
@@ -814,13 +852,22 @@ t5nq consumes the lock inventories from nn6z/nlww/vbeb/h5m4 and must precede y36
 | Child | Exclusive code-path ownership | Required deliverable/evidence |
 |---|---|---|
 | `nn6z` | slot/ID registry; model-load begin/nesting/commit/abort; planner publication | checked nonwrapping IDs, side-effect-free slot exhaustion, rollback; H1-H4, H10, **G1**, M1-M3 |
-| `nlww` | context/session create/free; KV pending-mask attribution; context arena owner keys | context/session state machines and exact reset keys; H5-H6, G3-G4 |
-| `vbeb` | graph epoch registry; top-level per-device token acquisition/copy/join; record/replay epoch plumbing | retiring-epoch isolation, busy/wait/reentrant/multi-device behavior; H7, H11, G5-G6 |
-| `h5m4` | submit event-lease payload and completion retention for handles, DIRECT backing, ARENA backing, sidecars/pointer tables | allocation lifetime through final event; H7, H12, G5-G6, M6 |
-| `t5nq` | lock-rank declarations/instrumentation and completion queue mechanics only | concrete inventory/tie-break and every no-under-lock prohibition; H8, M7 |
-| `y36c` | model/context/session reset and teardown orchestration; cache owner removal | consumes prior identities/events; no graph-token or handle redesign; H3-H6, G2-G4, M4-M5 |
+| `nlww` | `ContextId`/`SessionId`/`SessionResetEpoch` types and registries; state-transition primitives; context/session create+publish; KV pending-mask and arena owner keys | named transition API handoff, nonwrapping/ABA tests; H5-H6, H13-H14, G3-G4 |
+| `vbeb` | `GraphEpoch`/`InvocationId` registries; per-device token acquisition/copy; per-context/device aggregate retention; record/replay epoch plumbing | retiring isolation, join-failure quarantine, busy/wait/reentrant/multi-device behavior; H7, H11, H13, G5-G7, M6a |
+| `h5m4` | submit event-lease payload and completion retention for handles, DIRECT backing, ARENA backing, sidecars/pointer tables | allocation lifetime through every aggregate terminal event; H7, H12, G5-G7, M6b-M6d |
+| `t5nq` | exhaustive lock-rank declarations/instrumentation and completion/quarantine queue mechanics only | sentinel/tie-break and every no-under-lock prohibition; H8, M7 |
+| `y36c` | drain/reset/teardown **callers and orchestration only**; cache owner removal | calls `nlww` handoff APIs; never edits context/session registries/primitives; H3-H6, H14, G2-G4, M4-M5 |
 | `x3ou` | tier-verdict record/public reporting and reader audit | no routing/reset readers; H9, M8 |
-| `hcyp` | generated census/prose reconciliation only | regenerate at final HEAD and make `--check` clean |
+| `hcyp` | `scripts/audit-sycl-static-storage.py`, its self-test fixtures, `docs/backend/sycl-static-storage-inventory.csv`, and final census/count prose in this audit | starts after main's self-test repair; refreshes all four artifacts together at final HEAD and makes `--self-test`/`--check` clean |
+
+The `nlww`→`y36c` API handoff is named and exclusive. `nlww` implements
+`lifecycle_context_begin_drain(ContextId) -> DrainTicket`,
+`lifecycle_session_begin_reset(ContextId, SessionId, expected_epoch) -> ResetTicket`,
+`lifecycle_session_finish_reset(ResetTicket)`, and
+`lifecycle_context_finish_drain(DrainTicket)`. `y36c` owns every legacy
+free/reset/teardown caller and cleanup sequence that invokes those APIs. It does
+not access registry storage or transition state directly; `nlww` does not edit
+those legacy callers. The handoff commit lands before `y36c` starts.
 
 Overlapping legacy work is superseded for lifecycle acceptance as follows; it
 may supply prerequisites/history but must not edit a path concurrently with its
@@ -828,9 +875,10 @@ new exclusive owner:
 
 | Legacy scope | Superseding owner / boundary |
 |---|---|
-| `32dg8.15.10` model/context ownership and §5 single-context guard | `nlww` owns context/session keys; `y36c` owns reset/teardown |
-| `32dg8.15.12` in-flight handle lifetime | `h5m4` owns allocation/backing event payload; `vbeb` owns device token/epoch |
-| `32dg8.15.13` event-returning memory ops | remains a prerequisite API shape; `h5m4` owns lifecycle retention integration |
+| `32dg8.2` preload/placement consumption | not a lifecycle-ownership owner; `nn6z` supersedes its load/publication ownership assumptions while preserving planner consumption |
+| `32dg8.15.10` model/context ownership and §5 single-context guard | `nlww` owns registry primitives/create/publish; `y36c` owns drain/reset/teardown callers through the named API |
+| `32dg8.15.12` in-flight handle lifetime | `h5m4` owns allocation/backing event payload; `vbeb` owns device token/epoch/aggregate |
+| `32dg8.15.13` event-returning memory ops | explicit prerequisite edge to `h5m4`; it owns only the event-returning memory-op surface, then hands it off; `h5m4` exclusively owns lifecycle payload/retention |
 | current bare-slot ownership/reclaim (`0qlw` history) | `nn6z` owns generated identity; `y36c` only consumes it |
 | current all-device graph cleanup (`2wv5` history) | `vbeb` owns epoch attribution; `y36c` removes the sweep after that lands |
 | current load scratch reset (`k7b0` history) | retained as mitigation until `nn6z` transaction rollback supersedes it |
@@ -847,53 +895,63 @@ test names, not claims that they exist now**.
 | ID | Class | Exact command | Required assertions |
 |---|---|---|---|
 | H1 | host | `ctest --test-dir build -R '^sycl-lifecycle-load-txn$' --output-on-failure` | nested success commits exactly once |
-| H2 | host | `for c in inner-failure wrong-txn depth-underflow cancel rollback-idempotence; do ./build/bin/test-sycl-lifecycle-load-txn --case "$c" || exit 1; done` | each case poisons/aborts, publishes no LIVE owner; idempotence case proves one free/callback/generation change |
+| H2 | host | `for c in inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence; do ./build/bin/test-sycl-lifecycle-load-txn --case "$c" || exit 1; done` | each case poisons/aborts and publishes no LIVE owner; idempotence proves one free/callback/generation change |
 | H3 | host | `ctest --test-dir build -R '^sycl-lifecycle-multi-model$' --output-on-failure` | A and B LIVE; B load/abort cannot change A |
 | H4 | host | `ctest --test-dir build -R '^sycl-lifecycle-multi-model$' --output-on-failure` | sequential A→B→A gets fresh IDs/generations and identical A plan |
 | H5 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | reset/teardown touches only target model/context/session/epoch |
 | H6 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | stale slot generation and stale/retiring graph callback cannot mutate current state |
-| H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | mocked incomplete event retains every handle and top-level token through final join |
-| H8 | host | `ctest --test-dir build -R '^sycl-lifecycle-lock-order$' --output-on-failure` | inversion/tie-break plus wait, callback, blocking call, final handle/token destruction under locks fail |
+| H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | mocked incomplete per-context/device terminal sets retain each pair's handles and root token independently |
+| H8 | host | `./build/bin/test-sycl-lifecycle-lock-order --cases rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-device-call,final-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every operation/rank pair rejects before performing the operation |
 | H9 | host | `ctest --test-dir build -R '^sycl-lifecycle-tier-reporting$' --output-on-failure` | changing verdict changes report only, never route/reset |
-| H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case id-overflow --case generation-overflow` | 33rd slot returns `SLOT_EXHAUSTED` before LOADING with registry snapshot unchanged; IDs never wrap; exhausted slot retires |
-| H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case reentrant --case busy --case wait-cancel --case multi-device --case final-join` | exactly one token/device; reentrancy tuple, no-side-effect busy, unlocked wait, all-or-none sorted multi-device, final join |
-| H12 | host | `./build/bin/test-sycl-lifecycle-event-lease --case bare-direct-rejected --case direct-with-owner --case arena-backing` | async bare DIRECT rejected; matching backing accepted; ARENA reset blocked until terminal event |
+| H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case model-id-overflow --case load-txn-id-overflow --case slot-generation-overflow --case invocation-id-counter-overflow` | 33rd slot is side-effect-free before LOADING; common checked counter refuses InvocationId wrap; model/load IDs never wrap; exhausted slot retires; `nn6z` owns common primitive fixture |
+| H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case invocation-id-overflow --case reentrant --case busy --case wait-cancel --case multi-device --case aggregate-terminals --case join-create-failure --case submit-exception-known --case submit-exception-uncertain` | `vbeb` owns cases; one token/device, nonwrapping invocation, independent pair roots, and drain/quarantine fallback |
+| H12 | host | `./build/bin/test-sycl-lifecycle-event-lease --case bare-direct-rejected --case direct-with-owner --case arena-backing` | async bare DIRECT rejected; matching backing accepted; ARENA reset blocked until all pair terminal events |
+| H13 | host | `./build/bin/test-sycl-lifecycle-owner-reset --case context-id-overflow --case session-id-overflow --case session-reset-epoch-overflow --case graph-epoch-overflow --case session-reset-aba` | `nlww` owns context/session/reset cases; `vbeb` owns graph case; all fail closed/nonwrapping and stale reset N cannot finish N+1 |
+| H14 | host | `./build/bin/test-sycl-lifecycle-owner-reset --case teardown-repeat --case teardown-unknown-model --case teardown-stale-slot-generation --case teardown-unknown-context --case teardown-stale-context --case teardown-stale-session --case teardown-stale-graph-epoch` | repeat returns `OK_ALREADY_DEAD` with one original teardown; unknown model/context returns `NOT_FOUND`; every stale case returns `STALE_IDENTITY`; all owner snapshots remain unchanged |
 | G1 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure` | `nn6z` owner; one process runs A→B→A on logged/asserted same physical device |
 | G2 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-multi-live$' --output-on-failure` | A remains runnable after B load, injected failed load, and B teardown on same device |
 | G3 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | clearing context/session 1 preserves context/session 2 KV on same device |
 | G4 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-context-reset$' --output-on-failure` | unequal `n_ctx`, interleaved slot lifetime, no cross-reset |
 | G5 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | delayed terminal event returns BUSY/blocks second same-device owner and teardown |
 | G6 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICE=0 ctest --test-dir build -R '^sycl-lifecycle-gpu-event-lease$' --output-on-failure` | retiring epoch releases old resources but cannot mutate replacement epoch |
+| G7 | GPU | `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 GGML_SYCL_LIFECYCLE_TEST_DEVICES=0,1 ctest --test-dir build -R '^sycl-lifecycle-gpu-multidevice-aggregate$' --output-on-failure` | `vbeb` owner; two physical UUIDs, per-context/device terminal sets, one pair delayed cannot release the other incorrectly, final aggregate drains all |
 
 The lifecycle GPU CMake registrations must require a reproducible
-`test-sycl-lifecycle-models` fixture. Fixture A is the existing downloaded
-`${CMAKE_BINARY_DIR}/tinyllamas/stories15M-q4_0.gguf`, SHA-256
-`66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739`.
-Fixture B is a byte-identical copy at
-`${CMAKE_BINARY_DIR}/sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf` with the
-same verified hash. The duplicate is deliberate: distinct model objects/paths
-exercise deduplicated shared-weight ownership. Reproduce fixture setup exactly:
+`test-sycl-lifecycle-models` fixture with three paths:
+
+| Fixture | Path | SHA-256 | Purpose |
+|---|---|---|---|
+| A | `${CMAKE_BINARY_DIR}/tinyllamas/stories15M-q4_0.gguf` | `66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739` | existing valid inference fixture |
+| B | `${CMAKE_BINARY_DIR}/sycl-lifecycle-fixtures/stories260K.gguf` | `270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d` | semantically distinct parameters/shapes for contamination tests |
+| A-shared | `${CMAKE_BINARY_DIR}/sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf` | same as A | separate model object/path with identical bytes for shared/deduplicated ownership |
+
+Reproduce fixture setup exactly (both downloads are content-hash pinned):
 
 ```sh
 ctest --test-dir build -R '^test-download-model$' --output-on-failure
 cmake -E make_directory build/sycl-lifecycle-fixtures
+cmake -DDEST=build/sycl-lifecycle-fixtures/stories260K.gguf \
+  -DNAME=tinyllamas/stories260K.gguf \
+  -DHASH=SHA256=270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d \
+  -P cmake/download-models.cmake
 cmake -E copy_if_different build/tinyllamas/stories15M-q4_0.gguf \
   build/sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf
-printf '%s  %s\n%s  %s\n' \
+printf '%s  %s\n%s  %s\n%s  %s\n' \
   66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739 build/tinyllamas/stories15M-q4_0.gguf \
+  270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d build/sycl-lifecycle-fixtures/stories260K.gguf \
   66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739 build/sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf | sha256sum -c -
 ```
 
-Every G CTest registration passes
-`--model-a <A> --model-b <B> --prompt "1, 2, 3, 4, 5," --seed 42 --temp 0 --n-predict 8 --device 0`.
-The test asserts the logical device equals
-`GGML_SYCL_LIFECYCLE_TEST_DEVICE`, records the queue's physical device UUID for
-every phase, asserts all recorded UUIDs are identical, and fails if work spills
-to a second device. G1/G2 require identical generated token-ID vectors for A1,
-B, and A2 (the fixtures are byte-identical); G3/G4 compare each context against
-its isolated serial reference. GPU commands run once, serially by the lead
-session under repository safety rules; exit 77/SKIP is not a pass. Identity and
-owner diagnostics are assertions, not merely log output.
+Every G CTest registration passes `--model-a <A> --model-b <B>
+--model-a-shared <A-shared> --prompt "1, 2, 3, 4, 5," --seed 42 --temp 0
+--n-predict 8`. G1 runs A→B→A and compares each run with that model's isolated
+fixed-seed token reference; G2 keeps A and A-shared LIVE to prove shared-owner
+survival while loading/running distinct B to detect contamination. G3/G4 compare
+each context with its isolated serial reference. Same-device tests assert the
+selected logical ID and identical physical UUID throughout. G7 instead asserts
+exactly two distinct selected physical UUIDs and aggregate pair identities.
+GPU commands run once, serially by the lead session; exit 77/SKIP is not a pass.
+Identity/owner diagnostics are assertions, not merely log output.
 
 Mutation support is test-build-only: `scoped_lifecycle_mutation` activates one
 named hook in one subprocess; production builds contain no environment-controlled
@@ -910,8 +968,11 @@ is executable, not a manual source revert.
 | M3 | `tests/test-sycl-lifecycle-mutations.sh build M3` | `txn_poison_before_outer_decision`: clear poison for each H2 case | `poisoned transaction published LIVE`; H2/G2 negative control green after restore |
 | M4 | `tests/test-sycl-lifecycle-mutations.sh build M4` | `context_reset_before_owner_filter`: substitute wildcard owner | `non-target context changed`; H5/G3 green after restore |
 | M5 | `tests/test-sycl-lifecycle-mutations.sh build M5` | `graph_clear_before_epoch_filter`: substitute all-device/all-epoch clear | `current/non-target graph changed`; H5/G2/G6 green after restore |
-| M6 | `tests/test-sycl-lifecycle-mutations.sh build M6` | `event_lease_before_terminal_join`: drop token, handles and DIRECT/ARENA backing immediately after submit | `resource released before terminal event`; H7/H12/G5/G6 green after restore |
-| M7 | `for v in wait callback blocking-call final-handle-destroy final-token-destroy; do for r in L1 L2 L3 L4 L5 C; do tests/test-sycl-lifecycle-mutations.sh build M7-$v-$r || exit 1; done; done` | `lock_probe_before_unlock($v,$r)`: perform exactly that operation while that rank/isolated completion lock is held | exact marker `M7:$v:forbidden-under:$r`; H8 green after every restored subprocess |
+| M6a | `tests/test-sycl-lifecycle-mutations.sh build M6-token` | `aggregate_after_submit_drop_token`: drop one pair's root token | `token released before pair terminals`; H7/H11/G5/G7 green after restore |
+| M6b | `tests/test-sycl-lifecycle-mutations.sh build M6-handle` | `event_payload_after_submit_drop_handle`: drop one ordinary/sidecar/pointer-table handle | `handle released before pair terminals`; H7/G5-G7 green after restore |
+| M6c | `tests/test-sycl-lifecycle-mutations.sh build M6-direct` | `event_payload_skip_direct_owner`: accept bare DIRECT/drop explicit owner | `bare DIRECT escaped backing validation`; H12/G5 green after restore |
+| M6d | `tests/test-sycl-lifecycle-mutations.sh build M6-arena` | `event_payload_skip_arena_backing`: drop arena/chunk generation lease | `arena backing released before pair terminals`; H12/G5-G7 green after restore |
+| M7 | `for v in event-wait event-wait-and-throw queue-wait queue-wait-and-throw future-wait condvar-wait callback blocking-device-call final-handle-destroy final-token-destroy final-backing-lease-destroy; do for r in L1 L2 L3 L4 L5 C; do tests/test-sycl-lifecycle-mutations.sh build M7-$v-$r || exit 1; done; done` | `lock_probe_before_unlock($v,$r)`: perform exactly that operation while that rank/isolated C lock is held | exact marker `M7:$v:forbidden-under:$r`; H8 green after every restored subprocess |
 | M8 | `tests/test-sycl-lifecycle-mutations.sh build M8` | `tier_report_before_dispatch`: invert route when report verdict flips | `reporting verdict changed dispatch`; H9 green after restore |
 
 The mutation runner fails if the mutant unexpectedly passes, the marker is
@@ -924,9 +985,11 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
-The regenerated audit must record current source commit/hash/counts, reconcile
-all new lifecycle statics, and contain no unowned mutable model/context/session/
-graph state. The historical 5793 census is not accepted as final evidence.
+Main first owns the parser self-test repair. Then `hcyp` owns the final script
+and fixture adjustments plus generated CSV and this audit's commit/hash/count
+prose as one atomic refresh. It must reconcile all new lifecycle statics and
+contain no unowned mutable model/context/session/graph/invocation state. The
+historical 5793 census is not accepted as final evidence.
 
 ### 12.10 Phased code-path plan (not implemented by this document)
 
@@ -934,12 +997,12 @@ graph state. The historical 5793 census is not accepted as final evidence.
 |---|---|---|
 | P0 inventory | slot/load globals, planner scratch, pending KV FIFO, graph clear, cache owner masks | Every mutable site assigned one exclusive owner in §12.8 |
 | P1 transactions | model load begin/nested exit/preload/failure; slot/ID registry | `nn6z`, including G1, exhaustion/overflow, and rollback mutations pass |
-| P2 context ownership | context/session creation/drain, KV/RUNTIME/SCRATCH reservation, pending masks | `nlww` state-machine and exact-owner tests pass; no teardown sweep yet |
-| P3 graph/execution foundation | graph compute, device token, record/replay, retiring epochs | `vbeb` token/epoch tests pass before teardown changes |
-| P4 allocation event foundation | memcpy/memset, direct/fallback, persistent-TG, pointer tables/sidecars, DIRECT/ARENA backing | `h5m4` H7/H12/G5/G6 and M6 pass |
-| P5 locks then teardown | `t5nq` ranks/completion queue, then `y36c` model/context teardown and cache reclaim | all lock mutations pass; owner-targeted teardown consumes P1-P4 foundations |
+| P2 context ownership | `nlww` types/registries/state primitives/create/publish, KV/RUNTIME/SCRATCH owner keys, named handoff APIs | H13 reset-ABA/overflow passes; API handoff commit lands; no legacy drain/reset caller edited |
+| P3 graph/execution foundation | graph compute, checked InvocationId, device token, per-context/device aggregate/quarantine, record/replay/retiring epochs | `vbeb` H11/G7/M6a passes before teardown changes |
+| P4 allocation event foundation | `.15.13` event surface handoff, memcpy/memset, direct/fallback, pointer tables/sidecars, DIRECT/ARENA backing | `h5m4` H7/H12/G5-G7 and M6b-d pass |
+| P5 locks then teardown | `t5nq` exhaustive ranks/completion queue, then `y36c` legacy drain/reset/teardown callers and cache reclaim | all H8/M7 variants pass; callers use only `nlww` tickets; H14 passes |
 | P6 reporting | planner/tier API and all readers | `x3ou` proves report-only behavior |
-| P7 final audit | parser census and source-anchor review at final HEAD | `hcyp` regeneration and `--check` pass; all H/G tests green |
+| P7 final audit | `hcyp` script fixtures, CSV, source hashes/count prose after main self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
 
 No phase may expose a target identity API as supported current behavior before
 its owning paths and tests land end-to-end. Compatibility shims must fail closed
