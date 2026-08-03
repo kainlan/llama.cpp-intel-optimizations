@@ -655,6 +655,46 @@ def is_preprocessor_condition_recovery(source_b: bytes, gap):
     return end_byte(gap) <= line_end and re.match(rb"\s*#\s*(?:if|elif)\b", line) is not None
 
 
+def is_defaulted_const_reference_recovery(source_b: bytes, gap):
+    """Recognize grammar ABI 15's missing type in `const T & value = {}` only."""
+    if kind(gap) != "type_identifier" or not is_missing(gap) or start_byte(gap) != end_byte(gap):
+        return False
+    literal = parent(gap)
+    if literal is None or kind(literal) != "compound_literal_expression":
+        return False
+    literal_children = children(literal)
+    if len(literal_children) != 2 or (
+        kind(literal_children[0]), start_byte(literal_children[0]), end_byte(literal_children[0])
+    ) != (kind(gap), start_byte(gap), end_byte(gap)):
+        return False
+    initializer = literal_children[1]
+    if kind(initializer) != "initializer_list" or text(source_b, initializer).strip() != "{}":
+        return False
+    parameter = parent(literal)
+    if parameter is None or kind(parameter) != "optional_parameter_declaration":
+        return False
+    default_value = field(parameter, "default_value")
+    if default_value is None or (
+        kind(default_value), start_byte(default_value), end_byte(default_value)
+    ) != (kind(literal), start_byte(literal), end_byte(literal)):
+        return False
+    if "const" not in direct_qualifiers(source_b, parameter):
+        return False
+    declarator = field(parameter, "declarator")
+    if declarator is None or kind(declarator) != "reference_declarator":
+        return False
+    operators = [text(source_b, item) for item in children(declarator) if kind(item) in {"&", "&&"}]
+    if operators != ["&"] or declarator_name(source_b, declarator) is None:
+        return False
+    parameter_list = parent(parameter)
+    function = parent(parameter_list) if parameter_list is not None else None
+    return (
+        parameter_list is not None and kind(parameter_list) == "parameter_list"
+        and function is not None and kind(function) == "function_declarator"
+        and any(kind(item) in {"declaration", "function_definition"} for item in ancestors(function))
+    )
+
+
 def recovery_tail_is_structurally_parsed(masked: bytes, container, body_end: int):
     """Prove an oversized recovery function's tail is parsed top-level syntax."""
     safe = {
@@ -763,6 +803,8 @@ def recovery_coverage(source_b: bytes, root, declarations, recovered_regions, pr
             categories["class-member-declarator-proven"] += 1
         elif is_preprocessor_condition_recovery(source_b, gap):
             categories["preprocessor-condition-nondeclaration"] += 1
+        elif is_defaulted_const_reference_recovery(source_b, gap):
+            categories["defaulted-const-reference-parameter"] += 1
         else:
             # Namespace/file or structural-preprocessor recovery can hide an
             # implicit-static object of any user type or initializer spelling.
@@ -1013,6 +1055,22 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
     assert "alias_hidden_function" not in by_name
     assert "qualified_alias_hidden_function" not in by_name
 
+    defaulted_reference_source = """
+struct placement_kv_info {};
+void lifecycle_stage_placement_plan(unsigned long long load_txn_id,
+                                    const placement_kv_info & kv_info = {},
+                                    unsigned model_n_layer = 0);
+void lifecycle_stage_no_placement_plan(unsigned long long load_txn_id,
+                                       const placement_kv_info & kv_info = {},
+                                       unsigned model_n_layer = 0);
+"""
+    _, defaulted_rows, defaulted_gaps, defaulted_categories, defaulted_failures = parse_source(
+        parser, defaulted_reference_source
+    )
+    assert not defaulted_rows and not defaulted_failures
+    assert len(defaulted_gaps) == 2
+    assert defaulted_categories == Counter({"defaulted-const-reference-parameter": 2})
+
     same_rows = by_name["same"]
     lines = source.splitlines()
     for row in same_rows:
@@ -1042,6 +1100,10 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
         "class-alias": "struct Owner { using Local = int; static Local object; };",
         "ordinary-name-hiding": "using F = int(int); void owner() { struct F {}; static F object; }",
         "ambiguous-direct-class-member": "struct T { int data; }; struct H { inline static int T::* volatile object = {}; };",
+        "defaulted-const-object": "struct T {}; void f(const T value = {});",
+        "defaulted-const-pointer": "struct T {}; void f(const T * value = {});",
+        "defaulted-const-rvalue-reference": "struct T {}; void f(const T && value = {});",
+        "defaulted-const-reference-nonempty": "struct T { T(int); }; void f(const T & value = {1});",
     }
     alias_failures = {
         "function-alias-array", "unproved-function-alias", "unknown-qualified-alias", "alias-template",
@@ -1065,6 +1127,8 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
             "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
         }:
             assert any(reason == "unproved recovery tail after function body" for _, reason in broken_failures)
+        if fixture.startswith("defaulted-const-"):
+            assert broken_failures == [(1, "unproved type_identifier recovery at namespace/file scope")]
     # Keep recovery-tail scope coverage synthetic.  This used to parse the live
     # ggml-sycl.cpp and select declarations by historical line number, coupling
     # parser validation to the audited source snapshot rather than parser behavior.
@@ -1104,7 +1168,9 @@ namespace recovered_tail_namespace { static int recovered_namespace_tail; }
           "unproved-function-alias,unknown-qualified-alias,alias-template,inline-namespace-alias,"
           "resolved-inline-namespace-ambiguity,"
           "namespace-alias,local-alias,class-alias,ordinary-name-hiding,"
-          "ambiguous-direct-class-member,g++-c++17-pedantic,synthetic-file-tail-scopes,line-shift-independent")
+          "ambiguous-direct-class-member,defaulted-const-reference-parameter,"
+          "defaulted-reference-near-misses-fail-closed,g++-c++17-pedantic,"
+          "synthetic-file-tail-scopes,line-shift-independent")
 
 
 def main():
