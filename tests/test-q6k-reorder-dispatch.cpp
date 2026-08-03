@@ -76,6 +76,7 @@ static bool test_production_reorder_layout() {
 
         q.memcpy(device_aos, aos_data.data(), data_size).wait();
         reorder_q6_k_aos_to_soa_sycl(device_aos, device_soa, nblocks, &q);
+        q.wait_and_throw();
 
         std::vector<uint8_t> actual(data_size);
         q.memcpy(actual.data(), device_soa, data_size).wait();
@@ -87,15 +88,15 @@ static bool test_production_reorder_layout() {
         printf("  Result: %s\n", pass ? "PASS" : "FAIL");
         return pass;
     } catch (const sycl::exception & e) {
-        printf("  SKIP: SYCL error: %s\n", e.what());
-        return true;
+        printf("  FAIL: SYCL error: %s\n", e.what());
+        return false;
     }
 }
 
 //=============================================================================
 // Test 2: Verify offset calculations from quants.hpp
 //=============================================================================
-static void test_offset_calculations() {
+static bool test_offset_calculations() {
     printf("\n=== Test 2: SoA Offset Calculations (quants.hpp) ===\n");
 
     // Simulate quants.hpp block_q_t<GGML_TYPE_Q6_K> offset calculations
@@ -144,6 +145,7 @@ static void test_offset_calculations() {
     }
 
     printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 //=============================================================================
@@ -189,7 +191,7 @@ static float cpu_dot_q6k_q8_1(const block_q6_K* bq6, const float* y, int k_eleme
     return sum;
 }
 
-static void test_cpu_dequant_reference() {
+static bool test_cpu_dequant_reference() {
     printf("\n=== Test 3: CPU Dequantization Reference ===\n");
 
     // Create a test block with known values
@@ -210,7 +212,9 @@ static void test_cpu_dequant_reference() {
 
     printf("  Test: all q=5 (dequant=-27), Y=1.0\n");
     printf("  Result: %.1f, Expected: %.1f\n", result, expected);
-    printf("  Result: %s\n", fabs(result - expected) < 0.01f ? "PASS" : "FAIL");
+    const bool pass = fabs(result - expected) < 0.01f;
+    printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 //=============================================================================
@@ -284,7 +288,7 @@ static void test_dispatch_aos_vs_soa() {
 //=============================================================================
 // Test 5: Direct kernel data access simulation
 //=============================================================================
-static void test_kernel_data_access() {
+static bool test_kernel_data_access() {
     printf("\n=== Test 5: Kernel Data Access Simulation ===\n");
 
     // Simulate what the kernel does when reading from SoA layout
@@ -348,12 +352,13 @@ static void test_kernel_data_access() {
     }
 
     printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 //=============================================================================
 // Test 6: Multi-row matrix simulation (actual MMVQ scenario)
 //=============================================================================
-static void test_multirow_matrix() {
+static bool test_multirow_matrix() {
     printf("\n=== Test 6: Multi-Row Matrix (MMVQ Scenario) ===\n");
 
     // Simulate output layer: n_vocab rows x n_embd cols
@@ -445,12 +450,13 @@ static void test_multirow_matrix() {
 
     printf("  Errors: %d/%d blocks\n", errors, total_blocks);
     printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 //=============================================================================
 // Test 7: GPU kernel execution (SoA path) - uses float Y (simplified)
 //=============================================================================
-static void test_gpu_soa_kernel() {
+static bool test_gpu_soa_kernel() {
     printf("\n=== Test 7: GPU Kernel with SoA X and Float Y ===\n");
 
     try {
@@ -560,9 +566,11 @@ static void test_gpu_soa_kernel() {
         sycl::free(d_out, q);
 
         printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+        return pass;
 
-    } catch (sycl::exception& e) {
-        printf("  SKIP: SYCL error: %s\n", e.what());
+    } catch (const sycl::exception & e) {
+        printf("  FAIL: SYCL error: %s\n", e.what());
+        return false;
     }
 }
 
@@ -584,7 +592,7 @@ static inline int get_int_from_int8_aligned_test(const int8_t* x8, const int i32
     return *((const int*)(x8 + sizeof(int) * i32));
 }
 
-static void test_gpu_production_format() {
+static bool test_gpu_production_format() {
     printf("\n=== Test 8: Production vec_dot Q6_K (exact algorithm) ===\n");
 
     try {
@@ -788,9 +796,11 @@ static void test_gpu_production_format() {
         sycl::free(d_out, q);
 
         printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+        return pass;
 
-    } catch (sycl::exception& e) {
-        printf("  SKIP: SYCL error: %s\n", e.what());
+    } catch (const sycl::exception & e) {
+        printf("  FAIL: SYCL error: %s\n", e.what());
+        return false;
     }
 }
 
@@ -803,13 +813,13 @@ int main() {
 
     int failures = 0;
     failures += !test_production_reorder_layout();
-    test_offset_calculations();
-    test_cpu_dequant_reference();
-    test_dispatch_aos_vs_soa();
-    test_kernel_data_access();
-    test_multirow_matrix();
-    test_gpu_soa_kernel();
-    test_gpu_production_format();
+    failures += !test_offset_calculations();
+    failures += !test_cpu_dequant_reference();
+    test_dispatch_aos_vs_soa(); // Informational: this test does not execute or check a dispatch result.
+    failures += !test_kernel_data_access();
+    failures += !test_multirow_matrix();
+    failures += !test_gpu_soa_kernel();
+    failures += !test_gpu_production_format();
 
     printf("\n=== All Tests Complete: %d failure(s) ===\n", failures);
     return failures == 0 ? 0 : 1;
