@@ -163,7 +163,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 6,
+        "ggml_sycl_global_plan_snapshot": 8,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -314,6 +314,30 @@ checks = {
     and "rollback_token.model_id != 0" in llama
     and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "exact model-scoped weight identity": "ggml_sycl_owner_name_key" in backend
+    and "g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key" in backend
+    and "ggml_sycl_erase_weight_identities_for_owner" in backend
+    and "register_identity(tensor" in (root / "src/llama-model-loader.cpp").read_text()
+    and (root / "src/llama-model-loader.cpp").read_text().index("register_identity(tensor") <
+        (root / "src/llama-model-loader.cpp").read_text().index("register_host_weight(selected_layer_dev"),
+    "CPU classified before lifecycle begin": "resolved_sycl_weight_owner" in llama
+    and "llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner" in llama
+    and "if (sycl_model_loading_guard.active)" in llama,
+    "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
+    and "req.device = exact_device" in backend
+    and "get_current_device_id()" not in re.search(
+        r"ggml_backend_sycl_host_buffer_type_alloc_buffer\(.*?\n\}", backend, re.S
+    ).group(0),
+    "DL KV and compute parity": all(f'strcmp(name, "{name}")' in backend for name in (
+        "ggml_backend_sycl_kv_buffer_type_from_dev",
+        "ggml_backend_sycl_push_kv_layer_mask_from_dev",
+        "ggml_backend_sycl_host_compute_buffer_type",
+        "ggml_backend_sycl_cpu_offload_compute_buffer_type",
+        "ggml_backend_sycl_cpu_offload_available",
+    ))
+    and "llama_kv_cache_sycl_hooks_for" in (root / "src/llama-kv-cache.cpp").read_text()
+    and "llama_recurrent_sycl_kv_buft" in (root / "src/llama-memory-recurrent.cpp").read_text()
+    and "llama_context_sycl_compute_procs" in (root / "src/llama-context.cpp").read_text(),
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in
     (root / "src/llama-context.cpp").read_text()
     and "ggml_backend_reg_get_proc_address" in (root / "src/llama-context.cpp").read_text()

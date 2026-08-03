@@ -104,6 +104,30 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
 #endif
 
 #if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
+struct llama_context_sycl_dl_compute_hooks {
+    decltype(&ggml_backend_sycl_host_compute_buffer_type)        host_compute  = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_compute_buffer_type) cpu_compute   = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_available)           cpu_available = nullptr;
+};
+
+static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
+    llama_context_sycl_dl_compute_hooks hooks;
+    if (!dev) {
+        return hooks;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return hooks;
+    }
+    hooks.host_compute = reinterpret_cast<decltype(hooks.host_compute)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_compute_buffer_type"));
+    hooks.cpu_compute = reinterpret_cast<decltype(hooks.cpu_compute)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_compute_buffer_type"));
+    hooks.cpu_available = reinterpret_cast<decltype(hooks.cpu_available)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_available"));
+    return hooks;
+}
+
 static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
     ggml_backend_dev_t dev) {
     if (!dev) {
@@ -453,7 +477,7 @@ llama_context::llama_context(
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         int sycl_gpu_idx = 0;
 #endif
         for (auto & backend : backends) {
@@ -509,6 +533,20 @@ llama_context::llama_context(
                 }
 
                 sycl_gpu_idx++;
+            }
+#elif defined(GGML_BACKEND_DL)
+            else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                const auto hooks = llama_context_sycl_compute_procs(dev);
+                if (hooks.host_compute && hooks.cpu_compute && hooks.cpu_available) {
+                    const int sycl_dev = sycl_gpu_idx++;
+                    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                        buft = hooks.host_compute(sycl_dev);
+                    } else if (const char * env = std::getenv("GGML_SYCL_HOST_COMPUTE"); env && std::atoi(env) != 0) {
+                        buft = hooks.cpu_compute(sycl_dev);
+                    } else if (const char * env = std::getenv("GGML_SYCL_CPU_OFFLOAD"); env && std::atoi(env) != 0) {
+                        (void) hooks.cpu_available();
+                    }
+                }
             }
 #endif
 

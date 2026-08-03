@@ -1330,12 +1330,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return;
         }
 
-        if (sycl_hooks.weights_evictable()) {
-            sycl_hooks.register_host_weight(selected_layer_dev, tensor);
-        }
         const auto weight = weights_map.find(ggml_get_name(tensor));
         if (weight != weights_map.end()) {
             sycl_hooks.register_identity(tensor, weight->second.idx, weight->second.offs, ggml_nbytes(tensor), 0);
+        }
+        if (sycl_hooks.weights_evictable()) {
+            sycl_hooks.register_host_weight(selected_layer_dev, tensor);
         }
 
         auto usage_from_tensor = [](llm_tensor t) -> ggml_backend_sycl_tensor_usage {

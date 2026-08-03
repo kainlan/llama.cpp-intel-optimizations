@@ -8543,19 +8543,27 @@ struct sycl_host_weight_extra_entry {
 static std::mutex                                                    g_sycl_host_weight_extras_mutex;
 static std::unordered_map<std::string, sycl_host_weight_extra_entry> g_sycl_host_weight_extras;
 
-static std::string ggml_sycl_host_weight_registry_key(const ggml_tensor * tensor, const ggml_tensor_extra_gpu * extra) {
+static std::string ggml_sycl_owner_name_key(ggml_sycl::lifecycle::ModelToken owner, const char * name) {
+    if (owner.model.value == 0 || owner.load.value == 0 || !name || !name[0]) {
+        return {};
+    }
+    return std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
+           std::to_string(owner.owner.slot) + ":" + std::to_string(owner.owner.generation) + ":" + name;
+}
+
+static std::string ggml_sycl_host_weight_registry_key(const ggml_tensor *              tensor,
+                                                      const ggml_tensor_extra_gpu *    extra,
+                                                      ggml_sycl::lifecycle::ModelToken owner) {
     if (tensor) {
         const char * name = ggml_get_name(tensor);
         if (name && name[0]) {
-            std::string key = "name:";
-            key += name;
-            return key;
+            return ggml_sycl_owner_name_key(owner, name);
         }
     }
-    if (extra && extra->cache_uuid != 0) {
-        std::string key = "uuid:";
-        key += std::to_string(static_cast<unsigned long long>(extra->cache_uuid));
-        return key;
+    if (extra && extra->cache_uuid != 0 && owner.model.value != 0 && owner.load.value != 0) {
+        return std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
+               std::to_string(owner.owner.slot) + ":" + std::to_string(owner.owner.generation) +
+               ":uuid:" + std::to_string(static_cast<unsigned long long>(extra->cache_uuid));
     }
     return {};
 }
@@ -8565,8 +8573,17 @@ const void * ggml_sycl_lookup_host_weight_ptr_by_name(const char * name) {
         return nullptr;
     }
 
+    const auto snapshot = ggml_sycl_global_plan_snapshot();
+    if (!snapshot) {
+        return nullptr;
+    }
+    const ggml_sycl::lifecycle::ModelToken owner{
+        { snapshot->model_id },
+        { snapshot->load_txn_id },
+        { snapshot->slot, snapshot->slot_generation }
+    };
     std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
-    const std::string           key = std::string("name:") + name;
+    const std::string           key = ggml_sycl_owner_name_key(owner, name);
     auto                        it  = g_sycl_host_weight_extras.find(key);
     if (it != g_sycl_host_weight_extras.end()) {
         const ggml_tensor * tensor = it->second.tensor;
@@ -8817,10 +8834,13 @@ static uint64_t ggml_sycl_assign_cache_uuid(ggml_tensor_extra_gpu * extra) {
 }
 
 struct ggml_sycl_weight_identity {
-    uint16_t file_idx  = 0;
-    size_t   file_offs = 0;
-    size_t   nbytes    = 0;
-    uint64_t model_id  = 0;
+    uint16_t file_idx        = 0;
+    size_t   file_offs       = 0;
+    size_t   nbytes          = 0;
+    uint64_t model_id        = 0;
+    uint64_t load_txn_id     = 0;
+    uint32_t slot            = 0;
+    uint64_t slot_generation = 0;
 };
 
 static size_t ggml_sycl_hash_combine(size_t seed, size_t value) {
@@ -9221,6 +9241,19 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
     };
 }
 
+static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
+    std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+    for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
+        const auto & id = it->second;
+        if (id.model_id == owner.model.value && id.load_txn_id == owner.load.value && id.slot == owner.owner.slot &&
+            id.slot_generation == owner.owner.generation) {
+            it = g_sycl_weight_identities_by_name.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
@@ -9228,6 +9261,7 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // slot-scoped graph ownership belongs to downstream 1q72/o6jx.
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
+    ggml_sycl_erase_weight_identities_for_owner(owner);
     const size_t   reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
     GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
                   reclaimed);
@@ -9537,6 +9571,7 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
     ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
+    ggml_sycl_erase_weight_identities_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
     // Abort discards only loader-thread candidate state. The previously active
     // LIVE execution authority remains continuously published.
@@ -10040,19 +10075,26 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
 
         int device_id = ggml_sycl_device_id_from_backend_dev(dev);
         if (device_id < 0) {
-            device_id = 0;
+            delete extra;
+            tensor->extra  = nullptr;
+            tensor->layout = nullptr;
+            return;
         }
         ggml_sycl_init_layout_info(extra, tensor, device_id, /* use_tensor_data_ptr = */ false);
     } else if (tensor->layout == nullptr) {
         tensor->layout = &extra->layout;
     }
 
+    const auto owner = ggml_sycl::lifecycle::global_registry().current_active_token();
+    if (owner.model.value == 0 || owner.load.value == 0) {
+        return;
+    }
     ggml_sycl_assign_cache_uuid(extra);
     {
         std::lock_guard<std::mutex> lock_id(g_sycl_weight_identity_mutex);
         const char *                name = ggml_get_name(tensor);
         if (name && name[0]) {
-            auto name_it = g_sycl_weight_identities_by_name.find(std::string(name));
+            auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name));
             if (name_it != g_sycl_weight_identities_by_name.end()) {
                 extra->model_id = name_it->second.model_id;
             }
@@ -10061,7 +10103,7 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
 
     {
         std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
-        const std::string           key = ggml_sycl_host_weight_registry_key(tensor, extra);
+        const std::string           key = ggml_sycl_host_weight_registry_key(tensor, extra, owner);
         if (key.empty()) {
             GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
@@ -10115,13 +10157,23 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
     }
     ggml_sycl::dispatch_tuning::ensure_model_loaded(model_id);
 
-    const ggml_sycl_weight_identity identity = { file_idx, file_offs, tensor_nbytes, model_id };
+    const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
+    if (token.model.value != model_id) {
+        return;
+    }
+    const ggml_sycl_weight_identity identity = { file_idx,         file_offs,        tensor_nbytes,         model_id,
+                                                 token.load.value, token.owner.slot, token.owner.generation };
 
     std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
 
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        g_sycl_weight_identities_by_name[std::string(name)] = identity;
+        const ggml_sycl::lifecycle::ModelToken owner{
+            { model_id },
+            { identity.load_txn_id },
+            { identity.slot, identity.slot_generation }
+        };
+        g_sycl_weight_identities_by_name[ggml_sycl_owner_name_key(owner, name)] = identity;
     }
 
     // NOTE: We intentionally do NOT modify tensor->extra or tensor->layout here.
@@ -10256,7 +10308,16 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     ggml_sycl_weight_identity identity{};
 
     if (!name.empty() && name != "unknown") {
-        auto name_it = g_sycl_weight_identities_by_name.find(name);
+        const auto                             snapshot = ggml_sycl_global_plan_snapshot();
+        const ggml_sycl::lifecycle::ModelToken owner =
+            snapshot ?
+                ggml_sycl::lifecycle::ModelToken{
+                    { snapshot->model_id },
+                    { snapshot->load_txn_id },
+                    { snapshot->slot, snapshot->slot_generation }
+        } :
+                ggml_sycl::lifecycle::ModelToken{};
+        auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
         if (name_it != g_sycl_weight_identities_by_name.end()) {
             identity          = name_it->second;
             has_gguf_identity = true;
@@ -10431,14 +10492,9 @@ std::atomic<bool>                                    g_tiered_enabled{ false };
 // leak was the same shape one level down, in a per-device singleton instead
 // of a process-global).
 //
-// g_sycl_named_weight_cache_uuids and g_sycl_weight_identities_by_name are
-// deliberately NOT touched here: the former is keyed by a signature that is
-// a pure function of (name, type, ne, nbytes) -- a stale entry from a
-// different model is either identical (harmless reuse) or keyed differently
-// (no collision), so it is not model-scoped state at all. The latter is
-// unconditionally overwritten (`g_sycl_weight_identities_by_name[name] =
-// identity;`, not emplace-if-absent) on every real write, so staleness for a
-// name the current model does not have is simply never read.
+// Named cache UUIDs remain signature-keyed. Weight identities are separately
+// keyed by exact ModelToken plus name and are erased on abort/teardown; they
+// must never be reset process-wide while another model remains LIVE.
 //
 // g_sycl_weight_usages IS a real bug, fixed here: registration only
 // *emplaces* on first sight of a name and forces UNKNOWN on a *mismatch*
@@ -32528,9 +32584,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     GGML_LOG_INFO("[SYCL] Host buffer alloc request: %.1f MB (evictable=%d, in_model_load=%d)\n",
                   size / (1024.0 * 1024.0), weights_evictable ? 1 : 0, in_model_load ? 1 : 0);
 
+    const int exact_device = ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
+    if (exact_device < 0) {
+        return nullptr;
+    }
+    auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
+    sycl::queue * exact_queue =
+        exact_cache ? &exact_cache->get_queue() : &ggml_sycl_get_device(exact_device).default_queue();
     ggml_sycl::alloc_request req{};
-    req.queue  = &dpct::get_in_order_queue();
-    req.device = get_current_device_id();
+    req.queue  = exact_queue;
+    req.device = exact_device;
     req.size   = size;
     req.intent.role =
         (in_model_load || weights_evictable) ? ggml_sycl::alloc_role::WEIGHT : ggml_sycl::alloc_role::STAGING;
@@ -32540,8 +32603,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     // When host zones are configured, route through the zone system so allocations
     // are tracked and budgeted. Model weights go to WEIGHT zone, compute buffers
     // go to SCRATCH zone. When zones are not configured, use the pinned pool runtime.
-    auto * sycl_cache                       = ggml_sycl::get_unified_cache_for_device(req.device);
-    req.intent.constraints.use_pinned_pool  = (sycl_cache && sycl_cache->host_zones_configured());
+    req.intent.constraints.use_pinned_pool  = (exact_cache && exact_cache->host_zones_configured());
     ggml_sycl::alloc_handle host_buffer_owner{};
     if (!ggml_sycl::unified_alloc(req, &host_buffer_owner)) {
         host_buffer_owner = {};
@@ -95632,6 +95694,21 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
+    }
+    if (strcmp(name, "ggml_backend_sycl_kv_buffer_type_from_dev") == 0) {
+        return (void *) ggml_backend_sycl_kv_buffer_type_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_push_kv_layer_mask_from_dev") == 0) {
+        return (void *) ggml_backend_sycl_push_kv_layer_mask_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_host_compute_buffer_type") == 0) {
+        return (void *) ggml_backend_sycl_host_compute_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_cpu_offload_compute_buffer_type") == 0) {
+        return (void *) ggml_backend_sycl_cpu_offload_compute_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_cpu_offload_available") == 0) {
+        return (void *) ggml_backend_sycl_cpu_offload_available;
     }
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
