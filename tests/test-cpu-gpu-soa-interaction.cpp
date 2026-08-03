@@ -2,6 +2,7 @@
 // Calls production dequantizers from dequantize.hpp and the production Q4_0
 // reorder path from ggml-sycl.cpp. CPU GET_ROWS and DMMV remain test harnesses.
 //
+// Available after Task 17 registers this test target:
 // Build: cmake --build build --target test-cpu-gpu-soa-interaction
 // Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-cpu-gpu-soa-interaction
 
@@ -55,7 +56,7 @@ void dmmv_q4_0_soa_reference(sycl::queue& q, const uint8_t* soa_data,
     const sycl::half* d_base = (const sycl::half*)(soa_data + d_offset);
 
     q.parallel_for(sycl::nd_range<1>(nrows * WARP_SIZE, WARP_SIZE),
-        [=](sycl::nd_item<1> item) {
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const int row = item.get_group(0);
             const int tid = item.get_local_id(0);
             const int blocks_per_row = ncols / QK4_0;
