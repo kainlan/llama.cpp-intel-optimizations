@@ -43,6 +43,15 @@ ggml_add_backend_library(ggml-sycl
                         )
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
+
+# cpu-dispatch.cpp consumes CPU trait function pointers. In DL builds ggml-cpu
+# is the single SHARED implementation, so this creates a normal relocatable
+# dependency and does not duplicate CPU backend global state inside SYCL.
+if (GGML_BACKEND_DL)
+    target_link_libraries(ggml-sycl PRIVATE ggml-cpu)
+    set_property(TARGET ggml-sycl APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+    set_property(TARGET ggml-sycl APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+endif()
 option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
 option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
 option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
@@ -125,6 +134,19 @@ if (BUILD_TESTING)
     target_include_directories(test-sycl-lifecycle-public-api PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     add_test(NAME sycl-lifecycle-public-wrappers COMMAND test-sycl-lifecycle-public-api)
+    if (GGML_BACKEND_DL)
+        add_executable(test-sycl-module-dlopen
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dlopen.cpp)
+        target_compile_definitions(test-sycl-module-dlopen PRIVATE
+            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+        target_link_libraries(test-sycl-module-dlopen PRIVATE ${CMAKE_DL_LIBS})
+        add_dependencies(test-sycl-module-dlopen ggml-sycl)
+        add_test(NAME sycl-module-dlopen-now COMMAND test-sycl-module-dlopen)
+        set_tests_properties(sycl-module-dlopen-now PROPERTIES
+            FIXTURES_SETUP sycl_module_dlopen_ready
+            LABELS "sycl;module;host")
+    endif()
+
     add_executable(test-sycl-lifecycle-runtime-wrapper
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-runtime-wrapper.cpp)
     target_include_directories(test-sycl-lifecycle-runtime-wrapper PRIVATE
@@ -141,6 +163,9 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
+    if (GGML_BACKEND_DL)
+        set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES FIXTURES_REQUIRED sycl_module_dlopen_ready)
+    endif()
     add_executable(test-sycl-lifecycle-wrapper-overlap
         tests/test-lifecycle-wrapper-overlap.cpp)
     target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
@@ -174,6 +199,9 @@ if (BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
     set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
+    if (GGML_BACKEND_DL)
+        set_tests_properties(sycl-device-uuid-api PROPERTIES FIXTURES_REQUIRED sycl_module_dlopen_ready)
+    endif()
 
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown

@@ -47,7 +47,7 @@ namespace ggml_sycl {
 uint64_t unified_cache_bound_load_txn() noexcept {
     try {
         const auto txn = lifecycle::global_registry().bound_candidate();
-        return txn && lifecycle_find_candidate_placement_plan(txn.value) ? txn.value : 0;
+        return txn.value != 0 && lifecycle_find_candidate_placement_plan(txn.value) ? txn.value : 0;
     } catch (...) {
         return 0;
     }

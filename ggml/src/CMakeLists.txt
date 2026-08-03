@@ -269,7 +269,15 @@ endif()
 
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
-        add_library(${backend} MODULE ${ARGN})
+        # CPU traits are consumed by host-fallback code in accelerator modules.
+        # Build CPU as one shared implementation (rather than an unlinkable
+        # MODULE or duplicated objects) so dependent modules get a relocatable
+        # DT_NEEDED entry and share the same backend state.
+        if (backend STREQUAL "ggml-cpu")
+            add_library(${backend} SHARED ${ARGN})
+        else()
+            add_library(${backend} MODULE ${ARGN})
+        endif()
         # write the shared library to the output directory
         set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
