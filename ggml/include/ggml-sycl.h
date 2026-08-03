@@ -785,6 +785,17 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_en
     struct ggml_sycl_load_txn txn);
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
     struct ggml_sycl_load_txn txn, bool explicit_success, struct ggml_sycl_model_token * model);
+// Select exact immutable LIVE model authority for explicit A/B/A routing.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(
+    struct ggml_sycl_model_token model);
+// Foundation model-bound runtime update. Context/graph code will call this
+// automatically in 1q72; callers currently bind explicitly.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
+    ggml_backend_t               backend,
+    struct ggml_sycl_model_token model,
+    uint32_t                     n_ctx,
+    uint32_t                     n_ubatch,
+    uint32_t                     n_seq_max);
 
 // Deprecated bool compatibility boundary. It is abort-default and cannot be
 // used to obtain ownership identity; migrated callers use the APIs above.

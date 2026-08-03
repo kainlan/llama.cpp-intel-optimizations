@@ -1997,6 +1997,9 @@ static std::atomic<bool> g_moe_multi_gpu_active{ false };
 // used because std::atomic<std::shared_ptr<T>> is C++20-only. There is no
 // mutable process-global plan: builders publish a fresh immutable snapshot.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_publication;
+static thread_local std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_load_candidate_publication;
+static thread_local bool                                                      g_runtime_expected_model_set = false;
+static thread_local ggml_sycl_model_token                                     g_runtime_expected_model{};
 // Canonical ranked inventory/lifecycle publication writer lock. All cache/global
 // placement publications are serialized by this existing lock.
 static std::mutex                                                g_tensor_inventory_mutex;
@@ -2039,7 +2042,9 @@ static const std::shared_ptr<const placement_plan> & empty_placement_plan_owner(
 }
 
 std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {
-    const auto authority = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+    const auto authority = g_load_candidate_publication ?
+                               g_load_candidate_publication :
+                               std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
     return authority && authority->plan ? authority->plan : empty_placement_plan_owner();
 }
 
@@ -2053,7 +2058,12 @@ std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unifie
 
 placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept {
     placement_cache_read result;
-    result.owner         = empty_placement_plan_owner();
+    result.owner = empty_placement_plan_owner();
+    if (g_load_candidate_publication && g_load_candidate_publication->plan) {
+        result.coherence = placement_cache_coherence::MATCH;
+        result.owner     = g_load_candidate_publication->plan;
+        return result;
+    }
     const auto authority = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
     if (!authority || authority->explicit_no_plan || !authority->plan) {
         result.coherence = placement_cache_coherence::GENUINE_NO_PLAN;
@@ -9364,7 +9374,8 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // Clean slate for every model-scoped scratch global before this
             // model's own tensors are inventoried -- see the function for why
             // this must not be left to the per-field writer alone.
-            ggml_sycl_reset_model_load_scratch_state();
+            g_load_candidate_publication.reset();
+            ggml_sycl_reset_model_load_scratch_state(true);
 
             // A new outer model load is the ownership boundary for the previous
             // model's tensor extras. Release the registry's references before
@@ -9537,18 +9548,12 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
     ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
+    g_load_candidate_publication.reset();
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
-    // Preserve the currently published owner while scratch is reset, then
-    // refetch latest-LIVE under the canonical writer lock and publish exactly
-    // once. No stale restoration bundle or restored->null->restored window.
+    // Abort discards only loader-thread candidate state. The previously active
+    // LIVE execution authority remains continuously published.
     ggml_sycl_reset_model_load_scratch_state(true);
-    ggml_sycl_plan_restoration_bundle restoration;
-    std::lock_guard<std::mutex>       lock(g_tensor_inventory_mutex);
-    if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-        throw std::runtime_error("failed to prepare latest LIVE placement plan");
-    }
-    ggml_sycl_publish_plan_locked(restoration.snapshot);
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
@@ -9670,14 +9675,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             throw std::bad_alloc();
         }
         placement_inserted = true;
-        ggml_sycl_plan_restoration_bundle publication_bundle;
-        publication_bundle.snapshot = plan_snapshot;
-        ggml_sycl_publish_restored_plan(publication_bundle);
+        ggml_sycl_prepared_plan_publication prepared_publication;
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            prepared_publication = ggml_sycl_prepare_plan_publication_locked(plan_snapshot);
+        }
         const auto publication = ggml_sycl_lifecycle_publication_from_plan(*plan_snapshot);
         auto       state  = std::make_shared<const ggml_sycl::lifecycle::ModelState>(ggml_sycl::lifecycle::ModelState{
             ticket.token, ggml_sycl::lifecycle::model_phase::LIVE, publication.planned_host_bytes,
             publication.actual_host_bytes, publication.verdict });
         auto       result = registry->finalize_end(ticket, true, publication, std::move(state));
+        if (result.committed) {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            ggml_sycl_publish_prepared_plan_locked(prepared_publication);
+        }
+        g_load_candidate_publication.reset();
         if (result.cleanup_required) {
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
             bool cleanup_ok = false;
@@ -10383,6 +10395,30 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
     return ggml_sycl_has_global_plan();
 }
 
+ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
+    try {
+        const ggml_sycl::lifecycle::ModelToken token{
+            { model.model_id },
+            { model.load_txn_id },
+            { model.slot, model.slot_generation }
+        };
+        const auto state = ggml_sycl::lifecycle::global_registry().find(token.model);
+        if (!state || state->phase != ggml_sycl::lifecycle::model_phase::LIVE || !(state->token == token)) {
+            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        }
+        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
+                                                                         model.slot_generation);
+        if (!snapshot) {
+            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        }
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        ggml_sycl_publish_plan_locked(snapshot);
+        return GGML_SYCL_LIFECYCLE_OK;
+    } catch (...) {
+        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    }
+}
+
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id) {
     if (device_id < 0) {
         return false;
@@ -10449,12 +10485,16 @@ static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publi
     const auto & snapshot = publication.snapshot;
     g_model_n_layer       = publication.model_n_layer;
     g_placement_kv_info   = std::move(publication.kv_info);
-    for (int i = 0; i < publication.cache_count; ++i) {
-        publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
-    }
-    g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
-                                                 std::memory_order_release);
-    std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release);
+    ggml_sycl::publish_cache_first_global_last(
+        publication.cache_count,
+        [&](int i) {
+            publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
+        },
+        [&] {
+            g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
+                                                         std::memory_order_release);
+            std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release);
+        });
 }
 
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
@@ -11037,7 +11077,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
         }
     }
-    ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr);
+    g_load_candidate_publication = have_plan ? plan_snapshot : nullptr;
 }
 
 // Compute placement plan early — before create_tensor in the llama loader.
@@ -11233,6 +11273,12 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     if (!current || !current->plan) {
         return;
     }
+    if (g_runtime_expected_model_set && (current->model_id != g_runtime_expected_model.model_id ||
+                                         current->load_txn_id != g_runtime_expected_model.load_txn_id ||
+                                         current->slot != g_runtime_expected_model.slot ||
+                                         current->slot_generation != g_runtime_expected_model.slot_generation)) {
+        return;
+    }
     const ggml_sycl::lifecycle::ModelToken current_token{
         { current->model_id },
         { current->load_txn_id },
@@ -11301,6 +11347,30 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
             g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
             g_placement_kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
+                                                                           ggml_sycl_model_token model,
+                                                                           uint32_t              n_ctx,
+                                                                           uint32_t              n_ubatch,
+                                                                           uint32_t              n_seq_max) {
+    const auto activated = ggml_backend_sycl_activate_model_plan(model);
+    if (activated != GGML_SYCL_LIFECYCLE_OK) {
+        return activated;
+    }
+
+    struct expected_model_guard {
+        ~expected_model_guard() { g_runtime_expected_model_set = false; }
+    } guard;
+
+    g_runtime_expected_model     = model;
+    g_runtime_expected_model_set = true;
+    ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max);
+    const auto current = ggml_sycl_global_plan_snapshot();
+    return current && current->model_id == model.model_id && current->load_txn_id == model.load_txn_id &&
+                   current->slot == model.slot && current->slot_generation == model.slot_generation ?
+               GGML_SYCL_LIFECYCLE_OK :
+               GGML_SYCL_LIFECYCLE_BUSY;
 }
 
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
@@ -95337,6 +95407,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_activate_model_plan") == 0) {
+        return (void *) ggml_backend_sycl_activate_model_plan;
+    }
+    if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
+        return (void *) ggml_backend_sycl_set_runtime_context_for_model;
     }
     if (strcmp(name, "ggml_backend_sycl_model_unloaded_token") == 0) {
         return (void *) ggml_backend_sycl_model_unloaded_token;

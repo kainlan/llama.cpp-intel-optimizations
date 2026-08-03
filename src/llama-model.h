@@ -689,7 +689,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
-protected:
+    const llama_sycl_model_token & get_sycl_model_token() const { return sycl_model_token; }
+
+  protected:
     llama_model_params params;
 
     struct impl;

@@ -75,14 +75,20 @@ void check_concurrent_snapshot_publication() {
         next->version           = version;
         next->plan              = std::move(plan);
         snapshot_ptr immutable  = std::move(next);
-        // Cache-first/global-last is the production restore order. Readers may
-        // reject an in-flight mixture, but must never accept it as coherent.
-        std::atomic_store_explicit(&caches[0], immutable, std::memory_order_release);
-        std::atomic_store_explicit(&caches[1], immutable, std::memory_order_release);
-        if ((version % 127) == 0) {
-            std::atomic_store_explicit(&authority, snapshot_ptr{}, std::memory_order_release);
-        }
-        std::atomic_store_explicit(&authority, std::move(immutable), std::memory_order_release);
+        // Invoke the exact production ordering primitive. The global callback
+        // asserts both caches already contain this immutable generation, so an
+        // ordering mutation is killed deterministically.
+        publish_cache_first_global_last(
+            2, [&](int i) { std::atomic_store_explicit(&caches[i], immutable, std::memory_order_release); },
+            [&] {
+                for (const auto & slot : caches) {
+                    if (!lifecycle_plan_snapshot_matches(immutable,
+                                                         std::atomic_load_explicit(&slot, std::memory_order_acquire))) {
+                        mixed_accepted.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                std::atomic_store_explicit(&authority, immutable, std::memory_order_release);
+            });
     }
     stop.store(true, std::memory_order_release);
     reader.join();
@@ -233,6 +239,24 @@ int main() {
             n_fail++;
         }
     }
+    // Exact generation-safe manual A/B/A selection is independent of the
+    // latest-loaded model, and a transaction-local B candidate/abort cannot
+    // replace or null the already published A snapshot.
+    const auto manual_a1 = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    const auto manual_b  = lifecycle_select_placement_plan(2002, 1002, 4, 8);
+    lifecycle_stage_placement_plan(1003, plan, kv_a, 12);
+    const auto during_b_load = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    lifecycle_abort_placement_plan(1003);
+    const auto manual_a2 = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    const auto stale_a   = lifecycle_select_placement_plan(2001, 1001, 3, 8);
+    if (manual_a1 && manual_b && during_b_load.get() == manual_a1.get() && manual_a2.get() == manual_a1.get() &&
+        !stale_a) {
+        n_pass++;
+    } else {
+        printf("FAIL exact A/B/A activation or B-abort continuity\n");
+        n_fail++;
+    }
+
     // Simulate A runtime KV CAS while B is independently live. Removing B must
     // leave lifecycle ownership pointing at A-prime geometry, not A's original
     // process-global metadata or B's geometry.

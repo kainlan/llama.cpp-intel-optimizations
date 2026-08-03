@@ -79,6 +79,14 @@ checks = {
             "lifecycle_abort_placement_plan",
         )
     ),
+    "transaction-local load candidate": "thread_local std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot>"
+    in backend
+    and "g_load_candidate_publication = have_plan ? plan_snapshot : nullptr" in backend
+    and "ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr)" not in backend
+    and "ggml_sycl_reset_model_load_scratch_state(true)" in backend,
+    "explicit exact activation": "ggml_backend_sycl_activate_model_plan" in public
+    and "lifecycle_select_placement_plan" in backend
+    and "ggml_backend_sycl_set_runtime_context_for_model" in public,
     "serialized coherent publication": all(
         x in backend
         for x in (
@@ -151,7 +159,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 6,
+        "ggml_sycl_global_plan_snapshot": 7,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -182,6 +190,9 @@ checks = {
     == 1,
     "abort reset preserves authority": "ggml_sycl_reset_model_load_scratch_state(true)" in backend
     and "if (!preserve_placement_authority)" in backend,
+    "production publisher primitive": "publish_cache_first_global_last(" in backend
+    and "publish_cache_first_global_last(" in cache_hpp
+    and "publish_cache_first_global_last(" in (root / "tests/test-sycl-tensor-placement.cpp").read_text(),
     "global cache aliases aggregated": "publication.caches" in backend
     and re.search(r"publication\.participates\[i\]\s*=\s*publication\.participates\[i\]\s*\|\|", backend),
     "KV allocation retains one lifecycle owner": (

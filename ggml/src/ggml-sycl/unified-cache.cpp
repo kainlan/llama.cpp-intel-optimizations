@@ -168,6 +168,21 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uin
     return plan == model->second.end() ? nullptr : plan->second;
 }
 
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(uint64_t model_id,
+                                                                               uint64_t load_txn_id,
+                                                                               uint32_t slot,
+                                                                               uint64_t slot_generation) noexcept {
+    try {
+        const auto plan = lifecycle_find_placement_plan(model_id, load_txn_id);
+        return plan && plan->model_id == model_id && plan->load_txn_id == load_txn_id && plan->slot == slot &&
+                       plan->slot_generation == slot_generation ?
+                   plan :
+                   nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                       const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
     if (!expected || !replacement || expected->model_id == 0 || expected->load_txn_id == 0) {

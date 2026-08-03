@@ -1039,6 +1039,17 @@ inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycl
 class unified_cache;
 enum class placement_cache_coherence : uint8_t { MATCH, GENUINE_NO_PLAN, TRANSIENT_MISMATCH };
 
+// Single production ordering primitive: every participating cache is updated
+// before the global authority callback. Host tests use this exact template so
+// reversing either callback order is mutation-killed without a SYCL device.
+template <typename CachePublish, typename GlobalPublish>
+void publish_cache_first_global_last(int cache_count, CachePublish && publish_cache, GlobalPublish && publish_global) {
+    for (int i = 0; i < cache_count; ++i) {
+        publish_cache(i);
+    }
+    publish_global();
+}
+
 struct placement_cache_read {
     placement_cache_coherence             coherence = placement_cache_coherence::GENUINE_NO_PLAN;
     std::shared_ptr<const placement_plan> owner;
@@ -1069,6 +1080,10 @@ bool lifecycle_publish_placement_plan(
     bool                                             have_actual,
     std::shared_ptr<const lifecycle_plan_snapshot> * published_out = nullptr) noexcept;
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(uint64_t model_id,
+                                                                               uint64_t load_txn_id,
+                                                                               uint32_t slot,
+                                                                               uint64_t slot_generation) noexcept;
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,

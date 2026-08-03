@@ -352,8 +352,14 @@ llama_context::llama_context(
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             if (llama_context_dev_is_sycl(dev)) {
-                ggml_backend_sycl_set_runtime_context(backend.get(), cparams.n_ctx, cparams.n_ubatch,
-                                                      cparams.n_seq_max);
+                const auto &                owner = model.get_sycl_model_token();
+                const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
+                                                      owner.slot_generation };
+                const auto rc = ggml_backend_sycl_set_runtime_context_for_model(backend.get(), token, cparams.n_ctx,
+                                                                                cparams.n_ubatch, cparams.n_seq_max);
+                if (rc != GGML_SYCL_LIFECYCLE_OK) {
+                    throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+                }
             }
         }
 #endif
