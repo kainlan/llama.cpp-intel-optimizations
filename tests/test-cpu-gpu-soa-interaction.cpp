@@ -330,7 +330,7 @@ bool test_cpu_gpu_path_with_soa() {
         return false;
     }
 
-    printf("  PASS: CPU→GPU path works correctly with SoA reordering\n");
+    printf("  PASS: Local CPU→GPU transfer harness passed with production Q4_0 reorder\n");
     return true;
 }
 
@@ -530,8 +530,7 @@ int main() {
         if (failed > 0) {
             printf("\nBug detected in one of the tests.\n");
         } else {
-            printf("\nAll production-path checks passed.\n");
-            printf("The bug is in higher-level ggml integration, not kernel code.\n");
+            printf("\nAll local transfer harness, production Q4_0 reorder, and inline dequantization checks passed.\n");
         }
 
         return failed > 0 ? 1 : 0;
