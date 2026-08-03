@@ -97,11 +97,13 @@ Reset does not override ownership. Weight reclaim is ownership- and mode-aware:
 `reset_model_weight_entries()` preserves entries with active `mem_handle` leases,
 entries owned by any live model even when `in_use_count == 0`, and unattributed
 entries when the current reclaim mode and live-model mask require it. It reclaims
-only entries for which `weight_entry_reclaimable()` returns true. An attributed
-entry that remains leased with no live model owner is diagnosed separately as an
-ownerless lease and may abort when `GGML_SYCL_STRICT_LEASES=1`; it is not treated
-as legitimate concurrent-model ownership. Whole-zone resets cannot preserve a
-single allocation, so `host_zone_reset()` and `zone_reset()` refuse the entire
+only entries for which `weight_entry_reclaimable()` returns true. Outside
+`MID_LOAD_REPLAN`, an attributed entry that remains leased with no live model
+owner is diagnosed separately as an ownerless lease and may abort when
+`GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are
+suppressed during `MID_LOAD_REPLAN`, and the state is not treated as legitimate
+concurrent-model ownership. Whole-zone resets cannot preserve a single
+allocation, so `host_zone_reset()` and `zone_reset()` refuse the entire
 reset while the target zone contains live registered allocations (`4afdb6d9f`).
 Callers must release the owning handles and retry; they must not purge ownership
 records or force reclamation.

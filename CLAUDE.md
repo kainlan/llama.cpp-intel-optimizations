@@ -411,11 +411,13 @@ model even when `in_use_count == 0`, and unattributed entries when the reclaim
 mode and live-model mask require preservation. Only entries that predicate
 permits may be reclaimed.
 
-Leak diagnosis remains separate from legitimate concurrency. An attributed
-entry that is still leased but has no live model owner is reported as an
-ownerless leaked lease; outside mid-load replan it may abort when
-`GGML_SYCL_STRICT_LEASES=1`. Do not classify that state as another model's valid
-ownership, and do not infer reclaimability from `in_use_count` alone.
+Leak diagnosis remains separate from legitimate concurrency. Outside
+`MID_LOAD_REPLAN`, an attributed entry that is still leased but has no live
+model owner is reported as an ownerless leaked lease and may abort when
+`GGML_SYCL_STRICT_LEASES=1`; ownerless classification, including that warning
+and strict abort, is suppressed during `MID_LOAD_REPLAN`. Do not classify that
+state as another model's valid ownership, and do not infer reclaimability from
+`in_use_count` alone.
 
 Raw pointers are not ownership tokens and must not model allocation state. They
 are only transient ABI views resolved from `mem_handle` for immediate kernel
@@ -872,9 +874,11 @@ passing two `-m` flags aborts at the model switch with a leaked model-weight
 the ownership contract. Current model-weight reclaim preserves active leases,
 live-model-owned entries even when `in_use_count == 0`, and unattributed entries
 when required by the reclaim mode and live-model mask; it reclaims only entries
-permitted by `weight_entry_reclaimable()`. Attributed leases with no live model
-owner are diagnosed separately and may abort under `GGML_SYCL_STRICT_LEASES=1`.
-Since `4afdb6d9f`, host and device whole-zone resets refuse a reset that would
+permitted by `weight_entry_reclaimable()`. Outside `MID_LOAD_REPLAN`, attributed
+leases with no live model owner are diagnosed separately and may abort under
+`GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are
+suppressed during `MID_LOAD_REPLAN`. Since `4afdb6d9f`, host and device
+whole-zone resets refuse a reset that would
 reclaim live registered allocations. Neither path force-reclaims another model's
 memory.
 
