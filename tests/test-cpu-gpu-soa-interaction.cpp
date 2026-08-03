@@ -1,9 +1,11 @@
-// Unit test for CPU→GPU data path with SoA reordering
-// Tests the actual inp_embd bug scenario using ACTUAL kernel functions
-// from dequantize.hpp and the reorder kernel from ggml-sycl.cpp
+// Unit test for CPU→GPU data path with SoA reordering.
+// Calls production dequantizers from dequantize.hpp and the production Q4_0
+// reorder path from ggml-sycl.cpp. CPU GET_ROWS and DMMV remain test harnesses.
 //
 // Build: cmake --build build --target test-cpu-gpu-soa-interaction
 // Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-cpu-gpu-soa-interaction
+
+#include "dequantize.hpp"
 
 #include <sycl/sycl.hpp>
 #include <cstdio>
@@ -12,104 +14,26 @@
 #include <cmath>
 #include <vector>
 
-// ============================================================================
-// ACTUAL definitions from ggml-common.h
-// ============================================================================
-#define QK4_0 32
-#define QR4_0 2
-#define WARP_SIZE 32
-
-// ACTUAL block_q4_0 struct from ggml-common.h
-typedef struct {
-    sycl::half d;        // delta (fp16)
-    uint8_t qs[QK4_0/2]; // nibbles / quants (16 bytes)
-} block_q4_0;
-
-static_assert(sizeof(block_q4_0) == 18, "block_q4_0 size mismatch");
-
-// ACTUAL dfloat2 type from common.hpp
-typedef sycl::float2 dfloat2;
-typedef float dfloat;
-
-// ============================================================================
-// ACTUAL dequantize_q4_0 from dequantize.hpp (AoS version)
-// ============================================================================
-static inline void dequantize_q4_0(const void *vx, const int64_t ib,
-                                    const int iqs, dfloat2 &v) {
-    const block_q4_0 * x = (const block_q4_0 *) vx;
-
-    const dfloat d = x[ib].d;
-
-    const int vui = x[ib].qs[iqs];
-
-    v.x() = vui & 0xF;
-    v.y() = vui >> 4;
-
-    v.x() = (v.x() - 8.0f) * d;
-    v.y() = (v.y() - 8.0f) * d;
-}
-
-// ============================================================================
-// ACTUAL dequantize_q4_0_reorder from dequantize.hpp (SoA version)
-// ============================================================================
-static inline void dequantize_q4_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
-                                            const int iqs, dfloat2 &v) {
-    const dfloat d = (const dfloat)*((const sycl::half*)d_ptr+ib);
-
-    const int vui = *((const uint8_t *)qs+iqs);
-
-    v.x() = vui & 0xF;
-    v.y() = vui >> 4;
-
-    v.x() = (v.x() - 8.0f) * d;
-    v.y() = (v.y() - 8.0f) * d;
-}
-
-// ============================================================================
-// ACTUAL reorder kernel from ggml-sycl.cpp reorder_qw_q4_0
-// ============================================================================
-void reorder_q4_0_to_soa_actual(sycl::queue& stream, uint8_t* data_device,
+// Exercise the production Q4_0 reorder entry point. This dispatches through
+// reorder_rows_to_soa() to reorder_qw_q4_0() in ggml-sycl.cpp.
+bool reorder_q4_0_to_soa_actual(sycl::queue& stream, uint8_t* data_device,
                                  int ncols, int nrows) {
-    const int nblocks = nrows * (ncols / QK4_0);
-    size_t size = nblocks * sizeof(block_q4_0);
-
-    // ACTUAL: allocate temp buffer
-    uint8_t* tmp_buf = sycl::malloc_device<uint8_t>(size, stream);
-
-    // ACTUAL: copy to temp (matches ggml-sycl.cpp line 8602)
-    stream.memcpy(tmp_buf, data_device, size).wait();
-
-    // ACTUAL: compute SoA pointers (matches ggml-sycl.cpp lines 8610-8611)
-    auto qs_ptr = data_device;
-    auto d_ptr = (sycl::half*)(qs_ptr + ncols * nrows / 2);
-
-    // ACTUAL: parallel_for reorder kernel (matches ggml-sycl.cpp lines 8638-8649)
-    stream.parallel_for(
-        size / sizeof(block_q4_0),
-        [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            const block_q4_0* x = (const block_q4_0*)tmp_buf;
-            const int ib = i;
-
-            for (int j = 0; j < QK4_0/2; j++) {
-                *(qs_ptr + ib * QK4_0 / 2 + j) = x[ib].qs[j];
-            }
-            *(d_ptr + ib) = x[ib].d;
-        }).wait();
-
-    sycl::free(tmp_buf, stream);
+    const size_t size = nrows * (ncols / QK4_0) * sizeof(block_q4_0);
+    return reorder_rows_to_soa(data_device, GGML_TYPE_Q4_0, ncols, nrows, size, &stream);
 }
 
 // ============================================================================
-// ACTUAL DMMV kernel pattern from dmmv.cpp dequantize_mul_mat_vec_reorder
+// Test-local DMMV reference patterned after dequantize_mul_mat_vec_reorder.
+// This is not production DMMV coverage; it does call the production dequantizer.
 // ============================================================================
 #define GGML_SYCL_DMMV_X 32
 
-void dmmv_q4_0_soa_actual(sycl::queue& q, const uint8_t* soa_data,
+void dmmv_q4_0_soa_reference(sycl::queue& q, const uint8_t* soa_data,
                           const float* y_vec, float* result,
                           int ncols, int nrows) {
-    const int iter_stride = 2 * GGML_SYCL_DMMV_X;  // ACTUAL: from dmmv.cpp
-    const int vals_per_iter = 2;  // ACTUAL: from dmmv.cpp
-    const int d_offset = nrows * ncols / 2;  // ACTUAL: SoA d offset
+    const int iter_stride = 2 * GGML_SYCL_DMMV_X;  // patterned after dmmv.cpp
+    const int vals_per_iter = 2;
+    const int d_offset = nrows * ncols / 2;  // SoA d offset
 
     const sycl::half* d_base = (const sycl::half*)(soa_data + d_offset);
 
@@ -121,26 +45,26 @@ void dmmv_q4_0_soa_actual(sycl::queue& q, const uint8_t* soa_data,
 
             float tmp = 0.0f;
 
-            // ACTUAL: iteration pattern from dmmv.cpp
+            // Reference iteration pattern based on dmmv.cpp.
             for (int i = 0; i < ncols; i += iter_stride) {
                 const int col = i + vals_per_iter * tid;
                 const int ib = row * blocks_per_row + col / QK4_0;
                 const int iqs = (col % QK4_0) / vals_per_iter;
 
-                // ACTUAL: SoA data access pattern
+                // Test-local SoA data access pattern.
                 const uint8_t* qs = soa_data + ib * (QK4_0/2);
 
                 dfloat2 v;
-                // ACTUAL: call dequantize_q4_0_reorder
+                // Call the production dequantize_q4_0_reorder.
                 dequantize_q4_0_reorder(d_base, ib, qs, iqs, v);
 
-                // ACTUAL: multiply-accumulate with y vector
+                // Reference multiply-accumulate with y vector.
                 const float* y_col = y_vec + col;
                 tmp += v.x() * y_col[0];
                 tmp += v.y() * y_col[QK4_0/2];
             }
 
-            // ACTUAL: sub-group reduction
+            // Reference sub-group reduction.
             auto sg = item.get_sub_group();
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
                 tmp += sycl::shift_group_left(sg, tmp, offset);
@@ -169,9 +93,9 @@ void cpu_dequantize_q4_0(const block_q4_0* src, float* dst, int nblocks) {
 // TESTS
 // ============================================================================
 
-// Test 1: Verify ACTUAL dequantize functions match
+// Test 1: Verify production dequantize functions match
 bool test_actual_dequantize_functions() {
-    printf("Test 1: Verify ACTUAL dequantize_q4_0 vs dequantize_q4_0_reorder\n");
+    printf("Test 1: Verify production dequantize_q4_0 vs dequantize_q4_0_reorder\n");
 
     sycl::queue q{sycl::gpu_selector_v};
     printf("  Device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
@@ -209,10 +133,10 @@ bool test_actual_dequantize_functions() {
         for (int iqs = 0; iqs < QK4_0/2; iqs++) {
             dfloat2 v_aos, v_soa;
 
-            // ACTUAL dequantize_q4_0 (AoS)
+            // Production dequantize_q4_0 (AoS)
             dequantize_q4_0(aos_data.data(), ib, iqs, v_aos);
 
-            // ACTUAL dequantize_q4_0_reorder (SoA)
+            // Production dequantize_q4_0_reorder (SoA)
             const uint8_t* qs = soa_data.data() + ib * (QK4_0/2);
             dequantize_q4_0_reorder(d_ptr, ib, qs, iqs, v_soa);
 
@@ -236,9 +160,9 @@ bool test_actual_dequantize_functions() {
     return true;
 }
 
-// Test 2: Verify ACTUAL GPU reorder kernel
+// Test 2: Verify the production GPU reorder path
 bool test_actual_reorder_kernel() {
-    printf("Test 2: Verify ACTUAL GPU reorder kernel\n");
+    printf("Test 2: Verify production GPU reorder path\n");
 
     sycl::queue q{sycl::gpu_selector_v};
 
@@ -260,8 +184,12 @@ bool test_actual_reorder_kernel() {
     uint8_t* gpu_data = sycl::malloc_device<uint8_t>(size, q);
     q.memcpy(gpu_data, aos_data.data(), size).wait();
 
-    // ACTUAL reorder kernel
-    reorder_q4_0_to_soa_actual(q, gpu_data, ncols, nrows);
+    // Production reorder kernel
+    if (!reorder_q4_0_to_soa_actual(q, gpu_data, ncols, nrows)) {
+        sycl::free(gpu_data, q);
+        printf("  FAIL: production Q4_0 reorder rejected the request\n");
+        return false;
+    }
 
     // Copy back
     std::vector<uint8_t> soa_result(size);
@@ -358,8 +286,13 @@ bool test_cpu_gpu_path_with_soa() {
 
         // Step 3: SoA reorder on weights (first token only, simulates prompt phase)
         if (token == 1) {
-            printf("  Token 1: ACTUAL SoA reorder on weights...\n");
-            reorder_q4_0_to_soa_actual(q, gpu_weights, weight_cols, weight_rows);
+            printf("  Token 1: production SoA reorder on weights...\n");
+            if (!reorder_q4_0_to_soa_actual(q, gpu_weights, weight_cols, weight_rows)) {
+                sycl::free(gpu_weights, q);
+                sycl::free(gpu_inp_embd, q);
+                printf("  FAIL: production Q4_0 reorder rejected the request\n");
+                return false;
+            }
         }
 
         // Step 4: GPU reads inp_embd - copy back and verify
@@ -444,8 +377,11 @@ bool test_usm_host_memory() {
         cpu_dequantize_q4_0(token_data.data(), usm_inp_embd, nblocks);
 
         // SoA reorder on first token
-        if (token == 1) {
-            reorder_q4_0_to_soa_actual(q, gpu_weights, 4096, 128);
+        if (token == 1 && !reorder_q4_0_to_soa_actual(q, gpu_weights, 4096, 128)) {
+            sycl::free(gpu_weights, q);
+            sycl::free(usm_inp_embd, q);
+            printf("  FAIL: production Q4_0 reorder rejected the request\n");
+            return false;
         }
 
         // GPU reads USM host memory directly
@@ -494,9 +430,9 @@ bool test_usm_host_memory() {
     return true;
 }
 
-// Test 5: Full DMMV with SoA (ACTUAL kernel pattern)
-bool test_dmmv_soa_actual() {
-    printf("Test 5: ACTUAL DMMV kernel with SoA layout\n");
+// Test 5: test-local DMMV reference with production dequantization
+bool test_dmmv_soa_reference() {
+    printf("Test 5: DMMV reference with production SoA dequantization\n");
 
     sycl::queue q{sycl::gpu_selector_v};
 
@@ -525,11 +461,17 @@ bool test_dmmv_soa_actual() {
     q.memcpy(gpu_weights, aos_data.data(), size).wait();
     q.memcpy(gpu_y, y_vec.data(), ncols * sizeof(float)).wait();
 
-    // Reorder to SoA
-    reorder_q4_0_to_soa_actual(q, gpu_weights, ncols, nrows);
+    // Reorder to SoA through the production entry point.
+    if (!reorder_q4_0_to_soa_actual(q, gpu_weights, ncols, nrows)) {
+        sycl::free(gpu_weights, q);
+        sycl::free(gpu_y, q);
+        sycl::free(gpu_result, q);
+        printf("  FAIL: production Q4_0 reorder rejected the request\n");
+        return false;
+    }
 
-    // Run ACTUAL DMMV kernel
-    dmmv_q4_0_soa_actual(q, gpu_weights, gpu_y, gpu_result, ncols, nrows);
+    // Run the test-local DMMV reference.
+    dmmv_q4_0_soa_reference(q, gpu_weights, gpu_y, gpu_result, ncols, nrows);
 
     // Get result
     std::vector<float> result(nrows);
@@ -555,13 +497,13 @@ bool test_dmmv_soa_actual() {
         return false;
     }
 
-    printf("  PASS: ACTUAL DMMV kernel works correctly with SoA\n");
+    printf("  PASS: DMMV reference works correctly with production SoA dequantization\n");
     return true;
 }
 
 int main() {
-    printf("=== CPU→GPU SoA Interaction Tests (ACTUAL Kernels) ===\n");
-    printf("Using ACTUAL kernel functions from dequantize.hpp and ggml-sycl.cpp\n\n");
+    printf("=== CPU→GPU SoA Interaction Tests ===\n");
+    printf("Using production dequantization and Q4_0 reorder paths\n\n");
 
     try {
         int passed = 0;
@@ -579,7 +521,7 @@ int main() {
         if (test_usm_host_memory()) passed++; else failed++;
         printf("\n");
 
-        if (test_dmmv_soa_actual()) passed++; else failed++;
+        if (test_dmmv_soa_reference()) passed++; else failed++;
         printf("\n");
 
         printf("=================================\n");
@@ -588,7 +530,7 @@ int main() {
         if (failed > 0) {
             printf("\nBug detected in one of the tests.\n");
         } else {
-            printf("\nAll tests passed with ACTUAL kernel functions.\n");
+            printf("\nAll production-path checks passed.\n");
             printf("The bug is in higher-level ggml integration, not kernel code.\n");
         }
 
