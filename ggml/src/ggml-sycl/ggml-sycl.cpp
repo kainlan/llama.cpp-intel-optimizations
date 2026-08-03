@@ -34086,6 +34086,18 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
         GGML_LOG_WARN("[SYCL] CPU fallback ctx init failed (%s)\n", reason ? reason : "unknown");
         return false;
     }
+    struct cpu_fallback_resources {
+        ggml_context *    gctx;
+        ggml_threadpool_t tp = nullptr;
+        ~cpu_fallback_resources() noexcept {
+            if (tp) {
+                ggml_threadpool_free(tp);
+            }
+            if (gctx) {
+                ggml_free(gctx);
+            }
+        }
+    } resources{ gctx };
     ggml_cgraph * graph = ggml_new_graph_custom(gctx, graph_nodes, false);
     // This fallback runs while the main scheduled graph is already executing.
     // Only compute the current node from its already-produced inputs; expanding
@@ -34094,10 +34106,9 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_graph_add_node(graph, dst);
     ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
     ggml_threadpool_t      tp  = ggml_threadpool_new(&tpp);
+    resources.tp = tp;
     if (!tp) {
         GGML_LOG_WARN("[SYCL] CPU fallback threadpool alloc failed (%s)\n", reason ? reason : "unknown");
-        ggml_free(gctx);
-
         return false;
     }
 
@@ -34110,6 +34121,16 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     };
 
     std::vector<fallback_host_copy> host_copies;
+    struct tensor_storage_restore_guard {
+        std::vector<fallback_host_copy> & copies;
+        ~tensor_storage_restore_guard() noexcept {
+            for (auto & entry : copies) {
+                ggml_sycl_assign_tensor_storage(entry.tensor, entry.orig);
+                entry.handle = {};
+                entry.host_ptr = nullptr;
+            }
+        }
+    } storage_guard{ host_copies };
     host_copies.reserve(static_cast<size_t>(graph->n_nodes + graph->n_leafs));
     std::unordered_set<ggml_tensor *> seen;
     seen.reserve(static_cast<size_t>(graph->n_nodes + graph->n_leafs));
@@ -34159,10 +34180,12 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
                 ggml_sycl_copy_handle_for_raw_ptr(tensor_ptr, GGML_LAYOUT_AOS, ctx.device);
             ggml_sycl::mem_copy(entry.handle, device_handle, bytes, *stream);
         }
-        ggml_sycl_assign_tensor_storage(t, entry.host_ptr);
+        // Own the allocation and original pointer before publishing storage.
+        // If push_back throws, entry releases the allocation and t is untouched.
+        host_copies.push_back(std::move(entry));
+        ggml_sycl_assign_tensor_storage(t, host_copies.back().host_ptr);
         staged_tensors++;
         staged_bytes += bytes;
-        host_copies.push_back(std::move(entry));
     };
     auto stage_tensor_tree = [&](auto && self, ggml_tensor * t, bool is_output) -> void {
         if (!t) {
@@ -34193,8 +34216,6 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
     if (staging_failed) {
         restore_host_copies();
-        ggml_threadpool_free(tp);
-        ggml_free(gctx);
         GGML_LOG_WARN("[SYCL] CPU fallback staging failed (%s)\n", reason ? reason : "unknown");
         return false;
     }
@@ -34210,9 +34231,6 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
             plan.work_data = plan_work.data();
         } catch (const std::bad_alloc &) {
             GGML_LOG_WARN("[SYCL] CPU fallback work buffer alloc failed (%s)\n", reason ? reason : "unknown");
-            ggml_threadpool_free(tp);
-            ggml_free(gctx);
-
             restore_host_copies();
             return false;
         }
@@ -34222,9 +34240,6 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const ggml_status status = ggml_graph_compute(graph, &plan);
     GGML_SYCL_DEBUG("[SYCL-CPU-FALLBACK] compute-end reason=%s status=%d\n", reason ? reason : "unknown", (int) status);
-    ggml_threadpool_free(tp);
-    ggml_free(gctx);
-
     if (dst_is_device && dst_device_ptr) {
         ggml_sycl::mem_handle dst_handle =
             ggml_sycl_copy_handle_for_raw_ptr(dst_device_ptr, GGML_LAYOUT_AOS, ctx.device);
@@ -73747,6 +73762,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
 
     return true;
 
+} catch (const ggml_sycl_fallback_error &) {
+    throw;
 } catch (const dnnl::error & e) {
     if (g_ggml_sycl_graph_recording) {
         throw;
@@ -84646,6 +84663,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
         }
     };
 
+    const size_t segmented_retained_baseline = sycl_ctx->graph_retained_handles.size();
     for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
         const auto &  seg                  = segments[seg_idx];
         const int     seg_size             = seg.end - seg.start;
@@ -84739,6 +84757,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             }
 
         } catch (const sycl::exception & exc) {
+            try { sycl_ctx->graph_retained_handles.resize(segmented_retained_baseline); } catch (...) {}
             g_ggml_sycl_graph_recording = false;
             g_recording_graph_ptr       = nullptr;
             g_recording_queue_ptr       = nullptr;
@@ -84750,6 +84769,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
             return false;
         } catch (const std::exception & exc) {
+            try { sycl_ctx->graph_retained_handles.resize(segmented_retained_baseline); } catch (...) {}
             g_ggml_sycl_graph_recording = false;
             g_recording_graph_ptr       = nullptr;
             g_recording_queue_ptr       = nullptr;
@@ -94561,6 +94581,7 @@ normal_dispatch:
         // Cleanup must never mask the recoverable status. Drain prior work
         // before releasing leases or allowing deferred cache frees.
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+        try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
         if (cleanup_ctx) {
             try {
                 if (cleanup_ctx->last_graph_event) {

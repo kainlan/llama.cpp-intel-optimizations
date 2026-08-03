@@ -32,23 +32,41 @@ prefix_dtor = re.search(r"~prefix_suffix_guard\(\) noexcept \{(.*?)\n        \}"
 assert "dispatch_suffix" not in prefix_dtor
 assert "suffix_guard.dispatch_suffix();" in sycl
 
-# Non-DL staging OOM/copy exceptions restore all tensor pointers and free CPU
-# resources before graph planning can run.
+# compute_forward must not convert the recoverable fallback into its generic
+# std::exception fatal-exit path.
+cf_fallback = sycl.index("catch (const ggml_sycl_fallback_error &)")
+cf_generic = sycl.index("catch (const std::exception & e)", cf_fallback)
+assert cf_fallback < cf_generic and "throw;" in sycl[cf_fallback:cf_generic]
+
+# Non-DL staging reserve/push/copy failures restore all tensor pointers and
+# release CPU resources before graph planning can run.
 staging_check = sycl.index("if (staging_failed)")
 plan = sycl.index("ggml_graph_plan", staging_check)
 block = sycl[staging_check:plan]
-for token in ("restore_host_copies()", "ggml_threadpool_free(tp)", "ggml_free(gctx)", "return false"):
+for token in ("restore_host_copies()", "return false"):
     assert token in block
+assert "struct cpu_fallback_resources" in sycl and "~cpu_fallback_resources() noexcept" in sycl
+fallback_start = sycl.index("struct cpu_fallback_resources")
+assert sycl.index("host_copies.reserve", fallback_start) < sycl.index("unified_alloc(req", fallback_start)
+assert sycl.index("host_copies.push_back(std::move(entry))") < sycl.index("ggml_sycl_assign_tensor_storage(t, host_copies.back().host_ptr)")
+assert "struct tensor_storage_restore_guard" in sycl and "~tensor_storage_restore_guard() noexcept" in sycl
 
 # Boundary cleanup drains prior submissions and deferred scatters, unpins
 # transient leases, and clears active/deferred state before FAILED.
 catch = sycl.index("catch (const ggml_sycl_fallback_error & error)")
 failed = sycl.index("return GGML_STATUS_FAILED", catch)
 cleanup = sycl[catch:failed]
-for token in ("last_graph_event->wait_and_throw", "stream()->wait_and_throw",
+for token in ("ggml_sycl_cpu_tg_flush_pending", "last_graph_event->wait_and_throw", "stream()->wait_and_throw",
               "flush_pending_secondary_scatter", "ggml_sycl_cpu_staging_drain",
               "graph_unpin_transient_leases_after_direct_execution",
               "last_graph_event_deferred_decode = false",
               "unified_cache_set_graph_compute_active(false)"):
     assert token in cleanup
+assert cleanup.index("ggml_sycl_cpu_tg_flush_pending") < cleanup.index("last_graph_event->wait_and_throw")
+
+# Each segmented attempt snapshots retained handles and rolls additions back on
+# either SYCL or generic failure before publishing context graph state.
+assert "const size_t segmented_retained_baseline = sycl_ctx->graph_retained_handles.size()" in sycl
+assert sycl.count("graph_retained_handles.resize(segmented_retained_baseline)") >= 2
+assert sycl.index("graph_retained_handles.resize(segmented_retained_baseline)") < sycl.index("sycl_ctx->moe_segments           = std::move(recorded_segments)")
 print("SYCL fallback exception safety source injections: PASS")
