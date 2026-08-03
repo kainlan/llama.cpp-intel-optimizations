@@ -1,7 +1,8 @@
 # Canonical SYCL Memory Architecture Contract
 
-*Status: in-force as of 2026-04-27. All new SYCL backend code must comply. Migration
-tasks for existing non-conforming sites are tracked in `llama.cpp-32dg8`.*
+*Status: in force since 2026-04-27; last updated 2026-08-03. All new SYCL backend
+code must comply. Migration tasks for existing non-conforming sites are tracked
+in `llama.cpp-32dg8`.*
 
 ---
 
@@ -85,6 +86,28 @@ these four `host_zone_id` zones.
 - Kernel dispatch logic (the dispatch router owns that).
 - Memory allocated inside tests (see §8).
 - ggml buffer allocations at the public `ggml_backend` API boundary (see §8).
+
+**Authority is not optional.** Commit `9a0670712` removed optional cache
+enablement and the cache enable/disable branches, including the
+`unified_cache_enabled()` check of the now-unread `GGML_SYCL_UNIFIED_CACHE`
+opt-out. `GGML_SYCL_UNIFIED_CACHE_MODE` is reserved for topology selection
+(`auto`, `global`, or `per_device`); it does not disable the cache, and no
+replacement enable/disable control exists. See §9.3 for the migration rule.
+
+Reset does not override ownership. Weight reclaim is ownership- and mode-aware:
+`reset_model_weight_entries()` preserves entries with active `mem_handle` leases,
+entries owned by any live model even when `in_use_count == 0`, and unattributed
+entries when the current reclaim mode and live-model mask require it. It reclaims
+only entries for which `weight_entry_reclaimable()` returns true. Outside
+`MID_LOAD_REPLAN`, an attributed entry that remains leased with no live model
+owner is diagnosed separately as an ownerless lease and may abort when
+`GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are
+suppressed during `MID_LOAD_REPLAN`, and the state is not treated as legitimate
+concurrent-model ownership. Whole-zone resets cannot preserve a single
+allocation, so `host_zone_reset()` and `zone_reset()` refuse the entire
+reset while the target zone contains live registered allocations (`4afdb6d9f`).
+Callers must release the owning handles and retry; they must not purge ownership
+records or force reclamation.
 
 ### 1.3 `mem_handle` (`ggml_sycl::mem_handle`)
 
@@ -214,12 +237,20 @@ SYCL work that uses the pointer.
 
 ## 5. Process-Scoped vs Context/Slot-Scoped State
 
-A single process may load one model (process-scoped) and serve multiple concurrent
-inference contexts or server slots (context/slot-scoped). The contract distinguishes:
+A process may switch models sequentially, keep multiple `llama_model` objects
+alive, and create multiple contexts. Those object lifetimes are distinct from
+execution support: current planner globals are process-wide rather than keyed by
+model, and per-device arena state is not keyed by context. The graph-compute
+eviction guard and graph-compute mutex are separate process-global state. Live
+ownership must therefore be safe across coexisting objects, but concurrent
+inference on the same SYCL device is not supported. The mutex does not
+universally serialize submission or device execution; §5.3 defines the mixed
+path taxonomy and the resulting overlap. The contract distinguishes:
 
 ### 5.1 Process-scoped (model) state
 
-Owned by one model load; immutable after load completes; shared across all contexts:
+Associated with the currently active model load; immutable after that load
+completes and shared by its contexts:
 
 | Global / struct | Current location | Correct scope |
 |---|---|---|
@@ -233,7 +264,10 @@ Owned by one model load; immutable after load completes; shared across all conte
 | `placement_plan::layer_device`, `expert_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
 
 **Invariant:** No context-level operation (graph compute, KV reset, slot eviction)
-may modify model-scoped globals. Read-only access is safe across threads.
+may modify model-scoped globals. A load or reset must preserve weight entries
+owned by every still-live model object. These process-wide globals are not
+model-keyed concurrency state, and read-only access does not make same-device
+concurrent graph compute safe.
 
 ### 5.2 Context/slot-scoped state
 
@@ -250,20 +284,42 @@ Owned per inference context; reset between requests or at context free:
 | MoE routing buffers | RUNTIME zone | Per-inference reset |
 | Staging / DMA buffers | HOST / RUNTIME | Per-weight-stream event |
 
-**Invariant:** `arena_reserve` resets KV + RUNTIME + HOST zones only for the owning
-device's cache. It must not reset another context's zones. Until T1 (`llama.cpp-32dg8.2`)
-adds explicit context ownership keys, callers must ensure single-active-context per
-device.
+**Invariant:** `arena_reserve` requests resets of KV + RUNTIME + HOST zones only
+for the owning device's cache. A reset proceeds only when the target zone has no
+live registered allocations; otherwise the reset is refused and existing
+allocations are preserved. It must not reset another context's zones. Until T1
+(`llama.cpp-32dg8.2`) adds explicit context ownership keys, callers must ensure
+single-active-context per device.
 
-### 5.3 Multi-user / server concurrency
+### 5.3 Multiple models, contexts, and server slots
 
-For multi-server-slot operation:
-- Model-scoped globals (§5.1) are read-only after load — safe for concurrent readers.
-- Each server slot must have a distinct ggml context and dedicated KV/RUNTIME arena
-  reservation. Sharing an arena between slots is **not safe** under the current
-  implementation (tracked in `llama.cpp-32dg8.15.10`).
-- The `unified_cache_set_graph_compute_active` flag is per-device, not per-context;
-  concurrent graph compute on the same device is not supported.
+Keep these cases separate:
+- `llama-bench` with multiple `-m` values performs sequential model switches:
+  it frees the old model before loading the next one. It tests teardown and
+  reload, not simultaneous model or context execution.
+- Multiple model or context objects may remain alive. Their ownership records
+  and leases must coexist without one model load or teardown reclaiming another
+  live model's weights.
+- Object coexistence does not imply execution concurrency. Each server slot
+  would need a distinct context and context-keyed KV/RUNTIME arena reservation;
+  that ownership is not implemented yet (tracked in `llama.cpp-32dg8.15.10`).
+  `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
+  the process-global `g_graph_compute_active` eviction guard
+  (`unified-cache.cpp:303`). It is not per-device or per-context state.
+- Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
+  the current graph-compute entry point (`ggml-sycl.cpp:91438`) but does not
+  universally serialize submission. Direct/fallback paths explicitly release it
+  before `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). In contrast,
+  persistent-TG and deferred-copy paths submit while it remains held
+  (`ggml-sycl.cpp:91978`, `92084`, `92101`, `92159`), as do command-graph
+  record/replay paths (`ggml-sycl.cpp:92700`, `93161`, `93188`, `93298`).
+  Completion may still outlive the lock where a path permits deferred exit.
+  Thus host submission can overlap across graph-compute calls on direct/fallback
+  paths, and device execution may overlap across calls and devices; pure-GPU
+  decode may also return with kernels still in flight. Do not infer supported
+  concurrent inference or cache safety from either overlap. The distinct
+  same-device limitation remains: same-device concurrent inference is
+  unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
 ---
 
@@ -329,11 +385,12 @@ forms above with the understanding that they are scheduled for replacement.
 
 ### 7.3 Multi-context / Multi-server slot
 
-- Each llama context that shares a model sees the same `placement_plan` and the
-  same WEIGHT zone entries (read-only).
-- KV and RUNTIME zones must be reserved separately per context (see §5.2).
-- Concurrent inference on the same device is not safe until `llama.cpp-32dg8.15.10`
-  delivers explicit context-keyed arena ownership.
+The lifetime and execution distinctions in §5.3 apply. Contexts sharing a model
+may share its read-only `placement_plan` and WEIGHT entries, but the
+process-global mutex does not make host submission or device execution globally
+serial. Separately, same-device concurrent inference remains unsupported until
+`llama.cpp-32dg8.15.10` delivers explicit context-keyed KV/RUNTIME arena
+ownership.
 
 ---
 
@@ -398,11 +455,13 @@ dispatch is tracked in:
 | `llama.cpp-32dg8.10` | Migrate remaining op call sites |
 | `llama.cpp-32dg8.15.17` | Build host-fallback coverage matrix, file per-op blockers |
 
-### 9.3 Optional cache branches
+### 9.3 Removed cache opt-out
 
-The optional unified-cache mode has been removed. Remaining memory-routing branches
-should express concrete conditions such as weight eviction, placement-plan state, or
-host accessibility rather than cache enablement.
+The authority and topology contract is stated in §1.2. Migration must not
+reintroduce optional cache enablement or cache enable/disable branches;
+`GGML_SYCL_UNIFIED_CACHE_MODE` remains topology-only. Remaining memory-routing
+branches should express concrete conditions such as weight eviction,
+placement-plan state, or host accessibility rather than cache enablement.
 
 | Owner bead | Action |
 |---|---|

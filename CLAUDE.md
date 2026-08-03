@@ -365,8 +365,12 @@ GPU backends cache weights on-device for repeated inference:
 > key design constraint of the fork — read those before touching allocation,
 > dispatch, or eviction code. The rules below are the short form.
 
-The unified cache is the memory allocator for the SYCL backend. All SYCL
-backend GPU, host-pinned, staging, scratch, graph-temporary, KV, oneDNN, and
+The unified cache is the memory allocator for the SYCL backend. Its authority is
+not optional: `9a0670712` removed optional cache enablement and the enable/disable
+branches, including the now-unread `GGML_SYCL_UNIFIED_CACHE` opt-out. The distinct
+`GGML_SYCL_UNIFIED_CACHE_MODE` variable selects topology only; see the canonical
+contract §1.2 and §9.3 for details. All SYCL backend GPU, host-pinned, staging,
+scratch, graph-temporary, KV, oneDNN, and
 weight-layout allocations must flow through the unified-cache allocation APIs
 (`unified_alloc`, `unified_allocate`, cache materialization helpers, or wrappers
 that return `mem_handle`). Do not introduce direct `sycl::malloc_device`,
@@ -385,35 +389,47 @@ that still has a live handle; a live allocation at cleanup means a leaked
 reference or stale owner that must be fixed.
 
 ⚠️ **"At cleanup" is load-bearing, and was being read too broadly.** A live lease
-is a defect only when its **owner is gone**. Several `llama_model` objects may be
-loaded at once — that is supported public API, and `tests/test-thread-safety.cpp`
-exists to exercise it (it loads one model per GPU plus a CPU copy, then runs them
-concurrently). So **another live model's lease is correct, not leaked**, and a
-*new model's load* is not a quiescent point for anybody else's weights.
+is a defect only when its **owner is gone**. Several `llama_model` objects may
+remain loaded at once, so **another live model's lease is correct, not leaked**,
+and a *new model's load* is not a quiescent point for anybody else's weights.
+This lifetime rule does not promise concurrent inference. The
+`unified_cache_set_graph_compute_active(bool)` eviction guard and
+`g_sycl_graph_compute_mutex` are process-global, but the mutex does not
+universally serialize submission. Direct/fallback paths release it before
+`compute_impl` submission. In contrast, persistent-TG/deferred-copy paths and
+command-graph record/replay paths submit while the process-global mutex remains
+held. Completion may still outlive the lock where a path permits deferred exit.
+Thus host submission can overlap across calls on direct/fallback paths, and
+device execution may overlap across calls and devices; pure-GPU decode may also
+return with kernels still in flight. Do not infer supported concurrent inference
+or cache safety from either overlap. Separately, same-device concurrent inference
+remains unsupported because context-keyed KV/RUNTIME arena ownership is absent
+(canonical contract §5).
 
 Getting this backwards cost real time. `9a0670712` ("sycl: checkpoint unified
 memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
 continue with `GGML_ABORT`, plus the same in `host_zone_reset` and `zone_reset`.
 That made `test-llama-archs` and `test-thread-safety` — both `main`-labelled —
 fail deterministically, and each abort masked whatever came after it, so nobody
-connected the failures back. Restored in `acdb192d4`; the zone-reset siblings are
-tracked in `llama.cpp-fz2u`.
+connected the failures back. `acdb192d4` restored preserve-and-continue for
+leased weight entries; `4afdb6d9f` made whole-zone resets refuse the reset when
+live registered allocations prevent safe partial preservation.
 
-Two things this does **not** license:
+This does **not** license a general loosening. `mem_handle`'s destructor is still
+the sole release point, and reclaiming memory that still has a live handle is
+still forbidden. Current weight reclaim is ownership- and mode-aware and must use
+`weight_entry_reclaimable()`: it preserves active leases, entries owned by a live
+model even when `in_use_count == 0`, and unattributed entries when the reclaim
+mode and live-model mask require preservation. Only entries that predicate
+permits may be reclaimed.
 
-- **It is a scoped exception, not a general loosening.** `mem_handle`'s destructor
-  is still the sole release point, and reclaiming memory that still has a live
-  handle is still forbidden. `acdb192d4` *refuses to reclaim* — the opposite of a
-  forced reap.
-- **It costs leak detection at that site, knowingly.** That scan can no longer
-  distinguish "another live model owns this" from "something leaked it"; both now
-  warn and preserve. A future real leak will surface as a growing
-  `entries_preserved` count and eventual VRAM pressure, not a loud abort. Scoping
-  the reset per model would have kept both properties but is structurally
-  impossible: `unified-cache-key.hpp` deliberately excludes `model_id` from
-  `cache_id_equal` for GGUF weights, and the primary call site
-  (`ggml_backend_sycl_set_model_loading`) runs before any tensor of the incoming
-  model exists. See `llama.cpp-ljb9`.
+Leak diagnosis remains separate from legitimate concurrency. Outside
+`MID_LOAD_REPLAN`, an attributed entry that is still leased but has no live
+model owner is reported as an ownerless leaked lease and may abort when
+`GGML_SYCL_STRICT_LEASES=1`; ownerless classification, including that warning
+and strict abort, is suppressed during `MID_LOAD_REPLAN`. Do not classify that
+state as another model's valid ownership, and do not infer reclaimability from
+`in_use_count` alone.
 
 Raw pointers are not ownership tokens and must not model allocation state. They
 are only transient ABI views resolved from `mem_handle` for immediate kernel
@@ -864,10 +880,15 @@ timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
 Note `-p 0 -n 4` triggers planning but does **no prompt processing**, so paths
 reached only during PP will show zero activity. Use `-p 512` when you need them.
 
-**2. ONE model per process.** Passing two `-m` flags to a single `llama-bench`
-aborts at the model switch on a leaked model-weight `mem_handle` lease
-(`unified-cache.cpp`, `reset_model_weight_entries: leaked model-weight
-mem_handle lease`). Loop the shell, don't loop the flag.
+**2. Multiple `-m` values are sequential model switches.** `llama-bench` frees
+the previous model before loading one with different model parameters
+(`tools/llama-bench/llama-bench.cpp:2278-2284`). Thus a multi-`-m` run checks
+teardown and the next load; it does not test simultaneously loaded models or
+contexts. Multiple model/context objects may remain alive, and their live weight
+ownership must be preserved as described under **SYCL Memory Ownership** above.
+The process-global mutex does not make submission or device execution globally
+serial; the direct/fallback overlap and separate same-device limitation in the
+canonical contract §5 still apply.
 
 ### GPT-OSS Prompt Template Rule
 
@@ -1139,8 +1160,9 @@ semantic path times out on this store); there is no single standing task id.
 
 ### SYCL Environment Variables
 
-Full catalog (dispatch tuning, persistent-TG, memory hierarchy, cache,
-debugging — 240+ vars) is in **`docs/backend/sycl-env-vars.md`**. The
+The curated catalog (dispatch tuning, persistent-TG, memory hierarchy, cache,
+and debugging) is **`docs/backend/sycl-env-vars.md`**. Its accessor-independent
+literal-search command is the starting point for names not listed there. The
 load-bearing performance opt-outs (all default ON — flip to disable) that you
 most need to know:
 
@@ -1153,10 +1175,8 @@ most need to know:
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
 Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK=1`,
-`GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults),
-`GGML_SYCL_OP_TIMEOUT_MS=<N>` (abort before the xe GT-reset cascade). To find any
-var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
-(codescout `search_text`, or `grep -r`).
+`GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults), and
+`GGML_SYCL_OP_TIMEOUT_MS=<N>` (abort before the xe GT-reset cascade).
 
 ## CI and Validation
 
