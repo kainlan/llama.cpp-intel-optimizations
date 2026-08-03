@@ -158,6 +158,74 @@ static float cpu_dot_q6k_f32(const void* x_data, const float* y, int ncols) {
     return sum;
 }
 
+static constexpr float diagnostic_abs(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+static constexpr float gpu_q8_tolerance(float cpu_q8) {
+    return 1e-3f > 1e-4f * diagnostic_abs(cpu_q8) ? 1e-3f : 1e-4f * diagnostic_abs(cpu_q8);
+}
+
+static constexpr bool gpu_q8_observational_match(float gpu, float cpu_q8) {
+    return diagnostic_abs(gpu - cpu_q8) <= gpu_q8_tolerance(cpu_q8);
+}
+
+static constexpr bool q8_accounts_for_f32_delta(float gpu, float cpu_q8, float cpu_f32) {
+    const float q8_f32_abs = diagnostic_abs(cpu_q8 - cpu_f32);
+    const float q8_f32_error = diagnostic_abs(cpu_f32) > 1e-6f ? q8_f32_abs / diagnostic_abs(cpu_f32) : q8_f32_abs;
+    return gpu_q8_observational_match(gpu, cpu_q8) && q8_f32_error > 0.01f;
+}
+
+enum class q8_diagnostic_state {
+    not_evaluated,
+    consistent,
+    not_consistent,
+};
+
+static constexpr q8_diagnostic_state q8_diagnostic_summary(int f32_failures, int consistent_rows) {
+    return f32_failures == 0 ? q8_diagnostic_state::not_evaluated :
+           consistent_rows == f32_failures ? q8_diagnostic_state::consistent :
+                                             q8_diagnostic_state::not_consistent;
+}
+
+// Synthetic checks keep the observational threshold inclusive and the empty sample non-conclusive.
+static_assert(gpu_q8_observational_match(0.001f, 0.0f), "absolute threshold boundary must match");
+static_assert(!gpu_q8_observational_match(0.0011f, 0.0f), "values outside absolute threshold must not match");
+static_assert(gpu_q8_observational_match(10001.0f, 10000.0f), "relative threshold boundary must match");
+static_assert(!gpu_q8_observational_match(10001.1f, 10000.0f), "values outside relative threshold must not match");
+static_assert(q8_accounts_for_f32_delta(0.0205f, 0.02f, 0.0f),
+              "Q8-F32 crossing the F32 gate must account for a tightly matching GPU delta");
+static_assert(!q8_accounts_for_f32_delta(0.0105f, 0.01f, 0.0f),
+              "Q8-F32 at the F32 gate boundary must not account for a failing delta");
+static_assert(q8_diagnostic_summary(0, 0) == q8_diagnostic_state::not_evaluated,
+              "zero F32 failures must not produce a conclusion");
+
+static void format_relative_metric(char * buffer, size_t size, float reference, float relative_error) {
+    if (std::abs(reference) <= 1e-6f) {
+        snprintf(buffer, size, "N/A");
+    } else {
+        snprintf(buffer, size, "%.3f%%", relative_error * 100.0f);
+    }
+}
+
+static void print_q8_diagnostic_summary(int f32_failures, int consistent_rows) {
+    const q8_diagnostic_state state = q8_diagnostic_summary(f32_failures, consistent_rows);
+    if (state == q8_diagnostic_state::not_evaluated) {
+        printf("  Activation-quantization observation: not evaluated (no F32-failing sampled rows)\n");
+        return;
+    }
+
+    if (state == q8_diagnostic_state::consistent) {
+        printf("  Activation-quantization observation: all %d F32-failing sampled rows are consistent with activation quantization\n",
+               f32_failures);
+    } else {
+        printf("  Activation-quantization observation: %d/%d F32-failing sampled rows are consistent with activation quantization\n",
+               consistent_rows, f32_failures);
+    }
+    printf("    Observational only (does not establish causation): abs(GPU-CPU_Q8) <= max(1e-3, 1e-4*abs(CPU_Q8))\n");
+    printf("    and Q8-F32 independently crosses the same F32 failure gate\n");
+}
+
 // Test 1: Basic Q6_K MUL_MAT with single token (MMVQ path)
 bool test_q6k_mul_mat_single_token() {
     printf("Test 1: Q6_K MUL_MAT single token (MMVQ dispatch path)\n");
@@ -266,8 +334,9 @@ bool test_q6k_mul_mat_single_token() {
     printf("  Computing CPU reference...\n");
     const int test_rows = std::min(16, n_vocab);
     int mismatches = 0;
-    int q8_explained_mismatches = 0;
+    int q8_consistent_mismatches = 0;
     float max_rel_error = 0.0f;
+    bool has_relative_error = false;
 
     printf("  Sample row comparisons (positive control):\n");
     for (int row = 0; row < test_rows; row++) {
@@ -282,31 +351,38 @@ bool test_q6k_mul_mat_single_token() {
         float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
-        max_rel_error = std::max(max_rel_error, rel_error);
+        if (std::abs(cpu_val) > 1e-6f) {
+            max_rel_error = std::max(max_rel_error, rel_error);
+            has_relative_error = true;
+        }
 
+        char gpu_f32_rel_text[32];
+        char gpu_q8_rel_text[32];
+        char q8_f32_rel_text[32];
+        format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
         printf("    Row %2d: GPU=%10.6f CPU_F32=%10.6f CPU_Q8=%10.6f "
-               "GPU-F32 abs=%9.6f rel=%7.3f%% GPU-Q8 abs=%9.6f rel=%7.3f%% "
-               "Q8-F32 abs=%9.6f rel=%7.3f%%\n",
+               "GPU-F32 abs=%9.6f rel=%7s GPU-Q8 abs=%9.6f rel=%7s "
+               "Q8-F32 abs=%9.6f rel=%7s\n",
                row, gpu_val, cpu_val, cpu_q8_val,
-               abs_diff, rel_error * 100, gpu_q8_abs, gpu_q8_rel * 100,
-               q8_f32_abs, q8_f32_rel * 100);
+               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               q8_f32_abs, q8_f32_rel_text);
 
         if (rel_error > 0.01f) {  // 1% tolerance
             mismatches++;
-            if (gpu_q8_rel <= 0.01f) {
-                q8_explained_mismatches++;
+            if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
+                q8_consistent_mismatches++;
             }
         }
     }
 
-    printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
-    if (mismatches > 0 && q8_explained_mismatches == mismatches) {
-        printf("  Quantization explanation: CONFIRMED for all %d F32-failing sampled rows; GPU-vs-Q8 is within 1%%\n",
-               mismatches);
+    if (has_relative_error) {
+        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
     } else {
-        printf("  Quantization explanation: REFUTED for this sample (%d/%d F32-failing rows are within 1%% of Q8)\n",
-               q8_explained_mismatches, mismatches);
+        printf("  Max relative error: N/A\n");
     }
+    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
     printf("  Weight extra ptr: %p\n", weight->extra);
 
     // Cleanup
@@ -421,8 +497,9 @@ bool test_q6k_mistral_dimensions() {
     // Test specific rows (first, middle, last)
     int test_indices[] = {0, 100, 1000, 5000, 10000, n_ff - 1};
     int mismatches = 0;
-    int q8_explained_mismatches = 0;
+    int q8_consistent_mismatches = 0;
     float max_rel_error = 0.0f;
+    bool has_relative_error = false;
 
     printf("  Sample row comparisons (positive control):\n");
     for (int idx : test_indices) {
@@ -439,32 +516,39 @@ bool test_q6k_mistral_dimensions() {
         float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
-        max_rel_error = std::max(max_rel_error, rel_error);
+        if (std::abs(cpu_val) > 1e-6f) {
+            max_rel_error = std::max(max_rel_error, rel_error);
+            has_relative_error = true;
+        }
 
+        char gpu_f32_rel_text[32];
+        char gpu_q8_rel_text[32];
+        char q8_f32_rel_text[32];
+        format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
         const char* status_str = (rel_error <= 0.01f) ? "OK" : "FAIL";
         printf("    Row %5d: GPU=%10.4f CPU_F32=%10.4f CPU_Q8=%10.4f "
-               "GPU-F32 abs=%9.4f rel=%7.3f%% GPU-Q8 abs=%9.4f rel=%7.3f%% "
-               "Q8-F32 abs=%9.4f rel=%7.3f%% %s\n",
+               "GPU-F32 abs=%9.4f rel=%7s GPU-Q8 abs=%9.4f rel=%7s "
+               "Q8-F32 abs=%9.4f rel=%7s %s\n",
                idx, gpu_val, cpu_val, cpu_q8_val,
-               abs_diff, rel_error * 100, gpu_q8_abs, gpu_q8_rel * 100,
-               q8_f32_abs, q8_f32_rel * 100, status_str);
+               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               q8_f32_abs, q8_f32_rel_text, status_str);
 
         if (rel_error > 0.01f) {
             mismatches++;
-            if (gpu_q8_rel <= 0.01f) {
-                q8_explained_mismatches++;
+            if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
+                q8_consistent_mismatches++;
             }
         }
     }
 
-    printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
-    if (mismatches > 0 && q8_explained_mismatches == mismatches) {
-        printf("  Quantization explanation: CONFIRMED for all %d F32-failing sampled rows; GPU-vs-Q8 is within 1%%\n",
-               mismatches);
+    if (has_relative_error) {
+        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
     } else {
-        printf("  Quantization explanation: REFUTED for this sample (%d/%d F32-failing rows are within 1%% of Q8)\n",
-               q8_explained_mismatches, mismatches);
+        printf("  Max relative error: N/A\n");
     }
+    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
 
     // Cleanup
     ggml_backend_buffer_free(weight_buffer);
