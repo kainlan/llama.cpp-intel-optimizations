@@ -73,21 +73,38 @@ error Registry::enter_nested(LoadTxnId id) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Owner identity is checked before terminal/depth state. A mismatched call
     // poisons the actual active transaction.
-    if (active_txn_ != id.value) { poison_active_locked(); return error::WRONG_TRANSACTION; }
+    if (active_txn_ != id.value) {
+        poison_active_locked();
+        return error::WRONG_TRANSACTION;
+    }
     auto it = txns_.find(id.value);
-    if (id.value == 0 || it == txns_.end()) { poison_active_locked(); return error::WRONG_TRANSACTION; }
+    if (id.value == 0 || it == txns_.end()) {
+        poison_active_locked();
+        return error::WRONG_TRANSACTION;
+    }
     auto & txn = it->second;
-    if (txn.phase != finish_phase::ACTIVE || txn.depth == 0) { txn.poisoned = true; return error::DEPTH_UNDERFLOW; }
-    if (txn.depth >= depth_limit_ || txn.depth == UINT64_MAX) { txn.poisoned = true; return error::DEPTH_OVERFLOW; }
+    if (txn.phase != finish_phase::ACTIVE || txn.depth == 0) {
+        txn.poisoned = true;
+        return error::DEPTH_UNDERFLOW;
+    }
+    if (txn.depth >= depth_limit_ || txn.depth == UINT64_MAX) {
+        txn.poisoned = true;
+        return error::DEPTH_OVERFLOW;
+    }
     ++txn.depth;
     return error::OK;
 }
 
 error Registry::poison(LoadTxnId id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (active_txn_ != id.value) { poison_active_locked(); return error::WRONG_TRANSACTION; }
+    if (active_txn_ != id.value) {
+        poison_active_locked();
+        return error::WRONG_TRANSACTION;
+    }
     auto it = txns_.find(id.value);
-    if (it == txns_.end() || it->second.phase != finish_phase::ACTIVE) return error::WRONG_TRANSACTION;
+    if (it == txns_.end() || it->second.phase != finish_phase::ACTIVE) {
+        return error::WRONG_TRANSACTION;
+    }
     it->second.poisoned = true;
     return error::POISONED;
 }
@@ -99,15 +116,25 @@ finish_ticket Registry::prepare_end(LoadTxnId id, bool success, bool output_avai
         // Exact active identity is authoritative. Only when no coordinator is
         // active may a bounded terminal tombstone be replayed.
         if (active_txn_ != id.value) {
-            if (active_txn_ != 0) poison_active_locked();
+            if (active_txn_ != 0) {
+                poison_active_locked();
+            }
             if (active_txn_ == 0 && it != txns_.end() &&
                 (it->second.phase == finish_phase::COMMITTED || it->second.phase == finish_phase::ABORTED)) {
-                return {it->second.terminal_result.code, it->second.token, it->second.finish_serial,
-                        true, false, it->second.terminal_result.committed, it->second.terminal_result};
+                return { it->second.terminal_result.code,
+                         it->second.token,
+                         it->second.finish_serial,
+                         true,
+                         false,
+                         it->second.terminal_result.committed,
+                         it->second.terminal_result };
             }
-            return {error::WRONG_TRANSACTION};
+            return { error::WRONG_TRANSACTION };
         }
-        if (id.value == 0 || it == txns_.end()) { poison_active_locked(); return {error::WRONG_TRANSACTION}; }
+        if (id.value == 0 || it == txns_.end()) {
+            poison_active_locked();
+            return { error::WRONG_TRANSACTION };
+        }
         if (it->second.phase == finish_phase::COMMITTING || it->second.phase == finish_phase::ROLLING_BACK) {
             cv_.wait(lock, [&] {
                 auto current = txns_.find(id.value);
@@ -124,27 +151,46 @@ finish_ticket Registry::prepare_end(LoadTxnId id, bool success, bool output_avai
             };
         }
         auto & txn = it->second;
-        if (txn.phase != finish_phase::ACTIVE || txn.depth == 0) { txn.poisoned = true; return {error::DEPTH_UNDERFLOW, txn.token}; }
-        if (!success) txn.poisoned = true;
-        if (mutation_ == test_mutation::M3_CLEAR_POISON) txn.poisoned = false;
+        if (txn.phase != finish_phase::ACTIVE || txn.depth == 0) {
+            txn.poisoned = true;
+            return { error::DEPTH_UNDERFLOW, txn.token };
+        }
+        if (!success) {
+            txn.poisoned = true;
+        }
+        if (mutation_ == test_mutation::M3_CLEAR_POISON) {
+            txn.poisoned = false;
+        }
 
         if (txn.depth > 1) {
             --txn.depth;
-            if (mutation_ == test_mutation::M2_NESTED_COMMIT)
-                return {error::OK, txn.token, 0, false, false, true, {error::OK, txn.token, false, true}};
+            if (mutation_ == test_mutation::M2_NESTED_COMMIT) {
+                return {
+                    error::OK, txn.token, 0, false, false, true, { error::OK, txn.token, false, true }
+                };
+            }
             const error code = txn.poisoned ? error::POISONED : error::NESTED;
-            return {code, txn.token, 0, false, false, false, {code, txn.token, false, false}};
+            return {
+                code, txn.token, 0, false, false, false, { code, txn.token, false, false }
+            };
         }
 
         error reason = error::OK;
-        bool commit = success && !txn.poisoned && output_available;
-        if (!success) reason = error::MISSING_SUCCESS;
-        else if (!output_available) { txn.poisoned = true; reason = error::NULL_OUTPUT; }
-        else if (txn.poisoned) reason = error::POISONED;
+        bool  commit = success && !txn.poisoned && output_available;
+        if (!success) {
+            reason = error::MISSING_SUCCESS;
+        } else if (!output_available) {
+            txn.poisoned = true;
+            reason       = error::NULL_OUTPUT;
+        } else if (txn.poisoned) {
+            reason = error::POISONED;
+        }
         txn.finish_serial = next_finish_serial_++;
-        if (next_finish_serial_ == 0) next_finish_serial_ = 1; // serial is internal, never owner identity
+        if (next_finish_serial_ == 0) {
+            next_finish_serial_ = 1;  // serial is internal, never owner identity
+        }
         txn.finish_reason = reason;
-        txn.phase = commit ? finish_phase::COMMITTING : finish_phase::ROLLING_BACK;
+        txn.phase         = commit ? finish_phase::COMMITTING : finish_phase::ROLLING_BACK;
         try {
             model_entry row;
             row.token = txn.token;
@@ -154,7 +200,7 @@ finish_ticket Registry::prepare_end(LoadTxnId id, bool success, bool output_avai
             txn.finish_reason = error::ALLOCATION_FAILED;
             commit            = false;
         }
-        return {txn.finish_reason, txn.token, txn.finish_serial, true, true, commit, {}};
+        return { txn.finish_reason, txn.token, txn.finish_serial, true, true, commit, {} };
     }
 }
 
@@ -173,7 +219,9 @@ error Registry::validate_end(const finish_ticket & ticket) const {
     return it->second.poisoned ? error::POISONED : error::OK;
 }
 
-end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok, publication_data publication,
+end_result Registry::finalize_end(const finish_ticket &             ticket,
+                                  bool                              effects_ok,
+                                  publication_data                  publication,
                                   std::shared_ptr<const ModelState> prepared_state) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -287,8 +335,11 @@ end_result Registry::finalize_cleanup(const finish_ticket & ticket, bool cleanup
 
 end_result Registry::end(LoadTxnId id, bool success, uint64_t planned, uint64_t actual, tier_verdict verdict) {
     auto ticket = prepare_end(id, success, true);
-    if (!ticket.finisher) return ticket.replay.token.model.value ? ticket.replay : end_result{ticket.code, ticket.token, ticket.outer, ticket.commit};
-    return finalize_end(ticket, true, {planned, actual, verdict});
+    if (!ticket.finisher) {
+        return ticket.replay.token.model.value ? ticket.replay :
+                                                 end_result{ ticket.code, ticket.token, ticket.outer, ticket.commit };
+    }
+    return finalize_end(ticket, true, { planned, actual, verdict });
 }
 
 void Registry::remember_dead_locked(ModelToken token, error result) {
@@ -349,7 +400,9 @@ error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept
 
 teardown_ticket Registry::prepare_teardown(ModelToken token) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (token.model.value == 0 || token.owner.slot >= model_slot_count) return {error::NOT_FOUND};
+    if (token.model.value == 0 || token.owner.slot >= model_slot_count) {
+        return { error::NOT_FOUND };
+    }
     if (active_txn_ != 0) {
         return { error::BUSY, token };
     }
@@ -371,8 +424,10 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     auto model = models_.find(token.model.value);
     if (model == models_.end()) {
         auto dead = dead_.find(token.model.value);
-        if (dead == dead_.end()) return {error::NOT_FOUND};
-        return {dead->second.first == token ? error::OK_ALREADY_DEAD : error::STALE_IDENTITY, token, 0, false};
+        if (dead == dead_.end()) {
+            return { error::NOT_FOUND };
+        }
+        return { dead->second.first == token ? error::OK_ALREADY_DEAD : error::STALE_IDENTITY, token, 0, false };
     }
     if (!(model->second.token == token)) {
         return { error::STALE_IDENTITY };
@@ -395,7 +450,7 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
         auto dead = dead_.find(token.model.value);
         return { dead != dead_.end() ? dead->second.second : error::EFFECT_FAILED, token, serial, false };
     }
-    if (model->second.phase != model_phase::LIVE) {
+    if (model->second.phase != model_phase::LIVE && model->second.phase != model_phase::QUARANTINED) {
         return { error::BUSY, token };
     }
     if (next_finish_serial_ == 0) {
@@ -418,6 +473,8 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
             return { error::ALLOCATION_FAILED, token };
         }
     }
+    // An exact-token QUARANTINED retry enters the same serialized drain as a
+    // first teardown. New updates are blocked and any issued lease must drain.
     const uint64_t serial         = next_finish_serial_;
     next_finish_serial_           = serial == UINT64_MAX ? 0 : serial + 1;
     model->second.phase           = model_phase::DRAINING_UPDATES;
@@ -602,4 +659,4 @@ Registry & global_registry() {
     return registry;
 }
 
-} // namespace ggml_sycl::lifecycle
+}  // namespace ggml_sycl::lifecycle

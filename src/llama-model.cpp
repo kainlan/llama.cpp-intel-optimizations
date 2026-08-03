@@ -66,46 +66,47 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_model_quarantine_token)  quarantine = nullptr;
 };
 
-static const llama_model_sycl_lifecycle_hooks & llama_model_sycl_hooks() {
-    static const llama_model_sycl_lifecycle_hooks hooks = [] {
-        llama_model_sycl_lifecycle_hooks result;
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            auto * dev = ggml_backend_dev_get(i);
-            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
-                continue;
-            }
-            result.reg   = reg;
-            result.begin = reinterpret_cast<decltype(result.begin)>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
-            result.nested = reinterpret_cast<decltype(result.nested)>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_enter_nested"));
-            result.end = reinterpret_cast<decltype(result.end)>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
-            result.unload = reinterpret_cast<decltype(result.unload)>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
-            result.quarantine = reinterpret_cast<decltype(result.quarantine)>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_quarantine_token"));
-            break;
+static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
+    llama_model_sycl_lifecycle_hooks result;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+            continue;
         }
-        return result;
-    }();
-    return hooks;
+        result.reg   = reg;
+        result.begin = reinterpret_cast<decltype(result.begin)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
+        result.nested = reinterpret_cast<decltype(result.nested)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_enter_nested"));
+        result.end = reinterpret_cast<decltype(result.end)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
+        result.unload = reinterpret_cast<decltype(result.unload)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
+        result.quarantine = reinterpret_cast<decltype(result.quarantine)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_quarantine_token"));
+        break;
+    }
+    return result;
 }
 
-static bool llama_model_sycl_hooks_enabled() {
-    const auto & hooks = llama_model_sycl_hooks();
+static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
     return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
            hooks.quarantine;
 }
 
+static bool llama_model_sycl_hooks_enabled() {
+    return llama_model_sycl_hooks_enabled(llama_model_sycl_hooks());
+}
+
 static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
-    return llama_model_sycl_hooks_enabled() && dev != nullptr &&
-           ggml_backend_dev_backend_reg(dev) == llama_model_sycl_hooks().reg;
+    const auto hooks = llama_model_sycl_hooks();
+    return llama_model_sycl_hooks_enabled(hooks) && dev != nullptr && ggml_backend_dev_backend_reg(dev) == hooks.reg;
 }
 
 struct llama_model_sycl_loading_guard {
-    bool active = false;
+    llama_model_sycl_lifecycle_hooks hooks{};
+    bool                             active    = false;
     bool outer = false;
     ggml_sycl_load_txn txn = {};
     llama_sycl_model_token * out_model = nullptr;
@@ -116,17 +117,22 @@ struct llama_model_sycl_loading_guard {
     llama_model_sycl_loading_guard & operator=(llama_model_sycl_loading_guard &&) = delete;
 
     explicit llama_model_sycl_loading_guard(bool enabled, llama_sycl_model_token * out = nullptr) :
-        active(enabled && llama_model_sycl_hooks_enabled()), outer(true), out_model(out) {
+        hooks(llama_model_sycl_hooks()),
+        active(enabled && llama_model_sycl_hooks_enabled(hooks)),
+        outer(true),
+        out_model(out) {
         if (active) {
-            const auto rc = llama_model_sycl_hooks().begin(&txn);
+            const auto rc = hooks.begin(&txn);
             if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL model lifecycle begin failed: result=%d", (int) rc));
         }
     }
 
     llama_model_sycl_loading_guard(bool enabled, ggml_sycl_load_txn parent) :
-        active(enabled && llama_model_sycl_hooks_enabled()), txn(parent) {
+        hooks(llama_model_sycl_hooks()),
+        active(enabled && llama_model_sycl_hooks_enabled(hooks)),
+        txn(parent) {
         if (active) {
-            const auto rc = llama_model_sycl_hooks().nested(txn);
+            const auto rc = hooks.nested(txn);
             if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL nested model lifecycle begin failed: txn=%llu result=%d", (unsigned long long) txn.id, (int) rc));
         }
     }
@@ -134,7 +140,7 @@ struct llama_model_sycl_loading_guard {
     ~llama_model_sycl_loading_guard() {
         if (!active) return;
         ggml_sycl_model_token token = {};
-        const auto            rc    = llama_model_sycl_hooks().end(txn, false, outer ? &token : nullptr);
+        const auto            rc    = hooks.end(txn, false, outer ? &token : nullptr);
         if (outer && out_model && token.model_id != 0) {
             *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
         }
@@ -147,7 +153,7 @@ struct llama_model_sycl_loading_guard {
     void finish(bool explicit_success) {
         if (!active) return;
         ggml_sycl_model_token token = {};
-        const auto            rc    = llama_model_sycl_hooks().end(txn, explicit_success, outer ? &token : nullptr);
+        const auto            rc    = hooks.end(txn, explicit_success, outer ? &token : nullptr);
         active = false;
         if (outer && out_model && token.model_id != 0) {
             *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
@@ -1414,12 +1420,13 @@ llama_model::~llama_model() {
         const ggml_sycl_model_token token = { sycl_model_token.model_id, sycl_model_token.load_txn_id,
                                               sycl_model_token.slot, sycl_model_token.slot_generation };
         pimpl.reset();
-        if (llama_model_sycl_hooks_enabled()) {
-            const auto rc = llama_model_sycl_hooks().unload(token);
+        const auto hooks = llama_model_sycl_hooks();
+        if (llama_model_sycl_hooks_enabled(hooks)) {
+            const auto rc = hooks.unload(token);
             if (rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
                 sycl_model_token = {};
             } else {
-                const auto queued = llama_model_sycl_hooks().quarantine(token);
+                const auto queued = hooks.quarantine(token);
                 LLAMA_LOG_ERROR(
                     "SYCL model teardown failed: model=%llu txn=%llu slot=%u generation=%llu result=%d quarantine=%d\n",
                     (unsigned long long) token.model_id, (unsigned long long) token.load_txn_id, token.slot,

@@ -119,6 +119,12 @@ void check_role(const char * name, expert_tensor_role expected) {
 
 int main() {
     check_concurrent_snapshot_publication();
+    if (test_plan_publication_prepare_failure_is_caught()) {
+        n_pass++;
+    } else {
+        printf("FAIL publication preparation failure escaped noexcept boundary\n");
+        n_fail++;
+    }
     if (test_provisional_placement_id_exhaustion_is_caught()) {
         n_pass++;
     } else {

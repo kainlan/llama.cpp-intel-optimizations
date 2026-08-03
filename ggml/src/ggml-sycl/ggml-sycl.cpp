@@ -2001,6 +2001,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_pub
 // placement publications are serialized by this existing lock.
 static std::mutex                                                g_tensor_inventory_mutex;
 static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };
+static std::atomic<bool>                                         g_fail_next_plan_publication_prepare{ false };
 
 static_assert(std::is_nothrow_move_assignable<ggml_sycl::placement_kv_info>::value,
               "prepared placement publication requires nonthrowing KV metadata commit");
@@ -9494,40 +9495,42 @@ static bool ggml_sycl_prepare_latest_live_plan(ggml_sycl_plan_restoration_bundle
     }
 }
 
-static void ggml_sycl_publish_restored_plan(const ggml_sycl_plan_restoration_bundle & bundle) noexcept {
+static void ggml_sycl_publish_restored_plan(const ggml_sycl_plan_restoration_bundle & bundle) {
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(bundle.snapshot);
 }
 
 static bool ggml_sycl_restore_latest_live_plan() noexcept {
-    ggml_sycl_plan_restoration_bundle bundle;
-    if (!ggml_sycl_prepare_latest_live_plan(bundle)) {
+    try {
+        ggml_sycl_plan_restoration_bundle bundle;
+        if (!ggml_sycl_prepare_latest_live_plan(bundle)) {
+            return false;
+        }
+        ggml_sycl_publish_restored_plan(bundle);
+        return true;
+    } catch (...) {
         return false;
     }
-    ggml_sycl_publish_restored_plan(bundle);
-    return true;
 }
 
 static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken owner) noexcept {
-    ggml_sycl_plan_restoration_bundle restoration;
-    {
-        // Refetch latest-LIVE only after acquiring the canonical publication
-        // writer lock. A completed A runtime update therefore cannot be
-        // overwritten by a stale pre-lock restoration bundle.
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-        if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-            return false;
-        }
-        ggml_sycl_publish_plan_locked(restoration.snapshot);
-    }
-    // Replacement authority is visible before any dying-owner resource can be
-    // reclaimed. Cleanup failure/quarantine therefore cannot restore the dying
-    // owner or clear the latest-LIVE authority.
     try {
+        ggml_sycl_plan_restoration_bundle restoration;
+        {
+            // Refetch latest-LIVE only after acquiring the canonical publication
+            // writer lock. A completed A runtime update therefore cannot be
+            // overwritten by a stale pre-lock restoration bundle.
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
+                return false;
+            }
+            ggml_sycl_publish_plan_locked(restoration.snapshot);
+        }
+        // Replacement authority is visible before any dying-owner resource can
+        // be reclaimed. Failure retains the exact owner in quarantine.
         ggml_sycl_release_model_slot_resources(owner);
         return true;
     } catch (...) {
-        ggml_sycl_publish_restored_plan(restoration);
         return false;
     }
 }
@@ -10415,6 +10418,9 @@ static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan
 
 static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_locked(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    if (g_fail_next_plan_publication_prepare.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
+    }
     ggml_sycl_prepared_plan_publication publication;
     publication.snapshot      = snapshot;
     publication.kv_info       = snapshot ? snapshot->kv_info : ggml_sycl::placement_kv_info{};
@@ -10739,6 +10745,11 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
 namespace ggml_sycl {
 int test_physical_device_count() {
     return ggml_sycl_info().total_gpu_count;
+}
+
+bool test_plan_publication_prepare_failure_is_caught() {
+    g_fail_next_plan_publication_prepare.store(true, std::memory_order_release);
+    return !ggml_sycl_restore_latest_live_plan();
 }
 
 bool test_provisional_placement_id_exhaustion_is_caught() {
@@ -11228,7 +11239,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         { current->slot, current->slot_generation }
     };
     auto &     registry      = ggml_sycl::lifecycle::global_registry();
-    const auto update_ticket = registry.prepare_live_update(current_token);
+    auto       update_ticket = registry.prepare_live_update(current_token);
     if (!update_ticket.active) {
         return;
     }
@@ -11237,8 +11248,17 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         ggml_sycl::lifecycle::Registry &         registry;
         ggml_sycl::lifecycle::live_update_ticket ticket;
 
+        live_update_guard(ggml_sycl::lifecycle::Registry &            registry,
+                          ggml_sycl::lifecycle::live_update_ticket && ticket) :
+            registry(registry),
+            ticket(std::move(ticket)) {}
+
+        live_update_guard(const live_update_guard &)             = delete;
+        live_update_guard & operator=(const live_update_guard &) = delete;
+        live_update_guard(live_update_guard &&)                  = delete;
+        live_update_guard & operator=(live_update_guard &&)      = delete;
         ~live_update_guard() { (void) registry.finalize_live_update(ticket); }
-    } update_guard{ registry, update_ticket };
+    } update_guard{ registry, std::move(update_ticket) };
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {

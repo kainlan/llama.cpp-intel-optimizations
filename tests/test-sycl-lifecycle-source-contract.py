@@ -10,6 +10,7 @@ backend = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
+cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 placement_paths = sorted(
     [root / "ggml/include/ggml-sycl.h"]
     + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
@@ -33,7 +34,7 @@ census_fixture = (
     "if (g_has_placement_plan) use(g_placement_plan); cache->get_placement_plan();"
 )
 checks = {
-    "full slot token": "struct SlotToken { uint32_t slot" in hpp
+    "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
     "immutable publication": "std::shared_ptr<const ModelState>" in hpp,
     "two phase finish": all(
@@ -49,13 +50,14 @@ checks = {
     ),
     "checked IDs": "class CheckedCounter" in hpp and "ID_EXHAUSTED" in cpp,
     "explicit nested transaction": "enter_nested(LoadTxnId" in hpp,
-    "abort default guard": "llama_model_sycl_hooks().end(txn, false" in llama,
-    "noncopyable guard": "llama_model_sycl_loading_guard(const llama_model_sycl_loading_guard &) = delete"
-    in llama,
+    "abort default guard": "hooks.end(txn, false" in llama,
+    "noncopyable guard": re.search(
+        r"llama_model_sycl_loading_guard\(const llama_model_sycl_loading_guard\s*&\)\s*=\s*delete", llama
+    ) is not None,
     "explicit outer success": "sycl_model_loading_guard.finish(true)" in llama,
     "no-alloc success": "if (ml.no_alloc)" in llama
     and "sycl_model_loading_guard.finish(true)" in llama,
-    "generation-safe teardown": "llama_model_sycl_hooks().unload(token)" in llama,
+    "generation-safe teardown": "hooks.unload(token)" in llama,
     "no legacy llama guard": "ggml_backend_sycl_set_model_loading(" not in llama,
     "public null-output result": "GGML_SYCL_LIFECYCLE_NULL_OUTPUT" in public
     and "model != nullptr" in backend,
@@ -232,6 +234,10 @@ checks = {
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
     in cpp,
+    "retained cache coherence decisions": cache_cpp.count("cache_placement_coherence(this)") == 9
+    and cache_cpp.count("planned_materialization_allowed(\"direct_stage_") == 3
+    and cache_cpp.count("__func__, &placement") == 3
+    and "unpin(key, layout, &placement)" in cache_cpp,
     "runtime update lease blocks teardown": "prepare_live_update" in hpp
     and "live_update_serials" in hpp
     and "current->second.live_update_count == 0" in cpp
@@ -257,15 +263,17 @@ checks = {
     not in backend,
     "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend
     and "max_passes" in backend,
-    "dynamic model lifecycle callbacks": "llama_model_sycl_hooks().begin" in llama
-    and "llama_model_sycl_hooks().end" in llama
-    and "llama_model_sycl_hooks().unload" in llama
+    "dynamic model lifecycle callbacks": "hooks.begin" in llama
+    and "hooks.end" in llama
+    and "hooks.unload" in llama
+    and "static const llama_model_sycl_lifecycle_hooks" not in llama
     and "ggml_backend_reg_get_proc_address" in llama
     and "defined(GGML_BACKEND_DL)" in llama,
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
-    and "dlsym" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    and "ggml_backend_unload(reg)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count("ggml_backend_load(") >= 2,
     "canonical G1 registration": "sycl-lifecycle-gpu-sequential"
     in (root / "tests/CMakeLists.txt").read_text()
     and "GGML_SYCL_G1_MODEL_A"

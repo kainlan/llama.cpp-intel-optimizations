@@ -123,7 +123,7 @@ if (BUILD_TESTING)
     if (GGML_BACKEND_DL)
         target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE
             GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
-        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ${CMAKE_DL_LIBS})
+        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
     else()
         # Static backend builds need the CPU implementation objects referenced

@@ -7,9 +7,13 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace ggml_sycl::lifecycle;
+
+static_assert(!std::is_copy_constructible<live_update_ticket>::value, "LIVE update tickets must be move-only");
+static_assert(!std::is_copy_assignable<live_update_ticket>::value, "LIVE update tickets must be move-only");
 
 static void require(bool v, const char * marker) {
     if (!v) {

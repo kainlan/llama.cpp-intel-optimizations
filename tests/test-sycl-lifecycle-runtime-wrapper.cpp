@@ -2,22 +2,26 @@
 
 #include <cstdio>
 
-#if defined(GGML_SYCL_RUNTIME_MODULE)
-#    include <dlfcn.h>
-#endif
-
 int main() {
 #if defined(GGML_SYCL_RUNTIME_MODULE)
-    void * module = dlopen(GGML_SYCL_RUNTIME_MODULE, RTLD_NOW | RTLD_LOCAL);
-    if (!module) {
-        std::fprintf(stderr, "failed to load SYCL backend module: %s\n", dlerror());
+    // Exercise real registry late registration and module lifetime: load,
+    // unregister/unload, then reload before resolving lifecycle operations.
+    auto * reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
+    if (!reg) {
+        std::fprintf(stderr, "failed to register SYCL backend module\n");
         return 1;
     }
-#    define LOAD_SYCL(name)                                                       \
-        auto name##_fn = reinterpret_cast<decltype(&name)>(dlsym(module, #name)); \
-        if (!name##_fn) {                                                         \
-            std::fprintf(stderr, "missing module symbol %s\n", #name);            \
-            return 1;                                                             \
+    ggml_backend_unload(reg);
+    reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
+    if (!reg) {
+        std::fprintf(stderr, "failed to reload SYCL backend module\n");
+        return 1;
+    }
+#    define LOAD_SYCL(name)                                                                                \
+        auto name##_fn = reinterpret_cast<decltype(&name)>(ggml_backend_reg_get_proc_address(reg, #name)); \
+        if (!name##_fn) {                                                                                  \
+            std::fprintf(stderr, "missing registry procedure %s\n", #name);                                \
+            return 1;                                                                                      \
         }
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
@@ -68,7 +72,7 @@ int main() {
         return 1;
     }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
-    dlclose(module);
+    ggml_backend_unload(reg);
 #endif
     return 0;
 }
