@@ -9761,6 +9761,10 @@ static ggml_sycl::placement_kv_info                  g_placement_kv_info{};
 static ggml_sycl_placement_envelope                  g_placement_envelope{};
 static bool                                          g_placement_envelope_set = false;
 std::atomic<bool>                                    g_tiered_enabled{ false };
+// Current-model API verdict: unlike g_tiered_enabled (the cache/dispatch gate),
+// this records only whether the authoritative completed planner placed any
+// bytes on host. It is model-load scratch state, not cache capability.
+static std::atomic<bool>                             g_current_model_planner_host_placement{ false };
 
 // Structural load-boundary reset (llama.cpp-k7b0) for every SCRATCH global in
 // this region that describes "the model currently being loaded", as opposed
@@ -9826,6 +9830,7 @@ static void ggml_sycl_reset_model_load_scratch_state() {
         g_moe_expert_vram_reserve.fill(0);
         g_placement_plan     = ggml_sycl::placement_plan{};
         g_has_placement_plan = false;
+        g_current_model_planner_host_placement.store(false, std::memory_order_release);
     }
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
@@ -10208,6 +10213,7 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
 static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
     if (!ggml_sycl::vram_arena_enabled()) {
         g_has_placement_plan = false;
+        g_current_model_planner_host_placement.store(false, std::memory_order_release);
         return;
     }
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
@@ -10346,6 +10352,12 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
             g_placement_plan.host_bytes / (1024.0 * 1024.0));
     }
+
+    // Publish only after the authoritative plan is complete. Keep this verdict
+    // independent of g_has_placement_plan because S1 preload deliberately clears
+    // a multi-device global plan after copying it into device caches.
+    const bool planner_host_placement = g_has_placement_plan && g_placement_plan.host_bytes > 0;
+    g_current_model_planner_host_placement.store(planner_host_placement, std::memory_order_release);
 
     // PLACE-4 G1 (llama.cpp-2egrd polish): single-line summary of plan-driven
     // weight placement.  Surfaces the per-tensor verdict at plan-computation
@@ -10579,10 +10591,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
 
     GGML_LOG_INFO(
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "
-        "(VRAM: %.2f GB free, tiered: %s)\n",
+        "(VRAM: %.2f GB free, planner host placement: %s)\n",
         g_tensor_inventory.size(), g_tensor_inventory_total_size / (1024.0 * 1024.0 * 1024.0),
         free_mem / (1024.0 * 1024.0 * 1024.0),
-        g_tiered_enabled.load(std::memory_order_relaxed) ? "enabled" : "disabled");
+        g_current_model_planner_host_placement.load(std::memory_order_acquire) ? "yes" : "no");
 }
 
 void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
@@ -10714,8 +10726,8 @@ void ggml_sycl_get_moe_info(size_t * expert_total_bytes, int * n_expert, int * n
 }
 
 bool ggml_backend_sycl_is_tiered_enabled(ggml_backend_t backend) {
-    (void) backend;  // Backend context not needed for current implementation
-    return g_tiered_enabled.load(std::memory_order_relaxed);
+    (void) backend;  // Verdict is current-model planner state, reset at the outer load boundary.
+    return g_current_model_planner_host_placement.load(std::memory_order_acquire);
 }
 
 int ggml_backend_sycl_planned_target_device(const char * tensor_name) {
