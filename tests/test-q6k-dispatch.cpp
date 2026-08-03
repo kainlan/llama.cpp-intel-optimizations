@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <cmath>
 #include <vector>
 #include <random>
@@ -28,6 +29,107 @@
 // Constants from ggml-common.h
 #define QK_K 256
 #define QK8_1 32
+#ifndef QI6_K
+#define QI6_K 32
+#endif
+#ifndef QR6_K
+#define QR6_K 2
+#endif
+#ifndef QI8_1
+#define QI8_1 (QK8_1 / 4)
+#endif
+
+// Portable packed-byte helpers for the Q8_1 positive control.
+static constexpr uint32_t assemble_u32_le(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    return static_cast<uint32_t>(b0) |
+           (static_cast<uint32_t>(b1) << 8) |
+           (static_cast<uint32_t>(b2) << 16) |
+           (static_cast<uint32_t>(b3) << 24);
+}
+
+static inline uint32_t load_u32_le(const uint8_t * bytes, int i32) {
+    bytes += 4 * i32;
+    return assemble_u32_le(bytes[0], bytes[1], bytes[2], bytes[3]);
+}
+
+static inline uint32_t load_u32_le(const int8_t * bytes, int i32) {
+    bytes += 4 * i32;
+    return assemble_u32_le(
+        static_cast<uint8_t>(bytes[0]), static_cast<uint8_t>(bytes[1]),
+        static_cast<uint8_t>(bytes[2]), static_cast<uint8_t>(bytes[3]));
+}
+
+static constexpr int signed_byte_lane(uint32_t packed, int lane) {
+    return ((packed >> (8 * lane)) & 0xffu) < 0x80u
+        ? static_cast<int>((packed >> (8 * lane)) & 0xffu)
+        : static_cast<int>((packed >> (8 * lane)) & 0xffu) - 0x100;
+}
+
+static constexpr int q6_lane(uint32_t vl, uint32_t vh, int nibble, int lane) {
+    return static_cast<int>(
+        ((vl >> (8 * lane + 4 * nibble)) & 0x0fu) |
+        (((vh >> (8 * lane + 4 * nibble)) & 0x03u) << 4)) - 32;
+}
+
+static bool q6k_positive_control_helper_known_vector() {
+    const uint8_t ql[4] = { 0x10, 0x32, 0x54, 0x76 };
+    const uint8_t qh[4] = { 0x20, 0x10, 0x30, 0x00 };
+    const int8_t qs[4] = { -128, -1, 0, 127 };
+    const uint32_t packed_ql = load_u32_le(ql, 0);
+    const uint32_t packed_qh = load_u32_le(qh, 0);
+    const uint32_t packed_qs = load_u32_le(qs, 0);
+
+    return packed_ql == 0x76543210u && packed_qh == 0x00301020u && packed_qs == 0x7f00ff80u &&
+           q6_lane(packed_ql, packed_qh, 1, 0) == 1 &&
+           q6_lane(packed_ql, packed_qh, 1, 1) == -13 &&
+           q6_lane(packed_ql, packed_qh, 1, 2) == 21 &&
+           q6_lane(packed_ql, packed_qh, 1, 3) == -25 &&
+           signed_byte_lane(packed_qs, 0) == -128 && signed_byte_lane(packed_qs, 1) == -1 &&
+           signed_byte_lane(packed_qs, 2) == 0 && signed_byte_lane(packed_qs, 3) == 127;
+}
+
+static float cpu_vec_dot_q6_K_q8_1(const block_q6_K* bq6_K, const block_q8_1* bq8_1, int iqs) {
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const uint32_t vl = load_u32_le(bq6_K->ql, iqs);
+    const uint32_t vh = load_u32_le(
+        bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t* scs = bq6_K->scales + scale_offset;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scs[4 * i];
+        const uint32_t u = load_u32_le(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        const float d8 = ggml_fp16_to_fp32(bq8_1[bq8_offset + 2*i].d);
+
+        int dp4a_result = 0;
+        for (int j = 0; j < 4; ++j) {
+            const int vi_j = q6_lane(vl, vh, i, j);
+            dp4a_result += vi_j * signed_byte_lane(u, j);
+        }
+
+        sumf += d8 * (dp4a_result * sc);
+    }
+    return ggml_fp16_to_fp32(bq6_K->d) * sumf;
+}
+
+static float cpu_row_dot_q6_K_q8_1(const block_q6_K* x_row, const block_q8_1* y, int ncols) {
+    const int blocks_per_row = ncols / QK_K;
+    float sum = 0.0f;
+
+    for (int ib = 0; ib < blocks_per_row; ++ib) {
+        const block_q6_K* bx = &x_row[ib];
+        const block_q8_1* by = &y[ib * (QK_K / QK8_1)];
+
+        for (int iqs = 0; iqs < QI6_K; ++iqs) {
+            sum += cpu_vec_dot_q6_K_q8_1(bx, by, iqs);
+        }
+    }
+    return sum;
+}
 
 static bool parse_layout_arg(const char * arg, ggml_layout_mode & out) {
     if (!arg) {
@@ -86,6 +188,74 @@ static float cpu_dot_q6k_f32(const void* x_data, const float* y, int ncols) {
         sum += x_f32[i] * y[i];
     }
     return sum;
+}
+
+static constexpr float diagnostic_abs(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+static constexpr float gpu_q8_tolerance(float cpu_q8) {
+    return 1e-3f > 1e-4f * diagnostic_abs(cpu_q8) ? 1e-3f : 1e-4f * diagnostic_abs(cpu_q8);
+}
+
+static constexpr bool gpu_q8_observational_match(float gpu, float cpu_q8) {
+    return diagnostic_abs(gpu - cpu_q8) <= gpu_q8_tolerance(cpu_q8);
+}
+
+static constexpr bool q8_accounts_for_f32_delta(float gpu, float cpu_q8, float cpu_f32) {
+    const float q8_f32_abs = diagnostic_abs(cpu_q8 - cpu_f32);
+    const float q8_f32_error = diagnostic_abs(cpu_f32) > 1e-6f ? q8_f32_abs / diagnostic_abs(cpu_f32) : q8_f32_abs;
+    return gpu_q8_observational_match(gpu, cpu_q8) && q8_f32_error > 0.01f;
+}
+
+enum class q8_diagnostic_state {
+    not_evaluated,
+    consistent,
+    not_consistent,
+};
+
+static constexpr q8_diagnostic_state q8_diagnostic_summary(int f32_failures, int consistent_rows) {
+    return f32_failures == 0 ? q8_diagnostic_state::not_evaluated :
+           consistent_rows == f32_failures ? q8_diagnostic_state::consistent :
+                                             q8_diagnostic_state::not_consistent;
+}
+
+// Synthetic checks keep the observational threshold inclusive and the empty sample non-conclusive.
+static_assert(gpu_q8_observational_match(0.001f, 0.0f), "absolute threshold boundary must match");
+static_assert(!gpu_q8_observational_match(0.0011f, 0.0f), "values outside absolute threshold must not match");
+static_assert(gpu_q8_observational_match(10001.0f, 10000.0f), "relative threshold boundary must match");
+static_assert(!gpu_q8_observational_match(10001.1f, 10000.0f), "values outside relative threshold must not match");
+static_assert(q8_accounts_for_f32_delta(0.0205f, 0.02f, 0.0f),
+              "Q8-F32 crossing the F32 gate must account for a tightly matching GPU delta");
+static_assert(!q8_accounts_for_f32_delta(0.0105f, 0.01f, 0.0f),
+              "Q8-F32 at the F32 gate boundary must not account for a failing delta");
+static_assert(q8_diagnostic_summary(0, 0) == q8_diagnostic_state::not_evaluated,
+              "zero F32 failures must not produce a conclusion");
+
+static void format_relative_metric(char * buffer, size_t size, float reference, float relative_error) {
+    if (std::abs(reference) <= 1e-6f) {
+        snprintf(buffer, size, "N/A");
+    } else {
+        snprintf(buffer, size, "%.3f%%", relative_error * 100.0f);
+    }
+}
+
+static void print_q8_diagnostic_summary(int f32_failures, int consistent_rows) {
+    const q8_diagnostic_state state = q8_diagnostic_summary(f32_failures, consistent_rows);
+    if (state == q8_diagnostic_state::not_evaluated) {
+        printf("  Activation-quantization observation: not evaluated (no F32-failing sampled rows)\n");
+        return;
+    }
+
+    if (state == q8_diagnostic_state::consistent) {
+        printf("  Activation-quantization observation: all %d F32-failing sampled rows are consistent with activation quantization\n",
+               f32_failures);
+    } else {
+        printf("  Activation-quantization observation: %d/%d F32-failing sampled rows are consistent with activation quantization\n",
+               consistent_rows, f32_failures);
+    }
+    printf("    Observational only (does not establish causation): abs(GPU-CPU_Q8) <= max(1e-3, 1e-4*abs(CPU_Q8))\n");
+    printf("    and Q8-F32 independently crosses the same F32 failure gate\n");
 }
 
 // Test 1: Basic Q6_K MUL_MAT with single token (MMVQ path)
@@ -169,6 +339,10 @@ bool test_q6k_mul_mat_single_token() {
     }
     ggml_backend_tensor_set(input, input_f32.data(), 0, n_embd * sizeof(float));
 
+    // Quantize the activation once for the Q8_1 positive control used by every sampled row.
+    std::vector<block_q8_1> input_q8(n_embd / QK8_1);
+    quantize_row_q8_1_ref(input_f32.data(), input_q8.data(), n_embd);
+
     // Build and execute graph
     struct ggml_cgraph* graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -192,24 +366,55 @@ bool test_q6k_mul_mat_single_token() {
     printf("  Computing CPU reference...\n");
     const int test_rows = std::min(16, n_vocab);
     int mismatches = 0;
+    int q8_consistent_mismatches = 0;
     float max_rel_error = 0.0f;
+    bool has_relative_error = false;
 
+    printf("  Sample row comparisons (positive control):\n");
     for (int row = 0; row < test_rows; row++) {
         float cpu_val = cpu_dot_q6k_f32(&weight_q6k[row * blocks_per_row], input_f32.data(), n_embd);
+        float cpu_q8_val = cpu_row_dot_q6_K_q8_1(
+            &weight_q6k[row * blocks_per_row], input_q8.data(), n_embd);
         float gpu_val = gpu_output[row];
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        max_rel_error = std::max(max_rel_error, rel_error);
+        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_val);
+        float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
+        float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
+        float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
+        if (std::abs(cpu_val) > 1e-6f) {
+            max_rel_error = std::max(max_rel_error, rel_error);
+            has_relative_error = true;
+        }
+
+        char gpu_f32_rel_text[32];
+        char gpu_q8_rel_text[32];
+        char q8_f32_rel_text[32];
+        format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
+        printf("    Row %2d: GPU=%10.6f CPU_F32=%10.6f CPU_Q8=%10.6f "
+               "GPU-F32 abs=%9.6f rel=%7s GPU-Q8 abs=%9.6f rel=%7s "
+               "Q8-F32 abs=%9.6f rel=%7s\n",
+               row, gpu_val, cpu_val, cpu_q8_val,
+               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               q8_f32_abs, q8_f32_rel_text);
 
         if (rel_error > 0.01f) {  // 1% tolerance
-            printf("  Row %d: GPU=%.6f CPU=%.6f diff=%.6f (%.2f%%)\n",
-                   row, gpu_val, cpu_val, abs_diff, rel_error * 100);
             mismatches++;
+            if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
+                q8_consistent_mismatches++;
+            }
         }
     }
 
-    printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+    if (has_relative_error) {
+        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+    } else {
+        printf("  Max relative error: N/A\n");
+    }
+    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
     printf("  Weight extra ptr: %p\n", weight->extra);
 
     // Cleanup
@@ -299,6 +504,10 @@ bool test_q6k_mistral_dimensions() {
     }
     ggml_backend_tensor_set(input, input_f32.data(), 0, n_embd * sizeof(float));
 
+    // Quantize the activation once for the Q8_1 positive control used by every sampled row.
+    std::vector<block_q8_1> input_q8(n_embd / QK8_1);
+    quantize_row_q8_1_ref(input_f32.data(), input_q8.data(), n_embd);
+
     // Execute
     struct ggml_cgraph* graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -320,27 +529,58 @@ bool test_q6k_mistral_dimensions() {
     // Test specific rows (first, middle, last)
     int test_indices[] = {0, 100, 1000, 5000, 10000, n_ff - 1};
     int mismatches = 0;
+    int q8_consistent_mismatches = 0;
     float max_rel_error = 0.0f;
+    bool has_relative_error = false;
 
-    printf("  Sample row comparisons:\n");
+    printf("  Sample row comparisons (positive control):\n");
     for (int idx : test_indices) {
         if (idx >= n_ff) continue;
 
         float cpu_val = cpu_dot_q6k_f32(&weight_q6k[idx * blocks_per_row], input_f32.data(), n_embd);
+        float cpu_q8_val = cpu_row_dot_q6_K_q8_1(
+            &weight_q6k[idx * blocks_per_row], input_q8.data(), n_embd);
         float gpu_val = gpu_output[idx];
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        max_rel_error = std::max(max_rel_error, rel_error);
+        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_val);
+        float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
+        float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
+        float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
+        if (std::abs(cpu_val) > 1e-6f) {
+            max_rel_error = std::max(max_rel_error, rel_error);
+            has_relative_error = true;
+        }
 
+        char gpu_f32_rel_text[32];
+        char gpu_q8_rel_text[32];
+        char q8_f32_rel_text[32];
+        format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
         const char* status_str = (rel_error <= 0.01f) ? "OK" : "FAIL";
-        printf("    Row %5d: GPU=%10.4f CPU=%10.4f err=%.4f%% %s\n",
-               idx, gpu_val, cpu_val, rel_error * 100, status_str);
+        printf("    Row %5d: GPU=%10.4f CPU_F32=%10.4f CPU_Q8=%10.4f "
+               "GPU-F32 abs=%9.4f rel=%7s GPU-Q8 abs=%9.4f rel=%7s "
+               "Q8-F32 abs=%9.4f rel=%7s %s\n",
+               idx, gpu_val, cpu_val, cpu_q8_val,
+               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               q8_f32_abs, q8_f32_rel_text, status_str);
 
-        if (rel_error > 0.01f) mismatches++;
+        if (rel_error > 0.01f) {
+            mismatches++;
+            if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
+                q8_consistent_mismatches++;
+            }
+        }
     }
 
-    printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+    if (has_relative_error) {
+        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+    } else {
+        printf("  Max relative error: N/A\n");
+    }
+    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
 
     // Cleanup
     ggml_backend_buffer_free(weight_buffer);
@@ -559,6 +799,11 @@ int main(int argc, char** argv) {
     printf("========================================\n");
     printf("Q6_K Dispatch Unit Test\n");
     printf("========================================\n\n");
+
+    if (!q6k_positive_control_helper_known_vector()) {
+        printf("FAIL: Q6_K positive-control packed-byte helper known vector failed\n");
+        return 1;
+    }
 
     // Check environment
     const char * disable_graph = getenv("GGML_SYCL_DISABLE_GRAPH");
