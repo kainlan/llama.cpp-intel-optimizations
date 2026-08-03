@@ -213,7 +213,7 @@ At that pinned live snapshot, **31 Task 4a GREEN rows are classified `GPU serial
 
 Evidence keys used in the table:
 
-- **H:** a literal static scan of the 10 host-only sources found zero occurrences of the direct/runtime markers `ggml_backend_sycl_init`, `ggml_sycl_get_device`, `sycl::queue`, `ggml_backend_graph_compute`, `ggml_backend_sycl_buffer_type`, `ggml_backend_sycl_kv_buffer_type`, `gpu_selector`, `malloc_device`, `parallel_for`, `single_task`, or `.submit(` **and** the indirect device/cache APIs `ggml_backend_sycl_get_device_memory`, `get_unified_cache_for_device`, `ensure_cached_alloc`, or `ggml_backend_sycl_get_weight_cache_key`. The indirect list is load-bearing: the two unified-memory sources do not spell a queue or kernel launch but require a real device cache and allocate against its VRAM budget; likewise, the three weight-key sources enter the SYCL registry/device path under default evictability. This deliberately uses a stricter execution test than restoration commits `f87b6f410`/`d27a6fe19`, whose no-direct-kernel filter also admitted sources that initialize a backend, execute a graph, or reach the device through cache/key APIs.
+- **H:** a literal static scan of the 9 host-only sources found zero occurrences of the direct/runtime markers `ggml_backend_sycl_init`, `ggml_sycl_get_device`, `sycl::queue`, `ggml_backend_graph_compute`, `ggml_backend_sycl_buffer_type`, `ggml_backend_sycl_kv_buffer_type`, `gpu_selector`, `malloc_device`, `parallel_for`, `single_task`, or `.submit(` **and** the indirect device/cache APIs `ggml_backend_sycl_get_device_memory`, `get_unified_cache_for_device`, `ensure_cached_alloc`, or `ggml_backend_sycl_get_weight_cache_key`. The indirect list is load-bearing: the two unified-memory sources do not spell a queue or kernel launch but require a real device cache and allocate against its VRAM budget; likewise, the three weight-key sources enter the SYCL registry/device path under default evictability. This deliberately uses a stricter execution test than restoration commits `f87b6f410`/`d27a6fe19`, whose no-direct-kernel filter also admitted sources that initialize a backend, execute a graph, or reach the device through cache/key APIs.
 - **G:** the cited source line directly initializes a SYCL backend/queue, obtains a device buffer type, allocates/submits device work, executes a backend graph, or enters one of those device paths indirectly. For weight keys, `ggml_backend_sycl_get_weight_cache_key` at `ggml-sycl.cpp:9563–9589` calls `ggml_backend_sycl_reg` for a default-evictable host tensor; registry initialization at `ggml-sycl.cpp:94710–94739` enters `ggml_sycl_info`, enumerates devices, sets each device, and obtains its SYCL device object/manager state.
 - **M:** the cited source header makes the run opt-in/manual, a benchmark, a standalone hardware experiment, or dependent on a special instrumentation build.
 - **N:** the cited source either reimplements the purported production helper locally or includes the removed `expert-cache.hpp`; it is not a production-path test in its current form.
@@ -248,7 +248,7 @@ Evidence keys used in the table:
 | `tests/test-sycl-moe-q8-scratch.cpp` | **GPU serial** | G: lines 73–78 pin Level Zero and initialize the SYCL backend before device-VRAM scratch allocation |
 | `tests/test-sycl-onednn-packed-cache.cpp` | **GPU serial** | G: line 18 initializes the SYCL backend; line 152 obtains its device queue |
 | `tests/test-sycl-orchestrator.cpp` | **GPU serial** | G: graph computes at lines 271/342; SYCL backend initialization at line 373 |
-| `tests/test-sycl-prestage-routed-experts.cpp` | **host-only** | H; source lines 7–10 explicitly say the standalone routing-logic test does not require the SYCL runtime |
+| `tests/test-sycl-prestage-routed-experts.cpp` | **never-test** | N: the source locally mimics routed-expert prestaging, includes no production header or production path, and relies on NDEBUG-vulnerable bare `assert()` checks |
 | `tests/test-sycl-unified-cache.cpp` | **GPU serial** | G: lines 815–820 require device-0 memory; lines 90–180 obtain its unified cache and allocate weight/expert entries into VRAM with `ensure_cached_alloc` |
 | `tests/test-sycl-unified-memory-e2e.cpp` | **GPU serial** | G: lines 870–875 require device-0 memory; lines 94–201 obtain its unified cache and allocate attention/KV/expert entries against VRAM (the model workload is simulated, the allocations are not) |
 | `tests/test-sycl-weight-key-stability.cpp` | **GPU serial** | G: lines 67/85 call `ggml_backend_sycl_get_weight_cache_key`, entering the default-evictability SYCL registry/device initialization chain documented above |
@@ -298,7 +298,7 @@ These are the **exact five** model/model-file-loading hazards. They **must not e
 | **L4** `tests/test-planner-canary-pp-tg-union.cpp` | Lines 16–22 specify fork/exec workers that each load a model/context; line 175 calls `llama_model_load_from_file`, line 204 calls `llama_new_context_with_model`, and lines 311/381–382 run workers across available model fixtures/shapes. |
 | **L5** `tests/test-planner-canary-skeleton-determinism.cpp` | Lines 3–10 delegate to the mini-context proof with `real-A`/`real-B` full weight loads; lines 46–55 fork/exec that binary, and lines 82–103 locate it and iterate available model fixtures. This inherits L1's full-weight loads. |
 
-**Task 4b counts:** 10 host-only + 39 GPU serial + 5 model-loading + 5 manual + 5 never-test + 0 parser = **64/64**. This independently reconciles with Task 4a's 41 GREEN + 23 RED = 64 source rows: the hazard and provenance axes are complete but intentionally do not imply one another.
+**Task 4b counts:** 9 host-only + 39 GPU serial + 5 model-loading + 5 manual + 6 never-test + 0 parser = **64/64**. This independently reconciles with Task 4a's 41 GREEN + 23 RED = 64 source rows: the hazard and provenance axes are complete but intentionally do not imply one another.
 
 **Static completeness check:** the classification table contains each Task 4a source row exactly once (64 unique names; no missing names and no extras), and the six class counts sum to 64. The dedicated hazard table contains exactly five unique names, all five are classified `model-loading` in the complete table, and no other row has that class. No CMake or disposition change is made here.
 
@@ -407,7 +407,7 @@ owner or next action:
 | `tests/test-sycl-moe-q8-scratch.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
 | `tests/test-sycl-onednn-packed-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
 | `tests/test-sycl-orchestrator.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
-| `tests/test-sycl-prestage-routed-experts.cpp` | GREEN/live | host-only | **restore candidate** | **RC-L** |
+| `tests/test-sycl-prestage-routed-experts.cpp` | GREEN/live | never-test | **deleted/never-test** | **D-LOCAL** |
 | `tests/test-sycl-unified-cache.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
 | `tests/test-sycl-unified-memory-e2e.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
 | `tests/test-sycl-weight-key-stability.cpp` | GREEN/live | GPU serial | **restore candidate** | **RC-L** |
@@ -445,9 +445,9 @@ owner or next action:
 | `tests/test-unified-dispatch-integration.cpp` | RED/inactive | GPU serial | **restore candidate** | **RC-I** |
 | `tests/test-expert-cache.cpp` | RED/inactive | never-test | **deleted/never-test** | **D-OBSOLETE** |
 
-**Disposition counts:** 49 restore candidates + 9 manual-only + 5
+**Disposition counts:** 48 restore candidates + 9 manual-only + 6
 deleted/never-test + 1 named tracker task = **64/64 unique rows**. The action
-keys independently reconcile as 41 RC-L + 8 RC-I + 5 M-MODEL + 4 M-OPTIN + 4
+keys independently reconcile as 40 RC-L + 8 RC-I + 5 M-MODEL + 4 M-OPTIN + 5
 D-LOCAL + 1 D-OBSOLETE + 1 P-PIN = **64/64**. “Live” is provenance, not Task
 16 acceptance. The legend is the single source for downstream ownership and
 sequencing; Task 16 below resolves the then-open `llama.cpp-awcp` owner-policy
@@ -479,7 +479,7 @@ for every `GPU serial` row; all GPU execution and all Task 19 proof is lead-only
 and one-at-a-time. Host-only rows do not acquire `RUN_SERIAL` merely by linking
 SYCL.
 
-### Accepted — 49/64
+### Accepted — 48/64
 
 Every row below is accepted with owner/action `CHAIN` and skip policy `NV-77`.
 Target is the exact CMake target to preserve or restore; command is the exact
@@ -518,7 +518,6 @@ Task 17c's explicit soft-skip/non-vacuity audit and repair where necessary.
 | `tests/test-sycl-moe-q8-scratch.cpp` | `test-sycl-moe-q8-scratch` | `CMD(test-sycl-moe-q8-scratch)` | GPU serial | NV-77 | `lead` / `CHAIN` |
 | `tests/test-sycl-onednn-packed-cache.cpp` | `test-sycl-onednn-packed-cache` | `CMD(test-sycl-onednn-packed-cache)` | GPU serial | NV-77; repair success-on-unavailable | `lead` / `CHAIN` |
 | `tests/test-sycl-orchestrator.cpp` | `test-sycl-orchestrator` | `CMD(test-sycl-orchestrator)` | GPU serial | NV-77; repair success-on-unavailable | `lead` / `CHAIN` |
-| `tests/test-sycl-prestage-routed-experts.cpp` | `test-sycl-prestage-routed-experts` | `CMD(test-sycl-prestage-routed-experts)` | host-only | NV-77 | `lead` / `CHAIN` |
 | `tests/test-sycl-unified-cache.cpp` | `test-sycl-unified-cache` | `CMD(test-sycl-unified-cache)` | GPU serial | NV-77; repair all-subcases-skipped success | `lead` / `CHAIN` |
 | `tests/test-sycl-unified-memory-e2e.cpp` | `test-sycl-unified-memory-e2e` | `CMD(test-sycl-unified-memory-e2e)` | GPU serial | NV-77; repair all-subcases-skipped success | `lead` / `CHAIN` |
 | `tests/test-sycl-weight-key-stability.cpp` | `test-sycl-weight-key-stability` | `CMD(test-sycl-weight-key-stability)` | GPU serial | NV-77; repair success-on-unavailable | `lead` / `CHAIN` |
@@ -541,13 +540,13 @@ Task 17c's explicit soft-skip/non-vacuity audit and repair where necessary.
 | `tests/test-sycl-set-rows-owner-routing.cpp` | `test-sycl-set-rows-owner-routing` | `CMD(test-sycl-set-rows-owner-routing)` | GPU serial | NV-77; repair success-on-unavailable | `lead` / `CHAIN` |
 | `tests/test-unified-dispatch-integration.cpp` | `test-unified-dispatch-integration` | `CMD(test-unified-dispatch-integration)` | GPU serial | NV-77; 77-ready by Task 14d | `lead` / `CHAIN` |
 
-Accepted reconciliation: **41 live + 8 inactive = 49**; hazards are **10
-host-only + 38 GPU serial + 1 manual opt-in = 49**. The source-ready review set
+Accepted reconciliation: **40 live + 8 inactive = 48**; hazards are **9
+host-only + 38 GPU serial + 1 manual opt-in = 48**. The source-ready review set
 is exactly Task 14a–d plus Task 15a–b: streaming, MXFP4, oneDNN descriptors,
 unified dispatch, CPU/GPU SoA, and Q6K reorder. Their required lead proofs
 remain conditions on `llama.cpp-8kyi`, not results claimed here.
 
-### Declined from ordinary restoration — 15/64
+### Declined from ordinary restoration — 16/64
 
 These are exact declines of the **current sources** from the accepted ordinary
 registration set. Each retains an owner and next action; a future rewritten
@@ -558,10 +557,11 @@ source needs a new acceptance decision.
 | `tests/mini-context-prototype.cpp`; `tests/test-planner-canary-cpy-visibility.cpp`; `tests/test-planner-canary-direct-load.cpp`; `tests/test-planner-canary-pp-tg-union.cpp`; `tests/test-planner-canary-skeleton-determinism.cpp` | 5 | model-loading; no ordinary/parallel CTest registration | `lead` via `llama.cpp-0igs`: retain manual-only, lead-only, serial, once-only safeguarded procedure; any run remains Task 19/lead work |
 | `tests/test-expert-routing-roundtrip.cpp`; `tests/test-moe-expert-placement.cpp`; `tests/test-sycl-expert-cache-bandwidth.cpp`; `tests/test-sycl-race-conditions.cpp` | 4 | manual benchmark/diagnostic or special instrumentation | `lead` via `llama.cpp-0igs`: retain opt-in manual procedure; do not ordinarily register |
 | `tests/test-q6k-56block-debug.cpp`; `tests/test-q6k-layout-debug.cpp`; `tests/test-q6k-variable-reorder.cpp`; `tests/test-tile-decomposition.cpp` | 4 | never-test local reimplementations; vacuous against production | `lead` via `llama.cpp-0igs`: delete current sources, preserving the Task 4b per-file reasons |
+| `tests/test-sycl-prestage-routed-experts.cpp` | 1 | D-LOCAL: current source locally mimics routed-expert prestaging, includes no production header/path, and its bare `assert()` checks compile away under NDEBUG | `lead` via `llama.cpp-0igs`: delete the current source; to seek reacceptance, rewrite it to include and call the production routed-expert prestage path, use NDEBUG-proof failure checks, and request a new Task 16 acceptance decision |
 | `tests/test-expert-cache.cpp` | 1 | never-test obsolete include of removed `expert-cache.hpp` | `lead` via `llama.cpp-0igs`: delete current source, preserving the obsolete-header reason |
 | `tests/test-pinned-chunk-pool.cpp` | 1 | current source is unsafe/stale pending canonical pinned-pool API work | `lead` via `llama.cpp-32dg8.20`: preserve allocation/reuse/capacity/failure checks in a rewrite, perform its build/GPU proof, then request a new Task 16 acceptance decision |
 
-Final reconciliation: **49 accepted + 15 declined = 64/64 unique rows**. The
+Final reconciliation: **48 accepted + 16 declined = 64/64 unique rows**. The
 five model-loading hazards are exactly the five declined model rows above; none
 is accepted into ordinary CTest. The 38 accepted GPU rows remain lead-only,
 serial, and gated on Task 17 metadata plus Task 19 runtime/mutation acceptance.
@@ -815,7 +815,7 @@ of which Task 4c disposes 64 as merge-relevant and leaves roughly 83 as
 post-merge debt.
 
 Current ownership is concrete: `lead` owns, through `llama.cpp-0igs`, the 9
-manual-only actions, 5 deletion actions, and roughly 83 post-merge source rows.
+manual-only actions, 6 deletion actions, and roughly 83 post-merge source rows.
 The pinned-pool row is sequenced separately through open task
 `llama.cpp-32dg8.20`, also assigned to `lead`, before returning to Task 16.
 
