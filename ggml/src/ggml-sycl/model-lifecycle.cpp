@@ -294,6 +294,42 @@ void Registry::remember_dead_locked(ModelToken token, error result) {
     dead_[token.model.value] = { token, result };
 }
 
+live_update_ticket Registry::prepare_live_update(ModelToken token) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (token.model.value == 0 || token.load.value == 0 || token.owner.slot >= model_slot_count) {
+        return { error::STALE_IDENTITY, token };
+    }
+    auto model = models_.find(token.model.value);
+    if (model == models_.end() || !(model->second.token == token)) {
+        return { error::STALE_IDENTITY, token };
+    }
+    if (model->second.phase != model_phase::LIVE) {
+        return { error::BUSY, token };
+    }
+    const uint64_t serial = ++model->second.live_update_serial;
+    ++model->second.active_live_updates;
+    return { error::OK, token, serial, true };
+}
+
+error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ticket.active) {
+            return ticket.code;
+        }
+        auto model = models_.find(ticket.token.model.value);
+        if (model == models_.end() || !(model->second.token == ticket.token) ||
+            model->second.active_live_updates == 0 || model->second.live_update_serial < ticket.serial) {
+            return error::STALE_IDENTITY;
+        }
+        --model->second.active_live_updates;
+        cv_.notify_all();
+        return error::OK;
+    } catch (...) {
+        return error::EFFECT_FAILED;
+    }
+}
+
 teardown_ticket Registry::prepare_teardown(ModelToken token) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (token.model.value == 0 || token.owner.slot >= model_slot_count) return {error::NOT_FOUND};
@@ -325,6 +361,20 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     }
     if (model->second.phase == model_phase::LOADING) {
         return { error::BUSY, token };
+    }
+    if (model->second.active_live_updates != 0) {
+        cv_.wait(lock, [&] {
+            auto current = models_.find(token.model.value);
+            return current == models_.end() || !(current->second.token == token) ||
+                   current->second.active_live_updates == 0;
+        });
+        model = models_.find(token.model.value);
+        if (model == models_.end() || !(model->second.token == token)) {
+            return { error::STALE_IDENTITY, token };
+        }
+        if (model->second.phase != model_phase::LIVE) {
+            return { error::BUSY, token };
+        }
     }
     // Reserve compact durable replay metadata before any unlocked teardown
     // effect can destroy the model or release its slot. Large placement plans
@@ -423,6 +473,9 @@ error Registry::defer_quarantine(ModelToken token) noexcept {
         }
         if (model->second.phase == model_phase::QUARANTINED) {
             return error::OK;
+        }
+        if (model->second.active_live_updates != 0) {
+            return error::BUSY;
         }
         if (model->second.phase != model_phase::LIVE) {
             return error::BUSY;

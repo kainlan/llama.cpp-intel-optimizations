@@ -82,6 +82,14 @@ struct finish_ticket {
     bool commit = false;
     end_result replay{};
 };
+
+struct live_update_ticket {
+    error      code = error::NOT_FOUND;
+    ModelToken token{};
+    uint64_t   serial = 0;
+    bool       active = false;
+};
+
 struct teardown_ticket {
     error code = error::OK;
     ModelToken token{};
@@ -126,7 +134,9 @@ public:
                    uint64_t planned_host_bytes = 0, uint64_t actual_host_bytes = 0,
                    tier_verdict verdict = tier_verdict::UNKNOWN);
 
-    teardown_ticket prepare_teardown(ModelToken token);
+    live_update_ticket prepare_live_update(ModelToken token);
+    error              finalize_live_update(const live_update_ticket & ticket) noexcept;
+    teardown_ticket    prepare_teardown(ModelToken token);
     error finalize_teardown(const teardown_ticket & ticket, bool effects_ok) noexcept;
     error teardown(ModelToken token);
     bool            is_quarantined(ModelToken token) const noexcept;
@@ -162,6 +172,8 @@ public:
         std::shared_ptr<const ModelState> state;
         model_phase phase = model_phase::LOADING;
         uint64_t teardown_serial = 0;
+        uint64_t                          live_update_serial  = 0;
+        uint32_t                          active_live_updates = 0;
         error teardown_result = error::OK;
     };
 

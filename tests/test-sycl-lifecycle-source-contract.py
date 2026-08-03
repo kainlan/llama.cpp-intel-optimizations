@@ -135,8 +135,23 @@ checks = {
         "ggml/src/ggml-sycl/expert-prefetch.cpp": 2,
         "ggml/src/ggml-sycl/ggml-sycl.cpp": 8,
         "ggml/src/ggml-sycl/mmvq.cpp": 1,
-        "ggml/src/ggml-sycl/unified-cache.cpp": 13,
+        "ggml/src/ggml-sycl/unified-cache.cpp": 14,
         "ggml/src/ggml-sycl/unified-cache.hpp": 4,
+    },
+    "exact internal wrapper census": {
+        name: backend.count(name + "(")
+        for name in (
+            "ggml_sycl_cache_plan_owner",
+            "ggml_sycl_global_plan_owner",
+            "ggml_sycl_global_plan_snapshot",
+            "ggml_sycl_has_global_plan",
+        )
+    }
+    == {
+        "ggml_sycl_cache_plan_owner": 127,
+        "ggml_sycl_global_plan_owner": 16,
+        "ggml_sycl_global_plan_snapshot": 6,
+        "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
     in backend
@@ -155,7 +170,8 @@ checks = {
     "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend
     and "auto next_kv_info = current->kv_info" in backend
     and "next->kv_info       = next_kv_info" in backend
-    and "exact_live" in backend,
+    and "prepare_live_update(current_token)" in backend
+    and "finalize_live_update(ticket)" in backend,
     "provisional exhaustion is typed": "ggml_sycl_placement_publication_exhausted" in backend
     and "GGML_ABORT(\"[SYCL-PLAN] placement publication ID exhausted\")" not in backend,
     "global owner has no cache dependency": "return ggml_sycl::global_placement_plan_owner();" in backend,
@@ -163,13 +179,36 @@ checks = {
         r"global_placement_plan_owner\(\) noexcept \{(?P<body>.*?)\n\}", backend, re.S
     ).group("body").count("atomic_load_explicit")
     == 1,
+    "abort reset preserves authority": "ggml_sycl_reset_model_load_scratch_state(true)" in backend
+    and "if (!preserve_placement_authority)" in backend,
     "global cache aliases aggregated": "unique_caches" in backend
     and re.search(r"participates\[i\]\s*=\s*participates\[i\]\s*\|\|", backend),
+    "KV allocation retains one lifecycle owner": (
+        lambda body: body.count("ggml_sycl_global_plan_snapshot()") == 1
+        and "g_placement_kv_info" not in body
+        and "g_model_n_layer" not in body
+        and "ggml_sycl_cache_plan_owner" not in body
+    )(
+        re.search(
+            r"tiered_kv_buft_alloc_buffer\(.*?\n\}", backend, re.S
+        ).group(0)
+    ),
+    "cache decisions retain one coherence read": all(
+        (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text().count(token) >= count
+        for token, count in (
+            ("planned_materialization_allowed(\"direct_stage", 3),
+            ("__func__, &placement", 3),
+            ("const placement_cache_read * retained_read", 2),
+        )
+    ),
     "snapshot owns KV geometry": "placement_kv_info                     kv_info" in cache_hpp
     and "uint32_t                              model_n_layer" in cache_hpp
     and "auto next_kv_info = current->kv_info" in backend,
-    "publish replacement before reclaim": backend.index("ggml_sycl_publish_restored_plan(restoration)")
-    < backend.index("ggml_sycl_release_model_slot_resources(owner)"),
+    "publish replacement before reclaim": re.search(
+        r"ggml_sycl_teardown_owner_effects.*?ggml_sycl_publish_plan_locked\(restoration.snapshot\).*?"
+        r"ggml_sycl_release_model_slot_resources\(owner\)", backend, re.S
+    )
+    is not None,
     "explicit cache mismatch state": all(
         name in cache_hpp for name in ("MATCH", "GENUINE_NO_PLAN", "TRANSIENT_MISMATCH")
     )
@@ -194,6 +233,9 @@ checks = {
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
     in cpp,
+    "runtime update lease blocks teardown": "prepare_live_update" in hpp
+    and "active_live_updates" in hpp
+    and "current->second.active_live_updates == 0" in cpp,
     "fallible pre-finalize restoration": backend.index("teardown_owner_effects(owner)")
     < backend.index("finalize_teardown(ticket, true)"),
     "durable quarantine reaper": all(
@@ -212,6 +254,10 @@ checks = {
     not in backend,
     "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend
     and "max_passes" in backend,
+    "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
+    in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "dlsym" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "canonical G1 registration": "sycl-lifecycle-gpu-sequential"
     in (root / "tests/CMakeLists.txt").read_text()
     and "GGML_SYCL_G1_MODEL_A"

@@ -120,11 +120,21 @@ if (BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-runtime-wrapper.cpp)
     target_include_directories(test-sycl-lifecycle-runtime-wrapper PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
-    target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml-sycl)
+    if (GGML_BACKEND_DL)
+        target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE
+            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ${CMAKE_DL_LIBS})
+        add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
+    else()
+        # Static backend builds need the CPU implementation objects referenced
+        # by ggml-sycl's host fallback paths, not only the backend library.
+        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml-sycl ggml-cpu)
+    endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
+                  runtime-update-teardown
                   durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
                   latest-live-restoration busy-deferred-quarantine restore-failure-quarantine effect-failure-quarantine
@@ -1054,6 +1064,10 @@ endif()
 # perturb a benchmark in progress.
 # =============================================================================
 
+# Backend-linked fixtures below cannot link a MODULE backend in dynamic mode.
+# The lifecycle runtime wrapper above has its own dlopen/dlsym path; the wider
+# accelerator fixture matrix remains a static-backend test suite.
+if (NOT GGML_BACKEND_DL)
 set(SYCL_LINK_ONLY_TEST_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
@@ -3243,3 +3257,4 @@ if (Python3_Interpreter_FOUND)
 else()
     message(STATUS "ggml-sycl: Python3 not found; AST reset contract test is not registered")
 endif()
+endif() # NOT GGML_BACKEND_DL

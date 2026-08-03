@@ -2004,7 +2004,9 @@ class unified_cache {
     // === Pinning for Graphs ===
 
     void pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
-    void unpin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
+    void unpin(const ggml_sycl_cache_id &   key,
+               ggml_layout_mode             layout,
+               const placement_cache_read * retained_read = nullptr);
     void unpin_experts();
     void unpin_all();
     bool is_pinned(const ggml_sycl_cache_id & key, ggml_layout_mode layout) const;
@@ -3084,10 +3086,11 @@ class unified_cache {
     mutable std::shared_ptr<const lifecycle_plan_snapshot> placement_plan_snapshot_;
     std::atomic<int>                                       planned_materialization_depth_{ 0 };
 
-    bool planned_materialization_allowed(const char *               op,
-                                         const ggml_sycl_cache_id & key,
-                                         ggml_layout_mode           layout,
-                                         const char *               caller) const;
+    bool planned_materialization_allowed(const char *                 op,
+                                         const ggml_sycl_cache_id &   key,
+                                         ggml_layout_mode             layout,
+                                         const char *                 caller,
+                                         const placement_cache_read * retained_read = nullptr) const;
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };

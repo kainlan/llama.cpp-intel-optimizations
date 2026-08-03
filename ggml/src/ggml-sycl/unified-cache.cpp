@@ -2912,11 +2912,13 @@ bool unified_cache::planned_materialization_active() const {
     return planned_materialization_depth_.load(std::memory_order_acquire) > 0;
 }
 
-bool unified_cache::planned_materialization_allowed(const char *               op,
-                                                    const ggml_sycl_cache_id & key,
-                                                    ggml_layout_mode           layout,
-                                                    const char *               caller) const {
-    const auto placement = cache_placement_coherence(this);
+bool unified_cache::planned_materialization_allowed(const char *                 op,
+                                                    const ggml_sycl_cache_id &   key,
+                                                    ggml_layout_mode             layout,
+                                                    const char *                 caller,
+                                                    const placement_cache_read * retained_read) const {
+    const auto   owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);
+    const auto & placement  = retained_read ? *retained_read : owned_read;
     if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return false;
     }
@@ -3070,7 +3072,8 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
     direct_stage_result result{};
-    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+    const auto          placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return result;
     }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
@@ -3107,7 +3110,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             return result;
         }
     }
-    if (!planned_materialization_allowed("direct_stage_weight", key, layout, __func__)) {
+    if (!planned_materialization_allowed("direct_stage_weight", key, layout, __func__, &placement)) {
         return result;
     }
 
@@ -3307,7 +3310,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
     direct_stage_result result{};
-    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+    const auto          placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return result;
     }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
@@ -3344,7 +3348,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             return result;
         }
     }
-    if (!planned_materialization_allowed("direct_stage_expert", key, layout, __func__)) {
+    if (!planned_materialization_allowed("direct_stage_expert", key, layout, __func__, &placement)) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN("[DIRECT-STAGE] planned materialization rejected for expert layout=%d\n", (int) layout);
         }
@@ -3648,7 +3652,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
     direct_stage_result result{};
-    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+    const auto          placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return result;
     }
     if (keys.empty() || !src_ptr || src_size == 0 || expert_dst_size == 0) {
@@ -3728,7 +3733,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         }
     }
     for (const ggml_sycl_cache_id & key : keys) {
-        if (!planned_materialization_allowed("direct_stage_expert_tensor", key, layout, __func__)) {
+        if (!planned_materialization_allowed("direct_stage_expert_tensor", key, layout, __func__, &placement)) {
             return result;
         }
     }
@@ -6081,8 +6086,12 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
     }
 }
 
-void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
-    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+void unified_cache::unpin(const ggml_sycl_cache_id &   key_id,
+                          ggml_layout_mode             layout,
+                          const placement_cache_read * retained_read) {
+    const auto   owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);
+    const auto & placement  = retained_read ? *retained_read : owned_read;
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return;
     }
     if (!key_id.valid) {
@@ -6242,12 +6251,16 @@ int unified_cache::pin_layer_weights(int layer_id, const layer_weight_set & weig
 }
 
 void unified_cache::unpin_layer_weights(int layer_id, const layer_weight_set & weights, ggml_layout_mode layout) {
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     // Helper lambda to try unpinning a single key
     auto try_unpin = [&](const ggml_sycl_cache_id & key) {
         if (!key.valid) {
             return;
         }
-        unpin(key, layout);
+        unpin(key, layout, &placement);
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] bulk unpin layer=%d model=%llu name_hash=0x%llx layout=%d\n", layer_id,
                         (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout);
     };

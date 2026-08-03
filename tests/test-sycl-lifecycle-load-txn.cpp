@@ -146,6 +146,18 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto replay = duplicate.get();
         require(!replay.finisher && replay.code == error::OK_ALREADY_DEAD,
                 "duplicate teardown terminal replay differed");
+    } else if (name == "runtime-update-teardown") {
+        Registry r;
+        auto     model  = commit_one(r);
+        auto     update = r.prepare_live_update(model);
+        require(update.active && update.code == error::OK, "LIVE update lease rejected");
+        auto teardown = std::async(std::launch::async, [&] { return r.prepare_teardown(model); });
+        require(teardown.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                "teardown did not wait for runtime update");
+        require(r.finalize_live_update(update) == error::OK, "LIVE update finalize failed");
+        auto ticket = teardown.get();
+        require(ticket.finisher && ticket.code == error::OK, "teardown did not resume after runtime update");
+        require(r.finalize_teardown(ticket, true) == error::OK, "teardown after runtime update failed");
     } else if (name == "durable-replay") {
         Registry   r;
         LoadTxnId  first_txn{};

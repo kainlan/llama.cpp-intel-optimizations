@@ -9330,7 +9330,7 @@ static void ggml_sycl_quarantine_drain_shutdown() noexcept {
 // Forward declarations: defined later in this TU (after the globals they
 // clear), called at the outermost model-load boundary below. See each
 // definition for the full rationale (llama.cpp-k7b0).
-static void ggml_sycl_reset_model_load_scratch_state();
+static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_authority = false);
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
@@ -9495,13 +9495,19 @@ static bool ggml_sycl_restore_latest_live_plan() noexcept {
 
 static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken owner) noexcept {
     ggml_sycl_plan_restoration_bundle restoration;
-    if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-        return false;
+    {
+        // Refetch latest-LIVE only after acquiring the canonical publication
+        // writer lock. A completed A runtime update therefore cannot be
+        // overwritten by a stale pre-lock restoration bundle.
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
+            return false;
+        }
+        ggml_sycl_publish_plan_locked(restoration.snapshot);
     }
     // Replacement authority is visible before any dying-owner resource can be
     // reclaimed. Cleanup failure/quarantine therefore cannot restore the dying
     // owner or clear the latest-LIVE authority.
-    ggml_sycl_publish_restored_plan(restoration);
     try {
         ggml_sycl_release_model_slot_resources(owner);
         return true;
@@ -9513,14 +9519,17 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
     ggml_sycl_plan_restoration_bundle restoration;
-    if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-        throw std::runtime_error("failed to prepare latest LIVE placement plan");
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
+            throw std::runtime_error("failed to prepare latest LIVE placement plan");
+        }
+        ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
+        ggml_sycl_publish_plan_locked(restoration.snapshot);
     }
-    ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
-    ggml_sycl_publish_restored_plan(restoration);
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
-    ggml_sycl_reset_model_load_scratch_state();
+    ggml_sycl_reset_model_load_scratch_state(true);
     ggml_sycl_publish_restored_plan(restoration);
 }
 
@@ -10313,7 +10322,7 @@ std::atomic<bool>                                    g_tiered_enabled{ false };
 // `it->second != mapped` reads true against the stale UNKNOWN, so the new
 // model's real classification is discarded before it is ever used. The map
 // only makes sense for the model currently loading, so it is wiped here.
-static void ggml_sycl_reset_model_load_scratch_state() {
+static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_authority) {
     {
         std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
         g_tensor_inventory.clear();
@@ -10336,7 +10345,9 @@ static void ggml_sycl_reset_model_load_scratch_state() {
         g_placement_envelope                                   = ggml_sycl_placement_envelope{};
         g_placement_envelope_set                               = false;
         g_moe_expert_vram_reserve.fill(0);
-        ggml_sycl_publish_plan_locked(nullptr);
+        if (!preserve_placement_authority) {
+            ggml_sycl_publish_plan_locked(nullptr);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
@@ -11187,9 +11198,30 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-    const auto                  current = ggml_sycl_global_plan_snapshot();
+    const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
+        return;
+    }
+    const ggml_sycl::lifecycle::ModelToken current_token{
+        { current->model_id },
+        { current->load_txn_id },
+        { current->slot, current->slot_generation }
+    };
+    auto &     registry      = ggml_sycl::lifecycle::global_registry();
+    const auto update_ticket = registry.prepare_live_update(current_token);
+    if (!update_ticket.active) {
+        return;
+    }
+
+    struct live_update_guard {
+        ggml_sycl::lifecycle::Registry &         registry;
+        ggml_sycl::lifecycle::live_update_ticket ticket;
+
+        ~live_update_guard() { (void) registry.finalize_live_update(ticket); }
+    } update_guard{ registry, update_ticket };
+
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return;
     }
     auto next_kv_info = current->kv_info;
@@ -11211,15 +11243,9 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         return;
     }
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
-    // Validate current authority, CAS lifecycle ownership, and publish while
-    // holding the canonical writer lock. Metadata commits only after all three
-    // succeed, so exhaustion/commit/teardown races leave it unchanged.
-    const auto live       = ggml_sycl::lifecycle::global_registry().latest_live();
-    const bool exact_live = live && live->token.model.value == current->model_id &&
-                            live->token.load.value == current->load_txn_id && live->token.owner.slot == current->slot &&
-                            live->token.owner.generation == current->slot_generation;
-    if (!exact_live || ggml_sycl_global_plan_snapshot().get() != current.get() ||
-        !ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
+    // The live-update ticket prevents exact-token teardown from entering
+    // TEARING_DOWN until this CAS/publication transaction finalizes.
+    if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
         return;
     }
     ggml_sycl_publish_plan_locked(immutable);
@@ -28716,9 +28742,17 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     int    device   = buft_ctx->device;
     ggml_sycl_set_device(device);
 
+    // One immutable lifecycle owner supplies the plan and all KV geometry for
+    // this complete allocation decision. No mutable model-load mirror or
+    // repeated owner lookup may participate.
+    const auto                                lifecycle_owner = ggml_sycl_global_plan_snapshot();
+    static const ggml_sycl::placement_kv_info empty_kv_geometry{};
+    const auto &   kv_geometry       = lifecycle_owner ? lifecycle_owner->kv_info : empty_kv_geometry;
+    const uint32_t lifecycle_n_layer = lifecycle_owner ? lifecycle_owner->model_n_layer : 0;
+
     size = std::max(size, size_t(1));
     GGML_LOG_INFO("[KV-ALLOC] tiered_kv_buft_alloc_buffer: size=%.1f MB, n_layers=%u\n", size / (1024.0 * 1024.0),
-                  g_model_n_layer);
+                  lifecycle_n_layer);
 
     // Check env var override: GGML_SYCL_KV_HOST=1 forces all-host KV cache.
     static std::atomic<int> cached_kv_host{ -1 };
@@ -28748,23 +28782,17 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     GGML_SYCL_DEBUG("[KV-TIER] dev=%d cache_available=%.0f MB kv_req=%.0f MB arena=%d\n", device,
                     kv_vram_cap / (1024.0 * 1024.0), size / (1024.0 * 1024.0), (int) ggml_sycl::vram_arena_enabled());
 
-    uint32_t n_layers = g_model_n_layer;
+    uint32_t n_layers = lifecycle_n_layer;
     if (n_layers == 0) {
         n_layers = 32;  // Fallback: assume 32 layers (common for 7B models)
     }
 
-    auto &                            mgr                  = ggml_sycl::get_kv_tier_manager(device);
-    const ggml_sycl::placement_plan * kv_plan              = nullptr;
-    auto *                            plan_cache           = ggml_sycl::get_unified_cache_for_device(device);
-    const auto                        cache_kv_plan_owner  = ggml_sycl_cache_plan_owner(plan_cache);
-    const auto                        global_kv_plan_owner = ggml_sycl_global_plan_owner();
-    if (global_kv_plan_owner && !global_kv_plan_owner->kv_device.empty()) {
-        kv_plan = global_kv_plan_owner.get();
-    } else if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
-        if (!cache_kv_plan_owner->kv_device.empty()) {
-            kv_plan = cache_kv_plan_owner.get();
-        }
-    }
+    auto &                            mgr        = ggml_sycl::get_kv_tier_manager(device);
+    auto *                            plan_cache = ggml_sycl::get_unified_cache_for_device(device);
+    const ggml_sycl::placement_plan * kv_plan =
+        lifecycle_owner && lifecycle_owner->plan && !lifecycle_owner->plan->kv_device.empty() ?
+            lifecycle_owner->plan.get() :
+            nullptr;
 
     const std::vector<uint8_t> explicit_layer_mask     = ggml_sycl_pop_kv_layer_mask(device);
     const bool                 has_explicit_layer_mask = explicit_layer_mask.size() >= static_cast<size_t>(n_layers);
@@ -28779,10 +28807,10 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     // attention type.  We identify which buffer this is by matching its total
     // size against the planner's expected per-type totals, unless llama_kv_cache
     // provided exact layer membership for this buffer.
-    const size_t   planner_full_kv = g_placement_kv_info.kv_bytes_per_layer();
-    const size_t   planner_swa_kv  = g_placement_kv_info.kv_bytes_per_swa_layer();
-    const uint32_t n_full_layers   = g_placement_kv_info.n_full_attn_layers();
-    const uint32_t n_swa_layers    = g_placement_kv_info.n_swa_layers;
+    const size_t   planner_full_kv = kv_geometry.kv_bytes_per_layer();
+    const size_t   planner_swa_kv  = kv_geometry.kv_bytes_per_swa_layer();
+    const uint32_t n_full_layers   = kv_geometry.n_full_attn_layers();
+    const uint32_t n_swa_layers    = kv_geometry.n_swa_layers;
 
     // Identify this buffer by comparing its total size against expected totals.
     // Do not assume the SWA buffer is smaller: at short contexts the SWA
@@ -28809,7 +28837,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         if (buffer_kind == kv_buffer_kind::ALL_LAYERS) {
             return true;
         }
-        const bool is_swa = g_placement_kv_info.is_swa_layer(layer_id);
+        const bool is_swa = kv_geometry.is_swa_layer(layer_id);
         return buffer_kind == kv_buffer_kind::SWA_ONLY ? is_swa : !is_swa;
     };
     const bool kv_buffer_covers_all_layers =
@@ -28844,9 +28872,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);
 
     ggml_sycl::placement_plan runtime_kv_plan;
-    if (kv_plan && g_placement_kv_info.valid()) {
+    if (kv_plan && kv_geometry.valid()) {
         runtime_kv_plan = *kv_plan;
-        runtime_kv_plan.update_runtime_kv_sizes(g_placement_kv_info.n_ctx, planner_full_kv, planner_swa_kv);
+        runtime_kv_plan.update_runtime_kv_sizes(kv_geometry.n_ctx, planner_full_kv, planner_swa_kv);
 
         static const bool block_exec_candidate_kv_enabled = [] {
             const char * env = std::getenv("GGML_SYCL_BLOCK_EXEC_CANDIDATE_KV");
