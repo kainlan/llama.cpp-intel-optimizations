@@ -274,23 +274,62 @@ def code_mask(source_b: bytes):
     return bytes(out)
 
 
-def enclosing_recovered_function(source_b: bytes, node):
-    if kind(node) == "ERROR" and recovered_function_name(source_b, node):
-        return True
-    return any(kind(item) == "ERROR" and recovered_function_name(source_b, item) for item in ancestors(node))
+def recovered_function_ancestor(source_b: bytes, node):
+    candidates = [node, *ancestors(node)]
+    return next(
+        (item for item in candidates if kind(item) == "ERROR" and recovered_function_name(source_b, item)),
+        None,
+    )
+
+
+def parsed_function_context(node):
+    candidates = [node, *ancestors(node)]
+    return next((item for item in candidates if kind(item) in {"function_definition", "lambda_expression"}), None)
+
+
+def is_preprocessor_condition_recovery(source_b: bytes, gap):
+    """Accept only recovery confined to a #if/#elif condition line, never its body."""
+    if not any(kind(item) in {"preproc_if", "preproc_elif"} for item in ancestors(gap)):
+        return False
+    line_start = source_b.rfind(b"\n", 0, start_byte(gap)) + 1
+    line_end = source_b.find(b"\n", start_byte(gap))
+    if line_end < 0:
+        line_end = len(source_b)
+    line = source_b[line_start:line_end]
+    return end_byte(gap) <= line_end and re.match(rb"\s*#\s*(?:if|elif)\b", line) is not None
 
 
 def recovery_coverage(source_b: bytes, root, declarations):
     """Prove every recovery site unable to hide a census declaration, or fail."""
     gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
     declaration_spans = [(start_byte(item), end_byte(item)) for item in declarations]
-    function_spans = [
-        (start_byte(item), end_byte(item)) for item in walk(root)
-        if kind(item) in {"function_definition", "lambda_expression"}
-    ]
+
+    # Exempt storage markers only in actual function signatures. A whole parsed
+    # or recovered function body is deliberately not an exemption: every marker
+    # there must still belong to a parsed declaration. Nested function_definition
+    # nodes are invalid C++ and can be recovery's misparse of a malformed local.
+    signature_spans = []
+    for item in walk(root):
+        if kind(item) not in {"function_definition", "lambda_expression"}:
+            continue
+        if any(kind(ancestor) in {"function_definition", "lambda_expression"} for ancestor in ancestors(item)):
+            continue
+        body = field(item, "body")
+        if body is not None:
+            signature_spans.append((start_byte(item), start_byte(body)))
     recovered_functions = [
-        item for item in gaps if kind(item) == "ERROR" and recovered_function_name(source_b, item)
+        item for item in gaps
+        if kind(item) == "ERROR" and recovered_function_name(source_b, item)
+        and not any(
+            kind(ancestor) in {"function_definition", "lambda_expression"}
+            or (kind(ancestor) == "ERROR" and recovered_function_name(source_b, ancestor))
+            for ancestor in ancestors(item)
+        )
     ]
+    for item in recovered_functions:
+        body_start = source_b.find(b"{", start_byte(item), end_byte(item))
+        if body_start >= 0:
+            signature_spans.append((start_byte(item), body_start))
 
     failures = []
     masked = code_mask(source_b)
@@ -298,25 +337,28 @@ def recovery_coverage(source_b: bytes, root, declarations):
         pos = match.start()
         if any(begin <= pos < end for begin, end in declaration_spans):
             continue
-        # A static function's storage marker is not an object declaration.
-        if any(begin <= pos < end for begin, end in function_spans):
-            continue
-        if any(start_byte(item) <= pos < end_byte(item)
-               and pos < source_b.find(b"{", start_byte(item), end_byte(item))
-               for item in recovered_functions):
+        # A function's signature-level storage marker is not an object declaration.
+        if any(begin <= pos < end for begin, end in signature_spans):
             continue
         failures.append((line_of(source_b, pos), "unparsed storage-duration marker"))
 
     categories = Counter()
     for gap in gaps:
-        ancestor_kinds = {kind(item) for item in ancestors(gap)}
-        if {"function_definition", "lambda_expression"} & ancestor_kinds or enclosing_recovered_function(source_b, gap):
-            categories["function-region-marker-covered"] += 1
-        elif "preproc_if" in ancestor_kinds or text(source_b, gap).lstrip().startswith("#"):
-            categories["preprocessor-expression"] += 1
+        function = parsed_function_context(gap)
+        recovered = recovered_function_ancestor(source_b, gap)
+        if function is not None or recovered is not None:
+            body = field(function, "body") if function is not None else None
+            if body is not None and end_byte(gap) <= start_byte(body):
+                categories["function-signature-non-storage"] += 1
+            else:
+                # Body recovery is accepted only alongside the marker scan above:
+                # all static/thread_local spellings must be parsed declarations.
+                categories["function-body-storage-proven"] += 1
+        elif is_preprocessor_condition_recovery(source_b, gap):
+            categories["preprocessor-condition-nondeclaration"] += 1
         else:
-            # Namespace/file recovery can hide an implicit-static object of any
-            # user type or initializer spelling. There is no lexical exemption.
+            # Namespace/file or structural-preprocessor recovery can hide an
+            # implicit-static object of any user type or initializer spelling.
             failures.append((line_of(source_b, gap), f"unproved {kind(gap)} recovery at namespace/file scope"))
     return gaps, categories, failures
 
@@ -425,10 +467,16 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
         assert writes.startswith("unscoped lexical candidate:") or writes.startswith("none found by")
         assert not disposition.startswith("reset/teardown evidence:")
 
-    broken = "namespace broken { Widget implicit_global{; }"
-    _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
-    assert broken_gaps and broken_failures, "namespace recovery must fail closed for implicit/direct-init globals"
-    print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern")
+    negative_fixtures = {
+        "function-body-static-recovery": "void f(){ static Widget x{; }",
+        "structural-preprocessor-recovery": "#if X\nWidget implicit_global{;\n#endif",
+        "namespace-direct-init-recovery": "namespace broken { Widget implicit_global{; }",
+    }
+    for fixture, broken in negative_fixtures.items():
+        _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
+        assert broken_gaps and broken_failures, f"{fixture} must fail closed"
+    print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
+          "function-body-static-recovery,structural-preprocessor-recovery")
 
 
 def main():

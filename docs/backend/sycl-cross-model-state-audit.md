@@ -55,19 +55,26 @@ from nested preprocessor alternatives, declaration-prefix macros
 tokens such as `PRId64`; the latter are dispatch macro invocations and a label
 next to a conditional compilation boundary. These are **explicit raw-parser recovery sites**, not silently discarded
 regions. Each of the 51 nodes must receive a structural proof category. In the
-current inputs, 48 are inside parsed or unambiguously recovered function
-regions, where every `static`/`thread_local` marker is independently required
-to belong to a parsed declaration; the remaining 3 are preprocessor-expression
-fragments. Any namespace/file recovery is rejected because it could conceal an
-implicit-static object of a user-defined type or direct-initialization spelling.
-There are no declaration-type or spelling exemptions. The generator exits 2
-without writing output when a recovery node or storage marker lacks proof.
+current inputs, 17 are confined to parsed function signature/storage spans and
+31 are in parsed or unambiguously recovered function bodies. Only the signature
+span exempts a function's own `static` storage-class marker. Body recovery is
+accepted only when every `static`/`thread_local` marker in it independently
+belongs to a parsed declaration; an unparsed marker fails the census. The
+remaining 3 sites are confined to `#if` condition lines, which cannot contain a
+declaration. Structural preprocessor recovery spanning a conditional body is
+not exempt. Any other namespace/file recovery is rejected because it could
+conceal an implicit-static object of a user-defined type or direct-initialization
+spelling. There are no declaration-type or spelling exemptions. The generator
+exits 2 without writing output when a recovery node or storage marker lacks
+proof.
 
 `--self-test` covers nearest method/lambda scope, const pointee versus const
 pointer, mutable containers/atomics, repeated names in different bindings,
 initializer-free direct initialization, fail-closed namespace recovery,
 multi-object declarations, and namespaced `extern` declaration versus
-definition.
+definition. Negative fixtures also require rejection of malformed recovery in
+a function body (`void f(){ static Widget x{; }`) and across a structural
+preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`).
 
 ### Static high-risk highlights (no behavior changes in this census)
 
