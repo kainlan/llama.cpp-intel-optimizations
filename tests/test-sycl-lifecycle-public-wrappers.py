@@ -18,6 +18,8 @@ required = {
     "guard abort default": "ggml_backend_sycl_model_load_end(txn, false" in llama,
     "guard explicit success": "sycl_model_loading_guard.finish(true)" in llama,
     "teardown failure logged": "SYCL model teardown failed" in llama,
+    "quarantine token retained": llama.index("token.model_id != 0") < llama.index("if (!expected)"),
+    "teardown token cleared only on success": "rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD" in llama,
 }
 failed = [k for k, v in required.items() if not v]
 if failed:

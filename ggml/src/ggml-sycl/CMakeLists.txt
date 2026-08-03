@@ -110,7 +110,8 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown durable-replay waiter-rollover
-                  committing-teardown load-effect-failure-quarantine effect-failure-quarantine begin-allocation-failure null-output stale-token-after-reuse)
+                  committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
+                  latest-live-restoration effect-failure-quarantine begin-allocation-failure null-output stale-token-after-reuse)
         add_test(NAME sycl-lifecycle-h2-${_case} COMMAND test-sycl-lifecycle-load-txn --case ${_case})
     endforeach()
     foreach(_case slot-exhaustion model-id-overflow load-txn-id-overflow slot-generation-overflow invocation-id-counter-overflow)
@@ -120,7 +121,7 @@ if (BUILD_TESTING)
     foreach(_mutation M1 M2 M3)
         add_test(NAME sycl-lifecycle-mutation-${_mutation}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-mutations.sh
-                    ${CMAKE_BINARY_DIR} ${_mutation})
+                    $<TARGET_FILE:test-sycl-lifecycle-load-txn> ${_mutation})
     endforeach()
 
     find_package(Python3 COMPONENTS Interpreter REQUIRED)

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-build=${1:?build directory required}
+bin=${1:?test binary required}
 mutation=${2:?M1, M2, or M3 required}
-bin="$build/bin/test-sycl-lifecycle-load-txn"
 case "$mutation" in
   M1) cases=(--case stale-generation); marker='stale slot generation accepted' ;;
   M2) cases=(--case nested-success); marker='nested load committed' ;;

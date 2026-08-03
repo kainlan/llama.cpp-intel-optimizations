@@ -22,6 +22,11 @@ begin_result Registry::begin_outer() noexcept {
         if (active_txn_ != 0) {
             return { error::LOAD_BUSY };
         }
+        for (const auto & model : models_) {
+            if (model.second.phase == model_phase::TEARING_DOWN) {
+                return { error::LOAD_BUSY };
+            }
+        }
         uint32_t slot = no_model_slot;
         for (uint32_t i = 0; i < model_slot_count; ++i) {
             if (!slots_[i].reserved && slots_[i].generation != UINT64_MAX) {
@@ -170,7 +175,7 @@ end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok,
         }
 
         bool  commit      = ticket.commit && effects_ok;
-        error result_code = ticket.commit && !effects_ok ? error::EFFECT_FAILED : txn.finish_reason;
+        error result_code = !effects_ok ? error::EFFECT_FAILED : txn.finish_reason;
         if (commit) {
             try {
                 auto state = prepared_state ? std::move(prepared_state) :
@@ -233,6 +238,9 @@ void Registry::remember_dead_locked(ModelToken token, error result) {
 teardown_ticket Registry::prepare_teardown(ModelToken token) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (token.model.value == 0 || token.owner.slot >= model_slot_count) return {error::NOT_FOUND};
+    if (active_txn_ != 0) {
+        return { error::BUSY, token };
+    }
     auto txn = txns_.find(token.load.value);
     if (txn != txns_.end() && txn->second.token == token &&
         (txn->second.phase == finish_phase::COMMITTING || txn->second.phase == finish_phase::ROLLING_BACK)) {
@@ -253,6 +261,23 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     }
     if (model->second.phase == model_phase::LOADING) {
         return { error::BUSY, token };
+    }
+    // Reserve compact durable replay metadata before any unlocked teardown
+    // effect can destroy the model or release its slot. Large placement plans
+    // live elsewhere and are erased after successful teardown.
+    if (dead_.find(token.model.value) == dead_.end()) {
+        try {
+            if (fail_next_dead_allocation_) {
+                fail_next_dead_allocation_ = false;
+                throw std::bad_alloc();
+            }
+            dead_.emplace(token.model.value, std::make_pair(token, error::EFFECT_FAILED));
+        } catch (...) {
+            model->second.phase           = model_phase::QUARANTINED;
+            model->second.teardown_result = error::ALLOCATION_FAILED;
+            cv_.notify_all();
+            return { error::ALLOCATION_FAILED, token };
+        }
     }
     if (model->second.phase == model_phase::TEARING_DOWN) {
         const uint64_t serial = model->second.teardown_serial;
@@ -289,11 +314,18 @@ error Registry::finalize_teardown(const teardown_ticket & ticket, bool effects_o
             cv_.notify_all();
             return error::EFFECT_FAILED;
         }
+        auto dead = dead_.find(ticket.token.model.value);
+        if (dead == dead_.end()) {
+            model->second.phase           = model_phase::QUARANTINED;
+            model->second.teardown_result = error::ALLOCATION_FAILED;
+            cv_.notify_all();
+            return error::ALLOCATION_FAILED;
+        }
+        dead->second  = { ticket.token, error::OK_ALREADY_DEAD };
         auto & slot   = slots_[ticket.token.owner.slot];
         slot.reserved = false;
         slot.model    = {};
         models_.erase(model);
-        remember_dead_locked(ticket.token, error::OK_ALREADY_DEAD);
         cv_.notify_all();
         return error::OK;
     } catch (...) {
@@ -315,6 +347,18 @@ std::shared_ptr<const ModelState> Registry::find(ModelId id) const {
 std::shared_ptr<const ModelState> Registry::last_success() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_success_;
+}
+
+std::shared_ptr<const ModelState> Registry::latest_live() const {
+    std::lock_guard<std::mutex>       lock(mutex_);
+    std::shared_ptr<const ModelState> latest;
+    for (const auto & item : models_) {
+        if (item.second.phase == model_phase::LIVE && item.second.state &&
+            (!latest || item.second.token.model.value > latest->token.model.value)) {
+            latest = item.second.state;
+        }
+    }
+    return latest;
 }
 
 uint32_t Registry::live_mask() const {
@@ -365,6 +409,11 @@ void Registry::test_set_slot_generation(uint32_t slot, uint64_t generation) {
 void Registry::test_fail_next_begin_allocation() {
     std::lock_guard<std::mutex> lock(mutex_);
     fail_next_begin_allocation_ = true;
+}
+
+void Registry::test_fail_next_dead_allocation() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_next_dead_allocation_ = true;
 }
 
 Registry & global_registry() {

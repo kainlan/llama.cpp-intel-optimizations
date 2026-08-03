@@ -115,9 +115,7 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto     old = commit_one(r);
         auto     t   = r.prepare_teardown(old);
         require(t.finisher, "no teardown finisher");
-        auto b = r.begin_outer();
-        require(b.token.owner.slot != old.owner.slot, "teardown slot reused before effects");
-        r.end(b.txn, false);
+        require(r.begin_outer().code == error::LOAD_BUSY, "load raced teardown cache effects");
         require(r.finalize_teardown(t, true) == error::OK, "teardown finalize failed");
     } else if (name == "concurrent-teardown") {
         Registry r;
@@ -181,6 +179,37 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto retry = r.prepare_teardown(b.token);
         require(retry.finisher, "failed-load quarantine not retryable");
         require(r.finalize_teardown(retry, true) == error::OK, "failed-load quarantine retry failed");
+    } else if (name == "rollback-effect-replay") {
+        Registry r;
+        auto     b      = r.begin_outer();
+        auto     finish = r.prepare_end(b.txn, false);
+        auto     failed = r.finalize_end(finish, false);
+        require(failed.code == error::EFFECT_FAILED, "rollback effect failure classification lost");
+        require(r.end(b.txn, false).code == error::EFFECT_FAILED, "rollback effect replay changed classification");
+    } else if (name == "dead-allocation-failure") {
+        Registry r;
+        auto     model = commit_one(r);
+        r.test_fail_next_dead_allocation();
+        auto failed = r.prepare_teardown(model);
+        require(failed.code == error::ALLOCATION_FAILED && !failed.finisher, "dead metadata allocation failure lost");
+        require(!r.find(model.model), "dead metadata allocation failure restored LIVE");
+        auto retry = r.prepare_teardown(model);
+        require(retry.finisher, "dead metadata allocation failure was not retryable");
+        auto waiter = std::async(std::launch::async, [&] { return r.prepare_teardown(model); });
+        require(waiter.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout,
+                "dead metadata waiter did not block");
+        require(r.finalize_teardown(retry, true) == error::OK, "dead metadata retry failed");
+        require(waiter.get().code == error::OK_ALREADY_DEAD, "dead metadata waiter replay mismatch");
+    } else if (name == "latest-live-restoration") {
+        Registry r;
+        auto     a = commit_one(r);
+        auto     b = commit_one(r);
+        require(r.latest_live()->token == b, "latest LIVE did not select B");
+        require(r.teardown(b) == error::OK && r.latest_live()->token == a, "B teardown did not restore A authority");
+        auto c = r.begin_outer();
+        r.end(c.txn, false);
+        require(r.latest_live()->token == a, "failed C changed A restoration authority");
+        require(r.teardown(a) == error::OK && !r.latest_live(), "A teardown left stale restoration authority");
     } else if (name == "effect-failure-quarantine") {
         Registry r;
         auto     model    = commit_one(r);

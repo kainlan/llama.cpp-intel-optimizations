@@ -83,7 +83,10 @@ void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
 bool lifecycle_publish_placement_plan(uint64_t model_id,
                                       uint64_t load_txn_id,
                                       uint32_t slot,
-                                      uint64_t slot_generation) noexcept {
+                                      uint64_t slot_generation,
+                                      uint64_t actual_host_bytes,
+                                      uint64_t actual_device_bytes,
+                                      bool     have_actual) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
@@ -94,6 +97,22 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         published->model_id                            = model_id;
         published->slot                                = slot;
         published->slot_generation                     = slot_generation;
+        if (published->plan) {
+            published->planned_host_bytes  = published->plan->weight_host_bytes;
+            published->actual_host_bytes   = have_actual ? actual_host_bytes : published->planned_host_bytes;
+            const uint64_t reported_host   = published->actual_host_bytes;
+            const uint64_t reported_device = have_actual ? actual_device_bytes : published->plan->weight_vram_bytes;
+            published->verdict = reported_host == 0 && reported_device == 0 ? lifecycle_plan_verdict::UNKNOWN :
+                                 reported_host == 0                         ? lifecycle_plan_verdict::DEVICE :
+                                 reported_device == 0                       ? lifecycle_plan_verdict::HOST :
+                                                                              lifecycle_plan_verdict::MIXED;
+        } else {
+            // no_alloc is an explicit successful UNKNOWN, never a stale DEVICE
+            // verdict inherited from a prior model.
+            published->planned_host_bytes = 0;
+            published->actual_host_bytes  = 0;
+            published->verdict            = lifecycle_plan_verdict::UNKNOWN;
+        }
         g_lifecycle_plan_models[model_id][load_txn_id] = std::move(published);
         g_lifecycle_plan_candidates.erase(candidate);
         return true;
@@ -110,6 +129,34 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uin
     }
     auto plan = model->second.find(load_txn_id);
     return plan == model->second.end() ? nullptr : plan->second;
+}
+
+void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        model = g_lifecycle_plan_models.find(model_id);
+        if (model == g_lifecycle_plan_models.end()) {
+            return;
+        }
+        model->second.erase(load_txn_id);
+        if (model->second.empty()) {
+            g_lifecycle_plan_models.erase(model);
+        }
+    } catch (...) {
+    }
+}
+
+size_t lifecycle_published_placement_plan_count_for_test() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        size_t                      count = 0;
+        for (const auto & model : g_lifecycle_plan_models) {
+            count += model.second.size();
+        }
+        return count;
+    } catch (...) {
+        return 0;
+    }
 }
 
 const char * residency_reject_reason_name(residency_reject_reason reason) {

@@ -1011,23 +1011,33 @@ struct placement_plan {
 
 // Immutable lifecycle-owned plan snapshots. A null plan with
 // explicit_no_plan=true is the published no_alloc/UNKNOWN outcome.
+enum class lifecycle_plan_verdict : uint8_t { UNKNOWN, DEVICE, HOST, MIXED };
+
 struct lifecycle_plan_snapshot {
-    uint64_t                              model_id         = 0;
-    uint64_t                              load_txn_id      = 0;
-    uint32_t                              slot             = UINT32_MAX;
-    uint64_t                              slot_generation  = 0;
-    bool                                  explicit_no_plan = false;
+    uint64_t                              model_id           = 0;
+    uint64_t                              load_txn_id        = 0;
+    uint32_t                              slot               = UINT32_MAX;
+    uint64_t                              slot_generation    = 0;
+    uint64_t                              planned_host_bytes = 0;
+    uint64_t                              actual_host_bytes  = 0;
+    lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
+    bool                                  explicit_no_plan   = false;
     std::shared_ptr<const placement_plan> plan;
 };
 
 void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan);
 void lifecycle_stage_no_placement_plan(uint64_t load_txn_id);
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
-bool lifecycle_publish_placement_plan(uint64_t model_id,
-                                      uint64_t load_txn_id,
-                                      uint32_t slot,
-                                      uint64_t slot_generation) noexcept;
+bool                                           lifecycle_publish_placement_plan(uint64_t model_id,
+                                                                                uint64_t load_txn_id,
+                                                                                uint32_t slot,
+                                                                                uint64_t slot_generation,
+                                                                                uint64_t actual_host_bytes,
+                                                                                uint64_t actual_device_bytes,
+                                                                                bool     have_actual) noexcept;
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
+void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
+size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.

@@ -30,6 +30,11 @@ checks = {
     "committing teardown busy": "BUSY, token" in cpp,
     "immutable full plan candidate": all(x in backend for x in ("lifecycle_stage_placement_plan", "lifecycle_publish_placement_plan", "lifecycle_abort_placement_plan")),
     "atomic dying cache bit": "unified_cache_set_live_model_mask(live_after)" not in backend,
+    "candidate-only publication accounting": "publication_from_plan" in backend and "cache->get_placement_plan().weight_host_bytes" not in backend,
+    "latest live restoration": "global_registry().latest_live()" in backend and "explicit_no_plan" in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text(),
+    "plan deletion on teardown": "lifecycle_erase_placement_plan" in backend,
+    "dead metadata preallocated": "dead_.emplace" in cpp and cpp.index("dead_.emplace") < cpp.index("model->second.phase = model_phase::TEARING_DOWN"),
+    "rollback effect replay": "error result_code = !effects_ok ? error::EFFECT_FAILED" in cpp,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

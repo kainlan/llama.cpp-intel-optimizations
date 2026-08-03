@@ -117,6 +117,7 @@ public:
 
     std::shared_ptr<const ModelState> find(ModelId model) const;
     std::shared_ptr<const ModelState> last_success() const;
+    std::shared_ptr<const ModelState> latest_live() const;
     uint32_t live_mask() const;
     SlotToken current_active_slot() const;
     ModelToken current_active_token() const;
@@ -126,8 +127,9 @@ public:
     void test_set_next_ids(uint64_t model, uint64_t load);
     void test_set_slot_generation(uint32_t slot, uint64_t generation);
     void test_fail_next_begin_allocation();
+    void test_fail_next_dead_allocation();
 
-private:
+  private:
     struct txn_state {
         ModelToken token{};
         uint64_t depth = 1;
@@ -165,6 +167,7 @@ private:
     uint64_t active_txn_ = 0;
     uint64_t publications_ = 0, rollbacks_ = 0;
     bool                                                       fail_next_begin_allocation_ = false;
+    bool                                                       fail_next_dead_allocation_  = false;
 };
 
 Registry & global_registry();

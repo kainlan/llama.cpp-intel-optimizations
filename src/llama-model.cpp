@@ -98,6 +98,9 @@ struct llama_model_sycl_loading_guard {
         if (!active) return;
         ggml_sycl_model_token token = {};
         const auto rc = ggml_backend_sycl_model_load_end(txn, false, outer ? &token : nullptr);
+        if (outer && out_model && token.model_id != 0) {
+            *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        }
         if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
             rc != GGML_SYCL_LIFECYCLE_NESTED) {
             LLAMA_LOG_ERROR("SYCL model lifecycle abort failed: txn=%llu result=%d\n", (unsigned long long) txn.id, (int) rc);
@@ -109,10 +112,14 @@ struct llama_model_sycl_loading_guard {
         ggml_sycl_model_token token = {};
         const auto rc = ggml_backend_sycl_model_load_end(txn, explicit_success, outer ? &token : nullptr);
         active = false;
+        if (outer && out_model && token.model_id != 0) {
+            *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        }
         const bool expected = rc == GGML_SYCL_LIFECYCLE_OK || (!outer && rc == GGML_SYCL_LIFECYCLE_NESTED);
-        if (!expected) throw std::runtime_error(format("SYCL model lifecycle end failed: txn=%llu outer=%d success=%d result=%d",
-            (unsigned long long) txn.id, outer, explicit_success, (int) rc));
-        if (outer && out_model) *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        if (!expected) {
+            throw std::runtime_error(format("SYCL model lifecycle end failed: txn=%llu outer=%d success=%d result=%d",
+                                            (unsigned long long) txn.id, outer, explicit_success, (int) rc));
+        }
     }
 };
 
@@ -1366,12 +1373,13 @@ llama_model::~llama_model() {
     // tensors hold leases until their extras go.
     if (sycl_model_token.model_id != 0) {
         const ggml_sycl_model_token token = { sycl_model_token.model_id, sycl_model_token.load_txn_id,
-                                               sycl_model_token.slot, sycl_model_token.slot_generation };
-        sycl_model_token = {};
+                                              sycl_model_token.slot, sycl_model_token.slot_generation };
         pimpl.reset();
         if (llama_model_sycl_hooks_enabled()) {
             const auto rc = ggml_backend_sycl_model_unloaded_token(token);
-            if (rc != GGML_SYCL_LIFECYCLE_OK && rc != GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
+            if (rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
+                sycl_model_token = {};
+            } else {
                 LLAMA_LOG_ERROR("SYCL model teardown failed: model=%llu txn=%llu slot=%u generation=%llu result=%d\n",
                     (unsigned long long) token.model_id, (unsigned long long) token.load_txn_id, token.slot,
                     (unsigned long long) token.slot_generation, (int) rc);

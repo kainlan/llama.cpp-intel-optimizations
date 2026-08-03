@@ -58,6 +58,52 @@ void check_role(const char * name, expert_tensor_role expected) {
 }  // namespace
 
 int main() {
+    // Lifecycle snapshots own one full plan per model, not one summary per
+    // device cache. This also verifies explicit no-plan publication and plan
+    // deletion without requiring a GPU queue.
+    placement_plan plan{};
+    plan.weight_host_bytes = 11;
+    plan.weight_vram_bytes = 22;
+    plan.multi_device      = true;
+    plan.devices           = { 0, 1, 2 };
+    lifecycle_stage_placement_plan(1001, plan);
+    if (!lifecycle_publish_placement_plan(2001, 1001, 3, 7, 0, 0, false)) {
+        printf("FAIL lifecycle plan publish\n");
+        n_fail++;
+    } else {
+        auto published = lifecycle_find_placement_plan(2001, 1001);
+        if (published && published->planned_host_bytes == 11 && published->actual_host_bytes == 11 &&
+            published->verdict == lifecycle_plan_verdict::MIXED) {
+            n_pass++;
+        } else {
+            printf("FAIL lifecycle multi-device single count\n");
+            n_fail++;
+        }
+    }
+    lifecycle_stage_no_placement_plan(1002);
+    if (!lifecycle_publish_placement_plan(2002, 1002, 4, 8, 99, 99, true)) {
+        printf("FAIL lifecycle no-plan publish\n");
+        n_fail++;
+    } else {
+        auto no_plan = lifecycle_find_placement_plan(2002, 1002);
+        auto prior   = lifecycle_find_placement_plan(2001, 1001);
+        if (no_plan && no_plan->explicit_no_plan && !no_plan->plan &&
+            no_plan->verdict == lifecycle_plan_verdict::UNKNOWN && no_plan->planned_host_bytes == 0 && prior) {
+            n_pass++;
+        } else {
+            printf("FAIL lifecycle no-plan isolation\n");
+            n_fail++;
+        }
+    }
+    lifecycle_erase_placement_plan(2002, 1002);
+    lifecycle_erase_placement_plan(2001, 1001);
+    if (lifecycle_published_placement_plan_count_for_test() == 0) {
+        n_pass++;
+    } else {
+        printf("FAIL lifecycle plan deletion\n");
+        n_fail++;
+    }
+
     // Non-expert tensors -- must NOT classify as MOE_EXPERT_WEIGHT / a routed role.
     check_usage("blk.0.attn_q.weight", tensor_usage::ATTENTION_WEIGHT);
     check_usage("blk.0.attn_k.weight", tensor_usage::ATTENTION_WEIGHT);

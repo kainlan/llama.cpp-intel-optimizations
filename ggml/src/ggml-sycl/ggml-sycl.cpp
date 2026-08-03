@@ -1990,6 +1990,7 @@ static std::atomic<bool> g_moe_multi_gpu_active{ false };
 // so secondary setup can follow the already-computed smart-handle plan.
 static ggml_sycl::placement_plan g_placement_plan;
 static bool                      g_has_placement_plan = false;
+static std::atomic<bool>         g_current_model_planner_host_placement{ false };
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
 static bool ggml_sycl_placement_plan_uses_other_device(const ggml_sycl::placement_plan & plan, int current_device);
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan);
@@ -9019,6 +9020,7 @@ uint32_t ggml_backend_sycl_model_slot_current(void) {
 // must run at MODEL teardown rather than backend-context teardown
 // (llama.cpp-2wv5).
 static void ggml_sycl_release_graph_replay_leases_all_devices();
+static void ggml_sycl_restore_latest_live_plan() noexcept;
 
 static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecycle::error e) {
     using E = ggml_sycl::lifecycle::error;
@@ -9075,7 +9077,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
         ticket = registry.prepare_teardown(owner);
         if (!ticket.finisher) return ggml_sycl_lifecycle_c_result(ticket.code);
         ggml_sycl_release_model_slot_resources(owner);
-        return ggml_sycl_lifecycle_c_result(registry.finalize_teardown(ticket, true));
+        const auto result = registry.finalize_teardown(ticket, true);
+        if (result == ggml_sycl::lifecycle::error::OK) {
+            // Full plans can be large; durable replay identity remains compact
+            // in Registry::dead_ after this snapshot is deleted.
+            ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value);
+            ggml_sycl_restore_latest_live_plan();
+        }
+        return ggml_sycl_lifecycle_c_result(result);
     } catch (...) {
         if (ticket.finisher) (void) registry.finalize_teardown(ticket, false);
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -9172,35 +9181,78 @@ static void ggml_sycl_export_token(const ggml_sycl::lifecycle::ModelToken & in, 
     if (out) *out = {in.model.value, in.load.value, in.owner.slot, in.owner.generation};
 }
 
-static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_snapshot() {
-    ggml_sycl::lifecycle::publication_data data;
-    size_t actual_device = 0;
+struct ggml_sycl_lifecycle_actual_data {
+    uint64_t host_bytes   = 0;
+    uint64_t device_bytes = 0;
     bool have_actual = false;
-    {
-        std::lock_guard<std::mutex> lock(g_sycl_load_summary_mutex);
-        for (const auto & state : g_sycl_load_summary) {
-            if (state.have_actual_weights) {
-                have_actual = true;
-                data.actual_host_bytes += state.weight_host_bytes;
-                actual_device += state.weight_device_bytes;
+};
+
+static ggml_sycl_lifecycle_actual_data ggml_sycl_lifecycle_actual_snapshot() {
+    ggml_sycl_lifecycle_actual_data data;
+    std::lock_guard<std::mutex>     lock(g_sycl_load_summary_mutex);
+    for (const auto & state : g_sycl_load_summary) {
+        if (state.have_actual_weights) {
+            data.have_actual = true;
+            data.host_bytes += state.weight_host_bytes;
+            data.device_bytes += state.weight_device_bytes;
+        }
+    }
+    return data;
+}
+
+static ggml_sycl::lifecycle::publication_data ggml_sycl_lifecycle_publication_from_plan(
+    const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
+    ggml_sycl::lifecycle::publication_data data;
+    data.planned_host_bytes = snapshot.planned_host_bytes;
+    data.actual_host_bytes  = snapshot.actual_host_bytes;
+    switch (snapshot.verdict) {
+        case ggml_sycl::lifecycle_plan_verdict::DEVICE:
+            data.verdict = ggml_sycl::lifecycle::tier_verdict::DEVICE;
+            break;
+        case ggml_sycl::lifecycle_plan_verdict::HOST:
+            data.verdict = ggml_sycl::lifecycle::tier_verdict::HOST;
+            break;
+        case ggml_sycl::lifecycle_plan_verdict::MIXED:
+            data.verdict = ggml_sycl::lifecycle::tier_verdict::MIXED;
+            break;
+        case ggml_sycl::lifecycle_plan_verdict::UNKNOWN:
+        default:
+            data.verdict = ggml_sycl::lifecycle::tier_verdict::UNKNOWN;
+            break;
+    }
+    return data;
+}
+
+static void ggml_sycl_restore_latest_live_plan() noexcept {
+    try {
+        const auto latest = ggml_sycl::lifecycle::global_registry().latest_live();
+        const auto snapshot =
+            latest ? ggml_sycl::lifecycle_find_placement_plan(latest->token.model.value, latest->token.load.value) :
+                     nullptr;
+        g_placement_plan     = {};
+        g_has_placement_plan = false;
+        g_current_model_planner_host_placement.store(false, std::memory_order_release);
+        if (snapshot && snapshot->plan) {
+            g_placement_plan     = *snapshot->plan;
+            g_has_placement_plan = true;
+            g_current_model_planner_host_placement.store(snapshot->planned_host_bytes > 0, std::memory_order_release);
+        }
+        const int total_gpus = ggml_sycl_info().total_gpu_count;
+        for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+            if (!cache) {
+                continue;
+            }
+            if (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d)) {
+                cache->set_placement_plan(ggml_sycl::placement_plan(*snapshot->plan));
+            } else {
+                cache->clear_placement_plan();
             }
         }
+    } catch (...) {
+        // C lifecycle boundaries fail closed; never unwind lock/allocation
+        // failures through the ABI.
     }
-    size_t planned_device = 0;
-    const int total_gpus = ggml_sycl_info().total_gpu_count;
-    for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-        if (cache && cache->has_placement_plan()) {
-            data.planned_host_bytes += cache->get_placement_plan().weight_host_bytes;
-            planned_device += cache->get_placement_plan().weight_vram_bytes;
-        }
-    }
-    const size_t reported_host = have_actual ? data.actual_host_bytes : data.planned_host_bytes;
-    const size_t reported_device = have_actual ? actual_device : planned_device;
-    data.verdict = reported_host == 0 ? ggml_sycl::lifecycle::tier_verdict::DEVICE :
-                   reported_device == 0 ? ggml_sycl::lifecycle::tier_verdict::HOST :
-                                          ggml_sycl::lifecycle::tier_verdict::MIXED;
-    return data;
 }
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
@@ -9209,28 +9261,7 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
     ggml_sycl_reset_model_load_scratch_state();
 
-    // Restore A's legacy execution view after failed B. The immutable A
-    // snapshot itself was never replaced; token routing remains separate work.
-    const auto previous = ggml_sycl::lifecycle::global_registry().last_success();
-    const auto snapshot =
-        previous ? ggml_sycl::lifecycle_find_placement_plan(previous->token.model.value, previous->token.load.value) :
-                   nullptr;
-    if (snapshot && snapshot->plan) {
-        g_placement_plan     = *snapshot->plan;
-        g_has_placement_plan = true;
-    }
-    const int total_gpus = ggml_sycl_info().total_gpu_count;
-    for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; ++d) {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-        if (!cache) {
-            continue;
-        }
-        if (snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d)) {
-            cache->set_placement_plan(ggml_sycl::placement_plan(*snapshot->plan));
-        } else {
-            cache->clear_placement_plan();
-        }
-    }
+    ggml_sycl_restore_latest_live_plan();
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
@@ -9285,9 +9316,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
     try {
         ticket = registry.prepare_end({txn.id}, explicit_success, model != nullptr);
         if (!ticket.finisher) {
-            if (ticket.replay.committed) {
-                if (!model) return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+            if (ticket.replay.token.model.value != 0 && model) {
                 ggml_sycl_export_token(ticket.replay.token, model);
+            }
+            if (ticket.replay.committed && !model) {
+                return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
             }
             return ggml_sycl_lifecycle_c_result(ticket.replay.token.model.value ? ticket.replay.code : ticket.code);
         }
@@ -9301,14 +9334,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
         }
 
         ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot);
-        const auto publication = ggml_sycl_lifecycle_publication_snapshot();
-        auto state = std::make_shared<const ggml_sycl::lifecycle::ModelState>(
-            ggml_sycl::lifecycle::ModelState{ticket.token, ggml_sycl::lifecycle::model_phase::LIVE,
-                publication.planned_host_bytes, publication.actual_host_bytes, publication.verdict});
+        const auto actual = ggml_sycl_lifecycle_actual_snapshot();
         if (!ggml_sycl::lifecycle_publish_placement_plan(ticket.token.model.value, ticket.token.load.value,
-                                                         ticket.token.owner.slot, ticket.token.owner.generation)) {
+                                                         ticket.token.owner.slot, ticket.token.owner.generation,
+                                                         actual.host_bytes, actual.device_bytes, actual.have_actual)) {
             throw std::bad_alloc();
         }
+        const auto plan_snapshot =
+            ggml_sycl::lifecycle_find_placement_plan(ticket.token.model.value, ticket.token.load.value);
+        if (!plan_snapshot) {
+            throw std::bad_alloc();
+        }
+        const auto publication = ggml_sycl_lifecycle_publication_from_plan(*plan_snapshot);
+        auto       state  = std::make_shared<const ggml_sycl::lifecycle::ModelState>(ggml_sycl::lifecycle::ModelState{
+            ticket.token, ggml_sycl::lifecycle::model_phase::LIVE, publication.planned_host_bytes,
+            publication.actual_host_bytes, publication.verdict });
         const auto result = registry.finalize_end(ticket, true, publication, std::move(state));
         if (result.committed) ggml_sycl_export_token(result.token, model);
         return ggml_sycl_lifecycle_c_result(result.code);
@@ -9316,7 +9356,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
         g_sycl_abort_load_exit = false;
         if (ticket.finisher) {
             try { ggml_sycl_abort_owner_effects(ticket.token); } catch (...) { }
-            (void) registry.finalize_end(ticket, false);
+            const auto failed = registry.finalize_end(ticket, false);
+            if (model && failed.token.model.value != 0) {
+                ggml_sycl_export_token(failed.token, model);
+            }
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -9899,10 +9942,10 @@ static ggml_sycl::placement_kv_info                  g_placement_kv_info{};
 static ggml_sycl_placement_envelope                  g_placement_envelope{};
 static bool                                          g_placement_envelope_set = false;
 std::atomic<bool>                                    g_tiered_enabled{ false };
+
 // Current-model API verdict: unlike g_tiered_enabled (the cache/dispatch gate),
 // this records only whether the authoritative completed planner placed any
 // bytes on host. It is model-load scratch state, not cache capability.
-static std::atomic<bool>                             g_current_model_planner_host_placement{ false };
 
 // Structural load-boundary reset (llama.cpp-k7b0) for every SCRATCH global in
 // this region that describes "the model currently being loaded", as opposed
