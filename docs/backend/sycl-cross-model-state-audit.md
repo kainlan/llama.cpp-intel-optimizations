@@ -15,15 +15,21 @@ python3 scripts/audit-sycl-static-storage.py --check
 
 The generator pins and checks the C++ grammar ABI 15 through
 `tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
-different installed version. It walks C++
-`declaration` and `field_declaration` nodes rather than matching declaration
-text. Each declarator in a multi-object declaration becomes its own row. Actual
+different installed version. It walks C++ `declaration` and
+`field_declaration` nodes rather than matching declaration text. A narrow,
+anchored spelling proof also recovers compiler-valid direct class member-pointer
+declarations that grammar ABI 15 misparses as fields/functions with `ERROR`
+children; any non-matching or ambiguous form still fails closed. Each declarator
+in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
 pointer/reference-to-function and pointer-to-member function/data objects
 (including arrays) remain census objects. Function-type `using` aliases are
-resolved through alias chains: direct alias declarations remain excluded as
-functions, indirect pointer/reference objects are included, and unresolved or
-invalid array-of-function alias uses fail closed.
+resolved through namespace-qualified identities and alias chains: direct alias
+declarations remain excluded as functions, indirect pointer/reference objects
+are included, and unresolved qualified aliases or invalid array-of-function
+alias uses fail closed. Object aliases also carry top-level binding cv through
+chains and arrays, so an array whose aliased pointer elements are `const` is
+reported immutable.
 The scope walk includes file and named-namespace objects, anonymous-namespace
 objects without the `static` spelling, function-local `static`/`thread_local`
 objects (including `bias_detect_flag`), and class/header static declarations.
@@ -91,10 +97,15 @@ multi-object declarations, and namespaced `extern` declaration versus
 definition. Positive function-object fixtures verify names, initializer-free
 types, scopes, and binding mutability for file/class/function/lambda function
 pointers, a function reference, a function-pointer array, and file/class/local
-pointer-to-member function/data objects and arrays. Const pointer elements are
-recognized through array declarators. Function-type alias fixtures include
-pointer objects while excluding direct function declarations; unresolved alias
-cycles and invalid arrays of aliased function type must fail closed. Negative fixtures also require rejection
+pointer-to-member function/data objects and arrays, including exact direct
+class-scope spellings recovered from the pinned grammar's `ERROR` shape. Const
+pointer elements are recognized through array declarators, and all positive
+const-array declarations include compiler-required `={}` initialization.
+Function-type alias fixtures cover qualified identities/chains and cv-bearing
+object aliases while excluding direct function declarations; unresolved aliases
+and invalid arrays of aliased function type must fail closed. A `g++ -std=c++17
+-pedantic-errors -fsyntax-only` gate proves the positive fixture declarations
+are compiler-valid. Negative fixtures also require rejection
 of malformed recovery in a function body (`void f(){ static Widget x{; }`),
 across a structural
 preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and

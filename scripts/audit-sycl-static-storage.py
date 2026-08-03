@@ -11,6 +11,7 @@ import argparse
 import csv
 import hashlib
 import re
+import subprocess
 import sys
 from collections import Counter
 from importlib.metadata import version
@@ -167,7 +168,7 @@ def declarator_core(node):
     return field(node, "declarator") if kind(node) == "init_declarator" else node
 
 
-def is_top_level_immutable(source_b: bytes, decl, declarator, name_node):
+def is_top_level_immutable(source_b: bytes, decl, declarator, name_node, alias_info=None):
     """Distinguish const object/pointer from const pointee/template argument."""
     declaration_qualifiers = direct_qualifiers(source_b, decl)
     core = declarator_core(declarator)
@@ -189,6 +190,10 @@ def is_top_level_immutable(source_b: bytes, decl, declarator, name_node):
                 item = parent(item)
                 continue
             item = parent(item)
+    if alias_info is not None and alias_info["immutable"]:
+        path = declarator_path_kinds(name_node, core)
+        if not any(item_kind in {"pointer_declarator", "pointer_type_declarator", "reference_declarator"} for item_kind in path):
+            return True
     return "const" in declaration_qualifiers
 
 
@@ -224,7 +229,7 @@ def declarator_path_kinds(name_node, core):
     return result
 
 
-def abstract_binding_kind(node):
+def abstract_binding_node(node):
     """Return the innermost abstract declarator operator used by a type alias."""
     declarator_kinds = {
         "abstract_function_declarator", "abstract_pointer_declarator",
@@ -235,12 +240,26 @@ def abstract_binding_kind(node):
     if nested is None:
         nested = next((item for item in children(node) if kind(item) in declarator_kinds), None)
     if nested is not None:
-        return abstract_binding_kind(nested)
-    return kind(node) if kind(node) in declarator_kinds else None
+        return abstract_binding_node(nested)
+    return node if kind(node) in declarator_kinds else None
+
+
+def namespace_prefix(source_b: bytes, node):
+    names = []
+    for item in ancestors(node):
+        if kind(item) == "namespace_definition":
+            name = field(item, "name")
+            if name is not None:
+                names.append(text(source_b, name))
+    return "::".join(reversed(names))
+
+
+def normalized_identity(value: str):
+    return re.sub(r"\s*::\s*", "::", value.strip()).removeprefix("::")
 
 
 def function_type_aliases(source_b: bytes, root):
-    """Resolve visible using-aliases as function, object, or unknown."""
+    """Resolve qualified using-aliases and preserve top-level binding mutability."""
     pending, resolved = {}, {}
     for item in walk(root):
         if kind(item) != "alias_declaration":
@@ -249,33 +268,57 @@ def function_type_aliases(source_b: bytes, root):
         descriptor = next((child_item for child_item in children(item) if kind(child_item) == "type_descriptor"), None)
         if name is None or descriptor is None:
             continue
-        alias = text(source_b, name)
+        prefix = namespace_prefix(source_b, item)
+        alias = normalized_identity("::".join(part for part in (prefix, text(source_b, name)) if part))
         if alias in resolved or alias in pending:
             pending.pop(alias, None)
-            resolved[alias] = "unknown"
+            resolved[alias] = {"status": "unknown", "immutable": False}
             continue
-        abstract_kind = abstract_binding_kind(descriptor)
-        if abstract_kind is not None:
-            status = "function" if abstract_kind == "abstract_function_declarator" else "object"
-            resolved[alias] = status if alias not in resolved else "unknown"
+        binding = abstract_binding_node(descriptor)
+        if binding is not None:
+            binding_kind = kind(binding)
+            status = "function" if binding_kind == "abstract_function_declarator" else "object"
+            immutable = binding_kind == "abstract_reference_declarator" or (
+                binding_kind == "abstract_pointer_declarator" and "const" in direct_qualifiers(source_b, binding)
+            )
+            resolved[alias] = {"status": status, "immutable": immutable}
             continue
         dependency = field(descriptor, "type")
         if dependency is None:
             dependency = next((part for part in children(descriptor) if kind(part) == "type_identifier"), None)
-        pending[alias] = text(source_b, dependency) if dependency is not None else None
+        if dependency is not None and (
+            kind(dependency) in {"primitive_type", "sized_type_specifier"}
+            or any(kind(part) == "template_type" for part in walk(dependency))
+        ):
+            resolved[alias] = {
+                "status": "object", "immutable": "const" in direct_qualifiers(source_b, descriptor),
+            }
+            continue
+        dependency_name = normalized_identity(text(source_b, dependency)) if dependency is not None else None
+        if dependency_name and "::" not in dependency_name and prefix:
+            dependency_name = prefix + "::" + dependency_name
+        pending[alias] = dependency_name
     changed = True
     while changed:
         changed = False
         for alias, dependency in list(pending.items()):
-            if dependency not in pending and dependency not in resolved:
-                resolved[alias] = "object"
-            elif dependency in resolved:
-                resolved[alias] = resolved[dependency]
+            lookup = dependency
+            if lookup not in pending and lookup not in resolved and lookup and "::" in lookup:
+                global_lookup = lookup.rsplit("::", 1)[1]
+                if global_lookup in pending or global_lookup in resolved:
+                    lookup = global_lookup
+            if lookup not in pending and lookup not in resolved:
+                resolved[alias] = {
+                    "status": "unknown" if lookup and "::" in lookup else "object",
+                    "immutable": False,
+                }
+            elif lookup in resolved:
+                resolved[alias] = resolved[lookup]
             else:
                 continue
             del pending[alias]
             changed = True
-    resolved.update({alias: "unknown" for alias in pending})
+    resolved.update({alias: {"status": "unknown", "immutable": False} for alias in pending})
     return resolved
 
 
@@ -295,13 +338,69 @@ def is_function_declaration(name_node, core):
     return False
 
 
-def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures):
+def lookup_alias(source_b: bytes, node, type_node, aliases):
+    if type_node is None or kind(type_node) not in {"type_identifier", "qualified_identifier"}:
+        return None, None
+    spelling = normalized_identity(text(source_b, type_node))
+    if "::" in spelling:
+        return aliases.get(spelling), spelling
+    prefix = namespace_prefix(source_b, node)
+    candidates = []
+    parts = prefix.split("::") if prefix else []
+    for count in range(len(parts), -1, -1):
+        candidates.append("::".join([*parts[:count], spelling]) if count else spelling)
+    for candidate in candidates:
+        if candidate in aliases:
+            return aliases[candidate], candidate
+    return None, spelling
+
+
+DIRECT_MEMBER_FUNCTION_RE = re.compile(
+    r"^(?:inline\s+)?static\s+(?P<base>[\w:<>]+)\s+\(\s*(?P<owner>[\w:]+)::\*\s*"
+    r"(?P<cv>const\s+)?(?P<name>\w+)\s*(?P<array>\[[^\]]+\])?\s*\)"
+    r"(?P<params>\([^;]+\))\s*(?:=\s*\{\s*\})?\s*;?$"
+)
+DIRECT_MEMBER_DATA_RE = re.compile(
+    r"^(?:inline\s+)?static\s+(?P<base>[\w:<>]+)\s+(?P<owner>[\w:]+)::\*\s*"
+    r"(?P<cv>const\s+)?(?P<name>\w+)\s*(?P<array>\[[^\]]+\])?\s*"
+    r"(?:=\s*\{\s*\})?\s*;?$"
+)
+
+
+def direct_class_member_row(source_b: bytes, decl, scope, storage):
+    if not scope.startswith("class:") or kind(decl) not in {"field_declaration", "function_definition"}:
+        return None
+    spelling = " ".join(text(source_b, decl).split())
+    match = DIRECT_MEMBER_FUNCTION_RE.fullmatch(spelling) or DIRECT_MEMBER_DATA_RE.fullmatch(spelling)
+    if match is None:
+        return None
+    name = match.group("name")
+    relative = text(source_b, decl).find(name)
+    name_offset = start_byte(decl) + relative
+    array = re.sub(r"\s+", "", match.group("array") or "")
+    cv = " const" if match.group("cv") else ""
+    if "params" in match.groupdict():
+        object_type = f"{match.group('base')} ({match.group('owner')}::*{cv}{array}){match.group('params')}"
+    else:
+        object_type = f"{match.group('base')} {match.group('owner')}::*{cv}{array}"
+    return {
+        "name": name, "type": object_type, "scope": scope, "storage": storage,
+        "name_node": name_offset, "decl_line": line_of(source_b, decl),
+        "immutable": bool(match.group("cv")), "proven_span": (start_byte(decl), end_byte(decl)),
+    }
+
+
+def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures, proven_spans):
     scope, local = named_scope(source_b, decl, recovered_regions)
     storage = storage_specifiers(source_b, decl)
     if scope.startswith("class:") and "static" not in storage:
         return []
     if local and not ({"static", "thread_local"} & storage):
         return []
+    direct_member = direct_class_member_row(source_b, decl, scope, storage)
+    if direct_member is not None:
+        proven_spans.add(direct_member.pop("proven_span"))
+        return [direct_member]
 
     type_node = field(decl, "type")
     type_end = end_byte(type_node) if type_node else start_byte(decl)
@@ -317,8 +416,13 @@ def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures
         if not result:
             continue
         name, name_node = result
-        type_name = text(source_b, type_node) if type_node is not None and kind(type_node) == "type_identifier" else None
-        alias_status = aliases.get(type_name)
+        alias_info, type_name = lookup_alias(source_b, decl, type_node, aliases)
+        alias_status = alias_info["status"] if alias_info is not None else None
+        if alias_info is None and type_node is not None and kind(type_node) == "qualified_identifier":
+            qualifier = type_name.rsplit("::", 1)[0]
+            if any(identity.startswith(qualifier + "::") for identity in aliases):
+                failures.append((line_of(source_b, decl), f"unproved qualified type alias {type_name}"))
+                continue
         path_kinds = declarator_path_kinds(name_node, core)
         indirect = {"pointer_declarator", "pointer_type_declarator", "reference_declarator"}
         if alias_status == "unknown":
@@ -341,7 +445,7 @@ def declaration_rows(source_b: bytes, decl, recovered_regions, aliases, failures
             "storage": storage,
             "name_node": name_node,
             "decl_line": line_of(source_b, decl),
-            "immutable": is_top_level_immutable(source_b, decl, declarator, name_node),
+            "immutable": is_top_level_immutable(source_b, decl, declarator, name_node, alias_info),
         })
     return rows
 
@@ -458,7 +562,7 @@ def recovery_tail_is_structurally_parsed(masked: bytes, container, body_end: int
     return not masked[cursor:end_byte(container)].strip()
 
 
-def recovery_coverage(source_b: bytes, root, declarations, recovered_regions):
+def recovery_coverage(source_b: bytes, root, declarations, recovered_regions, proven_class_members=()):
     """Prove every recovery site unable to hide a census declaration, or fail."""
     gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
     declaration_spans = [(start_byte(item), end_byte(item)) for item in declarations]
@@ -541,6 +645,8 @@ def recovery_coverage(source_b: bytes, root, declarations, recovered_regions):
                 # Body recovery is accepted only alongside the marker scan above:
                 # all static/thread_local spellings must be parsed declarations.
                 categories["function-body-storage-proven"] += 1
+        elif any(begin <= start_byte(gap) and end_byte(gap) <= end for begin, end in proven_class_members):
+            categories["class-member-declarator-proven"] += 1
         elif is_preprocessor_condition_recovery(source_b, gap):
             categories["preprocessor-condition-nondeclaration"] += 1
         else:
@@ -611,20 +717,61 @@ def parse_source(parser, source):
     source_b = source.encode()
     root = call(parser.parse(source), "root_node")
     declarations = [item for item in walk(root) if kind(item) in DECL_KINDS]
+    declarations.extend(
+        item for item in walk(root)
+        if kind(item) == "function_definition"
+        and any(kind(ancestor) in {"class_specifier", "struct_specifier", "union_specifier"} for ancestor in ancestors(item))
+        and DIRECT_MEMBER_FUNCTION_RE.fullmatch(" ".join(text(source_b, item).split()))
+    )
     gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
     recovered_regions = recovered_function_regions(source_b, gaps)
     aliases = function_type_aliases(source_b, root)
-    declaration_failures = []
+    declaration_failures, proven_class_members = [], set()
     rows = [
         row for decl in declarations
-        for row in declaration_rows(source_b, decl, recovered_regions, aliases, declaration_failures)
+        for row in declaration_rows(
+            source_b, decl, recovered_regions, aliases, declaration_failures, proven_class_members
+        )
     ]
-    gaps, categories, failures = recovery_coverage(source_b, root, declarations, recovered_regions)
+    gaps, categories, failures = recovery_coverage(
+        source_b, root, declarations, recovered_regions, proven_class_members
+    )
     failures.extend(declaration_failures)
     return source_b, rows, gaps, categories, failures
 
 
+def compile_fixture_declarations():
+    source = r"""
+struct MemberTarget { int method(int); int data; };
+static int (* const const_function_pointer_array[2])(int) = {};
+static int (MemberTarget::* const member_function_array[2])(int) = {};
+struct DirectMemberObjects {
+    inline static int MemberTarget::*data = {};
+    inline static int MemberTarget::*data_array[2] = {};
+    inline static int (MemberTarget::*function)(int) = {};
+    inline static int (MemberTarget::*function_array[2])(int) = {};
+};
+void local_objects() {
+    static int MemberTarget::* const data_array[2] = {};
+}
+namespace qualified_aliases { using F = int(int); using Chain = F; }
+namespace alias_users { using QualifiedChain = qualified_aliases::F; }
+static qualified_aliases::F qualified_function;
+static qualified_aliases::Chain *qualified_pointer;
+static alias_users::QualifiedChain *cross_namespace_qualified_pointer;
+using ConstPointer = int * const;
+using ConstPointerChain = ConstPointer;
+static ConstPointerChain const_pointer_alias_array[2] = {};
+"""
+    result = subprocess.run(
+        ["g++", "-std=c++17", "-pedantic-errors", "-fsyntax-only", "-x", "c++", "-"],
+        input=source, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, "g++ fixture compile failed:\n" + result.stderr
+
+
 def self_test(parser, repo):
+    compile_fixture_declarations()
     source = """
 struct C {
     static int member;
@@ -651,29 +798,39 @@ void pointer_owner() {
     auto fn = [] { static int (*lambda_function_pointer)(int); };
 }
 static int (*function_pointer_array[3])(int);
-static int (* const const_function_pointer_array[2])(int);
+static int (* const const_function_pointer_array[2])(int) = {};
 struct MemberTarget { int method(int); int data; };
 static int (MemberTarget::*file_member_function)(int);
 static int MemberTarget::*file_member_data;
-static int (MemberTarget::* const file_const_member_function_array[2])(int);
+static int (MemberTarget::* const file_const_member_function_array[2])(int) = {};
 struct MemberObjects {
-    static decltype(&MemberTarget::method) class_member_function;
-    static decltype(&MemberTarget::data) class_member_data;
-    static decltype(&MemberTarget::method) class_member_function_array[2];
+    inline static int MemberTarget::*class_member_data = {};
+    inline static int MemberTarget::*class_member_data_array[2] = {};
+    inline static int (MemberTarget::*class_member_function)(int) = {};
+    inline static int (MemberTarget::*class_member_function_array[2])(int) = {};
 };
 void member_owner() {
     static int (MemberTarget::*local_member_function)(int);
     static int MemberTarget::*local_member_data;
-    static int MemberTarget::* const local_const_member_data_array[2];
+    static int MemberTarget::* const local_const_member_data_array[2] = {};
 }
 using Function = int(int);
 using FunctionAlias = Function;
 static Function alias_hidden_function;
 static Function *alias_function_pointer;
 static FunctionAlias *alias_chain_function_pointer;
+namespace qualified_aliases { using F = int(int); using Chain = F; }
+namespace alias_users { using QualifiedChain = qualified_aliases::F; }
+static qualified_aliases::F qualified_alias_hidden_function;
+static qualified_aliases::Chain *qualified_alias_function_pointer;
+static alias_users::QualifiedChain *cross_namespace_qualified_alias_pointer;
+using ConstPointer = int * const;
+using ConstPointerChain = ConstPointer;
+static ConstPointerChain const_pointer_alias_array[2] = {};
 """
-    _, rows, gaps, _, failures = parse_source(parser, source)
-    assert not gaps and not failures
+    _, rows, gaps, categories, failures = parse_source(parser, source)
+    assert gaps and not failures
+    assert categories["class-member-declarator-proven"] == 2
     by_name = {}
     for row in rows: by_name.setdefault(row["name"], []).append(row)
     assert by_name["member"][0]["scope"] == "class:C"
@@ -703,19 +860,24 @@ static FunctionAlias *alias_chain_function_pointer;
         "file_member_function": ("int (MemberTarget::*)(int)", "file", False),
         "file_member_data": ("int MemberTarget::*", "file", False),
         "file_const_member_function_array": ("int (MemberTarget::* const[2])(int)", "file", True),
-        "class_member_function": ("decltype(&MemberTarget::method)", "class:MemberObjects", False),
-        "class_member_data": ("decltype(&MemberTarget::data)", "class:MemberObjects", False),
-        "class_member_function_array": ("decltype(&MemberTarget::method) [2]", "class:MemberObjects", False),
+        "class_member_function": ("int (MemberTarget::*)(int)", "class:MemberObjects", False),
+        "class_member_data": ("int MemberTarget::*", "class:MemberObjects", False),
+        "class_member_data_array": ("int MemberTarget::*[2]", "class:MemberObjects", False),
+        "class_member_function_array": ("int (MemberTarget::*[2])(int)", "class:MemberObjects", False),
         "local_member_function": ("int (MemberTarget::*)(int)", "function-local:member_owner", False),
         "local_member_data": ("int MemberTarget::*", "function-local:member_owner", False),
         "local_const_member_data_array": ("int MemberTarget::* const[2]", "function-local:member_owner", True),
         "alias_function_pointer": ("Function *", "file", False),
         "alias_chain_function_pointer": ("FunctionAlias *", "file", False),
+        "qualified_alias_function_pointer": ("qualified_aliases::Chain *", "file", False),
+        "cross_namespace_qualified_alias_pointer": ("alias_users::QualifiedChain *", "file", False),
+        "const_pointer_alias_array": ("ConstPointerChain [2]", "file", True),
     }
     for name, expected in member_objects.items():
         row = by_name[name][0]
         assert (row["type"], row["scope"], row["immutable"]) == expected, (name, row)
     assert "alias_hidden_function" not in by_name
+    assert "qualified_alias_hidden_function" not in by_name
     same_rows = by_name["same"]
     lines = source.splitlines()
     for row in same_rows:
@@ -736,9 +898,12 @@ static FunctionAlias *alias_chain_function_pointer;
         "nested-function-lambda-wrong-close": "static void outer() { auto recovered = [] { x; x template #if X }\nstatic Widget hidden{}; }",
         "function-alias-array": "using Function = int(int); static Function invalid[2];",
         "unproved-function-alias": "using First = Second; using Second = First; static First * invalid;",
-        "ambiguous-function-alias": "namespace one { using Same = int(int); static Same fn; } namespace two { using Same = int; static Same object; }",
+        "unknown-qualified-alias": "namespace N { using F = int(int); } static N::Missing object;",
+        "ambiguous-direct-class-member": "struct T { int data; }; struct H { inline static int T::* volatile object = {}; };",
     }
-    alias_failures = {"function-alias-array", "unproved-function-alias", "ambiguous-function-alias"}
+    alias_failures = {
+        "function-alias-array", "unproved-function-alias", "unknown-qualified-alias",
+    }
     for fixture, broken in negative_fixtures.items():
         _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
         if fixture in alias_failures:
@@ -746,7 +911,7 @@ static FunctionAlias *alias_chain_function_pointer;
         else:
             assert broken_gaps and broken_failures, f"{fixture} must fail closed"
         if fixture in alias_failures:
-            assert any("function-type alias" in reason for _, reason in broken_failures)
+            assert any("alias" in reason for _, reason in broken_failures)
         if fixture in {
             "recovered-function-tail", "parsed-function-recovery-tail", "parsed-function-wrong-close",
             "lambda-wrong-close", "template-lambda-wrong-close", "nested-function-lambda-wrong-close",
@@ -775,7 +940,8 @@ static FunctionAlias *alias_chain_function_pointer;
           "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,"
           "parsed-function-recovery-tail,parsed-function-wrong-close,lambda-wrong-close,"
           "template-lambda-wrong-close,nested-function-lambda-wrong-close,function-alias-array,"
-          "unproved-function-alias,ambiguous-function-alias,file-tail-scopes")
+          "unproved-function-alias,unknown-qualified-alias,"
+          "ambiguous-direct-class-member,g++-c++17-pedantic,file-tail-scopes")
 
 
 def main():
