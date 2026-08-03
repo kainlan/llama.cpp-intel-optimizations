@@ -990,7 +990,7 @@ if (NOT WIN32)
     )
 
     # ---------------------------------------------------------------------
-    # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 25 pytest-style SOURCE
+    # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 26 pytest-style SOURCE
     # assertions over ggml-sycl/ and tools/, same unregistered-so-vacuous
     # situation as batch 1 above.
     #

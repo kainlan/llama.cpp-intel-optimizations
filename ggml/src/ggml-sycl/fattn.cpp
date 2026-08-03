@@ -510,6 +510,16 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             }
             zero_event        = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
             packed.ready_event = zero_event;
+
+            // Publish every field used by retry lookup/reuse before the injected throw. The ready-event checkpoint
+            // remains immediately adjacent to the accepted fill, so retry can safely depend on and reuse this owner.
+            packed.device      = target_device;
+            packed.D           = GGML_SYCL_FATTN_XMX_PACKED_K_D;
+            packed.n_kv        = n_kv;
+            packed.H_kv        = H_kv;
+            packed.batch       = batch;
+            packed.n_blocks    = n_blocks;
+            packed.total_bytes = total_bytes;
             ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update");
             add_zero_dep = ggml_sycl_should_add_dependency(zero_event);
         } else {

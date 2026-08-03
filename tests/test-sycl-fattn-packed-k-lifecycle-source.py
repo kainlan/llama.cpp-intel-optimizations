@@ -33,6 +33,36 @@ def test_failpoints_are_exact_match_and_reserved_for_gpu_lifecycle_run() -> None
     assert "throw sycl::exception" in helper
 
 
+def test_new_sidecar_publishes_retry_identity_before_injected_throw() -> None:
+    update = section(
+        FATTN,
+        "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
+        "void ggml_sycl_fattn_xmx_unregister_packed_k_range",
+    )
+    new_alloc = section(update, "if (!reuse_alloc) {", "} else {")
+    ordered(
+        new_alloc,
+        "packed.ready_event = zero_event",
+        "packed.device      = target_device",
+        "packed.D           = GGML_SYCL_FATTN_XMX_PACKED_K_D",
+        "packed.n_kv        = n_kv",
+        "packed.H_kv        = H_kv",
+        "packed.batch       = batch",
+        "packed.n_blocks    = n_blocks",
+        "packed.total_bytes = total_bytes",
+        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
+    )
+
+    # These are the exact production predicates a retry uses to rediscover and reuse the surviving owner.
+    assert "candidate->k_handle_hash == root_handle_hash" in update
+    assert "candidate->packed.device == target_device" in update
+    assert "packed.handle.valid() && packed.ptr != nullptr && packed.device == target_device" in update
+    assert "packed.D == GGML_SYCL_FATTN_XMX_PACKED_K_D && packed.H_kv == H_kv" in update
+    assert "packed.batch == batch && packed.n_kv >= n_kv && packed.n_blocks >= n_blocks" in update
+    assert "packed.total_bytes >= total_bytes" in update
+    assert "add_prev_dep = ggml_sycl_should_add_dependency(packed.ready_event)" in update
+
+
 def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> None:
     submit = section(
         FATTN,
