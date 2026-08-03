@@ -139,11 +139,14 @@ global after assigning it local scope. Lambda coverage includes the exact
 file-scope fixture `static auto recovered = [] { x; x template #if X }\nWidget
 implicit_global{};`, its templated-lambda variant, and a nested-function lambda
 wrong-close fixture; each must fail closed rather than letting a recovery-expanded
-lambda compound hide static-storage declarations. Synthetic recovered-function-tail
-fixtures assert file and named-namespace scope by symbol/scope identity, both normally
-and with unrelated lines prepended. No self-test assertion selects declarations from
-live `ggml-sycl.cpp` by historical line number; current-input changes are covered by
-generation and `--check` instead.
+lambda compound hide static-storage declarations. A synthetic, brace-balanced
+recovered-function fixture makes the pinned grammar produce one oversized `ERROR`
+whose parser-owned tail contains valid file and named-namespace declarations. The
+self-test proves the recovered region is non-empty, its lexical body end precedes the
+`ERROR` end, both declarations are inside that tail, and their symbol/scope identities
+remain file and named-namespace scope both normally and with unrelated lines prepended.
+No self-test assertion selects declarations from live `ggml-sycl.cpp` by historical
+line number; current-input changes are covered by generation and `--check` instead.
 
 ### Static high-risk highlights (no behavior changes in this census)
 

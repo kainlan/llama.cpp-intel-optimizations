@@ -1068,20 +1068,33 @@ static ConstPointerChain const_pointer_alias_array[2] = {};
     # Keep recovery-tail scope coverage synthetic.  This used to parse the live
     # ggml-sycl.cpp and select declarations by historical line number, coupling
     # parser validation to the audited source snapshot rather than parser behavior.
-    recovered_tail_source = """
-static void recovered_tail() { expression template #if SYNTHETIC }
+    # The deliberately malformed, brace-balanced body makes grammar ABI 15
+    # recover one oversized ERROR from the function signature through both valid
+    # post-body declarations.  Keep this compact parser shape synthetic: scope
+    # attribution must stop at the lexical function end, not the ERROR end.
+    recovered_tail_source = """static void recovered_tail() {
+{{}}{{{{}}}}{{{{}}}{{}}{{}{}}}{{{}}{}}{{}}{{{}}{{{}{{{}}}}{}{}}}{try{try{}}{}}{{}{{}}}}
 static int recovered_file_tail;
 namespace recovered_tail_namespace { static int recovered_namespace_tail; }
 """
-    shifted_recovered_tail_source = "// unrelated line shift\n\n\n" + recovered_tail_source
+    shifted_recovered_tail_source = "\n\n\n" + recovered_tail_source
     for fixture_source in (recovered_tail_source, shifted_recovered_tail_source):
-        _, recovered_rows, recovered_gaps, _, recovered_failures = parse_source(parser, fixture_source)
-        assert recovered_gaps and not recovered_failures
+        recovered_b, recovered_rows, recovered_gaps, _, recovered_failures = parse_source(parser, fixture_source)
+        recovered_regions = recovered_function_regions(recovered_b, recovered_gaps)
+        assert len(recovered_regions) == 1 and not recovered_failures
+        (_error_start, error_end), (function_name, _, body_end) = next(iter(recovered_regions.items()))
+        assert function_name == "recovered_tail" and body_end < error_end
         recovered_scopes = {row["name"]: row["scope"] for row in recovered_rows}
         assert recovered_scopes == {
             "recovered_file_tail": "file",
             "recovered_namespace_tail": "namespace:recovered_tail_namespace",
         }, f"synthetic recovered function tail scopes: {recovered_scopes}"
+        tail_offsets = [
+            start_byte(row["name_node"])
+            for row in recovered_rows
+            if row["name"] in recovered_scopes
+        ]
+        assert tail_offsets and all(body_end <= offset < error_end for offset in tail_offsets)
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
           "function-pointer-object-scopes,member-pointer-object-scopes,function-type-aliases,"
           "declaration-position-aliases,relative-qualified-aliases,"
