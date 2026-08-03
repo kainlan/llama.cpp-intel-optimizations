@@ -34240,6 +34240,11 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const ggml_status status = ggml_graph_compute(graph, &plan);
     GGML_SYCL_DEBUG("[SYCL-CPU-FALLBACK] compute-end reason=%s status=%d\n", reason ? reason : "unknown", (int) status);
+    if (status != GGML_STATUS_SUCCESS) {
+        restore_host_copies();
+        GGML_LOG_WARN("[SYCL] CPU fallback graph failed (%s)\n", reason ? reason : "unknown");
+        return false;
+    }
     if (dst_is_device && dst_device_ptr) {
         ggml_sycl::mem_handle dst_handle =
             ggml_sycl_copy_handle_for_raw_ptr(dst_device_ptr, GGML_LAYOUT_AOS, ctx.device);
@@ -34248,10 +34253,6 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
         ggml_sycl::mem_copy(dst_handle, src_handle, dst_bytes, *stream);
     }
     restore_host_copies();
-    if (status != GGML_STATUS_SUCCESS) {
-        GGML_LOG_WARN("[SYCL] CPU fallback graph failed (%s)\n", reason ? reason : "unknown");
-        return false;
-    }
     return true;
 #endif
 }
@@ -84663,7 +84664,6 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
         }
     };
 
-    const size_t segmented_retained_baseline = sycl_ctx->graph_retained_handles.size();
     for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
         const auto &  seg                  = segments[seg_idx];
         const int     seg_size             = seg.end - seg.start;
@@ -84703,10 +84703,26 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             continue;
         }
 
+        const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
+        bool segment_submitted = false;
+        struct recording_depth_owner {
+            bool owned = false;
+            void acquire() {
+                g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
+                owned = true;
+            }
+            void release() noexcept {
+                if (owned) {
+                    g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+                    owned = false;
+                }
+            }
+            ~recording_depth_owner() noexcept { release(); }
+        } depth_owner;
         try {
             sycl_ex::command_graph seg_graph(*stream, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
 
-            g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
+            depth_owner.acquire();
             ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
             g_ggml_sycl_graph_recording = true;
             g_recording_graph_ptr       = &seg_graph;
@@ -84733,7 +84749,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             g_recording_queue_ptr = nullptr;
             ggml_sycl::set_graph_retained_handle_sink(nullptr);
             g_ggml_sycl_graph_recording = false;
-            g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+            depth_owner.release();
 
             // Finalize as immutable (segments never change!)
             auto exec     = seg_graph.finalize();
@@ -84747,6 +84763,10 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             recorded_segments.push_back({ seg.start, seg.end, std::move(exec_ptr) });
 
             // Execute this segment immediately (first token output)
+            // Submission failure is ambiguous: work may already be queued.
+            // Mark first so exception cleanup retains handles unless completion
+            // is successfully drained by a higher-level cleanup path.
+            segment_submitted = true;
             stream->ext_oneapi_graph(*recorded_segments.back().exec_graph);
             if (seg.moe_after >= 0) {
                 ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
@@ -84757,24 +84777,28 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             }
 
         } catch (const sycl::exception & exc) {
-            try { sycl_ctx->graph_retained_handles.resize(segmented_retained_baseline); } catch (...) {}
+            if (!segment_submitted) {
+                try { sycl_ctx->graph_retained_handles.resize(retained_baseline); } catch (...) {}
+            }
             g_ggml_sycl_graph_recording = false;
             g_recording_graph_ptr       = nullptr;
             g_recording_queue_ptr       = nullptr;
             ggml_sycl::set_graph_retained_handle_sink(nullptr);
-            g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+            depth_owner.release();
             GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
                           recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
                           recording_node ? recording_node->name : "?", exc.what());
             g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
             return false;
         } catch (const std::exception & exc) {
-            try { sycl_ctx->graph_retained_handles.resize(segmented_retained_baseline); } catch (...) {}
+            if (!segment_submitted) {
+                try { sycl_ctx->graph_retained_handles.resize(retained_baseline); } catch (...) {}
+            }
             g_ggml_sycl_graph_recording = false;
             g_recording_graph_ptr       = nullptr;
             g_recording_queue_ptr       = nullptr;
             ggml_sycl::set_graph_retained_handle_sink(nullptr);
-            g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+            depth_owner.release();
             GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
                           recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
                           recording_node ? recording_node->name : "?", exc.what());
