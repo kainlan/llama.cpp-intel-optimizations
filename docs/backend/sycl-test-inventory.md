@@ -12,8 +12,11 @@ confirm the reasoning.
 
 ## ⚠️ TOP-LINE ANSWER: the `llama.cpp-0igs` merge-blocker question
 
-**Of the still-unregistered test sources, 64 cover code this branch changed.**
-Redirected here by the lead: exhaustively mutation-verifying the whole
+**At the original inventory baseline on 2026-08-02 (`333a8d7b2`), 64
+still-unregistered test sources covered code this branch changed.** At the
+current Task 4a audit point (`c27ba2292`), those 64 source rows split into 41
+active registrations and 23 inactive registrations. Redirected here by the
+lead: exhaustively mutation-verifying the whole
 remaining population (~65–70 more registered C++ tests, ~90 Python/shell
 gates) has falling marginal value and is not what gates *this* merge — the
 question that matters is how much of `llama.cpp-0igs`'s ~147-file backlog is
@@ -193,7 +196,7 @@ Evidence keys: historical references are `git show 3c8f296fd:tests/CMakeLists.tx
 |---|---|---|---|
 | `tests/test-expert-cache.cpp` | `target 1825; add_test 1833; guards GGML_SYCL + FALSE`; preceded by `DISABLED: expert-cache.hpp removed` at lines 1822–1824 | `absent from both live files` | **RED** |
 
-**Completeness check:** 41 GREEN + 22 RED + 1 guard-hidden RED = 64/64 rows. Historical shape within the 22: eight active ctest registrations under `GGML_SYCL`, five `GGML_SYCL` targets explicitly not wired to ctest, one commented-out block, one `GGML_SYCL && FALSE` registration, and seven names absent entirely. The separate exception is another `GGML_SYCL && FALSE` registration. No status in this section asserts safety, usefulness, or a future disposition.
+**Completeness check:** 41 GREEN + 22 RED + 1 guard-hidden RED = 64/64 rows. Historical shape within the 22: eight source rows with active ctest registrations under `GGML_SYCL` (11 CTest names, because `test-mmvq-q8-0-streaming-bench.cpp` registered four), five `GGML_SYCL` targets explicitly not wired to ctest, one commented-out block, one `GGML_SYCL && FALSE` registration, and seven names absent entirely. The separate exception is another `GGML_SYCL && FALSE` registration. No status in this section asserts safety, usefulness, or a future disposition.
 
 
 ## Two instances named in the ticket
