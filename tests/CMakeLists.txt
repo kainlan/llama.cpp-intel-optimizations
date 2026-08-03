@@ -366,38 +366,44 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
-if (GGML_SYCL)
-    llama_build(test-sycl-lifecycle-gpu-sequential.cpp)
-    # The public backend API exposes PCI IDs, not the Level Zero physical UUID
-    # needed by G1.  Use the loader only when its SDK/runtime is available;
-    # otherwise the normal test reports unsupported and strict acceptance fails.
-    find_library(G1_LEVEL_ZERO_LOADER NAMES ze_loader)
-    if (G1_LEVEL_ZERO_LOADER)
-        target_link_libraries(test-sycl-lifecycle-gpu-sequential PRIVATE ${G1_LEVEL_ZERO_LOADER})
-        target_compile_definitions(test-sycl-lifecycle-gpu-sequential PRIVATE G1_HAVE_LEVEL_ZERO=1)
-    endif()
-    add_test(NAME sycl-lifecycle-gpu-sequential
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-aba.sh
-                $<TARGET_FILE:test-sycl-lifecycle-gpu-sequential> ${CMAKE_BINARY_DIR})
-    set_tests_properties(sycl-lifecycle-gpu-sequential PROPERTIES
-        FIXTURES_REQUIRED test-download-model
-        SKIP_RETURN_CODE 77
-        RUN_SERIAL TRUE
-        RESOURCE_LOCK sycl-lifecycle-device
-        LABELS "sycl;lifecycle;g1;hash-pinned")
+option(LLAMA_SYCL_G1_STRICT "Make missing G1 acceptance prerequisites fail instead of skip" OFF)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (LLAMA_SYCL_G1_STRICT AND NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires a Python 3 interpreter")
+endif()
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-sycl-lifecycle-g1-harness
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
+    set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
+        LABELS "sycl;lifecycle;g1;python"
+        TIMEOUT 30)
+endif()
 
-    # Lab-only acceptance gate.  Keep it out of generic no-device CTest: the
-    # normal registration skips unsupported/incomplete fixture setups, while
-    # this opt-in command makes the same conditions hard failures.
+if (GGML_SYCL)
+    set(LLAMA_SYCL_G1_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/sycl-lifecycle-fixtures.json" CACHE FILEPATH
+        "Canonical G1 fixture JSON (lead-populated external file is recommended)")
+    llama_build(test-sycl-lifecycle-gpu-sequential.cpp)
+    target_include_directories(test-sycl-lifecycle-gpu-sequential PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    set(G1_LAUNCH_ARGS --fixture ${LLAMA_SYCL_G1_FIXTURE})
     if (LLAMA_SYCL_G1_STRICT)
-        add_test(NAME sycl-lifecycle-g1-strict
-            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-aba.sh
-                    --strict $<TARGET_FILE:test-sycl-lifecycle-gpu-sequential> ${CMAKE_BINARY_DIR})
-        set_tests_properties(sycl-lifecycle-g1-strict PROPERTIES
-            FIXTURES_REQUIRED test-download-model
+        list(PREPEND G1_LAUNCH_ARGS --strict)
+    endif()
+    # Exact lab gate:
+    # cmake -S . -B build -DGGML_SYCL=ON -DLLAMA_SYCL_G1_STRICT=ON \
+    #   -DLLAMA_SYCL_G1_FIXTURE=/absolute/path/g1-canonical.json
+    # ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure
+    # The test name is intentionally identical in normal and strict modes.
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME sycl-lifecycle-gpu-sequential
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-aba.py
+                    ${G1_LAUNCH_ARGS} $<TARGET_FILE:test-sycl-lifecycle-gpu-sequential>)
+        set_tests_properties(sycl-lifecycle-gpu-sequential PROPERTIES
+            SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE
             RESOURCE_LOCK sycl-lifecycle-device
-            LABELS "sycl;lifecycle;g1;acceptance;hash-pinned")
+            TIMEOUT 950
+            LABELS "sycl;lifecycle;g1;hash-pinned")
     endif()
 endif()
 

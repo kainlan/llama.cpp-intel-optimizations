@@ -1,28 +1,17 @@
 {
-  "schema": 2,
+  "schema": 4,
   "fixtures": {
     "A": {
-      "path": "tinyllamas/stories15M-q4_0.gguf",
-      "sha256": "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
+      "path": "REPLACE_ON_G1_MODEL_A_PATH"
     },
     "B": {
-      "path": "sycl-lifecycle-fixtures/stories260K.gguf",
-      "sha256": "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
+      "path": "REPLACE_ON_G1_MODEL_B_PATH"
     },
     "A-shared": {
-      "path": "sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf",
-      "sha256": "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
+      "path": "REPLACE_ON_G1_MODEL_A_SHARED_PATH"
     }
   },
-  "generation": {
-    "prompt": "1, 2, 3, 4, 5,",
-    "seed": 42,
-    "temperature": 0,
-    "n_predict": 8
-  },
   "device": {
-    "oneapi_selector": "REPLACE_ON_G1_ONEAPI_SELECTOR",
-    "ggml_logical_selector": "REPLACE_ON_G1_GGML_DEVICE",
     "physical_uuid": "REPLACE_ON_G1_PHYSICAL_UUID"
   },
   "expected": {
