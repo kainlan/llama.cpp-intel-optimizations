@@ -6,9 +6,18 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
+import sys
 from typing import Iterable
 
-from tree_sitter_language_pack import get_parser
+try:
+    from tree_sitter_language_pack import get_parser
+except ImportError:
+    print(
+        "SKIP: sycl-moe-reset-source-contract requires the test-only tree-sitter-language-pack module",
+        file=sys.stderr,
+    )
+    raise SystemExit(77)
 
 RESET = "ggml_sycl_moe_layer_ids_cache_new_graph"
 CACHE = "g_moe_layer_ids_cache"
@@ -104,9 +113,22 @@ def verify_reset_dominates(ast: Ast, body, path: str, targets: tuple[str, ...]) 
     reset_statement = reset_statements[0]
     reset_index = statements.index(reset_statement)
 
-    terminators = {"return_statement", "co_return_statement", "throw_statement", "goto_statement"}
+    terminators = {"return_statement", "co_return_statement", "throw_statement"}
     if any(kind(statement) in terminators for statement in statements[:reset_index]):
         raise ContractError(f"{path}: reset is unreachable after an unconditional terminator")
+
+    labels = {}
+    for label in (node for node in walk(body) if kind(node) == "labeled_statement"):
+        name = label.child_by_field_name("label")
+        if name:
+            labels[ast.text(name)] = label
+    for jump in (node for node in walk(body) if kind(node) == "goto_statement"):
+        target_ids = [node for node in children(jump) if kind(node) == "statement_identifier"]
+        if not target_ids:
+            target_ids = [node for node in walk(jump) if kind(node) in {"identifier", "statement_identifier"}]
+        target = labels.get(ast.text(target_ids[0])) if target_ids else None
+        if jump.start_byte() < reset_statement.start_byte() and target and target.start_byte() > reset_statement.end_byte():
+            raise ContractError(f"{path}: forward goto can enter the post-reset region without reset")
 
     cache_accesses = ast.identifiers(body, CACHE)
     reset_cache_ids = ast.identifiers(all_resets[0], CACHE)
@@ -164,13 +186,21 @@ def verify_helper(header_source: str) -> None:
     body = helper.child_by_field_name("body")
     loops = [node for node in children(body) if kind(node) == "for_range_loop"]
     entry_resets = ast.calls(body, "ggml_sycl_moe_layer_ids_cache_reset_entry")
+    reset_inside_loop = False
+    if len(loops) == 1 and len(entry_resets) == 1:
+        ancestor = entry_resets[0].parent()
+        while ancestor and ancestor.start_byte() >= loops[0].start_byte():
+            if ancestor.start_byte() == loops[0].start_byte() and ancestor.end_byte() == loops[0].end_byte():
+                reset_inside_loop = True
+                break
+            ancestor = ancestor.parent()
     direct_map_clears = []
     for call in (node for node in walk(body) if kind(node) == "call_expression"):
         function = call.child_by_field_name("function")
         if function and ast.text(function).replace(" ", "") == "cache.clear":
             direct_map_clears.append(call)
-    if len(loops) != 1 or len(entry_resets) != 1 or direct_map_clears:
-        raise ContractError("reset helper: map allocation/capacity retention contract lost")
+    if len(loops) != 1 or len(entry_resets) != 1 or direct_map_clears or not reset_inside_loop:
+        raise ContractError("reset helper: every retained map entry must reset inside the range-loop body")
 
 
 def verify_contract(source: str, header: str) -> None:
@@ -226,6 +256,10 @@ def run_mutation_matrix(source: str, header: str) -> None:
         nested = "    {\n        " + terminator + "\n" + reset_line + "    }\n"
         cases.append((f"{path}-nested-unreachable", replace_nth(source, reset_line, nested, occurrence), header,
                       f"{contract_path}: reset is unreachable after an unconditional terminator"))
+        label = f"h5m4_skip_{path}"
+        goto_skip = f"    goto {label};\n" + reset_line + f"{label}:\n    ;\n"
+        cases.append((f"{path}-goto-skip", replace_nth(source, reset_line, goto_skip, occurrence), header,
+                      f"{contract_path}: forward goto can enter the post-reset region without reset"))
 
     cases.extend(
         [
@@ -250,7 +284,22 @@ def run_mutation_matrix(source: str, header: str) -> None:
     loop_start = "    for (auto & [_, entry] : cache) {\n"
     loop_body = "        ggml_sycl_moe_layer_ids_cache_reset_entry(entry);\n    }\n"
     cleared_header = header.replace(loop_start + loop_body, "    cache.clear();\n", 1)
-    cases.append(("capacity-map-clear", source, cleared_header, "reset helper: map allocation/capacity retention contract lost"))
+    cases.append(("capacity-map-clear", source, cleared_header,
+                  "reset helper: every retained map entry must reset inside the range-loop body"))
+
+    begin_only_header = header.replace(
+        loop_start + loop_body,
+        "    for (auto & [_, entry] : cache) {\n"
+        "        (void) _;\n"
+        "        (void) entry;\n"
+        "    }\n"
+        "    if (!cache.empty()) {\n"
+        "        ggml_sycl_moe_layer_ids_cache_reset_entry(cache.begin()->second);\n"
+        "    }\n",
+        1,
+    )
+    cases.append(("empty-loop-begin-only-reset", source, begin_only_header,
+                  "reset helper: every retained map entry must reset inside the range-loop body"))
 
     positive_comments = source
     for occurrence in reversed(range(3)):
@@ -271,6 +320,20 @@ def run_mutation_matrix(source: str, header: str) -> None:
 
     verify_contract(source, header)
     print("PASS baseline AST/control-flow contract")
+
+    clean_env = subprocess.run(
+        [sys.executable, "-S", str(Path(__file__)), "--source", "unused", "--header", "unused"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    dependency_message = "SKIP: sycl-moe-reset-source-contract requires the test-only tree-sitter-language-pack module"
+    if clean_env.returncode != 77 or dependency_message not in clean_env.stderr:
+        raise AssertionError(
+            f"clean dependency environment returned {clean_env.returncode}: {clean_env.stdout}{clean_env.stderr}"
+        )
+    print("PASS clean dependency environment: exit 77 with explicit skip message")
+
     for name, mutated_source, mutated_header, expected in cases:
         try:
             verify_contract(mutated_source, mutated_header)

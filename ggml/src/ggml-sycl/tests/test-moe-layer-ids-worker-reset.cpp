@@ -1,5 +1,6 @@
 #include "moe-layer-ids-cache.hpp"
 
+#include <array>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -89,39 +90,51 @@ class persistent_worker {
     std::thread             thread_;
 };
 
+constexpr std::array<int, 3> layer_keys = { 17, 23, 31 };
+
+struct entry_snapshot {
+    int          key          = -1;
+    const void * address      = nullptr;
+    size_t       ids_capacity = 0;
+    size_t       cpu_capacity = 0;
+    size_t       sec_capacity = 0;
+    size_t       gpu_capacity = 0;
+};
+
 struct worker_snapshot {
-    std::thread::id thread_id;
-    size_t          bucket_count  = 0;
-    const void *    entry_address = nullptr;
-    size_t          ids_capacity  = 0;
-    size_t          cpu_capacity  = 0;
-    size_t          sec_capacity  = 0;
-    size_t          gpu_capacity  = 0;
+    std::thread::id                               thread_id;
+    size_t                                        bucket_count = 0;
+    std::array<entry_snapshot, layer_keys.size()> entries;
 };
 
 static void seed_worker(worker_snapshot & snapshot, int worker_index) {
     check(g_moe_layer_ids_cache.empty(), "new persistent worker did not start with empty TLS state");
     g_moe_layer_ids_cache.reserve(8);
-    auto & entry = g_moe_layer_ids_cache[17];
-    entry.ids_host.reserve(32);
-    entry.partition.cpu_indices.reserve(16);
-    entry.partition.sec_indices.reserve(16);
-    entry.partition.gpu0_cached_indices.reserve(16);
-    entry.ids_host              = { 100 + worker_index, 110 + worker_index };
-    entry.partition.cpu_indices = { static_cast<size_t>(worker_index + 1) };
-    entry.partition.sec_indices = {
-        { static_cast<size_t>(worker_index + 2), worker_index }
-    };
-    entry.partition.gpu0_cached_indices = { static_cast<size_t>(worker_index + 3) };
-    entry.partition.valid               = true;
+    for (size_t i = 0; i < layer_keys.size(); ++i) {
+        const int key   = layer_keys[i];
+        auto &    entry = g_moe_layer_ids_cache[key];
+        entry.ids_host.reserve(32 + i);
+        entry.partition.cpu_indices.reserve(16 + i);
+        entry.partition.sec_indices.reserve(16 + i);
+        entry.partition.gpu0_cached_indices.reserve(16 + i);
+        entry.ids_host              = { 100 + worker_index * 100 + key, 110 + worker_index * 100 + key };
+        entry.partition.cpu_indices = { static_cast<size_t>(worker_index * 100 + key + 1) };
+        entry.partition.sec_indices = {
+            { static_cast<size_t>(key + 2), worker_index }
+        };
+        entry.partition.gpu0_cached_indices = { static_cast<size_t>(key + 3) };
+        entry.partition.valid               = true;
 
-    snapshot.thread_id     = std::this_thread::get_id();
-    snapshot.bucket_count  = g_moe_layer_ids_cache.bucket_count();
-    snapshot.entry_address = &entry;
-    snapshot.ids_capacity  = entry.ids_host.capacity();
-    snapshot.cpu_capacity  = entry.partition.cpu_indices.capacity();
-    snapshot.sec_capacity  = entry.partition.sec_indices.capacity();
-    snapshot.gpu_capacity  = entry.partition.gpu0_cached_indices.capacity();
+        auto & retained       = snapshot.entries[i];
+        retained.key          = key;
+        retained.address      = &entry;
+        retained.ids_capacity = entry.ids_host.capacity();
+        retained.cpu_capacity = entry.partition.cpu_indices.capacity();
+        retained.sec_capacity = entry.partition.sec_indices.capacity();
+        retained.gpu_capacity = entry.partition.gpu0_cached_indices.capacity();
+    }
+    snapshot.thread_id    = std::this_thread::get_id();
+    snapshot.bucket_count = g_moe_layer_ids_cache.bucket_count();
 }
 
 static void cross_graph_reset_then_refill(const worker_snapshot & snapshot, int worker_index) {
@@ -130,40 +143,48 @@ static void cross_graph_reset_then_refill(const worker_snapshot & snapshot, int 
     // This is the exact synchronous helper called at all production graph boundaries.
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
 
-    check(g_moe_layer_ids_cache.size() == 1, "graph reset erased the retained map node");
+    check(g_moe_layer_ids_cache.size() == layer_keys.size(), "graph reset erased a retained map node");
     check(g_moe_layer_ids_cache.bucket_count() == snapshot.bucket_count, "graph reset replaced map allocation");
-    auto it = g_moe_layer_ids_cache.find(17);
-    check(it != g_moe_layer_ids_cache.end(), "graph reset erased layer key");
-    auto & entry = it->second;
-    check(&entry == snapshot.entry_address, "graph reset replaced retained map entry");
-    check(entry.ids_host.empty(), "stale IDs were readable after graph reset");
-    check(entry.partition.cpu_indices.empty(), "stale CPU partition was readable after graph reset");
-    check(entry.partition.sec_indices.empty(), "stale secondary partition was readable after graph reset");
-    check(entry.partition.gpu0_cached_indices.empty(), "stale GPU partition was readable after graph reset");
-    check(!entry.partition.valid, "stale partition remained valid after graph reset");
-    check(entry.ids_host.capacity() == snapshot.ids_capacity, "IDs vector capacity was released");
-    check(entry.partition.cpu_indices.capacity() == snapshot.cpu_capacity, "CPU vector capacity was released");
-    check(entry.partition.sec_indices.capacity() == snapshot.sec_capacity, "secondary vector capacity was released");
-    check(entry.partition.gpu0_cached_indices.capacity() == snapshot.gpu_capacity, "GPU vector capacity was released");
+    for (const entry_snapshot & retained : snapshot.entries) {
+        auto it = g_moe_layer_ids_cache.find(retained.key);
+        check(it != g_moe_layer_ids_cache.end(), "graph reset erased layer key");
+        auto & entry = it->second;
+        check(&entry == retained.address, "graph reset replaced retained map entry");
+        check(entry.ids_host.empty(), "stale IDs were readable after graph reset");
+        check(entry.partition.cpu_indices.empty(), "stale CPU partition was readable after graph reset");
+        check(entry.partition.sec_indices.empty(), "stale secondary partition was readable after graph reset");
+        check(entry.partition.gpu0_cached_indices.empty(), "stale GPU partition was readable after graph reset");
+        check(!entry.partition.valid, "stale partition remained valid after graph reset");
+        check(entry.ids_host.capacity() == retained.ids_capacity, "IDs vector capacity was released");
+        check(entry.partition.cpu_indices.capacity() == retained.cpu_capacity, "CPU vector capacity was released");
+        check(entry.partition.sec_indices.capacity() == retained.sec_capacity,
+              "secondary vector capacity was released");
+        check(entry.partition.gpu0_cached_indices.capacity() == retained.gpu_capacity,
+              "GPU vector capacity was released");
 
-    // Refill and consume within the same graph, proving reset did not disable bounded reuse.
-    entry.ids_host              = { 200 + worker_index, 210 + worker_index };
-    entry.partition.cpu_indices = { static_cast<size_t>(20 + worker_index) };
-    entry.partition.sec_indices = {
-        { static_cast<size_t>(30 + worker_index), worker_index + 4 }
-    };
-    entry.partition.gpu0_cached_indices = { static_cast<size_t>(40 + worker_index) };
-    entry.partition.valid               = true;
-    check(entry.ids_host[0] == 200 + worker_index && entry.partition.valid, "same-graph refill was not readable");
+        // Refill and consume within the same graph, proving reset did not disable bounded reuse.
+        entry.ids_host = { 200 + worker_index * 100 + retained.key, 210 + worker_index * 100 + retained.key };
+        entry.partition.cpu_indices = { static_cast<size_t>(worker_index * 100 + retained.key + 20) };
+        entry.partition.sec_indices = {
+            { static_cast<size_t>(retained.key + 30), worker_index + 4 }
+        };
+        entry.partition.gpu0_cached_indices = { static_cast<size_t>(retained.key + 40) };
+        entry.partition.valid               = true;
+        check(entry.ids_host[0] == 200 + worker_index * 100 + retained.key && entry.partition.valid,
+              "same-graph refill was not readable");
+    }
 }
 
 static void probe_same_worker(int worker_index) {
-    auto it = g_moe_layer_ids_cache.find(17);
-    check(it != g_moe_layer_ids_cache.end(), "worker lost its retained TLS layer");
-    check(it->second.ids_host.size() == 2 && it->second.ids_host[1] == 210 + worker_index,
-          "worker observed another worker's graph-local IDs");
-    check(it->second.partition.valid && it->second.partition.cpu_indices[0] == static_cast<size_t>(20 + worker_index),
-          "worker observed another worker's graph-local partition");
+    for (int key : layer_keys) {
+        auto it = g_moe_layer_ids_cache.find(key);
+        check(it != g_moe_layer_ids_cache.end(), "worker lost a retained TLS layer");
+        check(it->second.ids_host.size() == 2 && it->second.ids_host[1] == 210 + worker_index * 100 + key,
+              "worker observed another worker's graph-local IDs");
+        check(it->second.partition.valid &&
+                  it->second.partition.cpu_indices[0] == static_cast<size_t>(worker_index * 100 + key + 20),
+              "worker observed another worker's graph-local partition");
+    }
 }
 
 int main() {

@@ -3174,15 +3174,21 @@ set_tests_properties(sycl-moe-worker-reset PROPERTIES
 
 # AST/control-flow contract plus executable mutation matrix. tree-sitter parses
 # active C++ nodes, so comments and literals cannot spoof reset/TLS/order checks.
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_test(NAME sycl-moe-reset-source-contract
-    COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-layer-ids-source-contract.py
-        --source ${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
-        --header ${CMAKE_CURRENT_SOURCE_DIR}/moe-layer-ids-cache.hpp
-        --mutation-matrix
-)
-set_tests_properties(sycl-moe-reset-source-contract PROPERTIES
-    LABELS "sycl;moe;host-only;ast;mutation"
-    TIMEOUT 120
-)
+# Python is test-only: its absence must not break a clean SYCL configuration.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME sycl-moe-reset-source-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-layer-ids-source-contract.py
+            --source ${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
+            --header ${CMAKE_CURRENT_SOURCE_DIR}/moe-layer-ids-cache.hpp
+            --mutation-matrix
+    )
+    set_tests_properties(sycl-moe-reset-source-contract PROPERTIES
+        LABELS "sycl;moe;host-only;ast;mutation"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+else()
+    message(STATUS "ggml-sycl: Python3 not found; AST reset contract test is not registered")
+endif()
