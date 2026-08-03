@@ -44,14 +44,6 @@ ggml_add_backend_library(ggml-sycl
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 
-# cpu-dispatch.cpp consumes CPU trait function pointers. In DL builds ggml-cpu
-# is the single SHARED implementation, so this creates a normal relocatable
-# dependency and does not duplicate CPU backend global state inside SYCL.
-if (GGML_BACKEND_DL)
-    target_link_libraries(ggml-sycl PRIVATE ggml-cpu)
-    set_property(TARGET ggml-sycl APPEND PROPERTY BUILD_RPATH "$ORIGIN")
-    set_property(TARGET ggml-sycl APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
-endif()
 option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
 option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
 option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
@@ -108,6 +100,17 @@ target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
 # contains no SYCL headers, device calls, or GPU fixture dependency.
 if (BUILD_TESTING)
+    if (NOT GGML_BACKEND_DL)
+        add_executable(test-sycl-cpu-traits-parity
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-traits-parity.cpp
+            cpu-traits-support.cpp)
+        target_include_directories(test-sycl-cpu-traits-parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_link_libraries(test-sycl-cpu-traits-parity PRIVATE ggml-base ggml-cpu)
+        add_test(NAME sycl-cpu-traits-parity COMMAND test-sycl-cpu-traits-parity)
+        set_tests_properties(sycl-cpu-traits-parity PROPERTIES LABELS "sycl;cpu;host")
+    endif()
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
@@ -142,9 +145,13 @@ if (BUILD_TESTING)
         target_link_libraries(test-sycl-module-dlopen PRIVATE ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-module-dlopen ggml-sycl)
         add_test(NAME sycl-module-dlopen-now COMMAND test-sycl-module-dlopen)
-        set_tests_properties(sycl-module-dlopen-now PROPERTIES
-            FIXTURES_SETUP sycl_module_dlopen_ready
-            LABELS "sycl;module;host")
+        set_tests_properties(sycl-module-dlopen-now PROPERTIES LABELS "sycl;module;host")
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_test(NAME sycl-module-no-cpu-dependency
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dependencies.py
+                    $<TARGET_FILE:ggml-sycl>)
+        set_tests_properties(sycl-module-no-cpu-dependency PROPERTIES LABELS "sycl;module;host")
     endif()
 
     add_executable(test-sycl-lifecycle-runtime-wrapper
@@ -163,9 +170,6 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
-    if (GGML_BACKEND_DL)
-        set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES FIXTURES_REQUIRED sycl_module_dlopen_ready)
-    endif()
     add_executable(test-sycl-lifecycle-wrapper-overlap
         tests/test-lifecycle-wrapper-overlap.cpp)
     target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
@@ -199,9 +203,6 @@ if (BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
     set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
-    if (GGML_BACKEND_DL)
-        set_tests_properties(sycl-device-uuid-api PROPERTIES FIXTURES_REQUIRED sycl_module_dlopen_ready)
-    endif()
 
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
@@ -227,6 +228,8 @@ if (BUILD_TESTING)
 
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
+    add_test(NAME sycl-private-cpu-traits-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.

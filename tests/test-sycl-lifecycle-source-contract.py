@@ -367,15 +367,13 @@ checks = {
     and "ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);" not in
         re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
     "bound transaction uses explicit value check": "txn.value != 0 && lifecycle_find_candidate_placement_plan(txn.value)" in cache_cpp,
-    "DL module resolves CPU traits at RTLD_NOW":
-        "target_link_libraries(ggml-sycl PRIVATE ggml-cpu)" in
+    "DL SYCL module has private CPU traits and no CPU linkage":
+        "target_link_libraries(ggml-sycl PRIVATE ggml-cpu)" not in
             (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
-    and 'if (backend STREQUAL "ggml-cpu")' in (root / "ggml/src/CMakeLists.txt").read_text()
-    and "add_library(${backend} SHARED ${ARGN})" in (root / "ggml/src/CMakeLists.txt").read_text()
-    and "FIXTURES_SETUP sycl_module_dlopen_ready" in
-        (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
-    and "FIXTURES_REQUIRED sycl_module_dlopen_ready" in
-        (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and 'if (backend STREQUAL "ggml-cpu")' not in (root / "ggml/src/CMakeLists.txt").read_text()
+    and "add_library(${backend} MODULE ${ARGN})" in (root / "ggml/src/CMakeLists.txt").read_text()
+    and "ggml_sycl_get_type_traits_cpu" in
+        (root / "ggml/src/ggml-sycl/cpu-traits-support.cpp").read_text()
     and "RTLD_NOW | RTLD_LOCAL" in (root / "tests/test-sycl-module-dlopen.cpp").read_text(),
     "transaction-scoped cache ownership promotion": "pending_load_txn_id" in cache_hpp
     and "test_shared_entry_exact_two_owner_unload" in

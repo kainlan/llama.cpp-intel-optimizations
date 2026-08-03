@@ -79,6 +79,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
+#include "cpu-traits-support.hpp"
 #include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
@@ -34084,13 +34085,22 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     // the full forward graph can pull earlier SYCL-only nodes (for example MoE
     // MUL_MAT_ID/ADD_ID with planner-owned smart handles) onto the CPU backend.
     ggml_graph_add_node(graph, dst);
-    ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
-    ggml_threadpool_t      tp  = ggml_threadpool_new(&tpp);
-    if (!tp) {
-        GGML_LOG_WARN("[SYCL] CPU fallback threadpool alloc failed (%s)\n", reason ? reason : "unknown");
-        ggml_free(gctx);
 
+    // Resolve the generic CPU backend through the registry. In CPU-off builds
+    // (or before a DL CPU module is loaded) there is no backend to borrow, so
+    // fail without introducing direct CPU implementation symbols in SYCL.
+    ggml_backend_reg_t cpu_reg = ggml_backend_reg_by_name("CPU");
+    ggml_backend_dev_t cpu_dev = cpu_reg && ggml_backend_reg_dev_count(cpu_reg) > 0 ?
+                                     ggml_backend_reg_dev_get(cpu_reg, 0) : nullptr;
+    ggml_backend_t cpu_backend = cpu_dev ? ggml_backend_dev_init(cpu_dev, nullptr) : nullptr;
+    if (!cpu_backend) {
+        GGML_LOG_WARN("[SYCL] CPU fallback unavailable (%s)\n", reason ? reason : "unknown");
+        ggml_free(gctx);
         return false;
+    }
+    if (auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads"))) {
+        set_n_threads(cpu_backend, ggml_sycl_cpu_threads_hint());
     }
 
     struct fallback_host_copy {
@@ -34180,28 +34190,12 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
             entry.host_ptr = nullptr;
         }
     };
-    ggml_cplan plan = ggml_graph_plan(graph, tpp.n_threads, tp);
-
-    std::vector<uint8_t> plan_work;
-    if (plan.work_size > 0) {
-        try {
-            plan_work.resize(plan.work_size);
-            plan.work_data = plan_work.data();
-        } catch (const std::bad_alloc &) {
-            GGML_LOG_WARN("[SYCL] CPU fallback work buffer alloc failed (%s)\n", reason ? reason : "unknown");
-            ggml_threadpool_free(tp);
-            ggml_free(gctx);
-
-            restore_host_copies();
-            return false;
-        }
-    }
     GGML_LOG_WARN("[SYCL] CPU fallback executing graph (%s)\n", reason ? reason : "unknown");
     GGML_SYCL_DEBUG("[SYCL-CPU-FALLBACK] compute-begin reason=%s\n", reason ? reason : "unknown");
 
-    const ggml_status status = ggml_graph_compute(graph, &plan);
+    const ggml_status status = ggml_backend_graph_compute(cpu_backend, graph);
     GGML_SYCL_DEBUG("[SYCL-CPU-FALLBACK] compute-end reason=%s status=%d\n", reason ? reason : "unknown", (int) status);
-    ggml_threadpool_free(tp);
+    ggml_backend_free(cpu_backend);
     ggml_free(gctx);
 
     if (dst_is_device && dst_device_ptr) {
@@ -52063,7 +52057,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
 
             // Early-out before D2H memcpy — vec_dot_rows checks internally too,
             // but we avoid the unnecessary src1 copy when vec_dot is unavailable.
-            const auto * cpu_traits = ggml_get_type_traits_cpu(src0->type);
+            const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(src0->type);
             if (cpu_traits && cpu_traits->vec_dot) {
                 // Thread-local staging buffers for D2H(src1) and H2D(dst)
                 static thread_local std::vector<float> tl_src1_host;
@@ -52249,7 +52243,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         if (K <= 0 || N <= 0 || K > INT_MAX || N > INT_MAX) {
             return false;
         }
-        const auto * cpu_traits = ggml_get_type_traits_cpu(src0->type);
+        const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(src0->type);
         if (!cpu_traits || !cpu_traits->vec_dot) {
             return false;
         }
@@ -58074,7 +58068,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             host_weights_fast = moe_plan_host_fast;
         }
-        const auto * cpu_traits_fast  = ggml_get_type_traits_cpu(src0->type);
+        const auto * cpu_traits_fast  = ggml_sycl_get_type_traits_cpu(src0->type);
         const bool   cpu_type_ok_fast = cpu_traits_fast && cpu_traits_fast->vec_dot;
         const bool   cpu_act_ok_fast  = src1->type == GGML_TYPE_F32;
 
@@ -66790,7 +66784,7 @@ cpu_tg_fallthrough:
     // GGML_SYCL_MOE_HYBRID; now hardcoded on.
     // ---------------------------------------------------------------------------
     const int    moe_hybrid_val   = 1;
-    const auto * cpu_traits_check = ggml_get_type_traits_cpu(src0->type);
+    const auto * cpu_traits_check = ggml_sycl_get_type_traits_cpu(src0->type);
     const bool   cpu_type_ok      = cpu_traits_check && cpu_traits_check->vec_dot;
     // Hybrid CPU dispatch requires ne11==1 (all experts share the same activation row).
     // When ne11>1 (b=0 with n_used>1 in test-backend-ops), each expert slot has a
@@ -95627,7 +95621,7 @@ static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const gg
     // Types with vec_dot (Q4_0, Q8_0, MXFP4, etc.) can fall through to hybrid
     // dispatch which routes experts to CPU when weights are host-resident.
     if (op->op == GGML_OP_MUL_MAT_ID && op->src[0]) {
-        const auto * cpu_traits = ggml_get_type_traits_cpu(op->src[0]->type);
+        const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(op->src[0]->type);
         if (!cpu_traits || !cpu_traits->vec_dot) {
             return true;
         }
