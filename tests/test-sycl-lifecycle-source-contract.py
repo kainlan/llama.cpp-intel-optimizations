@@ -331,11 +331,19 @@ checks = {
     and "llama_model_loader_sycl_hooks_for(selected_final_dev)" in
         (root / "src/llama-model-loader.cpp").read_text(),
     "host rows filtered before dereference": "ggml_sycl_host_row_authorized" in backend
+    and "candidate->load_txn_id" in backend
+    and "candidate.value" not in backend
     and backend.count("if (!ggml_sycl_host_row_authorized(entry.second.owner))") >= 2
     and "if (!ggml_sycl_host_row_authorized(it->second.owner))" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and "stamp_pending_owner(entry_it->second)" in cache_cpp
     and "stamp_pending_owner(it->second)" in cache_cpp,
+    "nested loading requires exact outer ownership":
+        "llama_model_sycl_loading_guard sycl_loading_guard(sycl_model_backend, sycl_model_loading_guard.txn)" in llama
+    and "const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
+    and "if (sycl_model_backend)" in llama
+    and "if (ml.no_alloc)" in llama
+    and "defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)" in llama,
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
     and "req.device = exact_device" in backend
     and "get_current_device_id()" not in re.search(

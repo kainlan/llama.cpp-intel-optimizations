@@ -2114,7 +2114,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    llama_model_sycl_loading_guard sycl_loading_guard(has_sycl_weight_buffer, sycl_model_loading_guard.txn);
+    llama_model_sycl_loading_guard sycl_loading_guard(sycl_model_backend, sycl_model_loading_guard.txn);
 #endif
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {

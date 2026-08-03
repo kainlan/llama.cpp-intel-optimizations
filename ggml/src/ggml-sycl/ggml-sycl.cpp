@@ -2051,7 +2051,7 @@ static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
 static bool ggml_sycl_host_row_authorized(const ggml_sycl::lifecycle::ModelToken & owner) noexcept {
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate) {
-        return owner.load.value == candidate.value;
+        return owner.load.value == candidate->load_txn_id;
     }
     const auto active = ggml_sycl_global_plan_snapshot();
     if (!active) {
