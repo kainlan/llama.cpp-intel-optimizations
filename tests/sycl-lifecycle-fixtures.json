@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "fixtures": {
     "A": {
       "path": "tinyllamas/stories15M-q4_0.gguf",
@@ -14,10 +14,25 @@
       "sha256": "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
     }
   },
-  "args": {
+  "generation": {
     "prompt": "1, 2, 3, 4, 5,",
     "seed": 42,
     "temperature": 0,
     "n_predict": 8
+  },
+  "device": {
+    "oneapi_selector": "REPLACE_ON_G1_ONEAPI_SELECTOR",
+    "ggml_logical_selector": "REPLACE_ON_G1_GGML_DEVICE",
+    "physical_uuid": "REPLACE_ON_G1_PHYSICAL_UUID"
+  },
+  "expected": {
+    "A": {
+      "tokens": [],
+      "token_sha256": "REPLACE_ON_G1_A_TOKEN_SHA256"
+    },
+    "B": {
+      "tokens": [],
+      "token_sha256": "REPLACE_ON_G1_B_TOKEN_SHA256"
+    }
   }
 }
