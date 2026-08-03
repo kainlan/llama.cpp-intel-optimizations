@@ -1018,6 +1018,7 @@ struct lifecycle_plan_snapshot {
     uint64_t                              load_txn_id        = 0;
     uint32_t                              slot               = UINT32_MAX;
     uint64_t                              slot_generation    = 0;
+    uint64_t                              version            = 0;
     uint64_t                              planned_host_bytes = 0;
     uint64_t                              actual_host_bytes  = 0;
     lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
@@ -1034,7 +1035,8 @@ bool                                           lifecycle_publish_placement_plan(
                                                                                 uint64_t slot_generation,
                                                                                 uint64_t actual_host_bytes,
                                                                                 uint64_t actual_device_bytes,
-                                                                                bool     have_actual) noexcept;
+                                                                                bool     have_actual,
+                                                                                std::shared_ptr<const lifecycle_plan_snapshot> * published_out = nullptr) noexcept;
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
@@ -2190,61 +2192,76 @@ class unified_cache {
     // When active, S1-PRELOAD uses the plan to decide VRAM vs host placement
     // instead of first-come-first-served.  Gated by GGML_SYCL_VRAM_ARENA=1.
 
-    void set_placement_plan(placement_plan && plan) {
-        placement_plan_     = std::move(plan);
-        has_placement_plan_ = true;
+    // C++17 atomic shared_ptr publication. Readers must retain the returned
+    // owner for the complete operation; no plan reference escapes a snapshot.
+    void set_placement_plan_snapshot(std::shared_ptr<const lifecycle_plan_snapshot> snapshot) {
+        std::atomic_store_explicit(&placement_plan_snapshot_, std::move(snapshot), std::memory_order_release);
     }
 
-    void clear_placement_plan() {
-        placement_plan_     = placement_plan{};
-        has_placement_plan_ = false;
+    std::shared_ptr<const lifecycle_plan_snapshot> get_placement_plan_snapshot() const {
+        return std::atomic_load_explicit(&placement_plan_snapshot_, std::memory_order_acquire);
     }
+
+    void set_placement_plan(placement_plan && plan) {
+        auto snapshot    = std::make_shared<lifecycle_plan_snapshot>();
+        snapshot->plan   = std::make_shared<const placement_plan>(std::move(plan));
+        snapshot->version = placement_plan_local_version_.fetch_add(1, std::memory_order_relaxed) + 1;
+        set_placement_plan_snapshot(std::move(snapshot));
+    }
+
+    void clear_placement_plan() { set_placement_plan_snapshot(nullptr); }
 
     void update_placement_plan_runtime_kv(uint32_t n_ctx, size_t kv_per_layer, size_t kv_per_swa_layer) {
-        if (!has_placement_plan_) {
-            return;
-        }
-        placement_plan_.update_runtime_kv_sizes(n_ctx, kv_per_layer, kv_per_swa_layer);
+        auto current = get_placement_plan_snapshot();
+        if (!current || !current->plan) return;
+        auto plan = std::make_shared<placement_plan>(*current->plan);
+        plan->update_runtime_kv_sizes(n_ctx, kv_per_layer, kv_per_swa_layer);
+        auto next     = std::make_shared<lifecycle_plan_snapshot>(*current);
+        next->plan    = std::move(plan);
+        next->version = placement_plan_local_version_.fetch_add(1, std::memory_order_relaxed) + 1;
+        set_placement_plan_snapshot(std::move(next));
     }
 
     bool plan_on_device(const std::string & tensor_name) const {
-        if (!has_placement_plan_) {
-            return true;
-        }
-        return placement_plan_.is_on_device(tensor_name);
+        auto snapshot = get_placement_plan_snapshot();
+        return !snapshot || !snapshot->plan || snapshot->plan->is_on_device(tensor_name);
     }
 
     // P4.5: Check if tensor is assigned to THIS device in a multi-device plan.
     bool plan_on_this_device(const std::string & tensor_name, int this_device) const {
-        if (!has_placement_plan_) {
-            return true;
-        }
-        if (!placement_plan_.multi_device) {
-            // Single-device plan: original behavior
-            return placement_plan_.is_on_device(tensor_name);
-        }
-        return placement_plan_.is_on_device(tensor_name, this_device);
+        auto snapshot = get_placement_plan_snapshot();
+        if (!snapshot || !snapshot->plan) return true;
+        return snapshot->plan->multi_device ? snapshot->plan->is_on_device(tensor_name, this_device) :
+                                              snapshot->plan->is_on_device(tensor_name);
     }
 
-    bool has_placement_plan() const { return has_placement_plan_; }
+    bool has_placement_plan() const {
+        auto snapshot = get_placement_plan_snapshot();
+        return snapshot && snapshot->plan;
+    }
 
-    // Returns true if any expert of a MoE tensor is planned for host memory on device_id.
-    // Replaces ad-hoc static cache maps in dispatch code: placement_plan::expert_index_ is
-    // already O(1) per lookup, so no caller-side memoization is needed.
     bool moe_tensor_has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
-        if (!has_placement_plan_) {
-            return false;  // No plan → all experts are device-resident (default)
-        }
-        return placement_plan_.has_host_experts(tensor_name, n_experts, device_id);
+        auto snapshot = get_placement_plan_snapshot();
+        return snapshot && snapshot->plan && snapshot->plan->has_host_experts(tensor_name, n_experts, device_id);
     }
 
-    const placement_plan & get_placement_plan() const { return placement_plan_; }
+    // Transitional value accessor: deliberately returns a copy, never an
+    // unprotected reference. New multi-step readers should retain the snapshot.
+    placement_plan get_placement_plan() const {
+        auto snapshot = get_placement_plan_snapshot();
+        return snapshot && snapshot->plan ? *snapshot->plan : placement_plan{};
+    }
 
     bool demote_expert_placement_to_host(const std::string & tensor_name, int expert_id) {
-        if (!has_placement_plan_) {
-            return false;
-        }
-        return placement_plan_.demote_expert_placement_to_host(tensor_name, expert_id);
+        auto current = get_placement_plan_snapshot();
+        if (!current || !current->plan) return false;
+        auto plan = std::make_shared<placement_plan>(*current->plan);
+        if (!plan->demote_expert_placement_to_host(tensor_name, expert_id)) return false;
+        auto next     = std::make_shared<lifecycle_plan_snapshot>(*current);
+        next->plan    = std::move(plan);
+        next->version = placement_plan_local_version_.fetch_add(1, std::memory_order_relaxed) + 1;
+        set_placement_plan_snapshot(std::move(next));
+        return true;
     }
 
     // Access the internal SYCL queue (for deferred free of temp allocations
@@ -3092,9 +3109,9 @@ class unified_cache {
     std::mutex                                                                 partial_mutex_;
 
     // === Placement Plan (P4) ===
-    placement_plan   placement_plan_;
-    bool             has_placement_plan_ = false;
-    std::atomic<int> planned_materialization_depth_{ 0 };
+    mutable std::shared_ptr<const lifecycle_plan_snapshot> placement_plan_snapshot_;
+    std::atomic<uint64_t>                                  placement_plan_local_version_{ 0 };
+    std::atomic<int>                                       planned_materialization_depth_{ 0 };
 
     bool planned_materialization_allowed(const char *               op,
                                          const ggml_sycl_cache_id & key,

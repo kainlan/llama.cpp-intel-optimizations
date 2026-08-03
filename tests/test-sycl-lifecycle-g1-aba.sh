@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Lead-only G1: the model artifacts and runner are intentionally external. The
-# test is registered everywhere but skips unless exact hash-pinned inputs exist.
-a=${GGML_SYCL_G1_MODEL_A:-}
-b=${GGML_SYCL_G1_MODEL_B:-}
-sha_a=${GGML_SYCL_G1_SHA256_A:-}
-sha_b=${GGML_SYCL_G1_SHA256_B:-}
-runner=${GGML_SYCL_G1_RUNNER:-}
-device=${ONEAPI_DEVICE_SELECTOR:-}
-if [[ -z "$a" || -z "$b" || -z "$sha_a" || -z "$sha_b" || -z "$runner" || -z "$device" ]]; then
-  echo "SKIP: G1 A/B artifacts, hashes, runner, or device selector unavailable"
+# Source-built G1 launcher. Paths and hashes are canonical checked-in fixture
+# truth; environment selects only the physical device, never expected results.
+runner=${1:?runner}; build=${2:?build directory}
+a="$build/tinyllamas/stories15M-q4_0.gguf"
+b="$build/sycl-lifecycle-fixtures/stories260K.gguf"
+a_shared="$build/sycl-lifecycle-fixtures/stories15M-copy-q4_0.gguf"
+if [[ -z "${ONEAPI_DEVICE_SELECTOR:-}" || -z "${GGML_SYCL_LIFECYCLE_TEST_DEVICE:-}" ||
+      ! -x "$runner" || ! -f "$a" || ! -f "$b" || ! -f "$a_shared" ]]; then
+  echo "SKIP: canonical G1 fixtures or selected SYCL device unavailable"
   exit 77
 fi
-[[ -f "$a" && -f "$b" && -x "$runner" ]] || exit 77
-actual_a=$(sha256sum "$a" | awk '{print $1}')
-actual_b=$(sha256sum "$b" | awk '{print $1}')
-[[ "$actual_a" == "$sha_a" && "$actual_b" == "$sha_b" ]] || {
-  echo "G1 model hash mismatch" >&2
-  exit 1
-}
-# Runner contract is ordered and explicit: load A, load B, unload B, fail C,
-# restore A, unload A. It must reject any device other than the selected one.
-exec "$runner" --device "$device" --model-a "$a" --model-b "$b" --sequence A-B-A
+printf '%s  %s\n%s  %s\n%s  %s\n' \
+  66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739 "$a" \
+  270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d "$b" \
+  66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739 "$a_shared" | sha256sum -c -
+exec "$runner" --model-a "$a" --model-b "$b" --model-a-shared "$a_shared" \
+  --prompt "1, 2, 3, 4, 5," --seed 42 --temp 0 --n-predict 8

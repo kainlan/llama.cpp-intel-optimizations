@@ -29,6 +29,9 @@ checks = {
     "quarantine never live": cpp.count("model_phase::QUARANTINED") >= 3,
     "committing teardown busy": "BUSY, token" in cpp,
     "immutable full plan candidate": all(x in backend for x in ("lifecycle_stage_placement_plan", "lifecycle_publish_placement_plan", "lifecycle_abort_placement_plan")),
+    "versioned atomic plan publication": all(x in backend for x in ("g_placement_publication", "atomic_store_explicit", "set_placement_plan_snapshot")) and
+        all(x in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text() for x in ("uint64_t                              version", "atomic_load_explicit", "shared_ptr<const lifecycle_plan_snapshot>")),
+    "no cache plan reference accessor": "const placement_plan & get_placement_plan" not in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text(),
     "atomic dying cache bit": "unified_cache_set_live_model_mask(live_after)" not in backend,
     "candidate-only publication accounting": "publication_from_plan" in backend and "cache->get_placement_plan().weight_host_bytes" not in backend,
     "latest live restoration": "global_registry().latest_live()" in backend and "explicit_no_plan" in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text(),
@@ -43,6 +46,8 @@ checks = {
     "exact quarantine validation": "is_quarantined" in hpp and "slot_generation == token.slot_generation" in backend,
     "no all-device graph sweep": "release_graph_replay_leases_all_devices" not in backend,
     "bounded quarantine shutdown": "quarantine_drain_shutdown" in backend and "max_passes" in backend,
+    "canonical G1 registration": "sycl-lifecycle-gpu-sequential" in (root / "tests/CMakeLists.txt").read_text() and
+        "GGML_SYCL_G1_MODEL_A" not in (root / "tests/test-sycl-lifecycle-g1-aba.sh").read_text(),
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

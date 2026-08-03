@@ -48,6 +48,7 @@ std::mutex                                                                   g_l
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
     g_lifecycle_plan_models;
+uint64_t g_lifecycle_plan_next_version = 1;
 }  // namespace
 
 void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan) {
@@ -86,7 +87,8 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
                                       uint64_t slot_generation,
                                       uint64_t actual_host_bytes,
                                       uint64_t actual_device_bytes,
-                                      bool     have_actual) noexcept {
+                                      bool     have_actual,
+                                      std::shared_ptr<const lifecycle_plan_snapshot> * published_out) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
@@ -113,8 +115,13 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
             published->actual_host_bytes  = 0;
             published->verdict            = lifecycle_plan_verdict::UNKNOWN;
         }
-        g_lifecycle_plan_models[model_id][load_txn_id] = std::move(published);
+        published->version = g_lifecycle_plan_next_version++;
+        std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
+        g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
         g_lifecycle_plan_candidates.erase(candidate);
+        if (published_out) {
+            *published_out = std::move(immutable);
+        }
         return true;
     } catch (...) {
         return false;
@@ -2857,7 +2864,8 @@ bool unified_cache::planned_materialization_allowed(const char *               o
                                                     const ggml_sycl_cache_id & key,
                                                     ggml_layout_mode           layout,
                                                     const char *               caller) const {
-    if (!has_placement_plan_) {
+    const auto plan_snapshot = get_placement_plan_snapshot();
+    if (!plan_snapshot || !plan_snapshot->plan) {
         return true;
     }
     if (planned_materialization_active()) {
@@ -6041,7 +6049,7 @@ void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void unified_cache::unpin_experts() {
-    if (has_placement_plan_) {
+    if (has_placement_plan()) {
         // Placement-plan experts are model-load residency decisions.  Runtime
         // prestage/LRU helpers must not invalidate those smart-handle routes.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] ignoring expert unpin request while placement plan is active\n");

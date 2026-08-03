@@ -1,5 +1,6 @@
 #include "model-lifecycle.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <future>
@@ -333,6 +334,50 @@ static void run_case(const std::string & name, test_mutation mutation) {
             require(second.owner.generation != first.owner.generation, "stale slot generation accepted");
         }
         require(second.owner.generation != first.owner.generation, "stale slot generation accepted");
+    } else if (name == "publication-concurrency") {
+        struct snapshot {
+            uint64_t              version;
+            std::vector<uint64_t> vector;
+        };
+
+        std::shared_ptr<const snapshot> authority, cache0, cache1;
+        auto                            publish = [&](std::shared_ptr<const snapshot> next) {
+            // Production order: participating caches first, authority last.
+            std::atomic_store_explicit(&cache0, next, std::memory_order_release);
+            std::atomic_store_explicit(&cache1, next, std::memory_order_release);
+            std::atomic_store_explicit(&authority, std::move(next), std::memory_order_release);
+        };
+        publish(std::make_shared<const snapshot>(snapshot{
+            1, { 1, 1, 1, 1 }
+        }));
+        std::atomic<bool> stop{ false }, failed{ false };
+        auto              reader = [&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                auto a = std::atomic_load_explicit(&authority, std::memory_order_acquire);
+                auto x = std::atomic_load_explicit(&cache0, std::memory_order_acquire);
+                auto y = std::atomic_load_explicit(&cache1, std::memory_order_acquire);
+                // A cache newer than authority means publication is in flight;
+                // retry. Equal versions must be the exact same owner/payload.
+                if (!a || !x || !y || x->version != a->version || y->version != a->version) {
+                    continue;
+                }
+                if (a != x || a != y || a->vector.size() != 4 || a->vector[0] != a->vector[3]) {
+                    failed.store(true, std::memory_order_release);
+                }
+            }
+        };
+        std::thread r0(reader), r1(reader), r2(reader), r3(reader);
+        for (uint64_t v = 2; v < 20000; ++v) {
+            publish(std::make_shared<const snapshot>(snapshot{
+                v, { v, v, v, v }
+            }));
+        }
+        stop.store(true, std::memory_order_release);
+        r0.join();
+        r1.join();
+        r2.join();
+        r3.join();
+        require(!failed.load(std::memory_order_acquire), "mixed placement publication observed");
     } else if (name == "multi-model" || name == "sequential-aba") {
         Registry r;
         auto     a       = commit_one(r, { 11, 7, tier_verdict::MIXED });

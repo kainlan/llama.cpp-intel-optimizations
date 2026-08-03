@@ -108,6 +108,9 @@ if (BUILD_TESTING)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
+    add_test(NAME sycl-lifecycle-placement-publication
+        COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
+    set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
     add_executable(test-sycl-lifecycle-public-api
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-api.cpp)
     target_include_directories(test-sycl-lifecycle-public-api PRIVATE
@@ -120,13 +123,6 @@ if (BUILD_TESTING)
     target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml-sycl)
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
-    add_test(NAME sycl-lifecycle-g1-a-b-a
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-g1-aba.sh)
-    set_tests_properties(sycl-lifecycle-g1-a-b-a PROPERTIES
-        SKIP_RETURN_CODE 77
-        RUN_SERIAL TRUE
-        RESOURCE_LOCK sycl-lifecycle-device
-        LABELS "sycl;lifecycle;g1;hash-pinned")
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   durable-replay waiter-rollover

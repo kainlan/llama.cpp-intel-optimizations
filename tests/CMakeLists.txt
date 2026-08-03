@@ -366,6 +366,18 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
+if (GGML_SYCL)
+    llama_build(test-sycl-lifecycle-gpu-sequential.cpp)
+    add_test(NAME sycl-lifecycle-gpu-sequential
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-aba.sh
+                $<TARGET_FILE:test-sycl-lifecycle-gpu-sequential> ${CMAKE_BINARY_DIR})
+    set_tests_properties(sycl-lifecycle-gpu-sequential PROPERTIES
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK sycl-lifecycle-device
+        LABELS "sycl;lifecycle;g1;hash-pinned")
+endif()
+
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
