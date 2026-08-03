@@ -118,6 +118,41 @@ void check_role(const char * name, expert_tensor_role expected) {
 int main() {
     check_concurrent_snapshot_publication();
 
+    // Equal metadata is insufficient: only the exact shared publication owner
+    // distributed to authority and cache is coherent. Null authority also
+    // fails closed even when a stale cache owner remains.
+    auto identity_plan = std::make_shared<placement_plan>();
+    identity_plan->entries.push_back({});
+    auto authority         = std::make_shared<lifecycle_plan_snapshot>();
+    authority->model_id    = 9;
+    authority->load_txn_id = 10;
+    authority->version     = 11;
+    authority->plan        = identity_plan;
+    auto metadata_clone    = std::make_shared<lifecycle_plan_snapshot>(*authority);
+    if (lifecycle_plan_snapshot_matches(authority, authority) &&
+        !lifecycle_plan_snapshot_matches(authority, metadata_clone) &&
+        !lifecycle_plan_snapshot_matches({}, authority)) {
+        n_pass++;
+    } else {
+        printf("FAIL placement snapshot pointer identity/null authority\n");
+        n_fail++;
+    }
+
+    placement_plan exhausted_candidate{};
+    lifecycle_stage_placement_plan(9001, exhausted_candidate);
+    lifecycle_set_next_plan_publication_id_for_test(UINT64_MAX);
+    const bool exhausted = !lifecycle_publish_placement_plan(9002, 9001, 0, 1, 0, 0, false);
+    lifecycle_set_next_plan_publication_id_for_test(1);
+    // The failed publication must erase its staged candidate: retrying with a
+    // live ID must still fail rather than publishing residue.
+    const bool candidate_erased = !lifecycle_publish_placement_plan(9002, 9001, 0, 1, 0, 0, false);
+    if (exhausted && candidate_erased) {
+        n_pass++;
+    } else {
+        printf("FAIL publication version exhaustion wrapped or retained candidate\n");
+        n_fail++;
+    }
+
     // Lifecycle snapshots own one full plan per model, not one summary per
     // device cache. This also verifies explicit no-plan publication and plan
     // deletion without requiring a GPU queue.

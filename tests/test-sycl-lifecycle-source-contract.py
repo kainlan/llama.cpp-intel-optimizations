@@ -10,18 +10,22 @@ backend = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
-placement_production = "\n".join(
-    (root / path).read_text()
-    for path in (
-        "ggml/src/ggml-sycl/ggml-sycl.cpp",
-        "ggml/src/ggml-sycl/unified-cache.hpp",
-        "ggml/src/ggml-sycl/unified-cache.cpp",
-        "ggml/src/ggml-sycl/model-lifecycle.hpp",
-        "ggml/src/ggml-sycl/model-lifecycle.cpp",
-    )
+placement_paths = sorted(
+    [root / "ggml/include/ggml-sycl.h"]
+    + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
+    + list((root / "ggml/src/ggml-sycl").rglob("*.hpp"))
+    + list((root / "ggml/src/ggml-sycl").rglob("*.h"))
+    + list((root / "src").glob("*.cpp"))
+    + list((root / "src").glob("*.h"))
 )
+placement_production = "\n".join(path.read_text(errors="replace") for path in placement_paths)
 legacy_global_re = re.compile(r"\bg_(?:has_)?placement_plan\b")
-legacy_cache_re = re.compile(r"(?:->|\.)get_placement_plan\s*\(")
+legacy_cache_re = re.compile(
+    r"(?:->|\.)\s*(?:has_placement_plan|get_placement_plan|get_placement_plan_owner|"
+    r"plan_on_device|plan_on_this_device|moe_tensor_has_host_experts)\s*\("
+)
+raw_snapshot_reader_re = re.compile(r"(?:->|\.)\s*get_placement_plan_snapshot\s*\(")
+raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*\(")
 # Positive controls prove the census expressions still detect both prohibited
 # reader families rather than passing because of an accidentally-empty regex.
 census_fixture = (
@@ -73,22 +77,21 @@ checks = {
             "lifecycle_abort_placement_plan",
         )
     ),
-    "versioned atomic plan publication": all(
+    "serialized coherent publication": all(
         x in backend
         for x in (
-            "g_placement_publication",
-            "atomic_store_explicit",
-            "set_placement_plan_snapshot",
-        )
-    )
-    and all(
-        x in (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
-        for x in (
-            "uint64_t                              version",
-            "atomic_load_explicit",
-            "shared_ptr<const lifecycle_plan_snapshot>",
+            "g_tensor_inventory_mutex",
+            "ggml_sycl_publish_plan_locked",
+            "set_placement_plan_snapshot(participates ? snapshot : nullptr)",
+            "atomic_store_explicit(&g_placement_publication, snapshot",
         )
     ),
+    "globally checked publication IDs": "lifecycle_next_plan_publication_id" in cache_hpp
+    and "next == UINT64_MAX" in (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+    and "g_provisional_plan_version" not in backend,
+    "bounded cross-TU coherent owner": "coherent_placement_plan_owner" in cache_hpp
+    and "for (int attempt = 0; attempt < 4" in backend
+    and "global_first.get() == global_second.get()" in backend,
     "no unsafe global placement readers": not legacy_global_re.search(
         placement_production
     ),
@@ -100,21 +103,16 @@ checks = {
     "cache census positive control": len(legacy_cache_re.findall(census_fixture)) == 1,
     "all cache readers retain owners": backend.count("ggml_sycl_cache_plan_owner(")
     >= 49,
-    "cache snapshot identity validation": "lifecycle_plan_snapshot_matches(global, cached)"
+    "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(global_first, cached)"
     in backend
-    and all(
-        x in cache_hpp
-        for x in (
-            "authority->version == cache->version",
-            "authority->model_id == cache->model_id",
-            "authority->load_txn_id == cache->load_txn_id",
-            "authority->slot_generation == cache->slot_generation",
-        )
-    ),
-    "same snapshot cache publication": backend.count("set_placement_plan_snapshot")
-    >= 5,
-    "no cache plan reference accessor": "const placement_plan & " + "get_placement_plan"
-    not in cache_hpp,
+    and "authority.get() == cache.get()" in cache_hpp
+    and "authority->version == cache->version" not in cache_hpp,
+    "raw snapshot reader whitelist": len(raw_snapshot_reader_re.findall(placement_production)) == 1,
+    "raw snapshot writer whitelist": len(raw_snapshot_writer_re.findall(placement_production)) == 1,
+    "same snapshot cache publication": backend.count("set_placement_plan_snapshot") == 1,
+    "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
+    and "get_placement_plan_owner(" not in cache_hpp,
+    "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend,
     "atomic dying cache bit": "unified_cache_set_live_model_mask(live_after)"
     not in backend,
     "candidate-only publication accounting": "publication_from_plan" in backend

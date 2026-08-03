@@ -48,8 +48,25 @@ std::mutex                                                                   g_l
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
     g_lifecycle_plan_models;
-uint64_t g_lifecycle_plan_next_version = 1;
+std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
 }  // namespace
+
+uint64_t lifecycle_next_plan_publication_id() noexcept {
+    uint64_t next = g_lifecycle_plan_next_version.load(std::memory_order_relaxed);
+    for (;;) {
+        if (next == 0 || next == UINT64_MAX) {
+            return 0;
+        }
+        if (g_lifecycle_plan_next_version.compare_exchange_weak(next, next + 1, std::memory_order_relaxed,
+                                                                std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
+
+void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
+    g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
+}
 
 void lifecycle_stage_placement_plan(uint64_t load_txn_id, placement_plan plan) {
     if (load_txn_id == 0) {
@@ -115,7 +132,11 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
             published->actual_host_bytes  = 0;
             published->verdict            = lifecycle_plan_verdict::UNKNOWN;
         }
-        published->version = g_lifecycle_plan_next_version++;
+        published->version = lifecycle_next_plan_publication_id();
+        if (published->version == 0) {
+            g_lifecycle_plan_candidates.erase(candidate);
+            return false;
+        }
         std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
         g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
         g_lifecycle_plan_candidates.erase(candidate);
@@ -136,6 +157,28 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uin
     }
     auto plan = model->second.find(load_txn_id);
     return plan == model->second.end() ? nullptr : plan->second;
+}
+
+bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
+                                      const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
+    if (!expected || !replacement || expected->model_id == 0 || expected->load_txn_id == 0) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        model = g_lifecycle_plan_models.find(expected->model_id);
+        if (model == g_lifecycle_plan_models.end()) {
+            return false;
+        }
+        auto current = model->second.find(expected->load_txn_id);
+        if (current == model->second.end() || current->second.get() != expected.get()) {
+            return false;
+        }
+        current->second = replacement;
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
@@ -2864,8 +2907,8 @@ bool unified_cache::planned_materialization_allowed(const char *               o
                                                     const ggml_sycl_cache_id & key,
                                                     ggml_layout_mode           layout,
                                                     const char *               caller) const {
-    const auto plan_snapshot = get_placement_plan_snapshot();
-    if (!plan_snapshot || !plan_snapshot->plan) {
+    const auto plan_owner = coherent_placement_plan_owner(this);
+    if (plan_owner->entries.empty()) {
         return true;
     }
     if (planned_materialization_active()) {
@@ -3058,7 +3101,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !has_placement_plan()) {
+    if (!ptr && !!coherent_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3295,8 +3338,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             GGML_LOG_INFO(
                 "[DIRECT-STAGE] begin expert device=%d layout=%d src=%p src_size=%zu dst_size=%zu plan=%d "
                 "arena=%d weight_used=%.1f MB avail=%.1f MB largest=%.1f MB\n",
-                cache_device, (int) layout, src_ptr, src_size, dst_size, has_placement_plan() ? 1 : 0,
-                arena_active() ? 1 : 0, zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+                cache_device, (int) layout, src_ptr, src_size, dst_size,
+                !coherent_placement_plan_owner(this)->entries.empty() ? 1 : 0, arena_active() ? 1 : 0,
+                zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
         }
@@ -3307,7 +3351,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !has_placement_plan()) {
+    if (!ptr && !!coherent_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3323,7 +3367,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
     }
     if (!ptr) {
-        if (has_placement_plan()) {
+        if (!coherent_placement_plan_owner(this)->entries.empty()) {
             static std::atomic<int> planned_stage_fail_log{ 0 };
             if (planned_stage_fail_log.fetch_add(1, std::memory_order_relaxed) < 10) {
                 size_t entry_count         = 0;
@@ -4912,7 +4956,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     // Check VRAM budget and evict if needed.
     // Skip the legacy layout_pool_ when the cache has a placement plan: the arena manages
     // all VRAM allocations in that mode, making pool sub-allocation redundant.
-    const bool skip_pool     = has_placement_plan();
+    const bool skip_pool     = !coherent_placement_plan_owner(this)->entries.empty();
     bool       is_pool_alloc = false;
     void *     device_ptr    = nullptr;
     mem_handle direct_alloc_owner;
@@ -6049,7 +6093,7 @@ void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void unified_cache::unpin_experts() {
-    if (has_placement_plan()) {
+    if (!coherent_placement_plan_owner(this)->entries.empty()) {
         // Placement-plan experts are model-load residency decisions.  Runtime
         // prestage/LRU helpers must not invalidate those smart-handle routes.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] ignoring expert unpin request while placement plan is active\n");

@@ -4253,7 +4253,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                                                  std::strstr(tensor_name, "exps.weight") != nullptr &&
                                                  std::strstr(tensor_name, ".bias") == nullptr &&
                                                  ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
-            if (cache->has_placement_plan() && is_composite_moe_weight) {
+            if (ggml_sycl::coherent_placement_plan_owner(cache)->entries.size() != 0 && is_composite_moe_weight) {
                 GGML_SYCL_DEBUG(
                     "[RESOLVE] refusing composite MoE expert tensor materialization for placement-planned '%s' "
                     "device %d\n",
@@ -4432,12 +4432,13 @@ inline ggml_sycl_planned_weight_residency ggml_sycl_get_planned_weight_residency
         return ggml_sycl_planned_weight_residency::UNKNOWN;
     }
 
-    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    auto *     cache      = ggml_sycl::get_unified_cache_for_device(device);
+    const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);
+    if (plan_owner->entries.empty()) {
         return ggml_sycl_planned_weight_residency::UNKNOWN;
     }
 
-    const auto & plan     = cache->get_placement_plan();
+    const auto & plan     = *plan_owner;
     const int    layer_id = ggml_sycl::extract_layer_id(tensor->name);
     if (layer_id >= 0) {
         auto it = plan.layer_device.find(layer_id);
@@ -4494,7 +4495,7 @@ inline bool ggml_sycl_planner_authoritative_residency_active(int device) {
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    return cache != nullptr && cache->has_placement_plan();
+    return !ggml_sycl::coherent_placement_plan_owner(cache)->entries.empty();
 }
 
 // Returns true if `tensor` is a weight AND currently VRAM-resident on

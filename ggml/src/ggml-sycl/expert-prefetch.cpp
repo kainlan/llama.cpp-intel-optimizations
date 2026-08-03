@@ -130,7 +130,7 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
         return true;
     }
 
-    if (cache->has_placement_plan()) {
+    if (!coherent_placement_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -359,7 +359,8 @@ void * ExpertPrefetcher::demand_load(int layer_idx, int expert_idx) {
         return nullptr;
     }
 
-    if (unified_cache * cache = get_unified_cache_for_device(device_id_); cache && cache->has_placement_plan()) {
+    if (unified_cache * cache = get_unified_cache_for_device(device_id_);
+        !coherent_placement_plan_owner(cache)->entries.empty()) {
         return get_cached_ptr(layer_idx, expert_idx);
     }
 

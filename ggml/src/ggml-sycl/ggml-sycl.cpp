@@ -798,7 +798,7 @@ static void ggml_sycl_log_load_summary(int          device,
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!actual_weights && cache && cache->has_placement_plan()) {
+    if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
         const auto & plan       = *plan_owner;
         weight_device_bytes     = plan.weight_vram_bytes;
@@ -1997,43 +1997,49 @@ static std::atomic<bool> g_moe_multi_gpu_active{ false };
 // used because std::atomic<std::shared_ptr<T>> is C++20-only. There is no
 // mutable process-global plan: builders publish a fresh immutable snapshot.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_publication;
-static std::atomic<uint64_t>                                     g_provisional_plan_version{ UINT64_C(1) << 63 };
+// Canonical ranked inventory/lifecycle publication writer lock. All cache/global
+// placement publications are serialized by this existing lock.
+static std::mutex                                                g_tensor_inventory_mutex;
 static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };
+
+static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {
     return std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
 }
 
-static bool ggml_sycl_has_global_plan() {
-    const auto snapshot = ggml_sycl_global_plan_snapshot();
-    return snapshot && snapshot->plan;
-}
-
 static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_global_plan_owner() {
-    static const auto empty    = std::make_shared<const ggml_sycl::placement_plan>();
-    const auto        snapshot = ggml_sycl_global_plan_snapshot();
-    return snapshot && snapshot->plan ? snapshot->plan : empty;
+    return ggml_sycl::coherent_placement_plan_owner(ggml_sycl::get_unified_cache_for_device(0));
 }
 
-// Mixed publications fail closed. Lifecycle publications have all three
-// identity fields; provisional load-time publications are validated by exact
-// snapshot identity. A cache-only test plan remains readable when no global
-// authority exists.
-static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_owner(
-    const ggml_sycl::unified_cache * cache) {
-    static const auto empty = std::make_shared<const ggml_sycl::placement_plan>();
+static bool ggml_sycl_has_global_plan() {
+    return !ggml_sycl_global_plan_owner()->entries.empty();
+}
+
+namespace ggml_sycl {
+std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept {
+    static const auto empty = std::make_shared<const placement_plan>();
     if (!cache) {
         return empty;
     }
-    const auto cached = cache->get_placement_plan_snapshot();
-    if (!cached || !cached->plan) {
-        return empty;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto global_first = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+        if (!global_first || !global_first->plan) {
+            return empty;
+        }
+        const auto cached        = cache->get_placement_plan_snapshot();
+        const auto global_second = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
+        if (global_first.get() == global_second.get() && lifecycle_plan_snapshot_matches(global_first, cached)) {
+            return global_first->plan;
+        }
     }
-    const auto global = ggml_sycl_global_plan_snapshot();
-    if (!global) {
-        return cached->plan;
-    }
-    return ggml_sycl::lifecycle_plan_snapshot_matches(global, cached) ? cached->plan : empty;
+    return empty;
+}
+}  // namespace ggml_sycl
+
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_owner(
+    const ggml_sycl::unified_cache * cache) {
+    return ggml_sycl::coherent_placement_plan_owner(cache);
 }
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_make_provisional_plan_snapshot(
@@ -2042,9 +2048,23 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_make_
     const auto token      = ggml_sycl::lifecycle::global_registry().current_active_token();
     snapshot->model_id    = token.model.value;
     snapshot->load_txn_id = token.load.value;
-    snapshot->version     = g_provisional_plan_version.fetch_add(1, std::memory_order_relaxed);
-    snapshot->plan        = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
+    snapshot->version     = ggml_sycl::lifecycle_next_plan_publication_id();
+    if (snapshot->version == 0) {
+        GGML_ABORT("[SYCL-PLAN] placement publication ID exhausted");
+    }
+    snapshot->plan = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
     return snapshot;
+}
+
+static void ggml_sycl_publish_test_plan(ggml_sycl::placement_plan plan) {
+    const auto                  snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan));
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    ggml_sycl_publish_plan_locked(snapshot);
+}
+
+static void ggml_sycl_republish_current_plan() {
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());
 }
 
 static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan & plan, int device_id);
@@ -2857,7 +2877,7 @@ static bool ggml_sycl_runtime_prestage_enabled() {
     const int n_devs = std::min<int>(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
     for (int d = 0; d < n_devs; ++d) {
         if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d)) {
-            if (cache->has_placement_plan()) {
+            if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
                 return false;
             }
         }
@@ -3148,7 +3168,7 @@ static void moe_prestage_popular_experts() {
             // Each tensor (gate/up/down) is checked individually.  If the plan
             // says an expert is not on device, skip its staging to avoid
             // exhausting the WEIGHT zone on MoE models.
-            if (cache->has_placement_plan()) {
+            if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
                 const auto   pp_owner            = ggml_sycl_cache_plan_owner(cache);
                 const auto & pp                  = *pp_owner;
                 auto         check_expert_tensor = [&](const moe_expert_meta * meta) -> bool {
@@ -3399,7 +3419,7 @@ static void moe_prestage_popular_experts() {
                     for (int i = 0; i < static_cast<int>(sec_budgets.size()); ++i) {
                         const auto & b         = sec_budgets[i];
                         auto *       sec_cache = b.cache;
-                        if (!sec_cache || !sec_cache->has_placement_plan()) {
+                        if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {
                             continue;
                         }
                         const auto placement =
@@ -3420,7 +3440,7 @@ static void moe_prestage_popular_experts() {
 
                 if (planned_budget_idx < 0) {
                     for (int i = 0; i < static_cast<int>(sec_budgets.size()); ++i) {
-                        if (sec_budgets[i].cache && !sec_budgets[i].cache->has_placement_plan()) {
+                        if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {
                             planned_budget_idx = i;
                             break;
                         }
@@ -3822,7 +3842,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     // P4: Check placement plan — skip device staging for experts planned for host.
     // Without this, adaptive prestage and ExpertPrefetcher::hint() bypass the plan
     // and exhaust the WEIGHT zone on MoE models that exceed VRAM.
-    if (cache->has_placement_plan() && meta->tensor && meta->tensor->name) {
+    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && meta->tensor && meta->tensor->name) {
         const std::string tname(meta->tensor->name);
         if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(tname, expert_idx, device_id)) {
             return nullptr;  // Expert planned for host — caller handles host fallback
@@ -3841,7 +3861,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
 
     key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
-    if (cache->has_placement_plan()) {
+    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return cache->lookup(key, GGML_LAYOUT_SOA);
     }
 
@@ -3881,7 +3901,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
 }
 
 static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache) {
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return;
     }
 
@@ -4118,8 +4138,8 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         (void) ggml_sycl::unified_cache_register_for_queue(target_device, *q);
         if (ggml_sycl_has_global_plan()) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);
-                cache && !cache->has_placement_plan()) {
-                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
+                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+                ggml_sycl_republish_current_plan();
             }
         }
         return true;
@@ -4138,8 +4158,9 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         }
         (void) ggml_sycl::unified_cache_register_for_queue(d, *q_d);
         if (ggml_sycl_has_global_plan()) {
-            if (auto * cache = ggml_sycl::get_unified_cache_for_device(d); cache && !cache->has_placement_plan()) {
-                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
+            if (auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+                ggml_sycl_republish_current_plan();
             }
         }
         ++n_registered;
@@ -4238,7 +4259,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     }
 
     unified_cache * cache = get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         log_fail("no-cache-or-plan");
         return false;
     }
@@ -4612,7 +4633,7 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
     std::vector<ggml_sycl_cache_id> canonical_keys = ggml_sycl_get_canonical_moe_expert_keys(src0, expert_id);
     unified_cache *                 plan_cache     = get_unified_cache_for_device(current_device);
     bool                            current_device_planned_alternate = false;
-    if (plan_cache && plan_cache->has_placement_plan() && src0->name && src0->name[0] != '\0') {
+    if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\0') {
         const auto placement =
             (*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);
         if (placement.found()) {
@@ -4963,7 +4984,7 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
     };
 
     unified_cache * plan_cache = get_unified_cache_for_device(device);
-    if (plan_cache && plan_cache->has_placement_plan() && src0->name && src0->name[0] != '\0') {
+    if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\0') {
         const auto placement =
             (*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);
         if (placement.found()) {
@@ -6425,7 +6446,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // expert weights on secondary GPUs but the dispatch code ignores them.
     {
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-        if (cache && cache->has_placement_plan()) {
+        if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             const auto   plan_owner           = ggml_sycl_cache_plan_owner(cache);
             const auto & plan                 = *plan_owner;
             const bool   plan_needs_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
@@ -6546,7 +6567,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             // per-expert device assignments.  The cache stores a copy of the
             // global (*ggml_sycl_global_plan_owner()) set by compute_and_store_plan_for_inventory().
             ggml_sycl::unified_cache * plan_cache  = ggml_sycl::get_unified_cache_for_device(device);
-            const bool                 use_planner = plan_cache && plan_cache->has_placement_plan() &&
+            const bool use_planner = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() &&
                                      (*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;
 
             if (use_planner) {
@@ -6874,7 +6895,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         {
             auto resolve_planned_expert = [&](const auto & info, int current_device) -> moe_expert_route {
                 unified_cache * route_cache = get_unified_cache_for_device(current_device);
-                if (!route_cache || !route_cache->has_placement_plan()) {
+                if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {
                     return {};
                 }
                 const layout_mode layout = ggml_sycl_select_moe_graph_layout(info.tensor, current_device, true);
@@ -7820,7 +7841,7 @@ bool test_moe_ptr_table_retains_route_lease_until_event() {
         plan.expert_device[7][e] = 0;
     }
     plan.build_index();
-    cache->set_placement_plan(std::move(plan));
+    ggml_sycl_publish_test_plan(std::move(plan));
 
     std::vector<sycl::event> stage_events;
     void *                   target_ptr = nullptr;
@@ -7913,7 +7934,7 @@ bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
         plan.expert_device[11][e] = 0;
     }
     plan.build_index();
-    cache->set_placement_plan(std::move(plan));
+    ggml_sycl_publish_test_plan(std::move(plan));
 
     constexpr int            expert_id = 3;
     std::vector<sycl::event> stage_events;
@@ -8055,7 +8076,7 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
         plan.expert_device[12][e] = 0;
     }
     plan.build_index();
-    cache->set_placement_plan(std::move(plan));
+    ggml_sycl_publish_test_plan(std::move(plan));
 
     constexpr int            expert_id = 3;
     std::vector<sycl::event> stage_events;
@@ -9445,14 +9466,8 @@ static bool ggml_sycl_prepare_latest_live_plan(ggml_sycl_plan_restoration_bundle
 }
 
 static void ggml_sycl_publish_restored_plan(ggml_sycl_plan_restoration_bundle && bundle) noexcept {
-    // Publish participating execution views first and the global authority
-    // last. A reader that validates cache.version == authority.version either
-    // sees the old complete publication or retries after the new authority.
-    for (auto & item : bundle.caches) {
-        item.cache->set_placement_plan_snapshot(item.participates ? bundle.snapshot : nullptr);
-    }
-    g_current_model_planner_host_placement.store(bundle.host_placement, std::memory_order_release);
-    std::atomic_store_explicit(&g_placement_publication, std::move(bundle.snapshot), std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    ggml_sycl_publish_plan_locked(bundle.snapshot);
 }
 
 static bool ggml_sycl_restore_latest_live_plan() noexcept {
@@ -9560,6 +9575,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
                                                             ggml_sycl_model_token * model) {
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
     ggml_sycl::lifecycle::finish_ticket ticket;
+    bool                                placement_inserted = false;
     try {
         registry = &ggml_sycl::lifecycle::global_registry();
         ticket   = registry->prepare_end({ txn.id }, explicit_success, model != nullptr);
@@ -9608,6 +9624,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             !plan_snapshot) {
             throw std::bad_alloc();
         }
+        placement_inserted = true;
         ggml_sycl_plan_restoration_bundle publication_bundle;
         publication_bundle.snapshot       = plan_snapshot;
         publication_bundle.host_placement = plan_snapshot->plan && plan_snapshot->planned_host_bytes > 0;
@@ -9641,6 +9658,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
         g_sycl_abort_load_exit = false;
+        if (placement_inserted) {
+            ggml_sycl::lifecycle_erase_placement_plan(ticket.token.model.value, ticket.token.load.value);
+        } else if (ticket.token.load.value != 0) {
+            ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
+        }
         if (ticket.finisher) {
             try {
                 ggml_sycl_abort_owner_effects(ticket.token);
@@ -10209,7 +10231,6 @@ static bool ggml_sycl_layout_override_active(layout_mode & override_layout);
 static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layout_mode layout, int device);
 
 // Tensor inventory storage for tiered memory placement
-static std::mutex                                    g_tensor_inventory_mutex;
 static std::vector<std::pair<std::string, size_t>>   g_tensor_inventory;
 static std::vector<ggml_sycl::placement_tensor_info> g_tensor_inventory_detail;
 static std::unordered_map<std::string, size_t>       g_tensor_inventory_index;  // name -> index for O(1) lookup
@@ -10306,8 +10327,7 @@ static void ggml_sycl_reset_model_load_scratch_state() {
         g_placement_envelope                                   = ggml_sycl_placement_envelope{};
         g_placement_envelope_set                               = false;
         g_moe_expert_vram_reserve.fill(0);
-        std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
-        g_current_model_planner_host_placement.store(false, std::memory_order_release);
+        ggml_sycl_publish_plan_locked(nullptr);
     }
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
@@ -10356,6 +10376,23 @@ static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan
         }
     }
     return false;
+}
+
+static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    // Writer serialization is provided by g_tensor_inventory_mutex. Every
+    // extant cache is explicitly assigned the shared owner or null before the
+    // process authority changes.
+    const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    for (int d = 0; d < total; ++d) {
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(d)) {
+            const bool participates =
+                snapshot && snapshot->plan && ggml_sycl_placement_plan_uses_device(*snapshot->plan, d);
+            cache->set_placement_plan_snapshot(participates ? snapshot : nullptr);
+        }
+    }
+    g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
+                                                 std::memory_order_release);
+    std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release);
 }
 
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan) {
@@ -10648,8 +10685,9 @@ void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, 
     next.kv_per_layer   = kv_per_layer;
     next.planner_n_ctx  = 1;
     next.multi_device   = true;
-    auto snapshot       = ggml_sycl_make_provisional_plan_snapshot(std::move(next));
-    std::atomic_store_explicit(&g_placement_publication, std::move(snapshot), std::memory_order_release);
+    auto                        snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(next));
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    ggml_sycl_publish_plan_locked(snapshot);
     g_model_n_layer                  = n_layers;
     g_placement_kv_info              = {};
     g_placement_kv_info.n_layer      = n_layers;
@@ -10660,7 +10698,8 @@ void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, 
 }
 
 void test_clear_kv_placement_plan() {
-    std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    ggml_sycl_publish_plan_locked(nullptr);
     g_model_n_layer     = 0;
     g_placement_kv_info = {};
 }
@@ -10690,8 +10729,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     ggml_sycl::placement_plan plan_candidate;
     bool                      have_plan = false;
     if (!ggml_sycl::vram_arena_enabled()) {
-        std::atomic_store_explicit(&g_placement_publication, {}, std::memory_order_release);
-        g_current_model_planner_host_placement.store(false, std::memory_order_release);
+        ggml_sycl_publish_plan_locked(nullptr);
         return;
     }
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
@@ -10831,9 +10869,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             plan_candidate.host_bytes / (1024.0 * 1024.0));
     }
 
-    const auto plan_snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan_candidate));
-    std::atomic_store_explicit(&g_placement_publication, plan_snapshot, std::memory_order_release);
-    const auto & plan = *plan_snapshot->plan;
+    const auto   plan_snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan_candidate));
+    const auto & plan          = *plan_snapshot->plan;
 
     // Stage a full immutable transaction-owned candidate. Process-global and
     // per-cache copies remain legacy execution routing, not model identity.
@@ -10845,8 +10882,6 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // Publish only after the authoritative plan is complete. Keep this verdict
     // independent of have_plan because S1 preload deliberately clears
     // a multi-device global plan after copying it into device caches.
-    const bool planner_host_placement = have_plan && plan.host_bytes > 0;
-    g_current_model_planner_host_placement.store(planner_host_placement, std::memory_order_release);
 
     // PLACE-4 G1 (llama.cpp-2egrd polish): single-line summary of plan-driven
     // weight placement.  Surfaces the per-tensor verdict at plan-computation
@@ -10877,18 +10912,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // late inventory pass runs after arena reservation and can materially change
     // weight-zone capacity.  S1 materialization must follow this final plan.
     if (have_plan) {
-        const bool plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
-        for (int d = 0; d < ggml_sycl_info().total_gpu_count; d++) {
-            if (!ggml_sycl_placement_plan_uses_device(plan, d)) {
-                continue;
-            }
-            auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-            if (cache) {
-                cache->set_placement_plan_snapshot(plan_snapshot);
-                GGML_SYCL_DEBUG("[SYCL] Early plan store for device %d\n", d);
-            }
-        }
-
+        const bool   plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
         const auto & info              = ggml_sycl_info();
         const char * moe_multi_gpu_env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
         const bool   moe_multi_gpu_requested =
@@ -10927,6 +10951,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
         }
     }
+    ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr);
 }
 
 // Compute placement plan early — before create_tensor in the llama loader.
@@ -11132,17 +11157,19 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                           g_placement_kv_info.kv_bytes_per_swa_layer());
         auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
         next->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
-        next->version = g_provisional_plan_version.fetch_add(1, std::memory_order_relaxed);
-        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
-        for (int d = 0; d < ggml_sycl_info().total_gpu_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
-            if (auto * cache = ggml_sycl::get_unified_cache_for_device(d)) {
-                const auto cached = cache->get_placement_plan_snapshot();
-                if (cached.get() == current.get()) {
-                    cache->set_placement_plan_snapshot(immutable);
-                }
-            }
+        next->version = ggml_sycl::lifecycle_next_plan_publication_id();
+        if (next->version == 0) {
+            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
+            return;
         }
-        std::atomic_store_explicit(&g_placement_publication, std::move(immutable), std::memory_order_release);
+        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
+        // CAS against lifecycle ownership before publishing. A newer commit or
+        // teardown erases/replaces this exact owner and makes the update fail.
+        if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable) ||
+            ggml_sycl_global_plan_snapshot().get() != current.get()) {
+            return;
+        }
+        ggml_sycl_publish_plan_locked(immutable);
     }
 
     if (g_placement_kv_info.valid()) {
@@ -11612,7 +11639,7 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
         plan.expert_device[13][e] = 0;
     }
     plan.build_index();
-    cache->set_placement_plan(std::move(plan));
+    ggml_sycl_publish_test_plan(std::move(plan));
 
     constexpr int            expert_id = 5;
     std::vector<sycl::event> stage_events;
@@ -11700,7 +11727,7 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
         plan.expert_device[17][e] = 0;
     }
     plan.build_index();
-    cache->set_placement_plan(std::move(plan));
+    ggml_sycl_publish_test_plan(std::move(plan));
 
     std::vector<sycl::event> stage_events;
     {
@@ -13136,7 +13163,7 @@ static bool ggml_sycl_moe_tensor_has_secondary_device_route(const ggml_tensor * 
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(current_device);
-    if (!cache || !cache->has_placement_plan() || tensor->name[0] == '\0') {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\0') {
         return false;
     }
 
@@ -14623,7 +14650,7 @@ static bool ggml_sycl_moe_fusion_enabled() {
         const int n_devs = ggml_sycl_info().total_gpu_count;
         for (int d = 0; d < n_devs && d < GGML_SYCL_MAX_DEVICES; ++d) {
             ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
-            if (cache && cache->has_placement_plan()) {
+            if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
                 return true;
             }
         }
@@ -17647,11 +17674,11 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
     }
     auto *        cache     = ggml_sycl::get_unified_cache_for_device(device);
     const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    if (cache && cache->has_placement_plan()) {
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         if (known) {
             *known = true;
         }
-        return cache->moe_tensor_has_host_experts(src0->name ? src0->name : "", n_experts, device);
+        return ggml_sycl_cache_plan_owner(cache)->has_host_experts(src0->name ? src0->name : "", n_experts, device);
     }
     const auto plan_owner = ggml_sycl_global_plan_owner();
     if (ggml_sycl_has_global_plan()) {
@@ -19313,7 +19340,7 @@ static bool ggml_sycl_try_decode_secondary_moe_route_on_device(const ggml_tensor
     }
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(target_device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -19949,7 +19976,7 @@ static bool ggml_sycl_moe_decode_down_i8_selected_candidate(const ggml_tensor * 
     }
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -20331,7 +20358,7 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                                                              bool                host_weights,
                                                              int64_t             n_tokens) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return ggml_sycl_select_moe_graph_layout(src0, device, host_weights);
     }
 
@@ -24129,7 +24156,7 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
             continue;
         }
 
-        if (cache->has_placement_plan() && !tname.empty()) {
+        if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {
             const auto placement =
                 (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));
             if (!placement.found()) {
@@ -24385,7 +24412,7 @@ static void ggml_sycl_preload_model_weights() {
             // fragmentation the comment above warns about (llama.cpp-0qlw).
             cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::MID_LOAD_REPLAN);
             if (global_plan != nullptr) {
-                cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
+                ggml_sycl_republish_current_plan();
             }
 
             // Track dense weight cache keys for pinning + data_device update after finalize
@@ -24522,7 +24549,7 @@ static void ggml_sycl_preload_model_weights() {
                     }
                     const int64_t     n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
                     const std::string tname(tensor->name ? tensor->name : "");
-                    const bool        have_plan     = cache->has_placement_plan() && !tname.empty();
+                    const bool        have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();
                     sycl::queue *     moe_preload_q = s1_preload_q;
                     if (!have_plan && ggml_sycl_should_skip_blind_preload(n_experts)) {
                         moe_failed++;  // Not a real failure — just skipped
@@ -25263,8 +25290,9 @@ static void ggml_sycl_preload_model_weights() {
                     bool                                  dense_alternate_on_this_device = false;
                     ggml_sycl::placement_alternate_layout dense_alternate_layout{};
                     const std::string dense_name = tensor->name[0] != '\0' ? std::string(tensor->name) : std::string();
-                    if (cache->has_placement_plan() && !dense_name.empty()) {
-                        dense_planned_on_this_device = cache->plan_on_this_device(dense_name, device);
+                    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {
+                        dense_planned_on_this_device =
+                            ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);
                         dense_alternate_on_this_device =
                             (*ggml_sycl_cache_plan_owner(cache))
                                 .dense_alternate_on_device(dense_name, device, &dense_alternate_layout);
@@ -25273,7 +25301,7 @@ static void ggml_sycl_preload_model_weights() {
                     // P4/P4.5: Skip device upload for host-planned dense weights.
                     // Stage into host arena and register in direct_weight_entries_ so
                     // lookup_weight() resolves them with location==HOST_PINNED.
-                    if (cache->has_placement_plan() && !dense_name.empty()) {
+                    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {
                         if (!dense_planned_on_this_device && !dense_alternate_on_this_device) {
                             // Dense weight is host-planned: copy mmap data into host arena
                             // and register in direct_weight_entries_ so lookup_weight() finds it.
@@ -25494,7 +25522,7 @@ static void ggml_sycl_preload_model_weights() {
                                 "incomplete device placement");
                         } else {
                             dense_failed++;
-                            if (cache->has_placement_plan() &&
+                            if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&
                                 (dense_planned_on_this_device || dense_alternate_on_this_device)) {
                                 GGML_ABORT(
                                     "[S1-PRELOAD] planned dense materialization failed for %s; aborting before "
@@ -25505,7 +25533,7 @@ static void ggml_sycl_preload_model_weights() {
                         }
                     } else {
                         dense_failed++;
-                        if (cache->has_placement_plan() &&
+                        if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&
                             (dense_planned_on_this_device || dense_alternate_on_this_device)) {
                             GGML_ABORT(
                                 "[S1-PRELOAD] planned dense materialization failed for %s; aborting before inference "
@@ -25568,7 +25596,7 @@ static void ggml_sycl_preload_model_weights() {
                         continue;
                     }
                     const std::string tname(tensor->name ? tensor->name : "");
-                    const bool        have_plan = cache->has_placement_plan() && !tname.empty();
+                    const bool        have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();
                     std::vector<int>  local_experts;
                     local_experts.reserve(static_cast<size_t>(n_experts));
                     if (have_plan) {
@@ -28680,7 +28708,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     const auto                        global_kv_plan_owner = ggml_sycl_global_plan_owner();
     if (global_kv_plan_owner && !global_kv_plan_owner->kv_device.empty()) {
         kv_plan = global_kv_plan_owner.get();
-    } else if (plan_cache && plan_cache->has_placement_plan()) {
+    } else if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
         if (!cache_kv_plan_owner->kv_device.empty()) {
             kv_plan = cache_kv_plan_owner.get();
         }
@@ -40759,7 +40787,7 @@ static int ggml_sycl_planned_layer_device_for_simple_consumer(const ggml_tensor 
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(current_device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return -1;
     }
 
@@ -40814,7 +40842,7 @@ static bool ggml_sycl_plan_real_simple_consumer_dispatch(const ggml_tensor *    
 static bool ggml_sycl_current_plan_needs_secondary_devices(int current_device) {
     if (current_device >= 0 && current_device < GGML_SYCL_MAX_DEVICES) {
         if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(current_device);
-            cache && cache->has_placement_plan()) {
+            cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             return ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);
         }
     }
@@ -40825,7 +40853,7 @@ static bool ggml_sycl_current_plan_needs_secondary_devices(int current_device) {
 static bool ggml_sycl_current_plan_is_single_device_for_graph(int current_device) {
     if (current_device >= 0 && current_device < GGML_SYCL_MAX_DEVICES) {
         if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(current_device);
-            cache && cache->has_placement_plan()) {
+            cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);
         }
     }
@@ -44580,7 +44608,7 @@ static bool ggml_sycl_moe_decode_down_i8_hotset_candidate(const ggml_tensor * sr
         return false;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    return cache && cache->has_placement_plan();
+    return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
 }
 
 static std::vector<int> ggml_sycl_moe_unique_expert_ids(const std::vector<int32_t> & ids_host, int64_t n_experts) {
@@ -44674,7 +44702,7 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_selected(const ggml_tenso
         return 0;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return 0;
     }
     const size_t dst_bytes =
@@ -44796,7 +44824,7 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor(ggml_backend_s
         return 0;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return 0;
     }
 
@@ -45712,7 +45740,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     // regular host buffers.
     bool                       host_weights  = ggml_sycl_is_host_resident_weight(src0, stream);
     ggml_sycl::unified_cache * cache         = ggml_sycl::get_unified_cache(*stream);
-    const bool                 plan_active   = cache && cache->has_placement_plan();
+    const bool                 plan_active              = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
     const bool                 is_moe_expert = (ggml_sycl_get_tensor_usage(src0) == tensor_usage::MOE_EXPERT_WEIGHT);
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> logged_ptr_enter{ 0 };
@@ -46498,7 +46526,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     // and handled by CPU fallback — don't interfere with that path.
     const bool unresolved_needed_experts = stats_miss > 0 || stats_layout_mismatch > 0;
     if (unresolved_needed_experts && !skip_cpu_routed_experts) {
-        if (cache && cache->has_placement_plan()) {
+        if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             GGML_LOG_ERROR(
                 "[MOE-PTR] %d/%d experts missing and %d/%d layout-mismatched from placement-plan preload for layout=%d "
                 "on "
@@ -46628,7 +46656,7 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
     }
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -46665,7 +46693,8 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
 // phase-layout materialization when the device supports that path.
 static bool ggml_sycl_moe_plan_pp_soa_promoted(int device) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    return cache && cache->has_placement_plan() && (*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;
+    return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty() &&
+           (*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;
 }
 
 // Tensors whose decode XMX_TILED rematerialization failed (e.g. WEIGHT-zone
@@ -47092,7 +47121,7 @@ static ggml_sycl::test_moe_phase_xmx_auto_policy_input ggml_sycl_moe_phase_xmx_a
     }
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    in.has_placement_plan            = cache && cache->has_placement_plan();
+    in.has_placement_plan            = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
     in.pp_soa_promoted               = in.has_placement_plan && ggml_sycl_moe_plan_pp_soa_promoted(device);
 #if SYCL_XMX_MOE_AVAILABLE
     const auto & caps     = ggml_sycl_info().devices[device].xmx_caps;
@@ -47217,7 +47246,7 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
         return false;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -47656,7 +47685,7 @@ static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * 
     }
 
     ggml_sycl::unified_cache * plan_cache = ggml_sycl::get_unified_cache_for_device(current_device);
-    if (!plan_cache || !plan_cache->has_placement_plan()) {
+    if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
         return false;
     }
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -47709,10 +47738,10 @@ static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * 
             failed_devices++;
             continue;
         }
-        if (!cache->has_placement_plan() && ggml_sycl_has_global_plan()) {
-            cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
+        if (ggml_sycl_cache_plan_owner(cache)->entries.empty() && ggml_sycl_has_global_plan()) {
+            ggml_sycl_republish_current_plan();
         }
-        if (!cache->has_placement_plan()) {
+        if (ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             failed_devices++;
             continue;
         }
@@ -47797,7 +47826,7 @@ static bool ggml_sycl_materialize_moe_phase_layouts(ggml_backend_sycl_context & 
                                                     ggml_cgraph *               cgraph,
                                                     bool                        decode_phase) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    if (!cgraph || !cache || !cache->has_placement_plan()) {
+    if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return true;
     }
 
@@ -48013,7 +48042,7 @@ static bool ggml_sycl_moe_phase_materialization_needed(ggml_backend_sycl_context
                                                        ggml_cgraph *               cgraph,
                                                        bool                        decode_phase) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    if (!cgraph || !cache || !cache->has_placement_plan()) {
+    if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -48095,7 +48124,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         bool          host_weights   = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
         const int64_t n_ids          = ids->ne[0];
         const int64_t n_tokens       = ids->ne[1];
-        const bool    plan_preloaded = cache && cache->has_placement_plan();
+        const bool    plan_preloaded = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
         const bool    prompt_down_transient_soa =
             plan_preloaded && ggml_sycl_moe_prompt_down_transient_soa_active(src0, ctx.device, n_tokens);
         // Check if this MoE layer has too many experts for blind preload
@@ -58175,7 +58204,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const int64_t              n_ids_d = ids->ne[0];
                         ggml_sycl::unified_cache * plan_cache_fusion =
                             ggml_sycl::get_unified_cache_for_device(ctx.device);
-                        const bool have_plan_fusion = plan_cache_fusion && plan_cache_fusion->has_placement_plan();
+                        const bool have_plan_fusion =
+                            plan_cache_fusion && !ggml_sycl_cache_plan_owner(plan_cache_fusion)->entries.empty();
                         const layout_mode requested_layout_fusion =
                             has_override ? override_layout :
                                            (have_plan_fusion ? ggml_sycl_select_moe_planned_graph_layout(
@@ -61254,8 +61284,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     partner_weight->ne[1] != src0->ne[1] || partner_weight->ne[2] != src0->ne[2]) {
                     return reject_pair("partner-shape");
                 }
-                const bool gate_up_has_plan = ggml_sycl::get_unified_cache_for_device(ctx.device) &&
-                                              ggml_sycl::get_unified_cache_for_device(ctx.device)->has_placement_plan();
+                const bool gate_up_has_plan =
+                    ggml_sycl::get_unified_cache_for_device(ctx.device) &&
+                    !ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(ctx.device))->entries.empty();
                 const int64_t n_ids_pair = ids->ne[0];
                 const size_t  ids_n_elem = static_cast<size_t>(ids->ne[1] * n_ids_pair);
                 struct moe_pair_runtime_layout_cache_key {
@@ -61563,7 +61594,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const int64_t down_tokens = pair.glu_dst->ne[2];
                     const bool    down_has_plan =
                         ggml_sycl::get_unified_cache_for_device(ctx.device) &&
-                        ggml_sycl::get_unified_cache_for_device(ctx.device)->has_placement_plan();
+                        !ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(ctx.device))
+                             ->entries.empty();
                     layout_mode requested_down_layout =
                         has_override ?
                             override_layout :
@@ -62080,7 +62112,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             const int64_t down_tokens = pair.glu_dst->ne[2];
                             const bool    down_has_plan =
                                 ggml_sycl::get_unified_cache_for_device(ctx.device) &&
-                                ggml_sycl::get_unified_cache_for_device(ctx.device)->has_placement_plan();
+                                !ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(ctx.device))
+                                     ->entries.empty();
                             layout_mode requested_down_layout =
                                 has_override ?
                                              override_layout :
@@ -62206,7 +62239,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             const int64_t down_tokens = pair.glu_dst->ne[2];
                             const bool    down_has_plan =
                                 ggml_sycl::get_unified_cache_for_device(ctx.device) &&
-                                ggml_sycl::get_unified_cache_for_device(ctx.device)->has_placement_plan();
+                                !ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(ctx.device))
+                                     ->entries.empty();
                             requested_down_layout =
                                 has_override ? override_layout :
                                                (down_has_plan ? ggml_sycl_select_moe_planned_graph_layout(
@@ -62358,7 +62392,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int64_t down_tokens = pair.glu_dst->ne[2];
                                 const bool    down_has_plan =
                                     ggml_sycl::get_unified_cache_for_device(ctx.device) &&
-                                    ggml_sycl::get_unified_cache_for_device(ctx.device)->has_placement_plan();
+                                    !ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(ctx.device))
+                                         ->entries.empty();
                                 layout_mode requested_down_layout = GGML_LAYOUT_AOS;
                                 layout_mode down_layout           = GGML_LAYOUT_AOS;
                                 size_t      down_entries =
@@ -64192,7 +64227,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const moe_tensor_type      role_unfused        = moe_classify_tensor(tname_layer);
             const std::string          tname_fast_str(tname_layer);
             ggml_sycl::unified_cache * plan_cache_fast = ggml_sycl::get_unified_cache_for_device(ctx.device);
-            const bool                 have_plan_fast  = plan_cache_fast && plan_cache_fast->has_placement_plan();
+            const bool                 have_plan_fast =
+                plan_cache_fast && !ggml_sycl_cache_plan_owner(plan_cache_fast)->entries.empty();
             const auto                 plan_fast_owner = ggml_sycl_cache_plan_owner(plan_cache_fast);
             const auto &               plan_fast       = *plan_fast_owner;
 
@@ -65507,13 +65543,14 @@ cpu_tg_fallthrough:
 
     const bool planner_tensor_all_local_for_primary_fastpaths = [&]() -> bool {
         auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-        if (!plan_cache || !plan_cache->has_placement_plan() || !src0 || !src0->name || src0->name[0] == '\0') {
+        if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() || !src0 || !src0->name ||
+            src0->name[0] == '\0') {
             return false;
         }
 
         const std::string tname(src0->name);
         const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        if (plan_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device)) {
+        if (ggml_sycl_cache_plan_owner(plan_cache)->has_host_experts(tname, n_exp, ctx.device)) {
             return false;
         }
 
@@ -65533,11 +65570,11 @@ cpu_tg_fallthrough:
             return false;
         }
         auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-        return ggml_sycl_has_global_plan() || (plan_cache && plan_cache->has_placement_plan());
+        return ggml_sycl_has_global_plan() || (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());
     }();
     const bool planner_needs_cross_device_execution_for_primary_fastpaths = [&]() -> bool {
         auto * plan_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx.device);
-        if (plan_cache && plan_cache->has_placement_plan()) {
+        if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
             return ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_cache_plan_owner(plan_cache)));
         }
         return ggml_sycl_has_global_plan() &&
@@ -65636,13 +65673,14 @@ cpu_tg_fallthrough:
         }
         const bool planner_tensor_all_local_for_primary = [&]() -> bool {
             auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-            if (!plan_cache || !plan_cache->has_placement_plan() || !src0 || !src0->name || src0->name[0] == '\0') {
+            if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() || !src0 || !src0->name ||
+                src0->name[0] == '\0') {
                 return false;
             }
 
             const std::string tname(src0->name);
             const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
-            if (plan_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device)) {
+            if (ggml_sycl_cache_plan_owner(plan_cache)->has_host_experts(tname, n_exp, ctx.device)) {
                 return false;
             }
 
@@ -65662,7 +65700,8 @@ cpu_tg_fallthrough:
                 return false;
             }
             auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-            return ggml_sycl_has_global_plan() || (plan_cache && plan_cache->has_placement_plan());
+            return ggml_sycl_has_global_plan() ||
+                   (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());
         }();
         auto try_mmvq_layout = [&](layout_mode layout) -> bool {
             if (has_override && layout != override_layout) {
@@ -65680,7 +65719,7 @@ cpu_tg_fallthrough:
                 // planner-owned route below, which dispatches by resolved location.
                 {
                     auto * plan_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-                    if (plan_cache && plan_cache->has_placement_plan()) {
+                    if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
                         const layout_mode planned_layout = ggml_sycl_adjust_layout_for_tensor(
                             src0,
                             ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device,
@@ -66095,16 +66134,16 @@ cpu_tg_fallthrough:
     // Detect host-resident weights including SYCL HOST_PINNED buffers
     bool   host_weights  = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     auto * route_cache   = ggml_sycl::get_unified_cache(*stream);
-    if (route_cache && !route_cache->has_placement_plan() && ggml_sycl_has_global_plan()) {
-        route_cache->set_placement_plan_snapshot(ggml_sycl_global_plan_snapshot());
+    if (route_cache && ggml_sycl_cache_plan_owner(route_cache)->entries.empty() && ggml_sycl_has_global_plan()) {
+        ggml_sycl_republish_current_plan();
     }
-    const bool has_placement_plan         = route_cache && route_cache->has_placement_plan();
+    const bool has_placement_plan         = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();
     bool       plan_has_cpu_experts       = false;
     bool       plan_has_secondary_experts = false;
     if (has_placement_plan && src0->name && src0->name[0] != '\0') {
         const std::string tname(src0->name);
         const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        plan_has_cpu_experts    = route_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device);
+        plan_has_cpu_experts    = ggml_sycl_cache_plan_owner(route_cache)->has_host_experts(tname, n_exp, ctx.device);
         const auto   plan_owner = ggml_sycl_cache_plan_owner(route_cache);
         const auto & plan       = *plan_owner;
         for (int64_t e = 0; e < n_exp; ++e) {
@@ -67074,7 +67113,8 @@ cpu_tg_fallthrough:
             // Placement plan for hybrid dispatch: when the plan says host, skip GPU checks.
             const std::string          tname_hybrid_str(src0->name ? src0->name : "");
             ggml_sycl::unified_cache * plan_cache_hybrid = ggml_sycl::get_unified_cache_for_device(ctx.device);
-            const bool                 have_plan_hybrid  = plan_cache_hybrid && plan_cache_hybrid->has_placement_plan();
+            const bool                 have_plan_hybrid =
+                plan_cache_hybrid && !ggml_sycl_cache_plan_owner(plan_cache_hybrid)->entries.empty();
             const auto                 plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);
             const auto &               plan_hybrid       = *plan_hybrid_owner;
             auto planned_route_layout_for_expert         = [&](int32_t expert_id, layout_mode fallback) -> layout_mode {
@@ -68595,7 +68635,7 @@ cpu_tg_fallthrough:
             const bool   pp_hidden_secondary_execution = pp_sycl_info.total_gpu_count > pp_sycl_info.device_count;
             const bool   pp_plan_needs_secondary       = has_placement_plan && use_expert_cache && [&]() {
                 auto * plan_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx.device);
-                if (plan_cache && plan_cache->has_placement_plan()) {
+                if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
                     return ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_cache_plan_owner(plan_cache)),
                                                                                    ctx.device);
                 }
@@ -71792,7 +71832,7 @@ static void build_layer_device_map(int device) {
     g_layer_plan_forced.assign(static_cast<size_t>(max_layer + 1), false);
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return;
     }
 
@@ -71847,7 +71887,7 @@ static void ggml_sycl_reset_layer_map_state() {
 
 static void seed_layer_plan_classification(int device) {
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return;
     }
 
@@ -72112,7 +72152,8 @@ static bool ggml_sycl_mul_mat_weight_resolves_to_host(const ggml_backend_sycl_co
         return false;
     }
     if (src0->name[0] != '\0') {
-        if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device); cache && cache->has_placement_plan()) {
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
+            cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
             const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
             const auto & plan       = *plan_owner;
             const int    layer_id   = ggml_sycl::extract_layer_id(src0->name);
@@ -72333,7 +72374,7 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
                 bool on_cpu             = false;
                 bool have_plan_decision = false;
                 if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-                    cache && cache->has_placement_plan()) {
+                    cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
                     const auto   plan_owner = ggml_sycl_cache_plan_owner(cache);
                     const auto & plan       = *plan_owner;
                     auto         it         = plan.layer_device.find(layer_id);
@@ -78584,7 +78625,7 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
     const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
     const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
     const ggml_sycl::placement_plan * plan              = nullptr;
-    if (cache && cache->has_placement_plan()) {
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         plan = cache_plan_owner.get();
     } else if (ggml_sycl_has_global_plan()) {
         plan = global_plan_owner.get();
@@ -79201,7 +79242,7 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph(ggml_back
     const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
     const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
     const ggml_sycl::placement_plan * plan_ptr          = nullptr;
-    if (cache && cache->has_placement_plan()) {
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         plan_ptr = cache_plan_owner.get();
     } else if (ggml_sycl_has_global_plan()) {
         plan_ptr = global_plan_owner.get();
@@ -94763,7 +94804,7 @@ static bool ggml_sycl_layer_has_host_gate_weight(int layer_id, int device) {
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -94850,7 +94891,7 @@ static bool ggml_sycl_moe_tensor_all_experts_on_host(const ggml_tensor * tensor,
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -94989,7 +95030,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->has_placement_plan()) {
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return n04bq_tr_final(false, "no_plan");
     }
 
