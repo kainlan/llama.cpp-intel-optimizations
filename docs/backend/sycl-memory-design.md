@@ -163,7 +163,8 @@ state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner regist
 → L4 cache/queue registry → L5 allocator/work ordering; the canonical table
 includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue,
 backend-context, and `control_host_allocs_mutex` locks. The target deletes the
-oneDNN global `unique_lock` registry. `t5nq` deletes it and freezes a logical
+oneDNN global `unique_lock` registry. Exclusive foundation owner
+`32dg8.15.12` deletes it and freezes a logical
 `{device, generation, reservation_id}` API: brief same-thread keyed-mutex
 transitions increment/decrement reservation refcounts, while event payloads carry
 only logical reservation/backing handles. Cross-thread completion takes/releases
@@ -184,17 +185,26 @@ batch under L4 → unlock → destroy batch → finish drain. These are
 non-conformances to migrate, not licensed exceptions to preserve or descriptions
 of supported concurrency.
 
-Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
-registry primitives/create/publish/extract; `y36c` owns legacy callers and the
-fixed drain→wait→extract→destroy→finish sequence), DAG (`nn6z → nlww → vbeb →
-h5m4 → y36c → otry`, `t5nq logical-reservation API → h5m4`, `.15.13 → h5m4`);
-`t5nq` has no post-h5 work, `y36c` owns teardown integration, and `otry` starts
-afterward for final payload/lock/teardown convergence, G1/G7 ownership, token-only G5a versus teardown-only G5b,
-legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
-independent ordinary/sidecar/pointer-table M6 mutants, the OPEN-before-seal race
-mutant, and L1-L5/C/D M7 with separate global-registry-absence and cross-thread
-reservation-completion controls, and final `hcyp`
-script+fixture+CSV+prose refresh after main's self-test repair.
+Canonical §12.8-§12.10 assigns foundations only to `viu2` (model/load), `1q72`
+(context/session/GraphEpoch/tokens), `32dg8.15.12` (exclusive async backing/event
+leases/oneDNN/locks), and `o6jx` (owner-targeted teardown). Exact foundation
+edges are `viu2 → 1q72` and `{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`;
+`tudj` is a closed duplicate with no ownership or edge. Existing focused IDs retain
+their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
+`vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics;
+`x3ou` consumes `viu2`/`1q72`/`32dg8.15.12`/`o6jx`. Closed `h5m4` remains the
+TLS-reset proof gate. `t5nq` is OPEN with merged
+reviewed packed-K-sidecar code awaiting its live GPU failpoint/retry/teardown
+gate; that gate has no foundation prerequisites and may close now. `otry`, not
+`t5nq`, revalidates packed-K guarantees after foundations. “All
+foundations/focused children → otry” is the lifecycle transitive-closure
+projection, not the exact live edge list. Exact direct `otry` dependencies are
+`nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, and `o6jx`;
+foundation/organizational edges are transitive. Exact tail edges are `{otry,
+hcyp (closed)} → jwy4` and `{jwy4, awcp (closed)} → k7b0`; final `k7b0` closure
+is blocked by `jwy4`. `{1q72, .15.13} → .15.12 → o6jx` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
+census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
+mutations, and lock controls remain canonical.
 
 ## Path-scoped zone sizing
 
