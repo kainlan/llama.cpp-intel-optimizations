@@ -538,6 +538,23 @@ if (NOT WIN32)
         set(LLAMA_PYTHON3 python3)
     endif()
 
+    # Parser census regression: establishes a freshly generated matching
+    # inventory, proves --check accepts it, then line-shifts an input and proves
+    # --check rejects drift without rewriting the snapshot. The plain unittest
+    # script exits 77 when g++ or pinned parser packages are unavailable, so
+    # dependency absence is visible as Skipped rather than a vacuous pass.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-static-storage-audit
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-static-storage-audit.py
+    )
+    set_tests_properties(test-sycl-static-storage-audit PROPERTIES
+        LABELS "sycl;policy;audit"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         NAME test-sycl-decode-timeline-profile-script

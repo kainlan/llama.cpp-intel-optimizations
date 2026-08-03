@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
@@ -38,24 +40,56 @@ class StaticStorageAuditIntegrationTest(unittest.TestCase):
         self.assertEqual(current.returncode, 0, current.stderr)
         self.assertIn("synthetic-file-tail-scopes", current.stdout)
 
+        with tempfile.TemporaryDirectory() as empty_directory:
+            empty_root = self.run_audit("--self-test", "--repo", empty_directory)
+            self.assertEqual(empty_root.returncode, 0, empty_root.stderr)
+
         with tempfile.TemporaryDirectory() as directory:
             shifted_repo = Path(directory)
-            for relative in (*INPUTS, INVENTORY):
+            for relative in INPUTS:
                 destination = shifted_repo / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if relative == INPUTS[0]:
-                    source = (REPO / relative).read_text(encoding="utf-8")
-                    destination.write_text("// unrelated prepended line\n" + source, encoding="utf-8")
-                else:
-                    shutil.copyfile(REPO / relative, destination)
+                shutil.copyfile(REPO / relative, destination)
 
-            shifted_self_test = self.run_audit("--self-test", "--repo", str(shifted_repo))
-            self.assertEqual(shifted_self_test.returncode, 0, shifted_self_test.stderr)
+            # Establish a known-matching baseline instead of assuming the
+            # repository's audited snapshot happens to match integration HEAD.
+            generated = self.run_audit("--repo", str(shifted_repo))
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            inventory_path = shifted_repo / INVENTORY
+            baseline_checksum = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
 
+            baseline_check = self.run_audit("--check", "--repo", str(shifted_repo))
+            self.assertEqual(baseline_check.returncode, 0, baseline_check.stderr)
+
+            source_path = shifted_repo / INPUTS[0]
+            source_path.write_text(
+                "// unrelated prepended line\n" + source_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             shifted_check = self.run_audit("--check", "--repo", str(shifted_repo))
             self.assertEqual(shifted_check.returncode, 1, shifted_check.stderr)
             self.assertIn(f"ERROR: {INVENTORY} is stale", shifted_check.stderr)
+            self.assertEqual(
+                hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+                baseline_checksum,
+                "--check must diagnose drift without rewriting the inventory",
+            )
+
+
+def missing_runtime_dependency() -> str | None:
+    if shutil.which("g++") is None:
+        return "g++ is required by the census compiler fixture"
+    try:
+        version("tree-sitter")
+        version("tree-sitter-language-pack")
+    except PackageNotFoundError as exc:
+        return f"missing pinned parser dependency: {exc}"
+    return None
 
 
 if __name__ == "__main__":
+    missing = missing_runtime_dependency()
+    if missing:
+        print(f"SKIP: {missing}", file=sys.stderr)
+        raise SystemExit(77)
     unittest.main()
