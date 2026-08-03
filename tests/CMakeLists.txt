@@ -367,6 +367,9 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
 option(LLAMA_SYCL_G1_STRICT "Make missing G1 acceptance prerequisites fail instead of skip" OFF)
+if (LLAMA_SYCL_G1_STRICT AND NOT GGML_SYCL)
+    message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires GGML_SYCL=ON")
+endif()
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if (LLAMA_SYCL_G1_STRICT AND NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires a Python 3 interpreter")

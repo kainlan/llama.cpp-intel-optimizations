@@ -21,22 +21,34 @@ N_PREDICT = 8
 PROCESS_TIMEOUT_SECONDS = 300
 ONEAPI_SELECTOR = "level_zero:0,1"
 GGML_LOGICAL_SELECTOR = "1"
-SCRUB_ENV = {
-    "ONEAPI_DEVICE_SELECTOR",
-    "SYCL_DEVICE_FILTER",
-    "SYCL_DEVICE_ALLOWLIST",
-    "SYCL_DEVICE_WHITELIST",
-    "ZE_AFFINITY_MASK",
-    "UR_DEVICE_AFFINITY_MASK",
-    "GGML_SYCL_DEVICE",
-    "GGML_SYCL_VISIBLE_DEVICES",
-    "GGML_SYCL_LIFECYCLE_TEST_DEVICE",
-    "GGML_BACKEND_PATH",
-    "GGML_BACKEND_CPU_ONLY",
-    "GGML_SYCL_CPU_OFFLOAD",
-    "GGML_SYCL_CPU_OFFLOAD_ASYNC",
-    "GGML_SYCL_CPU_DEVICE_SELECTOR",
+ROUTING_ENV_PREFIXES = ("GGML_", "SYCL_", "ONEAPI_", "UR_", "ZE_", "ZES_", "LLAMA_ARG_")
+ROUTING_ENV_NAMES = {
+    "CUDA_DEVICE_ORDER",
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
 }
+CANONICAL_RUNTIME_ENV = {
+    "ONEAPI_DEVICE_SELECTOR": ONEAPI_SELECTOR,
+    "GGML_SYCL_DEVICE": GGML_LOGICAL_SELECTOR,
+}
+
+
+def is_backend_routing_env(name):
+    return name in ROUTING_ENV_NAMES or name.startswith(ROUTING_ENV_PREFIXES)
+
+
+def canonical_environment(source):
+    env = {key: value for key, value in source.items() if not is_backend_routing_env(key)}
+    env.update(CANONICAL_RUNTIME_ENV)
+    if any(
+        is_backend_routing_env(key) and CANONICAL_RUNTIME_ENV.get(key) != value
+        for key, value in env.items()
+    ):
+        raise RuntimeError("failed to sanitize backend-routing environment")
+    return env
 
 
 class PrerequisiteError(Exception):
@@ -165,6 +177,8 @@ def run(argv=None):
         str(models["A"]),
         "--model-b",
         str(models["B"]),
+        "--model-a-shared",
+        str(models["A-shared"]),
         "--prompt",
         PROMPT,
         "--seed",
@@ -174,9 +188,7 @@ def run(argv=None):
         "--n-predict",
         str(N_PREDICT),
     ]
-    env = {key: value for key, value in os.environ.items() if key not in SCRUB_ENV}
-    env["ONEAPI_DEVICE_SELECTOR"] = ONEAPI_SELECTOR
-    env["GGML_SYCL_DEVICE"] = GGML_LOGICAL_SELECTOR
+    env = canonical_environment(os.environ)
     results = {}
     for label, sequence in (("A-reference", "A"), ("B-reference", "B"), ("ABA", "A,B,A")):
         try:

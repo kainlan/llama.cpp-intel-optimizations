@@ -94,10 +94,12 @@ class G1HarnessTests(unittest.TestCase):
             root = Path(td)
             fixture = self.make_fixture(root)
             calls = []
+            observed_sequences = []
 
             def fake_run(command, **kwargs):
                 calls.append((command, kwargs))
                 sequence = command[command.index("--run") + 1].split(",")
+                observed_sequences.append(sequence)
                 token_map = {"A": self.a_tokens, "B": self.b_tokens}
                 output = {
                     "device_uuid": self.uuid,
@@ -105,7 +107,19 @@ class G1HarnessTests(unittest.TestCase):
                 }
                 return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
-            polluted = {key: "conflict" for key in g1.SCRUB_ENV}
+            polluted = {
+                "GGML_SYCL_UNIFIED_FORCE_LEGACY": "1",
+                "GGML_FUTURE_BACKEND_ROUTE": "conflict",
+                "SYCL_PI_TRACE": "1",
+                "ONEAPI_DEVICE_SELECTOR": "opencl:cpu",
+                "UR_DEVICE_AFFINITY_MASK": "0",
+                "ZE_AFFINITY_MASK": "0",
+                "ZES_ENABLE_SYSMAN": "0",
+                "LLAMA_ARG_N_GPU_LAYERS": "0",
+                "CUDA_VISIBLE_DEVICES": "",
+                "PATH": "/canonical/bin",
+                "LD_LIBRARY_PATH": "/canonical/lib",
+            }
             with (
                 mock.patch.dict(g1.os.environ, polluted, clear=False),
                 mock.patch.object(g1, "model_paths", return_value=self.paths(root)),
@@ -113,10 +127,15 @@ class G1HarnessTests(unittest.TestCase):
             ):
                 self.assertEqual(g1.run(["--strict", "--fixture", str(fixture), sys.executable]), 0)
             self.assertEqual(len(calls), 3)
+            self.assertEqual(
+                [command[command.index("--run") + 1] for command, _ in calls],
+                ["A", "B", "A,B,A"],
+            )
+            self.assertEqual(observed_sequences, [["A"], ["B"], ["A", "B", "A"]])
             for command, kwargs in calls:
                 self.assertEqual(command[command.index("--model-a") + 1], str(root / "a.gguf"))
                 self.assertEqual(command[command.index("--model-b") + 1], str(root / "b.gguf"))
-                self.assertNotIn("--model-a-shared", command)
+                self.assertEqual(command[command.index("--model-a-shared") + 1], str(root / "as.gguf"))
                 self.assertEqual(command[command.index("--prompt") + 1], g1.PROMPT)
                 self.assertEqual(command[command.index("--seed") + 1], "42")
                 self.assertEqual(command[command.index("--temp") + 1], "0")
@@ -124,8 +143,17 @@ class G1HarnessTests(unittest.TestCase):
                 env = kwargs["env"]
                 self.assertEqual(env["ONEAPI_DEVICE_SELECTOR"], "level_zero:0,1")
                 self.assertEqual(env["GGML_SYCL_DEVICE"], "1")
-                for key in g1.SCRUB_ENV - {"ONEAPI_DEVICE_SELECTOR", "GGML_SYCL_DEVICE"}:
-                    self.assertNotIn(key, env)
+                self.assertEqual(env["PATH"], "/canonical/bin")
+                self.assertEqual(env["LD_LIBRARY_PATH"], "/canonical/lib")
+                for key in polluted:
+                    if key not in {"PATH", "LD_LIBRARY_PATH", *g1.CANONICAL_RUNTIME_ENV}:
+                        self.assertNotIn(key, env)
+                self.assertFalse(
+                    any(
+                        g1.is_backend_routing_env(key) and key not in g1.CANONICAL_RUNTIME_ENV
+                        for key in env
+                    )
+                )
                 self.assertEqual(kwargs["timeout"], g1.PROCESS_TIMEOUT_SECONDS)
 
     def test_token_mismatch_is_failure(self):

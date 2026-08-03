@@ -17,7 +17,7 @@ constexpr int          k_seed             = 42;
 constexpr int          k_n_predict        = 8;
 
 struct options {
-    std::string a, b, prompt, run;
+    std::string a, b, a_shared, prompt, run;
     int         n_predict   = 0;
     int         seed        = 0;
     float       temperature = 0.0f;
@@ -33,6 +33,8 @@ bool parse(int argc, char ** argv, options & o) {
             o.a = value;
         } else if (key == "--model-b") {
             o.b = value;
+        } else if (key == "--model-a-shared") {
+            o.a_shared = value;
         } else if (key == "--prompt") {
             o.prompt = value;
         } else if (key == "--n-predict") {
@@ -47,8 +49,8 @@ bool parse(int argc, char ** argv, options & o) {
             return false;
         }
     }
-    return !o.a.empty() && !o.b.empty() && o.prompt == k_prompt && o.seed == k_seed && o.temperature == 0.0f &&
-           o.n_predict == k_n_predict && (o.run == "A" || o.run == "B" || o.run == "A,B,A");
+    return !o.a.empty() && !o.b.empty() && !o.a_shared.empty() && o.prompt == k_prompt && o.seed == k_seed &&
+           o.temperature == 0.0f && o.n_predict == k_n_predict && (o.run == "A" || o.run == "B" || o.run == "A,B,A");
 }
 
 std::vector<llama_token> infer(const std::string & path, const options & o, ggml_backend_dev_t selected) {
@@ -110,9 +112,9 @@ bool selected_device(ggml_backend_dev_t & backend_device, std::string & uuid) {
         ggml_backend_dev_type(backend_devices[0]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return false;
     }
-    backend_device = backend_devices[0];
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend_device);
-    auto get_device_uuid = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_uuid)>(
+    backend_device                     = backend_devices[0];
+    ggml_backend_reg_t reg             = ggml_backend_dev_backend_reg(backend_device);
+    auto               get_device_uuid = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_uuid)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_uuid"));
     uint8_t native_uuid[16] = {};
     if (!get_device_uuid || !get_device_uuid(backend_device, native_uuid)) {

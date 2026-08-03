@@ -19,22 +19,21 @@ int main() {
         std::fprintf(stderr, "failed to load SYCL backend module\n");
         return 1;
     }
+#else
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+#endif
+
     auto get_device_uuid = reinterpret_cast<get_device_uuid_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_uuid"));
     if (get_device_uuid == nullptr || get_device_uuid(nullptr, uuid)) {
-        std::fprintf(stderr, "dynamic UUID procedure missing or accepted null device\n");
+        std::fprintf(stderr, "UUID registry procedure missing or accepted null device\n");
         return 1;
     }
-    ggml_backend_unload(reg);
-#else
-    if (ggml_backend_sycl_get_device_uuid(nullptr, uuid)) {
-        std::fprintf(stderr, "static UUID API accepted null device\n");
-        return 1;
-    }
+
+#if !defined(GGML_SYCL_RUNTIME_MODULE)
     ggml_backend_reg_t cpu_reg = ggml_backend_cpu_reg();
-    if (ggml_backend_reg_dev_count(cpu_reg) == 0 ||
-        ggml_backend_sycl_get_device_uuid(ggml_backend_reg_dev_get(cpu_reg, 0), uuid)) {
-        std::fprintf(stderr, "static UUID API accepted non-SYCL device\n");
+    if (ggml_backend_reg_dev_count(cpu_reg) == 0 || get_device_uuid(ggml_backend_reg_dev_get(cpu_reg, 0), uuid)) {
+        std::fprintf(stderr, "UUID registry procedure accepted non-SYCL device\n");
         return 1;
     }
 #endif
@@ -45,5 +44,8 @@ int main() {
             return 1;
         }
     }
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    ggml_backend_unload(reg);
+#endif
     return 0;
 }
