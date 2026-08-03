@@ -187,8 +187,12 @@ end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok,
         }
 
         const bool poisoned_after_prepare = ticket.commit && txn.poisoned;
-        if (poisoned_after_prepare) {
-            effects_ok = false;
+        if (poisoned_after_prepare && effects_ok) {
+            // Keep coordinator and slot authority until the wrapper has undone
+            // candidate/cache/scratch effects. No new begin can race cleanup.
+            txn.phase         = finish_phase::ROLLING_BACK;
+            txn.finish_reason = error::POISONED;
+            return { error::POISONED, txn.token, true, false, true };
         }
         bool  commit      = ticket.commit && effects_ok;
         error result_code = poisoned_after_prepare ? error::POISONED :
@@ -236,6 +240,43 @@ end_result Registry::finalize_end(const finish_ticket & ticket, bool effects_ok,
         txn.terminal_result = { result_code, txn.token, true, commit };
         active_txn_         = 0;
         remember_terminal_locked(ticket.token.load.value);
+        cv_.notify_all();
+        return txn.terminal_result;
+    } catch (...) {
+        return { error::EFFECT_FAILED, ticket.token, true, false };
+    }
+}
+
+end_result Registry::finalize_cleanup(const finish_ticket & ticket, bool cleanup_ok) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = txns_.find(ticket.token.load.value);
+        if (!ticket.finisher || it == txns_.end() || active_txn_ != ticket.token.load.value ||
+            it->second.finish_serial != ticket.serial || it->second.phase != finish_phase::ROLLING_BACK) {
+            return { error::STALE_IDENTITY, ticket.token };
+        }
+        auto & txn   = it->second;
+        auto   model = models_.find(txn.token.model.value);
+        error  code  = txn.finish_reason == error::OK ? error::POISONED : txn.finish_reason;
+        if (cleanup_ok) {
+            if (model != models_.end()) {
+                models_.erase(model);
+            }
+            auto & slot   = slots_[txn.token.owner.slot];
+            slot.reserved = false;
+            slot.model    = {};
+        } else {
+            code = error::EFFECT_FAILED;
+            if (model != models_.end()) {
+                model->second.token = txn.token;
+                model->second.phase = model_phase::QUARANTINED;
+            }
+        }
+        ++rollbacks_;
+        txn.depth           = 0;
+        txn.phase           = finish_phase::ABORTED;
+        txn.terminal_result = { code, txn.token, true, false };
+        active_txn_         = 0;
         cv_.notify_all();
         return txn.terminal_result;
     } catch (...) {
@@ -353,6 +394,20 @@ error Registry::finalize_teardown(const teardown_ticket & ticket, bool effects_o
         return error::OK;
     } catch (...) {
         return error::EFFECT_FAILED;
+    }
+}
+
+bool Registry::is_quarantined(ModelToken token) const noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (token.model.value == 0 || token.load.value == 0 || token.owner.slot >= model_slot_count) {
+            return false;
+        }
+        auto model = models_.find(token.model.value);
+        return model != models_.end() && model->second.phase == model_phase::QUARANTINED &&
+               model->second.token == token;
+    } catch (...) {
+        return false;
     }
 }
 

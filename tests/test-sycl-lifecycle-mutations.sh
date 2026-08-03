@@ -10,9 +10,18 @@ case "$mutation" in
 esac
 for case_name in "${cases[@]}"; do
   "$bin" --case "$case_name"
-  if "$bin" --case "$case_name" --mutation "$mutation" >/dev/null 2>&1; then
+  log=$(mktemp)
+  if "$bin" --case "$case_name" --mutation "$mutation" >"$log" 2>&1; then
+    rm -f "$log"
     echo "mutant unexpectedly passed: $mutation case=$case_name" >&2
     exit 1
   fi
+  if [[ "$mutation" == M3 ]] && ! grep -Fx "poisoned transaction published LIVE" "$log" >/dev/null; then
+    cat "$log" >&2
+    rm -f "$log"
+    echo "M3 case lacked exact poison marker: $case_name" >&2
+    exit 1
+  fi
+  rm -f "$log"
   "$bin" --case "$case_name"
 done

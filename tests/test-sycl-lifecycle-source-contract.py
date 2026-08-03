@@ -39,6 +39,8 @@ checks = {
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN" in cpp,
     "fallible pre-finalize restoration": backend.index("restore_latest_live_plan())") < backend.index("finalize_teardown(ticket, true)"),
     "durable quarantine reaper": all(x in backend for x in ("g_sycl_quarantine_tokens", "ggml_sycl_quarantine_reap", "model_quarantine_token")),
+    "late poison cleanup authority": "cleanup_required" in hpp and "finalize_cleanup" in cpp,
+    "exact quarantine validation": "is_quarantined" in hpp and "slot_generation == token.slot_generation" in backend,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

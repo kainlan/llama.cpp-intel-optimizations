@@ -55,7 +55,7 @@ static void run_case(const std::string & name, test_mutation mutation) {
         Registry r(UINT64_MAX, UINT64_MAX, mutation);
         auto     b = r.begin_outer();
         require(r.end({ b.txn.value + 1 }, true).code == error::WRONG_TRANSACTION, "wrong txn accepted");
-        require(!r.end(b.txn, true).committed, "wrong transaction did not poison outer");
+        require(!r.end(b.txn, true).committed, "poisoned transaction published LIVE");
     } else if (name == "depth-underflow") {
         Registry r;
         auto     b      = r.begin_outer();
@@ -63,8 +63,12 @@ static void run_case(const std::string & name, test_mutation mutation) {
         require(ticket.finisher, "no finisher");
         require(r.enter_nested(b.txn) == error::DEPTH_UNDERFLOW, "depth underflow accepted");
         require(r.validate_end(ticket) == error::POISONED, "post-prepare poison not authoritative");
-        auto failed = r.finalize_end(ticket, true);
-        require(failed.code == error::POISONED && !failed.committed, "depth underflow committed after prepare");
+        auto pending = r.finalize_end(ticket, true);
+        require(pending.code == error::POISONED && pending.cleanup_required && !pending.committed,
+                "depth underflow did not request cleanup");
+        require(r.begin_outer().code == error::LOAD_BUSY, "late-poison cleanup lost coordinator authority");
+        auto failed = r.finalize_cleanup(ticket, true);
+        require(failed.code == error::POISONED && !failed.committed, "depth underflow cleanup terminal mismatch");
         require(!r.find(b.token.model), "depth-underflow model became LIVE");
     } else if (name == "depth-overflow") {
         Registry r(UINT64_MAX, 1, mutation);
@@ -185,6 +189,13 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto     finish = r.prepare_end(b.txn, true);
         auto     failed = r.finalize_end(finish, false);
         require(failed.code == error::EFFECT_FAILED && !failed.committed, "load effect failure not reported");
+        require(r.is_quarantined(b.token), "exact quarantine token not recognized");
+        auto malformed = b.token;
+        malformed.owner.generation++;
+        require(!r.is_quarantined(malformed), "stale quarantine generation accepted");
+        malformed = b.token;
+        malformed.load.value++;
+        require(!r.is_quarantined(malformed), "stale quarantine load accepted");
         auto next = r.begin_outer();
         require(next.token.owner.slot != b.token.owner.slot, "failed-load slot reused");
         r.end(next.txn, false);

@@ -58,8 +58,21 @@ struct publication_data {
     uint64_t actual_host_bytes = 0;
     tier_verdict verdict = tier_verdict::UNKNOWN;
 };
-struct begin_result { error code = error::OK; LoadTxnId txn{}; ModelToken token{}; bool outer = false; };
-struct end_result { error code = error::OK; ModelToken token{}; bool outer = false; bool committed = false; };
+
+struct begin_result {
+    error      code = error::OK;
+    LoadTxnId  txn{};
+    ModelToken token{};
+    bool       outer = false;
+};
+
+struct end_result {
+    error      code = error::OK;
+    ModelToken token{};
+    bool       outer            = false;
+    bool       committed        = false;
+    bool       cleanup_required = false;
+};
 struct finish_ticket {
     error code = error::OK;
     ModelToken token{};
@@ -108,6 +121,7 @@ public:
     end_result finalize_end(const finish_ticket & ticket, bool effects_ok,
                             publication_data publication = {},
                             std::shared_ptr<const ModelState> prepared_state = {}) noexcept;
+    end_result    finalize_cleanup(const finish_ticket & ticket, bool cleanup_ok) noexcept;
     end_result end(LoadTxnId txn, bool explicit_success,
                    uint64_t planned_host_bytes = 0, uint64_t actual_host_bytes = 0,
                    tier_verdict verdict = tier_verdict::UNKNOWN);
@@ -115,6 +129,7 @@ public:
     teardown_ticket prepare_teardown(ModelToken token);
     error finalize_teardown(const teardown_ticket & ticket, bool effects_ok) noexcept;
     error teardown(ModelToken token);
+    bool            is_quarantined(ModelToken token) const noexcept;
 
     std::shared_ptr<const ModelState> find(ModelId model) const;
     std::shared_ptr<const ModelState> last_success() const;
