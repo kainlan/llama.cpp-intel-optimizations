@@ -1,5 +1,6 @@
 #include "moe-layer-ids-cache.hpp"
 
+#include <cctype>
 #include <condition_variable>
 #include <exception>
 #include <fstream>
@@ -186,14 +187,136 @@ static std::string bounded_scope(const std::string & source,
     return source.substr(begin, end - begin);
 }
 
-static void check_reset_contract(const std::string & scope, const char * path) {
+// Replace comments and literals with spaces while preserving offsets and
+// control-flow punctuation. This keeps brace/return checks immune to examples
+// in comments or braces embedded in diagnostics without pretending to parse C++.
+static std::string control_flow_source(const std::string & source) {
+    enum class state { code, line_comment, block_comment, string_literal, char_literal };
+    std::string clean   = source;
+    state       current = state::code;
+    bool        escaped = false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        const char c    = source[i];
+        const char next = i + 1 < source.size() ? source[i + 1] : '\0';
+        if (current == state::code) {
+            if (c == '/' && next == '/') {
+                clean[i] = clean[i + 1] = ' ';
+                ++i;
+                current = state::line_comment;
+            } else if (c == '/' && next == '*') {
+                clean[i] = clean[i + 1] = ' ';
+                ++i;
+                current = state::block_comment;
+            } else if (c == '"') {
+                clean[i] = ' ';
+                current  = state::string_literal;
+                escaped  = false;
+            } else if (c == '\'') {
+                clean[i] = ' ';
+                current  = state::char_literal;
+                escaped  = false;
+            }
+            continue;
+        }
+        if (current == state::line_comment) {
+            if (c == '\n') {
+                current = state::code;
+            } else {
+                clean[i] = ' ';
+            }
+            continue;
+        }
+        if (current == state::block_comment) {
+            clean[i] = ' ';
+            if (c == '*' && next == '/') {
+                clean[i + 1] = ' ';
+                ++i;
+                current = state::code;
+            }
+            continue;
+        }
+        clean[i] = ' ';
+        if (escaped) {
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if ((current == state::string_literal && c == '"') || (current == state::char_literal && c == '\'')) {
+            current = state::code;
+        }
+    }
+    return clean;
+}
+
+static int brace_depth_at(const std::string & source, size_t position) {
+    int depth = 0;
+    for (size_t i = 0; i < position; ++i) {
+        depth += source[i] == '{' ? 1 : source[i] == '}' ? -1 : 0;
+    }
+    return depth;
+}
+
+static bool has_return_at_depth_before(const std::string & source, size_t position, int required_depth) {
+    int depth = 0;
+    for (size_t i = 0; i < position;) {
+        if (source[i] == '{') {
+            ++depth;
+            ++i;
+        } else if (source[i] == '}') {
+            --depth;
+            ++i;
+        } else if (std::isalpha(static_cast<unsigned char>(source[i])) || source[i] == '_') {
+            const size_t begin = i++;
+            while (i < position && (std::isalnum(static_cast<unsigned char>(source[i])) || source[i] == '_')) {
+                ++i;
+            }
+            if (depth == required_depth && source.compare(begin, i - begin, "return") == 0) {
+                return true;
+            }
+        } else {
+            ++i;
+        }
+    }
+    return false;
+}
+
+static bool has_unbraced_control_immediately_before(const std::string & source, size_t position) {
+    size_t i = position;
+    while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1]))) {
+        --i;
+    }
+    if (i == 0 || source[i - 1] != ')') {
+        return false;
+    }
+    int parentheses = 0;
+    do {
+        --i;
+        parentheses += source[i] == ')' ? 1 : source[i] == '(' ? -1 : 0;
+    } while (i > 0 && parentheses != 0);
+    while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1]))) {
+        --i;
+    }
+    const size_t end = i;
+    while (i > 0 && (std::isalnum(static_cast<unsigned char>(source[i - 1])) || source[i - 1] == '_')) {
+        --i;
+    }
+    const std::string keyword = source.substr(i, end - i);
+    return keyword == "if" || keyword == "for" || keyword == "while" || keyword == "switch";
+}
+
+static void check_reset_contract(const std::string & scope, const char * path, int required_branch_depth) {
     const std::string reset      = "ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);";
     const std::string cache_name = "g_moe_layer_ids_cache";
     check(count_occurrences(scope, reset) == 1,
           std::string(path) + " path must contain exactly one worker-local reset");
-    const size_t reset_position = scope.find(reset);
-    const size_t first_access   = scope.find(cache_name);
-    const size_t reset_access   = reset_position + reset.find(cache_name);
+    const size_t      reset_position = scope.find(reset);
+    const std::string control_source = control_flow_source(scope);
+    check(brace_depth_at(control_source, reset_position) == required_branch_depth &&
+              !has_unbraced_control_immediately_before(control_source, reset_position),
+          std::string(path) + " reset is conditional instead of unconditional at required branch depth");
+    check(!has_return_at_depth_before(control_source, reset_position, required_branch_depth),
+          std::string(path) + " path can return before worker-local reset at required branch depth");
+    const size_t first_access = scope.find(cache_name);
+    const size_t reset_access = reset_position + reset.find(cache_name);
     check(first_access == reset_access, std::string(path) + " path accesses worker-local cache before reset");
 }
 
@@ -228,7 +351,11 @@ static void check_all_dispatches_after_reset(const std::string & scope,
 //   -> "graph reset erased the retained map node"
 // - remove thread_local from the production declaration
 //   -> "production MoE layer cache is not worker-local TLS"
-// The first six mutations use bounded function/branch slices, so a reset or
+// - wrap each of normal/block/segmented reset in if (false) { ... }
+//   -> "<path> reset is conditional instead of unconditional at required branch depth"
+// - put each reset after a same-branch unconditional return
+//   -> "<path> path can return before worker-local reset at required branch depth"
+// The source mutations use bounded function/branch slices, so a reset or
 // dispatch in a later production path cannot accidentally satisfy the check.
 static void check_production_source_order() {
     std::ifstream input(GGML_SYCL_CPP_SOURCE_PATH);
@@ -239,13 +366,13 @@ static void check_production_source_order() {
 
     const std::string normal = bounded_scope(source, "static void ggml_backend_sycl_graph_compute_impl(",
                                              "static bool moe_graph_pair_can_fuse_segment(", "normal compute");
-    check_reset_contract(normal, "normal");
+    check_reset_contract(normal, "normal", 1);
     check_all_dispatches_after_reset(normal, "ggml_sycl_compute_forward(",
                                      "normal compute dispatches before worker-local reset");
 
     const std::string block = bounded_scope(source, "static bool moe_graph_try_block_graphlets(",
                                             "static bool check_graph_compatibility(", "block graphlet");
-    check_reset_contract(block, "block graphlet");
+    check_reset_contract(block, "block graphlet", 1);
     // Record is checked first intentionally: moving reset after both record and
     // replay must name the later-record mutation rather than failing on replay.
     check_all_dispatches_after_reset(block, "moe_graph_record_block_graphs(",
@@ -255,7 +382,7 @@ static void check_production_source_order() {
 
     const std::string segmented = bounded_scope(source, "if (!block_graphlet_executed) {",
                                                 "} else if (sycl_ctx->exec_graph &&", "segmented replay");
-    check_reset_contract(segmented, "segmented replay");
+    check_reset_contract(segmented, "segmented replay", 1);
     check_all_dispatches_after_reset(segmented, "moe_graph_record_segments(",
                                      "segmented replay records before worker-local reset");
     check_all_dispatches_after_reset(segmented, "moe_graph_replay_segments(",
