@@ -1,4 +1,91 @@
-# SYCL cross-model state audit (llama.cpp-k7b0)
+# SYCL cross-model state audit (llama.cpp-k7b0; parser census llama.cpp-1kx3)
+
+## Reproducible parser-grade static-storage census (llama.cpp-1kx3)
+
+The generated inventory is
+[`sycl-static-storage-inventory.csv`](sycl-static-storage-inventory.csv). Regenerate it from the
+repository root with:
+
+```sh
+python3 scripts/audit-sycl-static-storage.py
+python3 scripts/audit-sycl-static-storage.py --check
+```
+
+The generator uses the C++ grammar ABI 15 through
+`tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2. It walks C++
+`declaration` and `field_declaration` nodes rather than matching declaration
+text. Each declarator in a multi-object declaration becomes its own row. The
+scope walk includes file and named-namespace objects, anonymous-namespace
+objects without the `static` spelling, function-local `static`/`thread_local`
+objects (including `bias_detect_flag`), and class/header static declarations.
+Every row includes the declaration type and scope plus conservative,
+source-derived mutability, synchronization, writer/reader, owner-identity,
+and reset/teardown evidence. Evidence fields say `none found` rather than
+turning an empty search into proof of no access.
+
+At source SHA `5793f2ca1089eaf27203ee171c0d73d60a3e4c83`, the census emits **1,326
+object rows**: 390 explicitly-static non-local objects, 58 non-local objects
+with implicit static storage duration, 871 function-local static/thread-local
+objects, and 7 class static declarations. Per-file rows are 1,127
+(`ggml-sycl.cpp`), 148 (`unified-cache.cpp`), 8 (`unified-cache.hpp`), 41
+(`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
+every input so this result can be tied to exact source bytes.
+
+The supplied **371 lexical candidate leads** are reconciled as leads, not as a
+census: their artifact, source SHA, and extraction method were not supplied,
+so a row-for-row comparison would be invented. Structurally, they expand in
+both directions: multi-object declarations produce multiple object rows,
+while static functions/prototypes are not storage objects; the parser also
+adds the 58 implicit non-local objects, 871 local statics, and 7 class statics
+that a column-zero lexical pass does not cover. No comparison is made to the
+historical 329 figure because it likewise lacks a source SHA and method.
+
+### Parse coverage and fail-closed behavior
+
+Tree-sitter reports 41 raw recovery/missing nodes in `ggml-sycl.cpp` and 10 in
+`fattn.cpp`; the other three inputs parse without recovery. The former are
+from nested preprocessor alternatives, declaration-prefix macros
+(`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
+tokens such as `PRId64`; the latter are dispatch macro invocations and a label
+next to a conditional compilation boundary. These are **explicit raw-parser
+recovery sites**, not silently discarded regions. Recovered declaration
+children are still walked, and the generator performs a second coverage pass
+over every real `static`/`thread_local` storage marker. It exits 2 instead of
+writing an inventory if any possible storage declaration is outside a parsed
+declaration. The current result is `unsafe_storage_gaps=0` in all five files.
+Translation/namespace-level recovery nodes were also checked: they are
+preprocessor directives or function signatures, not unparsed implicit-static
+namespace objects. Thus the declared census coverage has zero storage parse
+gaps while retaining the 51 raw recovery diagnostics as an explicit parser
+limitation.
+
+### Static high-risk highlights (no behavior changes in this census)
+
+- `ggml-sycl.cpp:79471` `bias_detect_flag` is a function-local
+  `std::once_flag`. Its `call_once` captures MoE expert-bias device pointers
+  and host copies from the first graph that reaches it. It has no reset path,
+  so it is process-first semantic model state and is the highest-risk finding.
+- `ggml-sycl.cpp:1973-1974` `g_moe_hybrid_init_success[]` and
+  `g_moe_hybrid_init_done` are process-first MoE initialization/activation
+  guards. Their later reads/writes are inventoried; no teardown/reset evidence
+  is present. They require lifecycle review rather than an assumed reset.
+- `ggml-sycl.cpp:57239` `tl_first_act` is thread-local pinned activation
+  staging. It is reused through `ensure()` as bounded capacity storage and the
+  current activation is copied before use. This is capacity retention, not by
+  itself semantic cross-model state. Nearby `tl_first_tasks` is explicitly
+  resized and cleared. The inventory keeps this distinction visible instead
+  of labeling all TLS reuse a leak.
+- `fattn.cpp:123-124`'s anonymous-namespace mutex and
+  `g_packed_k_sidecars` are included despite lacking `static`; the sidecars
+  have erase-on-unregister evidence. `layer-streaming.cpp:370`'s
+  device-keyed `g_layer_managers` is also included and has shutdown readers
+  but no map erase/clear evidence, so its retained per-manager model inventory
+  remains a lifecycle-review item.
+
+This task adds no resets or behavior changes and performs no build, GPU, or
+model execution.
+
+---
 
 `test-llama-archs` loads ~131 architectures back-to-back in **one process**.
 Any file-scope static in the SYCL backend that describes "the model
