@@ -990,7 +990,7 @@ if (NOT WIN32)
     )
 
     # ---------------------------------------------------------------------
-    # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 25 pytest-style SOURCE
+    # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 26 pytest-style SOURCE
     # assertions over ggml-sycl/ and tools/, same unregistered-so-vacuous
     # situation as batch 1 above.
     #
@@ -1026,6 +1026,13 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-e2e-profile-fattn-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-packed-k-lifecycle-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;lifecycle"
         TIMEOUT 120
     )
     llama_test_pytest(

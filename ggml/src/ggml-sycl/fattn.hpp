@@ -232,6 +232,10 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
 
 void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size);
 
+// Test-only partial-submit failpoint. Inert unless
+// GGML_SYCL_TEST_PACKED_K_FAIL_AFTER names an exact lifecycle checkpoint.
+void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint);
+
 #if GGML_SYCL_DNNL
 enum class ggml_sycl_onednn_fa_layout_kind {
     DIRECT,

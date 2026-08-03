@@ -2042,7 +2042,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                                                              int64_t              packed_batch_stride  = 0,
                                                              int64_t              packed_head_stride   = 0,
                                                              int64_t              packed_block_stride  = 0,
-                                                             const sycl::event *  packed_k_ready_event = nullptr) {
+                                                             sycl::event *        packed_k_ready_event = nullptr) {
     using slm_layout       = fattn_v2_decode_gqa_slm<D>;
     constexpr int nthreads = XMX_V2_DECODE_GQA_MAX * XMX_V2_SG;
 
@@ -2084,7 +2084,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
         return profiled_queue.submit([&](sycl::handler & cgh) {
         if constexpr (PACKED_K) {
             if (add_packed_dep) {
-                cgh.depends_on(*packed_k_ready_event);
+                cgh.depends_on(packed_ready_event);
             }
         }
         sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
@@ -2100,6 +2100,13 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
             });
         });
     });
+
+    if constexpr (PACKED_K) {
+        if (packed_k_ready_event != nullptr) {
+            *packed_k_ready_event = first_event;
+            ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge");
+        }
+    }
 
     sycl::range<3> merge_grid(params.ne02 * params.ne03, 1, n_query_blocks);
     sycl::range<3> merge_block(1, 1, XMX_V2_SG);
