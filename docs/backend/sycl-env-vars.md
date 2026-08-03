@@ -28,16 +28,18 @@ before treating any result as an active setting.
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
 `GGML_SYCL_DISABLE_GRAPH` controls graph replay, not graph-compute concurrency.
-The graph-compute mutex is process-global, but protects setup and graph
-management only while held; it is not a process-wide submission lock.
-Direct/fallback paths release it before `compute_impl` submission, so host
-submission and device execution may overlap across calls and devices. Pure-GPU
-decode may also return with kernels still in flight. Do not infer supported
-concurrent inference or cache safety from either overlap. The process-global
-`unified_cache_set_graph_compute_active(bool)` flag is an eviction guard, not a
-per-device concurrency control. Same-device concurrent inference also remains
-unsupported for the distinct context/arena ownership reasons documented in the
-canonical contract §5.
+The graph-compute mutex is process-global, but does not universally serialize
+submission. Direct/fallback paths release it before `compute_impl` submission.
+In contrast, persistent-TG/deferred-copy paths and command-graph record/replay
+paths submit while the process-global mutex remains held. Completion may still
+outlive the lock where a path permits deferred exit. Thus host submission can
+overlap across calls on direct/fallback paths, and device execution may overlap
+across calls and devices; pure-GPU decode may also return with kernels still in
+flight. Do not infer supported concurrent inference or cache safety from either
+overlap. The process-global `unified_cache_set_graph_compute_active(bool)` flag
+is an eviction guard, not a per-device concurrency control. Same-device
+concurrent inference also remains unsupported for the distinct context/arena
+ownership reasons documented in the canonical contract §5.
 
 ## Experimental (opt-in, off by default)
 

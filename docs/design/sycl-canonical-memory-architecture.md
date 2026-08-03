@@ -243,9 +243,9 @@ execution support: current planner globals are process-wide rather than keyed by
 model, and per-device arena state is not keyed by context. The graph-compute
 eviction guard and graph-compute mutex are separate process-global state. Live
 ownership must therefore be safe across coexisting objects, but concurrent
-inference on the same SYCL device is not supported. The mutex is not a
-process-wide submission or device-execution lock; §5.3 defines its narrower
-scope and the resulting overlap. The contract distinguishes:
+inference on the same SYCL device is not supported. The mutex does not
+universally serialize submission or device execution; §5.3 defines the mixed
+path taxonomy and the resulting overlap. The contract distinguishes:
 
 ### 5.1 Process-scoped (model) state
 
@@ -307,14 +307,18 @@ Keep these cases separate:
   the process-global `g_graph_compute_active` eviction guard
   (`unified-cache.cpp:303`). It is not per-device or per-context state.
 - Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
-  the current graph-compute entry point (`ggml-sycl.cpp:91438`) and protects
-  setup and graph management only while held. It is not a process-wide
-  submission lock: direct/fallback paths explicitly release it before
-  `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). Host submission and
-  device execution may therefore overlap across graph-compute calls and devices;
-  pure-GPU decode may also return with kernels still in flight. Do not infer
-  supported concurrent inference or cache safety from either overlap. The
-  distinct same-device limitation remains: same-device concurrent inference is
+  the current graph-compute entry point (`ggml-sycl.cpp:91438`) but does not
+  universally serialize submission. Direct/fallback paths explicitly release it
+  before `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). In contrast,
+  persistent-TG and deferred-copy paths submit while it remains held
+  (`ggml-sycl.cpp:91978`, `92084`, `92101`, `92159`), as do command-graph
+  record/replay paths (`ggml-sycl.cpp:92700`, `93161`, `93188`, `93298`).
+  Completion may still outlive the lock where a path permits deferred exit.
+  Thus host submission can overlap across graph-compute calls on direct/fallback
+  paths, and device execution may overlap across calls and devices; pure-GPU
+  decode may also return with kernels still in flight. Do not infer supported
+  concurrent inference or cache safety from either overlap. The distinct
+  same-device limitation remains: same-device concurrent inference is
   unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
 ---

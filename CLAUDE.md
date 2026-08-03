@@ -394,14 +394,17 @@ remain loaded at once, so **another live model's lease is correct, not leaked**,
 and a *new model's load* is not a quiescent point for anybody else's weights.
 This lifetime rule does not promise concurrent inference. The
 `unified_cache_set_graph_compute_active(bool)` eviction guard and
-`g_sycl_graph_compute_mutex` are process-global, but the mutex protects setup and
-graph management only while held; it is not a process-wide submission lock.
-Direct/fallback paths release it before `compute_impl` submission, so host
-submission and device execution may overlap across calls and devices. Pure-GPU
-decode may also return with kernels still in flight. Do not infer supported
-concurrent inference or cache safety from either overlap. Separately, same-device
-concurrent inference remains unsupported because context-keyed KV/RUNTIME arena
-ownership is absent (canonical contract §5).
+`g_sycl_graph_compute_mutex` are process-global, but the mutex does not
+universally serialize submission. Direct/fallback paths release it before
+`compute_impl` submission. In contrast, persistent-TG/deferred-copy paths and
+command-graph record/replay paths submit while the process-global mutex remains
+held. Completion may still outlive the lock where a path permits deferred exit.
+Thus host submission can overlap across calls on direct/fallback paths, and
+device execution may overlap across calls and devices; pure-GPU decode may also
+return with kernels still in flight. Do not infer supported concurrent inference
+or cache safety from either overlap. Separately, same-device concurrent inference
+remains unsupported because context-keyed KV/RUNTIME arena ownership is absent
+(canonical contract §5).
 
 Getting this backwards cost real time. `9a0670712` ("sycl: checkpoint unified
 memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
