@@ -314,6 +314,14 @@ checks = {
     and "*out_model = rollback_token.model_id != 0" in llama
     and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "load effects drain before end": "struct load_effect_lease" in hpp
+    and "acquire_load_effect" in cpp
+    and "load_effect_serials.empty()" in cpp
+    and "load-effect-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
+    and "load-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
+    "host registration uses one leased owner": "load_effect_lease effect" in backend
+    and "const auto owner = effect.owner" in backend
+    and backend.count("sycl_host_weight_extra_entry new_entry{ tensor, extra, owner }") == 1,
     "exact model-scoped weight identity": "ggml_sycl_owner_name_key" in backend
     and "g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key" in backend
     and "ggml_sycl_erase_weight_identities_for_owner" in backend

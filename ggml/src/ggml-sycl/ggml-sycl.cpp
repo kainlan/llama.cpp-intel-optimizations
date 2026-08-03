@@ -10107,6 +10107,18 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         return;
     }
 
+    auto &                                  registry = ggml_sycl::lifecycle::global_registry();
+    ggml_sycl::lifecycle::load_effect_lease effect;
+    try {
+        effect = registry.acquire_load_effect(registry.bound_candidate());
+    } catch (...) {
+        return;
+    }
+    if (!effect) {
+        return;
+    }
+    const auto owner = effect.owner;
+
     ggml_tensor_extra_gpu * extra         = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
     const bool              created_extra = (extra == nullptr);
     if (extra == nullptr) {
@@ -10127,10 +10139,6 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         tensor->layout = &extra->layout;
     }
 
-    const auto owner = ggml_sycl::lifecycle::global_registry().current_active_token();
-    if (owner.model.value == 0 || owner.load.value == 0) {
-        return;
-    }
     ggml_sycl_assign_cache_uuid(extra);
     {
         std::lock_guard<std::mutex> lock_id(g_sycl_weight_identity_mutex);
@@ -10150,7 +10158,6 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
             GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
         }
-        const auto                   owner = ggml_sycl::lifecycle::global_registry().current_active_token();
         sycl_host_weight_extra_entry new_entry{ tensor, extra, owner };
         auto                         insert = g_sycl_host_weight_extras.emplace(key, new_entry);
         if (!insert.second) {

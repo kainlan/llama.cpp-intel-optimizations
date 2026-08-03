@@ -212,7 +212,7 @@ if (BUILD_TESTING)
 
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
-                  runtime-update-teardown
+                  runtime-update-teardown load-effect-drain load-effect-abort-drain
                   durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
                   latest-live-restoration busy-deferred-quarantine restore-failure-quarantine effect-failure-quarantine

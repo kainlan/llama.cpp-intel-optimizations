@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ggml_sycl::lifecycle {
@@ -118,6 +119,32 @@ struct end_probe {
     finish_ticket result{};
 };
 
+class Registry;
+
+struct load_effect_lease {
+    error      code = error::NOT_FOUND;
+    ModelToken owner{};
+    uint64_t   serial   = 0;
+    Registry * registry = nullptr;
+
+    load_effect_lease() = default;
+
+    load_effect_lease(error code, ModelToken owner, uint64_t serial, Registry * registry) :
+        code(code),
+        owner(owner),
+        serial(serial),
+        registry(registry) {}
+
+    ~load_effect_lease();
+
+    load_effect_lease(const load_effect_lease &)             = delete;
+    load_effect_lease & operator=(const load_effect_lease &) = delete;
+    load_effect_lease(load_effect_lease && other) noexcept;
+    load_effect_lease & operator=(load_effect_lease && other) noexcept;
+
+    explicit operator bool() const noexcept { return registry != nullptr && serial != 0; }
+};
+
 struct live_update_ticket {
     error      code = error::NOT_FOUND;
     ModelToken token{};
@@ -204,6 +231,10 @@ class Registry {
     void      unbind_candidate(LoadTxnId txn) noexcept;
     LoadTxnId bound_candidate();
 
+    // Load effects are admitted only for the exact ACTIVE transaction. End
+    // closes admission first and waits all move-only leases out before effects.
+    load_effect_lease acquire_load_effect(LoadTxnId txn) noexcept;
+
     // prepare retains coordinator+slot in COMMITTING/ROLLING_BACK. Exactly one
     // caller receives finisher=true and performs effects without the lock.
     end_probe     probe_end(LoadTxnId txn) noexcept;
@@ -254,8 +285,9 @@ class Registry {
         bool         poisoned      = false;
         finish_phase phase         = finish_phase::ACTIVE;
         uint64_t     finish_serial = 0;
-        error        finish_reason = error::OK;
-        end_result   terminal_result{};
+        error                        finish_reason = error::OK;
+        end_result                   terminal_result{};
+        std::unordered_set<uint64_t> load_effect_serials;
     };
 
     struct slot_state {
@@ -277,6 +309,8 @@ class Registry {
 
     void poison_active_locked();
     void remember_terminal_locked(uint64_t txn) noexcept;
+    void release_load_effect(LoadTxnId txn, uint64_t serial) noexcept;
+    friend struct load_effect_lease;
 
     mutable std::mutex                        mutex_;
     std::condition_variable                   cv_;
@@ -284,6 +318,7 @@ class Registry {
     const uint64_t                            depth_limit_;
     const test_mutation                       mutation_;
     uint64_t                                  next_model_id_ = 1, next_load_id_ = 1, next_finish_serial_ = 1;
+    uint64_t                                                   next_effect_serial_ = 1;
     std::array<slot_state, model_slot_count>  slots_{};
     // Terminal transaction and dead-model rows are intentionally append-only.
     // Process-lifetime exact replay is required for idempotent end/unload;

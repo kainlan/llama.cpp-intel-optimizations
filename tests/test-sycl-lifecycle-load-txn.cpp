@@ -41,6 +41,26 @@ static void run_case(const std::string & name, test_mutation mutation) {
         }
         require(inner.code == error::NESTED && !inner.committed, "nested load committed");
         require(r.end(b.txn, true).committed && r.publication_count() == 1, "outer did not commit exactly once");
+    } else if (name == "load-effect-drain" || name == "load-effect-abort-drain") {
+        Registry r;
+        auto     begin = r.begin_outer();
+        require(begin.code == error::OK, "effect lease begin failed");
+        r.bind_candidate(begin.txn);
+        auto lease = r.acquire_load_effect(r.bound_candidate());
+        require(lease && lease.owner == begin.token, "effect lease authority mismatch");
+
+        const bool commit     = name == "load-effect-drain";
+        auto       end_future = std::async(std::launch::async, [&] { return r.prepare_end(begin.txn, commit); });
+        require(end_future.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+                "end did not wait for outstanding load effect");
+        require(r.begin_outer().code == error::LOAD_BUSY, "new load entered while effects were draining");
+
+        lease       = {};
+        auto ticket = end_future.get();
+        require(ticket.finisher && ticket.commit == commit, "drained end ticket mismatch");
+        auto ended = r.finalize_end(ticket, true);
+        require(ended.committed == commit, "drained end result mismatch");
+        require(r.begin_outer().code == error::OK, "next load remained blocked after effect drain");
     } else if (name == "inner-failure" || name == "cancel") {
         Registry r(UINT64_MAX, UINT64_MAX, mutation);
         auto     b = r.begin_outer();

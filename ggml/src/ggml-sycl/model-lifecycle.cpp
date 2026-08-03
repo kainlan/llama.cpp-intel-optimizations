@@ -14,6 +14,36 @@ struct candidate_binding {
 thread_local std::vector<candidate_binding> candidate_bindings;
 }  // namespace
 
+load_effect_lease::~load_effect_lease() {
+    if (registry && serial != 0) {
+        registry->release_load_effect(owner.load, serial);
+    }
+}
+
+load_effect_lease::load_effect_lease(load_effect_lease && other) noexcept :
+    code(other.code),
+    owner(other.owner),
+    serial(other.serial),
+    registry(other.registry) {
+    other.serial   = 0;
+    other.registry = nullptr;
+}
+
+load_effect_lease & load_effect_lease::operator=(load_effect_lease && other) noexcept {
+    if (this != &other) {
+        if (registry && serial != 0) {
+            registry->release_load_effect(owner.load, serial);
+        }
+        code           = other.code;
+        owner          = other.owner;
+        serial         = other.serial;
+        registry       = other.registry;
+        other.serial   = 0;
+        other.registry = nullptr;
+    }
+    return *this;
+}
+
 bool quarantine_queue::enqueue(ModelToken token) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -225,6 +255,35 @@ LoadTxnId Registry::bound_candidate() {
     return {};
 }
 
+load_effect_lease Registry::acquire_load_effect(LoadTxnId id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = txns_.find(id.value);
+        if (id.value == 0 || active_txn_ != id.value || it == txns_.end() || it->second.phase != finish_phase::ACTIVE) {
+            return { error::WRONG_TRANSACTION, {}, 0, nullptr };
+        }
+        uint64_t serial = next_effect_serial_++;
+        if (next_effect_serial_ == 0) {
+            next_effect_serial_ = 1;
+        }
+        it->second.load_effect_serials.insert(serial);
+        return { error::OK, it->second.token, serial, this };
+    } catch (...) {
+        return { error::ALLOCATION_FAILED, {}, 0, nullptr };
+    }
+}
+
+void Registry::release_load_effect(LoadTxnId id, uint64_t serial) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = txns_.find(id.value);
+        if (it != txns_.end() && it->second.load_effect_serials.erase(serial) != 0) {
+            cv_.notify_all();
+        }
+    } catch (...) {
+    }
+}
+
 end_probe Registry::probe_end(LoadTxnId id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -296,6 +355,7 @@ finish_ticket Registry::recover_binding_failure(LoadTxnId id) noexcept {
             }
             txn.finish_reason = error::POISONED;
             txn.phase         = finish_phase::ROLLING_BACK;
+            cv_.wait(lock, [&txn] { return txn.load_effect_serials.empty(); });
             try {
                 model_entry row;
                 row.token = txn.token;
@@ -392,6 +452,7 @@ finish_ticket Registry::prepare_end(LoadTxnId id, bool success, bool output_avai
         }
         txn.finish_reason = reason;
         txn.phase         = commit ? finish_phase::COMMITTING : finish_phase::ROLLING_BACK;
+        cv_.wait(lock, [&txn] { return txn.load_effect_serials.empty(); });
         try {
             model_entry row;
             row.token = txn.token;
