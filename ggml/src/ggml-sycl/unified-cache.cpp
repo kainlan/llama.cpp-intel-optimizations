@@ -9,7 +9,6 @@
 #include "alloc-registry.hpp"
 #include "common.hpp"
 #include "e2e-profile.hpp"
-#include "sycl-timeline.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
@@ -17,6 +16,8 @@
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "model-lifecycle.hpp"
+#include "sycl-timeline.hpp"
 #include "zone-sizing.hpp"
 
 #include <algorithm>
@@ -43,13 +44,22 @@
 
 namespace ggml_sycl {
 
-static std::atomic<uint64_t> g_pending_load_txn_id{ 0 };
-
-uint64_t unified_cache_pending_load_txn() noexcept {
-    return g_pending_load_txn_id.load(std::memory_order_acquire);
+uint64_t unified_cache_bound_load_txn() noexcept {
+    try {
+        const auto txn = lifecycle::global_registry().bound_candidate();
+        return txn && lifecycle_find_candidate_placement_plan(txn.value) ? txn.value : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 namespace {
+void stamp_pending_owner(unified_cache_entry & entry) noexcept {
+    if (const uint64_t txn = unified_cache_bound_load_txn()) {
+        entry.pending_load_txn_id = txn;
+    }
+}
+
 std::mutex                                                                   g_lifecycle_plan_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
@@ -2535,9 +2545,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // Create key for lookup (identity-only, no layout)
     unified_cache_key key{ type, key_id, layer_id, expert_id };
 
-    // Check if already cached
+    // Check if already cached. Reuse is a touch by this exact bound load.
     auto it = entries_.find(key);
     if (it != entries_.end()) {
+        stamp_pending_owner(it->second);
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
             id_to_key_.emplace(key_id, key);
@@ -3122,11 +3133,12 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
 
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
         auto                    it        = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
             it->second.location != cache_location::HOST_MMAP && !it->second.retired) {
+            stamp_pending_owner(it->second);
             result.ptr = it->second.device_ptr;
             if (it->second.has_ready_event) {
                 result.event = it->second.ready_event;
@@ -3360,11 +3372,12 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
 
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
         auto                    it        = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
             it->second.location == cache_location::DEVICE && !it->second.retired) {
+            stamp_pending_owner(it->second);
             result.ptr = it->second.device_ptr;
             if (it->second.has_ready_event) {
                 result.event = it->second.ready_event;
@@ -3715,7 +3728,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
 
     bool all_existing = true;
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         for (const ggml_sycl_cache_id & key : keys) {
             const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
             auto                    it        = entries_.find(cache_key);
@@ -3724,6 +3737,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                 all_existing = false;
                 break;
             }
+            stamp_pending_owner(it->second);
         }
         if (all_existing) {
             if (out_handles) {
@@ -5857,6 +5871,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
         auto entry_it = entries_.find(key);
         if (entry_it != entries_.end()) {
             auto & entry = entry_it->second;
+            stamp_pending_owner(entry);
             if (entry.retired) {
                 return result;
             }
@@ -7750,6 +7765,27 @@ size_t unified_cache::owner_tagged_entry_count() const {
         }
     }
     return n;
+}
+
+void unified_cache::test_mark_all_entries_touched_by_load(uint64_t load_txn_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto & pair : entries_) {
+        pair.second.pending_load_txn_id = load_txn_id;
+    }
+}
+
+bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
+                                                    ggml_layout_mode   layout,
+                                                    uint64_t           load_txn_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    bool                                found = false;
+    for (auto & pair : entries_) {
+        if (detail::cache_id_equal(pair.first.id, key) && pair.second.layout == layout) {
+            pair.second.pending_load_txn_id = load_txn_id;
+            found                           = true;
+        }
+    }
+    return found;
 }
 
 void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
@@ -13959,13 +13995,7 @@ void unified_cache_set_live_model_mask(uint32_t mask) {
     }
 }
 
-void unified_cache_note_model_load_begin(uint64_t load_txn_id) {
-    g_pending_load_txn_id.store(load_txn_id, std::memory_order_release);
-}
-
 void unified_cache_note_model_load_abort(uint64_t load_txn_id) {
-    uint64_t expected = load_txn_id;
-    (void) g_pending_load_txn_id.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
@@ -13981,8 +14011,6 @@ void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
             cache->note_model_load_end(slot, load_txn_id);
         }
     }
-    uint64_t expected = load_txn_id;
-    (void) g_pending_load_txn_id.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
 }
 
 size_t unified_cache_release_model_slot(uint32_t slot) {

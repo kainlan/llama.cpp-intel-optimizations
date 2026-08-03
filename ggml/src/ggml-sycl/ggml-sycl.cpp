@@ -9602,7 +9602,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
             return ggml_sycl_lifecycle_c_result(result.code);
         }
         txn->id = result.txn.value;
-        ggml_sycl::unified_cache_note_model_load_begin(result.txn.value);
         // no_alloc intentionally never invokes the planner, so stage an
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);

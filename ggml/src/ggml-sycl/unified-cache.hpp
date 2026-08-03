@@ -1549,7 +1549,8 @@ struct stale_weight_alloc {
 };
 
 // Metadata for a cached entry
-uint64_t unified_cache_pending_load_txn() noexcept;
+// Returns the current thread's validated Registry candidate, or zero.
+uint64_t unified_cache_bound_load_txn() noexcept;
 
 struct unified_cache_entry {
     void *                device_ptr;       // GPU memory pointer (or host memory if host_resident)
@@ -1605,7 +1606,7 @@ struct unified_cache_entry {
     // runtime, outside a load) -- the latter is kept while any model is live.
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
-    uint64_t              pending_load_txn_id   = unified_cache_pending_load_txn();
+    uint64_t              pending_load_txn_id   = unified_cache_bound_load_txn();
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -2379,6 +2380,8 @@ class unified_cache {
     // A model's load has finished: claim every entry it can now resolve.  Called
     // after S1-PRELOAD, so it covers both what this load staged and anything it
     // reused from an earlier model (identical GGUF weights dedupe to one entry).
+    void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
+    bool test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
     void note_model_load_abort(uint64_t load_txn_id);
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
@@ -4058,7 +4061,6 @@ void   unified_cache_reset_model_weight_entries(int                 device_id,
                                                 weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
 // Model lifetime fan-out over every device's cache (llama.cpp-0qlw).
 void   unified_cache_set_live_model_mask(uint32_t mask);
-void   unified_cache_note_model_load_begin(uint64_t load_txn_id);
 void   unified_cache_note_model_load_abort(uint64_t load_txn_id);
 void   unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 size_t unified_cache_release_model_slot(uint32_t slot);

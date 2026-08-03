@@ -174,7 +174,9 @@ struct llama_model_sycl_loading_guard {
         const auto            rc = hooks.end(txn, false, outer ? &rollback_token : nullptr);
         active                   = false;
         if (outer && out_model) {
-            *out_model = rollback_token.model_id != 0 ?
+            // Clean cancellation owns nothing. Preserve a token only when the
+            // backend reports poisoned cleanup so quarantine can finish it.
+            *out_model = rc == GGML_SYCL_LIFECYCLE_POISONED && rollback_token.model_id != 0 ?
                              llama_sycl_model_token{ rollback_token.model_id, rollback_token.load_txn_id,
                                                      rollback_token.slot, rollback_token.slot_generation } :
                              llama_sycl_model_token{};
@@ -1659,10 +1661,20 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    const bool resolved_sycl_weight_owner =
+    const bool sycl_layer_assignment =
         this->n_gpu_layers() > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
             return llama_model_dev_is_sycl(device.dev);
         });
+    bool sycl_tensor_override = false;
+    if (params.tensor_buft_overrides) {
+        for (const auto * override = params.tensor_buft_overrides; override->pattern != nullptr; ++override) {
+            if (llama_model_buft_is_sycl(override->buft) || llama_model_buft_backend_is_sycl(override->buft)) {
+                sycl_tensor_override = true;
+                break;
+            }
+        }
+    }
+    const bool                     resolved_sycl_weight_owner = sycl_layer_assignment || sycl_tensor_override;
     llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);
     if (sycl_model_loading_guard.active) {
         llama_model_sycl_compute_early_plan(ml, hparams, __func__);

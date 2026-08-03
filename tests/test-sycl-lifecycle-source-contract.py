@@ -311,7 +311,7 @@ checks = {
     "CPU speculative lifecycle cancellation": "sycl_model_loading_guard.cancel()" in llama
     and "if (has_sycl_weight_buffer)" in llama
     and "if (sycl_model_backend)" in llama
-    and "rollback_token.model_id != 0" in llama
+    and "rc == GGML_SYCL_LIFECYCLE_POISONED && rollback_token.model_id != 0" in llama
     and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "exact model-scoped weight identity": "ggml_sycl_owner_name_key" in backend
@@ -322,6 +322,8 @@ checks = {
         (root / "src/llama-model-loader.cpp").read_text().index("register_host_weight(selected_layer_dev"),
     "CPU classified before lifecycle begin": "resolved_sycl_weight_owner" in llama
     and "this->n_gpu_layers() > 0" in llama
+    and "params.tensor_buft_overrides" in llama
+    and "sycl_tensor_override" in llama
     and "llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner" in llama
     and "if (sycl_model_loading_guard.active)" in llama,
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
@@ -347,8 +349,14 @@ checks = {
     and "ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);" not in
         re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
     "transaction-scoped cache ownership promotion": "pending_load_txn_id" in cache_hpp
+    and "test_shared_entry_exact_two_owner_unload" in
+        (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()
+    and "test_unrelated_thread_entry_not_claimed" in
+        (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()
     and "pair.second.pending_load_txn_id != load_txn_id" in cache_cpp
-    and "unified_cache_note_model_load_begin" in backend
+    and "unified_cache_bound_load_txn" in cache_cpp
+    and "global_registry().bound_candidate()" in cache_cpp
+    and "g_pending_load_txn_id" not in cache_cpp
     and "unified_cache_note_model_load_abort" in backend
     and "unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value)" in backend,
     "DL context model-bound route": "llama_context_sycl_runtime_proc" in

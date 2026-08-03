@@ -100,6 +100,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sycl/sycl.hpp>
+#include <thread>
 #include <vector>
 
 #if !defined(GGML_USE_SYCL)
@@ -206,8 +207,8 @@ static bool test_reset_preserves_leased_entry_and_remaps_id(sycl::queue & q) {
 //
 // The first cache reserves the arena and later ones see no budget left, so they
 // fall back to per-entry allocation. Each test below builds its own cache
-// deliberately -- sharing one would let note_model_load_end() tag a previous
-// test's entries and couple the results -- so the fallback is unavoidable here.
+// deliberately to keep exact LoadTxnId ownership assertions independent, so
+// the fallback is unavoidable here.
 //
 // It does not affect anything these tests assert. Every assertion is entries_
 // membership via is_cached(), and the reclaim decision in
@@ -318,8 +319,9 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
         return false;
     }
 
-    // Model A's load completes: it claims every entry it can now resolve.
-    cache.note_model_load_end(0);
+    // Model A's exact load transaction completes.
+    cache.test_mark_all_entries_touched_by_load(1);
+    cache.note_model_load_end(0, 1);
     if (cache.live_model_mask() != 0x1u) {
         fprintf(stderr, "note_model_load_end(0) did not publish slot 0 as live (mask=0x%08x)\n",
                 cache.live_model_mask());
@@ -399,6 +401,74 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
 //
 // What it must still not touch is another LIVE model's weights. A live
 // model's ownership vetoes reclaim in every mode.
+static bool test_shared_entry_exact_two_owner_unload(sycl::queue & q) {
+    printf("\n=== Test: shared entry retains exact two-model ownership ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     data(128, 0x6b);
+    ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
+    if (!stage_with_idle_aos_sibling(cache, q, key, data, "shared A/A weight")) {
+        return false;
+    }
+
+    if (!cache.test_mark_entry_touched_by_load(key, GGML_LAYOUT_AOS, 101)) {
+        return false;
+    }
+    cache.note_model_load_end(0, 101);
+    if (!cache.test_mark_entry_touched_by_load(key, GGML_LAYOUT_AOS, 102)) {
+        return false;
+    }
+    cache.note_model_load_end(1, 102);
+
+    cache.release_model_slot(0);
+    if (!cache.is_cached(key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "shared entry was freed while its second exact owner remained live\n");
+        return false;
+    }
+    cache.release_model_slot(1);
+    if (cache.is_cached(key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "shared entry survived after both exact owners unloaded\n");
+        return false;
+    }
+    return true;
+}
+
+static bool test_unrelated_thread_entry_not_claimed(sycl::queue & q) {
+    printf("\n=== Test: unrelated-thread insertion is not claimed by loading model ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     loading_data(128, 0x31);
+    std::vector<uint8_t>     runtime_data(128, 0x32);
+    ggml_sycl_cache_id       loading_key = ggml_sycl::test_make_cache_id(loading_data.data());
+    ggml_sycl_cache_id       runtime_key = ggml_sycl::test_make_cache_id(runtime_data.data());
+    if (!stage_with_idle_aos_sibling(cache, q, loading_key, loading_data, "B staging")) {
+        return false;
+    }
+
+    bool        thread_ok = false;
+    std::thread unrelated([&] {
+        thread_ok = stage_with_idle_aos_sibling(cache, q, runtime_key, runtime_data, "unrelated runtime staging");
+    });
+    unrelated.join();
+    if (!thread_ok) {
+        return false;
+    }
+
+    if (!cache.test_mark_entry_touched_by_load(loading_key, GGML_LAYOUT_AOS, 201)) {
+        return false;
+    }
+    cache.note_model_load_end(0, 201);
+    cache.release_model_slot(0);
+    if (cache.is_cached(loading_key, GGML_LAYOUT_AOS)) {
+        return false;
+    }
+    if (!cache.is_cached(runtime_key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "unrelated-thread runtime entry was attributed to and freed with model B\n");
+        return false;
+    }
+    return true;
+}
+
 static bool test_replan_frees_own_staging_but_spares_a_live_model(sycl::queue & q) {
     printf("\n=== Test: MID_LOAD_REPLAN frees its own staging, spares a live model ===\n");
 
@@ -412,11 +482,12 @@ static bool test_replan_frees_own_staging_but_spares_a_live_model(sycl::queue & 
     if (!stage_with_idle_aos_sibling(cache, q, key_live, data_live, "the live model's weight")) {
         return false;
     }
-    cache.note_model_load_end(0);
+    cache.test_mark_all_entries_touched_by_load(2);
+    cache.note_model_load_end(0, 2);
 
     // Model B is MID-LOAD: it stages after A's load end, so its entries are
-    // untagged. This ordering is load-bearing -- note_model_load_end() claims
-    // every entry present when it runs, so staging B first would tag it too.
+    // untagged. Commit promotes only entries explicitly touched by its exact
+    // LoadTxnId; unrelated staging is never claimed.
     if (!stage_with_idle_aos_sibling(cache, q, key_loading, data_loading, "the loading model's staging")) {
         return false;
     }
@@ -467,7 +538,8 @@ static bool test_load_boundary_keeps_unattributed_while_a_model_is_live(sycl::qu
     if (!stage_with_idle_aos_sibling(cache, q, key_live, data_live, "the live model's weight")) {
         return false;
     }
-    cache.note_model_load_end(0);
+    cache.test_mark_all_entries_touched_by_load(3);
+    cache.note_model_load_end(0, 3);
     if (!stage_with_idle_aos_sibling(cache, q, key_runtime, data_runtime, "the runtime-materialized entry")) {
         return false;
     }
@@ -566,6 +638,8 @@ int main() {
     bool ok = true;
     ok &= test_reset_preserves_leased_entry_and_remaps_id(q);
     ok &= test_live_model_idle_weights_survive_load_boundary(q);
+    ok &= test_shared_entry_exact_two_owner_unload(q);
+    ok &= test_unrelated_thread_entry_not_claimed(q);
     ok &= test_replan_frees_own_staging_but_spares_a_live_model(q);
     ok &= test_load_boundary_keeps_unattributed_while_a_model_is_live(q);
 
