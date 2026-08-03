@@ -27,6 +27,14 @@ before treating any result as an active setting.
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
+`GGML_SYCL_DISABLE_GRAPH` controls graph replay, not graph-compute concurrency.
+Current SYCL graph execution is serialized across the entire process by the
+process-global graph-compute mutex, including graphs targeting different
+devices. The process-global `unified_cache_set_graph_compute_active(bool)` flag
+is an eviction guard, not a per-device concurrency control. Same-device
+concurrent inference also remains unsupported for the distinct context/arena
+ownership reasons documented in the canonical contract §5.
+
 ## Experimental (opt-in, off by default)
 
 | Variable | Default | Effect |

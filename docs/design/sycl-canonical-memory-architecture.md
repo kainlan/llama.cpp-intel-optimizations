@@ -240,9 +240,12 @@ SYCL work that uses the pointer.
 A process may switch models sequentially, keep multiple `llama_model` objects
 alive, and create multiple contexts. Those object lifetimes are distinct from
 execution support: current planner globals are process-wide rather than keyed by
-model, and per-device graph/arena state is not keyed by context. Live ownership
-must therefore be safe across coexisting objects, but concurrent inference on
-the same SYCL device is not supported. The contract distinguishes:
+model, and per-device arena state is not keyed by context. The graph-compute
+eviction guard is separate process-global state. Live ownership must therefore
+be safe across coexisting objects, but concurrent inference on the same SYCL
+device is not supported. Current SYCL graph execution is additionally serialized
+across the entire process by the process-global graph-compute mutex, including
+graphs targeting different devices. The contract distinguishes:
 
 ### 5.1 Process-scoped (model) state
 
@@ -300,8 +303,14 @@ Keep these cases separate:
 - Object coexistence does not imply execution concurrency. Each server slot
   would need a distinct context and context-keyed KV/RUNTIME arena reservation;
   that ownership is not implemented yet (tracked in `llama.cpp-32dg8.15.10`).
-  The `unified_cache_set_graph_compute_active` flag is per-device, not
-  per-context, so graph compute on one SYCL device must be serialized.
+  `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
+  the process-global `g_graph_compute_active` eviction guard
+  (`unified-cache.cpp:303`). It is not per-device or per-context state.
+- Independently, the process-global `g_sycl_graph_compute_mutex` serializes the
+  current graph-compute entry point (`ggml-sycl.cpp:91438`) across all SYCL
+  devices in the process. Do not infer cross-device graph parallelism. The
+  distinct same-device limitation remains: same-device concurrent inference is
+  unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
 ---
 
@@ -368,9 +377,12 @@ forms above with the understanding that they are scheduled for replacement.
 ### 7.3 Multi-context / Multi-server slot
 
 The lifetime and execution distinctions in §5.3 apply. Contexts sharing a model
-may share its read-only `placement_plan` and WEIGHT entries, but same-device
-inference must remain serialized until `llama.cpp-32dg8.15.10` delivers explicit
-context-keyed KV/RUNTIME arena ownership.
+may share its read-only `placement_plan` and WEIGHT entries. Current graph
+execution is serialized process-wide by `g_sycl_graph_compute_mutex`, so graphs
+on different devices do not execute in parallel within one process. Separately,
+same-device concurrent inference remains unsupported until
+`llama.cpp-32dg8.15.10` delivers explicit context-keyed KV/RUNTIME arena
+ownership.
 
 ---
 
