@@ -793,12 +793,6 @@ GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
 GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 
-// Test-only seam for the production S1 completion step. Placement-only tests
-// have no materialized host-weight registry, so preload returns before reaching
-// the multi-device global-plan clear. This supplies that precondition and runs
-// the same clear helper; returns false when no active plan existed.
-GGML_BACKEND_API bool ggml_backend_sycl_test_complete_multi_device_plan_clear(void);
-
 #ifdef __cplusplus
 }
 #endif

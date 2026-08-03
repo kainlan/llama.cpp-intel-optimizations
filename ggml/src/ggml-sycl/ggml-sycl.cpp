@@ -312,6 +312,7 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/quantized-comm.hpp"
 #include "ggml-sycl/sycl-profiling.hpp"
 #include "ggml-sycl/tensor-types.hpp"
+#include "ggml-sycl/tiered-plan-clear.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vmem-kv.hpp"
 #include "ggml.h"
@@ -23731,27 +23732,6 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
     return cached > 0 || host_registered > 0;
 }
 
-// Completion step shared by real S1 preload and the registry-free placement
-// contract test. The verdict is intentionally not cleared with the global plan.
-static void ggml_sycl_clear_completed_multi_device_global_plan() {
-    if (g_has_placement_plan && g_placement_plan.multi_device) {
-        g_has_placement_plan = false;
-    }
-}
-
-bool ggml_backend_sycl_test_complete_multi_device_plan_clear(void) {
-    if (!g_has_placement_plan) {
-        return false;
-    }
-    // test-tiered-dispatch has planner inventory but no materialized tensor
-    // registry, so S1 preload returns at weights.empty() before its completion
-    // step. Supply only the otherwise unreachable multi-device precondition,
-    // then execute the same helper used by production below.
-    g_placement_plan.multi_device = true;
-    ggml_sycl_clear_completed_multi_device_global_plan();
-    return !g_has_placement_plan;
-}
-
 static void ggml_sycl_preload_model_weights() {
     // Initialize CPU dispatch buffers once at model load time
     // This eliminates per-token resize() calls during inference
@@ -25366,7 +25346,8 @@ static void ggml_sycl_preload_model_weights() {
         }
 
         // P4.5: Clear multi-device plan after all device caches received it.
-        ggml_sycl_clear_completed_multi_device_global_plan();
+        // The current-model host-placement verdict is intentionally separate.
+        ggml_sycl::clear_completed_multi_device_global_plan(g_has_placement_plan, g_placement_plan.multi_device);
 
         const auto t_end   = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();

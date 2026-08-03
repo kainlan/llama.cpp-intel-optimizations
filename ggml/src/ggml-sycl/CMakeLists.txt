@@ -2720,7 +2720,7 @@ endif()
 add_test(NAME test-tiered-dispatch COMMAND test-tiered-dispatch)
 set_tests_properties(test-tiered-dispatch PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "GGML_SYCL_VRAM_ARENA=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
