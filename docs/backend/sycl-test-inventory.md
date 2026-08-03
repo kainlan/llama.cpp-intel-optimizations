@@ -12,8 +12,11 @@ confirm the reasoning.
 
 ## ⚠️ TOP-LINE ANSWER: the `llama.cpp-0igs` merge-blocker question
 
-**Of the still-unregistered test sources, 64 cover code this branch changed.**
-Redirected here by the lead: exhaustively mutation-verifying the whole
+**At the original inventory baseline on 2026-08-02 (`333a8d7b2`), 64
+still-unregistered test sources covered code this branch changed.** At the
+current Task 4a audit point (`c27ba2292`), those 64 source rows split into 41
+active registrations and 23 inactive registrations. Redirected here by the
+lead: exhaustively mutation-verifying the whole
 remaining population (~65–70 more registered C++ tests, ~90 Python/shell
 gates) has falling marginal value and is not what gates *this* merge — the
 question that matters is how much of `llama.cpp-0igs`'s ~147-file backlog is
@@ -107,6 +110,94 @@ the ticket's own ~15-min-per-file `ocloc` estimate, restoring this subset is
 - None of the 64 were mutation-tested this pass — that is the natural next
   step once the lead has the restoration-vs-defer decision this number is
   for.
+
+## Task 4a: registration provenance (static audit)
+
+Scope is exactly the 64 merge-relevant names in the top-line 0igs list: the handoff's 41 restored rows, its remaining 22-file set, and the separately recorded `test-expert-cache` pre-wipe exception. This is registration provenance only; hazard classes and final dispositions are intentionally deferred to Tasks 4b/4c.
+
+Evidence keys: historical references are `git show 3c8f296fd:tests/CMakeLists.txt` line numbers; live references are `ggml/src/ggml-sycl/CMakeLists.txt` line numbers at `c27ba2292`. A full literal-name audit found **none of these 64 names in live `tests/CMakeLists.txt`**. “Registration unguarded” means no surrounding CMake `if()` controls the live `add_executable`/`add_test`; target-local link guards do not hide the test. GREEN means an active live `add_test` exists; RED means absent, target-only/manual, commented out, or hidden by a false guard.
+
+### Handoff-restored 41 — all GREEN
+
+| source row | historical registration / guard evidence | live SYCL CMake registration / guard evidence | provenance |
+|---|---|---|---|
+| `tests/test-cold-start.cpp` | `target 2091; add_test 2099; guard GGML_SYCL` | `target 2010; add_test 2029; registration unguarded` | **GREEN** |
+| `tests/test-dmmv-q4-0-coalesced.cpp` | `target 1211; add_test 1219; guard GGML_SYCL` | `target 2099; add_test 2118; registration unguarded` | **GREEN** |
+| `tests/test-dmmv-q6k-coalesced.cpp` | `target 1224; add_test 1232; guard GGML_SYCL` | `target 2125; add_test 2144; registration unguarded` | **GREEN** |
+| `tests/test-fattn-thread-local.cpp` | `target 1146; add_test 1154; guard GGML_SYCL` | `target 2152; add_test 2171; registration unguarded` | **GREEN** |
+| `tests/test-ggml-sycl-soa.cpp` | `target 1431; add_test 1441; guard GGML_SYCL` | `target 2178; add_test 2197; registration unguarded` | **GREEN** |
+| `tests/test-layout-bytes.cpp` | `target 1104; add_test 1113; guard GGML_SYCL` | `target 2204; add_test 2223; registration unguarded` | **GREEN** |
+| `tests/test-mmq-q6k-gpu.cpp` | `target 559; add_test 568; guard GGML_SYCL` | `target 2230; add_test 2249; registration unguarded` | **GREEN** |
+| `tests/test-moe-mini-graph.cpp` | `target 878; add_test 886; guard GGML_SYCL` | `target 2256; add_test 2275; registration unguarded` | **GREEN** |
+| `tests/test-moe-mul-mat-id.cpp` | `target 806; add_test 814; guard GGML_SYCL` | `target 2282; add_test 2301; registration unguarded` | **GREEN** |
+| `tests/test-moe-mul-mat-id-q4q8.cpp` | `target 852; add_test 860; guard GGML_SYCL` | `target 2308; add_test 2327; registration unguarded` | **GREEN** |
+| `tests/test-mul-mat-host-streaming.cpp` | `target 819; add_test 827; guard GGML_SYCL` | `target 2334; add_test 2353; registration unguarded` | **GREEN** |
+| `tests/test-onednn-fallback.cpp` | `target 2127; add_test 2131; guard GGML_SYCL` | `target 2360; add_test 2379; registration unguarded` | **GREEN** |
+| `tests/test-onednn-woq.cpp` | `target 301; add_test 315; unguarded` | `target 2386; add_test 2408; registration unguarded` | **GREEN** |
+| `tests/test-q6k-dispatch.cpp` | `target 1655; add_test 1663; guard GGML_SYCL` | `target 2415; add_test 2434; registration unguarded` | **GREEN** |
+| `tests/test-q8-0-layout-cache-path.cpp` | `target 1371; add_test 1381; guard GGML_SYCL` | `target 2441; add_test 2460; registration unguarded` | **GREEN** |
+| `tests/test-q8-0-layout-cache-path-mmvq.cpp` | `target 1386; add_test 1396; guard GGML_SYCL` | `target 2467; add_test 2486; registration unguarded` | **GREEN** |
+| `tests/test-sycl-cpu-dispatch.cpp` | `target 1838; add_test 1847; guard GGML_SYCL` | `target 2493; add_test 2512; registration unguarded` | **GREEN** |
+| `tests/test-sycl-fattn-onednn-materialization.cpp` | `target 1007; add_test 1017; guard GGML_SYCL` | `target 1932; add_test 1951; registration unguarded` | **GREEN** |
+| `tests/test-sycl-fattn-xmx-policy.cpp` | `target 1037; add_test 1045; guard GGML_SYCL` | `target 1958; add_test 1977; registration unguarded` | **GREEN** |
+| `tests/test-sycl-kernel-selection.cpp` | `target 1538; add_test 1547; guard GGML_SYCL` | `target 1984; add_test 2003; registration unguarded` | **GREEN** |
+| `tests/test-sycl-kv-planned-device-materialization.cpp` | `target 1050; add_test 1058; guard GGML_SYCL` | `target 1802; add_test 1821; registration unguarded` | **GREEN** |
+| `tests/test-sycl-moe-expert-parallelism.cpp` | `target 1598; add_test 1607; guard GGML_SYCL` | `target 2519; add_test 2538; registration unguarded` | **GREEN** |
+| `tests/test-sycl-moe-handle-resolution.cpp` | `target 966; add_test 974; guard GGML_SYCL` | `target 2062; add_test 2081; registration unguarded` | **GREEN** |
+| `tests/test-sycl-moe-identity-hash.cpp` | `target 1586; add_test 1595; guard GGML_SYCL` | `target 2545; add_test 2564; registration unguarded` | **GREEN** |
+| `tests/test-sycl-moe-q8-scratch.cpp` | `target 979; add_test 987; guard GGML_SYCL` | `target 1828; add_test 1847; registration unguarded` | **GREEN** |
+| `tests/test-sycl-onednn-packed-cache.cpp` | `target 1526; add_test 1535; guard GGML_SYCL` | `target 1854; add_test 1873; registration unguarded` | **GREEN** |
+| `tests/test-sycl-orchestrator.cpp` | `target 1550; add_test 1559; guard GGML_SYCL` | `target 2571; add_test 2590; registration unguarded` | **GREEN** |
+| `tests/test-sycl-prestage-routed-experts.cpp` | `target 2080; add_test 2086; guard GGML_SYCL` | `target 2597; add_test 2616; registration unguarded` | **GREEN** |
+| `tests/test-sycl-unified-cache.cpp` | `target 1979; add_test 1990; guard GGML_SYCL` | `target 2623; add_test 2642; registration unguarded` | **GREEN** |
+| `tests/test-sycl-unified-memory-e2e.cpp` | `target 2031; add_test 2042; guard GGML_SYCL` | `target 2649; add_test 2668; registration unguarded` | **GREEN** |
+| `tests/test-sycl-weight-key-stability.cpp` | `target 1562; add_test 1571; guard GGML_SYCL` | `target 1750; add_test 1769; registration unguarded` | **GREEN** |
+| `tests/test-sycl-weight-key-uniqueness.cpp` | `target 1574; add_test 1583; guard GGML_SYCL` | `target 1880; add_test 1899; registration unguarded` | **GREEN** |
+| `tests/test-sycl-xmx-unified-correctness.cpp` | `target 904; add_test 912; guard GGML_SYCL` | `target 2675; add_test 2694; registration unguarded` | **GREEN** |
+| `tests/test-tensor-classification.cpp` | `target 1874; add_test 1876; guard GGML_SYCL` | `target 1776; add_test 1795; registration unguarded` | **GREEN** |
+| `tests/test-tiered-dispatch.cpp` | `target 2006; add_test 2013; guard GGML_SYCL` | `target 2701; add_test 2720; registration unguarded` | **GREEN** |
+| `tests/test-unified-cache-concurrent.cpp` | `target 1133; add_test 1141; guard GGML_SYCL` | `target 2036; add_test 2055; registration unguarded` | **GREEN** |
+| `tests/test-unified-cache-integrity.cpp` | `target 1089; add_test 1098; guard GGML_SYCL` | `target 1906; add_test 1925; registration unguarded` | **GREEN** |
+| `tests/test-xmx-host-streaming.cpp` | `target 832; add_test 847; guard GGML_SYCL` | `target 2727; add_test 2746; registration unguarded` | **GREEN** |
+| `tests/test-xmx-kernel-config.cpp` | `target 2168; add_test 2171; guard GGML_SYCL` | `target 2753; add_test 2772; registration unguarded` | **GREEN** |
+| `tests/test-xmx-quant-loaders.cpp` | `target 498; add_test 504; unguarded` | `target 2779; add_test 2798; registration unguarded` | **GREEN** |
+| `tests/test-xmx-unified-kernel.cpp` | `target 2177; add_test 2183; guard GGML_SYCL` | `target 2805; add_test 2824; registration unguarded` | **GREEN** |
+
+### Handoff remaining 22 — all RED
+
+| source row | historical registration / guard evidence | both live CMake files | provenance |
+|---|---|---|---|
+| `tests/mini-context-prototype.cpp` | `target 425; guard GGML_SYCL; no add_test (manual-only comment 388–394)` | `absent from both live files` | **RED** |
+| `tests/test-cpu-gpu-soa-interaction.cpp` | `target 1417; add_test 1425; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-expert-routing-roundtrip.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-mmvq-q8-0-streaming-bench.cpp` | `target 715; add_test 723–730 (4 names); guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-moe-expert-placement.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-mxfp4-xmx-tiled.cpp` | `target 792; add_test 801; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-pinned-chunk-pool.cpp` | `DISABLED - broken test` at 1784–1785; target/test lines 1786–1794 commented out inside GGML_SYCL | `absent from both live files` | **RED** |
+| `tests/test-planner-canary-cpy-visibility.cpp` | `target 411; guard GGML_SYCL; no add_test (manual-only comment 388–394)` | `absent from both live files` | **RED** |
+| `tests/test-planner-canary-direct-load.cpp` | `target 419; guard GGML_SYCL; no add_test (manual-only comment 388–394)` | `absent from both live files` | **RED** |
+| `tests/test-planner-canary-pp-tg-union.cpp` | `target 405; guard GGML_SYCL; no add_test (manual-only comment 388–394)` | `absent from both live files` | **RED** |
+| `tests/test-planner-canary-skeleton-determinism.cpp` | `target 397; guard GGML_SYCL; no add_test (manual-only comment 388–394)` | `absent from both live files` | **RED** |
+| `tests/test-q6k-56block-debug.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-q6k-layout-debug.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-q6k-reorder-dispatch.cpp` | `target 1667; add_test 1676; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-q6k-variable-reorder.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-sycl-expert-cache-bandwidth.cpp` | `target 1644; add_test 1652; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-sycl-expert-prefetch.cpp` | `target 1925; add_test 1935; guards GGML_SYCL + FALSE` | `absent from both live files` | **RED** |
+| `tests/test-sycl-fattn-onednn-descriptors.cpp` | `target 1022; add_test 1032; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-sycl-race-conditions.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-sycl-set-rows-owner-routing.cpp` | `target 1076; add_test 1084; guard GGML_SYCL` | `absent from both live files` | **RED** |
+| `tests/test-tile-decomposition.cpp` | `absent (no target/add_test)` | `absent from both live files` | **RED** |
+| `tests/test-unified-dispatch-integration.cpp` | `target 2148; add_test 2162; guard GGML_SYCL` | `absent from both live files` | **RED** |
+
+### Separate pre-wipe guard-hidden exception — RED
+
+| source row | historical registration / guard evidence | both live CMake files | provenance |
+|---|---|---|---|
+| `tests/test-expert-cache.cpp` | `target 1825; add_test 1833; guards GGML_SYCL + FALSE`; preceded by `DISABLED: expert-cache.hpp removed` at lines 1822–1824 | `absent from both live files` | **RED** |
+
+**Completeness check:** 41 GREEN + 22 RED + 1 guard-hidden RED = 64/64 rows. Historical shape within the 22: eight source rows with active ctest registrations under `GGML_SYCL` (11 CTest names, because `test-mmvq-q8-0-streaming-bench.cpp` registered four), five `GGML_SYCL` targets explicitly not wired to ctest, one commented-out block, one `GGML_SYCL && FALSE` registration, and seven names absent entirely. The separate exception is another `GGML_SYCL && FALSE` registration. No status in this section asserts safety, usefulness, or a future disposition.
+
 
 ## Two instances named in the ticket
 
