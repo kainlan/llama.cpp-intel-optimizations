@@ -33,6 +33,49 @@ def test_failpoints_are_exact_match_and_reserved_for_gpu_lifecycle_run() -> None
     assert "throw sycl::exception" in helper
 
 
+def test_borrowed_sidecar_precondition_is_documented_at_find_and_use() -> None:
+    lookup_comment = section(
+        FATTN,
+        "// Borrowed-lifetime precondition:",
+        "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
+    )
+    assert "single active context" in lookup_comment
+    assert "no\n// concurrent unregister/teardown" in lookup_comment
+    assert "Same-device concurrent find/use is unsupported until a lease or per-entry lock exists" in lookup_comment
+
+    use = section(
+        FATTN,
+        "// Immediate borrowed use under the sidecar's single-active-context/no-concurrent-teardown",
+        "if (packed_k == nullptr &&",
+    )
+    assert "concurrent same-device consumers require a future lease or per-entry lock" in use
+    assert "ggml_sycl_fattn_xmx_find_packed_k_sidecar(params, ctx.device)" in use
+
+
+def test_initial_fill_throw_erases_owner_before_retry() -> None:
+    update = section(
+        FATTN,
+        "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
+        "void ggml_sycl_fattn_xmx_unregister_packed_k_range",
+    )
+    new_alloc = section(update, "if (!reuse_alloc) {", "} else {")
+    ordered(
+        new_alloc,
+        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
+        "zero_event = ggml_sycl::mem_fill_async",
+        "catch (const sycl::exception & e)",
+        'GGML_LOG_WARN("[SYCL] packed-K sidecar initial fill submit failed:',
+        "if (it->get() == entry)",
+        "g_packed_k_sidecars.erase(it)",
+        "return false",
+        "packed.ready_event = zero_event",
+    )
+    # The failed entry was the registry owner pushed by this path; erasing it invokes packed reset/destruction.
+    assert "g_packed_k_sidecars.push_back(std::move(owned))" in update
+    assert new_alloc.count("g_packed_k_sidecars.erase(it)") == 1
+    assert "candidate->k_handle_hash == root_handle_hash" in update
+
+
 def test_new_sidecar_publishes_retry_identity_before_injected_throw() -> None:
     update = section(
         FATTN,
@@ -87,7 +130,7 @@ def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> N
     assert "packed.ready_event,\n                        add_zero_dep, add_prev_dep" in update
     ordered(
         update,
-        "zero_event        = ggml_sycl::mem_fill_async",
+        "zero_event = ggml_sycl::mem_fill_async",
         "packed.ready_event = zero_event",
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
         "ggml_sycl_fattn_xmx_submit_set_rows_update",
@@ -204,8 +247,20 @@ def test_unregister_is_half_open_range_isolated_and_waits_via_destructor() -> No
 
 
 def test_cache_clear_paths_cannot_erase_sidecars_and_teardown_is_range_scoped() -> None:
-    # The sidecar registry has exactly one erase operation and no blanket clear.
-    assert FATTN.count("g_packed_k_sidecars.erase(") == 1
+    # The registry has only targeted failure-cleanup/range-teardown erases and no blanket cache clear.
+    assert FATTN.count("g_packed_k_sidecars.erase(") == 2
+    update = section(
+        FATTN,
+        "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
+        "void ggml_sycl_fattn_xmx_unregister_packed_k_range",
+    )
+    unregister = section(
+        FATTN,
+        "void ggml_sycl_fattn_xmx_unregister_packed_k_range",
+        "// Kernel names for VTune profiling",
+    )
+    assert update.count("g_packed_k_sidecars.erase(") == 1
+    assert unregister.count("g_packed_k_sidecars.erase(") == 1
     assert "g_packed_k_sidecars.clear(" not in FATTN
 
     # The only backend callers are the two KV-allocation teardown branches.

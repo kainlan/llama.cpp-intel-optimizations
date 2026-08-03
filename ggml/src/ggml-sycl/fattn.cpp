@@ -343,6 +343,8 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
 
 }  // namespace
 
+// Borrowed-lifetime precondition: the returned sidecar is consumed immediately by the single active context, with no
+// concurrent unregister/teardown. Same-device concurrent find/use is unsupported until a lease or per-entry lock exists.
 ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const fattn_params & params,
                                                                          int                  target_device) {
     if (params.K == nullptr || target_device < 0 || params.ne10 != GGML_SYCL_FATTN_XMX_PACKED_K_D || params.ne11 <= 0 ||
@@ -508,7 +510,19 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                 packed.reset();
                 return debug_reject("sidecar-handle-invalid", root);
             }
-            zero_event        = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
+            try {
+                ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill");
+                zero_event = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
+            } catch (const sycl::exception & e) {
+                GGML_LOG_WARN("[SYCL] packed-K sidecar initial fill submit failed: %s\n", e.what());
+                for (auto it = g_packed_k_sidecars.begin(); it != g_packed_k_sidecars.end(); ++it) {
+                    if (it->get() == entry) {
+                        g_packed_k_sidecars.erase(it);
+                        break;
+                    }
+                }
+                return false;
+            }
             packed.ready_event = zero_event;
 
             // Publish every field used by retry lookup/reuse before the injected throw. The ready-event checkpoint
@@ -2447,6 +2461,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                             float *   partial_max = nullptr;
                             float *   partial_sum = nullptr;
                             float *   partial_out = nullptr;
+                            // Immediate borrowed use under the sidecar's single-active-context/no-concurrent-teardown
+                            // precondition; concurrent same-device consumers require a future lease or per-entry lock.
                             ggml_sycl_fattn_xmx_packed_k * packed_k =
                                 ggml_sycl_fattn_xmx_find_packed_k_sidecar(params, ctx.device);
                             if (packed_k == nullptr &&
