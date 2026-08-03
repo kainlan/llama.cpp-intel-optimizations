@@ -261,15 +261,20 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `x3ou` | focused diagnostics/reporting consumer only |
 | `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
 | `t5nq` | closed packed-K-sidecar-event-teardown gate revalidated by `1q72`/`tudj`/`o6jx`; no implementation ownership |
-| `otry` | final convergence after `o6jx` and every focused child |
-| `hcyp` | after main repairs self-test and `otry` converges, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
+| `otry` | final convergence after every foundation and focused child |
+| `hcyp` | closed merged prerequisite: self-test line-drift repair only; no census ownership |
+| `jwy4` | after `otry` and `hcyp`, owns final audit script/fixtures, CSV, source hashes/count prose refresh together |
+| `k7b0` | downstream closure after `jwy4` |
 
 Canonical §12.8 is authoritative. Foundation chain: `viu2 → 1q72 → tudj →
 o6jx`. Focused consumers retain only their subsystem scopes. Exact convergence
-edge: `{o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou} → otry`; closed
+edge: `{viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
+→ otry`; closed
 `h5m4`/`t5nq` are proof gates, not implementers. `32dg8.15.13 → tudj` remains a
 prerequisite. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
-`0qlw`, `2wv5`, and `k7b0` map to foundations without dual editing or cycles. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
+`0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact tail:
+all foundations/focused children → `otry → jwy4 → k7b0`, with closed prerequisite
+`hcyp → jwy4`. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
 shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
 M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
 L1-L5/C/D M7 hooks (global-registry absence and cross-thread completion are
@@ -281,7 +286,7 @@ execution, which must serialize/reject through per-device aggregate roots.
 `5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
 worktree, `python3 scripts/audit-sycl-static-storage.py --check` reports it stale.
 That is expected before implementation and is an explicit open gate, not a pass.
-`hcyp` must run, at final source HEAD:
+`jwy4` must run, at final source HEAD:
 
 ```sh
 python3 scripts/audit-sycl-static-storage.py --self-test
@@ -289,15 +294,16 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
-Main owns the prerequisite repair that makes the existing self-test green.
-After that lands, `hcyp` exclusively owns final edits to
-`scripts/audit-sycl-static-storage.py`, its embedded/external self-test fixtures,
-`docs/backend/sycl-static-storage-inventory.csv`, and this document's source
-SHA-256/commit/count prose. It refreshes all four at one final implementation
-HEAD, classifies every new mutable lifecycle row by owner/synchronization/
-teardown, and leaves no unowned model/context/session/graph/invocation state. A
-CSV-only refresh, a count without reconciliation, or a green check against
-pre-implementation source does not close `hcyp`.
+Closed prerequisite `hcyp` owns only the merged line-drift repair that makes
+the existing self-test green. After both `hcyp` and `otry`, `jwy4` exclusively
+owns final edits to `scripts/audit-sycl-static-storage.py`, its embedded/external
+self-test fixtures, `docs/backend/sycl-static-storage-inventory.csv`, and this
+document's source SHA-256/commit/count prose. It refreshes all four at one final
+implementation HEAD, classifies every new mutable lifecycle row by
+owner/synchronization/teardown, and leaves no unowned
+model/context/session/graph/invocation state. A CSV-only refresh, a count without
+reconciliation, or a green check against pre-implementation source does not
+close `jwy4`; `k7b0` starts afterward.
 
 ---
 

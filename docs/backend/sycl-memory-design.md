@@ -191,9 +191,11 @@ Canonical §12.8-§12.10 assigns foundations only to `viu2` (model/load), `1q72`
 their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
 `vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics. Closed
 `h5m4`/`t5nq` remain TLS-reset and packed-K-sidecar proof gates, not foundation
-implementers. Exact convergence is `{o6jx + every focused child} → otry`, then
-`hcyp`; `.15.13 → tudj` is preserved. The fixed teardown order, H1-H14/G1-G7,
-fixtures, split mutations, and lock controls remain canonical.
+implementers. Exact tail is `all foundations/focused children → otry → jwy4 →
+k7b0`, with closed self-test line-drift prerequisite `hcyp → jwy4`; `.15.13 →
+tudj` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
+census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
+mutations, and lock controls remain canonical.
 
 ## Path-scoped zone sizing
 

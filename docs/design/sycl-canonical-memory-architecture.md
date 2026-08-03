@@ -925,14 +925,16 @@ viu2 ─────────────────────────
 {1q72, o6jx} --preserve/revalidate--> h5m4 (merged TLS-worker-reset gate)
 {1q72, tudj, o6jx} --preserve/revalidate--> t5nq (merged packed-K-sidecar gate)
 32dg8.15.13 (event-returning memory-op surface) ─────> tudj
-{o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou} ──> otry
-main self-test repair + all implementation/convergence children ──> hcyp
+{viu2, 1q72, tudj, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
+  └──> otry ──> jwy4 ──> k7b0
+hcyp (closed self-test line-drift repair prerequisite) ────────────> jwy4
 ```
 
 This graph is acyclic. Closed `h5m4`/`t5nq` supply merged proof evidence and
 regression gates only; foundation owners must preserve/re-run those gates but do
-not assign them new implementation. `otry` starts only after `o6jx` and every
-focused child listed above.
+not assign them new implementation. `otry` starts only after every foundation
+and focused child listed above. Final-census owner `jwy4` starts after `otry` and
+closed self-test prerequisite `hcyp`; `k7b0` starts only after `jwy4`.
 
 | Owner | Actual exclusive scope | Required evidence |
 |---|---|---|
@@ -947,8 +949,10 @@ focused child listed above.
 | `x3ou` | diagnostics/reporting only; consumes immutable snapshots from all foundations | H9/M8 and identity-reporting audit; no lifecycle mutation |
 | `h5m4` | **closed merged gate:** TLS worker reset proof/fix | `1q72`/`o6jx` preserve and revalidate it; no new implementation ownership |
 | `t5nq` | **closed merged gate:** packed-K sidecar event teardown proof/fix | `1q72`/`tudj`/`o6jx` preserve and revalidate it; no new implementation ownership |
-| `otry` | final convergence after `o6jx` and all focused children | integrated payload/lock/teardown census and corrections |
-| `hcyp` | audit script/fixtures, generated CSV, final source-hash/count prose | refresh together after implementation/convergence |
+| `otry` | final convergence after all foundations and focused children | integrated payload/lock/teardown convergence corrections |
+| `hcyp` | **closed merged prerequisite:** self-test line-drift repair only | existing parser self-test is green; no final-census ownership |
+| `jwy4` | final audit script/fixtures, generated CSV, source-hash/count prose | consumes `otry` and `hcyp`; refreshes all artifacts atomically at final HEAD |
+| `k7b0` | downstream audit closure | starts only after `jwy4` final-census evidence lands |
 
 The `1q72`→`o6jx` API handoff is named and exclusive. `1q72` implements
 `lifecycle_context_begin_drain(ContextId) -> DrainTicket`,
@@ -975,7 +979,7 @@ new exclusive owner:
 | `32dg8.15.13` event-returning memory ops | explicit prerequisite edge to `tudj`, which owns lifecycle payload/retention integration |
 | current bare-slot ownership/reclaim (`0qlw` history) | `viu2` owns generated identity; `o6jx` consumes it |
 | current all-device graph cleanup (`2wv5` history) | `1q72` owns epoch attribution; `o6jx` removes the sweep |
-| current load scratch reset (`k7b0` history) | mitigation until `viu2` transaction rollback supersedes it |
+| current load scratch reset history | mitigation until `viu2` transaction rollback supersedes it; downstream `k7b0` does not own this foundation |
 | merged `h5m4` / `t5nq` | remain TLS-reset and packed-K-sidecar proof/fix gates respectively; never lifecycle foundation owners |
 
 Cross-child changes require an explicit handoff commit from the exclusive owner;
@@ -1077,7 +1081,7 @@ is executable, not a manual source revert.
 
 The mutation runner fails if the mutant unexpectedly passes, the marker is
 absent, an unrelated assertion fires, restoration leaves a hook active, or the
-post-restoration baseline fails. The final `hcyp` gate is exact:
+post-restoration baseline fails. The final `jwy4` census gate is exact:
 
 ```sh
 python3 scripts/audit-sycl-static-storage.py --self-test
@@ -1085,11 +1089,12 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
-Main first owns the parser self-test repair. Then `hcyp` owns the final script
-and fixture adjustments plus generated CSV and this audit's commit/hash/count
-prose as one atomic refresh. It must reconcile all new lifecycle statics and
-contain no unowned mutable model/context/session/graph/invocation state. The
-historical 5793 census is not accepted as final evidence.
+Closed prerequisite `hcyp` owns only the already-merged self-test line-drift
+repair. After `otry` and `hcyp`, `jwy4` owns the final script and fixture
+adjustments plus generated CSV and this audit's commit/hash/count prose as one
+atomic refresh. It must reconcile all new lifecycle statics and contain no
+unowned mutable model/context/session/graph/invocation state. The historical
+5793 census is not accepted as final evidence. `k7b0` follows `jwy4`.
 
 ### 12.10 Phased code-path plan (not implemented by this document)
 
@@ -1103,7 +1108,8 @@ historical 5793 census is not accepted as final evidence.
 | P5 focused consumers | MoE discovery (`nn6z`), MoE bias/activation (`nlww`), layer manager (`vbeb`), pending KV mask (`y36c`), diagnostics (`x3ou`) consume foundations | subsystem tests pass; no focused child owns a foundation; merged `h5m4`/`t5nq` gates revalidated |
 | P6 final convergence | integrated foundation + every focused subsystem payload/lock/teardown census | `otry` starts after `o6jx` and all focused children; owns only convergence corrections |
 | P6R reporting | planner/tier API readers within diagnostics scope | `x3ou` proves reporting-only H9/M8 behavior |
-| P7 final audit | `hcyp` script fixtures, CSV, source hashes/count prose after main self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
+| P7 final audit | `jwy4` script fixtures, CSV, source hashes/count prose after `otry` and closed `hcyp` self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
+| P8 downstream closure | `k7b0` consumes `jwy4` final-census evidence | starts only after `jwy4` closes |
 
 No phase may expose a target identity API as supported current behavior before
 its owning paths and tests land end-to-end. Compatibility shims must fail closed
