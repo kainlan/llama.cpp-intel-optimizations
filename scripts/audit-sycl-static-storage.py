@@ -126,7 +126,7 @@ def recovered_function_name(source_b: bytes, error_node):
     return match.group(1) if match else None
 
 
-def named_scope(source_b: bytes, decl):
+def named_scope(source_b: bytes, decl, recovered_regions):
     """Return the nearest lexical storage scope; methods beat their class."""
     for item in ancestors(decl):
         item_kind = kind(item)
@@ -136,9 +136,9 @@ def named_scope(source_b: bytes, decl):
             result = declarator_name(source_b, field(item, "declarator"))
             return "function-local:" + (result[0] if result else "<function>"), True
         if item_kind == "ERROR":
-            name = recovered_function_name(source_b, item)
-            if name:
-                return "function-local:" + name, True
+            region = recovered_regions.get((start_byte(item), end_byte(item)))
+            if region and start_byte(decl) < region[2]:
+                return "function-local:" + region[0], True
         if item_kind in {"class_specifier", "struct_specifier", "union_specifier"}:
             name = field(item, "name")
             return "class:" + (text(source_b, name) if name else "<anonymous>"), False
@@ -203,8 +203,8 @@ def initializer_free_type(source_b: bytes, decl, first_declarator, declarator, n
     return " ".join(part for part in (base, before + after) if part).strip()
 
 
-def declaration_rows(source_b: bytes, decl):
-    scope, local = named_scope(source_b, decl)
+def declaration_rows(source_b: bytes, decl, recovered_regions):
+    scope, local = named_scope(source_b, decl, recovered_regions)
     storage = storage_specifiers(source_b, decl)
     if scope.startswith("class:") and "static" not in storage:
         return []
@@ -274,12 +274,41 @@ def code_mask(source_b: bytes):
     return bytes(out)
 
 
-def recovered_function_ancestor(source_b: bytes, node):
+def recovered_function_regions(source_b: bytes, gaps):
+    """Map recovered ERROR functions to (name, body start, balanced body end)."""
+    masked = code_mask(source_b)
+    regions = {}
+    for item in gaps:
+        if kind(item) != "ERROR":
+            continue
+        name = recovered_function_name(source_b, item)
+        if not name:
+            continue
+        body_start = source_b.find(b"{", start_byte(item), end_byte(item))
+        if body_start < 0:
+            continue
+        depth = 0
+        body_end = None
+        for pos in range(body_start, end_byte(item)):
+            if masked[pos] == ord("{"):
+                depth += 1
+            elif masked[pos] == ord("}"):
+                depth -= 1
+                if depth == 0:
+                    body_end = pos + 1
+                    break
+        if body_end is not None:
+            regions[(start_byte(item), end_byte(item))] = (name, body_start, body_end)
+    return regions
+
+
+def recovered_function_ancestor(node, recovered_regions):
     candidates = [node, *ancestors(node)]
-    return next(
-        (item for item in candidates if kind(item) == "ERROR" and recovered_function_name(source_b, item)),
-        None,
-    )
+    for item in candidates:
+        region = recovered_regions.get((start_byte(item), end_byte(item)))
+        if region and start_byte(node) >= start_byte(item) and end_byte(node) <= region[2]:
+            return item
+    return None
 
 
 def parsed_function_context(node):
@@ -299,7 +328,28 @@ def is_preprocessor_condition_recovery(source_b: bytes, gap):
     return end_byte(gap) <= line_end and re.match(rb"\s*#\s*(?:if|elif)\b", line) is not None
 
 
-def recovery_coverage(source_b: bytes, root, declarations):
+def recovered_tail_is_structurally_parsed(masked: bytes, error_node, body_end: int):
+    """Prove an oversized recovered ERROR's post-function tail is parsed top-level syntax."""
+    safe = {
+        "comment", ";", "declaration", "function_definition", "template_declaration",
+        "namespace_definition", "linkage_specification", "class_specifier", "struct_specifier",
+        "union_specifier", "enum_specifier", "type_definition", "alias_declaration",
+        "static_assert_declaration", "call_expression",
+    }
+    cursor = body_end
+    for item in children(error_node):
+        if end_byte(item) <= body_end:
+            continue
+        if start_byte(item) < body_end or masked[cursor:start_byte(item)].strip():
+            return False
+        item_kind = kind(item)
+        if item_kind not in safe and not item_kind.startswith("preproc_"):
+            return False
+        cursor = end_byte(item)
+    return not masked[cursor:end_byte(error_node)].strip()
+
+
+def recovery_coverage(source_b: bytes, root, declarations, recovered_regions):
     """Prove every recovery site unable to hide a census declaration, or fail."""
     gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
     declaration_spans = [(start_byte(item), end_byte(item)) for item in declarations]
@@ -319,17 +369,16 @@ def recovery_coverage(source_b: bytes, root, declarations):
             signature_spans.append((start_byte(item), start_byte(body)))
     recovered_functions = [
         item for item in gaps
-        if kind(item) == "ERROR" and recovered_function_name(source_b, item)
+        if (start_byte(item), end_byte(item)) in recovered_regions
         and not any(
-            kind(ancestor) in {"function_definition", "lambda_expression"}
-            or (kind(ancestor) == "ERROR" and recovered_function_name(source_b, ancestor))
+            kind(ancestor) == "ERROR"
+            and (start_byte(ancestor), end_byte(ancestor)) in recovered_regions
             for ancestor in ancestors(item)
         )
     ]
     for item in recovered_functions:
-        body_start = source_b.find(b"{", start_byte(item), end_byte(item))
-        if body_start >= 0:
-            signature_spans.append((start_byte(item), body_start))
+        _, body_start, _ = recovered_regions[(start_byte(item), end_byte(item))]
+        signature_spans.append((start_byte(item), body_start))
 
     failures = []
     masked = code_mask(source_b)
@@ -344,8 +393,16 @@ def recovery_coverage(source_b: bytes, root, declarations):
 
     categories = Counter()
     for gap in gaps:
+        own_region = recovered_regions.get((start_byte(gap), end_byte(gap)))
+        if own_region is not None:
+            categories["function-body-storage-proven"] += 1
+            if own_region[2] < end_byte(gap) and not recovered_tail_is_structurally_parsed(
+                masked, gap, own_region[2]
+            ):
+                failures.append((line_of(source_b, own_region[2]), "unproved recovery tail after function body"))
+            continue
         function = parsed_function_context(gap)
-        recovered = recovered_function_ancestor(source_b, gap)
+        recovered = recovered_function_ancestor(gap, recovered_regions)
         if function is not None or recovered is not None:
             body = field(function, "body") if function is not None else None
             if body is not None and end_byte(gap) <= start_byte(body):
@@ -424,12 +481,14 @@ def parse_source(parser, source):
     source_b = source.encode()
     root = call(parser.parse(source), "root_node")
     declarations = [item for item in walk(root) if kind(item) in DECL_KINDS]
-    rows = [row for decl in declarations for row in declaration_rows(source_b, decl)]
-    gaps, categories, failures = recovery_coverage(source_b, root, declarations)
+    gaps = [item for item in walk(root) if kind(item) == "ERROR" or is_missing(item)]
+    recovered_regions = recovered_function_regions(source_b, gaps)
+    rows = [row for decl in declarations for row in declaration_rows(source_b, decl, recovered_regions)]
+    gaps, categories, failures = recovery_coverage(source_b, root, declarations, recovered_regions)
     return source_b, rows, gaps, categories, failures
 
 
-def self_test(parser):
+def self_test(parser, repo):
     source = """
 struct C {
     static int member;
@@ -471,12 +530,33 @@ namespace ext { extern int declaration_only; extern int definition = 1; }
         "function-body-static-recovery": "void f(){ static Widget x{; }",
         "structural-preprocessor-recovery": "#if X\nWidget implicit_global{;\n#endif",
         "namespace-direct-init-recovery": "namespace broken { Widget implicit_global{; }",
+        "recovered-function-tail": "static void recovered() { #wat x }\nWidget implicit_global{;",
     }
     for fixture, broken in negative_fixtures.items():
         _, _, broken_gaps, _, broken_failures = parse_source(parser, broken)
         assert broken_gaps and broken_failures, f"{fixture} must fail closed"
+        if fixture == "recovered-function-tail":
+            assert any(reason == "unproved recovery tail after function body" for _, reason in broken_failures)
+    audited = (repo / FILES[0]).read_text(encoding="utf-8")
+    audited_b, audited_rows, _, _, audited_failures = parse_source(parser, audited)
+    assert not audited_failures
+    expected_file_scopes = {
+        93499: "ggml_backend_sycl_interface",
+        94640: "ggml_backend_sycl_device_interface",
+        94700: "ggml_backend_sycl_reg_interface",
+        94801: "g_sycl_seq_ids_cache",
+        94857: "g_sycl_device_token_cache",
+    }
+    actual_file_scopes = {
+        line_of(audited_b, row["name_node"]): (row["name"], row["scope"])
+        for row in audited_rows
+        if line_of(audited_b, row["name_node"]) in expected_file_scopes
+    }
+    assert actual_file_scopes == {
+        line: (symbol, "file") for line, symbol in expected_file_scopes.items()
+    }, f"recovered function tail scopes: {actual_file_scopes}"
     print("fixtures=PASS method-local,const-pointee,same-name,direct-init-recovery,multi-object,namespaced-extern,"
-          "function-body-static-recovery,structural-preprocessor-recovery")
+          "function-body-static-recovery,structural-preprocessor-recovery,recovered-function-tail,file-tail-scopes")
 
 
 def main():
@@ -488,7 +568,7 @@ def main():
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = ap.parse_args()
     if args.self_test:
-        self_test(parser)
+        self_test(parser, args.repo)
         return 0
 
     all_rows, reports, failures = [], [], []

@@ -30,8 +30,8 @@ bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
 At audited source commit `5793f2ca1089eaf27203ee171c0d73d60a3e4c83`, the
-census emits **1,326 object rows**: 390 explicitly-static non-local objects,
-58 non-local objects with implicit static storage duration, 874 function-local
+census emits **1,326 object rows**: 395 explicitly-static non-local objects,
+58 non-local objects with implicit static storage duration, 869 function-local
 static/thread-local objects, and 4 class static declarations. Per-file rows are 1,127
 (`ggml-sycl.cpp`), 148 (`unified-cache.cpp`), 8 (`unified-cache.hpp`), 41
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
@@ -42,7 +42,7 @@ census: their artifact, source SHA, and extraction method were not supplied,
 so a row-for-row comparison would be invented. Structurally, they expand in
 both directions: multi-object declarations produce multiple object rows,
 while static functions/prototypes are not storage objects; the parser also
-adds the 58 implicit non-local objects, 874 local statics, and 4 class statics
+adds the 58 implicit non-local objects, 869 local statics, and 4 class statics
 that a column-zero lexical pass does not cover. No comparison is made to the
 historical 329 figure because it likewise lacks a source SHA and method.
 
@@ -56,25 +56,32 @@ tokens such as `PRId64`; the latter are dispatch macro invocations and a label
 next to a conditional compilation boundary. These are **explicit raw-parser recovery sites**, not silently discarded
 regions. Each of the 51 nodes must receive a structural proof category. In the
 current inputs, 17 are confined to parsed function signature/storage spans and
-31 are in parsed or unambiguously recovered function bodies. Only the signature
-span exempts a function's own `static` storage-class marker. Body recovery is
-accepted only when every `static`/`thread_local` marker in it independently
-belongs to a parsed declaration; an unparsed marker fails the census. The
-remaining 3 sites are confined to `#if` condition lines, which cannot contain a
-declaration. Structural preprocessor recovery spanning a conditional body is
-not exempt. Any other namespace/file recovery is rejected because it could
-conceal an implicit-static object of a user-defined type or direct-initialization
-spelling. There are no declaration-type or spelling exemptions. The generator
-exits 2 without writing output when a recovery node or storage marker lacks
-proof.
+31 are in parsed or unambiguously recovered function bodies. Recovered function
+regions end at the lexically balanced closing brace (with comments and literals
+masked); an oversized `ERROR` node's tail must independently consist of parsed
+top-level constructs or the census fails. The same balanced bound controls
+scope attribution, preventing later file-scope declarations from inheriting the
+recovered function's scope. Only the signature span exempts a function's own
+`static` storage-class marker. Body recovery is accepted only when every
+`static`/`thread_local` marker in it independently belongs to a parsed
+declaration; an unparsed marker fails the census. The remaining 3 sites are
+confined to `#if` condition lines, which cannot contain a declaration.
+Structural preprocessor recovery spanning a conditional body is not exempt. Any
+other namespace/file recovery is rejected because it could conceal an
+implicit-static object of a user-defined type or direct-initialization spelling.
+There are no declaration-type or spelling exemptions. The generator exits 2
+without writing output when a recovery node or storage marker lacks proof.
 
 `--self-test` covers nearest method/lambda scope, const pointee versus const
 pointer, mutable containers/atomics, repeated names in different bindings,
 initializer-free direct initialization, fail-closed namespace recovery,
 multi-object declarations, and namespaced `extern` declaration versus
 definition. Negative fixtures also require rejection of malformed recovery in
-a function body (`void f(){ static Widget x{; }`) and across a structural
-preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`).
+a function body (`void f(){ static Widget x{; }`), across a structural
+preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
+in an oversized recovered-function `ERROR` tail containing a malformed implicit
+global. It also asserts that the declarations at `ggml-sycl.cpp` lines 93499,
+94640, 94700, 94801, and 94857 retain file scope.
 
 ### Static high-risk highlights (no behavior changes in this census)
 
