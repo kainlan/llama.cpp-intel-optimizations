@@ -134,6 +134,68 @@ is the short form; this is the why):
   host-pinned pointer to a GPU kernel is slower (measured 1.6–2.6×) *and* breaks
   the tier abstraction. Let `resolve()` report residency and route accordingly.
 
+## Lifecycle identity and async lease boundary
+
+**Target invariants (not current APIs or current behavior).** The enforceable
+contract is canonical §12: `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
+`ContextId`, `(ContextId, SessionId, SessionResetEpoch)`, `(ContextId,
+GraphEpoch)`, and `InvocationId`. IDs never wrap; slot 33 fails before LOADING.
+Loads abort by default on missing success, wrong txn, depth error, cancellation,
+or failure. Reset/teardown uses exact typed tickets, including reset epochs that
+prevent ABA.
+
+Allocation identity, semantic owner, and asynchronous use are distinct. One
+exclusive top-level token per device is copied into submits. Each invocation binds exactly one `ContextId`/`GraphEpoch` across its devices;
+a cross-context/epoch submit fails before side effects. Lifecycle authority is
+an aggregate with separate root retention and terminal-event sets per device.
+Each device is OPEN while producers/submits register, SEALED only after
+registration closes and every producer seals, then COMPLETE only when every
+registered slot is terminal; uncertain submission becomes QUARANTINED. A fast
+terminal while OPEN cannot release anything. Join creation failure drains known
+events outside locks; quarantine retains roots/backing until quiescence is
+proven. Same-owner reentrancy copies the exact InvocationId; busy/wait and
+multi-device all-or-none rules remain explicit.
+
+Every async pointer has a backing lifetime. Bare `DIRECT` requires a validated
+owner/backing lease and ARENA handles retain arena/chunk generation. A retiring
+`GraphEpoch` completion releases only old-epoch resources, never replacement
+state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner registries
+→ L4 cache/queue registry → L5 allocator/work ordering; the canonical table
+includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue,
+backend-context, and `control_host_allocs_mutex` locks. The target deletes the
+oneDNN global `unique_lock` registry. `t5nq` deletes it and freezes a logical
+`{device, generation, reservation_id}` API: brief same-thread keyed-mutex
+transitions increment/decrement reservation refcounts, while event payloads carry
+only logical reservation/backing handles. Cross-thread completion takes/releases
+the keyed mutex on that completion thread; no mutex ownership is retained. Global/transitional same-rank co-holding is forbidden and
+completion/diagnostic locks C/D are isolated. No wait, blocking allocation/device
+call, queue create/destroy, callback, or final handle/token/backing destruction
+occurs under a listed lock. Tier verdicts are reporting-only.
+
+**Current exceptions during migration.** Current code still has bare slot masks,
+process-global load/planner scratch, device-only pending-KV FIFO,
+`g_sycl_graph_compute_mutex`, graph cleanup without model/epoch attribution,
+DIRECT/ARENA shapes without universal async backing retention, and void memory
+ops without terminal events. Current oneDNN scratch keeps keyed locks in a
+global same-rank registry, and current control-host cleanup clears owning
+`mem_handle`s under its context mutex. The sole target teardown order is: begin
+drain → wait for terminal context events outside locks → extract/move the control
+batch under L4 → unlock → destroy batch → finish drain. These are
+non-conformances to migrate, not licensed exceptions to preserve or descriptions
+of supported concurrency.
+
+Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
+registry primitives/create/publish/extract; `y36c` owns legacy callers and the
+fixed drain→wait→extract→destroy→finish sequence), DAG (`nn6z → nlww → vbeb →
+h5m4 → y36c → otry`, `t5nq logical-reservation API → h5m4`, `.15.13 → h5m4`);
+`t5nq` has no post-h5 work, `y36c` owns teardown integration, and `otry` starts
+afterward for final payload/lock/teardown convergence, G1/G7 ownership, token-only G5a versus teardown-only G5b,
+legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
+independent ordinary/sidecar/pointer-table M6 mutants, the OPEN-before-seal race
+mutant, and L1-L5/C/D M7 with separate global-registry-absence and cross-thread
+reservation-completion controls, and final `hcyp`
+script+fixture+CSV+prose refresh after main's self-test repair.
+
 ## Path-scoped zone sizing
 
 `populate_host_zone_sizing` (`ggml/src/ggml-sycl/unified-cache.cpp`) once sized

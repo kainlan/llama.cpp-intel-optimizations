@@ -177,6 +177,142 @@ model execution. The sections below preserve the earlier targeted/manual audit;
 the generated census does not retroactively make their textual searches
 binding-resolved evidence.
 
+## Lifecycle-contract delta (39p5, docs-only)
+
+The authoritative target lifecycle is now §12 of
+[`sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md).
+It requires explicit `ModelId`, `(slot, SlotGeneration)`, `LoadTxnId`,
+`ContextId`, `(ContextId, SessionId, SessionResetEpoch)`, `(ContextId,
+GraphEpoch)`, and `InvocationId` identities; abort-default nested transactions;
+owner-targeted reset/teardown; lock ordering; and aggregate event-held
+memory/execution leases. These are **target requirements**, not
+names of current C++ APIs. The earlier audit language about a single structural
+outer load reset describes current mitigation only and must not be read as proof
+of a transaction or multi-model lifecycle.
+
+### Current source-anchor check
+
+Anchors below were checked against the source in this worktree on 2026-08-04.
+Line numbers are review aids and may drift; the symbols/behaviors are the gate.
+
+| Source anchor | Current behavior observed | Contract gap / child |
+|---|---|---|
+| `ggml-sycl.cpp:8986-9006` | process-global allocated/live bitmasks; 32 bare slots; conservative unattributed fallback | no `ModelId` or generation; ABA/attribution work: `nn6z` |
+| `ggml-sycl.cpp:9029-9032` | “current” API returns process-global last-completed slot | not caller/model identity: `nn6z` |
+| `ggml-sycl.cpp:9041-9083` | teardown releases a bare slot, then clears graph replay leases on every device | not owner/epoch targeted: `y36c`, `vbeb` |
+| `ggml-sycl.cpp:9093-9199` | atomic nesting depth; outer entry resets scratch/reserves slot; outer `false` preloads and publishes LIVE | no transaction ID or failure channel; clamp can turn protocol failure into completion: `nn6z` |
+| `ggml-sycl.cpp:9244-9273` | pending KV layer masks are per-device FIFO queues | no context/session attribution: `nlww` |
+| `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
+| `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
+| `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
+| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `t5nq` deletes registry and supplies logical generation/refcount reservation; `h5m4` event-retains reservation/backing without mutex ownership |
+| `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | blocking allocation/device/final-owner work under metadata lock: `t5nq`, `h5m4` |
+| `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/device work must use reserve-create-publish: `t5nq` |
+| `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | target snapshot must carry an owner lease: `nlww`, `t5nq` |
+| `common.hpp:4614-4615`, `ggml-sycl.cpp:32784-32791` | `control_host_allocs_mutex` protects a vector whose clear destroys `mem_handle`s while locked | `nlww` extract primitive + `y36c` outside-lock destruction; rank/alias: `t5nq`; terminal retention: `h5m4` |
+
+Recheck these anchors without relying on a size-limited index:
+
+```sh
+awk 'NR>=8986 && NR<=9199 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=9238 && NR<=9275 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=9736 && NR<=10096 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=85621 && NR<=85670 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=1436 && NR<=1457 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.hpp
+awk 'NR>=11305 && NR<=11394 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.cpp
+awk 'NR>=13788 && NR<=14012 { print NR ":" $0 }' ggml/src/ggml-sycl/unified-cache.cpp
+awk 'NR>=14726 && NR<=14742 || NR>=17122 && NR<=17131 || NR>=32784 && NR<=32791 || NR>=76070 && NR<=76100 { print NR ":" $0 }' ggml/src/ggml-sycl/ggml-sycl.cpp
+awk 'NR>=4614 && NR<=4615 { print NR ":" $0 }' ggml/src/ggml-sycl/common.hpp
+```
+
+### Audit disposition by required identity
+
+| State class | Required identity | Reset/teardown verdict |
+|---|---|---|
+| plan, tensor inventory, load diagnostics, temporary registrations | `LoadTxnId` until commit, then `ModelId` | rollback transaction only; never “clear current model” globally |
+| bounded weight owner slot | `ModelId` + `(slot, SlotGeneration)` | remove exact owner; preserve shared entry and all live/event leases |
+| KV/RUNTIME/SCRATCH/oneDNN/staging | `ContextId`; KV rows also `SessionId` | exact context/session only; whole-device reset must refuse |
+| session reset | `(ContextId, SessionId, SessionResetEpoch)` | nonwrapping exact ticket; stale reset N cannot finish/reset N+1 |
+| recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
+| async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one context/epoch; each device is OPEN→SEALED→COMPLETE or QUARANTINED with registered producer/submit counts; no root release while OPEN |
+| tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
+
+IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
+and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and
+without registry/planner/reset side effects; it cannot fall back to unattributed
+ownership. Context, session, graph, reset-ABA, retiring completion, and aggregate
+join-failure/quarantine behavior, including a fast terminal before final producer
+registration/seal, are canonical §12.2-§12.3. H14 explicitly
+distinguishes never-issued `SessionId`/`GraphEpoch` (`NOT_FOUND`) from stale,
+previously-issued identities (`STALE_IDENTITY`).
+
+The concrete ranks are lifecycle/ID (L1) → per-device execution registry (L2) →
+model/context/session/graph (L3) → all listed cache metadata locks (L4) → all
+listed zone/staging/pool/work locks (L5). The canonical exhaustive table now
+includes `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`,
+`g_pipeline_copy_queue_mutex`, block-exec `copy_queue_mutex`, and
+`g_backend_context_by_device_mutex`, and
+`ggml_backend_sycl_context::control_host_allocs_mutex`, including their
+allocation/queue/final-owner under-lock hazards. The oneDNN global lock registry is not ordered around the
+keyed mutex: it is deleted. The surviving keyed mutex protects only brief
+same-thread logical reservation/refcount transitions; cross-thread completion
+acquires/releases that mutex on the completion thread itself. Global/transitional locks use a sentinel and cannot co-hold
+a keyed same-rank lock. Completion C and diagnostics D are isolated. Every wait,
+callback, blocking allocation/device operation, queue construction/destruction,
+and final handle/token/backing destruction is forbidden under L1-L5/C/D;
+H8/M7 must cover every operation/rank and each named lock alias.
+
+### Child and final-census gates
+
+| Child | Audit must prove |
+|---|---|
+| `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
+| `nlww` | context/session/reset-epoch registries and state primitives/create/publish; implements named control-host-allocation extract API |
+| `vbeb` | graph/invocation identities, one context/epoch, OPEN/SEALED producer+submit accounting, one token/device, aggregate+quarantine; owns H11/G5a/G7/M6e |
+| `t5nq` | pre-h5 only: deletes global registry, freezes logical generation/refcount acquire/completion API, inventories control mutex; no post-h5 work |
+| `h5m4` | consumes frozen t5 API and event-retains logical oneDNN reservation/backing plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA |
+| `y36c` | teardown integration after h5: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
+| `otry` | final post-y36c convergence owner: payload/lock/teardown census, registry/async-mutex absence, integration fixes |
+| `x3ou` | all tier-verdict readers are reporting-only |
+| `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
+
+Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
+vbeb → h5m4 → y36c → otry`, with explicit `t5nq logical-reservation API →
+h5m4` and `32dg8.15.13 → h5m4` edges. `t5nq` ends at handoff; `y36c` owns
+teardown integration; `otry` starts afterward and owns the final convergence
+census. No edge returns from `otry` to an implementation child. It supersedes stale `32dg8.2` ownership
+assumptions and treats historical `.15.10` as superseded by `nlww`/`y36c` while
+mapping `.15.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
+editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
+shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
+M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
+L1-L5/C/D M7 hooks (global-registry absence and cross-thread completion are
+separate positive controls) are canonical §12.9. Multiple LIVE
+models and sequential A→B→A are separate gates; neither proves overlapping
+execution, which must serialize/reject through per-device aggregate roots.
+
+**Census status now:** the checked-in inventory remains the historical
+`5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
+worktree, `python3 scripts/audit-sycl-static-storage.py --check` reports it stale.
+That is expected before implementation and is an explicit open gate, not a pass.
+`hcyp` must run, at final source HEAD:
+
+```sh
+python3 scripts/audit-sycl-static-storage.py --self-test
+python3 scripts/audit-sycl-static-storage.py
+python3 scripts/audit-sycl-static-storage.py --check
+```
+
+Main owns the prerequisite repair that makes the existing self-test green.
+After that lands, `hcyp` exclusively owns final edits to
+`scripts/audit-sycl-static-storage.py`, its embedded/external self-test fixtures,
+`docs/backend/sycl-static-storage-inventory.csv`, and this document's source
+SHA-256/commit/count prose. It refreshes all four at one final implementation
+HEAD, classifies every new mutable lifecycle row by owner/synchronization/
+teardown, and leaves no unowned model/context/session/graph/invocation state. A
+CSV-only refresh, a count without reconciliation, or a green check against
+pre-implementation source does not close `hcyp`.
+
 ---
 
 `test-llama-archs` loads ~131 architectures back-to-back in **one process**.
@@ -272,14 +408,18 @@ structurally impossible.
   the opposite mechanism from the uuid cache (always-fresh instead of
   pure-function), but safe.
 - **`g_runtime_alloc_registry`, `g_runtime_cohort_tier`,
-  `g_runtime_reset_reclaimed_allocs`, `g_offload_pool_slots`,
-  `g_onednn_scratch_locks`** (`unified-cache.cpp`): all "maintained, no
-  bare `.clear()`" in the systematic sweep, but all have paired
-  `emplace`/`erase` at every insertion site checked — these track the
-  lifetime of individual raw allocations (not model identity), which is a
-  legitimate use of pointer keys (this *is* the allocator's own bookkeeping,
-  not a downstream cache using a pointer as an identity key). Spot-checked,
-  not exhaustively traced through every call path.
+  `g_runtime_reset_reclaimed_allocs`, `g_offload_pool_slots`**
+  (`unified-cache.cpp`): all "maintained, no bare `.clear()`" in the systematic
+  sweep, but all have paired `emplace`/`erase` at every insertion site checked —
+  these track individual allocation lifetimes. Spot-checked, not exhaustively
+  traced through every call path.
+- **Historical correction — `g_onednn_scratch_locks` is non-conforming.** The
+  earlier category grouped it with correctly-scoped allocator bookkeeping
+  because its map entries had paired erase. That assessed key lifetime, not lock
+  lifetime: it persists a thread-owned keyed `unique_lock` in a global registry,
+  acquires another same-rank mutex to store it, and may erase/unlock on another
+  thread. Canonical §12.5 supersedes that assessment and requires the map/global
+  mutex to be deleted in favor of logical reservation generation/refcount state.
 
 ## Category (c): model-scoped and leaking — found and fixed
 
