@@ -96,6 +96,7 @@
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
+#include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
@@ -11027,41 +11028,9 @@ static bool ggml_sycl_refresh_moe_ids_cache(ggml_backend_sycl_context & ctx,
 // pointer tables are rebuilt from the current tensor's canonical mem_handles
 // so role/layout/lease/event state cannot drift.
 // ---------------------------------------------------------------------------
-struct moe_layer_ids_cache_entry {
-    std::vector<int32_t> ids_host;  // Expert IDs (copied D2H once at GATE)
-
-    // Task 1E: Cached expert partitioning from first sub-op for fusion path reuse.
-    // Avoids redundant placement table lookups at subsequent sub-ops (~1ms/token).
-    struct cached_partition {
-        std::vector<size_t> cpu_indices;
-
-        struct sec_info {
-            size_t ci;
-            int    device_id;
-        };
-
-        std::vector<sec_info> sec_indices;
-        std::vector<size_t>   gpu0_cached_indices;
-        bool                  valid = false;
-    } partition;
-};
-
-// Keyed by block-number layer_id (parsed from tensor name). Cleared each graph boundary.
-static thread_local std::unordered_map<int, moe_layer_ids_cache_entry> g_moe_layer_ids_cache;
-
-static inline void ggml_sycl_moe_layer_ids_cache_reset_entry(moe_layer_ids_cache_entry & entry) {
-    entry.ids_host.clear();
-    entry.partition.cpu_indices.clear();
-    entry.partition.sec_indices.clear();
-    entry.partition.gpu0_cached_indices.clear();
-    entry.partition.valid = false;
-}
-
-static inline void ggml_sycl_moe_layer_ids_cache_reset_all() {
-    for (auto & [_, entry] : g_moe_layer_ids_cache) {
-        ggml_sycl_moe_layer_ids_cache_reset_entry(entry);
-    }
-}
+// Keyed by block-number layer_id (parsed from tensor name). Reset synchronously
+// on the dispatching worker at every graph boundary.
+static thread_local moe_layer_ids_cache g_moe_layer_ids_cache;
 
 static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_context & ctx,
                                                         const ggml_tensor *         src0,
@@ -11333,10 +11302,6 @@ static void ggml_sycl_moe_ids_cache_new_graph() {
         entry.wait();
     }
     g_moe_ids_d2h_cache.clear();
-    // Clear per-layer IDs without releasing backing storage. Some hot paths
-    // reset this cache every graph; destroying the vectors/map there can turn
-    // into a large host-side stall under the SYCL runtime allocator.
-    ggml_sycl_moe_layer_ids_cache_reset_all();
 }
 
 // Re-resolve a cached secondary route for the current sub-op's weight tensor.
@@ -11364,10 +11329,6 @@ static inline bool moe_1e_resolve_sec_handle(const ggml_tensor *           src0,
         *out_route = std::move(route);
     }
     return true;
-}
-
-static void ggml_sycl_moe_layer_ids_cache_new_graph() {
-    ggml_sycl_moe_layer_ids_cache_reset_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -79378,11 +79339,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // no stale events leak across graph boundaries.
     split_merge_drain();
 
-    // Invalidate per-graph caches.
+    // Invalidate per-graph caches synchronously on this dispatch worker before
+    // the first graph-local lookup or compute dispatch.
     ggml_sycl_data_ptr_cache_new_graph();
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
-    ggml_sycl_moe_layer_ids_cache_new_graph();
+    ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
 #ifdef GGML_SYCL_GRAPH
     if (sycl_ctx->moe_direct_dispatch_graphs_n_nodes != cgraph->n_nodes ||
         sycl_ctx->moe_direct_dispatch_graphs_is_decode != g_moe_descriptor_capture_decode_phase) {
@@ -84626,7 +84588,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_data_ptr_cache_new_graph();
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
-    ggml_sycl_moe_layer_ids_cache_new_graph();
+    ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
     graph_prestage_leaf_tensors(sycl_ctx, cgraph);
     graph_refresh_input_tensors(sycl_ctx, cgraph);
 
@@ -93059,7 +93021,7 @@ normal_dispatch:
                 ggml_sycl_data_ptr_cache_new_graph();
                 ggml_sycl_cpu_quant_cache_new_graph();
                 ggml_sycl_moe_ids_cache_new_graph();
-                ggml_sycl_moe_layer_ids_cache_new_graph();
+                ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
 
                 // Check if segments are valid for this graph
                 bool segments_match = sycl_ctx->moe_segments_valid &&

@@ -3153,3 +3153,25 @@ set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
     LABELS "sycl;fusion;rms-norm;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120)
+
+# Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
+# std::threads but no SYCL queue, links no backend library, and takes no -fsycl
+# options. The source-order checks keep all three production entry paths wired
+# to the same synchronous helper before their first dispatch.
+add_executable(test-moe-layer-ids-worker-reset
+    tests/test-moe-layer-ids-worker-reset.cpp
+)
+target_include_directories(test-moe-layer-ids-worker-reset PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(test-moe-layer-ids-worker-reset PRIVATE
+    GGML_SYCL_CPP_SOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp\"
+)
+target_link_libraries(test-moe-layer-ids-worker-reset PRIVATE Threads::Threads)
+add_test(NAME sycl-moe-worker-reset COMMAND test-moe-layer-ids-worker-reset)
+set_tests_properties(sycl-moe-worker-reset PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;host-only;tls"
+    TIMEOUT 30
+)
