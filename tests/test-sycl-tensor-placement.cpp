@@ -247,10 +247,21 @@ int main() {
     lifecycle_stage_placement_plan(1003, plan, kv_a, 12);
     const auto during_b_load = lifecycle_select_placement_plan(2001, 1001, 3, 7);
     lifecycle_abort_placement_plan(1003);
+    lifecycle_stage_no_placement_plan(1004, kv_b, 24);
+    const auto        no_arena_candidate = lifecycle_find_candidate_placement_plan(1004);
+    std::atomic<bool> cross_thread_candidate{ false };
+    std::thread       candidate_reader([&] {
+        const auto candidate = lifecycle_find_candidate_placement_plan(1004);
+        cross_thread_candidate.store(candidate && candidate->explicit_no_plan, std::memory_order_release);
+    });
+    candidate_reader.join();
+    const auto during_no_arena_load = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    lifecycle_abort_placement_plan(1004);
     const auto manual_a2 = lifecycle_select_placement_plan(2001, 1001, 3, 7);
     const auto stale_a   = lifecycle_select_placement_plan(2001, 1001, 3, 8);
-    if (manual_a1 && manual_b && during_b_load.get() == manual_a1.get() && manual_a2.get() == manual_a1.get() &&
-        !stale_a) {
+    if (manual_a1 && manual_b && during_b_load.get() == manual_a1.get() && no_arena_candidate &&
+        no_arena_candidate->explicit_no_plan && cross_thread_candidate.load(std::memory_order_acquire) &&
+        during_no_arena_load.get() == manual_a1.get() && manual_a2.get() == manual_a1.get() && !stale_a) {
         n_pass++;
     } else {
         printf("FAIL exact A/B/A activation or B-abort continuity\n");

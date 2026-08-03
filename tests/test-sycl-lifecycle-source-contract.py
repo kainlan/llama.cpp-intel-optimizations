@@ -79,11 +79,14 @@ checks = {
             "lifecycle_abort_placement_plan",
         )
     ),
-    "transaction-local load candidate": "thread_local std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot>"
-    in backend
-    and "g_load_candidate_publication = have_plan ? plan_snapshot : nullptr" in backend
+    "transaction-local load candidate": re.search(r"thread_local\s+uint64_t\s+g_load_candidate_txn_id", backend)
+    is not None
+    and "lifecycle_find_candidate_placement_plan(g_load_candidate_txn_id)" in backend
+    and "g_load_candidate_txn_id = have_plan ? active_plan_owner.load.value : 0" in backend
     and "ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr)" not in backend
-    and "ggml_sycl_reset_model_load_scratch_state(true)" in backend,
+    and "ggml_sycl_reset_model_load_scratch_state(true)" in backend
+    and "lifecycle_stage_no_placement_plan(token.load.value" in backend
+    and "if (!ggml_sycl::vram_arena_enabled())" in backend,
     "explicit exact activation": "ggml_backend_sycl_activate_model_plan" in public
     and "lifecycle_select_placement_plan" in backend
     and "ggml_backend_sycl_set_runtime_context_for_model" in public,
@@ -159,7 +162,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 7,
+        "ggml_sycl_global_plan_snapshot": 6,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -176,6 +179,9 @@ checks = {
     "same snapshot cache publication": backend.count("set_placement_plan_snapshot") == 1,
     "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
     and "get_placement_plan_owner(" not in cache_hpp,
+    "transactional model runtime update": "g_runtime_external_lease" in backend
+    and "g_runtime_update_succeeded" in backend
+    and "if (!backend || !backend->context || n_ctx == 0)" in backend,
     "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend
     and "auto next_kv_info = current->kv_info" in backend
     and "next->kv_info       = next_kv_info" in backend

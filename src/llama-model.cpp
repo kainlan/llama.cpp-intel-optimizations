@@ -64,6 +64,8 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_model_load_end)          end        = nullptr;
     decltype(&ggml_backend_sycl_model_unloaded_token)    unload     = nullptr;
     decltype(&ggml_backend_sycl_model_quarantine_token)  quarantine = nullptr;
+    decltype(&ggml_backend_sycl_activate_model_plan)           activate        = nullptr;
+    decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context = nullptr;
 };
 
 static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
@@ -85,6 +87,10 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
         result.quarantine = reinterpret_cast<decltype(result.quarantine)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_quarantine_token"));
+        result.activate = reinterpret_cast<decltype(result.activate)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_activate_model_plan"));
+        result.runtime_context = reinterpret_cast<decltype(result.runtime_context)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
         break;
     }
     return result;
@@ -92,7 +98,7 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
 
 static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
     return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
-           hooks.quarantine;
+           hooks.quarantine && hooks.activate && hooks.runtime_context;
 }
 
 static bool llama_model_sycl_hooks_enabled() {

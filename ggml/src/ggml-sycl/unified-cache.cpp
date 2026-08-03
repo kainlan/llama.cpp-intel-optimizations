@@ -99,6 +99,16 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
 
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
+        return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);

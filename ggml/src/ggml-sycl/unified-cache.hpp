@@ -1070,6 +1070,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
                                        const placement_kv_info & kv_info       = {},
                                        uint32_t                  model_n_layer = 0);
 void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept;
 bool lifecycle_publish_placement_plan(
     uint64_t                                         model_id,
     uint64_t                                         load_txn_id,

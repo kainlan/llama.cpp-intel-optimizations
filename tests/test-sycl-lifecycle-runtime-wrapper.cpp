@@ -23,6 +23,8 @@ int main() {
             std::fprintf(stderr, "missing registry procedure %s\n", #name);                                \
             return 1;                                                                                      \
         }
+    LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
+    LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
     LOAD_SYCL(ggml_backend_sycl_model_load_end)
@@ -33,6 +35,12 @@ int main() {
 #endif
 
     ggml_sycl_model_token zero{};
+    if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||
+        CALL_SYCL(ggml_backend_sycl_set_runtime_context_for_model)(nullptr, zero, 0, 0, 0) !=
+            GGML_SYCL_LIFECYCLE_NULL_OUTPUT) {
+        std::fprintf(stderr, "activation/runtime API signature or invalid-input result mismatch\n");
+        return 1;
+    }
     if (CALL_SYCL(ggml_backend_sycl_model_quarantine_token)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
         std::fprintf(stderr, "zero quarantine token accepted\n");
         return 1;
