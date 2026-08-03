@@ -365,7 +365,10 @@ GPU backends cache weights on-device for repeated inference:
 > key design constraint of the fork — read those before touching allocation,
 > dispatch, or eviction code. The rules below are the short form.
 
-The unified cache is the memory allocator for the SYCL backend. All SYCL
+The unified cache is the memory allocator for the SYCL backend. Its authority is
+not optional: `9a0670712` removed `GGML_SYCL_UNIFIED_CACHE=0`, the old name is
+no longer read, and there is no replacement opt-out. The distinct
+`GGML_SYCL_UNIFIED_CACHE_MODE` variable selects cache topology only. All SYCL
 backend GPU, host-pinned, staging, scratch, graph-temporary, KV, oneDNN, and
 weight-layout allocations must flow through the unified-cache allocation APIs
 (`unified_alloc`, `unified_allocate`, cache materialization helpers, or wrappers
@@ -396,8 +399,9 @@ memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
 continue with `GGML_ABORT`, plus the same in `host_zone_reset` and `zone_reset`.
 That made `test-llama-archs` and `test-thread-safety` — both `main`-labelled —
 fail deterministically, and each abort masked whatever came after it, so nobody
-connected the failures back. Restored in `acdb192d4`; the zone-reset siblings are
-tracked in `llama.cpp-fz2u`.
+connected the failures back. `acdb192d4` restored preserve-and-continue for
+leased weight entries; `4afdb6d9f` made whole-zone resets refuse the reset when
+live registered allocations prevent safe partial preservation.
 
 Two things this does **not** license:
 
@@ -864,10 +868,14 @@ timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
 Note `-p 0 -n 4` triggers planning but does **no prompt processing**, so paths
 reached only during PP will show zero activity. Use `-p 512` when you need them.
 
-**2. ONE model per process.** Passing two `-m` flags to a single `llama-bench`
-aborts at the model switch on a leaked model-weight `mem_handle` lease
-(`unified-cache.cpp`, `reset_model_weight_entries: leaked model-weight
-mem_handle lease`). Loop the shell, don't loop the flag.
+**2. Multiple live models are supported.** This section previously claimed that
+passing two `-m` flags aborts at the model switch with a leaked model-weight
+`mem_handle` lease. That described the regression introduced by `9a0670712`, not
+the ownership contract. Since `acdb192d4`, model-weight reset preserves and warns
+about entries still leased by another live model while reclaiming unreferenced
+entries. Since `4afdb6d9f`, host and device whole-zone resets refuse a reset that
+would reclaim live registered allocations. Neither path force-reclaims another
+model's memory, and the warning alone is not evidence of a leak.
 
 ### GPT-OSS Prompt Template Rule
 

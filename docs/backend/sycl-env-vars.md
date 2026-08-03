@@ -259,10 +259,17 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 | Variable | Effect |
 |----------|--------|
-| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Cache topology: auto, global, per_device |
+| ~~`GGML_SYCL_UNIFIED_CACHE=0`~~ | **Removed by `9a0670712`.** Setting this name no longer disables anything; there is no replacement opt-out. |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Select cache topology (`auto`, `global`, or `per_device`). This is distinct from the removed enable/disable variable and cannot disable the cache. |
 | `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
 | `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction under memory pressure |
 | `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |
+
+The unified cache is intentionally always authoritative for SYCL memory. Commit
+`9a0670712` removed the `unified_cache_enabled()` environment check along with
+`GGML_SYCL_UNIFIED_CACHE=0`; the old name is not read, and no variable restores
+the legacy uncached path. `GGML_SYCL_UNIFIED_CACHE_MODE` remains supported only
+to choose the topology of the authoritative cache.
 
 ## Debugging
 

@@ -86,6 +86,21 @@ these four `host_zone_id` zones.
 - Memory allocated inside tests (see §8).
 - ggml buffer allocations at the public `ggml_backend` API boundary (see §8).
 
+**Authority is not optional.** Commit `9a0670712` removed the
+`unified_cache_enabled()` check and its `GGML_SYCL_UNIFIED_CACHE=0` opt-out. The
+unified cache is intentionally always authoritative, the removed variable is no
+longer read, and there is no replacement opt-out. The still-supported
+`GGML_SYCL_UNIFIED_CACHE_MODE` setting is distinct: it selects cache topology
+(`auto`, `global`, or `per_device`) and does not disable the cache.
+
+Reset does not override ownership. `reset_model_weight_entries()` preserves and
+warns about entries that still have live `mem_handle` leases, while reclaiming
+only unreferenced entries (`acdb192d4`). Whole-zone resets cannot preserve a
+single allocation, so `host_zone_reset()` and `zone_reset()` refuse the entire
+reset while the target zone contains live registered allocations (`4afdb6d9f`).
+Callers must release the owning handles and retry; they must not purge ownership
+records or force reclamation.
+
 ### 1.3 `mem_handle` (`ggml_sycl::mem_handle`)
 
 **File:** `ggml/src/ggml-sycl/mem-handle.hpp`, `mem-handle.cpp`
@@ -250,10 +265,12 @@ Owned per inference context; reset between requests or at context free:
 | MoE routing buffers | RUNTIME zone | Per-inference reset |
 | Staging / DMA buffers | HOST / RUNTIME | Per-weight-stream event |
 
-**Invariant:** `arena_reserve` resets KV + RUNTIME + HOST zones only for the owning
-device's cache. It must not reset another context's zones. Until T1 (`llama.cpp-32dg8.2`)
-adds explicit context ownership keys, callers must ensure single-active-context per
-device.
+**Invariant:** `arena_reserve` requests resets of KV + RUNTIME + HOST zones only
+for the owning device's cache. A reset proceeds only when the target zone has no
+live registered allocations; otherwise the reset is refused and existing
+allocations are preserved. It must not reset another context's zones. Until T1
+(`llama.cpp-32dg8.2`) adds explicit context ownership keys, callers must ensure
+single-active-context per device.
 
 ### 5.3 Multi-user / server concurrency
 
@@ -398,11 +415,15 @@ dispatch is tracked in:
 | `llama.cpp-32dg8.10` | Migrate remaining op call sites |
 | `llama.cpp-32dg8.15.17` | Build host-fallback coverage matrix, file per-op blockers |
 
-### 9.3 Optional cache branches
+### 9.3 Removed cache opt-out
 
-The optional unified-cache mode has been removed. Remaining memory-routing branches
-should express concrete conditions such as weight eviction, placement-plan state, or
-host accessibility rather than cache enablement.
+The optional unified-cache mode and `GGML_SYCL_UNIFIED_CACHE=0` were removed by
+`9a0670712`. The cache is always authoritative; the old variable is no longer
+read and has no replacement opt-out. `GGML_SYCL_UNIFIED_CACHE_MODE` is not such a
+replacement: it only selects `auto`, `global`, or `per_device` topology.
+Remaining memory-routing branches should express concrete conditions such as
+weight eviction, placement-plan state, or host accessibility rather than cache
+enablement.
 
 | Owner bead | Action |
 |---|---|
