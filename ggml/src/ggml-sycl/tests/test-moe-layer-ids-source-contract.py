@@ -123,11 +123,13 @@ def verify_reset_dominates(ast: Ast, body, path: str, targets: tuple[str, ...]) 
         if name:
             labels[ast.text(name)] = label
     for jump in (node for node in walk(body) if kind(node) == "goto_statement"):
-        target_ids = [node for node in children(jump) if kind(node) == "statement_identifier"]
-        if not target_ids:
-            target_ids = [node for node in walk(jump) if kind(node) in {"identifier", "statement_identifier"}]
-        target = labels.get(ast.text(target_ids[0])) if target_ids else None
-        if jump.start_byte() < reset_statement.start_byte() and target and target.start_byte() > reset_statement.end_byte():
+        if jump.start_byte() >= reset_statement.start_byte():
+            continue  # Existing post-reset dispatch-local gotos are legitimate.
+        target_ids = [node for node in walk(jump) if kind(node) == "statement_identifier"]
+        target = labels.get(ast.text(target_ids[0])) if len(target_ids) == 1 else None
+        if target is None or any(kind(node) == "ERROR" for node in walk(jump)):
+            raise ContractError(f"{path}: unresolved or indirect goto before reset")
+        if target.start_byte() > reset_statement.end_byte():
             raise ContractError(f"{path}: forward goto can enter the post-reset region without reset")
 
     cache_accesses = ast.identifiers(body, CACHE)
@@ -186,21 +188,41 @@ def verify_helper(header_source: str) -> None:
     body = helper.child_by_field_name("body")
     loops = [node for node in children(body) if kind(node) == "for_range_loop"]
     entry_resets = ast.calls(body, "ggml_sycl_moe_layer_ids_cache_reset_entry")
-    reset_inside_loop = False
-    if len(loops) == 1 and len(entry_resets) == 1:
-        ancestor = entry_resets[0].parent()
-        while ancestor and ancestor.start_byte() >= loops[0].start_byte():
-            if ancestor.start_byte() == loops[0].start_byte() and ancestor.end_byte() == loops[0].end_byte():
-                reset_inside_loop = True
-                break
-            ancestor = ancestor.parent()
-    direct_map_clears = []
-    for call in (node for node in walk(body) if kind(node) == "call_expression"):
-        function = call.child_by_field_name("function")
-        if function and ast.text(function).replace(" ", "") == "cache.clear":
-            direct_map_clears.append(call)
-    if len(loops) != 1 or len(entry_resets) != 1 or direct_map_clears or not reset_inside_loop:
-        raise ContractError("reset helper: every retained map entry must reset inside the range-loop body")
+    valid = len(loops) == 1 and len(entry_resets) == 1
+    if valid:
+        loop = loops[0]
+        range_expression = loop.child_by_field_name("right")
+        declarator = loop.child_by_field_name("declarator")
+        loop_body = loop.child_by_field_name("body")
+        binding_names = [node for node in walk(declarator) if kind(node) == "identifier"] if declarator else []
+        body_statements = children(loop_body) if loop_body and kind(loop_body) == "compound_statement" else []
+        direct_statement = body_statements[0] if len(body_statements) == 1 else None
+        statement_expressions = children(direct_statement) if direct_statement else []
+        direct_calls = ast.calls(direct_statement, "ggml_sycl_moe_layer_ids_cache_reset_entry") if direct_statement else []
+        arguments = entry_resets[0].child_by_field_name("arguments")
+        argument_nodes = children(arguments) if arguments else []
+        valid = (
+            range_expression is not None
+            and ast.text(range_expression) == "cache"
+            and declarator is not None
+            and kind(declarator) == "reference_declarator"
+            and sum(kind(node) == "structured_binding_declarator" for node in walk(declarator)) == 1
+            and [ast.text(node) for node in binding_names] == ["_", "entry"]
+            and direct_statement is not None
+            and kind(direct_statement) == "expression_statement"
+            and len(statement_expressions) == 1
+            and kind(statement_expressions[0]) == "call_expression"
+            and len(direct_calls) == 1
+            and statement_expressions[0].start_byte() == entry_resets[0].start_byte()
+            and statement_expressions[0].end_byte() == entry_resets[0].end_byte()
+            and len(argument_nodes) == 1
+            and kind(argument_nodes[0]) == "identifier"
+            and ast.text(argument_nodes[0]) == "entry"
+        )
+    if not valid:
+        raise ContractError(
+            "reset helper: direct range(cache) body must reset exactly structured-binding entry"
+        )
 
 
 def verify_contract(source: str, header: str) -> None:
@@ -260,6 +282,19 @@ def run_mutation_matrix(source: str, header: str) -> None:
         goto_skip = f"    goto {label};\n" + reset_line + f"{label}:\n    ;\n"
         cases.append((f"{path}-goto-skip", replace_nth(source, reset_line, goto_skip, occurrence), header,
                       f"{contract_path}: forward goto can enter the post-reset region without reset"))
+        computed_label = f"h5m4_computed_{path}"
+        computed_goto = (
+            f"    void * h5m4_target_{path} = &&{computed_label};\n"
+            f"    goto *h5m4_target_{path};\n"
+            + reset_line
+            + f"{computed_label}:\n    ;\n"
+        )
+        cases.append((f"{path}-computed-goto", replace_nth(source, reset_line, computed_goto, occurrence), header,
+                      f"{contract_path}: unresolved or indirect goto before reset"))
+
+    unresolved = "    goto h5m4_missing_target;\n" + reset_line
+    cases.append(("normal-unresolved-goto", replace_nth(source, reset_line, unresolved, 0), header,
+                  "normal: unresolved or indirect goto before reset"))
 
     cases.extend(
         [
@@ -284,8 +319,8 @@ def run_mutation_matrix(source: str, header: str) -> None:
     loop_start = "    for (auto & [_, entry] : cache) {\n"
     loop_body = "        ggml_sycl_moe_layer_ids_cache_reset_entry(entry);\n    }\n"
     cleared_header = header.replace(loop_start + loop_body, "    cache.clear();\n", 1)
-    cases.append(("capacity-map-clear", source, cleared_header,
-                  "reset helper: every retained map entry must reset inside the range-loop body"))
+    helper_contract_error = "reset helper: direct range(cache) body must reset exactly structured-binding entry"
+    cases.append(("capacity-map-clear", source, cleared_header, helper_contract_error))
 
     begin_only_header = header.replace(
         loop_start + loop_body,
@@ -298,8 +333,41 @@ def run_mutation_matrix(source: str, header: str) -> None:
         "    }\n",
         1,
     )
-    cases.append(("empty-loop-begin-only-reset", source, begin_only_header,
-                  "reset helper: every retained map entry must reset inside the range-loop body"))
+    cases.append(("empty-loop-begin-only-reset", source, begin_only_header, helper_contract_error))
+
+    conditional_entry_header = header.replace(
+        loop_body,
+        "        if (false) {\n"
+        "            ggml_sycl_moe_layer_ids_cache_reset_entry(entry);\n"
+        "        }\n"
+        "    }\n",
+        1,
+    )
+    cases.append(("helper-conditional-entry-reset", source, conditional_entry_header, helper_contract_error))
+
+    nested_entry_header = header.replace(
+        loop_body,
+        "        {\n"
+        "            ggml_sycl_moe_layer_ids_cache_reset_entry(entry);\n"
+        "        }\n"
+        "    }\n",
+        1,
+    )
+    cases.append(("helper-nested-entry-reset", source, nested_entry_header, helper_contract_error))
+
+    zero_trip_header = header.replace(
+        "for (auto & [_, entry] : cache)",
+        "for (auto & [_, entry] : std::array<moe_layer_ids_cache_entry, 0>{})",
+        1,
+    )
+    cases.append(("helper-zero-trip-range", source, zero_trip_header, helper_contract_error))
+
+    begin_argument_header = header.replace(
+        "ggml_sycl_moe_layer_ids_cache_reset_entry(entry);",
+        "ggml_sycl_moe_layer_ids_cache_reset_entry(cache.begin()->second);",
+        1,
+    )
+    cases.append(("helper-cache-begin-argument", source, begin_argument_header, helper_contract_error))
 
     positive_comments = source
     for occurrence in reversed(range(3)):
