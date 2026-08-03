@@ -310,9 +310,9 @@ roughly 147-C++-file restoration backlog after early batches. The Task 4 filter
 intersected that backlog with this branch's changed surface and found 65 topical
 hits, exactly 64 of which existed before the wipe. Therefore this audit is
 **64/147 merge-relevant rows** (a topical floor), with the other roughly 83
-remaining under ownerless `llama.cpp-0igs` as post-merge debt. This reconciles
-the two figures; it does not claim that 64 registrations are accepted or that
-the 83 are irrelevant forever.
+remaining under `llama.cpp-0igs` (assigned owner: `lead`) as post-merge debt.
+This reconciles the two figures; it does not claim that 64 registrations are
+accepted or that the 83 are irrelevant forever.
 
 The disposition is a source-level recommendation. **Task 16
 (`llama.cpp-o2hp`) remains the authority that records the exact accepted and
@@ -381,37 +381,38 @@ standalone benchmarks into ordinary tests.
 | `tests/test-xmx-kernel-config.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
 | `tests/test-xmx-quant-loaders.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
 | `tests/test-xmx-unified-kernel.cpp` | GREEN/live | host-only | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, preserve the live target. `llama.cpp-kdfh` audits labels/serial metadata and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/mini-context-prototype.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
+| `tests/mini-context-prototype.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
 | `tests/test-cpu-gpu-soa-interaction.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-expert-routing-roundtrip.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-expert-routing-roundtrip.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
 | `tests/test-mmvq-q8-0-streaming-bench.cpp` | RED/inactive | manual | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-moe-expert-placement.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-moe-expert-placement.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
 | `tests/test-mxfp4-xmx-tiled.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-pinned-chunk-pool.cpp` | RED/inactive | GPU serial | **named tracker task: `llama.cpp-32dg8.20`** | `llama.cpp-32dg8.20` (currently unassigned): update to the canonical pinned-pool API, preserve allocation/reuse/capacity/failure checks, then return the source to `llama.cpp-o2hp`; lead performs the task’s build/GPU proof. |
-| `tests/test-planner-canary-cpy-visibility.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-direct-load.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-pp-tg-union.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-planner-canary-skeleton-determinism.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
-| `tests/test-q6k-56block-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (ownerless): assign an owner to delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-q6k-layout-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (ownerless): assign an owner to delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
+| `tests/test-pinned-chunk-pool.cpp` | RED/inactive | GPU serial | **named tracker task: `llama.cpp-32dg8.20`** | `llama.cpp-32dg8.20` (assigned owner: `lead`): update to the canonical pinned-pool API, preserve allocation/reuse/capacity/failure checks, then return the source to `llama.cpp-o2hp`; lead performs the task’s build/GPU proof. |
+| `tests/test-planner-canary-cpy-visibility.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-planner-canary-direct-load.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-planner-canary-pp-tg-union.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-planner-canary-skeleton-determinism.cpp` | RED/inactive | model-loading | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): keep out of ordinary CTest and document one lead-only, serial, safeguarded model run. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-q6k-56block-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
+| `tests/test-q6k-layout-debug.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
 | `tests/test-q6k-reorder-dispatch.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-q6k-variable-reorder.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (ownerless): assign an owner to delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
-| `tests/test-sycl-expert-cache-bandwidth.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-q6k-variable-reorder.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
+| `tests/test-sycl-expert-cache-bandwidth.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
 | `tests/test-sycl-expert-prefetch.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
 | `tests/test-sycl-fattn-onednn-descriptors.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-sycl-race-conditions.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (ownerless): assign an owner; retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
+| `tests/test-sycl-race-conditions.cpp` | RED/inactive | manual | **manual-only** | `llama.cpp-0igs` (assigned owner: `lead`): retain an opt-in manual procedure and do not add ordinary CTest registration. `llama.cpp-o2hp` records the registration decline. |
 | `tests/test-sycl-set-rows-owner-routing.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-tile-decomposition.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (ownerless): assign an owner to delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
+| `tests/test-tile-decomposition.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete this self-contained local-helper reimplementation with the Task 4b per-file reason; `llama.cpp-o2hp` declines the current source. |
 | `tests/test-unified-dispatch-integration.cpp` | RED/inactive | GPU serial | **restore candidate** | `llama.cpp-o2hp`: explicitly accept or decline; if accepted, Task 17 registers it and `llama.cpp-8kyi` performs lead-only runtime acceptance. |
-| `tests/test-expert-cache.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (ownerless): assign an owner to delete the obsolete source (removed `expert-cache.hpp`) with this recorded reason; `llama.cpp-o2hp` records the decline. |
+| `tests/test-expert-cache.cpp` | RED/inactive | never-test | **deleted/never-test** | `llama.cpp-0igs` (assigned owner: `lead`): delete the obsolete source (removed `expert-cache.hpp`) with this recorded reason; `llama.cpp-o2hp` records the decline. |
 
 **Disposition counts:** 49 restore candidates + 9 manual-only + 5
 deleted/never-test + 1 named tracker task = **64/64 unique rows**. The 49
 restore candidates are 41 live and 8 inactive; “live” is provenance, not Task
 16 acceptance. Deferred ownership is explicit above: Task 16 owns every final
 accept/decline record, Task 17/17d owns accepted CMake metadata/audit, Task 19
-owns runtime proof, `llama.cpp-32dg8.20` owns the pinned-pool rewrite, and
-ownerless `llama.cpp-0igs` must receive an assignee for all manual/deletion
+owns runtime proof, `llama.cpp-32dg8.20` (assigned owner: `lead`) owns the
+pinned-pool rewrite, and `llama.cpp-0igs` (assigned owner: `lead`) owns all
+manual/deletion
 follow-through and the other ~83 rows. The unaccepted restoration-scope policy
 in `llama.cpp-awcp` is the remaining owner-decision blocker.
 
