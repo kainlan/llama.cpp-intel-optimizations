@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace ggml_sycl::lifecycle {
 
@@ -111,6 +112,12 @@ struct finish_ticket {
     end_result replay{};
 };
 
+struct end_probe {
+    bool          resolved         = false;
+    bool          binding_required = false;
+    finish_ticket result{};
+};
+
 struct live_update_ticket {
     error      code = error::NOT_FOUND;
     ModelToken token{};
@@ -146,6 +153,22 @@ struct teardown_ticket {
     bool       finisher = false;
 };
 
+// Fixed-capacity exact-token queue used by destructor quarantine. take_all()
+// transfers one reaper pass atomically; an overlapping enqueue remains queued
+// for the next pass rather than being lost.
+class quarantine_queue {
+  public:
+    bool   enqueue(ModelToken token) noexcept;
+    bool   erase(ModelToken token) noexcept;
+    size_t take_all(std::array<ModelToken, model_slot_count> & out) noexcept;
+    size_t size() const noexcept;
+
+  private:
+    mutable std::mutex                       mutex_;
+    std::array<ModelToken, model_slot_count> tokens_{};
+    size_t                                   count_ = 0;
+};
+
 enum class test_mutation { NONE, M1_SKIP_GENERATION, M2_NESTED_COMMIT, M3_CLEAR_POISON };
 
 class CheckedCounter {
@@ -174,8 +197,17 @@ class Registry {
     error        enter_nested(LoadTxnId txn);
     error        poison(LoadTxnId txn);
 
+    // Candidate bindings are nesting-aware and thread-local. bound_candidate()
+    // also validates the keyed transaction under the registry lock, so an end
+    // on another thread invalidates stale bindings immediately.
+    void      bind_candidate(LoadTxnId txn);
+    void      unbind_candidate(LoadTxnId txn) noexcept;
+    LoadTxnId bound_candidate();
+
     // prepare retains coordinator+slot in COMMITTING/ROLLING_BACK. Exactly one
     // caller receives finisher=true and performs effects without the lock.
+    end_probe     probe_end(LoadTxnId txn) noexcept;
+    finish_ticket recover_binding_failure(LoadTxnId txn) noexcept;
     finish_ticket prepare_end(LoadTxnId txn, bool explicit_success, bool output_available = true);
     error         validate_end(const finish_ticket & ticket) const;
     end_result    finalize_end(const finish_ticket &             ticket,
@@ -210,6 +242,10 @@ class Registry {
     void test_set_slot_generation(uint32_t slot, uint64_t generation);
     void test_fail_next_begin_allocation();
     void test_fail_next_dead_allocation();
+    void test_fail_next_candidate_binding_allocation();
+    void test_block_next_candidate_binding_allocation();
+    void test_wait_for_candidate_binding_failure();
+    void test_release_candidate_binding_failure();
 
   private:
     struct txn_state {
@@ -240,8 +276,7 @@ class Registry {
     };
 
     void poison_active_locked();
-    void remember_terminal_locked(uint64_t txn);
-    void remember_dead_locked(ModelToken token, error result);
+    void remember_terminal_locked(uint64_t txn) noexcept;
 
     mutable std::mutex                        mutex_;
     std::condition_variable                   cv_;
@@ -250,15 +285,21 @@ class Registry {
     const test_mutation                       mutation_;
     uint64_t                                  next_model_id_ = 1, next_load_id_ = 1, next_finish_serial_ = 1;
     std::array<slot_state, model_slot_count>  slots_{};
-    std::unordered_map<uint64_t, txn_state>   txns_;
-    std::unordered_map<uint64_t, model_entry> models_;
-    // Durable terminal identities prefer bounded row retention over identity reuse.
+    // Terminal transaction and dead-model rows are intentionally append-only.
+    // Process-lifetime exact replay is required for idempotent end/unload;
+    // monotonic IDs are never reused and eventually report ID_EXHAUSTED.
+    std::unordered_map<uint64_t, txn_state>                    txns_;
+    std::unordered_map<uint64_t, model_entry>                  models_;
     std::unordered_map<uint64_t, std::pair<ModelToken, error>> dead_;
     std::shared_ptr<const ModelState>                          last_success_;
     uint64_t                                                   active_txn_   = 0;
     uint64_t                                                   publications_ = 0, rollbacks_ = 0;
-    bool                                                       fail_next_begin_allocation_ = false;
-    bool                                                       fail_next_dead_allocation_  = false;
+    bool                                                       fail_next_begin_allocation_             = false;
+    bool                                                       fail_next_dead_allocation_              = false;
+    bool                                                       fail_next_candidate_binding_allocation_ = false;
+    bool                                                       candidate_binding_failure_barrier_      = false;
+    bool                                                       candidate_binding_failure_blocked_      = false;
+    bool                                                       candidate_binding_failure_release_      = false;
 };
 
 Registry & global_registry();

@@ -1997,11 +1997,14 @@ static std::atomic<bool> g_moe_multi_gpu_active{ false };
 // used because std::atomic<std::shared_ptr<T>> is C++20-only. There is no
 // mutable process-global plan: builders publish a fresh immutable snapshot.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_placement_publication;
-static thread_local uint64_t                                     g_load_candidate_txn_id = 0;
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_bound_load_candidate() noexcept {
-    return g_load_candidate_txn_id != 0 ? ggml_sycl::lifecycle_find_candidate_placement_plan(g_load_candidate_txn_id) :
-                                          nullptr;
+    try {
+        const auto txn = ggml_sycl::lifecycle::global_registry().bound_candidate();
+        return txn.value != 0 ? ggml_sycl::lifecycle_find_candidate_placement_plan(txn.value) : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
 }
 static thread_local bool                                                      g_runtime_expected_model_set = false;
 static thread_local ggml_sycl_model_token                                     g_runtime_expected_model{};
@@ -9230,29 +9233,10 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
                   reclaimed);
 }
 
-static std::mutex                                                                g_sycl_quarantine_mutex;
-static std::array<ggml_sycl_model_token, ggml_sycl::lifecycle::model_slot_count> g_sycl_quarantine_tokens{};
-static size_t                                                                    g_sycl_quarantine_count = 0;
+static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
 
 static bool ggml_sycl_quarantine_enqueue(ggml_sycl_model_token token) noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
-        for (size_t i = 0; i < g_sycl_quarantine_count; ++i) {
-            if (g_sycl_quarantine_tokens[i].model_id == token.model_id &&
-                g_sycl_quarantine_tokens[i].load_txn_id == token.load_txn_id &&
-                g_sycl_quarantine_tokens[i].slot == token.slot &&
-                g_sycl_quarantine_tokens[i].slot_generation == token.slot_generation) {
-                return true;
-            }
-        }
-        if (g_sycl_quarantine_count >= g_sycl_quarantine_tokens.size()) {
-            return false;
-        }
-        g_sycl_quarantine_tokens[g_sycl_quarantine_count++] = token;
-        return true;
-    } catch (...) {
-        return false;
-    }
+    return g_sycl_quarantine_queue.enqueue(ggml_sycl_cpp_token(token));
 }
 
 void ggml_backend_sycl_model_unloaded(uint32_t slot) {
@@ -9309,9 +9293,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_mo
         if (!ggml_sycl_quarantine_enqueue(token)) {
             return GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
         }
-        auto & registry = ggml_sycl::lifecycle::global_registry();
-        if (!registry.is_quarantined(owner)) {
-            (void) registry.defer_quarantine(owner);
+        auto &     registry = ggml_sycl::lifecycle::global_registry();
+        const auto deferred =
+            registry.is_quarantined(owner) ? ggml_sycl::lifecycle::error::OK : registry.defer_quarantine(owner);
+        if (deferred == ggml_sycl::lifecycle::error::STALE_IDENTITY) {
+            (void) g_sycl_quarantine_queue.erase(owner);
+            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
@@ -9320,26 +9307,22 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_mo
 }
 
 static void ggml_sycl_quarantine_reap() noexcept {
-    std::array<ggml_sycl_model_token, ggml_sycl::lifecycle::model_slot_count> pending{};
-    size_t                                                                    count = 0;
+    std::array<ggml_sycl::lifecycle::ModelToken, ggml_sycl::lifecycle::model_slot_count> pending{};
+    const size_t count = g_sycl_quarantine_queue.take_all(pending);
     try {
-        {
-            std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
-            count = g_sycl_quarantine_count;
-            std::copy_n(g_sycl_quarantine_tokens.begin(), count, pending.begin());
-            g_sycl_quarantine_count = 0;
-        }
         for (size_t i = 0; i < count; ++i) {
-            const auto rc       = ggml_backend_sycl_model_unloaded_token(pending[i]);
+            const ggml_sycl_model_token token{ pending[i].model.value, pending[i].load.value, pending[i].owner.slot,
+                                               pending[i].owner.generation };
+            const auto                  rc       = ggml_backend_sycl_model_unloaded_token(token);
             const bool terminal = rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD ||
                                   rc == GGML_SYCL_LIFECYCLE_NOT_FOUND || rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
             if (!terminal) {
-                (void) ggml_sycl_quarantine_enqueue(pending[i]);
+                (void) g_sycl_quarantine_queue.enqueue(pending[i]);
             }
         }
     } catch (...) {
         for (size_t i = 0; i < count; ++i) {
-            (void) ggml_sycl_quarantine_enqueue(pending[i]);
+            (void) g_sycl_quarantine_queue.enqueue(pending[i]);
         }
     }
 }
@@ -9348,23 +9331,14 @@ static void ggml_sycl_quarantine_drain_shutdown() noexcept {
     constexpr int max_passes = 4;
     for (int pass = 0; pass < max_passes; ++pass) {
         ggml_sycl_quarantine_reap();
-        try {
-            std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
-            if (g_sycl_quarantine_count == 0) {
-                return;
-            }
-        } catch (...) {
-            break;
+        if (g_sycl_quarantine_queue.size() == 0) {
+            return;
         }
     }
-    try {
-        std::lock_guard<std::mutex> lock(g_sycl_quarantine_mutex);
-        if (g_sycl_quarantine_count != 0) {
-            GGML_LOG_ERROR("[SYCL-LIFECYCLE] shutdown retained %zu quarantined owner token(s) after bounded retry\n",
-                           g_sycl_quarantine_count);
-        }
-    } catch (...) {
-        GGML_LOG_ERROR("[SYCL-LIFECYCLE] shutdown could not inspect quarantined owner queue\n");
+    const size_t retained = g_sycl_quarantine_queue.size();
+    if (retained != 0) {
+        GGML_LOG_ERROR("[SYCL-LIFECYCLE] shutdown retained %zu quarantined owner token(s) after bounded retry\n",
+                       retained);
     }
 }
 
@@ -9389,7 +9363,6 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // Clean slate for every model-scoped scratch global before this
             // model's own tensors are inventoried -- see the function for why
             // this must not be left to the per-field writer alone.
-            g_load_candidate_txn_id = 0;
             ggml_sycl_reset_model_load_scratch_state(true);
 
             // A new outer model load is the ownership boundary for the previous
@@ -9563,7 +9536,6 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
 
 static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
     ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
-    g_load_candidate_txn_id = 0;
     (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
     (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
     // Abort discards only loader-thread candidate state. The previously active
@@ -9589,7 +9561,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
-        g_load_candidate_txn_id = result.txn.value;
+        registry->bind_candidate(result.txn);
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         g_sycl_in_model_load.store(false, std::memory_order_release);
@@ -9615,27 +9587,117 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
     }
 }
 
+extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
+    ggml_sycl::lifecycle::global_registry().test_fail_next_candidate_binding_allocation();
+}
+
+extern "C" void ggml_backend_sycl_test_block_next_candidate_binding_allocation() {
+    ggml_sycl::lifecycle::global_registry().test_block_next_candidate_binding_allocation();
+}
+
+extern "C" void ggml_backend_sycl_test_wait_for_candidate_binding_failure() {
+    ggml_sycl::lifecycle::global_registry().test_wait_for_candidate_binding_failure();
+}
+
+extern "C" void ggml_backend_sycl_test_release_candidate_binding_failure() {
+    ggml_sycl::lifecycle::global_registry().test_release_candidate_binding_failure();
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
-    ggml_sycl::lifecycle::Registry * registry = nullptr;
+    ggml_sycl::lifecycle::Registry * registry         = nullptr;
+    bool                             candidate_pushed = false;
+    bool                             depth_entered    = false;
     try {
-        registry          = &ggml_sycl::lifecycle::global_registry();
+        registry = &ggml_sycl::lifecycle::global_registry();
+        // Push first: allocation failure leaves Registry depth unchanged. If
+        // depth entry fails, unwind only this nested binding so the outer
+        // candidate remains authoritative on this thread.
+        registry->bind_candidate({ txn.id });
+        candidate_pushed  = true;
         const auto result = registry->enter_nested({ txn.id });
         if (result != ggml_sycl::lifecycle::error::OK) {
+            registry->unbind_candidate({ txn.id });
             return ggml_sycl_lifecycle_c_result(result);
         }
+        depth_entered = true;
         ggml_sycl_model_loading_effects(true, false);
-        g_load_candidate_txn_id = txn.id;
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
+        if (candidate_pushed && registry) {
+            registry->unbind_candidate({ txn.id });
+        }
         try {
             if (registry) {
-                (void) registry->poison({ txn.id });
+                // If depth entry succeeded, consume exactly that nested level
+                // as a failed inner end. Otherwise only poison the unchanged
+                // outer depth.
+                if (depth_entered) {
+                    (void) registry->end({ txn.id }, false);
+                } else {
+                    (void) registry->poison({ txn.id });
+                }
             }
         } catch (...) {
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
 }
+
+static ggml_sycl_lifecycle_result ggml_sycl_load_end_replay_result(const ggml_sycl::lifecycle::finish_ticket & result,
+                                                                   ggml_sycl_model_token *                     model) {
+    if (result.replay.token.model.value != 0 && model) {
+        ggml_sycl_export_token(result.replay.token, model);
+    }
+    if (result.replay.committed && !model) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    return ggml_sycl_lifecycle_c_result(result.replay.token.model.value ? result.replay.code : result.code);
+}
+
+static void ggml_sycl_finalize_binding_failure_abort(ggml_sycl::lifecycle::Registry &            registry,
+                                                     const ggml_sycl::lifecycle::finish_ticket & recovery) noexcept {
+    bool effects_ok = true;
+    try {
+        g_sycl_abort_load_exit = true;
+        ggml_sycl_model_loading_effects(false, recovery.outer);
+        g_sycl_abort_load_exit = false;
+        ggml_sycl_abort_owner_effects(recovery.token);
+    } catch (...) {
+        g_sycl_abort_load_exit = false;
+        effects_ok             = false;
+    }
+    const auto failed = registry.finalize_end(recovery, effects_ok);
+    if (!failed.committed && registry.is_quarantined(failed.token)) {
+        ggml_sycl_model_token quarantined{};
+        ggml_sycl_export_token(failed.token, &quarantined);
+        (void) ggml_sycl_quarantine_enqueue(quarantined);
+    }
+}
+
+class ggml_sycl_load_candidate_end_scope {
+  public:
+    ggml_sycl_load_candidate_end_scope(ggml_sycl::lifecycle::Registry & registry,
+                                       ggml_sycl::lifecycle::LoadTxnId  txn,
+                                       bool                             enabled) :
+        registry_(registry),
+        txn_(txn),
+        enabled_(enabled) {
+        if (enabled_ && !(registry_.bound_candidate() == txn_)) {
+            registry_.bind_candidate(txn_);
+        }
+    }
+
+    ~ggml_sycl_load_candidate_end_scope() {
+        if (enabled_) {
+            registry_.unbind_candidate(txn_);
+        }
+    }
+
+  private:
+    ggml_sycl::lifecycle::Registry & registry_;
+    ggml_sycl::lifecycle::LoadTxnId  txn_;
+    bool                             enabled_;
+};
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
@@ -9644,18 +9706,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
     ggml_sycl::lifecycle::finish_ticket ticket;
     bool                                placement_inserted = false;
     try {
-        g_load_candidate_txn_id = txn.id;
-        registry = &ggml_sycl::lifecycle::global_registry();
-        ticket   = registry->prepare_end({ txn.id }, explicit_success, model != nullptr);
+        registry         = &ggml_sycl::lifecycle::global_registry();
+        const auto probe = registry->probe_end({ txn.id });
+        if (probe.resolved) {
+            return ggml_sycl_load_end_replay_result(probe.result, model);
+        }
+        ggml_sycl_load_candidate_end_scope candidate_scope(*registry, { txn.id }, probe.binding_required);
+        ticket = registry->prepare_end({ txn.id }, explicit_success, model != nullptr);
         if (!ticket.finisher) {
-            g_load_candidate_txn_id = 0;
-            if (ticket.replay.token.model.value != 0 && model) {
-                ggml_sycl_export_token(ticket.replay.token, model);
-            }
-            if (ticket.replay.committed && !model) {
-                return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
-            }
-            return ggml_sycl_lifecycle_c_result(ticket.replay.token.model.value ? ticket.replay.code : ticket.code);
+            return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
         g_sycl_abort_load_exit = !ticket.commit;
@@ -9711,8 +9770,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
             ggml_sycl_publish_prepared_plan_locked(prepared_publication);
         }
-        auto result             = registry->finalize_end(ticket, true, publication, std::move(state));
-        g_load_candidate_txn_id = 0;
+        auto result = registry->finalize_end(ticket, true, publication, std::move(state));
         if (result.cleanup_required) {
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
             bool cleanup_ok = false;
@@ -9744,6 +9802,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             if (model && failed.token.model.value != 0) {
                 ggml_sycl_export_token(failed.token, model);
             }
+        } else if (registry) {
+            // One Registry critical section now decides the race: durable
+            // terminal/wrong replay, waiting behind another finisher, or
+            // reserving this exact transaction's abort ticket.
+            const auto recovery = registry->recover_binding_failure({ txn.id });
+            if (!recovery.finisher) {
+                return ggml_sycl_load_end_replay_result(recovery, model);
+            }
+            ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -10890,7 +10957,6 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
         if (token.load.value != 0) {
             ggml_sycl::lifecycle_stage_no_placement_plan(token.load.value, g_placement_kv_info, g_model_n_layer);
-            g_load_candidate_txn_id = token.load.value;
         }
         return;
     }
@@ -11115,7 +11181,6 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
         }
     }
-    g_load_candidate_txn_id = have_plan ? active_plan_owner.load.value : 0;
 }
 
 // Compute placement plan early — before create_tensor in the llama loader.
@@ -95472,6 +95537,18 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_candidate_binding_allocation;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_block_next_candidate_binding_allocation") == 0) {
+        return (void *) ggml_backend_sycl_test_block_next_candidate_binding_allocation;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_wait_for_candidate_binding_failure") == 0) {
+        return (void *) ggml_backend_sycl_test_wait_for_candidate_binding_failure;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_release_candidate_binding_failure") == 0) {
+        return (void *) ggml_backend_sycl_test_release_candidate_binding_failure;
     }
     if (strcmp(name, "ggml_backend_sycl_activate_model_plan") == 0) {
         return (void *) ggml_backend_sycl_activate_model_plan;

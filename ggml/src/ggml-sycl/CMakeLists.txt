@@ -108,6 +108,15 @@ if (BUILD_TESTING)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
+    add_executable(test-sycl-lifecycle-runtime-host
+        tests/test-model-lifecycle-runtime.cpp
+        model-lifecycle.cpp)
+    target_include_directories(test-sycl-lifecycle-runtime-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-lifecycle-runtime-host PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-lifecycle-runtime-host PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-lifecycle-runtime-host COMMAND test-sycl-lifecycle-runtime-host)
+    set_tests_properties(sycl-lifecycle-runtime-host PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
@@ -132,6 +141,20 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
+    add_executable(test-sycl-lifecycle-wrapper-overlap
+        tests/test-lifecycle-wrapper-overlap.cpp)
+    target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    if (GGML_BACKEND_DL)
+        target_compile_definitions(test-sycl-lifecycle-wrapper-overlap PRIVATE
+            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+        target_link_libraries(test-sycl-lifecycle-wrapper-overlap PRIVATE ggml ${CMAKE_DL_LIBS})
+        add_dependencies(test-sycl-lifecycle-wrapper-overlap ggml-sycl)
+    else()
+        target_link_libraries(test-sycl-lifecycle-wrapper-overlap PRIVATE ggml-sycl ggml-cpu)
+    endif()
+    add_test(NAME sycl-lifecycle-wrapper-overlap COMMAND test-sycl-lifecycle-wrapper-overlap)
+    set_tests_properties(sycl-lifecycle-wrapper-overlap PROPERTIES RUN_SERIAL TRUE LABELS "sycl;lifecycle;host")
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   runtime-update-teardown
