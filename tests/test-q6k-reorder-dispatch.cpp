@@ -654,7 +654,7 @@ static bool test_gpu_production_format() {
         for (int b = 0; b < blocks_per_row_y; b++) {
             const float d_val = 1.0f / 127.0f;
             const float sum_val = 127.0f * QK8_1;
-            const sycl::half2 ds(sycl::half(d_val), sycl::half(sum_val));
+            const sycl::half2 ds{sycl::half(d_val), sycl::half(sum_val)};
             memcpy(y_soa.data() + ncols + b * sizeof(ds), &ds, sizeof(ds));
         }
 
