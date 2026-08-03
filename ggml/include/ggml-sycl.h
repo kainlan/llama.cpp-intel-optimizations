@@ -745,10 +745,44 @@ GGML_BACKEND_API void ggml_backend_sycl_wait_barrier(ggml_backend_t backend);
 // Weight Streaming Control API
 // ===========================================================================
 
-// Signal model load phase to SYCL backend
-// When loading=true: weight caching is disabled to avoid OOM on large models
-// When loading=false: weight caching is enabled for inference
-// Use this to bracket model loading to prevent cache allocation during load
+// Stable model/load identity. A numeric slot is valid only together with its
+// generation; zero IDs and GGML_SYCL_MODEL_SLOT_NONE fail closed.
+struct ggml_sycl_model_token {
+    uint64_t model_id;
+    uint64_t load_txn_id;
+    uint32_t slot;
+    uint64_t slot_generation;
+};
+
+struct ggml_sycl_load_txn { uint64_t id; };
+
+enum ggml_sycl_lifecycle_result {
+    GGML_SYCL_LIFECYCLE_OK = 0,
+    GGML_SYCL_LIFECYCLE_NESTED,
+    GGML_SYCL_LIFECYCLE_ABORTED,
+    GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED,
+    GGML_SYCL_LIFECYCLE_ID_EXHAUSTED,
+    GGML_SYCL_LIFECYCLE_LOAD_BUSY,
+    GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION,
+    GGML_SYCL_LIFECYCLE_DEPTH_UNDERFLOW,
+    GGML_SYCL_LIFECYCLE_DEPTH_OVERFLOW,
+    GGML_SYCL_LIFECYCLE_MISSING_SUCCESS,
+    GGML_SYCL_LIFECYCLE_POISONED,
+    GGML_SYCL_LIFECYCLE_NOT_FOUND,
+    GGML_SYCL_LIFECYCLE_STALE_IDENTITY,
+};
+
+// Explicit transaction API. begin reserves slot+generation and both IDs as one
+// side-effect-free operation. Nested calls must carry the outer transaction.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(
+    struct ggml_sycl_load_txn * txn);
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(
+    struct ggml_sycl_load_txn txn);
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
+    struct ggml_sycl_load_txn txn, bool explicit_success, struct ggml_sycl_model_token * model);
+
+// Deprecated bool compatibility boundary. It is abort-default and cannot be
+// used to obtain ownership identity; migrated callers use the APIs above.
 GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 
 // === Model ownership (llama.cpp-0qlw) ===
@@ -760,22 +794,17 @@ GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 // handle.  A slot is the model-lifetime token that answers it directly.
 #define GGML_SYCL_MODEL_SLOT_NONE 0xFFFFFFFFu
 
-// Slot assigned to the model whose load has just completed.  Read it right after
-// the matching ggml_backend_sycl_set_model_loading(false) and store it with the
-// model; it is the token ggml_backend_sycl_model_unloaded() expects.  Returns
-// GGML_SYCL_MODEL_SLOT_NONE when no slot was available (>32 concurrent models),
-// in which case that model's weights stay unattributed and are simply retained
-// for longer.
+// Deprecated reporting snapshot only. It is not ownership authority and may
+// return GGML_SYCL_MODEL_SLOT_NONE; use the token returned by load_end.
 GGML_BACKEND_API uint32_t ggml_backend_sycl_model_slot_current(void);
 
-// The model owning `slot` has been destroyed.  Releases the model's host weight
-// extras, then UNPINS and reclaims every cached weight that no live model owns.
-// The unpin is the load-bearing half: eviction skips pinned entries and model
-// preload pins every dense weight it caches, so without it a dead model's
-// weights are unreachable by LRU for the process lifetime.
-// Call AFTER the model's tensors and buffers are gone, so its weight leases have
-// already been dropped; a lease surviving this call is reported as a leak.
+// Deprecated bare-slot teardown fails closed because it cannot prove the slot
+// generation. Migrated owners must use model_unloaded_token after dropping
+// their tensors/buffers.
 GGML_BACKEND_API void ggml_backend_sycl_model_unloaded(uint32_t slot);
+// Generation-safe teardown used by migrated model owners.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(
+    struct ggml_sycl_model_token model);
 
 // Release all host-backed weight extras (layout metadata, accessors, etc.)
 // Call this when unloading a model to free SYCL resources associated with tensors.

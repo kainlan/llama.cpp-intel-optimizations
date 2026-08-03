@@ -68,31 +68,37 @@ static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
 }
 
 struct llama_model_sycl_loading_guard {
-    bool       active   = false;
-    uint32_t * out_slot = nullptr;
+    bool active = false;
+    bool outer = false;
+    ggml_sycl_load_txn txn = {};
+    llama_sycl_model_token * out_model = nullptr;
 
-    // `out_slot`, when given, receives the backend's ownership slot for the model
-    // whose load this guard brackets (llama.cpp-0qlw).  Only the OUTERMOST guard
-    // should pass it: the nested load_all_data guard does not end a model load,
-    // so no slot is published when it finishes.
-    explicit llama_model_sycl_loading_guard(bool enabled, uint32_t * out_slot = nullptr) :
-        active(enabled && llama_model_sycl_hooks_enabled()),
-        out_slot(out_slot) {
+    explicit llama_model_sycl_loading_guard(bool enabled, llama_sycl_model_token * out = nullptr) :
+        active(enabled && llama_model_sycl_hooks_enabled()), outer(true), out_model(out) {
         if (active) {
-            ggml_backend_sycl_set_model_loading(true);
+            const auto rc = ggml_backend_sycl_model_load_begin(&txn);
+            if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error("SYCL model lifecycle begin failed");
         }
     }
 
-    ~llama_model_sycl_loading_guard() { finish(); }
-
-    void finish() {
+    llama_model_sycl_loading_guard(bool enabled, ggml_sycl_load_txn parent) :
+        active(enabled && llama_model_sycl_hooks_enabled()), txn(parent) {
         if (active) {
-            ggml_backend_sycl_set_model_loading(false);
-            if (out_slot) {
-                *out_slot = ggml_backend_sycl_model_slot_current();
-            }
-            active = false;
+            const auto rc = ggml_backend_sycl_model_load_enter_nested(txn);
+            if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error("SYCL nested model lifecycle begin failed");
         }
+    }
+
+    ~llama_model_sycl_loading_guard() { finish(false); }
+
+    void finish(bool explicit_success) {
+        if (!active) return;
+        ggml_sycl_model_token token = {};
+        const auto rc = ggml_backend_sycl_model_load_end(txn, explicit_success, outer ? &token : nullptr);
+        if (outer && rc == GGML_SYCL_LIFECYCLE_OK && out_model) {
+            *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        }
+        active = false;
     }
 };
 
@@ -1344,12 +1350,13 @@ llama_model::~llama_model() {
     // pimpl owns the ggml contexts and buffers, so it must be destroyed FIRST:
     // the hook reports any surviving weight lease as a leak, and this model's own
     // tensors hold leases until their extras go.
-    if (sycl_model_slot != GGML_SYCL_MODEL_SLOT_NONE) {
-        const uint32_t slot = sycl_model_slot;
-        sycl_model_slot     = GGML_SYCL_MODEL_SLOT_NONE;
+    if (sycl_model_token.model_id != 0) {
+        const ggml_sycl_model_token token = { sycl_model_token.model_id, sycl_model_token.load_txn_id,
+                                               sycl_model_token.slot, sycl_model_token.slot_generation };
+        sycl_model_token = {};
         pimpl.reset();
         if (llama_model_sycl_hooks_enabled()) {
-            ggml_backend_sycl_model_unloaded(slot);
+            (void) ggml_backend_sycl_model_unloaded_token(token);
         }
     }
 #endif
@@ -1550,7 +1557,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #ifdef GGML_USE_SYCL
-    llama_model_sycl_loading_guard sycl_model_loading_guard(true, &sycl_model_slot);
+    llama_model_sycl_loading_guard sycl_model_loading_guard(true, &sycl_model_token);
     llama_model_sycl_compute_early_plan(ml, hparams, __func__);
 #endif
 
@@ -1978,7 +1985,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
 #ifdef GGML_USE_SYCL
-    llama_model_sycl_loading_guard sycl_loading_guard(has_sycl_weight_buffer);
+    llama_model_sycl_loading_guard sycl_loading_guard(has_sycl_weight_buffer, sycl_model_loading_guard.txn);
 #endif
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -1986,7 +1993,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 #ifdef GGML_USE_SYCL
-    sycl_loading_guard.finish();
+    sycl_loading_guard.finish(true);
 #endif
 
     if (use_mmap_buffer) {
@@ -1995,6 +2002,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef GGML_USE_SYCL
+    sycl_model_loading_guard.finish(true);
+#endif
     return true;
 }
 

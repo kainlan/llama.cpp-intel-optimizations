@@ -78,6 +78,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
+#include "model-lifecycle.hpp"
 #include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
@@ -8983,29 +8984,6 @@ static uint64_t ggml_sycl_named_weight_cache_uuid_locked(const std::string & nam
 // excludes model_id from cache_id_equal for GGUF weights, and the load-boundary
 // reset runs before any tensor of the incoming model exists.  A slot is bound to
 // the llama_model object instead, which does exist at both ends of its life.
-static std::mutex g_sycl_model_slot_mutex;
-static uint32_t   g_sycl_model_slot_allocated      = 0;  // reserved: loading or live
-static uint32_t   g_sycl_model_slot_live           = 0;  // load finished, model alive
-static uint32_t   g_sycl_model_slot_loading        = GGML_SYCL_MODEL_SLOT_NONE;
-static uint32_t   g_sycl_model_slot_last_completed = GGML_SYCL_MODEL_SLOT_NONE;
-
-static uint32_t ggml_sycl_model_slot_acquire() {
-    std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
-    for (uint32_t s = 0; s < ggml_sycl::MODEL_SLOT_COUNT; ++s) {
-        const uint32_t bit = 1u << s;
-        if ((g_sycl_model_slot_allocated & bit) == 0) {
-            g_sycl_model_slot_allocated |= bit;
-            return s;
-        }
-    }
-    // Out of slots: the model stays unattributed.  Its weights are then treated
-    // conservatively (kept while any model is live), which over-retains rather
-    // than freeing something we cannot prove is dead.
-    GGML_LOG_WARN("[SYCL] no free model ownership slot (%u concurrent models); weights left unattributed\n",
-                  ggml_sycl::MODEL_SLOT_COUNT);
-    return GGML_SYCL_MODEL_SLOT_NONE;
-}
-
 // Drop the registry rows registered by one model slot, releasing the registry's
 // extra refs.  Unlike the load-boundary sweep this does not touch other models'
 // rows.  Returns rows released.
@@ -9027,8 +9005,8 @@ static size_t ggml_sycl_release_host_weight_extras_for_slot(uint32_t slot) {
 }
 
 uint32_t ggml_backend_sycl_model_slot_current(void) {
-    std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
-    return g_sycl_model_slot_last_completed;
+    const auto state = ggml_sycl::lifecycle::global_registry().last_success();
+    return state ? state->token.owner.slot : GGML_SYCL_MODEL_SLOT_NONE;
 }
 
 // Forward declaration: defined later in this TU, right after
@@ -9038,49 +9016,52 @@ uint32_t ggml_backend_sycl_model_slot_current(void) {
 // (llama.cpp-2wv5).
 static void ggml_sycl_release_graph_replay_leases_all_devices();
 
-void ggml_backend_sycl_model_unloaded(uint32_t slot) {
-    if (slot >= ggml_sycl::MODEL_SLOT_COUNT) {
-        return;
+static ggml_sycl_lifecycle_result ggml_sycl_lifecycle_c_result(ggml_sycl::lifecycle::error e) {
+    using E = ggml_sycl::lifecycle::error;
+    switch (e) {
+        case E::OK:              return GGML_SYCL_LIFECYCLE_OK;
+        case E::NESTED:          return GGML_SYCL_LIFECYCLE_NESTED;
+        case E::ABORTED:         return GGML_SYCL_LIFECYCLE_ABORTED;
+        case E::SLOT_EXHAUSTED:  return GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED;
+        case E::ID_EXHAUSTED:    return GGML_SYCL_LIFECYCLE_ID_EXHAUSTED;
+        case E::LOAD_BUSY:       return GGML_SYCL_LIFECYCLE_LOAD_BUSY;
+        case E::WRONG_TRANSACTION:return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+        case E::DEPTH_UNDERFLOW: return GGML_SYCL_LIFECYCLE_DEPTH_UNDERFLOW;
+        case E::DEPTH_OVERFLOW:  return GGML_SYCL_LIFECYCLE_DEPTH_OVERFLOW;
+        case E::MISSING_SUCCESS: return GGML_SYCL_LIFECYCLE_MISSING_SUCCESS;
+        case E::POISONED:        return GGML_SYCL_LIFECYCLE_POISONED;
+        case E::NOT_FOUND:       return GGML_SYCL_LIFECYCLE_NOT_FOUND;
+        case E::STALE_IDENTITY:  return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        case E::OK_ALREADY_DEAD: return GGML_SYCL_LIFECYCLE_ABORTED;
     }
-    const uint32_t bit = 1u << slot;
-    uint32_t       live_after;
-    {
-        std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
-        g_sycl_model_slot_live &= ~bit;
-        g_sycl_model_slot_allocated &= ~bit;
-        if (g_sycl_model_slot_last_completed == slot) {
-            g_sycl_model_slot_last_completed = GGML_SYCL_MODEL_SLOT_NONE;
-        }
-        live_after = g_sycl_model_slot_live;
-    }
+    return GGML_SYCL_LIFECYCLE_ABORTED;
+}
 
-    // Order matters: the registry's own refs must go before the cache is asked
-    // whether anything still holds a lease, or every weight of the most recently
-    // loaded model reads as leaked.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_token token) {
+    return {{token.model_id}, {token.load_txn_id}, {token.slot, token.slot_generation}};
+}
+
+static void ggml_sycl_release_model_slot_resources(uint32_t slot) {
+    const uint32_t live_after = ggml_sycl::lifecycle::global_registry().live_mask();
     const size_t rows = ggml_sycl_release_host_weight_extras_for_slot(slot);
-
-    // graph_preload_weights()/graph_preload_moe_experts() retain COPIES of
-    // weight/MoE-expert mem_handle leases in each backend context's
-    // graph_weight_leases/graph_moe_expert_leases so a recorded SYCL graph's
-    // cache-slot pointers stay stable across replay (see
-    // ggml_backend_sycl_context). Those copies are normally dropped when the
-    // NEXT graph is preloaded or when the active graph is invalidated
-    // (sycl_exec_graph_clear_active()) -- neither of which necessarily
-    // happens before THIS model's own teardown scan runs below, so a graph
-    // recorded against the dying model's weights can still be holding them
-    // live at that instant. ~ggml_backend_sycl_context() also releases these,
-    // but that destructor fires at backend-context teardown, which -- since
-    // the context is effectively a long-lived per-device object (see
-    // g_backend_context_by_device) -- is far later than model teardown, too
-    // late to keep the reclaim scan below from reporting a leak
-    // (llama.cpp-2wv5). Must run before unified_cache_release_model_slot().
     ggml_sycl_release_graph_replay_leases_all_devices();
-
     ggml_sycl::unified_cache_set_live_model_mask(live_after);
     const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
-
     GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed (live mask 0x%08x)\n",
                   slot, rows, reclaimed, live_after);
+}
+
+void ggml_backend_sycl_model_unloaded(uint32_t slot) {
+    // Bare slots cannot prove generation/owner identity. Keep this compatibility
+    // wrapper fail-closed rather than risking teardown of a reused slot.
+    GGML_LOG_WARN("[SYCL] rejected generation-less model teardown for slot %u\n", slot);
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    const auto result = registry.teardown(ggml_sycl_cpp_token(token));
+    if (result == ggml_sycl::lifecycle::error::OK) ggml_sycl_release_model_slot_resources(token.slot);
+    return ggml_sycl_lifecycle_c_result(result);
 }
 
 // Forward declarations: defined later in this TU (after the globals they
@@ -9090,21 +9071,16 @@ static void ggml_sycl_reset_model_load_scratch_state();
 static void ggml_sycl_reset_layer_map_state();
 static void ggml_sycl_reset_moe_phase_demotion_state();
 
-void ggml_backend_sycl_set_model_loading(bool loading) {
-    // Depth counter tracks nesting of load_tensors → load_all_data.
-    // S1 mode: only clear registry at outermost entry, only preload at outermost exit.
-    //   This preserves host weight registrations from load_tensors across load_all_data.
-    // Non-S1 (baseline): always clear and always preload (original behavior).
-    //   The depth counter is maintained but not used for gating.
-    static std::atomic<int> g_model_load_depth{ 0 };
+static thread_local bool g_sycl_abort_load_exit = false;
 
+static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
+    // Transaction depth/authority lives only in Registry.
     if (loading) {
-        const int depth = g_model_load_depth.fetch_add(1, std::memory_order_acq_rel);
         g_sycl_in_model_load.store(true, std::memory_order_release);
         ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::LOAD);
         // Only release at outermost entry — preserve host weight registrations from
         // load_tensors across load_all_data (nested calls increment depth).
-        if (depth == 0) {
+        if (outer) {
             // Clean slate for every model-scoped scratch global before this
             // model's own tensors are inventoried -- see the function for why
             // this must not be left to the per-field writer alone.
@@ -9121,20 +9097,11 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
             // planned device experts to host.
             ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);
 
-            // Claim an ownership slot for the incoming model.  It is reserved
-            // now (so nothing else can take it) but not published as live until
-            // the load finishes -- it owns no entry yet.
-            g_sycl_model_slot_loading = ggml_sycl_model_slot_acquire();
-
             // Eager arena reservation: create the unified cache (and its VRAM arena)
             // BEFORE any KV/compute buffer allocations can steal VRAM.  The cache
             // constructor reserves the arena when vram_arena_enabled().
             const int total_gpus = ggml_sycl_info().total_gpu_count;
-            uint32_t  live_mask;
-            {
-                std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
-                live_mask = g_sycl_model_slot_live;
-            }
+            const uint32_t live_mask = ggml_sycl::lifecycle::global_registry().live_mask();
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
                 if (cache) {
@@ -9150,14 +9117,11 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
         return;
     }
 
-    const int prev = g_model_load_depth.fetch_sub(1, std::memory_order_acq_rel);
-    if (prev <= 1) {
-        g_model_load_depth.store(0, std::memory_order_release);  // safety clamp
-    }
     // Only preload on outermost exit — S1-PRELOAD runs once after all tensors are registered.
-    if (prev <= 1) {
+    if (outer) {
         g_sycl_in_model_load.store(false, std::memory_order_release);
         ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
+        if (g_sycl_abort_load_exit) return;
 
         // --- Compute Arena: reserve VRAM for compute scratch BEFORE weight preload ---
         // This guarantees FP16 attention scratch has VRAM even after weights fill budget.
@@ -9182,23 +9146,65 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
 
         ggml_sycl_preload_model_weights();
 
-        // The load is complete: claim every entry this model can now resolve.
-        // This runs AFTER preload deliberately -- it must cover both what this
-        // load staged and anything it reused from an already-loaded model, since
-        // identical GGUF weights dedupe to a single cache entry.
-        uint32_t slot;
-        {
-            std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
-            slot                             = g_sycl_model_slot_loading;
-            g_sycl_model_slot_loading        = GGML_SYCL_MODEL_SLOT_NONE;
-            g_sycl_model_slot_last_completed = slot;
-            if (slot < ggml_sycl::MODEL_SLOT_COUNT) {
-                g_sycl_model_slot_live |= 1u << slot;
-            }
-        }
-        if (slot < ggml_sycl::MODEL_SLOT_COUNT) {
-            ggml_sycl::unified_cache_note_model_load_end(slot);
-        }
+    }
+}
+
+static void ggml_sycl_export_token(const ggml_sycl::lifecycle::ModelToken & in, ggml_sycl_model_token * out) {
+    if (out) *out = {in.model.value, in.load.value, in.owner.slot, in.owner.generation};
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
+    if (!txn) return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    auto result = ggml_sycl::lifecycle::global_registry().begin_outer();
+    if (result.code != ggml_sycl::lifecycle::error::OK) return ggml_sycl_lifecycle_c_result(result.code);
+    txn->id = result.txn.value;
+    ggml_sycl_model_loading_effects(true, true);
+    return GGML_SYCL_LIFECYCLE_OK;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
+    const auto result = ggml_sycl::lifecycle::global_registry().enter_nested({txn.id});
+    if (result == ggml_sycl::lifecycle::error::OK) ggml_sycl_model_loading_effects(true, false);
+    return ggml_sycl_lifecycle_c_result(result);
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
+        ggml_sycl_load_txn txn, bool explicit_success, ggml_sycl_model_token * model) {
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    if (!registry.transaction_active({txn.id})) {
+        (void) registry.poison({txn.id});
+        return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+    }
+    const bool outer = registry.is_outer_exit({txn.id});
+    const bool will_commit = explicit_success && registry.ready_to_commit({txn.id});
+    g_sycl_abort_load_exit = !will_commit;
+    ggml_sycl_model_loading_effects(false, outer);
+    g_sycl_abort_load_exit = false;
+    auto result = registry.end({txn.id}, explicit_success);
+    if (result.committed) {
+        ggml_sycl_export_token(result.token, model);
+        ggml_sycl::unified_cache_note_model_load_end(result.token.owner.slot);
+    } else if (result.outer && result.token.owner.slot < ggml_sycl::MODEL_SLOT_COUNT) {
+        // Abort owns only this transaction's attributed rows/entries. Never
+        // publish LIVE/last-success and never sweep another live model.
+        (void) ggml_sycl_release_host_weight_extras_for_slot(result.token.owner.slot);
+        (void) ggml_sycl::unified_cache_release_model_slot(result.token.owner.slot);
+        ggml_sycl_reset_model_load_scratch_state();
+    }
+    return ggml_sycl_lifecycle_c_result(result.code);
+}
+
+void ggml_backend_sycl_set_model_loading(bool loading) {
+    // Legacy callers receive abort-default semantics and no last-success token.
+    static thread_local ggml_sycl_load_txn legacy{};
+    static thread_local uint64_t depth = 0;
+    if (loading) {
+        const auto rc = depth == 0 ? ggml_backend_sycl_model_load_begin(&legacy)
+                                   : ggml_backend_sycl_model_load_enter_nested(legacy);
+        if (rc == GGML_SYCL_LIFECYCLE_OK) ++depth;
+    } else if (depth != 0) {
+        (void) ggml_backend_sycl_model_load_end(legacy, false, nullptr);
+        if (--depth == 0) legacy = {};
     }
 }
 
@@ -9426,10 +9432,7 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
             return;
         }
         uint32_t owner_slot;
-        {
-            std::lock_guard<std::mutex> slot_lock(g_sycl_model_slot_mutex);
-            owner_slot = g_sycl_model_slot_loading;
-        }
+        owner_slot = ggml_sycl::lifecycle::global_registry().current_active_slot().slot;
         sycl_host_weight_extra_entry new_entry{ tensor, extra, owner_slot };
         auto                         insert = g_sycl_host_weight_extras.emplace(key, new_entry);
         if (!insert.second) {

@@ -96,6 +96,22 @@ endif()
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 
+# P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
+# contains no SYCL headers, device calls, or GPU fixture dependency.
+if (BUILD_TESTING)
+    add_executable(test-sycl-lifecycle-load-txn
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
+        model-lifecycle.cpp)
+    target_include_directories(test-sycl-lifecycle-load-txn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
+
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME sycl-lifecycle-source-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
+endif()
+
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.
 # Applied ONLY to cpu-dispatch.cpp to avoid affecting SYCL device code compilation.
 # Note: Arrow Lake does NOT support AVX-512 (removed from consumer chips).
