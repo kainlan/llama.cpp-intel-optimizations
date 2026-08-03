@@ -191,13 +191,18 @@ leases/oneDNN/locks), and `o6jx` (owner-targeted teardown). Exact foundation
 edges are `viu2 → 1q72` and `{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`;
 `tudj` is a closed duplicate with no ownership or edge. Existing focused IDs retain
 their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
-`vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics. Closed
-Closed `h5m4` remains the TLS-reset proof gate. `t5nq` is OPEN with merged
+`vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics;
+`x3ou` consumes `viu2`/`1q72`/`32dg8.15.12`/`o6jx`. Closed `h5m4` remains the
+TLS-reset proof gate. `t5nq` is OPEN with merged
 reviewed packed-K-sidecar code awaiting its live GPU failpoint/retry/teardown
 gate; that gate has no foundation prerequisites and may close now. `otry`, not
-`t5nq`, revalidates packed-K guarantees after foundations. Exact tail is `all foundations/focused children → otry → jwy4 →
-k7b0`, with closed self-test line-drift prerequisite `hcyp → jwy4`; `{1q72, .15.13} →
-.15.12 → o6jx` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
+`t5nq`, revalidates packed-K guarantees after foundations. “All
+foundations/focused children → otry” is the lifecycle transitive-closure
+projection, not the exact live edge list. Exact direct `otry` dependencies are
+`nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, and `o6jx`;
+foundation/organizational edges are transitive. Exact tail edges are `{otry,
+hcyp (closed)} → jwy4` and `{jwy4, awcp (closed)} → k7b0`; final `k7b0` closure
+is blocked by `jwy4`. `{1q72, .15.13} → .15.12 → o6jx` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
 census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
 mutations, and lock controls remain canonical.
 

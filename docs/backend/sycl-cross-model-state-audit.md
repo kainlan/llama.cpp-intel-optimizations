@@ -259,25 +259,28 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `nlww` | focused MoE bias/activation consumer of `viu2`/`1q72`/`32dg8.15.12` only |
 | `vbeb` | focused layer-stream manager consumer only |
 | `y36c` | focused pending KV-mask consumer only |
-| `x3ou` | focused diagnostics/reporting consumer of `1q72`/`32dg8.15.12`/`o6jx` only |
+| `x3ou` | focused diagnostics/reporting consumer of `viu2`/`1q72`/`32dg8.15.12`/`o6jx` only |
 | `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
 | `t5nq` | OPEN with merged reviewed packed-K-sidecar-event-teardown code; no foundation prerequisites; may close after its live GPU failpoint/retry/teardown gate; `otry` revalidates after foundations |
-| `otry` | final convergence after every foundation and focused child |
+| `otry` | exact direct deps: `nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, `o6jx`; foundation/organizational edges are transitive |
 | `hcyp` | closed merged prerequisite: self-test line-drift repair only; no census ownership |
 | `jwy4` | after `otry` and `hcyp`, owns final audit script/fixtures, CSV, source hashes/count prose refresh together |
-| `k7b0` | downstream closure after `jwy4` |
+| `k7b0` | final closure blocked by `jwy4`; closed `awcp` is its other direct dependency |
 
 Canonical §12.8 is authoritative. Foundation edges are `viu2 → 1q72`,
 `{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`; `.15.12` is the exclusive async
 backing/event-lease/oneDNN/lock foundation and `tudj` is a closed duplicate.
-Focused consumers retain only their subsystem scopes. Exact convergence edge:
-`{viu2, 1q72, 32dg8.15.12, o6jx, h5m4, t5nq, nn6z, nlww, vbeb, y36c, x3ou}
-→ otry`. Closed `h5m4` and OPEN `t5nq` are focused proof gates, not foundation
+Focused consumers retain only their subsystem scopes. The lifecycle
+transitive-closure projection includes all foundations/focused children before
+`otry`; it is not the live direct-edge list. Exact direct convergence edge:
+`{nlww, h5m4, nn6z, y36c, vbeb, x3ou, t5nq, o6jx} → otry`; foundation and
+organizational edges are transitive. Closed `h5m4` and OPEN `t5nq` are focused
+proof gates, not foundation
 implementers. `t5nq` has no foundation prerequisite and may close after its live
 GPU gate; `otry` revalidates packed-K guarantees after foundations. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
-`0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact tail:
-all foundations/focused children → `otry → jwy4 → k7b0`, with closed prerequisite
-`hcyp → jwy4`. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
+`0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact live
+tail edges are `{otry, hcyp (closed)} → jwy4` and `{jwy4, awcp (closed)} →
+k7b0`; final `k7b0` closure is blocked by `jwy4`. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
 shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
 M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
 L1-L5/C/D M7 hooks (global-registry absence and cross-thread completion are
@@ -306,7 +309,8 @@ implementation HEAD, classifies every new mutable lifecycle row by
 owner/synchronization/teardown, and leaves no unowned
 model/context/session/graph/invocation state. A CSV-only refresh, a count without
 reconciliation, or a green check against pre-implementation source does not
-close `jwy4`; `k7b0` starts afterward.
+close `jwy4`; final `k7b0` closure is blocked by `jwy4`, while its other direct
+dependency `awcp` is already closed.
 
 ---
 
