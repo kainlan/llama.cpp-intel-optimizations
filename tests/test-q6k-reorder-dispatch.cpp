@@ -15,6 +15,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-quants.h"
+#include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 
 // Constants from production code
@@ -35,83 +36,60 @@
 // [ql: 128*N bytes][qh: 64*N bytes][scales: 16*N bytes][d: 2*N bytes]
 
 //=============================================================================
-// Test 1: Verify CPU reorder function layout
+// Test 1: Verify the production Q6_K AoS -> SoA reorder
 //=============================================================================
-static void test_cpu_reorder_layout() {
-    printf("\n=== Test 1: CPU Reorder Layout Verification ===\n");
+static bool test_production_reorder_layout() {
+    printf("\n=== Test 1: Production Q6_K Reorder Layout Verification ===\n");
 
-    const size_t nblocks = 4;
-    const size_t aos_size = nblocks * sizeof(block_q6_K);
-    const size_t soa_size = aos_size;  // Same total size
+    try {
+        sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order());
+        const size_t nblocks = 4;
+        const size_t data_size = nblocks * sizeof(block_q6_K);
 
-    // Create test data with known patterns
-    std::vector<block_q6_K> aos_data(nblocks);
-    for (size_t b = 0; b < nblocks; b++) {
-        // Fill ql with block number in each byte
-        for (int i = 0; i < QK_K/2; i++) aos_data[b].ql[i] = (uint8_t)(b + 1);
-        // Fill qh with 0x10 + block number
-        for (int i = 0; i < QK_K/4; i++) aos_data[b].qh[i] = (uint8_t)(0x10 + b);
-        // Fill scales with 0x20 + block number
-        for (int i = 0; i < QK_K/16; i++) aos_data[b].scales[i] = (int8_t)(0x20 + b);
-        // Set d to block index as float
-        aos_data[b].d = ggml_fp32_to_fp16((float)(b + 1));
+        std::vector<block_q6_K> aos_data(nblocks);
+        std::vector<uint8_t> expected(data_size);
+        uint8_t * expected_ql = expected.data();
+        uint8_t * expected_qh = expected_ql + nblocks * (QK_K / 2);
+        int8_t * expected_scales = (int8_t *) (expected_qh + nblocks * (QK_K / 4));
+        ggml_half * expected_d = (ggml_half *) (expected_scales + nblocks * (QK_K / 16));
+
+        for (size_t b = 0; b < nblocks; ++b) {
+            for (int i = 0; i < QK_K / 2; ++i) aos_data[b].ql[i] = (uint8_t) (b * 17 + i);
+            for (int i = 0; i < QK_K / 4; ++i) aos_data[b].qh[i] = (uint8_t) (0x40 + b * 11 + i);
+            for (int i = 0; i < QK_K / 16; ++i) aos_data[b].scales[i] = (int8_t) (-32 + b * 7 + i);
+            aos_data[b].d = ggml_fp32_to_fp16((float) (b + 1) / 3.0f);
+
+            memcpy(expected_ql + b * (QK_K / 2), aos_data[b].ql, QK_K / 2);
+            memcpy(expected_qh + b * (QK_K / 4), aos_data[b].qh, QK_K / 4);
+            memcpy(expected_scales + b * (QK_K / 16), aos_data[b].scales, QK_K / 16);
+            expected_d[b] = aos_data[b].d;
+        }
+
+        block_q6_K * device_aos = sycl::malloc_device<block_q6_K>(nblocks, q);
+        uint8_t * device_soa = sycl::malloc_device<uint8_t>(data_size, q);
+        if (!device_aos || !device_soa) {
+            if (device_aos) sycl::free(device_aos, q);
+            if (device_soa) sycl::free(device_soa, q);
+            printf("  FAIL: device allocation failed\n");
+            return false;
+        }
+
+        q.memcpy(device_aos, aos_data.data(), data_size).wait();
+        reorder_q6_k_aos_to_soa_sycl(device_aos, device_soa, nblocks, &q);
+
+        std::vector<uint8_t> actual(data_size);
+        q.memcpy(actual.data(), device_soa, data_size).wait();
+        sycl::free(device_aos, q);
+        sycl::free(device_soa, q);
+
+        const bool pass = actual == expected;
+        printf("  Production call: reorder_q6_k_aos_to_soa_sycl\n");
+        printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+        return pass;
+    } catch (const sycl::exception & e) {
+        printf("  SKIP: SYCL error: %s\n", e.what());
+        return true;
     }
-
-    // Allocate SoA buffer and call reorder
-    std::vector<uint8_t> soa_data(soa_size);
-
-    // Replicate reorder_q6_k_cpu logic (from ggml-sycl.cpp)
-    const uint8_t* aos = (const uint8_t*)aos_data.data();
-    uint8_t* soa_ql = soa_data.data();
-    uint8_t* soa_qh = soa_ql + nblocks * (QK_K / 2);
-    uint8_t* soa_scales = soa_qh + nblocks * (QK_K / 4);
-    uint8_t* soa_d = soa_scales + nblocks * (QK_K / 16);
-
-    for (size_t ib = 0; ib < nblocks; ib++) {
-        const uint8_t* block_aos = aos + ib * sizeof(block_q6_K);
-        // Copy ql (128 bytes at offset 0)
-        memcpy(soa_ql + ib * (QK_K / 2), block_aos, QK_K / 2);
-        // Copy qh (64 bytes at offset 128)
-        memcpy(soa_qh + ib * (QK_K / 4), block_aos + (QK_K / 2), QK_K / 4);
-        // Copy scales (16 bytes at offset 192)
-        memcpy(soa_scales + ib * (QK_K / 16), block_aos + (QK_K / 2) + (QK_K / 4), QK_K / 16);
-        // Copy d (2 bytes at offset 208)
-        memcpy(soa_d + ib * sizeof(ggml_half), block_aos + (QK_K / 2) + (QK_K / 4) + (QK_K / 16), sizeof(ggml_half));
-    }
-
-    // Verify layout
-    printf("  SoA layout offsets:\n");
-    printf("    ql:     0 - %zu\n", nblocks * 128 - 1);
-    printf("    qh:     %zu - %zu\n", nblocks * 128, nblocks * 128 + nblocks * 64 - 1);
-    printf("    scales: %zu - %zu\n", nblocks * 192, nblocks * 192 + nblocks * 16 - 1);
-    printf("    d:      %zu - %zu\n", nblocks * 208, nblocks * 208 + nblocks * 2 - 1);
-
-    bool pass = true;
-    for (size_t b = 0; b < nblocks; b++) {
-        // Check ql
-        if (soa_ql[b * 128] != (b + 1)) {
-            printf("  FAIL: block %zu ql[0] = %d, expected %zu\n", b, soa_ql[b * 128], b + 1);
-            pass = false;
-        }
-        // Check qh
-        if (soa_qh[b * 64] != (0x10 + b)) {
-            printf("  FAIL: block %zu qh[0] = %d, expected %d\n", b, soa_qh[b * 64], 0x10 + (int)b);
-            pass = false;
-        }
-        // Check scales
-        if ((uint8_t)((int8_t*)soa_scales)[b * 16] != (uint8_t)(0x20 + b)) {
-            printf("  FAIL: block %zu scales[0] = %d, expected %d\n", b, ((int8_t*)soa_scales)[b * 16], 0x20 + (int)b);
-            pass = false;
-        }
-        // Check d
-        float d_val = ggml_fp16_to_fp32(*(ggml_half*)(soa_d + b * 2));
-        if (fabs(d_val - (b + 1)) > 0.01f) {
-            printf("  FAIL: block %zu d = %f, expected %f\n", b, d_val, (float)(b + 1));
-            pass = false;
-        }
-    }
-
-    printf("  Result: %s\n", pass ? "PASS" : "FAIL");
 }
 
 //=============================================================================
@@ -823,7 +801,8 @@ int main() {
     printf("Q6_K Reorder & Dispatch Comprehensive Unit Tests\n");
     printf("=================================================\n");
 
-    test_cpu_reorder_layout();
+    int failures = 0;
+    failures += !test_production_reorder_layout();
     test_offset_calculations();
     test_cpu_dequant_reference();
     test_dispatch_aos_vs_soa();
@@ -832,6 +811,6 @@ int main() {
     test_gpu_soa_kernel();
     test_gpu_production_format();
 
-    printf("\n=== All Tests Complete ===\n");
-    return 0;
+    printf("\n=== All Tests Complete: %d failure(s) ===\n", failures);
+    return failures == 0 ? 0 : 1;
 }
