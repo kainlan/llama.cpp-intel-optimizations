@@ -817,14 +817,21 @@ forbidden. In particular `g_sycl_graph_compute_mutex` must be replaced, not
 nested with per-device execution locks, and `g_cache_rw_mutex` must be dropped
 before a per-cache L4 lock is acquired. Snapshot/revalidate bridges these cases.
 The target **deletes** `g_onednn_scratch_lock_mutex` and
-`g_onednn_scratch_locks`; no persistent global registry may store a keyed
-`onednn_scratch_mutex_` `unique_lock`. `t5nq` supplies a move-only caller-owned
-`onednn_scratch_lease`, acquired while holding no other listed lock, that owns
-the keyed scratch lock and backing handles. `h5m4` moves it into the invocation's
-per-device event payload; completion extracts it under C and destroys/unlocks it
-after C is released. Acquire/release under any L1-L5/C/D lock is rejected by
-H8/M7. This RAII handoff replaces, rather than orders, the contradictory
-persistent global/keyed same-rank pair.
+`g_onednn_scratch_locks`; no global registry or async payload may store a
+`std::unique_lock`/mutex ownership token. `t5nq` supplies a logical
+`onednn_scratch_reservation { device, generation, reservation_id }` API. Acquire
+briefly locks that device's surviving keyed `onednn_scratch_mutex_`, validates
+or creates the current logical generation without allocating, increments its
+reservation refcount, snapshots backing handles, and unlocks on the same thread.
+Growth/allocation remains a two-phase outside-lock operation. `h5m4` retains the
+logical reservation and backing handles in each registered event payload.
+Completion may run on another thread: it briefly takes the keyed mutex itself,
+rejects a stale generation/reservation, decrements the refcount, marks the
+scratch reusable at zero, extracts any deferred backing cleanup, unlocks, and
+only then destroys handles. No mutex ownership crosses a thread or async
+boundary. H8/M7 probe acquire, same-thread completion, cross-thread completion,
+and stale generation on the surviving keyed mutex, and separately prove the
+deleted global registry symbols are absent.
 
 Current allocation/device work under registry locks is explicitly
 non-conforming. `g_moe_buffers_mutex` must only reserve an INITIALIZING generation
@@ -843,8 +850,9 @@ wait for terminal context events outside all locks; call
 swap/move the vector under L4; unlock; then destroy the returned batch's
 `mem_handle`s. Iterating/clearing the vector under the lock at current
 `ggml-sycl.cpp:32784-32791` is forbidden. H8 has positive controls for each named
-current lock, caller-owned oneDNN lease acquire/release, allocation, queue
-construction/destruction, and final-owner destruction under it.
+current lock, oneDNN logical reservation acquire/same-thread/cross-thread
+completion and registry absence, allocation, queue construction/destruction,
+and final-owner destruction under it.
 
 The execution lock protects token bookkeeping only, not device execution. The
 completion/quarantine lock protects queue mechanics only; pop, unlock, then
@@ -907,16 +915,20 @@ nn6z (model/load/slot foundation; owns G1)
   ├──> nlww (context/session ownership + control-allocation extract API)
   │      └──> vbeb (GraphEpoch + top-level device token + aggregate seal)
   │             └──> h5m4 (allocation/backing/control-host event leases)
-  │                    └──> y36c (drain, extract-call, unlocked destruction)
+  │                    └──> otry (final payload/lock convergence census)
+  │                           └──> y36c (drain/extract/unlocked destruction)
   └──> x3ou (reporting-only tier verdict)
 
 32dg8.15.13 (event-returning memory-op surface) ──> h5m4
-t5nq (caller-owned oneDNN scratch-lease API) ─────> h5m4
+t5nq (logical oneDNN reservation/event API) ─────> h5m4
+h5m4 ────────────────────────────────────────────> otry
 main self-test repair ──> hcyp
 
-t5nq consumes lock inventories from nn6z/nlww/vbeb and lands the caller-owned
-oneDNN scratch-lease API before h5m4 integrates it. h5m4 introduces no new lock;
-t5nq performs the final payload lock-census check, and both precede y36c.
+t5nq consumes lock inventories from nn6z/nlww/vbeb and lands the logical oneDNN
+reservation/event API before h5m4 integrates it. `h5m4` consumes that frozen API
+and does not edit its locks. New convergence child `otry` exclusively owns the
+post-integration payload/lock census and any integration-only corrections after
+h5m4; `t5nq` has no post-h5 work. `otry` and h5m4 both precede y36c.
 (all implementation children) ──> hcyp final census
 ```
 
@@ -925,8 +937,9 @@ t5nq performs the final payload lock-census check, and both precede y36c.
 | `nn6z` | slot/ID registry; model-load begin/nesting/commit/abort; planner publication | checked nonwrapping IDs, side-effect-free slot exhaustion, rollback; H1-H4, H10, **G1**, M1-M3 |
 | `nlww` | `ContextId`/`SessionId`/`SessionResetEpoch` types and registries; state-transition primitives; context/session create+publish; KV/arena keys; implementation of control-allocation extract primitive | named transition/extract API handoff, nonwrapping/ABA tests; H5-H6, H13-H14, G3-G4 |
 | `vbeb` | `GraphEpoch`/`InvocationId` registries; per-device token acquisition/copy; one-context/epoch per invocation; per-device aggregate retention; record/replay epoch plumbing | retiring isolation, owner-mismatch rejection, quarantine, busy/wait/multi-device; H7, H11, H13, G5a/G6/G7, M6a/M6e |
-| `h5m4` | event payload retention for ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA backing, and caller-owned `onednn_scratch_lease` | allocation lifetime through sealed aggregate completion; control handles remain leased until extraction after drain; H7, H12, rerun G5a, G6/G7, M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d |
-| `t5nq` | exhaustive lock ranks; delete oneDNN global lock registry and hand off caller-owned scratch-lease API; instrument `control_host_allocs_mutex`; completion queue mechanics | sentinel/tie-break, named alias, and every no-under-lock prohibition; H8, M7 |
+| `h5m4` | consumes frozen oneDNN reservation API; event payload retention for reservation/backing handles plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA | allocation lifetime through sealed aggregate completion; control handles remain leased until extraction after drain; H7, H12, rerun G5a, G6/G7, M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d |
+| `t5nq` | pre-integration only: delete oneDNN global registry; implement logical generation/refcount reservation acquire/completion API and lock probes; instrument `control_host_allocs_mutex` | sentinel/tie-break, named alias, and every no-under-lock prohibition; H8, M7 |
+| `otry` | post-h5 convergence only: final event-payload/lock census, verify global registry absence and no async mutex ownership; integration corrections | all h5 payload paths plus H8/M7 cross-thread/absence gates; no redesign of frozen t5 API |
 | `y36c` | drain/reset/teardown **callers and orchestration only**; cache owner removal | after event drain calls `nlww` control-allocation extract API and destroys returned handles outside locks; never edits registry primitives; H3-H6, H14, G2-G4/G5b, M4-M5 |
 | `x3ou` | tier-verdict record/public reporting and reader audit | no routing/reset readers; H9, M8 |
 | `hcyp` | `scripts/audit-sycl-static-storage.py`, its self-test fixtures, `docs/backend/sycl-static-storage-inventory.csv`, and final census/count prose in this audit | starts after main's self-test repair; refreshes all four artifacts together at final HEAD and makes `--self-test`/`--check` clean |
@@ -976,7 +989,7 @@ test names, not claims that they exist now**.
 | H5 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | reset/teardown touches only target model/context/session/epoch |
 | H6 | host | `ctest --test-dir build -R '^sycl-lifecycle-owner-reset$' --output-on-failure` | stale slot generation and stale/retiring graph callback cannot mutate current state |
 | H7 | host | `ctest --test-dir build -R '^sycl-lifecycle-event-lease$' --output-on-failure` | one bound context/epoch; OPEN/SEALED counters and incomplete per-device terminal sets retain each device's handles/root independently |
-| H8 | host | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-scratch-lease-acquire,onednn-scratch-lease-release,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; named MoE/oneDNN/pipeline/backend-context/control-host-allocation positive controls fire |
+| H8 | host | `./build/bin/test-sycl-lifecycle-lock-order --locks all-inventory --cases inventory-complete,rank-inversion,same-rank-order,global-keyed-cohold,event-wait,event-wait-and-throw,queue-wait,queue-wait-and-throw,future-wait,condvar-wait,callback,blocking-allocation,blocking-device-call,queue-construct,queue-destroy,onednn-global-registry-absent,onednn-reservation-acquire,onednn-reservation-complete,onednn-reservation-cross-thread-complete,onednn-reservation-stale-generation,final-handle-destroy,final-control-host-handle-destroy,final-token-destroy,final-backing-lease-destroy --ranks L1,L2,L3,L4,L5,C,D` | every named current/planned lock is classified; every operation/rank pair rejects before performing it; oneDNN global-registry absence and cross-thread logical completion pass; named MoE/pipeline/backend-context/control-host positive controls fire |
 | H9 | host | `ctest --test-dir build -R '^sycl-lifecycle-tier-reporting$' --output-on-failure` | changing verdict changes report only, never route/reset |
 | H10 | host | `./build/bin/test-sycl-lifecycle-load-txn --case slot-exhaustion --case model-id-overflow --case load-txn-id-overflow --case slot-generation-overflow --case invocation-id-counter-overflow` | 33rd slot is side-effect-free before LOADING; common checked counter refuses InvocationId wrap; model/load IDs never wrap; exhausted slot retires; `nn6z` owns common primitive fixture |
 | H11 | host | `./build/bin/test-sycl-lifecycle-event-lease --case invocation-id-overflow --case reentrant --case cross-context-rejected --case cross-epoch-rejected --case busy --case wait-cancel --case multi-device --case aggregate-terminals --case fast-first-terminal-before-final-registration --case join-create-failure --case submit-exception-known --case submit-exception-uncertain` | `vbeb` owns cases; one bound context/epoch, owner mismatch before side effects, one token/device, nonwrapping invocation, OPEN→SEALED gating, registered producer/submit counts, fast-terminal race resistance, independent device roots, and drain/quarantine fallback |
@@ -1052,7 +1065,7 @@ is executable, not a manual source revert.
 | M6c | `tests/test-sycl-lifecycle-mutations.sh build M6-direct` | `event_payload_skip_direct_owner`: accept bare DIRECT/drop explicit owner | `bare DIRECT escaped backing validation`; H12/G6 green after restore |
 | M6d | `tests/test-sycl-lifecycle-mutations.sh build M6-arena` | `event_payload_skip_arena_backing`: drop arena/chunk generation lease | `arena backing released before device terminals`; H12/G6/G7 green after restore |
 | M6e | `tests/test-sycl-lifecycle-mutations.sh build M6-aggregate-seal` | `aggregate_terminal_before_seal_release`: let the first completed slot publish COMPLETE while producer registration remains OPEN | `OPEN aggregate released before final producer seal`; H11/G7 green after restore |
-| M7 | `for v in event-wait event-wait-and-throw queue-wait queue-wait-and-throw future-wait condvar-wait callback blocking-allocation blocking-device-call queue-construct queue-destroy onednn-scratch-lease-acquire onednn-scratch-lease-release final-handle-destroy final-control-host-handle-destroy final-token-destroy final-backing-lease-destroy; do for r in L1 L2 L3 L4 L5 C D; do tests/test-sycl-lifecycle-mutations.sh build M7-$v-$r || exit 1; done; done` | `lock_probe_before_unlock($v,$r)`: perform exactly that operation while that rank/isolated lock is held; named lock aliases also target `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, `g_backend_context_by_device_mutex`, and `ggml_backend_sycl_context::control_host_allocs_mutex` | exact marker `M7:$v:forbidden-under:$r`; H8 green after every restored subprocess |
+| M7 | `tests/test-sycl-lifecycle-mutations.sh build M7-onednn-global-registry-present && tests/test-sycl-lifecycle-mutations.sh build M7-onednn-cross-thread-unlock && for v in event-wait event-wait-and-throw queue-wait queue-wait-and-throw future-wait condvar-wait callback blocking-allocation blocking-device-call queue-construct queue-destroy onednn-reservation-acquire onednn-reservation-complete onednn-reservation-cross-thread-complete final-handle-destroy final-control-host-handle-destroy final-token-destroy final-backing-lease-destroy; do for r in L1 L2 L3 L4 L5 C D; do tests/test-sycl-lifecycle-mutations.sh build M7-$v-$r || exit 1; done; done` | separate `legacy_onednn_global_registry_present` and `onednn_completion_cross_thread_unlock` mutants, plus `lock_probe_before_unlock($v,$r)`; surviving named aliases are `onednn_scratch_mutex_`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, `g_backend_context_by_device_mutex`, and `control_host_allocs_mutex`—no deleted global alias | exact markers `oneDNN global lock registry present`, `cross-thread mutex ownership`, and `M7:$v:forbidden-under:$r`; H8 green after every restore |
 | M8 | `tests/test-sycl-lifecycle-mutations.sh build M8` | `tier_report_before_dispatch`: invert route when report verdict flips | `reporting verdict changed dispatch`; H9 green after restore |
 
 The mutation runner fails if the mutant unexpectedly passes, the marker is
@@ -1079,9 +1092,10 @@ historical 5793 census is not accepted as final evidence.
 | P1 transactions | model load begin/nested exit/preload/failure; slot/ID registry | `nn6z`, including G1, exhaustion/overflow, and rollback mutations pass |
 | P2 context ownership | `nlww` types/registries/state primitives/create/publish, KV/RUNTIME/SCRATCH keys, control-host snapshot/extract API | H13 passes; extract handoff lands; no legacy drain/reset caller edited |
 | P3 graph/execution foundation | graph compute, checked InvocationId, one-context/epoch binding, device token, per-device aggregate/quarantine, record/replay/retiring epochs | `vbeb` H11/G5a/G7/M6a/M6e passes, including fast-terminal-before-final-registration; G5a contains no teardown |
-| P3L lock API handoff | delete oneDNN global lock registry; caller-owned scratch-lease acquire/release with rank probes | `t5nq` oneDNN H8/M7 cases pass and hands API to `h5m4` |
-| P4 allocation event foundation | `.15.13` event surface handoff, memcpy/memset, direct/fallback, ordinary I/O/pointer-table/sidecar/control-host, DIRECT/ARENA backing, caller-owned oneDNN scratch lease | `h5m4` H7/H12/G6/G7 and M6b-io/M6b-sidecar/M6b-pointer-table/M6c/M6d pass; rerun G5a as restored baseline |
-| P5 locks then teardown | `t5nq` exhaustive ranks/completion queue, then `y36c` legacy drain/reset/teardown callers and cache reclaim | all H8/M7 aliases pass; teardown order is begin drain → unlocked terminal wait → L4 extract → unlocked batch destruction → finish; H14 and G5b pass |
+| P3L lock API handoff | delete oneDNN global registry; logical generation/refcount reservation transitions under brief keyed lock | `t5nq` absence/acquire/same- and cross-thread completion H8/M7 pass; frozen API handed to `h5m4`; t5 ends |
+| P4 allocation event foundation | `.15.13` event surface handoff, ordinary I/O/pointer-table/sidecar/control-host, DIRECT/ARENA backing, logical oneDNN reservation/backing | `h5m4` consumes frozen API; H7/H12/G6/G7 and split M6 pass; rerun G5a |
+| P4C convergence | final integrated event-payload and lock census | `otry` owns all post-h5 corrections; proves no global registry/async mutex ownership and all H8/M7 gates |
+| P5 teardown | `y36c` legacy drain/reset/teardown callers and cache reclaim | begin drain → unlocked terminal wait → L4 extract → unlocked batch destruction → finish; H14 and G5b pass |
 | P6 reporting | planner/tier API and all readers | `x3ou` proves report-only behavior |
 | P7 final audit | `hcyp` script fixtures, CSV, source hashes/count prose after main self-test repair | all four refresh together; `--self-test` and `--check` pass at final HEAD; all H/G tests green |
 

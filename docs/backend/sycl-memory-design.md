@@ -163,9 +163,11 @@ state. Locks follow exhaustive L1 lifecycle → L2 execution → L3 owner regist
 → L4 cache/queue registry → L5 allocator/work ordering; the canonical table
 includes current oneDNN scratch, MoE buffer, pipeline/block copy-queue,
 backend-context, and `control_host_allocs_mutex` locks. The target deletes the
-oneDNN global `unique_lock` registry: `t5nq` returns a caller-owned RAII scratch
-lease acquired/released with no listed lock held, and `h5m4` retains it in the
-event payload. Global/transitional same-rank co-holding is forbidden and
+oneDNN global `unique_lock` registry. `t5nq` deletes it and freezes a logical
+`{device, generation, reservation_id}` API: brief same-thread keyed-mutex
+transitions increment/decrement reservation refcounts, while event payloads carry
+only logical reservation/backing handles. Cross-thread completion takes/releases
+the keyed mutex on that completion thread; no mutex ownership is retained. Global/transitional same-rank co-holding is forbidden and
 completion/diagnostic locks C/D are isolated. No wait, blocking allocation/device
 call, queue create/destroy, callback, or final handle/token/backing destruction
 occurs under a listed lock. Tier verdicts are reporting-only.
@@ -185,10 +187,12 @@ of supported concurrency.
 Canonical §12.8-§12.10 defines the exclusive handoff (`nlww` owns context/session
 registry primitives/create/publish/extract; `y36c` owns legacy callers and the
 fixed drain→wait→extract→destroy→finish sequence), DAG (`nn6z → nlww → vbeb →
-h5m4 → y36c`, `t5nq scratch-lease API → h5m4`, `.15.13 → h5m4`), G1/G7 ownership, token-only G5a versus teardown-only G5b,
+h5m4 → otry → y36c`, `t5nq logical-reservation API → h5m4`, `.15.13 → h5m4`);
+`t5nq` has no post-h5 work and `otry` owns final payload/lock convergence, G1/G7 ownership, token-only G5a versus teardown-only G5b,
 legacy supersession, H1-H14/G1-G7, hash-pinned distinct/shared fixtures,
 independent ordinary/sidecar/pointer-table M6 mutants, the OPEN-before-seal race
-mutant, and control-lock-aware L1-L5/C/D M7, and final `hcyp`
+mutant, and L1-L5/C/D M7 with separate global-registry-absence and cross-thread
+reservation-completion controls, and final `hcyp`
 script+fixture+CSV+prose refresh after main's self-test repair.
 
 ## Path-scoped zone sizing

@@ -189,7 +189,7 @@ Line numbers are review aids and may drift; the symbols/behaviors are the gate.
 | `ggml-sycl.cpp:9736-10096` | planner/inventory/tier values are process-global current-load scratch | not keyed by model/load transaction; tier verdict cannot route: `nn6z`, `x3ou` |
 | `ggml-sycl.cpp:85621-85670` | context graph clear drops handles; teardown helper iterates every backend device because graph leases lack model identity | no `GraphEpoch`; another model can be forced to re-record: `vbeb`, `y36c`, `h5m4` |
 | `unified-cache.hpp:1436-1457` | cache ownership and reclaim mode use bare 32-bit slot masks | no slot generation/`ModelId`: `nn6z`, `y36c` |
-| `unified-cache.cpp:11305-11394` | global registry stores keyed per-cache `unique_lock` values, forcing contradictory same-rank co-holding | `t5nq` deletes registry and returns caller-owned RAII scratch lease; `h5m4` retains it through event completion |
+| `unified-cache.cpp:11305-11394` | global registry persists thread-owned keyed `unique_lock` values and can erase/unlock cross-thread | `t5nq` deletes registry and supplies logical generation/refcount reservation; `h5m4` event-retains reservation/backing without mutex ownership |
 | `unified-cache.cpp:13788-14012` | `g_moe_buffers_mutex` spans `unified_alloc`, fills, and final handle reset | blocking allocation/device/final-owner work under metadata lock: `t5nq`, `h5m4` |
 | `ggml-sycl.cpp:14726-14742`, `76070-76100` | pipeline and block-exec copy-queue registry mutexes construct queues under lock | queue/device work must use reserve-create-publish: `t5nq` |
 | `ggml-sycl.cpp:17122-17131` | backend-context device registry returns a raw context after unlocking | target snapshot must carry an owner lease: `nlww`, `t5nq` |
@@ -238,8 +238,9 @@ includes `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`,
 `g_backend_context_by_device_mutex`, and
 `ggml_backend_sycl_context::control_host_allocs_mutex`, including their
 allocation/queue/final-owner under-lock hazards. The oneDNN global lock registry is not ordered around the
-keyed mutex: it is deleted in favor of a caller-owned lease acquired/released
-with no listed lock held. Global/transitional locks use a sentinel and cannot co-hold
+keyed mutex: it is deleted. The surviving keyed mutex protects only brief
+same-thread logical reservation/refcount transitions; cross-thread completion
+acquires/releases that mutex on the completion thread itself. Global/transitional locks use a sentinel and cannot co-hold
 a keyed same-rank lock. Completion C and diagnostics D are isolated. Every wait,
 callback, blocking allocation/device operation, queue construction/destruction,
 and final handle/token/backing destruction is forbidden under L1-L5/C/D;
@@ -252,21 +253,24 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `nn6z` | model/load/slot identities, missing-success/depth-overflow rollback, typed exhaustion, A→B→A; owns G1 |
 | `nlww` | context/session/reset-epoch registries and state primitives/create/publish; implements named control-host-allocation extract API |
 | `vbeb` | graph/invocation identities, one context/epoch, OPEN/SEALED producer+submit accounting, one token/device, aggregate+quarantine; owns H11/G5a/G7/M6e |
-| `h5m4` | retains ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA backing, and caller-owned oneDNN scratch lease through SEALED completion |
-| `t5nq` | deletes oneDNN global registry, owns rank-safe scratch-lease API, and inventories `control_host_allocs_mutex` with H8/M7 acquire/release aliases |
+| `h5m4` | consumes frozen t5 API and event-retains logical oneDNN reservation/backing plus ordinary I/O, sidecar, pointer-table, control-host, DIRECT/ARENA |
+| `otry` | sole post-h5 convergence owner: final payload/lock census, absence of global registry/async mutex ownership, integration fixes |
+| `t5nq` | pre-h5 only: deletes global registry, freezes logical generation/refcount acquire/completion API, inventories control mutex; no post-h5 work |
 | `y36c` | exact order: begin drain → unlocked terminal wait → L4 extract → unlocked handle destruction → finish; owns G5b |
 | `x3ou` | all tier-verdict readers are reporting-only |
 | `hcyp` | after main repairs self-test, owns audit script/fixtures, CSV, source hashes/count prose and final refresh together |
 
 Canonical §12.8 is the dependency/path-ownership authority: `nn6z → nlww →
-vbeb → h5m4 → y36c`, with explicit `t5nq scratch-lease API → h5m4` and
-`32dg8.15.13 → h5m4` edges; both `t5nq` and `h5m4` precede `y36c`. It supersedes stale `32dg8.2` ownership
+vbeb → h5m4 → otry → y36c`, with explicit `t5nq logical-reservation API →
+h5m4` and `32dg8.15.13 → h5m4` edges. `t5nq` ends at handoff; `otry` owns the
+post-h5 lock/payload census. It supersedes stale `32dg8.2` ownership
 assumptions and treats historical `.15.10` as superseded by `nlww`/`y36c` while
 mapping `.15.12/.13`, `0qlw`, `2wv5`, and `k7b0` without dual
 editing. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus
 shared-copy hash-pinned fixtures, same/multi-device UUID assertions, independent
 M6 payload mutants plus dedicated early-COMPLETE-before-seal mutant, and
-L1-L5/C/D M7 hooks are canonical §12.9. Multiple LIVE
+L1-L5/C/D M7 hooks (global-registry absence and cross-thread completion are
+separate positive controls) are canonical §12.9. Multiple LIVE
 models and sequential A→B→A are separate gates; neither proves overlapping
 execution, which must serialize/reject through per-device aggregate roots.
 
@@ -387,14 +391,18 @@ structurally impossible.
   the opposite mechanism from the uuid cache (always-fresh instead of
   pure-function), but safe.
 - **`g_runtime_alloc_registry`, `g_runtime_cohort_tier`,
-  `g_runtime_reset_reclaimed_allocs`, `g_offload_pool_slots`,
-  `g_onednn_scratch_locks`** (`unified-cache.cpp`): all "maintained, no
-  bare `.clear()`" in the systematic sweep, but all have paired
-  `emplace`/`erase` at every insertion site checked — these track the
-  lifetime of individual raw allocations (not model identity), which is a
-  legitimate use of pointer keys (this *is* the allocator's own bookkeeping,
-  not a downstream cache using a pointer as an identity key). Spot-checked,
-  not exhaustively traced through every call path.
+  `g_runtime_reset_reclaimed_allocs`, `g_offload_pool_slots`**
+  (`unified-cache.cpp`): all "maintained, no bare `.clear()`" in the systematic
+  sweep, but all have paired `emplace`/`erase` at every insertion site checked —
+  these track individual allocation lifetimes. Spot-checked, not exhaustively
+  traced through every call path.
+- **Historical correction — `g_onednn_scratch_locks` is non-conforming.** The
+  earlier category grouped it with correctly-scoped allocator bookkeeping
+  because its map entries had paired erase. That assessed key lifetime, not lock
+  lifetime: it persists a thread-owned keyed `unique_lock` in a global registry,
+  acquires another same-rank mutex to store it, and may erase/unlock on another
+  thread. Canonical §12.5 supersedes that assessment and requires the map/global
+  mutex to be deleted in favor of logical reservation generation/refcount state.
 
 ## Category (c): model-scoped and leaking — found and fixed
 
