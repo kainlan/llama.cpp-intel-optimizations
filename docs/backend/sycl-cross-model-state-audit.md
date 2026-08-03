@@ -1,4 +1,167 @@
-# SYCL cross-model state audit (llama.cpp-k7b0)
+# SYCL cross-model state audit (llama.cpp-k7b0; parser census llama.cpp-1kx3)
+
+## Reproducible parser-grade static-storage census (llama.cpp-1kx3)
+
+The generated inventory is
+[`sycl-static-storage-inventory.csv`](sycl-static-storage-inventory.csv). Regenerate it from the
+repository root with:
+
+```sh
+python3 -m pip install tree-sitter==0.25.2 tree-sitter-language-pack==1.8.1
+python3 scripts/audit-sycl-static-storage.py --self-test
+python3 scripts/audit-sycl-static-storage.py
+python3 scripts/audit-sycl-static-storage.py --check
+```
+
+The generator pins and checks the C++ grammar ABI 15 through
+`tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
+different installed version. It walks C++ `declaration` and
+`field_declaration` nodes rather than matching declaration text. A narrow,
+anchored spelling proof also recovers compiler-valid direct class member-pointer
+declarations that grammar ABI 15 misparses as fields/functions with `ERROR`
+children; any non-matching or ambiguous form still fails closed. Each declarator
+in a multi-object declaration becomes its own row. Actual
+function declarations are excluded by declarator binding shape, while
+pointer/reference-to-function and pointer-to-member function/data objects
+(including arrays) remain census objects. This is deliberately **not a general
+C++ frontend**: alias handling is a bounded proof for the five inputs listed
+below. It records declaration positions and lexical namespace/class/function/
+block identities, chooses the first nearest candidate and then its newest
+visible declaration, and treats relevant ordinary-name hiding conservatively.
+Relative qualified names search enclosing namespace prefixes before global
+scope, while leading `::` remains absolute. Function and object alias chains
+are accepted only when that bounded lookup proves them. Inline namespaces,
+namespace aliases, alias templates, unsupported local/class alias interactions,
+and unresolved hiding cause affected static declarations to fail closed rather
+than emit a guessed row. A hazard dominates even when bounded lookup also finds
+a visible ordinary alias, covering ambiguous inline-namespace injection. Object aliases carry compositional top-level binding cv
+through chains and arrays, so arrays of aliased `const` pointer elements are
+reported immutable.
+The scope walk includes file and named-namespace objects, anonymous-namespace
+objects without the `static` spelling, function-local `static`/`thread_local`
+objects (including `bias_detect_flag`), and class/header static declarations.
+Every row includes an initializer-free AST-derived type and top-level binding
+mutability (so `const T *` and containers with const template arguments remain
+mutable, while `T * const` is immutable), scope, synchronization, owner
+identity, and evidence candidates. Writer, reader, and reset searches are
+explicitly labeled **unscoped lexical candidates**: they do not resolve C++
+bindings and therefore never establish lifecycle reset/teardown. An empty
+candidate search is likewise not proof of no access.
+
+At audited source commit `5793f2ca1089eaf27203ee171c0d73d60a3e4c83`, the
+census emits **1,326 object rows**: 395 explicitly-static non-local objects,
+58 non-local objects with implicit static storage duration, 869 function-local
+static/thread-local objects, and 4 class static declarations. Per-file rows are 1,127
+(`ggml-sycl.cpp`), 148 (`unified-cache.cpp`), 8 (`unified-cache.hpp`), 41
+(`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
+every input so this result can be tied to exact source bytes.
+
+The supplied **371 lexical candidate leads** are reconciled as leads, not as a
+census: their artifact, source SHA, and extraction method were not supplied,
+so a row-for-row comparison would be invented. Structurally, they expand in
+both directions: multi-object declarations produce multiple object rows,
+while static functions/prototypes are not storage objects; the parser also
+adds the 58 implicit non-local objects, 869 local statics, and 4 class statics
+that a column-zero lexical pass does not cover. No comparison is made to the
+historical 329 figure because it likewise lacks a source SHA and method.
+
+### Parse coverage and fail-closed behavior
+
+Tree-sitter reports 41 raw recovery/missing nodes in `ggml-sycl.cpp` and 10 in
+`fattn.cpp`; the other three inputs parse without recovery. The former are
+from nested preprocessor alternatives, declaration-prefix macros
+(`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
+tokens such as `PRId64`; the latter are dispatch macro invocations and a label
+next to a conditional compilation boundary. These are **explicit raw-parser recovery sites**, not silently discarded
+regions. Each of the 51 nodes must receive a structural proof category. In the
+current inputs, 17 are confined to parsed function signature/storage spans and
+31 are in parsed or unambiguously recovered function bodies. Recovered function
+regions end at the lexically balanced closing brace (with comments and literals
+masked); an oversized `ERROR` node's tail must independently consist of parsed
+top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
+check for every compound body containing recovery, even when the AST supplies a
+non-missing closing delimiter: the body is lexically balanced
+and any parser-owned tail must independently validate. This prevents recovery
+from expanding the parsed body over a following valid file-scope declaration by
+borrowing a brace from that declaration's initializer.
+The same balanced bound controls scope attribution for recovered `ERROR`
+functions, preventing later file-scope declarations from inheriting the
+recovered function's scope. Only the signature span exempts a function's own
+`static` storage-class marker. Body recovery is accepted only when every
+`static`/`thread_local` marker in it independently belongs to a parsed
+declaration; an unparsed marker fails the census. The remaining 3 sites are
+confined to `#if` condition lines, which cannot contain a declaration.
+Structural preprocessor recovery spanning a conditional body is not exempt. Any
+other namespace/file recovery is rejected because it could conceal an
+implicit-static object of a user-defined type or direct-initialization spelling.
+There are no declaration-type or spelling exemptions. The generator exits 2
+without writing output when a recovery node or storage marker lacks proof.
+
+`--self-test` covers nearest method/lambda scope, const pointee versus const
+pointer, mutable containers/atomics, repeated names in different bindings,
+initializer-free direct initialization, fail-closed namespace recovery,
+multi-object declarations, and namespaced `extern` declaration versus
+definition. Positive function-object fixtures verify names, initializer-free
+types, scopes, and binding mutability for file/class/function/lambda function
+pointers, a function reference, a function-pointer array, and file/class/local
+pointer-to-member function/data objects and arrays, including exact direct
+class-scope spellings recovered from the pinned grammar's `ERROR` shape. Const
+pointer elements are recognized through array declarators, and all positive
+const-array declarations include compiler-required `={}` initialization.
+One compiler-valid positive fixture source is both parsed and passed to `g++
+-std=c++17 -pedantic-errors -fsyntax-only`. It covers declaration-position
+visibility, nearest relative and absolute qualified identities/chains, direct
+function exclusion, and compositional cv-bearing object/array aliases. Exact
+negative fixtures require fail-closed results for alias templates, inline
+namespaces, namespace aliases, unsupported local/class aliases, ordinary-name
+hiding, unresolved aliases, and invalid arrays of aliased function type.
+Negative recovery fixtures also require rejection
+of malformed recovery in a function body (`void f(){ static Widget x{; }`),
+across a structural
+preprocessor conditional (`#if X` / `Widget implicit_global{;` / `#endif`), and
+in an oversized recovered-function `ERROR` tail containing a malformed implicit
+global. The parsed-function recovery fixture
+`static void recovered() { #wat x }\nWidget implicit_global{};` and the exact
+wrong-close fixture `static void recovered() { x; x template #if X }\nWidget
+implicit_global{};` must both fail closed rather than silently dropping the valid
+global after assigning it local scope. Lambda coverage includes the exact
+file-scope fixture `static auto recovered = [] { x; x template #if X }\nWidget
+implicit_global{};`, its templated-lambda variant, and a nested-function lambda
+wrong-close fixture; each must fail closed rather than letting a recovery-expanded
+lambda compound hide static-storage declarations. It also asserts that the declarations at
+`ggml-sycl.cpp` lines 93499,
+94640, 94700, 94801, and 94857 retain file scope.
+
+### Static high-risk highlights (no behavior changes in this census)
+
+- `ggml-sycl.cpp:79471` `bias_detect_flag` is a function-local
+  `std::once_flag`. Its `call_once` captures MoE expert-bias device pointers
+  and host copies from the first graph that reaches it, making it process-first
+  semantic model state and the highest-risk review target. The inventory does
+  not claim a binding-resolved reset result.
+- `ggml-sycl.cpp:1973-1974` `g_moe_hybrid_init_success[]` and
+  `g_moe_hybrid_init_done` are process-first MoE initialization/activation
+  guards. Unscoped lexical access candidates are inventoried, but lifecycle
+  reset is deliberately not inferred. They require binding-aware review.
+- `ggml-sycl.cpp:57239` `tl_first_act` is thread-local pinned activation
+  staging. It is reused through `ensure()` as bounded capacity storage and the
+  current activation is copied before use. This is capacity retention, not by
+  itself semantic cross-model state. Nearby `tl_first_tasks` has lexical
+  resize/clear candidates, which require binding confirmation. The inventory
+  keeps this distinction visible instead of labeling all TLS reuse a leak.
+- `fattn.cpp:123-124`'s anonymous-namespace mutex and
+  `g_packed_k_sidecars` are included despite lacking `static`; its erase and
+  lookup lines are recorded only as unscoped lexical candidates.
+  `layer-streaming.cpp:370`'s device-keyed `g_layer_managers` is also included;
+  its retained per-manager model inventory remains a lifecycle-review item,
+  not a claimed leak or claimed absence of teardown.
+
+This task adds no resets or behavior changes and performs no build, GPU, or
+model execution. The sections below preserve the earlier targeted/manual audit;
+the generated census does not retroactively make their textual searches
+binding-resolved evidence.
+
+---
 
 `test-llama-archs` loads ~131 architectures back-to-back in **one process**.
 Any file-scope static in the SYCL backend that describes "the model
