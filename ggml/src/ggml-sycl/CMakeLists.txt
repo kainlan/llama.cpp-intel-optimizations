@@ -155,6 +155,26 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME sycl-lifecycle-wrapper-overlap COMMAND test-sycl-lifecycle-wrapper-overlap)
     set_tests_properties(sycl-lifecycle-wrapper-overlap PROPERTIES RUN_SERIAL TRUE LABELS "sycl;lifecycle;host")
+
+    # Public UUID ABI smoke test is host-only: null-device behavior needs no GPU.
+    # Exercise both direct static linkage and registry lookup from a DL module.
+    add_executable(test-sycl-device-uuid-api
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-device-uuid-api.cpp)
+    target_include_directories(test-sycl-device-uuid-api PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    if (GGML_BACKEND_DL)
+        target_compile_definitions(test-sycl-device-uuid-api PRIVATE
+            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+        target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml ${CMAKE_DL_LIBS})
+        add_dependencies(test-sycl-device-uuid-api ggml-sycl)
+    else()
+        target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml-sycl ggml-cpu)
+    endif()
+    set_target_properties(test-sycl-device-uuid-api PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
+    set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
+
     foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   runtime-update-teardown

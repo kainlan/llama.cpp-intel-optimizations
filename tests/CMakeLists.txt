@@ -377,6 +377,11 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
         LABELS "sycl;lifecycle;g1;python"
         TIMEOUT 30)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-device-uuid-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-uuid-source.py
+        LABEL "sycl;api;source;host"
+        TIMEOUT 30)
 endif()
 
 if (GGML_SYCL)

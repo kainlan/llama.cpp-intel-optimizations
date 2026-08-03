@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <limits.h>
+#include <stdint.h>
 
 #define GGML_SYCL_NAME        "SYCL"
 #define GGML_SYCL_MAX_DEVICES 48
@@ -34,6 +35,11 @@ extern "C" {
 GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
+
+// Copy the native UUID of this exact SYCL backend device. Returns false when
+// device/uuid is null, device is not owned by this backend, or the compiler or
+// runtime does not expose the 16-byte Intel device UUID extension.
+GGML_BACKEND_API bool ggml_backend_sycl_get_device_uuid(ggml_backend_dev_t device, uint8_t uuid[16]);
 
 // devide buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);

@@ -110,9 +110,12 @@ bool selected_device(ggml_backend_dev_t & backend_device, std::string & uuid) {
         ggml_backend_dev_type(backend_devices[0]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return false;
     }
-    backend_device          = backend_devices[0];
+    backend_device = backend_devices[0];
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend_device);
+    auto get_device_uuid = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_uuid)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_uuid"));
     uint8_t native_uuid[16] = {};
-    if (!ggml_backend_sycl_get_device_uuid(backend_device, native_uuid)) {
+    if (!get_device_uuid || !get_device_uuid(backend_device, native_uuid)) {
         return false;
     }
     char text[37];

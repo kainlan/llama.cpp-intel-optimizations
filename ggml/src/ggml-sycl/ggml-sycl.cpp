@@ -94388,6 +94388,42 @@ struct ggml_backend_sycl_device_context {
     std::string description;
 };
 
+bool ggml_backend_sycl_get_device_uuid(ggml_backend_dev_t dev, uint8_t uuid[16]) {
+    if (dev == nullptr || uuid == nullptr) {
+        return false;
+    }
+
+    try {
+        // Validate identity before interpreting the backend-private context.
+        // The context's device field is the mapping used to construct this exact
+        // registry device; do not re-identify it by ordinal, name, or PCI data.
+        if (ggml_backend_dev_backend_reg(dev) != ggml_backend_sycl_reg() || dev->context == nullptr) {
+            return false;
+        }
+        const auto * ctx = static_cast<const ggml_backend_sycl_device_context *>(dev->context);
+        if (ctx->device < 0 || ctx->device >= ggml_sycl_info().device_count) {
+            return false;
+        }
+
+#if defined(SYCL_EXT_INTEL_DEVICE_INFO) && SYCL_EXT_INTEL_DEVICE_INFO >= 6
+        const sycl::device sycl_device = ggml_sycl_get_device(ctx->device);
+        if (!sycl_device.has(sycl::aspect::ext_intel_device_info_uuid)) {
+            return false;
+        }
+        const auto native_uuid = sycl_device.get_info<sycl::ext::intel::info::device::uuid>();
+        static_assert(sizeof(native_uuid) == 16, "SYCL device UUID must contain exactly 16 bytes");
+        std::memcpy(uuid, native_uuid.data(), 16);
+        return true;
+#else
+        return false;
+#endif
+    } catch (...) {
+        // A capability query or get_info may fail at runtime. This optional
+        // metadata API must report unsupported rather than crossing the C ABI.
+        return false;
+    }
+}
+
 static const char * ggml_backend_sycl_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     return ctx->name.c_str();
@@ -95528,6 +95564,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_tp_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_tp_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
+        return (void *) ggml_backend_sycl_get_device_uuid;
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_begin") == 0) {
         return (void *) ggml_backend_sycl_model_load_begin;
