@@ -1,0 +1,19 @@
+Remaining count()/get() snapshot-race null-unsafe callers outside the lifecycle pathScope
+(audited at d0fdde5da; intentionally not edited in this change):
+
+common/arg.cpp:254
+common/arg.cpp:2443
+common/common.cpp:411
+examples/llama.android/lib/src/main/cpp/ai_chat.cpp:128
+tools/llama-bench/llama-bench.cpp:122
+tools/llama-bench/llama-bench.cpp:134
+tools/llama-bench/llama-bench.cpp:674
+tools/llama-bench/llama-bench.cpp:893
+tools/llama-bench/llama-bench.cpp:1512
+tools/rpc/rpc-server.cpp:259
+tools/rpc/rpc-server.cpp:272
+tools/server/server-context.cpp:1119
+
+Each location consumes ggml_backend_{dev,reg}_get() after a separate count() and
+uses or stores the result without first rejecting nullptr. server-context.cpp:1074
+only compares the nullable result and is therefore not included.

@@ -1698,6 +1698,7 @@ class unified_cache {
                   size_t        dma_reserved_bytes = 0,
                   size_t        device_total_vram  = 0);
     ~unified_cache();
+    bool shutdown_resources();
 
     // Non-copyable, non-movable
     unified_cache(const unified_cache &)             = delete;
@@ -2373,7 +2374,8 @@ class unified_cache {
     void     host_release_chunk_lease(uint64_t handle);
 
     // Destroy arena (free all chunks).
-    void arena_destroy();
+    bool arena_destroy();
+    bool resources_shutdown_ = false;
 
     // Abandon arena without freeing (for shutdown when SYCL context is invalid).
     void arena_abandon();
@@ -4239,8 +4241,9 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 // Shutdown the unified cache system before SYCL runtime destruction
 // Call this during ggml_backend_sycl_free() to avoid static destruction order issues
 // After calling this, the cache destructors will skip sycl::free() calls
-void shutdown_unified_cache();
+bool shutdown_unified_cache();
 bool unified_cache_shutdown_state_clean() noexcept;
+void unified_cache_test_fail_next_arena_free();
 void prepare_unified_cache_for_module_use() noexcept;
 
 // Returns true if SYCL runtime teardown has begun (atexit handler fired).

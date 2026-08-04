@@ -546,6 +546,7 @@ static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
+static std::atomic<bool>     g_test_fail_next_arena_free{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
 static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
@@ -2108,6 +2109,15 @@ bool unified_cache::ensure_planned_arena_zones() {
 }
 
 unified_cache::~unified_cache() {
+    if (!shutdown_resources()) {
+        arena_abandon();
+    }
+}
+
+bool unified_cache::shutdown_resources() {
+    if (resources_shutdown_) {
+        return true;
+    }
     // Mispredict accounting, reported here because this is the last point at
     // which the cache is guaranteed to run any code. It is placed ahead of the
     // shutdown early-return below so a teardown that skips resource cleanup
@@ -2154,7 +2164,8 @@ unified_cache::~unified_cache() {
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
-        return;
+        resources_shutdown_ = true;
+        return true;
     }
 
     // Try to verify SYCL context is still valid before freeing
@@ -2183,7 +2194,8 @@ unified_cache::~unified_cache() {
         staging_owner_                    = {};
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
-        return;
+        resources_shutdown_ = true;
+        return true;
     }
 
     // Check arena state before destroying anything.
@@ -2291,8 +2303,11 @@ unified_cache::~unified_cache() {
     }
     persistent_scratches_.clear();
 
-    // Destroy the VRAM arena (frees the pre-allocated chunks).
-    arena_destroy();
+    // Destroy the VRAM arena (frees the pre-allocated chunks). A failed free
+    // keeps the cache object and chunk registration intact for unload retry.
+    if (!arena_destroy()) {
+        return false;
+    }
 
     // Destroy layout pool before SYCL context goes away.
     // The pool's reset() returns physical bytes freed so we can decrement used_.
@@ -2410,6 +2425,8 @@ unified_cache::~unified_cache() {
         }
     }
     partial_cache_.clear();
+    resources_shutdown_ = true;
+    return true;
 }
 
 // Fast 64-bit hash of entire data buffer (xxHash-style)
@@ -12677,13 +12694,19 @@ bool unified_cache_shutdown_state_clean() noexcept {
     }
 }
 
-void shutdown_unified_cache() {
+bool shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
     // mem_handle release callbacks cannot deadlock on cache lookup.
     std::unordered_map<int, std::unique_ptr<unified_cache>> caches;
     {
         std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        for (auto & item : g_device_caches) {
+            if (item.second && !item.second->shutdown_resources()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] arena release failed; retaining cache owner for unload retry\n");
+                return false;
+            }
+        }
         caches.swap(g_device_caches);
         g_cache_mode_locked.store(false, std::memory_order_release);
     }
@@ -12703,6 +12726,7 @@ void shutdown_unified_cache() {
     g_sycl_shutting_down.store(true, std::memory_order_release);
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Explicit shutdown drained and destroyed all device caches\n");
+    return true;
 }
 
 // ============================================================================
@@ -15732,9 +15756,13 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     return zone_available(zone);
 }
 
-void unified_cache::arena_destroy() {
+void unified_cache_test_fail_next_arena_free() {
+    g_test_fail_next_arena_free.store(true, std::memory_order_release);
+}
+
+bool unified_cache::arena_destroy() {
     if (!arena_queue_) {
-        return;
+        return true;
     }
     try {
         arena_queue_->wait_and_throw();
@@ -15743,11 +15771,9 @@ void unified_cache::arena_destroy() {
     } catch (...) {
         GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed\n");
     }
-    const size_t released_chunk_count = arena_chunks_.size();
+    size_t released_chunk_count = 0;
     size_t released_chunk_bytes = 0;
-    for (const auto & chunk : arena_chunks_) {
-        released_chunk_bytes += chunk.size;
-    }
+    bool all_freed = true;
     for (auto & c : arena_chunks_) {
         if (c.ptr) {
             // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
@@ -15771,13 +15797,12 @@ void unified_cache::arena_destroy() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
-            alloc_registry::instance().unregister_alloc(c.ptr);
-            GGML_ASSERT(alloc_registry::instance().lookup(c.ptr) == nullptr &&
-                        "arena chunk remained registered after unregister");
-            const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
-            GGML_ASSERT(live_before > 0 && "arena chunk ownership counter underflow");
-            try {
+            bool freed = false;
+            if (g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel)) {
+                GGML_LOG_ERROR("[VRAM-ARENA] deterministic test free failure for chunk %p\n", c.ptr);
+            } else try {
                 sycl::free(c.ptr, arena_queue_->get_context());
+                freed = true;
             } catch (const sycl::exception & e) {
                 GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed: %s\n", c.ptr,
                                c.size / (1024.0 * 1024.0), e.what());
@@ -15785,10 +15810,25 @@ void unified_cache::arena_destroy() {
                 GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed\n", c.ptr,
                                c.size / (1024.0 * 1024.0));
             }
+            if (!freed) {
+                all_freed = false;
+                continue;
+            }
+            alloc_registry::instance().unregister_alloc(c.ptr);
+            GGML_ASSERT(alloc_registry::instance().lookup(c.ptr) == nullptr &&
+                        "arena chunk remained registered after unregister");
+            const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
+            GGML_ASSERT(live_before > 0 && "arena chunk ownership counter underflow");
+            c.ptr = nullptr;
+            ++released_chunk_count;
+            released_chunk_bytes += c.size;
         }
     }
     GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
                   released_chunk_bytes / (1024.0 * 1024.0));
+    if (!all_freed) {
+        return false;
+    }
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
@@ -15801,6 +15841,7 @@ void unified_cache::arena_destroy() {
         z.size  = 0;
         z.used.store(0, std::memory_order_relaxed);
     }
+    return true;
 }
 
 // === Arena chunk lease API (llama.cpp-dyhdl) ===

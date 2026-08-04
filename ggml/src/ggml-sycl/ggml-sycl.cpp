@@ -96092,7 +96092,16 @@ bool ggml_backend_sycl_can_unload(void) {
 }
 
 void ggml_backend_sycl_cancel_unload(void) {
-    ggml_sycl::lifecycle::global_registry().release_shutdown();
+    ggml_sycl::lifecycle::global_registry().cancel_shutdown();
+}
+
+void ggml_backend_sycl_complete_unload(void) {
+    ggml_sycl::lifecycle::global_registry().complete_shutdown();
+}
+
+void ggml_backend_sycl_reactivate(void) {
+    ggml_sycl::lifecycle::global_registry().reactivate();
+    ggml_sycl::prepare_unified_cache_for_module_use();
 }
 
 static void ggml_sycl_reset_moe_module_state() {
@@ -96191,7 +96200,9 @@ void ggml_backend_sycl_shutdown(void) {
     // owning MoE handles while the allocation registry and queues are live;
     // only then set the cache shutdown flag and drain the registry.
     ggml_sycl_reset_moe_module_state();
-    ggml_sycl::shutdown_unified_cache();
+    if (!ggml_sycl::shutdown_unified_cache()) {
+        throw std::runtime_error("SYCL unified cache arena release failed");
+    }
 
     GGML_LOG_INFO("[SYCL-MODULE] shutdown complete\n");
     // The generic loader releases the reservation only after registry/device
@@ -96237,12 +96248,21 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_get_device_memory") == 0) {
         return (void *) ggml_backend_sycl_get_device_memory;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_arena_free") == 0) {
+        return (void *) ggml_sycl::unified_cache_test_fail_next_arena_free;
+    }
     if (strcmp(name, "ggml_backend_can_unload") == 0 || strcmp(name, "ggml_backend_sycl_can_unload") == 0) {
         return (void *) ggml_backend_sycl_can_unload;
     }
     if (strcmp(name, "ggml_backend_cancel_unload") == 0 ||
-        strcmp(name, "ggml_backend_sycl_cancel_unload") == 0 || strcmp(name, "ggml_backend_complete_unload") == 0) {
+        strcmp(name, "ggml_backend_sycl_cancel_unload") == 0) {
         return (void *) ggml_backend_sycl_cancel_unload;
+    }
+    if (strcmp(name, "ggml_backend_complete_unload") == 0) {
+        return (void *) ggml_backend_sycl_complete_unload;
+    }
+    if (strcmp(name, "ggml_backend_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_reactivate;
     }
     if (strcmp(name, "ggml_backend_shutdown") == 0 || strcmp(name, "ggml_backend_sycl_shutdown") == 0) {
         return (void *) ggml_backend_sycl_shutdown;

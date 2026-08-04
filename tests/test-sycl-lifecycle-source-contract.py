@@ -562,7 +562,8 @@ checks = {
     and registry_backend.index("const bool is_new = existing == backends.end()")
         < registry_backend.index("backends.reserve(backends.size() + (is_new ? 1 : 0))")
     and "No iterator into backends is used after this point" in registry_backend
-    and "std::call_once(builtin_once, [&] { reg.register_builtin_backends(); })" in registry_backend
+    and "builtin_init_state::INITIALIZING && builtin_owner == std::this_thread::get_id()" in registry_backend
+    and "reg.register_builtin_backends();" in registry_backend
     and "generic registry tombstone/failure fixture" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "initial_reg_count < 2 || ggml_backend_reg_by_name(\"SYCL\") == nullptr" in
@@ -611,7 +612,7 @@ checks = {
     "optional unload hooks cannot throw across C API": registry_backend.count("catch (...)") >= 10
     and "resolver_failed" in registry_backend
     and "cancel_noexcept" in registry_backend,
-    "predictor ownership reset precedes cache shutdown": backend.index("ggml_sycl_reset_moe_module_state();\n    ggml_sycl::shutdown_unified_cache();")
+    "predictor ownership reset precedes cache shutdown": backend.index("ggml_sycl_reset_moe_module_state();\n    if (!ggml_sycl::shutdown_unified_cache())")
     > 0
     and "test_allocate_predictor_scores" in backend
     and "unified_alloc_validate_registry(-1, \"module-reload-clean\")" in backend,
@@ -651,10 +652,17 @@ checks = {
     and "ggml_backend_complete_unload" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "const auto settle_state" in registry_backend,
+    "completion, callback, arena retry and renamed DSO coverage": "shutdown_completed_" in hpp
+    and "complete_shutdown()" in backend
+    and "ggml_backend_reactivate" in backend
+    and "device_call_guard" in (root / "ggml/src/ggml-backend.cpp").read_text()
+    and "deterministic arena-free failure" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
-    and "ggml_backend_unload(reg)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "ggml_backend_unload_checked(reg)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count("ggml_backend_load(") >= 2,
     "canonical G1 registration": "sycl-lifecycle-gpu-sequential"
     in (root / "tests/CMakeLists.txt").read_text()

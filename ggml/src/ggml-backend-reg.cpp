@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <type_traits>
+#include <thread>
 #include <vector>
 #include <cctype>
 
@@ -427,8 +428,16 @@ struct ggml_backend_registry {
                 return nullptr;
             }
             ggml_backend_reg_t reg = backend_init_fn();
-            if (!reg || reg->api_version != GGML_BACKEND_API_VERSION ||
-                !register_backend(reg, std::move(handle), module_path)) {
+            if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
+                return nullptr;
+            }
+            using reactivate_fn = void (*)();
+            auto reactivate = reinterpret_cast<reactivate_fn>(
+                reg->iface.get_proc_address ? reg->iface.get_proc_address(reg, "ggml_backend_reactivate") : nullptr);
+            if (reactivate) {
+                reactivate();
+            }
+            if (!register_backend(reg, std::move(handle), module_path)) {
                 return nullptr;
             }
             GGML_LOG_INFO("%s: loaded %s backend from %s\n", __func__, ggml_backend_reg_name(reg), path_str(path).c_str());
@@ -757,8 +766,6 @@ void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
 
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
-    static std::once_flag builtin_once;
-    std::call_once(builtin_once, [&] { reg.register_builtin_backends(); });
     static const ggml_backend_registry_lifecycle_i lifecycle_iface = {
         ggml_backend_registry_begin_call,
         ggml_backend_registry_end_call,
@@ -770,6 +777,43 @@ static ggml_backend_registry & get_reg() {
         return true;
     }();
     (void) installed;
+
+    enum class builtin_init_state { UNINITIALIZED, INITIALIZING, COMPLETE };
+    static std::mutex builtin_mutex;
+    static std::condition_variable builtin_cv;
+    static builtin_init_state builtin_state = builtin_init_state::UNINITIALIZED;
+    static std::thread::id builtin_owner;
+    {
+        std::unique_lock<std::mutex> lock(builtin_mutex);
+        if (builtin_state == builtin_init_state::INITIALIZING && builtin_owner == std::this_thread::get_id()) {
+            // Constructor/callback reentry sees the fully constructed registry,
+            // but the currently initializing backend is not published yet.
+            return reg;
+        }
+        while (builtin_state == builtin_init_state::INITIALIZING) {
+            builtin_cv.wait(lock);
+        }
+        if (builtin_state == builtin_init_state::COMPLETE) {
+            return reg;
+        }
+        builtin_state = builtin_init_state::INITIALIZING;
+        builtin_owner = std::this_thread::get_id();
+    }
+    try {
+        reg.register_builtin_backends();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(builtin_mutex);
+        builtin_state = builtin_init_state::UNINITIALIZED;
+        builtin_owner = {};
+        builtin_cv.notify_all();
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(builtin_mutex);
+        builtin_state = builtin_init_state::COMPLETE;
+        builtin_owner = {};
+        builtin_cv.notify_all();
+    }
     return reg;
 }
 

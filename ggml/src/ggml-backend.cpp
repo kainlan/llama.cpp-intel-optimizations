@@ -35,6 +35,19 @@ std::atomic<registry_begin_fn> g_registry_begin{ nullptr };
 std::atomic<registry_end_fn>   g_registry_end{ nullptr };
 std::atomic<device_begin_fn>   g_device_begin{ nullptr };
 std::atomic<device_end_fn>     g_device_end{ nullptr };
+
+struct device_call_guard {
+    ggml_backend_dev_t device;
+    device_end_fn      end;
+    bool               admitted;
+    explicit device_call_guard(ggml_backend_dev_t dev) : device(dev), end(nullptr), admitted(false) {
+        const auto begin = g_device_begin.load(std::memory_order_acquire);
+        admitted = !begin || begin(device);
+        end = begin && admitted ? g_device_end.load(std::memory_order_acquire) : nullptr;
+    }
+    ~device_call_guard() { if (end) end(device); }
+    explicit operator bool() const { return admitted; }
+};
 }
 
 void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
@@ -625,17 +638,17 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
 
 ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
     // null device is allowed for the transition period to the device interface
-    if (device == NULL || device->iface.event_new == NULL) {
-        return NULL;
-    }
-    return device->iface.event_new(device);
+    if (device == NULL || device->iface.event_new == NULL) return NULL;
+    device_call_guard guard(device);
+    return guard ? device->iface.event_new(device) : nullptr;
 }
 
 void ggml_backend_event_free(ggml_backend_event_t event) {
     if (event == NULL) {
         return;
     }
-    event->device->iface.event_free(event->device, event);
+    device_call_guard guard(event->device);
+    if (guard) event->device->iface.event_free(event->device, event);
 }
 
 void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend) {
@@ -649,7 +662,8 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event);
     GGML_ASSERT(event->device->iface.event_synchronize);
 
-    event->device->iface.event_synchronize(event->device, event);
+    device_call_guard guard(event->device);
+    if (guard) event->device->iface.event_synchronize(event->device, event);
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -670,28 +684,34 @@ static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgra
 
 const char * ggml_backend_dev_name(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    return device->iface.get_name(device);
+    device_call_guard guard(device);
+    return guard ? device->iface.get_name(device) : nullptr;
 }
 
 const char * ggml_backend_dev_description(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    return device->iface.get_description(device);
+    device_call_guard guard(device);
+    return guard ? device->iface.get_description(device) : nullptr;
 }
 
 void ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total) {
     GGML_ASSERT(device);
+    device_call_guard guard(device);
+    if (!guard) { if (free) *free = 0; if (total) *total = 0; return; }
     device->iface.get_memory(device, free, total);
 }
 
 enum ggml_backend_dev_type ggml_backend_dev_type(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    return device->iface.get_type(device);
+    device_call_guard guard(device);
+    return guard ? device->iface.get_type(device) : GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
 
 void ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props) {
     GGML_ASSERT(device);
     memset(props, 0, sizeof(*props));
-    device->iface.get_props(device, props);
+    device_call_guard guard(device);
+    if (guard) device->iface.get_props(device, props);
 }
 
 ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
@@ -701,61 +721,46 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
 
 ggml_backend_t ggml_backend_dev_init(ggml_backend_dev_t device, const char * params) {
     GGML_ASSERT(device);
-    const auto begin = g_device_begin.load(std::memory_order_acquire);
-    if (begin && !begin(device)) {
-        return nullptr;
-    }
-    const auto end = begin ? g_device_end.load(std::memory_order_acquire) : nullptr;
-    try {
-        ggml_backend_t result = device->iface.init_backend(device, params);
-        if (end) {
-            end(device);
-        }
-        return result;
-    } catch (...) {
-        if (end) {
-            end(device);
-        }
-        return nullptr;
-    }
+    device_call_guard guard(device);
+    if (!guard) return nullptr;
+    try { return device->iface.init_backend(device, params); } catch (...) { return nullptr; }
 }
 
 ggml_backend_buffer_type_t ggml_backend_dev_buffer_type(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    return device->iface.get_buffer_type(device);
+    device_call_guard guard(device);
+    return guard ? device->iface.get_buffer_type(device) : nullptr;
 }
 
 ggml_backend_buffer_type_t ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
-    if (device->iface.get_host_buffer_type == NULL) {
-        return NULL;
-    }
-
+    device_call_guard guard(device);
+    if (!guard || device->iface.get_host_buffer_type == NULL) return NULL;
     return device->iface.get_host_buffer_type(device);
 }
 
 ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size) {
     GGML_ASSERT(device);
-    return device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size);
+    device_call_guard guard(device);
+    return guard ? device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size) : nullptr;
 }
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
-    return device->iface.supports_op(device, op);
+    device_call_guard guard(device);
+    return guard && device->iface.supports_op(device, op);
 }
 
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(device);
-    return device->iface.supports_buft(device, buft);
+    device_call_guard guard(device);
+    return guard && device->iface.supports_buft(device, buft);
 }
 
 bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
-    if (device->iface.offload_op != NULL) {
-        return device->iface.offload_op(device, op);
-    }
-
-    return false;
+    device_call_guard guard(device);
+    return guard && device->iface.offload_op != NULL && device->iface.offload_op(device, op);
 }
 
 // Backend (reg)

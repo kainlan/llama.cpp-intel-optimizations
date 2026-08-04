@@ -169,8 +169,15 @@ if (BUILD_TESTING)
     target_include_directories(test-sycl-lifecycle-runtime-wrapper PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     if (GGML_BACKEND_DL)
+        set(GGML_SYCL_RENAMED_RUNTIME_MODULE
+            "$<TARGET_FILE_DIR:ggml-sycl>/ggml-sycl-lifecycle-renamed$<TARGET_FILE_SUFFIX:ggml-sycl>")
+        add_custom_command(TARGET ggml-sycl POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:ggml-sycl>" "${GGML_SYCL_RENAMED_RUNTIME_MODULE}"
+            COMMENT "Creating renamed SYCL lifecycle DSO fixture")
         target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE
-            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>"
+            GGML_SYCL_RENAMED_RUNTIME_MODULE="${GGML_SYCL_RENAMED_RUNTIME_MODULE}")
         target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
     else()

@@ -37,8 +37,9 @@ assert "ggml_sycl_watchdog_start();" in backend
 assert "watchdog_once" not in backend
 assert "prepare_unified_cache_for_module_use()" in backend
 assert 'ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_shutdown")' in wrapper
-assert wrapper.count("ggml_backend_unload(reg)") == 1
-assert wrapper.count("ggml_backend_unload_checked(reg)") >= 3
+assert wrapper.count("ggml_backend_unload(reg)") == 0
+assert wrapper.count("ggml_backend_unload_checked(reg)") >= 5
+assert "GGML_SYCL_RENAMED_RUNTIME_MODULE" in wrapper
 assert "GGML_BACKEND_UNLOAD_BUSY" in wrapper
 assert 'phase("complete")' in wrapper
 print("SYCL module lifetime-policy source contract: PASS")

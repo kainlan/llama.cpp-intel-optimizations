@@ -301,7 +301,10 @@ class Registry {
     // transition; all lifecycle and backend-context admission remains closed
     // until generic registry/device removal consumes the reservation.
     error reserve_shutdown() noexcept;
-    void  release_shutdown() noexcept;
+    void  cancel_shutdown() noexcept;
+    void  release_shutdown() noexcept { cancel_shutdown(); }
+    void  complete_shutdown() noexcept;
+    void  reactivate() noexcept;
     bool  shutdown_reserved() const noexcept;
     bool  acquire_backend_context() noexcept;
     void  release_backend_context() noexcept;
@@ -379,6 +382,7 @@ class Registry {
     uint64_t                                                   next_effect_serial_ = 1;
     uint64_t                                                   backend_context_count_ = 0;
     bool                                                       shutdown_reserved_ = false;
+    bool                                                       shutdown_completed_ = false;
     std::array<slot_state, model_slot_count>  slots_{};
     // Terminal transaction and dead-model rows are intentionally append-only.
     // Process-lifetime exact replay is required for idempotent end/unload;

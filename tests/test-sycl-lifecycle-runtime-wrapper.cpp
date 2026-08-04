@@ -2,6 +2,7 @@
 #include "../ggml/src/ggml-backend-impl.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <future>
@@ -26,9 +27,21 @@ static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
 static int                    g_registry_fixture_recursive_registrations = 0;
 static int                    g_registry_fixture_shutdowns = 0;
 static int                    g_registry_fixture_cancels = 0;
+static std::mutex              g_device_callback_mutex;
+static std::condition_variable g_device_callback_cv;
+static bool                    g_device_callback_block = false;
+static bool                    g_device_callback_entered = false;
 
 static const char * registry_fixture_dev_name(ggml_backend_dev_t) { return "TEST-LIFECYCLE0"; }
-static const char * registry_fixture_dev_description(ggml_backend_dev_t) { return "registry lifecycle fixture"; }
+static const char * registry_fixture_dev_description(ggml_backend_dev_t) {
+    std::unique_lock<std::mutex> lock(g_device_callback_mutex);
+    if (g_device_callback_block) {
+        g_device_callback_entered = true;
+        g_device_callback_cv.notify_all();
+        g_device_callback_cv.wait(lock, [] { return !g_device_callback_block; });
+    }
+    return "registry lifecycle fixture";
+}
 static enum ggml_backend_dev_type registry_fixture_dev_type(ggml_backend_dev_t) {
     return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
@@ -122,6 +135,30 @@ static bool run_registry_failure_fixture() {
         ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
     g_registry_fixture_mode = registry_fixture_mode::NORMAL;
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_block = true;
+        g_device_callback_entered = false;
+    }
+    auto callback = std::async(std::launch::async, [&] {
+        return ggml_backend_dev_description(static_cast<ggml_backend_dev_t>(reg->context));
+    });
+    {
+        std::unique_lock<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_cv.wait(lock, [] { return g_device_callback_entered; });
+    }
+    auto blocked_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
+    const bool unload_waited_for_callback =
+        blocked_unload.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    {
+        std::lock_guard<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_block = false;
+        g_device_callback_cv.notify_all();
+    }
+    if (!unload_waited_for_callback || !callback.get() ||
+        blocked_unload.get() != GGML_BACKEND_UNLOAD_OK) return false;
     return g_registry_fixture_recursive_registrations >= 2 && g_registry_fixture_shutdowns >= 2 &&
            g_registry_fixture_cancels >= 2;
 }
@@ -174,11 +211,47 @@ int main() {
         std::fprintf(stderr, "failed to create real predictor unified allocation\n");
         return 1;
     }
+    size_t free_with_cache = 0;
+    size_t total_with_cache = 0;
+    initial_get_device_memory(0, &free_with_cache, &total_with_cache);
+    constexpr size_t minimum_measured_drop = 1ull * 1024ull * 1024ull * 1024ull;
+    if (total_with_cache != total_before_cache || free_before_cache < free_with_cache + minimum_measured_drop) {
+        std::fprintf(stderr, "cache allocation did not produce a meaningful measured VRAM drop: before=%zu after=%zu\n",
+                     free_before_cache, free_with_cache);
+        return 1;
+    }
+    const size_t measured_cache_drop = free_before_cache - free_with_cache;
+    auto saved_model_load_begin = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_begin)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
+    if (!saved_model_load_begin) {
+        std::fprintf(stderr, "missing saved model-load admission procedure\n");
+        return 1;
+    }
+    auto fail_next_arena_free = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_arena_free"));
+    if (!fail_next_arena_free) {
+        std::fprintf(stderr, "missing deterministic arena-free failure procedure\n");
+        return 1;
+    }
     seed_moe_state();
-    phase("initial module unload with shutdown hook");
+    phase("initial module unload with deterministic arena-free failure");
     shutdown = nullptr;
-    ggml_backend_unload(reg);
+    fail_next_arena_free();
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "arena free failure did not fail unload transactionally\n");
+        return 1;
+    }
+    phase("retry module unload after retained arena owner");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "arena owner retry did not complete unload\n");
+        return 1;
+    }
     reg = nullptr;
+    ggml_sycl_load_txn stale_txn{};
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+        std::fprintf(stderr, "saved model-load procedure admitted after completed unload\n");
+        return 1;
+    }
     phase("module reload");
     reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
     if (!reg) {
@@ -196,15 +269,17 @@ int main() {
         std::fprintf(stderr, "missing reloaded device-memory procedure\n");
         return 1;
     }
-    constexpr size_t reload_memory_tolerance = 2ull * 1024ull * 1024ull * 1024ull;
+    constexpr size_t reclaim_driver_noise = 256ull * 1024ull * 1024ull;
     constexpr auto reclaim_poll_interval = std::chrono::milliseconds(100);
     constexpr auto reclaim_deadline = std::chrono::seconds(10);
     const auto reclaim_started = std::chrono::steady_clock::now();
     bool memory_recovered = false;
     do {
         reloaded_get_device_memory(0, &free_after_shutdown, &total_after_shutdown);
+        const size_t measured_recovery = free_after_shutdown > free_with_cache ?
+                                             free_after_shutdown - free_with_cache : 0;
         memory_recovered = total_after_shutdown == total_before_cache &&
-                           free_after_shutdown + reload_memory_tolerance >= free_before_cache;
+                           measured_recovery + reclaim_driver_noise >= measured_cache_drop;
         if (memory_recovered || std::chrono::steady_clock::now() - reclaim_started >= reclaim_deadline) {
             break;
         }
@@ -221,8 +296,10 @@ int main() {
                      total_before_cache, total_after_shutdown);
         return 1;
     }
-    std::fprintf(stderr, "device memory reclaim settled after %lld ms: before=%zu recovered=%zu\n",
-                 static_cast<long long>(reclaim_elapsed_ms), free_before_cache, free_after_shutdown);
+    std::fprintf(stderr,
+                 "device memory reclaim settled after %lld ms: allocated_free=%zu recovered_free=%zu delta=%zu\n",
+                 static_cast<long long>(reclaim_elapsed_ms), free_with_cache, free_after_shutdown,
+                 free_after_shutdown - free_with_cache);
     auto moe_state_clean = reinterpret_cast<decltype(&ggml_backend_sycl_test_moe_module_state_clean)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_moe_module_state_clean"));
     if (!moe_state_clean || !moe_state_clean()) {
@@ -515,6 +592,20 @@ int main() {
         std::fprintf(stderr, "deferred logical reload failed\n");
         return 1;
     }
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "pre-renamed fixture unload failed\n");
+        return 1;
+    }
+#    if defined(GGML_SYCL_RENAMED_RUNTIME_MODULE)
+    phase("renamed DSO load/checked-unload/reload");
+    auto * renamed_reg = ggml_backend_load(GGML_SYCL_RENAMED_RUNTIME_MODULE);
+    if (!renamed_reg || ggml_backend_unload_checked(renamed_reg) != GGML_BACKEND_UNLOAD_OK ||
+        !(renamed_reg = ggml_backend_load(GGML_SYCL_RENAMED_RUNTIME_MODULE)) ||
+        ggml_backend_unload_checked(renamed_reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "renamed DSO lifecycle path failed: %s\n", GGML_SYCL_RENAMED_RUNTIME_MODULE);
+        return 1;
+    }
+#    endif
     phase("complete");
 #endif
     return 0;

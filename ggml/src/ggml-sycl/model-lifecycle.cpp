@@ -166,7 +166,7 @@ void Registry::poison_active_locked() {
 begin_result Registry::begin_outer() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (shutdown_reserved_ || active_txn_ != 0) {
+        if (shutdown_reserved_ || shutdown_completed_ || active_txn_ != 0) {
             return { error::LOAD_BUSY };
         }
         for (const auto & model : models_) {
@@ -217,7 +217,7 @@ begin_result Registry::begin_outer() noexcept {
 
 error Registry::enter_nested(LoadTxnId id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shutdown_reserved_) {
+    if (shutdown_reserved_ || shutdown_completed_) {
         return error::BUSY;
     }
     // Owner identity is checked before terminal/depth state. A mismatched call
@@ -311,7 +311,7 @@ load_effect_lease Registry::acquire_load_effect(LoadTxnId id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = txns_.find(id.value);
-        if (shutdown_reserved_ || id.value == 0 || active_txn_ != id.value || it == txns_.end() ||
+        if (shutdown_reserved_ || shutdown_completed_ || id.value == 0 || active_txn_ != id.value || it == txns_.end() ||
             it->second.phase != finish_phase::ACTIVE) {
             return { error::WRONG_TRANSACTION, {}, 0, nullptr };
         }
@@ -345,7 +345,7 @@ finisher_effect_scope Registry::acquire_finisher_effect(const finish_ticket & ti
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = txns_.find(ticket.token.load.value);
-        if (shutdown_reserved_ || !ticket.finisher || !ticket.commit || it == txns_.end() ||
+        if (shutdown_reserved_ || shutdown_completed_ || !ticket.finisher || !ticket.commit || it == txns_.end() ||
             active_txn_ != ticket.token.load.value ||
             it->second.finish_serial != ticket.serial || it->second.phase != finish_phase::COMMITTING ||
             !it->second.load_effect_serials.empty()) {
@@ -728,7 +728,7 @@ end_result Registry::end(LoadTxnId id, bool success, uint64_t planned, uint64_t 
 
 live_update_ticket Registry::prepare_live_update(ModelToken token) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shutdown_reserved_) {
+    if (shutdown_reserved_ || shutdown_completed_) {
         return { error::BUSY, token };
     }
     if (token.model.value == 0 || token.load.value == 0 || token.owner.slot >= model_slot_count) {
@@ -788,7 +788,7 @@ error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept
 
 teardown_ticket Registry::prepare_teardown(ModelToken token) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (shutdown_reserved_) {
+    if (shutdown_reserved_ || shutdown_completed_) {
         return { error::BUSY, token };
     }
     if (token.model.value == 0 || token.owner.slot >= model_slot_count) {
@@ -974,7 +974,7 @@ error Registry::teardown(ModelToken token) {
 error Registry::reserve_shutdown() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (shutdown_reserved_ || active_txn_ != 0 || backend_context_count_ != 0 || !models_.empty()) {
+        if (shutdown_reserved_ || shutdown_completed_ || active_txn_ != 0 || backend_context_count_ != 0 || !models_.empty()) {
             return error::BUSY;
         }
         for (const auto & item : txns_) {
@@ -992,7 +992,7 @@ error Registry::reserve_shutdown() noexcept {
     }
 }
 
-void Registry::release_shutdown() noexcept {
+void Registry::cancel_shutdown() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_reserved_ = false;
@@ -1001,10 +1001,30 @@ void Registry::release_shutdown() noexcept {
     }
 }
 
+void Registry::complete_shutdown() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown_reserved_  = false;
+        shutdown_completed_ = true;
+        cv_.notify_all();
+    } catch (...) {
+    }
+}
+
+void Registry::reactivate() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown_reserved_  = false;
+        shutdown_completed_ = false;
+        cv_.notify_all();
+    } catch (...) {
+    }
+}
+
 bool Registry::shutdown_reserved() const noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        return shutdown_reserved_;
+        return shutdown_reserved_ || shutdown_completed_;
     } catch (...) {
         return true;
     }
@@ -1013,7 +1033,7 @@ bool Registry::shutdown_reserved() const noexcept {
 bool Registry::acquire_backend_context() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (shutdown_reserved_ || backend_context_count_ == UINT64_MAX) {
+        if (shutdown_reserved_ || shutdown_completed_ || backend_context_count_ == UINT64_MAX) {
             return false;
         }
         ++backend_context_count_;
