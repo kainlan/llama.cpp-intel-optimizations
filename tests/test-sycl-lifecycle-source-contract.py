@@ -551,6 +551,9 @@ checks = {
     and "test_block_backend_context_release" in hpp
     and "checked unload crossed final backend destructor tail" in
         (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
+    "runtime wrapper links aggregate registry in static and DL builds":
+        sycl_cmake.count("target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml") == 2
+        and "propagates the selected SYCL/CPU backend libraries" in sycl_cmake,
     "base-safe lifecycle admission function table": "ggml_backend_set_registry_lifecycle" in backend_base
     and "g_registry_begin.load" in backend_base
     and "ggml_backend_registry_begin_call(reg)" not in backend_base

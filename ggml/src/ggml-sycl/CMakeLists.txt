@@ -174,9 +174,11 @@ if (BUILD_TESTING)
         target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
     else()
-        # Static backend builds need the CPU implementation objects referenced
-        # by ggml-sycl's host fallback paths, not only the backend library.
-        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml-sycl ggml-cpu)
+        # The wrapper exercises both generic registry APIs and direct static
+        # SYCL APIs. Link the aggregate target once: it owns the registry TUs
+        # and propagates the selected SYCL/CPU backend libraries without
+        # introducing duplicate backend objects.
+        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
