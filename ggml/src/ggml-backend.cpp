@@ -26,6 +26,7 @@
 #include <vector>
 
 namespace {
+using registry_cached_name_fn = const char * (*)(ggml_backend_reg_t);
 using registry_begin_fn = bool (*)(ggml_backend_reg_t);
 using registry_end_fn   = void (*)(ggml_backend_reg_t);
 using device_begin_fn   = bool (*)(ggml_backend_dev_t);
@@ -33,6 +34,7 @@ using device_end_fn     = void (*)(ggml_backend_dev_t);
 using device_owner_acquire_fn = bool (*)(ggml_backend_dev_t);
 using device_owner_release_fn = void (*)(ggml_backend_dev_t);
 
+std::atomic<registry_cached_name_fn> g_registry_cached_name{ nullptr };
 std::atomic<registry_begin_fn> g_registry_begin{ nullptr };
 std::atomic<registry_end_fn>   g_registry_end{ nullptr };
 std::atomic<device_begin_fn>   g_device_begin{ nullptr };
@@ -94,6 +96,7 @@ void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i
     g_device_end.store(iface ? iface->device_end : nullptr, std::memory_order_release);
     g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
     g_registry_begin.store(iface ? iface->registry_begin : nullptr, std::memory_order_release);
+    g_registry_cached_name.store(iface ? iface->registry_cached_name : nullptr, std::memory_order_release);
     ggml_backend_refresh_buffer_lifecycle();
 }
 
@@ -927,6 +930,12 @@ const char * ggml_backend_reg_name_unchecked(ggml_backend_reg_t reg) {
 
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
     GGML_ASSERT(reg);
+    // Published entries own immutable name storage for their full tombstone
+    // lifetime. Prefer it so logical unload never calls into a closed plugin.
+    const auto cached_name = g_registry_cached_name.load(std::memory_order_acquire);
+    if (cached_name) {
+        if (const char * name = cached_name(reg)) return name;
+    }
     const auto begin = g_registry_begin.load(std::memory_order_acquire);
     if (begin && !begin(reg)) return nullptr;
     const auto end = begin ? g_registry_end.load(std::memory_order_acquire) : nullptr;

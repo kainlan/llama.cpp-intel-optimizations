@@ -815,6 +815,7 @@ struct ggml_backend_registry {
     }
 };
 
+const char * ggml_backend_registry_cached_name(ggml_backend_reg_t reg) noexcept;
 bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept;
 void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
 bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
@@ -825,6 +826,7 @@ void ggml_backend_device_owner_release(ggml_backend_dev_t device) noexcept;
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
     static const ggml_backend_registry_lifecycle_i lifecycle_iface = {
+        ggml_backend_registry_cached_name,
         ggml_backend_registry_begin_call,
         ggml_backend_registry_end_call,
         ggml_backend_device_begin_call,
@@ -887,6 +889,21 @@ void ggml_backend_register(ggml_backend_reg_t reg) {
 
 void ggml_backend_device_register(ggml_backend_dev_t device) {
     get_reg().register_device(device);
+}
+
+const char * ggml_backend_registry_cached_name(ggml_backend_reg_t reg) noexcept {
+    if (!reg) return nullptr;
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        // Entry names are copied at staging and never mutated. Tombstones stay
+        // retained in the registry, so this pointer remains stable after unlock.
+        return found == registry.backends.end() ? nullptr : (*found)->name.c_str();
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept {

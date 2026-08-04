@@ -737,10 +737,12 @@ int main() {
     }
     // These get() calls consume the count snapshots captured before removal;
     // both must reject the now-tombstoned identity deterministically.
+    const char * tombstoned_name = ggml_backend_reg_name(reg);
     if (ggml_backend_reg_by_name("SYCL") != nullptr || ggml_backend_reg_get(unloaded_reg_index) != nullptr ||
         ggml_backend_dev_get(unloaded_dev_index) != nullptr || ggml_backend_reg_dev_get(reg, 0) != nullptr ||
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin") != nullptr ||
-        ggml_backend_dev_init(sycl_dev, nullptr) != nullptr || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        ggml_backend_dev_init(sycl_dev, nullptr) != nullptr || !tombstoned_name ||
+        std::strcmp(tombstoned_name, "SYCL") != 0) {
         std::fprintf(stderr, "logical unload lookup or retained raw-handle lease failed\n");
         return 1;
     }

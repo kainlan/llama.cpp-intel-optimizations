@@ -244,6 +244,7 @@ extern "C" {
     // registry library. ggml-base defaults to admitting standalone/custom
     // handles, avoiding a reverse link dependency on ggml-backend-reg.cpp.
     struct ggml_backend_registry_lifecycle_i {
+        const char * (*registry_cached_name)(ggml_backend_reg_t reg);
         bool (*registry_begin)(ggml_backend_reg_t reg);
         void (*registry_end)(ggml_backend_reg_t reg);
         bool (*device_begin)(ggml_backend_dev_t device);
