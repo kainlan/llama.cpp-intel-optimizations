@@ -13,6 +13,7 @@ extern "C" void ggml_backend_test_block_next_unload();
 extern "C" void ggml_backend_test_wait_unload_blocked();
 extern "C" void ggml_backend_test_reentrant_mutation_on_next_unload();
 extern "C" void ggml_backend_test_release_unload();
+extern "C" size_t ggml_backend_test_active_calls(ggml_backend_reg_t reg);
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state();
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
@@ -361,12 +362,15 @@ int main() {
         std::fprintf(stderr, "NODELETE reload retained model-bound MoE state\n");
         return 1;
     }
+    using admission_snapshot_fn = void (*)(uint64_t out[8]);
+    auto admission_snapshot = reinterpret_cast<admission_snapshot_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_admission_snapshot"));
     auto * generic_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_can_unload");
     auto * named_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_can_unload");
     auto * generic_cancel_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload");
     auto * named_cancel_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cancel_unload");
-    if (!generic_can_unload || generic_can_unload != named_can_unload || !generic_cancel_unload ||
-        generic_cancel_unload != named_cancel_unload) {
+    if (!admission_snapshot || !generic_can_unload || generic_can_unload != named_can_unload ||
+        !generic_cancel_unload || generic_cancel_unload != named_cancel_unload) {
         std::fprintf(stderr, "reload did not rebuild unload reservation procedure aliases\n");
         return 1;
     }
@@ -409,10 +413,30 @@ int main() {
 
 #if defined(GGML_SYCL_RUNTIME_MODULE)
     phase("post-check admission reservation");
+    uint64_t admission_before[8]{};
+    uint64_t admission_after[8]{};
+    admission_snapshot(admission_before);
+    const size_t generic_calls_before = ggml_backend_test_active_calls(reg);
+    const bool reserved = CALL_SYCL(ggml_backend_sycl_can_unload)();
     ggml_sycl_load_txn reserved_begin{};
-    if (!CALL_SYCL(ggml_backend_sycl_can_unload)() ||
-        CALL_SYCL(ggml_backend_sycl_model_load_begin)(&reserved_begin) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
-        std::fprintf(stderr, "shutdown reservation admitted a post-check load\n");
+    const auto reserved_begin_rc = reserved ? CALL_SYCL(ggml_backend_sycl_model_load_begin)(&reserved_begin) :
+                                              GGML_SYCL_LIFECYCLE_BUSY;
+    admission_snapshot(admission_after);
+    if (!reserved || reserved_begin_rc != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
+        std::fprintf(stderr,
+                     "shutdown reservation check failed: reserved=%d begin_rc=%d generic_calls=%zu "
+                     "before=[phase=%llu mutations=%llu txn=%llu models=%llu contexts=%llu updates=%llu "
+                     "reserved=%llu completed=%llu] after=[phase=%llu mutations=%llu txn=%llu models=%llu "
+                     "contexts=%llu updates=%llu reserved=%llu completed=%llu]\n",
+                     reserved ? 1 : 0, (int) reserved_begin_rc, generic_calls_before,
+                     (unsigned long long) admission_before[0], (unsigned long long) admission_before[1],
+                     (unsigned long long) admission_before[2], (unsigned long long) admission_before[3],
+                     (unsigned long long) admission_before[4], (unsigned long long) admission_before[5],
+                     (unsigned long long) admission_before[6], (unsigned long long) admission_before[7],
+                     (unsigned long long) admission_after[0], (unsigned long long) admission_after[1],
+                     (unsigned long long) admission_after[2], (unsigned long long) admission_after[3],
+                     (unsigned long long) admission_after[4], (unsigned long long) admission_after[5],
+                     (unsigned long long) admission_after[6], (unsigned long long) admission_after[7]);
         return 1;
     }
     CALL_SYCL(ggml_backend_sycl_cancel_unload)();

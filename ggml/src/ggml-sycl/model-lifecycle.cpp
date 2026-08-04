@@ -1030,6 +1030,22 @@ bool Registry::shutdown_reserved() const noexcept {
     }
 }
 
+admission_diagnostics_snapshot Registry::admission_diagnostics() const noexcept {
+    admission_diagnostics_snapshot snapshot{};
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot.active_txn = active_txn_;
+        snapshot.models = models_.size();
+        snapshot.backend_contexts = backend_context_count_;
+        for (const auto & model : models_) snapshot.live_updates += model.second.live_update_count;
+        snapshot.shutdown_reserved = shutdown_reserved_;
+        snapshot.shutdown_completed = shutdown_completed_;
+    } catch (...) {
+        snapshot.shutdown_reserved = true;
+    }
+    return snapshot;
+}
+
 bool Registry::acquire_backend_context() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);

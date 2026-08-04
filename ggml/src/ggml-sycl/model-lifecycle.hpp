@@ -253,6 +253,15 @@ class CheckedCounter {
     uint64_t next_;
 };
 
+struct admission_diagnostics_snapshot {
+    uint64_t active_txn = 0;
+    uint64_t models = 0;
+    uint64_t backend_contexts = 0;
+    uint64_t live_updates = 0;
+    bool shutdown_reserved = false;
+    bool shutdown_completed = false;
+};
+
 class Registry {
   public:
     explicit Registry(uint64_t      id_limit    = std::numeric_limits<uint64_t>::max(),
@@ -306,6 +315,7 @@ class Registry {
     void  complete_shutdown() noexcept;
     void  reactivate() noexcept;
     bool  shutdown_reserved() const noexcept;
+    admission_diagnostics_snapshot admission_diagnostics() const noexcept;
     bool  acquire_backend_context() noexcept;
     void  release_backend_context() noexcept;
     teardown_ticket    prepare_teardown(ModelToken token);

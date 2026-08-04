@@ -9704,7 +9704,9 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     sycl_module_mutation_guard module_guard;
-    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
+    // A closed module is the same load-admission condition as the Registry's
+    // shutdown gate, not the generic operation BUSY result.
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_LOAD_BUSY;
     if (!txn) {
         return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
     }
@@ -96409,6 +96411,22 @@ static void ggml_backend_sycl_test_fail_next_registry_stage() {
     if (module_guard) g_test_fail_next_registry_stage.store(true, std::memory_order_release);
 }
 
+static void ggml_backend_sycl_test_admission_snapshot(uint64_t out[8]) {
+    if (!out) return;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+        out[0] = static_cast<uint64_t>(g_sycl_module_admission);
+        out[1] = g_sycl_module_mutations;
+    }
+    const auto lifecycle = ggml_sycl::lifecycle::global_registry().admission_diagnostics();
+    out[2] = lifecycle.active_txn;
+    out[3] = lifecycle.models;
+    out[4] = lifecycle.backend_contexts;
+    out[5] = lifecycle.live_updates;
+    out[6] = lifecycle.shutdown_reserved ? 1 : 0;
+    out[7] = lifecycle.shutdown_completed ? 1 : 0;
+}
+
 static const char * ggml_backend_sycl_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
     return GGML_SYCL_NAME;
@@ -96453,6 +96471,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_registry_stage") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_registry_stage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_admission_snapshot") == 0) {
+        return (void *) ggml_backend_sycl_test_admission_snapshot;
     }
     if (strcmp(name, "ggml_backend_can_unload") == 0 || strcmp(name, "ggml_backend_sycl_can_unload") == 0) {
         return (void *) ggml_backend_sycl_can_unload;

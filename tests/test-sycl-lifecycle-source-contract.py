@@ -714,6 +714,11 @@ checks = {
     and "Reconcile the internal Registry gate" in backend
     and "CALL_SYCL(ggml_backend_sycl_model_load_end)(aborted, false, nullptr)" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "if (!module_guard) return GGML_SYCL_LIFECYCLE_LOAD_BUSY" in backend
+    and "ggml_backend_sycl_test_admission_snapshot" in backend
+    and "ggml_backend_test_active_calls" in registry_backend
+    and "shutdown reservation check failed: reserved=%d begin_rc=%d" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_prepare_reactivate" in backend
     and "ggml_backend_commit_reactivate" in backend
     and "ggml_backend_rollback_reactivate" in backend,
