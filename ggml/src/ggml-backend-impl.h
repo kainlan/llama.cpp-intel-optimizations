@@ -233,6 +233,19 @@ extern "C" {
         void * context;
     };
 
+    // Optional registry lifecycle admission supplied by the higher-level ggml
+    // registry library. ggml-base defaults to admitting standalone/custom
+    // handles, avoiding a reverse link dependency on ggml-backend-reg.cpp.
+    struct ggml_backend_registry_lifecycle_i {
+        bool (*registry_begin)(ggml_backend_reg_t reg);
+        void (*registry_end)(ggml_backend_reg_t reg);
+        bool (*device_begin)(ggml_backend_dev_t device);
+        void (*device_end)(ggml_backend_dev_t device);
+    };
+
+    GGML_API void ggml_backend_set_registry_lifecycle(
+        const struct ggml_backend_registry_lifecycle_i * iface);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend

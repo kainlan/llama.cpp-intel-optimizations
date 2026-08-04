@@ -20,9 +20,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
+
+namespace {
+using registry_begin_fn = bool (*)(ggml_backend_reg_t);
+using registry_end_fn   = void (*)(ggml_backend_reg_t);
+using device_begin_fn   = bool (*)(ggml_backend_dev_t);
+using device_end_fn     = void (*)(ggml_backend_dev_t);
+
+std::atomic<registry_begin_fn> g_registry_begin{ nullptr };
+std::atomic<registry_end_fn>   g_registry_end{ nullptr };
+std::atomic<device_begin_fn>   g_device_begin{ nullptr };
+std::atomic<device_end_fn>     g_device_end{ nullptr };
+}
+
+void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
+    g_registry_end.store(iface ? iface->registry_end : nullptr, std::memory_order_release);
+    g_device_end.store(iface ? iface->device_end : nullptr, std::memory_order_release);
+    g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
+    g_registry_begin.store(iface ? iface->registry_begin : nullptr, std::memory_order_release);
+}
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -679,20 +699,23 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
     return device->reg;
 }
 
-bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
-void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
-
 ggml_backend_t ggml_backend_dev_init(ggml_backend_dev_t device, const char * params) {
     GGML_ASSERT(device);
-    if (!ggml_backend_device_begin_call(device)) {
+    const auto begin = g_device_begin.load(std::memory_order_acquire);
+    if (begin && !begin(device)) {
         return nullptr;
     }
+    const auto end = begin ? g_device_end.load(std::memory_order_acquire) : nullptr;
     try {
         ggml_backend_t result = device->iface.init_backend(device, params);
-        ggml_backend_device_end_call(device);
+        if (end) {
+            end(device);
+        }
         return result;
     } catch (...) {
-        ggml_backend_device_end_call(device);
+        if (end) {
+            end(device);
+        }
         return nullptr;
     }
 }
@@ -742,50 +765,65 @@ const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
     return reg->iface.get_name(reg);
 }
 
-bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept;
-void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
-
 size_t ggml_backend_reg_dev_count(ggml_backend_reg_t reg) {
     GGML_ASSERT(reg);
-    if (!ggml_backend_registry_begin_call(reg)) {
+    const auto begin = g_registry_begin.load(std::memory_order_acquire);
+    if (begin && !begin(reg)) {
         return 0;
     }
+    const auto end = begin ? g_registry_end.load(std::memory_order_acquire) : nullptr;
     try {
         const size_t result = reg->iface.get_device_count(reg);
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return result;
     } catch (...) {
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return 0;
     }
 }
 
 ggml_backend_dev_t ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(reg);
-    if (!ggml_backend_registry_begin_call(reg)) {
+    const auto begin = g_registry_begin.load(std::memory_order_acquire);
+    if (begin && !begin(reg)) {
         return nullptr;
     }
+    const auto end = begin ? g_registry_end.load(std::memory_order_acquire) : nullptr;
     try {
         ggml_backend_dev_t result = reg->iface.get_device(reg, index);
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return result;
     } catch (...) {
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return nullptr;
     }
 }
 
 void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_ASSERT(reg);
-    if (!reg->iface.get_proc_address || !ggml_backend_registry_begin_call(reg)) {
+    const auto begin = g_registry_begin.load(std::memory_order_acquire);
+    if (!reg->iface.get_proc_address || (begin && !begin(reg))) {
         return NULL;
     }
+    const auto end = begin ? g_registry_end.load(std::memory_order_acquire) : nullptr;
     try {
         void * result = reg->iface.get_proc_address(reg, name);
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return result;
     } catch (...) {
-        ggml_backend_registry_end_call(reg);
+        if (end) {
+            end(reg);
+        }
         return NULL;
     }
 }

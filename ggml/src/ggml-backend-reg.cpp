@@ -734,8 +734,24 @@ struct ggml_backend_registry {
     }
 };
 
+bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept;
+void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
+bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
+void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
+
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
+    static const ggml_backend_registry_lifecycle_i lifecycle_iface = {
+        ggml_backend_registry_begin_call,
+        ggml_backend_registry_end_call,
+        ggml_backend_device_begin_call,
+        ggml_backend_device_end_call,
+    };
+    static const bool installed = [] {
+        ggml_backend_set_registry_lifecycle(&lifecycle_iface);
+        return true;
+    }();
+    (void) installed;
     return reg;
 }
 

@@ -8,6 +8,7 @@ hpp = (root / "ggml/src/ggml-sycl/model-lifecycle.hpp").read_text()
 cpp = (root / "ggml/src/ggml-sycl/model-lifecycle.cpp").read_text()
 backend = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 registry_backend = (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+backend_base = (root / "ggml/src/ggml-backend.cpp").read_text()
 backend_dl = (root / "ggml/src/ggml-backend-dl.cpp").read_text()
 public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
@@ -550,6 +551,10 @@ checks = {
     and "test_block_backend_context_release" in hpp
     and "checked unload crossed final backend destructor tail" in
         (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
+    "base-safe lifecycle admission function table": "ggml_backend_set_registry_lifecycle" in backend_base
+    and "g_registry_begin.load" in backend_base
+    and "ggml_backend_registry_begin_call(reg)" not in backend_base
+    and "ggml_backend_set_registry_lifecycle(&lifecycle_iface)" in registry_backend,
     "callbacks outside registry lock": "mutable std::mutex" in registry_backend
     and "Stage all plugin-owned metadata before taking the publication lock" in registry_backend
     and "Resolver is plugin code too" in registry_backend
