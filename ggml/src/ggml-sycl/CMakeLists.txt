@@ -2731,7 +2731,7 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME test-sycl-expert-prefetch COMMAND test-sycl-expert-prefetch)
 endif()
 
-if (NOT GGML_BACKEND_DL)
+if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
     add_executable(test-sycl-fattn-onednn-descriptors
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-onednn-descriptors.cpp
     )
@@ -2747,7 +2747,7 @@ if (NOT GGML_BACKEND_DL)
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     )
-    target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE ggml-base ggml ggml-cpu ggml-sycl DNNL::dnnl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE IntelSYCL::SYCL_CXX)
     endif()
