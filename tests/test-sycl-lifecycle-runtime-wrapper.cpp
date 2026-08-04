@@ -29,7 +29,9 @@ static int                    g_registry_fixture_cancels = 0;
 
 static const char * registry_fixture_dev_name(ggml_backend_dev_t) { return "TEST-LIFECYCLE0"; }
 static const char * registry_fixture_dev_description(ggml_backend_dev_t) { return "registry lifecycle fixture"; }
-static ggml_backend_dev_type registry_fixture_dev_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; }
+static enum ggml_backend_dev_type registry_fixture_dev_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
 static ggml_backend_t registry_fixture_dev_init(ggml_backend_dev_t, const char *) { return nullptr; }
 static const char * registry_fixture_reg_name(ggml_backend_reg_t) { return "TEST-LIFECYCLE"; }
 static size_t registry_fixture_reg_count(ggml_backend_reg_t) { return 1; }
