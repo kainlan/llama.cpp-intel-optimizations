@@ -641,6 +641,8 @@ checks = {
     "registry name tombstone cache and controlled staging bypass": "ggml_backend_reg_name_unchecked" in backend_base
     and "g_registry_cached_name" in backend_base
     and "ggml_backend_registry_cached_name" in registry_backend
+    and "std::string              cached_name" in registry_backend
+    and "(*found)->cached_name.c_str()" in registry_backend
     and "Entry names are copied at staging and never mutated" in registry_backend
     and "const auto begin = g_registry_begin.load" in backend_base
     and "ggml_backend_reg_name_unchecked(reg)" in registry_backend

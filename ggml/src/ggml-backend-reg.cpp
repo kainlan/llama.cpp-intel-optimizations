@@ -183,6 +183,7 @@ struct ggml_backend_reg_entry {
     bool                     dynamic = false;
     size_t                   active_calls = 0;
     size_t                   durable_owners = 0;
+    std::string              cached_name;
     std::string              module_path;
 };
 
@@ -353,7 +354,7 @@ struct ggml_backend_registry {
             const bool dynamic = handle != nullptr;
             auto candidate = std::make_shared<ggml_backend_reg_entry>(
                 ggml_backend_reg_entry{ reg, std::move(handle), ggml_backend_reg_state::ACTIVE, dynamic, 0, 0,
-                                        std::move(module_path) });
+                                        name ? name : "", std::move(module_path) });
 
             ggml_backend_reg_entry_ptr published_entry;
             {
@@ -900,7 +901,7 @@ const char * ggml_backend_registry_cached_name(ggml_backend_reg_t reg) noexcept 
             [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
         // Entry names are copied at staging and never mutated. Tombstones stay
         // retained in the registry, so this pointer remains stable after unlock.
-        return found == registry.backends.end() ? nullptr : (*found)->name.c_str();
+        return found == registry.backends.end() ? nullptr : (*found)->cached_name.c_str();
     } catch (...) {
         return nullptr;
     }
