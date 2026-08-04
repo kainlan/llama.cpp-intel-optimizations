@@ -151,7 +151,14 @@ template <typename T> static T * malloc_device_copy(sycl::queue & q, const std::
 }
 
 struct backend_owner {
-    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend;
+
+    explicit backend_owner(ggml_backend_t backend) : backend(backend) {}
+
+    backend_owner(const backend_owner &)             = delete;
+    backend_owner & operator=(const backend_owner &) = delete;
+    backend_owner(backend_owner &&)                  = delete;
+    backend_owner & operator=(backend_owner &&)      = delete;
 
     ~backend_owner() {
         if (backend) {
@@ -365,9 +372,10 @@ int main() {
         return 2;
     }
     if (child == 0) {
-        const int rc = run_descriptor_tests();
-        std::fflush(nullptr);
-        _exit(rc);
+        // Return normally from main after run_descriptor_tests has destroyed
+        // its backend owner. This also exercises child static/TLS/atexit
+        // teardown; _exit would hide failures in exactly that lifetime tail.
+        return run_descriptor_tests();
     }
 
     int status = 0;
