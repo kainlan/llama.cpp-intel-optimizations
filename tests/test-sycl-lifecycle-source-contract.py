@@ -547,6 +547,10 @@ checks = {
     and "shutdown_reserved_" in hpp
     and "backend_context_count_" in hpp
     and "global_registry().reserve_shutdown()" in backend
+    and 'strcmp(name, "ggml_backend_sycl_can_unload")' in backend
+    and 'strcmp(name, "ggml_backend_sycl_cancel_unload")' in backend
+    and 'named_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_can_unload")'
+        in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_cancel_unload" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "ggml_backend_complete_unload" in

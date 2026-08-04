@@ -39,6 +39,18 @@ int main() {
         std::fprintf(stderr, "failed to reload SYCL backend module\n");
         return 1;
     }
+    // Generic loader hooks and public SYCL names must both be rebuilt by the
+    // reloaded registry. Checking alias identity catches a stale/incomplete
+    // proc table before any lifecycle work begins.
+    auto * generic_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_can_unload");
+    auto * named_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_can_unload");
+    auto * generic_cancel_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload");
+    auto * named_cancel_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cancel_unload");
+    if (!generic_can_unload || generic_can_unload != named_can_unload || !generic_cancel_unload ||
+        generic_cancel_unload != named_cancel_unload) {
+        std::fprintf(stderr, "reload did not rebuild unload reservation procedure aliases\n");
+        return 1;
+    }
 #    define LOAD_SYCL(name)                                                                                \
         auto name##_fn = reinterpret_cast<decltype(&name)>(ggml_backend_reg_get_proc_address(reg, #name)); \
         if (!name##_fn) {                                                                                  \
