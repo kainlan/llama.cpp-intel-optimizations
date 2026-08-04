@@ -3582,6 +3582,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.layout                = GGML_LAYOUT_AOS;
             entry.location              = loc;
             entry.handle                = std::move(direct_handle);
+            entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
             direct_expert_entries_[key] = std::move(entry);
             moe_direct_trace_key("insert-host", key, GGML_LAYOUT_AOS, "zone-full", direct_expert_entries_.size(),
                                  &direct_expert_entries_.find(key)->second);
@@ -4671,17 +4672,33 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
         stamp_pending_owner(cache_entry, load_effect_guard);
-        entries_[cache_key] = cache_entry;
-        cache_inserted      = true;
-        auto & stored       = entries_[cache_key];
-        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_expert/publish-mirror");
-        if (out_handle) {
-            stored.in_use_count.fetch_add(1);
-            stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                        stored.location == cache_location::DEVICE, &stored);
+        try {
+            if (fail_next_host_registration_insert_.exchange(false)) {
+                throw std::bad_alloc();
+            }
+            entries_[cache_key] = cache_entry;
+            cache_inserted      = true;
+        } catch (...) {
+            return false;
         }
-        id_to_key_[key] = cache_key;
+        try {
+            auto & stored = entries_[cache_key];
+            direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_expert/publish-mirror");
+            if (out_handle) {
+                stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
+                *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
+                                                            stored.location == cache_location::DEVICE, &stored);
+            }
+            id_to_key_[key] = cache_key;
+        } catch (...) {
+            if (out_handle) {
+                *out_handle = {};
+            }
+            direct_handle.reset();
+            entries_.erase(cache_key);
+            return false;
+        }
     }
 
 publish_host_expert_direct:
@@ -4693,6 +4710,7 @@ publish_host_expert_direct:
         entry.layout                = layout;
         entry.location              = cache_loc;
         entry.handle                = std::move(direct_handle);
+        entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
         direct_expert_entries_[key] = std::move(entry);
     } catch (...) {
         if (out_handle) {
@@ -4793,17 +4811,33 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id key,
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
         stamp_pending_owner(cache_entry, load_effect_guard);
-        entries_[cache_key] = cache_entry;
-        cache_inserted      = true;
-        auto & stored       = entries_[cache_key];
-        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_weight/publish-mirror");
-        if (out_handle) {
-            stored.in_use_count.fetch_add(1);
-            stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                        stored.location == cache_location::DEVICE, &stored);
+        try {
+            if (fail_next_host_registration_insert_.exchange(false)) {
+                throw std::bad_alloc();
+            }
+            entries_[cache_key] = cache_entry;
+            cache_inserted      = true;
+        } catch (...) {
+            return false;
         }
-        id_to_key_[key] = cache_key;
+        try {
+            auto & stored = entries_[cache_key];
+            direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_weight/publish-mirror");
+            if (out_handle) {
+                stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
+                *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
+                                                            stored.location == cache_location::DEVICE, &stored);
+            }
+            id_to_key_[key] = cache_key;
+        } catch (...) {
+            if (out_handle) {
+                *out_handle = {};
+            }
+            direct_handle.reset();
+            entries_.erase(cache_key);
+            return false;
+        }
     }
 
 publish_host_weight_direct:
@@ -4815,6 +4849,7 @@ publish_host_weight_direct:
         entry.layout                = layout;
         entry.location              = cache_loc;
         entry.handle                = std::move(direct_handle);
+        entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
         direct_weight_entries_[key] = std::move(entry);
     } catch (...) {
         if (out_handle) {
@@ -7939,11 +7974,48 @@ bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
 }
 
 void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    for (auto & pair : entries_) {
-        if (pair.second.pending_load_txn_id == load_txn_id) {
-            pair.second.pending_load_txn_id = 0;
+    // End admission has already drained producers. Drop direct leases before
+    // erasing their canonical cache entries so no mem_handle can dangle.
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+        for (auto it = direct_expert_entries_.begin(); it != direct_expert_entries_.end();) {
+            it = it->second.pending_load_txn_id == load_txn_id ? direct_expert_entries_.erase(it) : std::next(it);
         }
+        for (auto it = direct_weight_entries_.begin(); it != direct_weight_entries_.end();) {
+            it = it->second.pending_load_txn_id == load_txn_id ? direct_weight_entries_.erase(it) : std::next(it);
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        auto & entry = it->second;
+        if (entry.pending_load_txn_id != load_txn_id) {
+            ++it;
+            continue;
+        }
+        if (entry.owner_mask != 0) {
+            // Shared/pre-existing ownership survives; remove only B's touch.
+            entry.pending_load_txn_id = 0;
+            ++it;
+            continue;
+        }
+        auto mapped = id_to_key_.find(it->first.id);
+        if (mapped != id_to_key_.end() && mapped->second == it->first) {
+            id_to_key_.erase(mapped);
+        }
+        if (entry.in_use_count.load() != 0) {
+            entry.retired             = true;
+            entry.device_ptr          = nullptr;
+            entry.src_ptr             = nullptr;
+            entry.pending_load_txn_id = 0;
+            ++it;
+            continue;
+        }
+        // In-place host registrations are model storage, not cache allocations.
+        if (!(entry.pinned && entry.host_resident)) {
+            release_entry_allocation_locked(entry);
+        }
+        it = entries_.erase(it);
     }
 }
 

@@ -401,6 +401,25 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
 //
 // What it must still not touch is another LIVE model's weights. A live
 // model's ownership vetoes reclaim in every mode.
+static bool test_host_registration_initial_insert_failures(sycl::queue & q) {
+    printf("\n=== Test: host registration initial insertion failures roll back ===\n");
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     dense_data(128, 0x41), expert_data(128, 0x42);
+    const auto               dense_key  = ggml_sycl::test_make_cache_id(dense_data.data());
+    const auto               expert_key = ggml_sycl::test_make_cache_id(expert_data.data());
+    cache.test_fail_next_host_registration_insert();
+    if (cache.register_host_weight(dense_key, dense_data.data(), dense_data.size(), GGML_LAYOUT_AOS) ||
+        cache.is_cached(dense_key, GGML_LAYOUT_AOS)) {
+        return false;
+    }
+    cache.test_fail_next_host_registration_insert();
+    if (cache.register_host_expert(expert_key, expert_data.data(), expert_data.size(), GGML_LAYOUT_AOS) ||
+        cache.is_cached(expert_key, GGML_LAYOUT_AOS)) {
+        return false;
+    }
+    return true;
+}
+
 static bool test_shared_entry_exact_two_owner_unload(sycl::queue & q) {
     printf("\n=== Test: shared entry retains exact two-model ownership ===\n");
 
@@ -638,6 +657,7 @@ int main() {
     bool ok = true;
     ok &= test_reset_preserves_leased_entry_and_remaps_id(q);
     ok &= test_live_model_idle_weights_survive_load_boundary(q);
+    ok &= test_host_registration_initial_insert_failures(q);
     ok &= test_shared_entry_exact_two_owner_unload(q);
     ok &= test_unrelated_thread_entry_not_claimed(q);
     ok &= test_replan_frees_own_staging_but_spares_a_live_model(q);

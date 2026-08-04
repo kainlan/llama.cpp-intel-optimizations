@@ -1388,6 +1388,7 @@ struct weight_entry {
     bool                        has_ready_event = false;
     sycl::event                 ready_event;
     std::shared_ptr<mem_handle> handle;
+    uint64_t                    pending_load_txn_id = 0;
     // Transient direct lookup mirror only. The handle is the canonical lifetime
     // token; ptr is a resolved mirror for diagnostics and legacy ABI boundaries.
 };
@@ -2379,6 +2380,8 @@ class unified_cache {
     // reused from an earlier model (identical GGUF weights dedupe to one entry).
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
     bool test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
+
+    void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
     void note_model_load_abort(uint64_t load_txn_id);
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
@@ -2721,6 +2724,8 @@ class unified_cache {
     void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
 
   private:
+    std::atomic<bool> fail_next_host_registration_insert_{ false };
+
     // Sub-allocate from a zone.
     void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
 

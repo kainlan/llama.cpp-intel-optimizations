@@ -24552,6 +24552,19 @@ static size_t ggml_sycl_get_padded_weight_bytes(ggml_type type, int64_t ncols, s
     return base_size + ggml_row_size(type, MATRIX_ROW_PADDING - rem);
 }
 
+struct ggml_sycl_scoped_alloc_rollback {
+    ggml_sycl::alloc_handle & handle;
+    bool                      transferred = false;
+
+    ~ggml_sycl_scoped_alloc_rollback() {
+        if (!transferred && handle.ptr) {
+            (void) ggml_sycl::unified_free(handle);
+        }
+    }
+
+    void release() noexcept { transferred = true; }
+};
+
 static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, layout_mode layout) {
     if (!src0 || device < 0 || device >= ggml_sycl_info().device_count) {
         return false;
@@ -25308,21 +25321,19 @@ static void ggml_sycl_preload_model_weights() {
                         if (!ggml_sycl::unified_alloc(host_req, &host_handle)) {
                             host_handle = {};
                         }
+                        ggml_sycl_scoped_alloc_rollback host_alloc_guard{ host_handle };
 
                         void *       host_ptr  = host_handle.ptr;
                         const size_t seg0_size = (!host_handle.all_segments.empty()) ?
                                                      host_handle.all_segments[0].size :
                                                      (host_ptr ? expert_size : 0);
                         if (host_ptr && seg0_size < expert_size) {
-                            ggml_sycl::unified_free(host_handle);
-                            host_handle = {};
-                            host_ptr    = nullptr;
+                            host_ptr = nullptr;
                         }
 
                         if (host_ptr) {
                             ggml_sycl::mem_handle host_copy_handle = host_handle.as_mem_handle();
                             if (!host_copy_handle.valid()) {
-                                ggml_sycl::unified_free(host_handle);
                                 return false;
                             }
                             if (tensor_source_is_device) {
@@ -25344,17 +25355,15 @@ static void ggml_sycl_preload_model_weights() {
                         }
 
                         bool remembered_handle = false;
-                        bool allocation_transferred = false;
                         for (const ggml_sycl_cache_id & key : keys) {
                             ggml_sycl::mem_handle handle;
                             if (!cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle) ||
                                 !handle.resolve().ptr) {
-                                if (!allocation_transferred && host_handle.ptr) {
-                                    ggml_sycl::unified_free(host_handle);
-                                }
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }
-                            allocation_transferred = true;
+                            if (host_handle.ptr && host_ptr == host_handle.ptr) {
+                                host_alloc_guard.release();
+                            }
                             if (!remembered_handle) {
                                 extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
                                                                    std::move(handle));
@@ -25826,19 +25835,18 @@ static void ggml_sycl_preload_model_weights() {
                                     dn_req.intent.constraints.must_host_pinned = true;
                                     ggml_sycl::alloc_handle dn_h{};
                                     (void) ggml_sycl::unified_alloc(dn_req, &dn_h);
+                                    ggml_sycl_scoped_alloc_rollback dense_alloc_guard{ dn_h };
                                     void * arena_ptr = dn_h.ptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, tensor->data, nbytes);
                                         ggml_sycl::mem_handle handle;
                                         if (!cache->register_host_weight(host_key, arena_ptr, nbytes, GGML_LAYOUT_AOS,
                                                                          &handle)) {
-                                            ggml_sycl::unified_free(dn_h);
                                             throw std::runtime_error(
                                                 "SYCL host weight registration failed during preload");
                                         }
                                         auto resolved = handle.resolve(device);
                                         if (!resolved.ptr) {
-                                            ggml_sycl::unified_free(dn_h);
                                             throw std::runtime_error(
                                                 "SYCL host weight registration returned no ownership handle");
                                         }
@@ -25847,6 +25855,7 @@ static void ggml_sycl_preload_model_weights() {
                                             extra->data_device[device]      = resolved.ptr;
                                             extra->data_device_size[device] = nbytes;
                                         }
+                                        dense_alloc_guard.release();
                                         GGML_SYCL_DEBUG("[S1-PRELOAD] host-arena weight: %s (%.1f MB)\n", tensor->name,
                                                         nbytes / (1024.0f * 1024.0f));
                                     } else {

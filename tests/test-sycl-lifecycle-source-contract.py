@@ -366,11 +366,13 @@ checks = {
     and cache_cpp.count("stamp_pending_owner(old->second, load_effect_guard)") >= 2
     and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
     "preload retains candidate identity": "const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot()" in backend
+    and "ggml_sycl_scoped_alloc_rollback" in backend
     and "ggml_sycl_global_plan_snapshot()" not in re.search(
         r"static void ggml_sycl_preload_model_weights\(\).*?\n\}", backend, re.S).group(0)
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
-    and "unified_free(dn_h)" in backend,
+    and "dense_alloc_guard" in backend
+    and "host_alloc_guard" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
@@ -417,6 +419,13 @@ checks = {
     and "ggml_sycl_get_type_traits_cpu" in
         (root / "ggml/src/ggml-sycl/cpu-traits-support.cpp").read_text()
     and "RTLD_NOW | RTLD_LOCAL" in (root / "tests/test-sycl-module-dlopen.cpp").read_text(),
+    "host registration insertion faults roll back": "fail_next_host_registration_insert_.exchange(false)" in cache_cpp
+    and "test_host_registration_initial_insert_failures" in
+        (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
+    "abort removes exact pending cache ownership": "direct_expert_entries_.erase(it)" in cache_cpp
+    and "direct_weight_entries_.erase(it)" in cache_cpp
+    and "entry.owner_mask != 0" in cache_cpp
+    and "entry.pinned && entry.host_resident" in cache_cpp,
     "transaction-scoped cache ownership promotion": "pending_load_txn_id" in cache_hpp
     and "test_shared_entry_exact_two_owner_unload" in
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()
