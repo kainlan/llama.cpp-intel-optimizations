@@ -62,6 +62,8 @@ GGML_BACKEND_API int ggml_backend_sycl_get_tp_rank(void);
 
 // Check if running in multi-process TP mode
 GGML_BACKEND_API bool ggml_backend_sycl_is_multiprocess_tp(void);
+// Drain module-owned threads, queues and caches before ggml_backend_unload().
+GGML_BACKEND_API void ggml_backend_sycl_shutdown(void);
 
 // KV buffer type for a backend device (falls back to default buffer type if not SYCL)
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backend_dev_t device);

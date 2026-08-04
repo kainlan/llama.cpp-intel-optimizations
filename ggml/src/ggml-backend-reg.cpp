@@ -310,6 +310,15 @@ struct ggml_backend_registry {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
         }
 
+        // Give a dynamic backend one last chance to join module-owned threads
+        // and destroy queues/caches while its code and dependent runtimes are
+        // still loaded. The hook is optional and must be idempotent.
+        using shutdown_fn = void (*)();
+        auto shutdown = reinterpret_cast<shutdown_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_shutdown"));
+        if (shutdown) {
+            shutdown();
+        }
+
         // remove devices
         devices.erase(
             std::remove_if(devices.begin(), devices.end(),

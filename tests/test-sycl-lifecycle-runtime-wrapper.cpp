@@ -2,16 +2,32 @@
 
 #include <cstdio>
 
+static void phase(const char * name) {
+    std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
+    std::fflush(stderr);
+}
+
 int main() {
 #if defined(GGML_SYCL_RUNTIME_MODULE)
     // Exercise real registry late registration and module lifetime: load,
     // unregister/unload, then reload before resolving lifecycle operations.
+    phase("initial module load");
     auto * reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
     if (!reg) {
         std::fprintf(stderr, "failed to register SYCL backend module\n");
         return 1;
     }
+    auto shutdown = reinterpret_cast<decltype(&ggml_backend_sycl_shutdown)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_shutdown"));
+    if (!shutdown) {
+        std::fprintf(stderr, "missing registry procedure ggml_backend_sycl_shutdown\n");
+        return 1;
+    }
+    phase("initial module unload with shutdown hook");
+    shutdown = nullptr;
     ggml_backend_unload(reg);
+    reg = nullptr;
+    phase("module reload");
     reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
     if (!reg) {
         std::fprintf(stderr, "failed to reload SYCL backend module\n");
@@ -23,6 +39,7 @@ int main() {
             std::fprintf(stderr, "missing registry procedure %s\n", #name);                                \
             return 1;                                                                                      \
         }
+    LOAD_SYCL(ggml_backend_sycl_shutdown)
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
@@ -76,6 +93,7 @@ int main() {
         return 1;
     }
 
+    phase("lifecycle abort checks");
     ggml_sycl_load_txn aborted{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&aborted) != GGML_SYCL_LIFECYCLE_OK || aborted.id == 0) {
         std::fprintf(stderr, "runtime begin failed\n");
@@ -107,6 +125,7 @@ int main() {
         return 1;
     }
 
+    phase("empty early and late planning commit");
     ggml_sycl_load_txn    committed{};
     ggml_sycl_model_token token{};
     ggml_sycl_tensor_inventory inventory{};
@@ -125,6 +144,7 @@ int main() {
         std::fprintf(stderr, "runtime no-allocation commit failed\n");
         return 1;
     }
+    phase("model teardown");
     if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(token) != GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "runtime teardown failed\n");
         return 1;
@@ -135,7 +155,10 @@ int main() {
         return 1;
     }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
+    phase("final module unload with shutdown hook");
     ggml_backend_unload(reg);
+    reg = nullptr;
+    phase("complete");
 #endif
     return 0;
 }

@@ -95974,6 +95974,37 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
     /* .event_synchronize       = */ ggml_backend_sycl_device_event_synchronize,
 };
 
+void ggml_backend_sycl_shutdown(void) {
+    static std::mutex           shutdown_mutex;
+    std::lock_guard<std::mutex> lock(shutdown_mutex);
+    GGML_LOG_INFO("[SYCL-MODULE] shutdown begin\n");
+
+    // Stop producers before queues/caches they may reference. Every operation
+    // here is idempotent because static builds may call this during tests too.
+    g_adaptive_prestage.stop();
+    ggml_sycl_tp_worker_shutdown();
+    cpu_worker_shutdown();
+    ggml_sycl_watchdog_stop();
+    ggml_sycl_quarantine_drain_shutdown();
+    {
+        std::lock_guard<std::mutex> queue_lock(g_pipeline_copy_queue_mutex);
+        for (auto & queue : g_pipeline_copy_queue) {
+            if (!queue) {
+                continue;
+            }
+            try {
+                queue->wait();
+            } catch (...) {
+            }
+            delete queue;
+            queue = nullptr;
+        }
+    }
+    ggml_sycl::shutdown_unified_cache();
+
+    GGML_LOG_INFO("[SYCL-MODULE] shutdown complete\n");
+}
+
 // backend reg
 struct ggml_backend_sycl_reg_context {
     std::vector<ggml_backend_dev_t> devices;
@@ -96006,6 +96037,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
+    }
+    if (strcmp(name, "ggml_backend_shutdown") == 0 || strcmp(name, "ggml_backend_sycl_shutdown") == 0) {
+        return (void *) ggml_backend_sycl_shutdown;
     }
     if (strcmp(name, "ggml_backend_sycl_kv_buffer_type_from_dev") == 0) {
         return (void *) ggml_backend_sycl_kv_buffer_type_from_dev;

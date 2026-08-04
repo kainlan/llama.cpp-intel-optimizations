@@ -12623,15 +12623,21 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
 }
 
 void shutdown_unified_cache() {
-    // Set shutdown flag FIRST so destructors skip sycl::free() calls
-    g_sycl_shutting_down.store(true);
+    // Explicit module shutdown runs while SYCL is still valid. Detach the map
+    // under its lock, then destroy caches without the registry lock held so
+    // mem_handle release callbacks cannot deadlock on cache lookup.
+    std::unordered_map<int, std::unique_ptr<unified_cache>> caches;
+    {
+        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        caches.swap(g_device_caches);
+    }
+    g_sycl_shutting_down.store(false, std::memory_order_release);
+    caches.clear();
+    // Any later static destructors must not re-enter SYCL after explicit DSO
+    // shutdown. A freshly loaded module gets a fresh false-initialized flag.
+    g_sycl_shutting_down.store(true, std::memory_order_release);
 
-    // Clear all device caches
-    // The destructors will skip cleanup due to the shutdown flag
-    std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-    g_device_caches.clear();
-
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Shutdown complete\n");
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Explicit shutdown drained and destroyed all device caches\n");
 }
 
 // ============================================================================

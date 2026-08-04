@@ -592,6 +592,13 @@ static std::atomic<int64_t> g_watchdog_last_tick_ns{ 0 };
 static std::atomic<bool>    g_watchdog_active{ false };
 static std::atomic<int>     g_watchdog_non_graph_inflight{ 0 };
 static std::thread          g_watchdog_thread;
+static std::mutex           g_watchdog_thread_mutex;
+
+struct watchdog_shutdown_guard {
+    ~watchdog_shutdown_guard() { ggml_sycl_watchdog_stop(); }
+};
+
+static watchdog_shutdown_guard g_watchdog_shutdown_guard;
 
 static inline int64_t ggml_sycl_watchdog_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -688,24 +695,34 @@ static int64_t ggml_sycl_parse_op_timeout_ms() {
 }
 
 void ggml_sycl_watchdog_start() {
-    static std::once_flag start_once;
-    std::call_once(start_once, [] {
-        const int64_t timeout_ms = ggml_sycl_parse_op_timeout_ms();
-        if (timeout_ms == 0) {
-            GGML_LOG_INFO("[SYCL] Watchdog disabled (GGML_SYCL_OP_TIMEOUT_MS=0)\n");
-            return;
-        }
-        GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n", (long long) timeout_ms,
-                      (long long) watchdog_poll_ms);
-        g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
-        g_watchdog_active.store(true, std::memory_order_release);
-        g_watchdog_thread = std::thread(watchdog_thread_fn, timeout_ms);
-        g_watchdog_thread.detach();  // Don't join — might deadlock if main thread is stuck
-    });
+    std::lock_guard<std::mutex> lock(g_watchdog_thread_mutex);
+    if (g_watchdog_active.load(std::memory_order_acquire)) {
+        return;
+    }
+    const int64_t timeout_ms = ggml_sycl_parse_op_timeout_ms();
+    if (timeout_ms == 0) {
+        GGML_LOG_INFO("[SYCL] Watchdog disabled (GGML_SYCL_OP_TIMEOUT_MS=0)\n");
+        return;
+    }
+    GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n", (long long) timeout_ms,
+                  (long long) watchdog_poll_ms);
+    g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
+    g_watchdog_active.store(true, std::memory_order_release);
+    g_watchdog_thread = std::thread(watchdog_thread_fn, timeout_ms);
 }
 
 void ggml_sycl_watchdog_stop() {
-    g_watchdog_active.store(false, std::memory_order_release);
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(g_watchdog_thread_mutex);
+        g_watchdog_active.store(false, std::memory_order_release);
+        if (g_watchdog_thread.joinable()) {
+            worker = std::move(g_watchdog_thread);
+        }
+    }
+    if (worker.joinable()) {
+        worker.join();
+    }
 }
 
 bool ggml_sycl_device_is_host_unified(const sycl::device & dev) {

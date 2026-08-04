@@ -417,6 +417,12 @@ checks = {
     and "lifecycle_find_candidate_placement_plan(effect.owner.load.value)" in cache_cpp,
     "direct cache tests link lifecycle authority":
         (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text().count("model-lifecycle.cpp") >= 6,
+    "DL unload drains module state before dlclose": "ggml_backend_shutdown" in
+        (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "ggml_backend_sycl_shutdown" in backend
+    and "g_watchdog_thread.detach()" not in (root / "ggml/src/ggml-sycl/common.cpp").read_text()
+    and "final module unload with shutdown hook" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "DL SYCL module has private CPU traits and no CPU linkage":
         re.search(r"if \(NOT GGML_BACKEND_DL\).*?target_link_libraries\(ggml-sycl PRIVATE ggml-cpu\).*?endif",
                   (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(), re.S)
