@@ -307,15 +307,32 @@ struct ggml_backend_registry {
                 }
                 needs_reactivation = known != backends.end();
             }
+            using prepare_reactivate_fn = bool (*)();
+            using settle_reactivate_fn = void (*)();
+            prepare_reactivate_fn prepare_reactivate = nullptr;
+            settle_reactivate_fn commit_reactivate = nullptr;
+            settle_reactivate_fn rollback_reactivate = nullptr;
+            bool reactivation_prepared = false;
             if (needs_reactivation && reg->iface.get_proc_address) {
-                using reactivate_fn = void (*)();
-                auto reactivate = reinterpret_cast<reactivate_fn>(
-                    reg->iface.get_proc_address(reg, "ggml_backend_reactivate"));
-                if (reactivate) {
-                    reactivate();
+                prepare_reactivate = reinterpret_cast<prepare_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_prepare_reactivate"));
+                commit_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_commit_reactivate"));
+                rollback_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_rollback_reactivate"));
+                const bool any_hook = prepare_reactivate || commit_reactivate || rollback_reactivate;
+                if (any_hook && (!prepare_reactivate || !commit_reactivate || !rollback_reactivate ||
+                                 !prepare_reactivate())) {
+                    return false;
                 }
+                reactivation_prepared = any_hook;
             }
-            // Stage all plugin-owned metadata before taking the publication lock.
+            struct reactivation_rollback_guard {
+                settle_reactivate_fn rollback;
+                bool * prepared;
+                ~reactivation_rollback_guard() { if (*prepared && rollback) rollback(); }
+            } rollback_guard{ rollback_reactivate, &reactivation_prepared };
+            // Stage all plugin-owned metadata while mutation admission remains closed.
             const char * name = ggml_backend_reg_name(reg);
             size_t count = 0;
             if (!ggml_backend_reg_dev_count_unchecked(reg, &count)) {
@@ -335,31 +352,32 @@ struct ggml_backend_registry {
                 ggml_backend_reg_entry{ reg, std::move(handle), ggml_backend_reg_state::ACTIVE, dynamic, 0,
                                         std::move(module_path) });
 
-            std::lock_guard<std::mutex> lock(mutex);
-            auto existing = std::find_if(backends.begin(), backends.end(),
-                [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
-            if (existing != backends.end() && (*existing)->state != ggml_backend_reg_state::REMOVED) {
-                return false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto existing = std::find_if(backends.begin(), backends.end(),
+                    [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+                if (existing != backends.end() && (*existing)->state != ggml_backend_reg_state::REMOVED) {
+                    return false;
+                }
+                const bool is_new = existing == backends.end();
+                ggml_backend_reg_entry_ptr entry = is_new ? candidate : *existing;
+                backends.reserve(backends.size() + (is_new ? 1 : 0));
+                devices.reserve(devices.size() + staged_devices.size());
+                if (is_new) {
+                    backends.push_back(entry);
+                } else {
+                    devices.erase(std::remove_if(devices.begin(), devices.end(),
+                        [&](const ggml_backend_device_entry & item) { return item.owner == entry; }), devices.end());
+                    entry->handle = std::move(candidate->handle);
+                    entry->dynamic = candidate->dynamic;
+                    entry->module_path = std::move(candidate->module_path);
+                    entry->state = ggml_backend_reg_state::ACTIVE;
+                }
+                for (auto dev : staged_devices) devices.push_back({ dev, entry });
             }
-            // Capture identity before reserve: reserve may invalidate even the
-            // end iterator. No iterator into backends is used after this point.
-            const bool is_new = existing == backends.end();
-            ggml_backend_reg_entry_ptr entry = is_new ? candidate : *existing;
-            // Every potentially-throwing allocation precedes state/vector mutation.
-            backends.reserve(backends.size() + (is_new ? 1 : 0));
-            devices.reserve(devices.size() + staged_devices.size());
-            if (is_new) {
-                backends.push_back(entry);
-            } else {
-                devices.erase(std::remove_if(devices.begin(), devices.end(),
-                    [&](const ggml_backend_device_entry & item) { return item.owner == entry; }), devices.end());
-                entry->handle = std::move(candidate->handle);
-                entry->dynamic = candidate->dynamic;
-                entry->module_path = std::move(candidate->module_path);
-                entry->state = ggml_backend_reg_state::ACTIVE;
-            }
-            for (auto dev : staged_devices) {
-                devices.push_back({ dev, entry });
+            if (reactivation_prepared) {
+                commit_reactivate();
+                reactivation_prepared = false;
             }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);

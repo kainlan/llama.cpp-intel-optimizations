@@ -16,6 +16,59 @@ cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 sycl_cmake = (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
 sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
+
+def function_has_guard(source, name, guard):
+    pattern = re.compile(r"(?:^|\n)[^\n;]*\b" + re.escape(name) + r"\s*\([^;]*?\)\s*(?:try\s*)?\{", re.S)
+    return any(guard in source[m.end():m.end() + 500] for m in pattern.finditer(source))
+
+def function_has_module_guard(source, name):
+    return function_has_guard(source, name, "sycl_module_mutation_guard")
+
+saveable_mutating_procs = {
+    "ggml_backend_split_buffer_type": "ggml_backend_sycl_split_buffer_type",
+    "ggml_backend_tp_buffer_type": "ggml_backend_sycl_tp_buffer_type",
+    "ggml_backend_sycl_kv_buffer_type_from_dev": "ggml_backend_sycl_kv_buffer_type_from_dev",
+    "ggml_backend_sycl_push_kv_layer_mask_from_dev": "ggml_backend_sycl_push_kv_layer_mask_from_dev",
+    "ggml_backend_sycl_host_compute_buffer_type": "ggml_backend_sycl_host_compute_buffer_type",
+    "ggml_backend_sycl_cpu_offload_compute_buffer_type": "ggml_backend_sycl_cpu_offload_compute_buffer_type",
+    "ggml_backend_sycl_host_buffer_type": "ggml_backend_sycl_host_buffer_type",
+    "ggml_backend_sycl_host_buffer_type_for_device": "ggml_backend_sycl_host_buffer_type_for_device",
+    "ggml_backend_sycl_register_host_weight_tensor": "ggml_backend_sycl_register_host_weight_tensor",
+    "ggml_backend_sycl_register_weight_identity": "ggml_backend_sycl_register_weight_identity",
+    "ggml_backend_sycl_register_weight_usage": "ggml_backend_sycl_register_weight_usage",
+    "ggml_backend_sycl_try_register_weight_usage": "ggml_backend_sycl_try_register_weight_usage",
+    "ggml_backend_sycl_stage_inventory_plan": "ggml_backend_sycl_stage_inventory_plan",
+    "ggml_backend_sycl_model_load_begin": "ggml_backend_sycl_model_load_begin",
+    "ggml_backend_sycl_model_load_enter_nested": "ggml_backend_sycl_model_load_enter_nested",
+    "ggml_backend_sycl_model_load_end": "ggml_backend_sycl_model_load_end",
+    "ggml_backend_sycl_activate_model_plan": "ggml_backend_sycl_activate_model_plan",
+    "ggml_backend_sycl_set_runtime_context_for_model": "ggml_backend_sycl_set_runtime_context_for_model",
+    "ggml_backend_sycl_model_unloaded_token": "ggml_backend_sycl_model_unloaded_token",
+    "ggml_backend_sycl_model_quarantine_token": "ggml_backend_sycl_model_quarantine_token",
+    "ggml_backend_sycl_test_seed_moe_module_state": "ggml_backend_sycl_test_seed_moe_module_state",
+    "ggml_backend_sycl_test_allocate_predictor_scores": "ggml_backend_sycl_test_allocate_predictor_scores",
+    "ggml_backend_sycl_test_hold_live_update": "ggml_backend_sycl_test_hold_live_update",
+    "ggml_backend_sycl_test_release_live_update": "ggml_backend_sycl_test_release_live_update",
+    "ggml_backend_sycl_test_fail_next_backend_publish": "ggml_backend_sycl_test_fail_next_backend_publish",
+    "ggml_backend_sycl_test_fail_next_candidate_binding_allocation": "ggml_backend_sycl_test_fail_next_candidate_binding_allocation",
+    "ggml_backend_sycl_test_block_next_candidate_binding_allocation": "ggml_backend_sycl_test_block_next_candidate_binding_allocation",
+    "ggml_backend_sycl_test_release_candidate_binding_failure": "ggml_backend_sycl_test_release_candidate_binding_failure",
+    "ggml_backend_sycl_test_fail_next_arena_free": "ggml_backend_sycl_test_fail_next_arena_free_guarded",
+    "ggml_backend_sycl_test_fail_next_shutdown_clean": "ggml_backend_sycl_test_fail_next_shutdown_clean_guarded",
+    "ggml_backend_sycl_test_fail_next_registry_stage": "ggml_backend_sycl_test_fail_next_registry_stage",
+    "ggml_backend_sycl_test_block_next_kv_push": "ggml_backend_sycl_test_block_next_kv_push",
+}
+module_proc_inventory_ok = all(
+    ('strcmp(name, "' + proc + '")') in backend and function_has_module_guard(backend, function)
+    for proc, function in saveable_mutating_procs.items()
+)
+buft_callback_inventory = [
+    "ggml_backend_buft_name", "ggml_backend_buft_alloc_buffer", "ggml_backend_buft_get_alignment",
+    "ggml_backend_buft_get_max_size", "ggml_backend_buft_get_alloc_size", "ggml_backend_buft_is_host",
+    "ggml_backend_buft_get_caps",
+]
+buft_callback_inventory_ok = all(function_has_guard(backend_base, name, "device_call_guard")
+                                  for name in buft_callback_inventory)
 placement_paths = sorted(
     [root / "ggml/include/ggml-sycl.h"]
     + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
@@ -561,7 +614,7 @@ checks = {
     and "device->reg != reg" not in registry_backend
     and registry_backend.index("const bool is_new = existing == backends.end()")
         < registry_backend.index("backends.reserve(backends.size() + (is_new ? 1 : 0))")
-    and "No iterator into backends is used after this point" in registry_backend
+    and "reactivation_rollback_guard" in registry_backend
     and "builtin_init_state::INITIALIZING && builtin_owner == std::this_thread::get_id()" in registry_backend
     and "reg.register_builtin_backends();" in registry_backend
     and "generic registry tombstone/failure fixture" in
@@ -573,7 +626,7 @@ checks = {
     and "ggml_backend_registry_begin_call(reg)" not in backend_base
     and "ggml_backend_set_registry_lifecycle(&lifecycle_iface)" in registry_backend,
     "callbacks outside registry lock": "mutable std::mutex" in registry_backend
-    and "Stage all plugin-owned metadata before taking the publication lock" in registry_backend
+    and "Stage all plugin-owned metadata while mutation admission remains closed" in registry_backend
     and "Resolver is plugin code too" in registry_backend
     and "active_calls" in registry_backend
     and "cv.wait(lock, [&] { return unloading->active_calls == 0; })" in registry_backend
@@ -627,7 +680,7 @@ checks = {
     "explicit cache ownership drain": "shutdown_shared_context_queues();" in cache_cpp
     and "g_live_arena_chunks.fetch_sub" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in cache_cpp
-    and "explicit shutdown retained cache/arena/queue ownership" in cache_cpp
+    and "explicit shutdown postcondition failed; retaining owners for retry" in cache_cpp
     and "arena chunk remained registered after unregister" in cache_cpp
     and "Destroyed %zu chunk(s), released %.1f MB" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in backend,
@@ -652,15 +705,26 @@ checks = {
     and "ggml_backend_complete_unload" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "const auto settle_state" in registry_backend,
+    "exhaustive saveable mutation and buffer callback admission": module_proc_inventory_ok
+    and buft_callback_inventory_ok
+    and "sycl_module_admission_state::RETRY_CLOSED" in backend
+    and "g_sycl_module_admission_cv.wait" in backend
+    and "ggml_backend_prepare_reactivate" in backend
+    and "ggml_backend_commit_reactivate" in backend
+    and "ggml_backend_rollback_reactivate" in backend,
     "completion, callback, arena retry and renamed DSO coverage": "shutdown_completed_" in hpp
-    and "g_sycl_module_inactive.store(true, std::memory_order_release)" in backend
-    and backend.count("if (!ggml_sycl_mutation_admitted())") >= 8
     and "complete_shutdown()" in backend
-    and "ggml_backend_reactivate" in backend
+    and "ggml_backend_commit_reactivate" in backend
     and "device_call_guard" in (root / "ggml/src/ggml-backend.cpp").read_text()
-    and "deterministic arena-free failure" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "failure-window saved model-load procedure" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "saved buffer-type path allocated after completed unload" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "reactivation staging failure published or reopened module" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "count/get census registered for every configuration": "add_test(NAME test-backend-count-get-null-census" in
+        (root / "tests/CMakeLists.txt").read_text(),
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()

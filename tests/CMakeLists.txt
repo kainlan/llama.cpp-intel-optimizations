@@ -375,6 +375,10 @@ if (LLAMA_SYCL_G1_STRICT AND NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires a Python 3 interpreter")
 endif()
 if (Python3_Interpreter_FOUND)
+    add_test(NAME test-backend-count-get-null-census
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
+    set_tests_properties(test-backend-count-get-null-census PROPERTIES
+        LABELS "backend;lifecycle;source;host" TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES

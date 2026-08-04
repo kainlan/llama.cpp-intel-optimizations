@@ -42,7 +42,7 @@ struct device_call_guard {
     bool               admitted;
     explicit device_call_guard(ggml_backend_dev_t dev) : device(dev), end(nullptr), admitted(false) {
         const auto begin = g_device_begin.load(std::memory_order_acquire);
-        admitted = !begin || begin(device);
+        admitted = !device || !begin || begin(device);
         end = begin && admitted ? g_device_end.load(std::memory_order_acquire) : nullptr;
     }
     ~device_call_guard() { if (end) end(device); }
@@ -70,13 +70,15 @@ static std::unordered_set<ggml_backend_buffer_t> g_backend_buffer_registry;
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
-    return buft->iface.get_name(buft);
+    device_call_guard guard(buft->device);
+    return guard ? buft->iface.get_name(buft) : nullptr;
 }
 
 ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     GGML_ASSERT(buft);
+    device_call_guard guard(buft->device);
+    if (!guard) return nullptr;
     if (size == 0) {
-        // return a dummy buffer for zero-sized allocations
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
     }
     return buft->iface.alloc_buffer(buft, size);
@@ -84,11 +86,14 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t 
 
 size_t ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
-    return buft->iface.get_alignment(buft);
+    device_call_guard guard(buft->device);
+    return guard ? buft->iface.get_alignment(buft) : 0;
 }
 
 size_t ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
+    device_call_guard guard(buft->device);
+    if (!guard) return 0;
     // get_max_size is optional, defaults to SIZE_MAX
     if (buft->iface.get_max_size) {
         return buft->iface.get_max_size(buft);
@@ -98,6 +103,8 @@ size_t ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 
 size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     GGML_ASSERT(buft);
+    device_call_guard guard(buft->device);
+    if (!guard) return 0;
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
@@ -109,6 +116,8 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
 
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
+    device_call_guard guard(buft->device);
+    if (!guard) return false;
     if (buft->iface.is_host) {
         return buft->iface.is_host(buft);
     }
@@ -122,6 +131,8 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 uint32_t ggml_backend_buft_get_caps(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
+    device_call_guard guard(buft->device);
+    if (!guard) return 0;
     if (buft->iface.get_caps) {
         return buft->iface.get_caps(buft);
     }

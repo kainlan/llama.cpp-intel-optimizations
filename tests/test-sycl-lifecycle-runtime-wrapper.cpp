@@ -223,33 +223,88 @@ int main() {
     const size_t measured_cache_drop = free_before_cache - free_with_cache;
     auto saved_model_load_begin = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_begin)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
-    if (!saved_model_load_begin) {
-        std::fprintf(stderr, "missing saved model-load admission procedure\n");
+    auto saved_host_compute = reinterpret_cast<decltype(&ggml_backend_sycl_host_compute_buffer_type)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_compute_buffer_type"));
+    auto saved_push_kv = reinterpret_cast<decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_push_kv_layer_mask_from_dev"));
+    auto saved_dev = ggml_backend_reg_dev_get(reg, 0);
+    auto saved_buft = saved_host_compute ? saved_host_compute(0) : nullptr;
+    if (!saved_model_load_begin || !saved_host_compute || !saved_push_kv || !saved_dev || !saved_buft) {
+        std::fprintf(stderr, "missing saved mutation/buffer procedures\n");
         return 1;
     }
     auto fail_next_arena_free = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_arena_free"));
-    if (!fail_next_arena_free) {
-        std::fprintf(stderr, "missing deterministic arena-free failure procedure\n");
+    auto fail_next_shutdown_clean = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_shutdown_clean"));
+    auto fail_next_registry_stage = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_registry_stage"));
+    auto block_next_kv_push = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_block_next_kv_push"));
+    auto wait_kv_push_blocked = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_wait_kv_push_blocked"));
+    auto release_kv_push = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_release_kv_push"));
+    if (!fail_next_arena_free || !fail_next_shutdown_clean || !fail_next_registry_stage || !block_next_kv_push ||
+        !wait_kv_push_blocked || !release_kv_push) {
+        std::fprintf(stderr, "missing deterministic unload/admission procedures\n");
         return 1;
     }
     seed_moe_state();
-    phase("initial module unload with deterministic arena-free failure");
+    phase("initial module unload drains saved KV mutation and preserves failure closure");
     shutdown = nullptr;
     fail_next_arena_free();
-    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+    fail_next_shutdown_clean();
+    fail_next_registry_stage();
+    block_next_kv_push();
+    const uint8_t test_kv_mask = 1;
+    auto blocked_push = std::async(std::launch::async, [&] { saved_push_kv(saved_dev, &test_kv_mask, 1); });
+    wait_kv_push_blocked();
+    auto draining_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
+    if (draining_unload.wait_for(std::chrono::milliseconds(100)) != std::future_status::timeout) {
+        std::fprintf(stderr, "unload did not drain saved KV mutation\n");
+        release_kv_push();
+        return 1;
+    }
+    release_kv_push();
+    blocked_push.get();
+    if (draining_unload.get() != GGML_BACKEND_UNLOAD_BUSY) {
         std::fprintf(stderr, "arena free failure did not fail unload transactionally\n");
         return 1;
     }
-    phase("retry module unload after retained arena owner");
+    ggml_sycl_load_txn stale_txn{};
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+        std::fprintf(stderr, "failure-window saved model-load procedure reopened admission\n");
+        return 1;
+    }
+    phase("retry module unload detects shutdown-clean failure");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "shutdown clean=false did not retain owners transactionally\n");
+        return 1;
+    }
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+        std::fprintf(stderr, "clean-failure window reopened saved mutation admission\n");
+        return 1;
+    }
+    phase("final retry module unload after retained owners");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
-        std::fprintf(stderr, "arena owner retry did not complete unload\n");
+        std::fprintf(stderr, "retained owner retry did not complete unload\n");
         return 1;
     }
     reg = nullptr;
-    ggml_sycl_load_txn stale_txn{};
     if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
         std::fprintf(stderr, "saved model-load procedure admitted after completed unload\n");
+        return 1;
+    }
+    if (saved_host_compute(0) != nullptr || ggml_backend_buft_alloc_buffer(saved_buft, 64) != nullptr) {
+        std::fprintf(stderr, "saved buffer-type path allocated after completed unload\n");
+        return 1;
+    }
+    phase("module reload staging failure remains closed and removed");
+    if (ggml_backend_load(GGML_SYCL_RUNTIME_MODULE) != nullptr ||
+        saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY ||
+        ggml_backend_reg_by_name("SYCL") != nullptr) {
+        std::fprintf(stderr, "reactivation staging failure published or reopened module\n");
         return 1;
     }
     phase("module reload");

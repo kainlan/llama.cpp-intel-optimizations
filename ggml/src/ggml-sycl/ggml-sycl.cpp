@@ -9362,13 +9362,36 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
 }
 
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
-// TU-local so NODELETE cannot route completion and saved mutation procedures
-// through different interposed Registry symbols. Only loader reactivation opens it.
-static std::atomic<bool> g_sycl_module_inactive{ false };
+// Non-interposable module admission for every saveable mutating/allocating
+// procedure. RETRY_CLOSED permits only the generic loader's hidden-failure retry.
+enum class sycl_module_admission_state { ACTIVE, RETRY_CLOSED, COMPLETE_CLOSED, PREPARING };
+static std::mutex                    g_sycl_module_admission_mutex;
+static std::condition_variable       g_sycl_module_admission_cv;
+static sycl_module_admission_state   g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+static size_t                        g_sycl_module_mutations = 0;
 
-static bool ggml_sycl_mutation_admitted() noexcept {
-    return !g_sycl_module_inactive.load(std::memory_order_acquire);
-}
+class sycl_module_mutation_guard {
+  public:
+    sycl_module_mutation_guard() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+            if (g_sycl_module_admission == sycl_module_admission_state::ACTIVE &&
+                g_sycl_module_mutations != SIZE_MAX) {
+                ++g_sycl_module_mutations;
+                active_ = true;
+            }
+        } catch (...) {}
+    }
+    ~sycl_module_mutation_guard() {
+        if (!active_) return;
+        std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+        --g_sycl_module_mutations;
+        g_sycl_module_admission_cv.notify_all();
+    }
+    explicit operator bool() const noexcept { return active_; }
+  private:
+    bool active_ = false;
+};
 
 static bool ggml_sycl_quarantine_enqueue(ggml_sycl_model_token token) noexcept {
     return g_sycl_quarantine_queue.enqueue(ggml_sycl_cpp_token(token));
@@ -9381,7 +9404,8 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
@@ -9417,7 +9441,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_model_token token) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
         const auto owner = ggml_sycl_cpp_token(token);
         if (owner.model.value == 0 || owner.load.value == 0 ||
@@ -9677,7 +9702,8 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!txn) {
         return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
     }
@@ -9725,6 +9751,8 @@ static std::mutex                                                g_test_live_upd
 static std::optional<ggml_sycl::lifecycle::live_update_guard>   g_test_live_update_guard;
 
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return false;
     std::lock_guard<std::mutex> lock(g_test_live_update_mutex);
     if (g_test_live_update_guard) {
         return false;
@@ -9738,15 +9766,21 @@ extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token mo
 }
 
 extern "C" void ggml_backend_sycl_test_release_live_update() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     std::lock_guard<std::mutex> lock(g_test_live_update_mutex);
     g_test_live_update_guard.reset();
 }
 
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     ggml_sycl::lifecycle::global_registry().test_fail_next_candidate_binding_allocation();
 }
 
 extern "C" void ggml_backend_sycl_test_block_next_candidate_binding_allocation() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     ggml_sycl::lifecycle::global_registry().test_block_next_candidate_binding_allocation();
 }
 
@@ -9755,11 +9789,14 @@ extern "C" void ggml_backend_sycl_test_wait_for_candidate_binding_failure() {
 }
 
 extern "C" void ggml_backend_sycl_test_release_candidate_binding_failure() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     ggml_sycl::lifecycle::global_registry().test_release_candidate_binding_failure();
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry * registry         = nullptr;
     bool                             candidate_pushed = false;
     bool                             depth_entered    = false;
@@ -9858,7 +9895,8 @@ class ggml_sycl_load_candidate_end_scope {
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
     ggml_sycl::lifecycle::finish_ticket ticket;
     bool                                placement_inserted = false;
@@ -10049,10 +10087,41 @@ static ggml_backend_dev_t ggml_sycl_backend_dev_from_device_id(int device_id) {
 
 static std::mutex                       g_pending_kv_layer_masks_mutex;
 static std::deque<std::vector<uint8_t>> g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES];
+static std::mutex                       g_test_kv_push_mutex;
+static std::condition_variable          g_test_kv_push_cv;
+static bool                             g_test_block_next_kv_push = false;
+static bool                             g_test_kv_push_blocked = false;
+
+static void ggml_backend_sycl_test_block_next_kv_push() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
+    std::lock_guard<std::mutex> lock(g_test_kv_push_mutex);
+    g_test_block_next_kv_push = true;
+    g_test_kv_push_blocked = false;
+}
+static void ggml_backend_sycl_test_wait_kv_push_blocked() {
+    std::unique_lock<std::mutex> lock(g_test_kv_push_mutex);
+    g_test_kv_push_cv.wait(lock, [] { return g_test_kv_push_blocked; });
+}
+static void ggml_backend_sycl_test_release_kv_push() {
+    std::lock_guard<std::mutex> lock(g_test_kv_push_mutex);
+    g_test_block_next_kv_push = false;
+    g_test_kv_push_cv.notify_all();
+}
 
 void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
                                                    const uint8_t *    layer_mask,
                                                    uint32_t           layer_count) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
+    {
+        std::unique_lock<std::mutex> lock(g_test_kv_push_mutex);
+        if (g_test_block_next_kv_push) {
+            g_test_kv_push_blocked = true;
+            g_test_kv_push_cv.notify_all();
+            g_test_kv_push_cv.wait(lock, [] { return !g_test_block_next_kv_push; });
+        }
+    }
     const int device = ggml_sycl_device_id_from_backend_dev(dev);
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || layer_mask == nullptr || layer_count == 0) {
         return;
@@ -10188,6 +10257,8 @@ void ggml_backend_sycl_set_onednn_pack_m(ggml_tensor * tensor, int64_t pack_m) {
 }
 
 void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_tensor * tensor) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     if (!dev || !tensor) {
         return;
     }
@@ -10282,6 +10353,8 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
                                                 size_t              file_offs,
                                                 size_t              tensor_nbytes,
                                                 uint64_t            model_id) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     if (tensor == nullptr) {
         return;
     }
@@ -10351,6 +10424,8 @@ static tensor_usage ggml_sycl_usage_from_api(ggml_backend_sycl_tensor_usage usag
 }
 
 bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return false;
     try {
         if (tensor_name == nullptr || tensor_name[0] == '\0') {
             return false;
@@ -10388,6 +10463,8 @@ bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_
 }
 
 void ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     (void) ggml_backend_sycl_try_register_weight_usage(tensor_name, usage);
 }
 
@@ -10707,7 +10784,8 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
         const ggml_sycl::lifecycle::ModelToken token{
             { model.model_id },
@@ -11587,7 +11665,8 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
                                                                   bool                                 early) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -11721,7 +11800,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            uint32_t              n_ctx,
                                                                            uint32_t              n_ubatch,
                                                                            uint32_t              n_seq_max) {
-    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!backend || !backend->context || n_ctx == 0) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -30530,6 +30610,8 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
 };
 
 ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     static std::mutex           mutex;
     std::lock_guard<std::mutex> lock(mutex);
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type\n");
@@ -31313,6 +31395,8 @@ static ggml_backend_buffer_type_t get_tp_buffer_type_for_device(int main_device)
 
 // This function matches the ggml_backend_tp_buffer_type_t signature
 ggml_backend_buffer_type_t ggml_backend_sycl_tp_buffer_type(int n_devices, const int * device_ids) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     // Initialize TP system if not already initialized
     static bool       tp_initialized = false;
     static std::mutex init_mutex;
@@ -32867,6 +32951,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_host_buffer_type\n");
     static struct ggml_backend_buffer_type ggml_backend_sycl_buffer_type_host = {
 
@@ -32887,6 +32973,8 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     if (!dev || ggml_backend_dev_backend_reg(dev) != ggml_backend_sycl_reg()) {
         return nullptr;
     }
@@ -33023,6 +33111,8 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_ty
 };
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     static std::mutex           mutex;
     std::lock_guard<std::mutex> lock(mutex);
     auto                        dev_count = ggml_backend_sycl_get_device_count();
@@ -33133,6 +33223,8 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_cpu_offload_compute_bu
 };
 
 ggml_backend_buffer_type_t ggml_backend_sycl_cpu_offload_compute_buffer_type(int device) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     static std::mutex           mutex;
     std::lock_guard<std::mutex> lock(mutex);
     auto                        dev_count = ggml_backend_sycl_get_device_count();
@@ -95086,6 +95178,8 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_device_get_host_buffer_type(
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backend_dev_t dev) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     if (!dev || ggml_backend_dev_backend_reg(dev) != ggml_backend_sycl_reg()) {
         return dev ? ggml_backend_dev_buffer_type(dev) : nullptr;
     }
@@ -96103,25 +96197,65 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 };
 
 bool ggml_backend_sycl_can_unload(void) {
-    return ggml_sycl_mutation_admitted() &&
-           ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK;
+    bool newly_closed = false;
+    {
+        std::unique_lock<std::mutex> lock(g_sycl_module_admission_mutex);
+        if (g_sycl_module_admission == sycl_module_admission_state::ACTIVE) {
+            g_sycl_module_admission = sycl_module_admission_state::RETRY_CLOSED;
+            newly_closed = true;
+        } else if (g_sycl_module_admission != sycl_module_admission_state::RETRY_CLOSED) {
+            return false;
+        }
+        g_sycl_module_admission_cv.wait(lock, [] { return g_sycl_module_mutations == 0; });
+    }
+    if (ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK) {
+        return true;
+    }
+    if (newly_closed) {
+        std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+        g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+    }
+    return false;
 }
 
 void ggml_backend_sycl_cancel_unload(void) {
+    // Cancellation after shutdown began is retryable, not active: saved raw
+    // procedures remain closed while the hidden registry entry is retried.
     ggml_sycl::lifecycle::global_registry().cancel_shutdown();
 }
 
 void ggml_backend_sycl_complete_unload(void) {
-    // Close the non-interposable admission gate before releasing the shutdown
-    // reservation. Saved DSO procedure pointers must fail from this point on.
-    g_sycl_module_inactive.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    g_sycl_module_admission = sycl_module_admission_state::COMPLETE_CLOSED;
     ggml_sycl::lifecycle::global_registry().complete_shutdown();
 }
 
-void ggml_backend_sycl_reactivate(void) {
+static sycl_module_admission_state g_sycl_reactivation_previous =
+    sycl_module_admission_state::COMPLETE_CLOSED;
+
+bool ggml_backend_sycl_prepare_reactivate(void) {
+    std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    if (g_sycl_module_admission != sycl_module_admission_state::RETRY_CLOSED &&
+        g_sycl_module_admission != sycl_module_admission_state::COMPLETE_CLOSED) {
+        return false;
+    }
+    g_sycl_reactivation_previous = g_sycl_module_admission;
+    g_sycl_module_admission = sycl_module_admission_state::PREPARING;
+    return true;
+}
+
+void ggml_backend_sycl_commit_reactivate(void) {
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
-    g_sycl_module_inactive.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+}
+
+void ggml_backend_sycl_rollback_reactivate(void) {
+    std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    if (g_sycl_module_admission == sycl_module_admission_state::PREPARING) {
+        g_sycl_module_admission = g_sycl_reactivation_previous;
+    }
 }
 
 static void ggml_sycl_reset_moe_module_state() {
@@ -96158,7 +96292,19 @@ static void ggml_sycl_reset_moe_module_state() {
     g_moe_bias_host_copies.clear();
 }
 
+static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) ggml_sycl::unified_cache_test_fail_next_arena_free();
+}
+
+static void ggml_backend_sycl_test_fail_next_shutdown_clean_guarded() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) ggml_sycl::unified_cache_test_fail_next_shutdown_clean();
+}
+
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     g_moe_hybrid_init_success[0].store(true, std::memory_order_relaxed);
     g_moe_hybrid_init_done.store(true, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(true, std::memory_order_relaxed);
@@ -96172,6 +96318,8 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
 }
 
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return false;
     if (ggml_sycl_info().device_count <= 0) {
         return false;
     }
@@ -96234,6 +96382,12 @@ void ggml_backend_sycl_shutdown(void) {
 struct ggml_backend_sycl_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
+static std::atomic<bool> g_test_fail_next_registry_stage{ false };
+
+static void ggml_backend_sycl_test_fail_next_registry_stage() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) g_test_fail_next_registry_stage.store(true, std::memory_order_release);
+}
 
 static const char * ggml_backend_sycl_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
@@ -96241,6 +96395,9 @@ static const char * ggml_backend_sycl_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_sycl_reg_get_device_count(ggml_backend_reg_t reg) {
+    if (g_test_fail_next_registry_stage.exchange(false, std::memory_order_acq_rel)) {
+        throw std::runtime_error("deterministic registry staging failure");
+    }
     ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *) reg->context;
     return ctx->devices.size();
 }
@@ -96269,7 +96426,13 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_sycl_get_device_memory;
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_arena_free") == 0) {
-        return (void *) ggml_sycl::unified_cache_test_fail_next_arena_free;
+        return (void *) ggml_backend_sycl_test_fail_next_arena_free_guarded;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_shutdown_clean") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_shutdown_clean_guarded;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_registry_stage") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_registry_stage;
     }
     if (strcmp(name, "ggml_backend_can_unload") == 0 || strcmp(name, "ggml_backend_sycl_can_unload") == 0) {
         return (void *) ggml_backend_sycl_can_unload;
@@ -96281,8 +96444,14 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_complete_unload") == 0) {
         return (void *) ggml_backend_sycl_complete_unload;
     }
-    if (strcmp(name, "ggml_backend_reactivate") == 0) {
-        return (void *) ggml_backend_sycl_reactivate;
+    if (strcmp(name, "ggml_backend_prepare_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_prepare_reactivate;
+    }
+    if (strcmp(name, "ggml_backend_commit_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_commit_reactivate;
+    }
+    if (strcmp(name, "ggml_backend_rollback_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_rollback_reactivate;
     }
     if (strcmp(name, "ggml_backend_shutdown") == 0 || strcmp(name, "ggml_backend_sycl_shutdown") == 0) {
         return (void *) ggml_backend_sycl_shutdown;
@@ -96292,6 +96461,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_push_kv_layer_mask_from_dev") == 0) {
         return (void *) ggml_backend_sycl_push_kv_layer_mask_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_block_next_kv_push") == 0) {
+        return (void *) ggml_backend_sycl_test_block_next_kv_push;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_wait_kv_push_blocked") == 0) {
+        return (void *) ggml_backend_sycl_test_wait_kv_push_blocked;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_release_kv_push") == 0) {
+        return (void *) ggml_backend_sycl_test_release_kv_push;
     }
     if (strcmp(name, "ggml_backend_sycl_host_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_host_compute_buffer_type;
@@ -96438,11 +96616,14 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
 static std::atomic<bool> g_test_fail_next_backend_publish{ false };
 
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
     g_test_fail_next_backend_publish.store(true, std::memory_order_release);
 }
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
-    if (!ggml_sycl_mutation_admitted()) return nullptr;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
     auto & lifecycle_registry = ggml_sycl::lifecycle::global_registry();
     if (!lifecycle_registry.acquire_backend_context()) {

@@ -547,6 +547,7 @@ static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 static std::atomic<bool>     g_test_fail_next_arena_free{ false };
+static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
 static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
@@ -12711,22 +12712,27 @@ bool shutdown_unified_cache() {
         g_cache_mode_locked.store(false, std::memory_order_release);
     }
     g_sycl_shutting_down.store(false, std::memory_order_release);
-    caches.clear();
+    // Keep the drained cache owners movable until every postcondition passes;
+    // a release-build failure restores them to the global map for retry.
     // Cache queues own the single-device contexts used for arena allocation.
     // Destroy them only after every cache destructor has freed its chunks; the
     // Level Zero runtime may retain large freed USM blocks until context release.
     shutdown_shared_context_queues();
-    const bool clean = unified_cache_shutdown_state_clean();
+    const bool clean = unified_cache_shutdown_state_clean() &&
+                       !g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel);
     if (!clean) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown retained cache/arena/queue ownership\n");
+        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown postcondition failed; retaining owners for retry\n");
+        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        caches.swap(g_device_caches);
+        return false;
     }
-    GGML_ASSERT(clean && "explicit unified cache shutdown retained owners");
+    caches.clear();
     // Any later static destructors must not re-enter SYCL after explicit DSO
     // shutdown. A freshly loaded module gets a fresh false-initialized flag.
     g_sycl_shutting_down.store(true, std::memory_order_release);
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Explicit shutdown drained and destroyed all device caches\n");
-    return true;
+    return clean;
 }
 
 // ============================================================================
@@ -15758,6 +15764,10 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
 
 void unified_cache_test_fail_next_arena_free() {
     g_test_fail_next_arena_free.store(true, std::memory_order_release);
+}
+
+void unified_cache_test_fail_next_shutdown_clean() {
+    g_test_fail_next_shutdown_clean.store(true, std::memory_order_release);
 }
 
 bool unified_cache::arena_destroy() {

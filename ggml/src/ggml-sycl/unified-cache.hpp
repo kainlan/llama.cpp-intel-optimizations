@@ -4244,6 +4244,7 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 bool shutdown_unified_cache();
 bool unified_cache_shutdown_state_clean() noexcept;
 void unified_cache_test_fail_next_arena_free();
+void unified_cache_test_fail_next_shutdown_clean();
 void prepare_unified_cache_for_module_use() noexcept;
 
 // Returns true if SYCL runtime teardown has begun (atexit handler fired).
