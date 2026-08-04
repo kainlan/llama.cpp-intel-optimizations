@@ -700,7 +700,7 @@ checks = {
     "explicit cache ownership drain": "shutdown_shared_context_queues();" in cache_cpp
     and "g_live_arena_chunks.fetch_sub" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in cache_cpp
-    and "explicit shutdown postcondition failed; retaining owners for retry" in cache_cpp
+    and "explicit shutdown postcondition failed after owner teardown" in cache_cpp
     and "arena chunk remained registered after unregister" in cache_cpp
     and "Destroyed %zu chunk(s), released %.1f MB" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in backend,
@@ -772,12 +772,18 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
-    "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_cpu_retained_cleanup();")
+    "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_cpu_retained_cleanup()")
         < backend.index("ggml_sycl::shutdown_unified_cache()")
-        and "offload_buffer_pool_trim(-1)" in backend
+        and "offload_buffer_pool_shutdown()" in backend
+        and backend.index("drain_retained_handles(true)", backend.index("void ggml_backend_sycl_shutdown"))
+            < backend.index("ggml_sycl_cpu_retained_cleanup()", backend.index("void ggml_backend_sycl_shutdown"))
         and "!ggml_sycl_cpu_retained_active()" in backend
         and "g_runtime_alloc_registry.empty()" in cache_cpp
-        and "g_offload_pool_slots.empty()" in cache_cpp,
+        and "g_offload_pool_slots.empty()" in cache_cpp
+        and "g_offload_pool_slots.clear()" in cache_cpp
+        and cache_cpp.index("caches.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
+            < cache_cpp.index("shutdown_shared_context_queues();", cache_cpp.index("bool shutdown_unified_cache()"))
+            < cache_cpp.index("unified_cache_shutdown_state_clean();", cache_cpp.index("bool shutdown_unified_cache()")),
     "preflight, bounded generic drain, hidden reactivation and score pin":
         registry_backend.index("reserved = can_unload()") < registry_backend.index("cv.wait_for(lock, active_call_drain_timeout")
         and "ggml_backend_reg_state::REACTIVATING" in registry_backend

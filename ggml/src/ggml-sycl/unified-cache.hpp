@@ -3512,6 +3512,7 @@ void unified_cache_deallocate(void * ptr, int device);
 bool acquire_offload_buffer(const offload_buffer_request & req, offload_buffer_lease * out);
 bool release_offload_buffer(const offload_buffer_lease & lease);
 void offload_buffer_pool_trim(int device = -1);
+bool offload_buffer_pool_shutdown();
 
 struct offload_stats_snapshot {
     uint64_t wait_count                                = 0;

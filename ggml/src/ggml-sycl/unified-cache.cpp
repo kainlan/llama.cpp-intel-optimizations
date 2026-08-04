@@ -10274,6 +10274,36 @@ void offload_buffer_pool_trim(int device) {
     }
 }
 
+bool offload_buffer_pool_shutdown() {
+    std::vector<offload_pool_slot> owners;
+    {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (const auto & [ptr, slot] : g_offload_pool_slots) {
+            (void) ptr;
+            if (slot.in_use) return false;
+            owners.push_back(slot);
+        }
+        // Drop both indexes atomically before releasing allocations: unified
+        // free may re-enter cache bookkeeping, but can no longer observe stale
+        // offload-pool ownership.
+        g_offload_pool_slots.clear();
+        g_offload_pool_free.clear();
+    }
+    std::vector<offload_pool_slot> failed;
+    for (const auto & owner : owners) {
+        if (!unified_free(owner.handle)) failed.push_back(owner);
+    }
+    if (!failed.empty()) {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (const auto & owner : failed) {
+            g_offload_pool_slots[owner.handle.ptr] = owner;
+            g_offload_pool_free[owner.key].push_back(owner.handle.ptr);
+        }
+        return false;
+    }
+    return true;
+}
+
 static size_t offload_buffer_pool_trim_host_zone(host_zone_id zone) {
     std::vector<alloc_handle> free_list;
     {
@@ -12720,19 +12750,25 @@ bool shutdown_unified_cache() {
     g_sycl_shutting_down.store(false, std::memory_order_release);
     // Keep the drained cache owners movable until every postcondition passes;
     // a release-build failure restores them to the global map for retry.
-    // Cache queues own the single-device contexts used for arena allocation.
-    // Destroy them only after every cache destructor has freed its chunks; the
-    // Level Zero runtime may retain large freed USM blocks until context release.
-    shutdown_shared_context_queues();
-    const bool clean = unified_cache_shutdown_state_clean() &&
-                       !g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel);
-    if (!clean) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown postcondition failed; retaining owners for retry\n");
+    // Preserve deterministic retry coverage before irreversible owner teardown.
+    if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic shutdown-clean failure; retaining owners for retry\n");
         std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
         caches.swap(g_device_caches);
         return false;
     }
+    // Cache destruction tears down host_arena_/pinned_chunk_pool while their
+    // SYCL queues and single-device contexts are still valid. Only after every
+    // cache destructor has released its chunks may those queues be destroyed.
     caches.clear();
+    shutdown_shared_context_queues();
+    // The clean postcondition is meaningful only after these final allocation
+    // owners are gone; otherwise a 2 GiB chunk can survive until DSO destruction.
+    const bool clean = unified_cache_shutdown_state_clean();
+    if (!clean) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown postcondition failed after owner teardown\n");
+        return false;
+    }
     // Any later static destructors must not re-enter SYCL after explicit DSO
     // shutdown. A freshly loaded module gets a fresh false-initialized flag.
     g_sycl_shutting_down.store(true, std::memory_order_release);

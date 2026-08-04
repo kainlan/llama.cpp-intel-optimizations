@@ -49,7 +49,7 @@ bool ggml_sycl_compute_fused_add_rms_norm(ggml_backend_sycl_context & ctx,
 // by keeping intermediate results in host scratch memory between
 // consecutive CPU-dispatched ops within a layer block.
 void   ggml_sycl_cpu_retained_init(int device, sycl::queue * gpu_q);
-void   ggml_sycl_cpu_retained_cleanup();
+bool   ggml_sycl_cpu_retained_cleanup();
 bool   ggml_sycl_cpu_retained_active();
 void * ggml_sycl_cpu_retained_alloc_output(const ggml_tensor * dst);
 void   ggml_sycl_cpu_retained_flush_all(int device, sycl::queue * gpu_q);

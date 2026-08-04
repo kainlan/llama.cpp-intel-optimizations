@@ -2073,20 +2073,25 @@ void ggml_sycl_cpu_retained_init(int device, sycl::queue * gpu_q) {
     g_retained_device = device;
 }
 
-void ggml_sycl_cpu_retained_cleanup() {
+bool ggml_sycl_cpu_retained_cleanup() {
     retained_wait_flush_event();
     cpu_wait_chain_event();
-    if (g_retained_scratch && g_retained_gpu_q) {
-        (void) ggml_sycl::release_offload_buffer(g_retained_scratch_lease);
-        g_retained_scratch       = nullptr;
-        g_retained_scratch_cap   = 0;
-        g_retained_scratch_lease = {};
+    if (g_retained_scratch_lease.valid &&
+        !ggml_sycl::release_offload_buffer(g_retained_scratch_lease)) {
+        return false;
     }
+    // Reset every scratch identity after its pool lease is returned. Do not
+    // predicate this on the queue pointer: shutdown may already have detached
+    // a queue while the durable offload lease remains live.
+    g_retained_scratch       = nullptr;
+    g_retained_scratch_cap   = 0;
+    g_retained_scratch_lease = {};
     g_retained_map.clear();
     scratch_reset();
     g_retained_active = false;
     g_retained_gpu_q  = nullptr;
     g_retained_device = -1;
+    return true;
 }
 
 bool ggml_sycl_cpu_retained_active() {

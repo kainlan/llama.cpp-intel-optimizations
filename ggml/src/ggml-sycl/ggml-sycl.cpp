@@ -96408,12 +96408,14 @@ void ggml_backend_sycl_shutdown(void) {
     split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();
-    // Retained CPU outputs own offload-pool leases backed by cache queues.
-    // Release them and trim all free pool slots before queue/cache destruction.
-    ggml_sycl_cpu_retained_cleanup();
-    ggml_sycl::offload_buffer_pool_trim(-1);
-    if (ggml_sycl_cpu_retained_active()) {
-        throw std::runtime_error("SYCL retained CPU state survived shutdown cleanup");
+    // Event-retained mem_handles and retained CPU outputs both own cache/pinned
+    // allocations. Drain events synchronously, return the scratch lease, then
+    // erase/free every offload-pool owner before queue or cache destruction.
+    ggml_sycl::release_graph_retained_handles();
+    ggml_sycl::drain_retained_handles(true);
+    if (!ggml_sycl_cpu_retained_cleanup() || !ggml_sycl::offload_buffer_pool_shutdown() ||
+        ggml_sycl_cpu_retained_active()) {
+        throw std::runtime_error("SYCL retained/offload state survived shutdown cleanup");
     }
     {
         std::lock_guard<std::mutex> queue_lock(g_pipeline_copy_queue_mutex);
