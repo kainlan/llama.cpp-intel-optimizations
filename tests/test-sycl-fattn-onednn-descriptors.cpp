@@ -129,11 +129,69 @@ template <typename T> static T * malloc_device_copy(sycl::queue & q, const std::
     if (!ptr) {
         return nullptr;
     }
-    q.memcpy(ptr, host.data(), host.size() * sizeof(T)).wait();
-    return ptr;
+    try {
+        q.memcpy(ptr, host.data(), host.size() * sizeof(T)).wait();
+        return ptr;
+    } catch (...) {
+        sycl::free(ptr, q);
+        throw;
+    }
 }
 
-static bool run_case(const case_shape & sh) {
+struct case_device_buffers {
+    sycl::queue & q;
+    sycl::half *  Q    = nullptr;
+    sycl::half *  K    = nullptr;
+    sycl::half *  V    = nullptr;
+    sycl::half *  mask = nullptr;
+    float *       out  = nullptr;
+
+    ~case_device_buffers() { release_noexcept(); }
+
+    void release() {
+        q.wait_and_throw();
+        free_all();
+    }
+
+  private:
+    void free_all() {
+        if (Q) {
+            sycl::free(Q, q);
+            Q = nullptr;
+        }
+        if (K) {
+            sycl::free(K, q);
+            K = nullptr;
+        }
+        if (V) {
+            sycl::free(V, q);
+            V = nullptr;
+        }
+        if (mask) {
+            sycl::free(mask, q);
+            mask = nullptr;
+        }
+        if (out) {
+            sycl::free(out, q);
+            out = nullptr;
+        }
+    }
+
+    void release_noexcept() noexcept {
+        try {
+            q.wait_and_throw();
+        } catch (...) {
+            // The original exception is reported by main; cleanup must continue.
+        }
+        try {
+            free_all();
+        } catch (...) {
+            // Never replace the test failure or an in-flight SYCL exception.
+        }
+    }
+};
+
+static bool run_case(ggml_backend_sycl_context & ctx, const case_shape & sh) {
     std::vector<sycl::half> Q((size_t) sh.H_q * sh.n_q * sh.D);
     std::vector<sycl::half> K((size_t) sh.H_kv * sh.n_kv * sh.k_stride, sycl::half(0.0f));
     std::vector<sycl::half> V((size_t) sh.H_kv * sh.n_kv * sh.v_stride, sycl::half(0.0f));
@@ -141,22 +199,22 @@ static bool run_case(const case_shape & sh) {
     fill_inputs(sh, Q, K, V, mask);
     const std::vector<float> expected = reference_sdpa(sh, Q, K, V, mask);
 
-    ggml_backend_sycl_context ctx(0);
-    sycl::queue *             q       = ctx.stream();
-    sycl::half *              q_dev   = malloc_device_copy(*q, Q);
-    sycl::half *              k_dev   = malloc_device_copy(*q, K);
-    sycl::half *              v_dev   = malloc_device_copy(*q, V);
-    sycl::half *              m_dev   = malloc_device_copy(*q, mask);
-    float *                   out_dev = sycl::malloc_device<float>(expected.size(), *q);
-    TEST_ASSERT(q_dev && k_dev && v_dev && m_dev && out_dev, "device allocation failed");
-    q->memset(out_dev, 0, expected.size() * sizeof(float)).wait();
+    sycl::queue *       q       = ctx.stream();
+    case_device_buffers buffers = { *q };
+    buffers.Q                   = malloc_device_copy(*q, Q);
+    buffers.K                   = malloc_device_copy(*q, K);
+    buffers.V                   = malloc_device_copy(*q, V);
+    buffers.mask                = malloc_device_copy(*q, mask);
+    buffers.out                 = sycl::malloc_device<float>(expected.size(), *q);
+    TEST_ASSERT(buffers.Q && buffers.K && buffers.V && buffers.mask && buffers.out, "device allocation failed");
+    q->memset(buffers.out, 0, expected.size() * sizeof(float)).wait();
 
     fattn_params params{};
-    params.Q         = reinterpret_cast<const char *>(q_dev);
-    params.K         = reinterpret_cast<const char *>(k_dev);
-    params.V         = reinterpret_cast<const char *>(v_dev);
-    params.mask      = reinterpret_cast<const char *>(m_dev);
-    params.dst       = out_dev;
+    params.Q         = reinterpret_cast<const char *>(buffers.Q);
+    params.K         = reinterpret_cast<const char *>(buffers.K);
+    params.V         = reinterpret_cast<const char *>(buffers.V);
+    params.mask      = reinterpret_cast<const char *>(buffers.mask);
+    params.dst       = buffers.out;
     params.Q_type    = GGML_TYPE_F16;
     params.K_type    = GGML_TYPE_F16;
     params.V_type    = GGML_TYPE_F16;
@@ -193,16 +251,12 @@ static bool run_case(const case_shape & sh) {
 
     std::vector<float> actual(expected.size(), 0.0f);
     if (executed) {
-        q->memcpy(actual.data(), out_dev, actual.size() * sizeof(float)).wait();
+        q->memcpy(actual.data(), buffers.out, actual.size() * sizeof(float)).wait();
     }
-
-    sycl::free(q_dev, *q);
-    sycl::free(k_dev, *q);
-    sycl::free(v_dev, *q);
-    sycl::free(m_dev, *q);
-    sycl::free(out_dev, *q);
+    buffers.release();
 
     TEST_ASSERT(executed, (std::string(sh.name) + " oneDNN dispatch did not execute").c_str());
+    TEST_ASSERT(!actual.empty(), (std::string(sh.name) + " produced an empty host result").c_str());
 
     float max_abs = 0.0f;
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -220,6 +274,9 @@ static bool run_case(const case_shape & sh) {
 }
 
 int main() {
+    // Keep progress/final markers deterministic even when CTest redirects output.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
@@ -243,10 +300,23 @@ int main() {
     }
 
     bool ok = true;
-    ok &= run_case({ "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16 });
-    ok &= run_case({ "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16 });
-    ok &= run_case({ "GQA-5D-materialized", 4, 2, 16, 8, 8, 19, 21 });
-    ok &= run_case({ "MQA-5D-materialized", 4, 1, 16, 8, 8, 19, 21 });
+    try {
+        // A backend owns one context for its whole lifetime. Reusing it also
+        // keeps oneDNN's compiled partitions, streams, and engines alive until
+        // every case has drained and released its per-case USM buffers.
+        ggml_backend_sycl_context ctx(0);
+        ok &= run_case(ctx, { "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16 });
+        ok &= run_case(ctx, { "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16 });
+        ok &= run_case(ctx, { "GQA-5D-materialized", 4, 2, 16, 8, 8, 19, 21 });
+        ok &= run_case(ctx, { "MQA-5D-materialized", 4, 1, 16, 8, 8, 19, 21 });
+        ctx.stream()->wait_and_throw();
+    } catch (const sycl::exception & e) {
+        std::fprintf(stderr, "FAIL: SYCL exception: %s\n", e.what());
+        ok = false;
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "FAIL: exception: %s\n", e.what());
+        ok = false;
+    }
     std::printf("SYCL oneDNN FA descriptor tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
