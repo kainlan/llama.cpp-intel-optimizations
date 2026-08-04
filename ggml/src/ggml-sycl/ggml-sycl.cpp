@@ -9794,9 +9794,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
+        ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
+        if (ticket.commit) {
+            finisher_effect = registry->acquire_finisher_effect(ticket);
+            if (!finisher_effect) {
+                throw std::bad_alloc();
+            }
+        }
         g_sycl_abort_load_exit = !ticket.commit;
         ggml_sycl_model_loading_effects(false, ticket.outer);
         g_sycl_abort_load_exit = false;
+        finisher_effect        = {};
         if (!ticket.commit) {
             ggml_sycl_abort_owner_effects(ticket.token);
             return ggml_sycl_lifecycle_c_result(registry->finalize_end(ticket, true).code);

@@ -145,6 +145,29 @@ struct load_effect_lease {
     explicit operator bool() const noexcept { return registry != nullptr && serial != 0; }
 };
 
+struct finisher_effect_scope {
+    error      code = error::NOT_FOUND;
+    ModelToken owner{};
+    uint64_t   serial   = 0;
+    Registry * registry = nullptr;
+
+    finisher_effect_scope() = default;
+
+    finisher_effect_scope(error code, ModelToken owner, uint64_t serial, Registry * registry) :
+        code(code),
+        owner(owner),
+        serial(serial),
+        registry(registry) {}
+
+    ~finisher_effect_scope();
+    finisher_effect_scope(const finisher_effect_scope &)             = delete;
+    finisher_effect_scope & operator=(const finisher_effect_scope &) = delete;
+    finisher_effect_scope(finisher_effect_scope && other) noexcept;
+    finisher_effect_scope & operator=(finisher_effect_scope && other) noexcept;
+
+    explicit operator bool() const noexcept { return registry != nullptr && serial != 0; }
+};
+
 struct live_update_ticket {
     error      code = error::NOT_FOUND;
     ModelToken token{};
@@ -233,7 +256,9 @@ class Registry {
 
     // Load effects are admitted only for the exact ACTIVE transaction. End
     // closes admission first and waits all move-only leases out before effects.
-    load_effect_lease acquire_load_effect(LoadTxnId txn) noexcept;
+    load_effect_lease     acquire_load_effect(LoadTxnId txn) noexcept;
+    finisher_effect_scope acquire_finisher_effect(const finish_ticket & ticket) noexcept;
+    ModelToken            bound_finisher_effect() noexcept;
 
     // prepare retains coordinator+slot in COMMITTING/ROLLING_BACK. Exactly one
     // caller receives finisher=true and performs effects without the lock.
@@ -289,6 +314,7 @@ class Registry {
         error                        finish_reason = error::OK;
         end_result                   terminal_result{};
         std::unordered_set<uint64_t> load_effect_serials;
+        std::unordered_set<uint64_t> finisher_effect_serials;
     };
 
     struct slot_state {
@@ -311,7 +337,9 @@ class Registry {
     void poison_active_locked();
     void remember_terminal_locked(uint64_t txn) noexcept;
     void release_load_effect(LoadTxnId txn, uint64_t serial) noexcept;
+    void release_finisher_effect(LoadTxnId txn, uint64_t serial) noexcept;
     friend struct load_effect_lease;
+    friend struct finisher_effect_scope;
 
     mutable std::mutex                        mutex_;
     std::condition_variable                   cv_;

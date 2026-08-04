@@ -64,6 +64,19 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto ended = r.finalize_end(ticket, true);
         require(ended.committed == commit, "drained end result mismatch");
         require(r.begin_outer().code == error::OK, "next load remained blocked after effect drain");
+    } else if (name == "finisher-effect-drain") {
+        Registry r;
+        auto     begin = r.begin_outer();
+        require(begin.code == error::OK, "finisher authority begin failed");
+        auto ticket = r.prepare_end(begin.txn, true);
+        auto scope  = r.acquire_finisher_effect(ticket);
+        require(scope && scope.owner == begin.token && r.bound_finisher_effect() == begin.token,
+                "finisher authority mismatch");
+        auto finalize = std::async(std::launch::async, [&] { return r.finalize_end(ticket, true); });
+        require(finalize.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+                "finalize did not wait for finisher scope");
+        scope = {};
+        require(finalize.get().committed, "finisher-scoped commit failed");
     } else if (name == "load-effect-allocation-failure") {
         Registry r;
         auto     begin = r.begin_outer();

@@ -12,6 +12,14 @@ struct candidate_binding {
 };
 
 thread_local std::vector<candidate_binding> candidate_bindings;
+
+struct finisher_binding {
+    Registry * registry = nullptr;
+    ModelToken owner{};
+    uint64_t   serial = 0;
+};
+
+thread_local std::vector<finisher_binding> finisher_bindings;
 }  // namespace
 
 load_effect_lease::~load_effect_lease() {
@@ -33,6 +41,36 @@ load_effect_lease & load_effect_lease::operator=(load_effect_lease && other) noe
     if (this != &other) {
         if (registry && serial != 0) {
             registry->release_load_effect(owner.load, serial);
+        }
+        code           = other.code;
+        owner          = other.owner;
+        serial         = other.serial;
+        registry       = other.registry;
+        other.serial   = 0;
+        other.registry = nullptr;
+    }
+    return *this;
+}
+
+finisher_effect_scope::~finisher_effect_scope() {
+    if (registry && serial != 0) {
+        registry->release_finisher_effect(owner.load, serial);
+    }
+}
+
+finisher_effect_scope::finisher_effect_scope(finisher_effect_scope && other) noexcept :
+    code(other.code),
+    owner(other.owner),
+    serial(other.serial),
+    registry(other.registry) {
+    other.serial   = 0;
+    other.registry = nullptr;
+}
+
+finisher_effect_scope & finisher_effect_scope::operator=(finisher_effect_scope && other) noexcept {
+    if (this != &other) {
+        if (registry && serial != 0) {
+            registry->release_finisher_effect(owner.load, serial);
         }
         code           = other.code;
         owner          = other.owner;
@@ -288,6 +326,67 @@ void Registry::release_load_effect(LoadTxnId id, uint64_t serial) noexcept {
     }
 }
 
+finisher_effect_scope Registry::acquire_finisher_effect(const finish_ticket & ticket) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = txns_.find(ticket.token.load.value);
+        if (!ticket.finisher || !ticket.commit || it == txns_.end() || active_txn_ != ticket.token.load.value ||
+            it->second.finish_serial != ticket.serial || it->second.phase != finish_phase::COMMITTING ||
+            !it->second.load_effect_serials.empty()) {
+            return { error::STALE_IDENTITY, {}, 0, nullptr };
+        }
+        uint64_t serial = next_effect_serial_++;
+        if (next_effect_serial_ == 0) {
+            next_effect_serial_ = 1;
+        }
+        it->second.finisher_effect_serials.insert(serial);
+        try {
+            finisher_bindings.push_back({ this, ticket.token, serial });
+        } catch (...) {
+            it->second.finisher_effect_serials.erase(serial);
+            throw;
+        }
+        return { error::OK, ticket.token, serial, this };
+    } catch (...) {
+        return { error::ALLOCATION_FAILED, {}, 0, nullptr };
+    }
+}
+
+ModelToken Registry::bound_finisher_effect() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = finisher_bindings.rbegin(); it != finisher_bindings.rend(); ++it) {
+            if (it->registry != this) {
+                continue;
+            }
+            auto txn = txns_.find(it->owner.load.value);
+            if (txn != txns_.end() && txn->second.phase == finish_phase::COMMITTING && txn->second.finish_serial != 0 &&
+                txn->second.finisher_effect_serials.count(it->serial) != 0) {
+                return it->owner;
+            }
+        }
+    } catch (...) {
+    }
+    return {};
+}
+
+void Registry::release_finisher_effect(LoadTxnId id, uint64_t serial) noexcept {
+    try {
+        for (auto it = finisher_bindings.rbegin(); it != finisher_bindings.rend(); ++it) {
+            if (it->registry == this && it->serial == serial) {
+                finisher_bindings.erase(std::next(it).base());
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        txn = txns_.find(id.value);
+        if (txn != txns_.end() && txn->second.finisher_effect_serials.erase(serial) != 0) {
+            cv_.notify_all();
+        }
+    } catch (...) {
+    }
+}
+
 end_probe Registry::probe_end(LoadTxnId id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -491,8 +590,8 @@ end_result Registry::finalize_end(const finish_ticket &             ticket,
                                   publication_data                  publication,
                                   std::shared_ptr<const ModelState> prepared_state) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto                        it = txns_.find(ticket.token.load.value);
+        std::unique_lock<std::mutex> lock(mutex_);
+        auto                         it = txns_.find(ticket.token.load.value);
         if (!ticket.finisher || it == txns_.end()) {
             return ticket.replay.token.model.value == 0 ? end_result{ error::WRONG_TRANSACTION } : ticket.replay;
         }
@@ -501,6 +600,7 @@ end_result Registry::finalize_end(const finish_ticket &             ticket,
             (txn.phase != finish_phase::COMMITTING && txn.phase != finish_phase::ROLLING_BACK)) {
             return { error::STALE_IDENTITY };
         }
+        cv_.wait(lock, [&txn] { return txn.finisher_effect_serials.empty(); });
 
         const bool poisoned_after_prepare = ticket.commit && txn.poisoned;
         if (poisoned_after_prepare && effects_ok) {

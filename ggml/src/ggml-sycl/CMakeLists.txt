@@ -216,6 +216,7 @@ if (BUILD_TESTING)
                   cache-effect-drain cache-effect-abort-drain
                   planning-effect-drain planning-effect-abort-drain
                   identity-effect-drain identity-effect-abort-drain load-effect-allocation-failure
+                  finisher-effect-drain
                   durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
                   latest-live-restoration busy-deferred-quarantine restore-failure-quarantine effect-failure-quarantine

@@ -356,6 +356,15 @@ checks = {
     and "candidate.value" not in backend
     and backend.count("if (!ggml_sycl_host_row_authorized(entry.second.owner))") >= 2
     and "if (!ggml_sycl_host_row_authorized(it->second.owner))" in backend,
+    "finisher effects authorize synchronous preload": "struct finisher_effect_scope" in hpp
+    and "acquire_finisher_effect(ticket)" in backend
+    and "bound_finisher_effect()" in cache_cpp
+    and "finisher_effect_serials.empty()" in cpp
+    and "finisher-effect-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
+    "host cache registration uses exact guard":
+        cache_cpp.count("void unified_cache::register_host_") >= 2
+    and cache_cpp.count("stamp_pending_owner(old->second, load_effect_guard)") >= 2
+    and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
