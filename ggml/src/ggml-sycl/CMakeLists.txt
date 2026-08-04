@@ -203,7 +203,9 @@ if (BUILD_TESTING)
         target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-device-uuid-api ggml-sycl)
     else()
-        target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml-sycl ggml-cpu)
+        # The static fixture calls registry/device APIs implemented by ggml-base
+        # directly; do not rely on transitive DSO linkage from ggml-sycl.
+        target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml-base ggml-sycl ggml-cpu)
     endif()
     set_target_properties(test-sycl-device-uuid-api PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

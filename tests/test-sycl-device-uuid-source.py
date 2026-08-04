@@ -36,6 +36,14 @@ def test_uuid_extension_guard_matches_dpct_helper() -> None:
     assert "sycl::aspect::ext_intel_device_info_uuid" in BACKEND[begin:end]
 
 
+def test_uuid_fixture_links_direct_core_symbols_explicitly() -> None:
+    begin = CMAKE.index("add_executable(test-sycl-device-uuid-api")
+    end = CMAKE.index("add_test(NAME sycl-device-uuid-api", begin)
+    fixture = CMAKE[begin:end]
+    assert "target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml-base ggml-sycl ggml-cpu)" in fixture
+    assert "target_link_libraries(test-sycl-device-uuid-api PRIVATE ggml ${CMAKE_DL_LIBS})" in fixture
+
+
 def test_proc_address_and_g1_dynamic_path_are_wired() -> None:
     needle = 'strcmp(name, "ggml_backend_sycl_get_device_uuid")'
     assert needle in BACKEND
