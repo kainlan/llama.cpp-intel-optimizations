@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include <random>
 
@@ -32,17 +33,27 @@
 #define QI8_1 (QK8_1 / 4)
 #endif
 
-// Helpers for Q6_K x Q8_1 CPU reference (matches MMVQ math)
-static inline int get_int_from_int8_aligned(const int8_t* x8, const int i32) {
-    return *((const int*)(x8 + sizeof(int) * i32));
+// Helpers for Q6_K x Q8_1 CPU reference (matches MMVQ's little-endian packed-lane math).
+// Assemble words byte-by-byte so the reference is independent of host alignment and byte order.
+static inline uint32_t load_u32_le(const uint8_t * x8, const int i32) {
+    const uint8_t * bytes = x8 + sizeof(uint32_t) * i32;
+    return uint32_t(bytes[0])
+         | (uint32_t(bytes[1]) <<  8)
+         | (uint32_t(bytes[2]) << 16)
+         | (uint32_t(bytes[3]) << 24);
 }
 
-static inline int get_int_from_uint8(const uint8_t* x8, const int i32) {
-    const uint16_t* x16 = (const uint16_t*)(x8 + sizeof(int) * i32);
-    int x32 = 0;
-    x32 |= x16[0];
-    x32 |= (int)x16[1] << 16;
-    return x32;
+static inline uint32_t load_u32_le(const int8_t * x8, const int i32) {
+    const int8_t * bytes = x8 + sizeof(uint32_t) * i32;
+    return uint32_t(uint8_t(bytes[0]))
+         | (uint32_t(uint8_t(bytes[1])) <<  8)
+         | (uint32_t(uint8_t(bytes[2])) << 16)
+         | (uint32_t(uint8_t(bytes[3])) << 24);
+}
+
+static inline int extract_i8_lane(const uint32_t word, const int lane) {
+    const uint32_t byte = (word >> (8 * lane)) & 0xffu;
+    return byte < 0x80u ? int(byte) : int(byte) - 0x100;
 }
 
 static float cpu_vec_dot_q6_K_q8_1(const block_q6_K* bq6_K, const block_q8_1* bq8_1, int iqs) {
@@ -50,32 +61,76 @@ static float cpu_vec_dot_q6_K_q8_1(const block_q6_K* bq6_K, const block_q8_1* bq
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int vl = get_int_from_uint8(bq6_K->ql, iqs);
-    const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const uint32_t vl = load_u32_le(bq6_K->ql, iqs);
+    const uint32_t vh = load_u32_le(
+        bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
 
     const int8_t* scs = bq6_K->scales + scale_offset;
 
     float sumf = 0.0f;
     for (int i = 0; i < QR6_K; ++i) {
         const int sc = scs[4 * i];
-        const int u = get_int_from_int8_aligned(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        const uint32_t u = load_u32_le(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
         const float d8 = ggml_fp16_to_fp32(bq8_1[bq8_offset + 2*i].d);
-
-        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int8_t* vil_bytes = (const int8_t*)&vil;
-        const int8_t* vih_bytes = (const int8_t*)&vih;
-        const int8_t* u_bytes = (const int8_t*)&u;
 
         int dp4a_result = 0;
         for (int j = 0; j < 4; ++j) {
-            int vi_j = (vil_bytes[j] | vih_bytes[j]) - 32;
-            dp4a_result += vi_j * u_bytes[j];
+            const int low = int((vl >> (8 * j + 4 * i)) & 0x0fu);
+            const int high = int((vh >> (8 * j + 4 * i)) & 0x03u);
+            const int vi_j = low | (high << 4);
+            dp4a_result += (vi_j - 32) * extract_i8_lane(u, j);
         }
 
         sumf += d8 * (dp4a_result * sc);
     }
     return ggml_fp16_to_fp32(bq6_K->d) * sumf;
+}
+
+static bool test_portable_reference_known_vectors() {
+    const uint8_t packed_u8[8] = { 0xa5, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd };
+    const int8_t packed_i8[4] = { 1, -2, 3, -4 };
+    const uint32_t u8_word = load_u32_le(packed_u8 + 1, 0);
+    const uint32_t i8_word = load_u32_le(packed_i8, 0);
+    const bool packing_ok = u8_word == 0x67452301u && i8_word == 0xfc03fe01u
+                         && extract_i8_lane(i8_word, 0) == 1
+                         && extract_i8_lane(i8_word, 1) == -2
+                         && extract_i8_lane(i8_word, 2) == 3
+                         && extract_i8_lane(i8_word, 3) == -4;
+
+    block_q6_K q6 = {};
+    block_q8_1 q8[QK_K / QK8_1] = {};
+
+    // iqs=0 contains two groups of four Q6 values.  Their unsigned encodings are
+    // {0,31,32,63} and {63,32,31,0}, covering both extremes and the sign boundary.
+    const uint8_t ql[4] = { 0xf0, 0x0f, 0xf0, 0x0f };
+    const uint8_t qh[4] = { 0x30, 0x21, 0x12, 0x03 };
+    for (int lane = 0; lane < 4; ++lane) {
+        q6.ql[lane] = ql[lane];
+        q6.qh[lane] = qh[lane];
+    }
+    q6.scales[0] = 3;
+    q6.scales[4] = -2;
+    q6.d = ggml_fp32_to_fp16(2.0f);
+
+    const int8_t q8_group0[4] = { 1, -2, 3, -4 };
+    const int8_t q8_group1[4] = { -5, 6, -7, 8 };
+    for (int lane = 0; lane < 4; ++lane) {
+        q8[0].qs[lane] = q8_group0[lane];
+        q8[2].qs[lane] = q8_group1[lane];
+    }
+    q8[0].d = ggml_fp32_to_fp16(0.5f);
+    q8[2].d = ggml_fp32_to_fp16(0.25f);
+
+    const float dot = cpu_vec_dot_q6_K_q8_1(&q6, q8, 0);
+    const bool dot_ok = dot == -58.0f;
+    printf("Portable reference known vectors: %s\n", packing_ok && dot_ok ? "PASS" : "FAIL");
+    if (!packing_ok) {
+        printf("  Packed words: u8=0x%08x i8=0x%08x\n", unsigned(u8_word), unsigned(i8_word));
+    }
+    if (!dot_ok) {
+        printf("  Q6_K x Q8_1 dot: got %.6f expected -58.000000\n", dot);
+    }
+    return packing_ok && dot_ok;
 }
 
 static float cpu_row_dot_q6_K_q8_1(const block_q6_K* x_row, const block_q8_1* y, int ncols) {
@@ -262,6 +317,10 @@ int main() {
     printf("Tests actual MMVQ kernel (batch 2-32) with various tensor sizes.\n");
 
     int passed = 0, failed = 0;
+
+    if (!test_portable_reference_known_vectors()) {
+        return 1;
+    }
 
     // Test 1: Small tensor, batch=4 (MMVQ range)
     if (test_mmvq_q6k_batch(4, 256, 512, true)) passed++; else failed++;
