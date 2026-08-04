@@ -274,7 +274,7 @@ int main() {
         return 1;
     }
     ggml_sycl_load_txn stale_txn{};
-    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
         std::fprintf(stderr, "failure-window saved model-load procedure reopened admission\n");
         return 1;
     }
@@ -283,7 +283,7 @@ int main() {
         std::fprintf(stderr, "shutdown clean=false did not retain owners transactionally\n");
         return 1;
     }
-    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
         std::fprintf(stderr, "clean-failure window reopened saved mutation admission\n");
         return 1;
     }
@@ -293,7 +293,7 @@ int main() {
         return 1;
     }
     reg = nullptr;
-    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY) {
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
         std::fprintf(stderr, "saved model-load procedure admitted after completed unload\n");
         return 1;
     }
@@ -303,7 +303,7 @@ int main() {
     }
     phase("module reload staging failure remains closed and removed");
     if (ggml_backend_load(GGML_SYCL_RUNTIME_MODULE) != nullptr ||
-        saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_BUSY ||
+        saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY ||
         ggml_backend_reg_by_name("SYCL") != nullptr) {
         std::fprintf(stderr, "reactivation staging failure published or reopened module\n");
         return 1;
