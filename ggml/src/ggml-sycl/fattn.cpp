@@ -1619,8 +1619,10 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         profile_label.metadata   = "role=pack";
         profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
         profile_label.bytes      = 0;
-        pack_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
-            return profiled_queue.submit([&](sycl::handler & cgh) {
+        // Publish the accepted event before optional profiler bookkeeping.
+        // Recording may allocate and throw (notably std::bad_alloc); that must
+        // never turn an accepted pack into an unpublished lifetime hole.
+        pack_event = stream->submit([&](sycl::handler & cgh) {
             cgh.depends_on(zero_event);
             cgh.parallel_for<fattn_xmx_pack_k_materializer_kernel>(sycl::range<1>(total_work), [=](sycl::id<1> item) {
                 const size_t linear   = item[0];
@@ -1650,8 +1652,15 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                 const size_t elem_off_half   = ggml_sycl_fattn_xmx_packed_k_element_offset_half(kv_local, d);
                 packed_ptr[block_base_half + elem_off_half] = k_val;
             });
-            });
         });
+        out->ready_event = pack_event;
+        try {
+            if (ggml_sycl_kernel_profile_enabled()) {
+                ggml_sycl_kernel_profile_record_event(profile_label, pack_event);
+            }
+        } catch (...) {
+            GGML_LOG_WARN("[SYCL] packed-K profiler bookkeeping failed after accepted pack submit\n");
+        }
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[SYCL] packed-K materializer submit failed: %s\n", e.what());
         // A throw after the fill was accepted must retain both the owner and

@@ -5,11 +5,16 @@
 #include "../fattn.hpp"
 #include "../unified-cache.hpp"
 
+#include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -18,6 +23,7 @@ constexpr int D = 64;
 constexpr int N_KV = 64;
 constexpr int H_KV = 1;
 constexpr int BATCH = 1;
+constexpr int SKIP_UNSUPPORTED = 77;
 
 void set_failpoint(const char * value) {
 #if defined(_WIN32)
@@ -76,7 +82,7 @@ template <typename T> struct device_buffer {
     device_buffer & operator=(const device_buffer &) = delete;
 };
 
-fattn_params tiny_params(sycl::half * q, sycl::half * k, sycl::half * v, float * dst) {
+fattn_params tiny_params(sycl::half * q, sycl::half * k, sycl::half * v, float * dst, int n_kv = N_KV) {
     fattn_params p{};
     p.Q = reinterpret_cast<const char *>(q);
     p.K = reinterpret_cast<const char *>(k);
@@ -91,11 +97,11 @@ fattn_params tiny_params(sycl::half * q, sycl::half * k, sycl::half * v, float *
 
     p.ne00 = D; p.ne01 = 1; p.ne02 = H_KV; p.ne03 = BATCH;
     p.nb01 = D * sizeof(sycl::half); p.nb02 = p.nb01; p.nb03 = p.nb02 * H_KV;
-    p.ne10 = D; p.ne11 = N_KV; p.ne12 = H_KV; p.ne13 = BATCH;
-    p.nb11 = D * sizeof(sycl::half); p.nb12 = p.nb11 * N_KV; p.nb13 = p.nb12 * H_KV;
-    p.nb21 = D * sizeof(sycl::half); p.nb22 = p.nb21 * N_KV; p.nb23 = p.nb22 * H_KV;
-    p.ne30 = N_KV; p.ne31 = 1; p.ne32 = 1; p.ne33 = 1;
-    p.nb31 = N_KV * sizeof(sycl::half); p.nb32 = p.nb31; p.nb33 = p.nb32;
+    p.ne10 = D; p.ne11 = n_kv; p.ne12 = H_KV; p.ne13 = BATCH;
+    p.nb11 = D * sizeof(sycl::half); p.nb12 = p.nb11 * n_kv; p.nb13 = p.nb12 * H_KV;
+    p.nb21 = D * sizeof(sycl::half); p.nb22 = p.nb21 * n_kv; p.nb23 = p.nb22 * H_KV;
+    p.ne30 = n_kv; p.ne31 = 1; p.ne32 = 1; p.ne33 = 1;
+    p.nb31 = n_kv * sizeof(sycl::half); p.nb32 = p.nb31; p.nb33 = p.nb32;
     return p;
 }
 
@@ -107,6 +113,68 @@ ggml_sycl_fattn_xmx_decode_kv_layout_plan tiny_plan(const fattn_params & params)
     caps.k_device_resident = true;
     caps.v_device_resident = true;
     return ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(params, D, caps);
+}
+
+void verify_token_boundaries() {
+    sycl::half * dummy_half = reinterpret_cast<sycl::half *>(uintptr_t{ 0x1000 });
+    float * dummy_float = reinterpret_cast<float *>(uintptr_t{ 0x2000 });
+    for (const auto [tokens, expected_blocks] :
+         { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 65, 2 } }) {
+        const fattn_params params = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float, tokens);
+        ggml_sycl_fattn_xmx_packed_k_materialization_desc desc{};
+        require(ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+                    params, tiny_plan(params), 0, &desc),
+                "63/65-token materialization descriptor rejected");
+        require(desc.n_blocks == expected_blocks, "63/65-token block boundary mismatch");
+        require(desc.total_packed_bytes ==
+                    static_cast<size_t>(expected_blocks) * GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK,
+                "63/65-token packed-byte boundary mismatch");
+    }
+}
+
+class packed_k_delay_kernel;
+class packed_k_half_payload_kernel;
+class packed_k_rows_payload_kernel;
+
+sycl::event submit_delay(sycl::queue & q, int * sink) {
+    return q.parallel_for<packed_k_delay_kernel>(sycl::range<1>(65536), [=](sycl::id<1>) {
+        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> value(*sink);
+        value.fetch_add(1);
+    });
+}
+
+sycl::event submit_half_payload(sycl::queue & q, const sycl::event & delay, sycl::half * ptr, sycl::half value) {
+    return q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(delay);
+        cgh.single_task<packed_k_half_payload_kernel>([=]() { ptr[0] = value; });
+    });
+}
+
+sycl::event submit_rows_payload(sycl::queue & q,
+                                const sycl::event & delay,
+                                float * values,
+                                int32_t * indices,
+                                float value) {
+    return q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(delay);
+        cgh.single_task<packed_k_rows_payload_kernel>([=]() {
+            for (int i = 0; i < D; ++i) {
+                values[i] = value;
+            }
+            indices[0] = 0;
+        });
+    });
+}
+
+template <typename T>
+T copy_after(sycl::queue & q, const sycl::event & dependency, const T * device_ptr) {
+    T host{};
+    q.submit([&](sycl::handler & cgh) {
+         cgh.depends_on(dependency);
+         cgh.memcpy(&host, device_ptr, sizeof(T));
+     }).wait_and_throw();
+    return host;
 }
 
 struct sidecar_fixture {
@@ -144,9 +212,8 @@ struct sidecar_fixture {
         lookup.K_view_offs = 0;
         lookup_handle = ggml_sycl::mem_handle::from_chunk_ptr(k.ptr, device, GGML_LAYOUT_AOS, true);
         lookup.K_handle_hash = lookup_handle.stable_identity_hash();
-
-        q.memset(values.ptr, 0, D * sizeof(float));
-        q.memset(indices.ptr, 0, sizeof(int32_t));
+        q.memset(values.ptr, 0, D * sizeof(float)).wait_and_throw();
+        q.memset(indices.ptr, 0, sizeof(int32_t)).wait_and_throw();
     }
 
     bool update(sycl::queue & q, int device) {
@@ -157,19 +224,25 @@ struct sidecar_fixture {
 };
 
 void verify_range_teardown(sidecar_fixture & fixture, int device) {
-    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) != nullptr,
-            "sidecar missing before range teardown");
+    auto find = [&]() { return ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device); };
+    require(find() != nullptr, "sidecar missing before range teardown");
+    const uintptr_t k = reinterpret_cast<uintptr_t>(fixture.k.ptr);
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(reinterpret_cast<void *>(k - 1), 1);
+    require(find() != nullptr, "end-exclusive range ending at K removed sidecar");
     ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.values.ptr, D * sizeof(float));
-    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) != nullptr,
-            "non-overlap range removed sidecar");
-    ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, D * N_KV * sizeof(sycl::half));
-    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
-            "overlap range retained sidecar");
+    require(find() != nullptr, "non-overlap range removed sidecar");
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(reinterpret_cast<void *>(k - 1), 2);
+    require(find() == nullptr, "interior overlap retained sidecar");
 }
 
-void run_sidecar_checkpoint(const std::string & checkpoint, sycl::queue & q, int device) {
+void run_sidecar_checkpoint(const std::string & checkpoint,
+                            sycl::queue & q,
+                            sycl::queue & dependency_q,
+                            int device) {
     enable_sidecar();
     sidecar_fixture fixture(q, device);
+    device_buffer<int> delay_sink(q, 1, device);
+    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     set_failpoint(checkpoint.c_str());
 
     if (checkpoint == "sidecar-before-initial-fill") {
@@ -184,52 +257,70 @@ void run_sidecar_checkpoint(const std::string & checkpoint, sycl::queue & q, int
             threw = true;
         }
         require(threw, "zero-to-update failpoint did not throw");
-        require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) != nullptr,
-                "zero event was not published before throw");
+        auto * packed = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
+        require(packed != nullptr, "zero event was not published before throw");
+        const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
+        packed->ready_event = submit_rows_payload(dependency_q, delay, fixture.values.ptr, fixture.indices.ptr, 3.0f);
     }
 
     set_failpoint(nullptr);
-    ggml_sycl_fattn_xmx_packed_k * before = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
+    auto * before = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
     void * retained_ptr = before ? before->ptr : nullptr;
     require(fixture.update(q, device), "same-owner sidecar retry failed");
-    ggml_sycl_fattn_xmx_packed_k * after = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
+    auto * after = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
     require(after != nullptr, "sidecar retry did not publish owner");
     if (checkpoint == "sidecar-zero-to-update") {
         require(after->ptr == retained_ptr, "sidecar retry replaced surviving owner");
+        const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
+        const sycl::half payload = copy_after(q, after->ready_event, static_cast<sycl::half *>(after->ptr) + offset);
+        require(std::fabs(static_cast<float>(payload) - 3.0f) < 0.01f,
+                "sidecar ready-event dependency did not order delayed payload");
     }
     verify_range_teardown(fixture, device);
 }
 
 void run_materializer_checkpoint(const std::string & checkpoint,
-                                 ggml_backend_sycl_context & ctx,
                                  sycl::queue & q,
+                                 sycl::queue & dependency_q,
                                  int device) {
     device_buffer<sycl::half> qbuf(q, D, device);
     device_buffer<sycl::half> kbuf(q, D * N_KV, device);
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
+    device_buffer<int> delay_sink(q, 1, device);
+    q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
+    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
     const auto plan = tiny_plan(params);
     require(plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE, "tiny packed plan rejected");
 
     ggml_sycl_fattn_xmx_packed_k packed;
-    set_failpoint(checkpoint.c_str());
-    const bool injected_ok = ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
-    require(!injected_ok, "materializer checkpoint was not observed");
-    require(packed.handle.valid() && packed.ptr != nullptr, "materializer zero event lost owner");
+    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
+            "materializer prerequisite failed");
+    packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
+    const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
+    packed.ready_event = submit_half_payload(dependency_q, delay, kbuf.ptr, sycl::half(2.0f));
 
+    set_failpoint(checkpoint.c_str());
+    require(!ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
+            "materializer checkpoint was not observed");
+    require(packed.handle.valid() && packed.ptr == retained_ptr, "materializer zero event lost owner");
     set_failpoint(nullptr);
     require(ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
             "same-object materializer retry failed");
     require(packed.ptr == retained_ptr, "materializer retry replaced surviving owner");
+    const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
+    const sycl::half payload = copy_after(q, packed.ready_event, static_cast<sycl::half *>(packed.ptr) + offset);
+    require(std::fabs(static_cast<float>(payload) - 2.0f) < 0.01f,
+            "materializer ready-event dependency did not order delayed payload");
     packed.reset();
-    (void) ctx;
 }
 
 void run_consumer_checkpoint(const std::string & checkpoint,
                              ggml_backend_sycl_context & ctx,
                              sycl::queue & q,
+                             sycl::queue & dependency_q,
                              int device) {
     device_buffer<sycl::half> qbuf(q, D, device);
     device_buffer<sycl::half> kbuf(q, D * N_KV, device);
@@ -238,17 +329,20 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     device_buffer<float> partial_max(q, 1, device);
     device_buffer<float> partial_sum(q, 1, device);
     device_buffer<float> partial_out(q, D, device);
+    device_buffer<int> delay_sink(q, 1, device);
+    q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
+    q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
+    std::vector<sycl::half> ones(D * N_KV, sycl::half(1.0f));
+    q.memcpy(vbuf.ptr, ones.data(), ones.size() * sizeof(sycl::half)).wait_and_throw();
+    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
-    const auto plan = tiny_plan(params);
-
-    q.memset(qbuf.ptr, 0, D * sizeof(sycl::half));
-    q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half));
-    q.memset(vbuf.ptr, 0, D * N_KV * sizeof(sycl::half));
 
     ggml_sycl_fattn_xmx_packed_k packed;
-    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
+    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, tiny_plan(params), device, &q, &packed),
             "consumer prerequisite materialization failed");
     void * retained_ptr = packed.ptr;
+    const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
+    packed.ready_event = submit_half_payload(dependency_q, delay, vbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
     bool threw = false;
@@ -261,13 +355,34 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     require(threw, "consumer checkpoint did not throw");
     require(packed.handle.valid() && packed.ptr == retained_ptr,
             "consumer first-event publication lost packed owner");
-
     set_failpoint(nullptr);
     require(launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
                 ctx, params, &q, &packed, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1),
             "same-object consumer retry failed");
     require(packed.ptr == retained_ptr, "consumer retry replaced packed owner");
+    const float payload = copy_after(q, packed.ready_event, out.ptr);
+    require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
+            "consumer ready-event dependency did not order delayed first/merge payload");
     packed.reset();
+}
+
+bool preflight_device() {
+    try {
+        const auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+        if (devices.empty()) {
+            return false;
+        }
+        const sycl::device & dev = devices.front();
+        const size_t required_slm = fattn_v2_decode_gqa_slm<D>::TOTAL * sizeof(sycl::half);
+        if (!dev.has(sycl::aspect::fp16) ||
+            !fattn_xmx_v2_decode_m1n64_supported(dev, 16) ||
+            dev.get_info<sycl::info::device::local_mem_size>() < required_slm) {
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace
@@ -291,43 +406,67 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    if (!preflight_device()) {
+        std::fprintf(stderr, "SKIP: packed-K lifecycle requires GPU FP16, XMX m1n64-k16, and sufficient SLM\n");
+        return SKIP_UNSUPPORTED;
+    }
+
     set_failpoint(nullptr);
+    std::atomic<int> async_failures{ 0 };
     try {
         ggml_backend_sycl_context ctx(0);
-        sycl::queue * q = ctx.stream();
-        if (!q) {
-            throw std::runtime_error("SYCL context returned no queue");
-        }
+        sycl::queue * context_queue = ctx.stream();
+        require(context_queue != nullptr, "SYCL context returned no queue");
+        auto async_handler = [&](sycl::exception_list failures) {
+            for (const auto & failure : failures) {
+                ++async_failures;
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "async SYCL failure: %s\n", e.what());
+                }
+            }
+        };
+        sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler);
+        sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler);
         const int device = ctx.device;
         const size_t registry_baseline = ggml_sycl::alloc_registry::instance().size();
         const size_t bytes_baseline = ggml_sycl::alloc_registry::instance().total_device_bytes(device);
         const size_t arena_baseline = ggml_sycl::unified_cache_arena_non_weight_used(device);
+        verify_token_boundaries();
 
         if (checkpoint.rfind("sidecar-", 0) == 0) {
-            run_sidecar_checkpoint(checkpoint, *q, device);
+            run_sidecar_checkpoint(checkpoint, work_queue, dependency_queue, device);
         } else if (checkpoint == "materializer-zero-to-pack") {
-            run_materializer_checkpoint(checkpoint, ctx, *q, device);
+            run_materializer_checkpoint(checkpoint, work_queue, dependency_queue, device);
         } else {
-            run_consumer_checkpoint(checkpoint, ctx, *q, device);
+            run_consumer_checkpoint(checkpoint, ctx, work_queue, dependency_queue, device);
         }
         set_failpoint(nullptr);
-        q->wait_and_throw();
+        dependency_queue.wait_and_throw();
+        work_queue.wait_and_throw();
+        context_queue->wait_and_throw();
 
+        require(async_failures.load() == 0, "observed asynchronous wait failures");
         require(ggml_sycl::unified_cache_arena_non_weight_used(device) == arena_baseline,
                 "final arena allocation accounting did not return to baseline");
         require(ggml_sycl::alloc_registry::instance().total_device_bytes(device) == bytes_baseline,
                 "final registered device bytes did not return to baseline");
         require(ggml_sycl::alloc_registry::instance().size() == registry_baseline,
                 "final allocation registry count did not return to baseline");
-        std::printf("PASS checkpoint=%s shape=D64,Hkv1,batch1,nkv64 async_wait_failures=0\n", checkpoint.c_str());
+        std::printf("PASS checkpoint=%s shape=D64,Hkv1,batch1,nkv64 async_wait_failures=%d\n",
+                    checkpoint.c_str(), async_failures.load());
         return 0;
     } catch (const sycl::exception & e) {
+        ++async_failures;
         set_failpoint(nullptr);
-        std::fprintf(stderr, "FAIL checkpoint=%s SYCL: %s\n", checkpoint.c_str(), e.what());
+        std::fprintf(stderr, "FAIL checkpoint=%s SYCL: %s async_wait_failures=%d\n",
+                     checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
     } catch (const std::exception & e) {
         set_failpoint(nullptr);
-        std::fprintf(stderr, "FAIL checkpoint=%s: %s\n", checkpoint.c_str(), e.what());
+        std::fprintf(stderr, "FAIL checkpoint=%s: %s async_wait_failures=%d\n",
+                     checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
     }
 }

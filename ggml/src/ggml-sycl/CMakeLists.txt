@@ -1093,7 +1093,7 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
-if (GGML_SYCL_TARGET STREQUAL "INTEL")
+if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)
 add_executable(test-fattn-packed-k-lifecycle
     tests/test-fattn-packed-k-lifecycle.cpp
 )
@@ -1134,7 +1134,8 @@ foreach(_packed_k_checkpoint IN ITEMS
         COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint})
     set_tests_properties(fattn-packed-k-lifecycle-${_packed_k_checkpoint} PROPERTIES
         LABELS "sycl;fattn;lifecycle;live"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 endforeach()
