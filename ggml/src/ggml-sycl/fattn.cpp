@@ -1575,6 +1575,17 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         }
     }
 
+    // Publish every field used by retry reuse before any submission can throw.
+    // If the zero fill is accepted but packing is interrupted, the same object
+    // retains its owner and the next attempt chains from ready_event.
+    out->device      = target_device;
+    out->D           = desc.D;
+    out->n_kv        = desc.n_kv;
+    out->H_kv        = desc.H_kv;
+    out->batch       = desc.batch;
+    out->n_blocks    = desc.n_blocks;
+    out->total_bytes = std::max(out->total_bytes, desc.total_packed_bytes);
+
     sycl::half *      packed_ptr   = static_cast<sycl::half *>(out->ptr);
     void *            packed_void  = out->ptr;
     const sycl::event previous_use = out->ready_event;
@@ -1591,6 +1602,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
 
     sycl::event zero_event;
     sycl::event pack_event;
+    bool        zero_published = false;
     try {
         std::vector<sycl::event> zero_deps;
         if (add_prev_dep) {
@@ -1598,6 +1610,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         }
         zero_event       = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
         out->ready_event = zero_event;
+        zero_published   = true;
         ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack");
         ggml_sycl_profile_label profile_label{};
         profile_label.name       = "fattn.pack";
@@ -1641,7 +1654,11 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         });
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[SYCL] packed-K materializer submit failed: %s\n", e.what());
-        if (!reuse_alloc) {
+        // A throw after the fill was accepted must retain both the owner and
+        // its published event: the caller can retry the same object and chain
+        // the next fill after this one.  A fill submission that itself failed
+        // accepted no work, so a newly-created owner is still discarded.
+        if (!reuse_alloc && !zero_published) {
             out->reset();
         }
         return false;

@@ -1090,6 +1090,56 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# Tiny model-free packed-K live lifecycle.  This compiles the Intel production
+# packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
+# the same AOT/JIT target set and split-barrier options as libggml-sycl.
+if (GGML_SYCL_TARGET STREQUAL "INTEL")
+add_executable(test-fattn-packed-k-lifecycle
+    tests/test-fattn-packed-k-lifecycle.cpp
+)
+target_include_directories(test-fattn-packed-k-lifecycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-fattn-packed-k-lifecycle PRIVATE
+    "-fsycl"
+    "-fsycl-targets=${GGML_SYCL_INTEL_TARGETS}"
+    "-Wno-narrowing"
+)
+target_link_options(test-fattn-packed-k-lifecycle PRIVATE
+    "-fsycl"
+    "-fsycl-targets=${GGML_SYCL_INTEL_TARGETS}"
+    "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+)
+if (GGML_SYCL_BMG_AOT_ENABLED)
+    target_link_options(test-fattn-packed-k-lifecycle PRIVATE
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier")
+endif()
+target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+foreach(_packed_k_checkpoint IN ITEMS
+        sidecar-before-initial-fill
+        sidecar-zero-to-update
+        materializer-zero-to-pack
+        packed-first-to-merge)
+    add_test(NAME fattn-packed-k-lifecycle-${_packed_k_checkpoint}
+        COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint})
+    set_tests_properties(fattn-packed-k-lifecycle-${_packed_k_checkpoint} PROPERTIES
+        LABELS "sycl;fattn;lifecycle;live"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+endforeach()
+endif()
+
 # MMQ XMX dispatch integration: XMX-path selection, MMQ fallback, and edge
 # cases (empty batch, non-aligned dims). Moved outside the guard
 # (llama.cpp-9c0s) -- it spent its life behind GGML_SYCL_BUILD_XMX_TESTS
