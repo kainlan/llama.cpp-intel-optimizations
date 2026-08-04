@@ -45,6 +45,7 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_set_runtime_context_for_model": "ggml_backend_sycl_set_runtime_context_for_model",
     "ggml_backend_sycl_model_unloaded_token": "ggml_backend_sycl_model_unloaded_token",
     "ggml_backend_sycl_model_quarantine_token": "ggml_backend_sycl_model_quarantine_token",
+    "ggml_backend_sycl_test_seed_cpu_retained": "ggml_backend_sycl_test_seed_cpu_retained",
     "ggml_backend_sycl_test_seed_moe_module_state": "ggml_backend_sycl_test_seed_moe_module_state",
     "ggml_backend_sycl_test_allocate_predictor_scores": "ggml_backend_sycl_test_allocate_predictor_scores",
     "ggml_backend_sycl_test_hold_live_update": "ggml_backend_sycl_test_hold_live_update",
@@ -629,6 +630,17 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "initial_reg_count < 2 || ggml_backend_reg_by_name(\"SYCL\") == nullptr" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "commit failure retains device tombstone identity": "Keep staged device identities linked to their REMOVED" in registry_backend
+    and "published_entry->state = ggml_backend_reg_state::REMOVED" in registry_backend,
+    "pre-registry buffer adoption and durable events": "ggml_backend_refresh_buffer_lifecycle" in backend_base
+    and "adoption_candidate" in backend_base
+    and "event->owner_lease" in backend_base
+    and "pre_registry_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "live backend event did not block checked unload" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "registry name admission with controlled staging bypass": "ggml_backend_reg_name_unchecked" in backend_base
+    and "const auto begin = g_registry_begin.load" in backend_base
+    and "ggml_backend_reg_name_unchecked(reg)" in registry_backend,
     "base-safe lifecycle admission function table": "ggml_backend_set_registry_lifecycle" in backend_base
     and "g_registry_begin.load" in backend_base
     and "ggml_backend_registry_begin_call(reg)" not in backend_base
@@ -720,6 +732,14 @@ checks = {
     and "owner_lease" in backend_base
     and "ggml_backend_buffer_set_type" in backend_base
     and "ggml_backend_buffer_set_type(buffer, buft)" in backend
+    and "consume_production_owner" in backend_base
+    and backend_base.index("buffer_production_guard production(buft->device)")
+        < backend_base.index("buft->iface.alloc_buffer(buft, size)")
+    and "buffer_production_guard production(device)" in backend_base
+    and "Underlying buffers already hold durable owners" in backend_base
+    and "pre_registry_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "live backend event did not block checked unload" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "remaining host-compute buffer lost durable ownership" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "sycl_module_admission_state::RETRY_CLOSED" in backend
@@ -752,6 +772,12 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_cpu_retained_cleanup();")
+        < backend.index("ggml_sycl::shutdown_unified_cache()")
+        and "offload_buffer_pool_trim(-1)" in backend
+        and "!ggml_sycl_cpu_retained_active()" in backend
+        and "g_runtime_alloc_registry.empty()" in cache_cpp
+        and "g_offload_pool_slots.empty()" in cache_cpp,
     "preflight, bounded generic drain, hidden reactivation and score pin":
         registry_backend.index("reserved = can_unload()") < registry_backend.index("cv.wait_for(lock, active_call_drain_timeout")
         and "ggml_backend_reg_state::REACTIVATING" in registry_backend

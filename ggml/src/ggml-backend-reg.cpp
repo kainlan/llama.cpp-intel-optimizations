@@ -336,7 +336,7 @@ struct ggml_backend_registry {
                 ~reactivation_rollback_guard() { if (*prepared && rollback) rollback(); }
             } rollback_guard{ rollback_reactivate, &reactivation_prepared };
             // Stage all plugin-owned metadata while mutation admission remains closed.
-            const char * name = ggml_backend_reg_name(reg);
+            const char * name = ggml_backend_reg_name_unchecked(reg);
             size_t count = 0;
             if (!ggml_backend_reg_dev_count_unchecked(reg, &count)) {
                 return false;
@@ -386,9 +386,9 @@ struct ggml_backend_registry {
                     commit_reactivate();
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    devices.erase(std::remove_if(devices.begin(), devices.end(),
-                        [&](const ggml_backend_device_entry & item) { return item.owner == published_entry; }),
-                        devices.end());
+                    // Keep staged device identities linked to their REMOVED
+                    // owner tombstone so saved handles reject rather than
+                    // falling through as standalone/unmanaged devices.
                     published_entry->state = ggml_backend_reg_state::REMOVED;
                     return false;
                 }
@@ -396,6 +396,7 @@ struct ggml_backend_registry {
                 published_entry->state = ggml_backend_reg_state::ACTIVE;
                 reactivation_prepared = false;
             }
+            ggml_backend_refresh_buffer_lifecycle();
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);
 #endif
@@ -860,6 +861,9 @@ static ggml_backend_registry & get_reg() {
     }
     try {
         reg.register_builtin_backends();
+        // Built-in devices are now published; transactionally backfill buffers
+        // that were created before lifecycle hooks/owners were available.
+        ggml_backend_set_registry_lifecycle(&lifecycle_iface);
     } catch (...) {
         std::lock_guard<std::mutex> lock(builtin_mutex);
         builtin_state = builtin_init_state::UNINITIALIZED;
@@ -964,7 +968,7 @@ bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept {
         std::lock_guard<std::mutex> lock(registry.mutex);
         const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
             [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
-        if (found == registry.devices.end()) return true;
+        if (found == registry.devices.end()) return device->reg == nullptr;
         if (found->owner->state != ggml_backend_reg_state::ACTIVE || found->owner->durable_owners == SIZE_MAX) {
             return false;
         }

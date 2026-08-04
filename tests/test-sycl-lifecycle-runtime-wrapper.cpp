@@ -121,6 +121,14 @@ static ggml_backend_reg_t registry_fixture() {
 
 static bool run_registry_failure_fixture() {
     auto reg = registry_fixture();
+    static ggml_backend_buffer_type pre_registry_buft{};
+    pre_registry_buft.device = static_cast<ggml_backend_dev_t>(reg->context);
+    auto pre_registry_buffer = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
+    if (!pre_registry_buffer) return false;
+    ggml_backend_register(reg);
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
+    ggml_backend_buffer_free(pre_registry_buffer);
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     ggml_backend_register(reg);
     const size_t initial_reg_count = ggml_backend_reg_count();
 #if defined(GGML_SYCL_RUNTIME_MODULE)
@@ -268,6 +276,12 @@ int main() {
         std::fprintf(stderr, "missing MoE reload-state seed procedure\n");
         return 1;
     }
+    auto seed_cpu_retained = reinterpret_cast<bool (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_cpu_retained"));
+    if (!seed_cpu_retained) {
+        std::fprintf(stderr, "missing CPU-retained reload fixture\n");
+        return 1;
+    }
     auto initial_get_device_memory = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_memory)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_memory"));
     size_t free_before_cache = 0;
@@ -277,6 +291,10 @@ int main() {
         return 1;
     }
     initial_get_device_memory(0, &free_before_cache, &total_before_cache);
+    if (!seed_cpu_retained()) {
+        std::fprintf(stderr, "failed to seed CPU-retained reload fixture\n");
+        return 1;
+    }
     auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_allocate_predictor_scores"));
     if (!allocate_predictor_scores || !allocate_predictor_scores()) {
@@ -686,6 +704,15 @@ int main() {
         return 1;
     }
     ggml_backend_buffer_free(durable_compute_buffer);
+
+    phase("durable event owner unload rejection");
+    auto durable_event = ggml_backend_event_new(ggml_backend_reg_dev_get(reg, 0));
+    if (!durable_event || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "live backend event did not block checked unload\n");
+        return 1;
+    }
+    ggml_backend_event_synchronize(durable_event);
+    ggml_backend_event_free(durable_event);
 
     phase("stateful module unload");
     size_t unloaded_reg_index = ggml_backend_reg_count();

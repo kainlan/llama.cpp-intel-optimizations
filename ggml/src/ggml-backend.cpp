@@ -40,6 +40,36 @@ std::atomic<device_end_fn>     g_device_end{ nullptr };
 std::atomic<device_owner_acquire_fn> g_device_owner_acquire{ nullptr };
 std::atomic<device_owner_release_fn> g_device_owner_release{ nullptr };
 
+struct production_frame { ggml_backend_dev_t device; bool transferred = false; };
+static thread_local std::vector<production_frame *> g_production_frames;
+
+struct buffer_production_guard {
+    production_frame frame;
+    bool acquired = false;
+    explicit buffer_production_guard(ggml_backend_dev_t device) : frame{device, false} {
+        const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
+        acquired = !device || !acquire || acquire(device);
+        if (acquired) g_production_frames.push_back(&frame);
+    }
+    ~buffer_production_guard() {
+        if (!acquired) return;
+        g_production_frames.pop_back();
+        if (frame.device && !frame.transferred) {
+            const auto release = g_device_owner_release.load(std::memory_order_acquire);
+            if (release) release(frame.device);
+        }
+    }
+    explicit operator bool() const { return acquired; }
+};
+
+static bool consume_production_owner(ggml_backend_dev_t device) {
+    if (g_production_frames.empty()) return false;
+    auto * frame = g_production_frames.back();
+    if (frame->device != device || frame->transferred) return false;
+    frame->transferred = true;
+    return device != nullptr;
+}
+
 struct device_call_guard {
     ggml_backend_dev_t device;
     device_end_fn      end;
@@ -54,6 +84,9 @@ struct device_call_guard {
 };
 }
 
+static std::mutex                                g_backend_buffer_registry_mutex;
+static std::unordered_set<ggml_backend_buffer_t> g_backend_buffer_registry;
+
 void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
     g_device_owner_release.store(iface ? iface->device_owner_release : nullptr, std::memory_order_release);
     g_device_owner_acquire.store(iface ? iface->device_owner_acquire : nullptr, std::memory_order_release);
@@ -61,6 +94,43 @@ void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i
     g_device_end.store(iface ? iface->device_end : nullptr, std::memory_order_release);
     g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
     g_registry_begin.store(iface ? iface->registry_begin : nullptr, std::memory_order_release);
+    ggml_backend_refresh_buffer_lifecycle();
+}
+
+void ggml_backend_refresh_buffer_lifecycle(void) {
+    const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
+    const auto release = g_device_owner_release.load(std::memory_order_acquire);
+    if (!acquire) return;
+    struct adoption_candidate { ggml_backend_buffer_t buffer; ggml_backend_dev_t device; };
+    std::vector<adoption_candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
+        for (auto * buffer : g_backend_buffer_registry) {
+            if (buffer && buffer->owner_device && !buffer->owner_lease) {
+                candidates.push_back({ buffer, buffer->owner_device });
+            }
+        }
+    }
+    std::vector<adoption_candidate> acquired;
+    for (const auto & candidate : candidates) {
+        if (!acquire(candidate.device)) {
+            for (const auto & prior : acquired) if (release) release(prior.device);
+            return;
+        }
+        acquired.push_back(candidate);
+    }
+    std::vector<ggml_backend_dev_t> release_later;
+    {
+        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
+        for (const auto & candidate : acquired) {
+            if (g_backend_buffer_registry.count(candidate.buffer) != 0 && !candidate.buffer->owner_lease) {
+                candidate.buffer->owner_lease = true;
+            } else {
+                release_later.push_back(candidate.device);
+            }
+        }
+    }
+    for (auto * device : release_later) if (release) release(device);
 }
 
 #ifdef __APPLE__
@@ -70,9 +140,6 @@ void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i
 
 
 // backend buffer type
-
-static std::mutex                                g_backend_buffer_registry_mutex;
-static std::unordered_set<ggml_backend_buffer_t> g_backend_buffer_registry;
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
@@ -84,6 +151,8 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t 
     GGML_ASSERT(buft);
     device_call_guard guard(buft->device);
     if (!guard) return nullptr;
+    buffer_production_guard production(buft->device);
+    if (!production) return nullptr;
     if (size == 0) {
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
     }
@@ -164,8 +233,9 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
         return true;
     }
     const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
-    const bool new_lease = new_device && acquire_owner;
-    if (new_lease && !acquire_owner(new_device)) return false;
+    const bool consumed_production = consume_production_owner(new_device);
+    const bool new_lease = consumed_production || (new_device && acquire_owner);
+    if (!consumed_production && new_lease && !acquire_owner(new_device)) return false;
 
     if (buffer->owner_lease) {
         const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
@@ -192,11 +262,12 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .owner_lease  = */ false
     };
     const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
-    if (buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
+    const bool consumed_production = consume_production_owner(buffer->owner_device);
+    if (!consumed_production && buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
         delete buffer;
         return nullptr;
     }
-    buffer->owner_lease = buffer->owner_device && acquire_owner;
+    buffer->owner_lease = consumed_production || (buffer->owner_device && acquire_owner);
 
     {
         std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
@@ -706,15 +777,31 @@ ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
     // null device is allowed for the transition period to the device interface
     if (device == NULL || device->iface.event_new == NULL) return NULL;
     device_call_guard guard(device);
-    return guard ? device->iface.event_new(device) : nullptr;
+    if (!guard) return nullptr;
+    const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
+    if (acquire && !acquire(device)) return nullptr;
+    ggml_backend_event_t event = device->iface.event_new(device);
+    if (!event) {
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (acquire && release) release(device);
+        return nullptr;
+    }
+    event->owner_lease = acquire != nullptr;
+    return event;
 }
 
 void ggml_backend_event_free(ggml_backend_event_t event) {
     if (event == NULL) {
         return;
     }
-    device_call_guard guard(event->device);
-    if (guard) event->device->iface.event_free(event->device, event);
+    ggml_backend_dev_t owner_device = event->device;
+    const bool owner_lease = event->owner_lease;
+    device_call_guard guard(owner_device);
+    if (guard) owner_device->iface.event_free(owner_device, event);
+    if (owner_lease) {
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (release) release(owner_device);
+    }
 }
 
 void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend) {
@@ -808,7 +895,9 @@ ggml_backend_buffer_type_t ggml_backend_dev_host_buffer_type(ggml_backend_dev_t 
 ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size) {
     GGML_ASSERT(device);
     device_call_guard guard(device);
-    return guard ? device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size) : nullptr;
+    if (!guard) return nullptr;
+    buffer_production_guard production(device);
+    return production ? device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size) : nullptr;
 }
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
@@ -831,9 +920,19 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
 
 // Backend (reg)
 
+const char * ggml_backend_reg_name_unchecked(ggml_backend_reg_t reg) {
+    if (!reg || !reg->iface.get_name) return nullptr;
+    try { return reg->iface.get_name(reg); } catch (...) { return nullptr; }
+}
+
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
     GGML_ASSERT(reg);
-    return reg->iface.get_name(reg);
+    const auto begin = g_registry_begin.load(std::memory_order_acquire);
+    if (begin && !begin(reg)) return nullptr;
+    const auto end = begin ? g_registry_end.load(std::memory_order_acquire) : nullptr;
+    const char * result = ggml_backend_reg_name_unchecked(reg);
+    if (end) end(reg);
+    return result;
 }
 
 bool ggml_backend_reg_dev_count_unchecked(ggml_backend_reg_t reg, size_t * count) {
@@ -979,7 +1078,16 @@ ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer
         total_size += ggml_backend_buffer_get_size(buffers[i]);
     }
 
-    return ggml_backend_buffer_init(buffers[0]->buft, ggml_backend_multi_buffer_i, ctx, total_size);
+    ggml_backend_buffer_t result = ggml_backend_buffer_init(buffers[0]->buft, ggml_backend_multi_buffer_i, ctx, total_size);
+    // Underlying buffers already hold durable owners; the aggregate must not
+    // double-count the same module lifetime.
+    if (result && result->owner_lease) {
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (release) release(result->owner_device);
+        result->owner_lease = false;
+        result->owner_device = nullptr;
+    }
+    return result;
 }
 
 bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer) {

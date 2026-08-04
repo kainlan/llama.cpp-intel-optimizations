@@ -96348,6 +96348,13 @@ static void ggml_backend_sycl_test_fail_next_shutdown_clean_guarded() {
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_shutdown_clean();
 }
 
+static bool ggml_backend_sycl_test_seed_cpu_retained() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || ggml_sycl_info().device_count <= 0) return false;
+    ggml_sycl_cpu_retained_init(0, &ggml_sycl_get_device(0).default_queue());
+    return ggml_sycl_cpu_retained_active();
+}
+
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return;
@@ -96379,7 +96386,8 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
            g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
-           !g_expert_predictors[0].test_scores_allocated() && ggml_sycl::unified_cache_shutdown_state_clean() &&
+           !g_expert_predictors[0].test_scores_allocated() && !ggml_sycl_cpu_retained_active() &&
+           ggml_sycl::unified_cache_shutdown_state_clean() &&
            ggml_sycl::unified_alloc_validate_registry(-1, "module-reload-clean");
 }
 
@@ -96400,6 +96408,13 @@ void ggml_backend_sycl_shutdown(void) {
     split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();
+    // Retained CPU outputs own offload-pool leases backed by cache queues.
+    // Release them and trim all free pool slots before queue/cache destruction.
+    ggml_sycl_cpu_retained_cleanup();
+    ggml_sycl::offload_buffer_pool_trim(-1);
+    if (ggml_sycl_cpu_retained_active()) {
+        throw std::runtime_error("SYCL retained CPU state survived shutdown cleanup");
+    }
     {
         std::lock_guard<std::mutex> queue_lock(g_pipeline_copy_queue_mutex);
         for (auto & queue : g_pipeline_copy_queue) {
@@ -96584,6 +96599,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_seed_cpu_retained") == 0) {
+        return (void *) ggml_backend_sycl_test_seed_cpu_retained;
     }
     if (strcmp(name, "ggml_backend_sycl_test_seed_moe_module_state") == 0) {
         return (void *) ggml_backend_sycl_test_seed_moe_module_state;

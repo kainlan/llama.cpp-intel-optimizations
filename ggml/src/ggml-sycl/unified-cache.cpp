@@ -12685,9 +12685,15 @@ bool unified_cache_shutdown_state_clean() noexcept {
             return false;
         }
         for (const auto * queue : g_shared_ctx_queues) {
-            if (queue != nullptr) {
-                return false;
-            }
+            if (queue != nullptr) return false;
+        }
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            if (!g_runtime_alloc_registry.empty()) return false;
+        }
+        {
+            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
+            if (!g_offload_pool_slots.empty() || !g_offload_pool_free.empty()) return false;
         }
         return true;
     } catch (...) {
