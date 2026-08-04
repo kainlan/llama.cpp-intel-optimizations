@@ -709,6 +709,8 @@ checks = {
     and buft_callback_inventory_ok
     and "sycl_module_admission_state::RETRY_CLOSED" in backend
     and "g_sycl_module_admission_cv.wait" in backend
+    and "g_sycl_module_shutdown_started = true" in backend
+    and "if (!g_sycl_module_shutdown_started" in backend
     and "ggml_backend_prepare_reactivate" in backend
     and "ggml_backend_commit_reactivate" in backend
     and "ggml_backend_rollback_reactivate" in backend,

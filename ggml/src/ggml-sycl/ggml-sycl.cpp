@@ -9369,6 +9369,7 @@ static std::mutex                    g_sycl_module_admission_mutex;
 static std::condition_variable       g_sycl_module_admission_cv;
 static sycl_module_admission_state   g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
 static size_t                        g_sycl_module_mutations = 0;
+static bool                          g_sycl_module_shutdown_started = false;
 
 class sycl_module_mutation_guard {
   public:
@@ -96206,6 +96207,7 @@ bool ggml_backend_sycl_can_unload(void) {
         } else if (g_sycl_module_admission != sycl_module_admission_state::RETRY_CLOSED) {
             return false;
         }
+        g_sycl_module_shutdown_started = false;
         g_sycl_module_admission_cv.wait(lock, [] { return g_sycl_module_mutations == 0; });
     }
     if (ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK) {
@@ -96219,9 +96221,14 @@ bool ggml_backend_sycl_can_unload(void) {
 }
 
 void ggml_backend_sycl_cancel_unload(void) {
-    // Cancellation after shutdown began is retryable, not active: saved raw
-    // procedures remain closed while the hidden registry entry is retried.
+    // Release the Registry reservation before reopening a pure probe, so
+    // buffer-only admissions cannot cross a half-cancelled window.
     ggml_sycl::lifecycle::global_registry().cancel_shutdown();
+    std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    if (!g_sycl_module_shutdown_started &&
+        g_sycl_module_admission == sycl_module_admission_state::RETRY_CLOSED) {
+        g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+    }
 }
 
 void ggml_backend_sycl_complete_unload(void) {
@@ -96248,6 +96255,7 @@ void ggml_backend_sycl_commit_reactivate(void) {
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+    g_sycl_module_shutdown_started = false;
     g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
 }
 
@@ -96338,6 +96346,10 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
 }
 
 void ggml_backend_sycl_shutdown(void) {
+    {
+        std::lock_guard<std::mutex> admission_lock(g_sycl_module_admission_mutex);
+        g_sycl_module_shutdown_started = true;
+    }
     static std::mutex           shutdown_mutex;
     std::lock_guard<std::mutex> lock(shutdown_mutex);
     GGML_LOG_INFO("[SYCL-MODULE] shutdown begin\n");
