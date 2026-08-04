@@ -7,6 +7,10 @@
 // Environment variables:
 //   GGML_SYCL_DISABLE_GRAPH=1 - Disable SYCL graphs
 //   (default)                - SoA optimization enabled
+//
+// Positive-control options (an exit failure is the expected RED result):
+//   --reference=f32          - restore the former, mismatched F32 oracle
+//   --corrupt-q8-reference   - perturb the matching Q8_1 oracle
 
 #include <cstdio>
 #include <cstdlib>
@@ -198,14 +202,25 @@ static constexpr float gpu_q8_tolerance(float cpu_q8) {
     return 1e-3f > 1e-4f * diagnostic_abs(cpu_q8) ? 1e-3f : 1e-4f * diagnostic_abs(cpu_q8);
 }
 
-static constexpr bool gpu_q8_observational_match(float gpu, float cpu_q8) {
+static constexpr bool gpu_q8_contract_match(float gpu, float cpu_q8) {
     return diagnostic_abs(gpu - cpu_q8) <= gpu_q8_tolerance(cpu_q8);
+}
+
+static constexpr bool gpu_f32_legacy_match(float gpu, float cpu_f32) {
+    const float difference = diagnostic_abs(gpu - cpu_f32);
+    const float error = diagnostic_abs(cpu_f32) > 1e-6f ? difference / diagnostic_abs(cpu_f32) : difference;
+    return error <= 0.01f;
+}
+
+static constexpr float corrupted_q8_reference(float cpu_q8) {
+    const float mutation = 8.0f * gpu_q8_tolerance(cpu_q8);
+    return cpu_q8 < 0.0f ? cpu_q8 - mutation : cpu_q8 + mutation;
 }
 
 static constexpr bool q8_accounts_for_f32_delta(float gpu, float cpu_q8, float cpu_f32) {
     const float q8_f32_abs = diagnostic_abs(cpu_q8 - cpu_f32);
     const float q8_f32_error = diagnostic_abs(cpu_f32) > 1e-6f ? q8_f32_abs / diagnostic_abs(cpu_f32) : q8_f32_abs;
-    return gpu_q8_observational_match(gpu, cpu_q8) && q8_f32_error > 0.01f;
+    return gpu_q8_contract_match(gpu, cpu_q8) && q8_f32_error > 0.01f;
 }
 
 enum class q8_diagnostic_state {
@@ -220,11 +235,16 @@ static constexpr q8_diagnostic_state q8_diagnostic_summary(int f32_failures, int
                                              q8_diagnostic_state::not_consistent;
 }
 
-// Synthetic checks keep the observational threshold inclusive and the empty sample non-conclusive.
-static_assert(gpu_q8_observational_match(0.001f, 0.0f), "absolute threshold boundary must match");
-static_assert(!gpu_q8_observational_match(0.0011f, 0.0f), "values outside absolute threshold must not match");
-static_assert(gpu_q8_observational_match(10001.0f, 10000.0f), "relative threshold boundary must match");
-static_assert(!gpu_q8_observational_match(10001.1f, 10000.0f), "values outside relative threshold must not match");
+// Host-only contract checks: the Q8 oracle accepts the known matching result, the former F32
+// oracle rejects the observed 1.444% delta, and a corrupted Q8 oracle is rejected specifically.
+static_assert(gpu_q8_contract_match(101.444f, 101.444f), "matching Q8 oracle must pass");
+static_assert(!gpu_f32_legacy_match(101.444f, 100.0f), "1.444% GPU-F32 positive control must RED");
+static_assert(!gpu_q8_contract_match(101.444f, corrupted_q8_reference(101.444f)),
+              "corrupting the Q8 oracle must RED the Q8 contract");
+static_assert(gpu_q8_contract_match(0.001f, 0.0f), "absolute threshold boundary must match");
+static_assert(!gpu_q8_contract_match(0.0011f, 0.0f), "values outside absolute threshold must not match");
+static_assert(gpu_q8_contract_match(10001.0f, 10000.0f), "relative threshold boundary must match");
+static_assert(!gpu_q8_contract_match(10001.1f, 10000.0f), "values outside relative threshold must not match");
 static_assert(q8_accounts_for_f32_delta(0.0205f, 0.02f, 0.0f),
               "Q8-F32 crossing the F32 gate must account for a tightly matching GPU delta");
 static_assert(!q8_accounts_for_f32_delta(0.0105f, 0.01f, 0.0f),
@@ -238,6 +258,19 @@ static void format_relative_metric(char * buffer, size_t size, float reference, 
     } else {
         snprintf(buffer, size, "%.3f%%", relative_error * 100.0f);
     }
+}
+
+static bool use_f32_positive_control = false;
+static bool corrupt_q8_positive_control = false;
+
+static bool reference_contract_match(float gpu, float cpu_q8_reference, float cpu_f32) {
+    return use_f32_positive_control ? gpu_f32_legacy_match(gpu, cpu_f32)
+                                    : gpu_q8_contract_match(gpu, cpu_q8_reference);
+}
+
+static const char * reference_contract_name() {
+    return use_f32_positive_control ? "CPU_F32 positive control (legacy 1% gate)"
+                                    : "CPU_Q8_1 (abs <= max(1e-3, 1e-4*abs(CPU_Q8_1)))";
 }
 
 static void print_q8_diagnostic_summary(int f32_failures, int consistent_rows) {
@@ -365,22 +398,26 @@ bool test_q6k_mul_mat_single_token() {
     // Compute CPU reference for first few rows
     printf("  Computing CPU reference...\n");
     const int test_rows = std::min(16, n_vocab);
-    int mismatches = 0;
-    int q8_consistent_mismatches = 0;
+    int contract_mismatches = 0;
+    int f32_observation_failures = 0;
+    int q8_consistent_f32_failures = 0;
     float max_rel_error = 0.0f;
     bool has_relative_error = false;
 
-    printf("  Sample row comparisons (positive control):\n");
+    printf("  Sample row comparisons (enforced contract plus CPU_F32/Q8 provenance):\n");
     for (int row = 0; row < test_rows; row++) {
         float cpu_val = cpu_dot_q6k_f32(&weight_q6k[row * blocks_per_row], input_f32.data(), n_embd);
         float cpu_q8_val = cpu_row_dot_q6_K_q8_1(
             &weight_q6k[row * blocks_per_row], input_q8.data(), n_embd);
         float gpu_val = gpu_output[row];
+        const float cpu_q8_reference = corrupt_q8_positive_control
+            ? corrupted_q8_reference(cpu_q8_val) : cpu_q8_val;
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_val);
-        float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
+        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_reference);
+        float gpu_q8_rel = (std::abs(cpu_q8_reference) > 1e-6f)
+            ? gpu_q8_abs / std::abs(cpu_q8_reference) : gpu_q8_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
         if (std::abs(cpu_val) > 1e-6f) {
@@ -392,29 +429,34 @@ bool test_q6k_mul_mat_single_token() {
         char gpu_q8_rel_text[32];
         char q8_f32_rel_text[32];
         format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
-        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_reference, gpu_q8_rel);
         format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
-        printf("    Row %2d: GPU=%10.6f CPU_F32=%10.6f CPU_Q8=%10.6f "
-               "GPU-F32 abs=%9.6f rel=%7s GPU-Q8 abs=%9.6f rel=%7s "
-               "Q8-F32 abs=%9.6f rel=%7s\n",
-               row, gpu_val, cpu_val, cpu_q8_val,
+        const bool contract_match = reference_contract_match(gpu_val, cpu_q8_reference, cpu_val);
+        printf("    Row %2d: GPU=%10.6f CPU_F32=%10.6f CPU_Q8=%10.6f MATCH_REF=%10.6f "
+               "GPU-F32 abs=%9.6f rel=%7s GPU-REF abs=%9.6f rel=%7s "
+               "Q8-F32 abs=%9.6f rel=%7s contract=%s\n",
+               row, gpu_val, cpu_val, cpu_q8_val, cpu_q8_reference,
                abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
-               q8_f32_abs, q8_f32_rel_text);
+               q8_f32_abs, q8_f32_rel_text, contract_match ? "OK" : "FAIL");
 
-        if (rel_error > 0.01f) {  // 1% tolerance
-            mismatches++;
+        if (!contract_match) {
+            contract_mismatches++;
+        }
+        if (!gpu_f32_legacy_match(gpu_val, cpu_val)) {
+            f32_observation_failures++;
             if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
-                q8_consistent_mismatches++;
+                q8_consistent_f32_failures++;
             }
         }
     }
 
     if (has_relative_error) {
-        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+        printf("  Max observed GPU-F32 relative error: %.4f%%\n", max_rel_error * 100);
     } else {
-        printf("  Max relative error: N/A\n");
+        printf("  Max observed GPU-F32 relative error: N/A\n");
     }
-    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
+    printf("  Enforced reference contract: %s\n", reference_contract_name());
+    print_q8_diagnostic_summary(f32_observation_failures, q8_consistent_f32_failures);
     printf("  Weight extra ptr: %p\n", weight->extra);
 
     // Cleanup
@@ -423,12 +465,14 @@ bool test_q6k_mul_mat_single_token() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 
-    if (mismatches > 0) {
-        printf("  FAIL: %d/%d rows have >1%% error\n", mismatches, test_rows);
+    if (contract_mismatches > 0) {
+        printf("  FAIL: %d/%d rows violate the enforced %s contract\n",
+               contract_mismatches, test_rows, reference_contract_name());
         return false;
     }
 
-    printf("  PASS: All %d test rows match CPU reference within 1%%\n", test_rows);
+    printf("  PASS: All %d test rows satisfy the enforced %s contract\n",
+           test_rows, reference_contract_name());
     return true;
 }
 
@@ -528,12 +572,13 @@ bool test_q6k_mistral_dimensions() {
 
     // Test specific rows (first, middle, last)
     int test_indices[] = {0, 100, 1000, 5000, 10000, n_ff - 1};
-    int mismatches = 0;
-    int q8_consistent_mismatches = 0;
+    int contract_mismatches = 0;
+    int f32_observation_failures = 0;
+    int q8_consistent_f32_failures = 0;
     float max_rel_error = 0.0f;
     bool has_relative_error = false;
 
-    printf("  Sample row comparisons (positive control):\n");
+    printf("  Sample row comparisons (enforced contract plus CPU_F32/Q8 provenance):\n");
     for (int idx : test_indices) {
         if (idx >= n_ff) continue;
 
@@ -541,11 +586,14 @@ bool test_q6k_mistral_dimensions() {
         float cpu_q8_val = cpu_row_dot_q6_K_q8_1(
             &weight_q6k[idx * blocks_per_row], input_q8.data(), n_embd);
         float gpu_val = gpu_output[idx];
+        const float cpu_q8_reference = corrupt_q8_positive_control
+            ? corrupted_q8_reference(cpu_q8_val) : cpu_q8_val;
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_val);
-        float gpu_q8_rel = (std::abs(cpu_q8_val) > 1e-6f) ? gpu_q8_abs / std::abs(cpu_q8_val) : gpu_q8_abs;
+        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_reference);
+        float gpu_q8_rel = (std::abs(cpu_q8_reference) > 1e-6f)
+            ? gpu_q8_abs / std::abs(cpu_q8_reference) : gpu_q8_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
         if (std::abs(cpu_val) > 1e-6f) {
@@ -557,30 +605,34 @@ bool test_q6k_mistral_dimensions() {
         char gpu_q8_rel_text[32];
         char q8_f32_rel_text[32];
         format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
-        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_val, gpu_q8_rel);
+        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_reference, gpu_q8_rel);
         format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
-        const char* status_str = (rel_error <= 0.01f) ? "OK" : "FAIL";
-        printf("    Row %5d: GPU=%10.4f CPU_F32=%10.4f CPU_Q8=%10.4f "
-               "GPU-F32 abs=%9.4f rel=%7s GPU-Q8 abs=%9.4f rel=%7s "
-               "Q8-F32 abs=%9.4f rel=%7s %s\n",
-               idx, gpu_val, cpu_val, cpu_q8_val,
+        const bool contract_match = reference_contract_match(gpu_val, cpu_q8_reference, cpu_val);
+        printf("    Row %5d: GPU=%10.4f CPU_F32=%10.4f CPU_Q8=%10.4f MATCH_REF=%10.4f "
+               "GPU-F32 abs=%9.4f rel=%7s GPU-REF abs=%9.4f rel=%7s "
+               "Q8-F32 abs=%9.4f rel=%7s contract=%s\n",
+               idx, gpu_val, cpu_val, cpu_q8_val, cpu_q8_reference,
                abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
-               q8_f32_abs, q8_f32_rel_text, status_str);
+               q8_f32_abs, q8_f32_rel_text, contract_match ? "OK" : "FAIL");
 
-        if (rel_error > 0.01f) {
-            mismatches++;
+        if (!contract_match) {
+            contract_mismatches++;
+        }
+        if (!gpu_f32_legacy_match(gpu_val, cpu_val)) {
+            f32_observation_failures++;
             if (q8_accounts_for_f32_delta(gpu_val, cpu_q8_val, cpu_val)) {
-                q8_consistent_mismatches++;
+                q8_consistent_f32_failures++;
             }
         }
     }
 
     if (has_relative_error) {
-        printf("  Max relative error: %.4f%%\n", max_rel_error * 100);
+        printf("  Max observed GPU-F32 relative error: %.4f%%\n", max_rel_error * 100);
     } else {
-        printf("  Max relative error: N/A\n");
+        printf("  Max observed GPU-F32 relative error: N/A\n");
     }
-    print_q8_diagnostic_summary(mismatches, q8_consistent_mismatches);
+    printf("  Enforced reference contract: %s\n", reference_contract_name());
+    print_q8_diagnostic_summary(f32_observation_failures, q8_consistent_f32_failures);
 
     // Cleanup
     ggml_backend_buffer_free(weight_buffer);
@@ -588,12 +640,13 @@ bool test_q6k_mistral_dimensions() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 
-    if (mismatches > 0) {
-        printf("  FAIL: %d sample rows have >1%% error\n", mismatches);
+    if (contract_mismatches > 0) {
+        printf("  FAIL: %d sample rows violate the enforced %s contract\n",
+               contract_mismatches, reference_contract_name());
         return false;
     }
 
-    printf("  PASS: All sample rows match CPU reference\n");
+    printf("  PASS: All sample rows satisfy the enforced %s contract\n", reference_contract_name());
     return true;
 }
 
@@ -819,18 +872,39 @@ int main(int argc, char** argv) {
             value = arg + 9;
         } else if (strcmp(arg, "--layout") == 0 && i + 1 < argc) {
             value = argv[++i];
+        } else if (strcmp(arg, "--reference=f32") == 0) {
+            use_f32_positive_control = true;
+            continue;
+        } else if (strcmp(arg, "--reference=q8") == 0) {
+            continue;
+        } else if (strcmp(arg, "--corrupt-q8-reference") == 0) {
+            corrupt_q8_positive_control = true;
+            continue;
         }
         if (value && parse_layout_arg(value, override_layout)) {
             ggml_sycl::test_set_layout_override(override_layout);
             has_override = true;
-            break;
         } else if (value) {
             printf("WARNING: unknown --layout=%s (ignoring)\n", value);
+        } else {
+            printf("WARNING: unknown option %s (ignoring)\n", arg);
         }
+    }
+    if (use_f32_positive_control && corrupt_q8_positive_control) {
+        printf("FAIL: --reference=f32 and --corrupt-q8-reference are independent positive controls; run one at a time\n");
+        if (has_override) {
+            ggml_sycl::test_clear_layout_override();
+        }
+        return 2;
     }
     printf("Environment:\n");
     printf("  Layout override: %s\n", has_override ? layout_mode_name(override_layout) : "(auto)");
     printf("  GGML_SYCL_DISABLE_GRAPH: %s\n", disable_graph ? disable_graph : "(not set, graphs enabled)");
+    printf("  Enforced reference: %s\n", reference_contract_name());
+    printf("  Q8 reference mutation: %s\n", corrupt_q8_positive_control ? "ENABLED (expected RED)" : "disabled");
+    if (use_f32_positive_control) {
+        printf("  F32 oracle positive control: ENABLED (expected RED; known sampled delta 1.444%%)\n");
+    }
     printf("\n");
 
     int passed = 0;
