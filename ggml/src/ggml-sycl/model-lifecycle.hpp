@@ -329,6 +329,9 @@ class Registry {
     void test_block_next_candidate_binding_allocation();
     void test_wait_for_candidate_binding_failure();
     void test_release_candidate_binding_failure();
+    void test_block_backend_context_release();
+    void test_wait_for_backend_context_release();
+    void test_allow_backend_context_release();
 
   private:
     struct txn_state {
@@ -393,6 +396,9 @@ class Registry {
     bool                                                       candidate_binding_failure_barrier_      = false;
     bool                                                       candidate_binding_failure_blocked_      = false;
     bool                                                       candidate_binding_failure_release_      = false;
+    bool                                                       backend_context_release_barrier_        = false;
+    bool                                                       backend_context_release_blocked_        = false;
+    bool                                                       backend_context_release_allowed_        = false;
 };
 
 Registry & global_registry();

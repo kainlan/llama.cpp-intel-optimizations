@@ -450,7 +450,7 @@ checks = {
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "ggml_backend_sycl_shutdown" in backend
     and "g_watchdog_thread.detach()" not in (root / "ggml/src/ggml-sycl/common.cpp").read_text()
-    and "final clean module unload" in
+    and "serialized unload/load/enumeration overlap" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_unload_checked(reg)" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
@@ -543,6 +543,27 @@ checks = {
     and "static const llama_model_sycl_lifecycle_hooks" not in llama
     and "ggml_backend_reg_get_proc_address" in llama
     and "defined(GGML_BACKEND_DL)" in llama,
+    "backend destructor admission tail": backend.index("delete backend;")
+    < backend.rindex("global_registry().release_backend_context();")
+    and "test_block_backend_context_release" in hpp
+    and "checked unload crossed final backend destructor tail" in
+        (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
+    "serialized dynamic registry transactions": "mutable std::recursive_mutex mutex" in
+        (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "backend_snapshot() const" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "device_snapshot() const" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "Serialize dlopen/init/register" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "registry load/enumeration crossed checked-unload transaction" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "NODELETE MoE state reset": "ggml_sycl_reset_moe_module_state()" in backend
+    and "g_moe_hybrid_init_success[d].store(false" in backend
+    and "g_moe_expert_meta.clear()" in backend
+    and "g_expert_groups.clear()" in backend
+    and "g_expert_popularity.clear()" in backend
+    and "g_adaptive_prestage.reset_after_stop()" in backend
+    and "g_expert_predictors[d].reset()" in backend
+    and "NODELETE reload retained model-bound MoE state" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "atomic shutdown reservation": "reserve_shutdown()" in hpp
     and "shutdown_reserved_" in hpp
     and "backend_context_count_" in hpp

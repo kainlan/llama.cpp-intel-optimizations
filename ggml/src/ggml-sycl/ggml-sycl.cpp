@@ -2343,6 +2343,22 @@ struct moe_warmup_state {
         return false;
     }
 
+    void reset() {
+        for (int l = 0; l < MOE_MAX_LAYERS; ++l) {
+            for (int e = 0; e < MOE_MAX_EXPERTS; ++e) {
+                counts[l][e].store(0, std::memory_order_relaxed);
+                epoch_counts[l][e].store(0, std::memory_order_relaxed);
+            }
+        }
+        token_count.store(0, std::memory_order_relaxed);
+        warmup_done.store(false, std::memory_order_relaxed);
+        epoch_token_count.store(0, std::memory_order_relaxed);
+        epoch_number.store(0, std::memory_order_relaxed);
+        reranking_enabled.store(false, std::memory_order_relaxed);
+        n_layers = 0;
+        n_experts = 0;
+    }
+
     // Enable periodic re-ranking (called after initial warmup + prestage completes)
     void enable_reranking() {
         if (rerank_interval <= 0) {
@@ -5549,15 +5565,30 @@ struct adaptive_prestage_state {
     }
 
     void stop() {
-        if (!enabled.load(std::memory_order_acquire)) {
-            return;
-        }
         shutdown.store(true, std::memory_order_release);
         wake_cv.notify_all();
         if (worker_thread.joinable()) {
             worker_thread.join();
         }
         enabled.store(false, std::memory_order_release);
+    }
+
+    void reset_after_stop() {
+        stop();
+        token_count.store(0, std::memory_order_relaxed);
+        shutdown.store(false, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(candidates_mutex);
+        pending_candidates.clear();
+    }
+
+    void test_seed_pending() {
+        std::lock_guard<std::mutex> lock(candidates_mutex);
+        pending_candidates.push_back({ 1, 2, 3, 4 });
+    }
+
+    bool test_pending_empty() {
+        std::lock_guard<std::mutex> lock(candidates_mutex);
+        return pending_candidates.empty();
     }
 
     // Called from inference thread after expert recording.
@@ -74178,8 +74209,9 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     g_split_weight_cache.clear();
     g_split_merge_queue = nullptr;
-    g_sycl_backend_refcount.fetch_sub(1, std::memory_order_acq_rel);
-    ggml_sycl::lifecycle::global_registry().release_backend_context();
+    // Keep backend-context admission held through the entire destructor tail.
+    // Checked unload must remain BUSY while any cleanup below can still call
+    // module code or touch module-owned state.
     // Clean up FP16 weight cache VRAM allocations
     if (g_fp16_cache.has_entries()) {
         GGML_LOG_INFO("[SYCL] FP16 weight cache: freeing (%.1fMB)\n", g_fp16_cache.total_bytes / (1024.0f * 1024.0f));
@@ -74204,6 +74236,8 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     delete sycl_ctx;
     delete backend;
+    g_sycl_backend_refcount.fetch_sub(1, std::memory_order_acq_rel);
+    ggml_sycl::lifecycle::global_registry().release_backend_context();
 }
 
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
@@ -96061,6 +96095,62 @@ void ggml_backend_sycl_cancel_unload(void) {
     ggml_sycl::lifecycle::global_registry().release_shutdown();
 }
 
+static void ggml_sycl_reset_moe_module_state() {
+    // Shutdown reservation proves graph/model quiescence. Clear every
+    // module/model-bound MoE pointer registry and initialization authority so
+    // RTLD_NODELETE reload rebuilds exclusively from the next model.
+    g_adaptive_prestage.reset_after_stop();
+    g_moe_warmup.reset();
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        g_moe_hybrid_init_success[d].store(false, std::memory_order_relaxed);
+        g_expert_predictors[d].reset();
+        g_moe_layer_seq[d].clear();
+        g_moe_expert_vram_reserve[d] = 0;
+    }
+    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);
+    g_moe_multi_gpu_active.store(false, std::memory_order_relaxed);
+    g_moe_expert_split_active.store(false, std::memory_order_relaxed);
+    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);
+    g_prestage_completed.store(false, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+        g_moe_expert_meta.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
+        g_expert_groups.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
+        g_expert_popularity.clear();
+        g_expert_popularity_initialized = false;
+    }
+    g_moe_expert_biases.clear();
+    g_moe_bias_host_copies.clear();
+}
+
+extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
+    g_moe_hybrid_init_success[0].store(true, std::memory_order_relaxed);
+    g_moe_hybrid_init_done.store(true, std::memory_order_relaxed);
+    g_moe_post_pp_preload_pending.store(true, std::memory_order_relaxed);
+    g_prestage_completed.store(true, std::memory_order_relaxed);
+    g_moe_warmup.n_layers = 1;
+    g_adaptive_prestage.test_seed_pending();
+    {
+        std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+        g_moe_expert_meta.push_back({});
+    }
+}
+
+extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
+    std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+    return !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
+           !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
+           !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
+           !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
+           g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty();
+}
+
 void ggml_backend_sycl_shutdown(void) {
     static std::mutex           shutdown_mutex;
     std::lock_guard<std::mutex> lock(shutdown_mutex);
@@ -96089,6 +96179,7 @@ void ggml_backend_sycl_shutdown(void) {
         }
     }
     ggml_sycl::shutdown_unified_cache();
+    ggml_sycl_reset_moe_module_state();
 
     GGML_LOG_INFO("[SYCL-MODULE] shutdown complete\n");
     // The generic loader releases the reservation only after registry/device
@@ -96189,6 +96280,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_seed_moe_module_state") == 0) {
+        return (void *) ggml_backend_sycl_test_seed_moe_module_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_moe_module_state_clean") == 0) {
+        return (void *) ggml_backend_sycl_test_moe_module_state_clean;
     }
     if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_hold_live_update;

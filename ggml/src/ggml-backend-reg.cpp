@@ -6,8 +6,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -92,6 +94,46 @@ namespace fs = std::filesystem;
 
 static std::atomic<bool> g_disable_device_backends{false};
 
+// Deterministic host-test barrier: blocks one checked unload while it owns the
+// registry transaction mutex, proving loads and enumeration readers cannot
+// overlap its vector mutation.
+static std::mutex              g_registry_test_mutex;
+static std::condition_variable g_registry_test_cv;
+static bool                    g_registry_test_block_next_unload = false;
+static bool                    g_registry_test_unload_blocked = false;
+static bool                    g_registry_test_release_unload = false;
+
+extern "C" void ggml_backend_test_block_next_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_block_next_unload = true;
+    g_registry_test_unload_blocked = false;
+    g_registry_test_release_unload = false;
+}
+
+extern "C" void ggml_backend_test_wait_unload_blocked() {
+    std::unique_lock<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_cv.wait(lock, [] { return g_registry_test_unload_blocked; });
+}
+
+extern "C" void ggml_backend_test_release_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_release_unload = true;
+    g_registry_test_cv.notify_all();
+}
+
+static void ggml_backend_test_unload_barrier() {
+    std::unique_lock<std::mutex> lock(g_registry_test_mutex);
+    if (!g_registry_test_block_next_unload) {
+        return;
+    }
+    g_registry_test_unload_blocked = true;
+    g_registry_test_cv.notify_all();
+    g_registry_test_cv.wait(lock, [] { return g_registry_test_release_unload; });
+    g_registry_test_block_next_unload = false;
+    g_registry_test_unload_blocked = false;
+    g_registry_test_release_unload = false;
+}
+
 bool ggml_backend_device_backends_disabled(void) {
     if (g_disable_device_backends.load(std::memory_order_acquire)) {
         return true;
@@ -122,6 +164,7 @@ struct ggml_backend_reg_entry {
 };
 
 struct ggml_backend_registry {
+    mutable std::recursive_mutex mutex;
     std::vector<ggml_backend_reg_entry> backends;
     std::vector<ggml_backend_dev_t> devices;
 
@@ -216,6 +259,7 @@ struct ggml_backend_registry {
     }
 
     void register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         if (!reg) {
             return;
         }
@@ -237,6 +281,7 @@ struct ggml_backend_registry {
     }
 
     void register_device(ggml_backend_dev_t device) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         for (auto & dev : devices) {
             if (dev == device) {
                 return;
@@ -250,6 +295,9 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
+        // Serialize dlopen/init/register with the full checked-unload
+        // reservation/shutdown/erase/completion transaction.
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         dl_handle_ptr handle{ dl_load_library(path) };
         if (!handle) {
             if (!silent) {
@@ -306,6 +354,8 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_unload_result unload_backend(ggml_backend_reg_t reg, bool silent) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        ggml_backend_test_unload_barrier();
         auto it = std::find_if(backends.begin(), backends.end(),
                                [reg](const ggml_backend_reg_entry & entry) { return entry.reg == reg; });
 
@@ -375,6 +425,21 @@ struct ggml_backend_registry {
         }
         return GGML_BACKEND_UNLOAD_OK;
     }
+
+    std::vector<ggml_backend_reg_t> backend_snapshot() const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        std::vector<ggml_backend_reg_t> result;
+        result.reserve(backends.size());
+        for (const auto & entry : backends) {
+            result.push_back(entry.reg);
+        }
+        return result;
+    }
+
+    std::vector<ggml_backend_dev_t> device_snapshot() const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        return devices;
+    }
 };
 
 static ggml_backend_registry & get_reg() {
@@ -406,17 +471,18 @@ static bool striequals(const char * a, const char * b) {
 }
 
 size_t ggml_backend_reg_count() {
-    return get_reg().backends.size();
+    return get_reg().backend_snapshot().size();
 }
 
 ggml_backend_reg_t ggml_backend_reg_get(size_t index) {
-    GGML_ASSERT(index < ggml_backend_reg_count());
-    return get_reg().backends[index].reg;
+    const auto snapshot = get_reg().backend_snapshot();
+    GGML_ASSERT(index < snapshot.size());
+    return snapshot[index];
 }
 
 ggml_backend_reg_t ggml_backend_reg_by_name(const char * name) {
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+    const auto snapshot = get_reg().backend_snapshot();
+    for (ggml_backend_reg_t reg : snapshot) {
         if (striequals(ggml_backend_reg_name(reg), name)) {
             return reg;
         }
@@ -424,19 +490,21 @@ ggml_backend_reg_t ggml_backend_reg_by_name(const char * name) {
     return nullptr;
 }
 
-// Device enumeration
+// Device enumeration. Each reader operates on one immutable vector snapshot,
+// never directly on storage being changed by load/unload.
 size_t ggml_backend_dev_count() {
-    return get_reg().devices.size();
+    return get_reg().device_snapshot().size();
 }
 
 ggml_backend_dev_t ggml_backend_dev_get(size_t index) {
-    GGML_ASSERT(index < ggml_backend_dev_count());
-    return get_reg().devices[index];
+    const auto snapshot = get_reg().device_snapshot();
+    GGML_ASSERT(index < snapshot.size());
+    return snapshot[index];
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_name(const char * name) {
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+    const auto snapshot = get_reg().device_snapshot();
+    for (ggml_backend_dev_t dev : snapshot) {
         if (striequals(ggml_backend_dev_name(dev), name)) {
             return dev;
         }
@@ -445,8 +513,8 @@ ggml_backend_dev_t ggml_backend_dev_by_name(const char * name) {
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+    const auto snapshot = get_reg().device_snapshot();
+    for (ggml_backend_dev_t dev : snapshot) {
         if (ggml_backend_dev_type(dev) == type) {
             return dev;
         }

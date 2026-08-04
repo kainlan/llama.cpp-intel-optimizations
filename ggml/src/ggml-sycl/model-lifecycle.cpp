@@ -1025,7 +1025,15 @@ bool Registry::acquire_backend_context() noexcept {
 
 void Registry::release_backend_context() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (backend_context_release_barrier_) {
+            backend_context_release_blocked_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return backend_context_release_allowed_; });
+            backend_context_release_barrier_ = false;
+            backend_context_release_blocked_ = false;
+            backend_context_release_allowed_ = false;
+        }
         if (backend_context_count_ != 0) {
             --backend_context_count_;
             cv_.notify_all();
@@ -1134,6 +1142,24 @@ void Registry::test_block_next_candidate_binding_allocation() {
 void Registry::test_wait_for_candidate_binding_failure() {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] { return candidate_binding_failure_blocked_; });
+}
+
+void Registry::test_block_backend_context_release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    backend_context_release_barrier_ = true;
+    backend_context_release_blocked_ = false;
+    backend_context_release_allowed_ = false;
+}
+
+void Registry::test_wait_for_backend_context_release() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return backend_context_release_blocked_; });
+}
+
+void Registry::test_allow_backend_context_release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    backend_context_release_allowed_ = true;
+    cv_.notify_all();
 }
 
 void Registry::test_release_candidate_binding_failure() {

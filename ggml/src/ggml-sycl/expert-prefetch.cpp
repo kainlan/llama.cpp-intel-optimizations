@@ -465,6 +465,26 @@ ExpertPredictor::~ExpertPredictor() {
     scores_queue_ = nullptr;
 }
 
+void ExpertPredictor::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    initialized_ = false;
+    n_layers_ = n_experts_ = n_experts_used_ = 0;
+    last_experts_.clear();
+    freq_table_.clear();
+    last_prediction_.clear();
+    gate_weight_ptrs_.clear();
+    n_embd_ = 0;
+    scores_handle_ = {};
+    scores_dev_ = nullptr;
+    scores_dev_n_ = 0;
+    scores_queue_ = nullptr;
+    accuracy_ring_.clear();
+    accuracy_ring_pos_ = accuracy_hits_ = window_total_ = 0;
+    warmup_tokens_ = 0;
+    warmup_layer_max_ = -1;
+    prefetch_disabled_.store(false, std::memory_order_relaxed);
+}
+
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
     if (initialized_) {
         return;

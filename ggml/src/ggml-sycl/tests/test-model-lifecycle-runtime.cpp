@@ -225,6 +225,30 @@ static void shutdown_reservation_state_machine_case() {
             "rollback fixture finalize failed");
 }
 
+static void backend_context_destructor_tail_case() {
+    Registry registry;
+    require(registry.acquire_backend_context(), "backend context admission failed");
+    registry.test_block_backend_context_release();
+    auto final_release = std::async(std::launch::async, [&] { registry.release_backend_context(); });
+    registry.test_wait_for_backend_context_release();
+    require(registry.reserve_shutdown() == error::BUSY,
+            "checked unload crossed final backend destructor tail");
+    registry.test_allow_backend_context_release();
+    final_release.get();
+    require(registry.reserve_shutdown() == error::OK,
+            "completed backend destructor did not balance context admission");
+    registry.release_shutdown();
+
+    // Failed/duplicate releases never underflow the count, and later balanced
+    // admissions still reserve cleanly.
+    registry.release_backend_context();
+    require(registry.acquire_backend_context(), "post-failure context admission failed");
+    registry.release_backend_context();
+    registry.release_backend_context();
+    require(registry.reserve_shutdown() == error::OK, "context admission count underflowed");
+    registry.release_shutdown();
+}
+
 static void allocation_free_live_update_guard_case() {
     Registry registry;
     const ModelToken model = commit_one(registry);
@@ -290,6 +314,7 @@ int main() {
     quarantine_wrapper_busy_overlap_case();
     live_update_ticket_saturation_case();
     shutdown_reservation_state_machine_case();
+    backend_context_destructor_tail_case();
     allocation_free_live_update_guard_case();
     duplicate_publication_case();
     return 0;

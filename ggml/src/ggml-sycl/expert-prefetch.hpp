@@ -277,6 +277,8 @@ class ExpertPredictor {
     //   n_experts:      total experts per MoE layer
     //   n_experts_used: experts activated per token (top-K)
     void init(int n_layers, int n_experts, int n_experts_used);
+    // Quiescent module shutdown reset for RTLD_NODELETE reload.
+    void reset();
 
     // Predict which experts will be needed for a given layer.
     // Returns up to n_experts_used predicted expert indices.

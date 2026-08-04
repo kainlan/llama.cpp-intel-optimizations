@@ -5,6 +5,11 @@
 #include <future>
 #include <thread>
 
+extern "C" void ggml_backend_test_block_next_unload();
+extern "C" void ggml_backend_test_wait_unload_blocked();
+extern "C" void ggml_backend_test_release_unload();
+extern "C" void ggml_backend_sycl_test_seed_moe_module_state();
+extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
@@ -29,6 +34,13 @@ int main() {
         std::fprintf(stderr, "missing registry procedure ggml_backend_sycl_shutdown\n");
         return 1;
     }
+    auto seed_moe_state = reinterpret_cast<decltype(&ggml_backend_sycl_test_seed_moe_module_state)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_moe_module_state"));
+    if (!seed_moe_state) {
+        std::fprintf(stderr, "missing MoE reload-state seed procedure\n");
+        return 1;
+    }
+    seed_moe_state();
     phase("initial module unload with shutdown hook");
     shutdown = nullptr;
     ggml_backend_unload(reg);
@@ -42,6 +54,12 @@ int main() {
     // Generic loader hooks and public SYCL names must both be rebuilt by the
     // reloaded registry. Checking alias identity catches a stale/incomplete
     // proc table before any lifecycle work begins.
+    auto moe_state_clean = reinterpret_cast<decltype(&ggml_backend_sycl_test_moe_module_state_clean)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_moe_module_state_clean"));
+    if (!moe_state_clean || !moe_state_clean()) {
+        std::fprintf(stderr, "NODELETE reload retained model-bound MoE state\n");
+        return 1;
+    }
     auto * generic_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_can_unload");
     auto * named_can_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_can_unload");
     auto * generic_cancel_unload = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload");
@@ -271,11 +289,23 @@ int main() {
         std::fprintf(stderr, "post-shutdown lifecycle reuse left dirty authority/token state\n");
         return 1;
     }
-    phase("final clean module unload");
-    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+    phase("serialized unload/load/enumeration overlap");
+    ggml_backend_test_block_next_unload();
+    auto final_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
+    ggml_backend_test_wait_unload_blocked();
+    auto concurrent_load = std::async(std::launch::async, [&] { return ggml_backend_load(GGML_SYCL_RUNTIME_MODULE); });
+    auto concurrent_enumeration = std::async(std::launch::async, [] { return ggml_backend_dev_count(); });
+    if (concurrent_load.wait_for(std::chrono::milliseconds(20)) != std::future_status::timeout ||
+        concurrent_enumeration.wait_for(std::chrono::milliseconds(20)) != std::future_status::timeout) {
+        std::fprintf(stderr, "registry load/enumeration crossed checked-unload transaction\n");
         return 1;
     }
-    reg = nullptr;
+    ggml_backend_test_release_unload();
+    if (final_unload.get() != GGML_BACKEND_UNLOAD_OK || !(reg = concurrent_load.get())) {
+        std::fprintf(stderr, "serialized unload/reload failed\n");
+        return 1;
+    }
+    (void) concurrent_enumeration.get();
     phase("complete");
 #endif
     return 0;
