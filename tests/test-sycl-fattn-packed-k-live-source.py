@@ -159,7 +159,7 @@ def lifecycle_teardown_contract(source: str) -> bool:
         for index, start_name in enumerate(starts):
             begin = source.index(start_name)
             end = (source.index(starts[index + 1], begin)
-                   if index + 1 < len(starts) else source.index("bool preflight_device", begin))
+                   if index + 1 < len(starts) else source.index("void initialize_production_baseline", begin))
             body = source[begin:end]
             guard = body.index("controlled_gate_release_guard gate_guard")
             if guard > body.index("require("):
@@ -168,7 +168,35 @@ def lifecycle_teardown_contract(source: str) -> bool:
                 packed = body.index("ggml_sycl_fattn_xmx_packed_k packed;")
                 if packed > guard or guard > body.index("q.memset("):
                     return False
-        return True
+            if start_name == "void run_materializer_checkpoint":
+                accepted_needles = (
+                    "retry_fill_before = ggml_sycl::mem_fill_test_profile_error_after_submit_count()",
+                    "set_mem_fill_profile_error_after_submit(true)",
+                    "submit_retry_after_accepted_signal",
+                    "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
+                    "set_mem_fill_profile_error_after_submit(false)",
+                    'require(retry_ok, "same-object materializer retry failed")',
+                )
+                accepted_positions = []
+                accepted_cursor = 0
+                for needle in accepted_needles:
+                    accepted_cursor = body.index(needle, accepted_cursor)
+                    accepted_positions.append(accepted_cursor)
+                if accepted_positions != sorted(accepted_positions):
+                    return False
+        signal_begin = source.index("bool submit_retry_after_accepted_signal")
+        signal_end = source.index("template <typename T>", signal_begin)
+        signal = source[signal_begin:signal_end]
+        signal_needles = (
+            "std::thread retry_thread",
+            "while (!accepted()",
+            "const bool accepted_before_release = accepted();",
+            "gate.release();",
+            "retry_thread.join();",
+            "require(accepted_before_release",
+        )
+        return [signal.index(needle) for needle in signal_needles] == sorted(
+            signal.index(needle) for needle in signal_needles)
     except ValueError:
         return False
 
@@ -201,8 +229,36 @@ def backend_owner_contract(source: str) -> bool:
         return False
 
 
+def baseline_accounting_contract(source: str) -> bool:
+    helper_begin = source.index("void initialize_production_baseline")
+    helper_end = source.index("struct backend_owner", helper_begin)
+    helper = source[helper_begin:helper_end]
+    main = source[source.index("int main(int argc, char ** argv)"):]
+    try:
+        helper_needles = (
+            "ggml_sycl_fattn_xmx_packed_k packed;",
+            "ggml_sycl_fattn_xmx_materialize_packed_k",
+            "launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
+            "packed.ready_event.wait_and_throw();",
+            "packed.reset();",
+            "q.wait_and_throw();",
+            "ggml_sycl::drain_retained_handles(true);",
+        )
+        helper_positions = [helper.index(needle) for needle in helper_needles]
+        initialize = main.index("initialize_production_baseline(ctx, work_queue, device);")
+        baseline = main.index("const size_t registry_baseline", initialize)
+        checkpoint_run = main.index('if (checkpoint.rfind("sidecar-", 0) == 0)', baseline)
+        final_drain = main.index("ggml_sycl::drain_retained_handles(true);", checkpoint_run)
+        first_compare = main.index("unified_cache_arena_non_weight_used(device) == arena_baseline", final_drain)
+        return (helper_positions == sorted(helper_positions) and
+                initialize < baseline < checkpoint_run < final_drain < first_compare)
+    except ValueError:
+        return False
+
+
 def final_retention_drain_contract(source: str) -> bool:
     main = source[source.index("int main(int argc, char ** argv)"):]
+    checkpoint_run = main.index('if (checkpoint.rfind("sidecar-", 0) == 0)')
     needles = (
         "dependency_queue.wait_and_throw();",
         "work_queue.wait_and_throw();",
@@ -213,7 +269,7 @@ def final_retention_drain_contract(source: str) -> bool:
         "alloc_registry::instance().size() == registry_baseline",
     )
     try:
-        positions = [main.index(needle) for needle in needles]
+        positions = [main.index(needle, checkpoint_run) for needle in needles]
         return positions == sorted(positions)
     except ValueError:
         return False
@@ -238,6 +294,9 @@ def live_contract(source: str) -> bool:
         "work_queue_.wait()",
         "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
         "submit_retry_before_gate_release",
+        "submit_retry_after_accepted_signal",
+        "retry fill submission was not accepted before gate release",
+        "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
         "retry submission blocked on an unreleased dependency event",
         "gate.release()",
         "retry_thread.join()",
@@ -279,6 +338,9 @@ def live_contract(source: str) -> bool:
         "size() == registry_baseline",
         "work_queue.wait_and_throw()",
         "ggml_sycl::drain_retained_handles(true)",
+        "initialize_production_baseline(ctx, work_queue, device)",
+        "production baseline materialization failed",
+        "production baseline packed dispatch failed",
     )
     guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
     return (all(needle in source for needle in required) and
@@ -286,6 +348,7 @@ def live_contract(source: str) -> bool:
             source.count(guard_construction) == 3 and
             lifecycle_teardown_contract(source) and
             backend_owner_contract(source) and
+            baseline_accounting_contract(source) and
             final_retention_drain_contract(source))
 
 
@@ -369,6 +432,14 @@ def test_checkpoint_mutations_are_killed() -> None:
     assert not live_contract(LIVE.replace(
         '"final allocation registry count did not return to baseline");\n        }\n        std::printf',
         '"final allocation registry count did not return to baseline");\n        std::printf', 1))
+    assert not live_contract(LIVE.replace(
+        "initialize_production_baseline(ctx, work_queue, device);",
+        "/* missing production-owner warmup */", 1))
+    assert not live_contract(LIVE.replace(
+        "const bool accepted_before_release = accepted();\n    const bool was_unreleased",
+        "const bool accepted_before_release = false;\n    const bool was_unreleased", 1))
+    assert not live_contract(LIVE.replace(
+        "submit_retry_after_accepted_signal(", "submit_retry_before_gate_release(", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -485,6 +556,9 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "backend_owner owner{ ggml_backend_sycl_init(0) }",
         "ggml_backend_sycl_context & ctx = owner.context()",
         "ggml_backend_free(backend)",
+        "initialize_production_baseline(ctx, work_queue, device)",
+        "submit_retry_after_accepted_signal",
+        "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))

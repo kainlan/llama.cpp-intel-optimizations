@@ -321,6 +321,34 @@ bool submit_retry_before_gate_release(controlled_gate & gate, Fn && fn) {
     return result;
 }
 
+template <typename Fn, typename AcceptedFn>
+bool submit_retry_after_accepted_signal(controlled_gate & gate, Fn && fn, AcceptedFn && accepted) {
+    bool               result = false;
+    std::exception_ptr error;
+    std::thread retry_thread([&]() {
+        try {
+            result = fn();
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!accepted() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool accepted_before_release = accepted();
+    const bool was_unreleased = !gate.released();
+    gate.release();
+    retry_thread.join();
+    require(was_unreleased, "controlled gate released before retry fill submission was accepted");
+    require(accepted_before_release, "retry fill submission was not accepted before gate release");
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    return result;
+}
+
 template <typename T>
 T copy_after(sycl::queue & q, const sycl::event & dependency, const T * device_ptr) {
     T host{};
@@ -514,10 +542,14 @@ void run_materializer_checkpoint(const std::string & checkpoint,
             "materializer checkpoint was not observed");
     require(packed.handle.valid() && packed.ptr == retained_ptr, "materializer zero event lost owner");
     set_failpoint(nullptr);
-    require(submit_retry_before_gate_release(gate, [&]() {
-                return ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
-            }),
-            "same-object materializer retry failed");
+    const uint64_t retry_fill_before = ggml_sycl::mem_fill_test_profile_error_after_submit_count();
+    set_mem_fill_profile_error_after_submit(true);
+    const bool retry_ok = submit_retry_after_accepted_signal(
+        gate,
+        [&]() { return ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed); },
+        [&]() { return ggml_sycl::mem_fill_test_profile_error_after_submit_count() > retry_fill_before; });
+    set_mem_fill_profile_error_after_submit(false);
+    require(retry_ok, "same-object materializer retry failed");
     require(packed.ptr == retained_ptr, "materializer retry replaced surviving owner");
     const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
     const sycl::half payload = copy_after(q, packed.ready_event, static_cast<sycl::half *>(packed.ptr) + offset);
@@ -608,6 +640,33 @@ void run_consumer_checkpoint(const std::string & checkpoint,
                 "packed consumer post-submit profiler error lost accepted event or payload");
     }
     packed.reset();
+}
+
+void initialize_production_baseline(ggml_backend_sycl_context & ctx, sycl::queue & q, int device) {
+    device_buffer<sycl::half> qbuf(q, D, device);
+    device_buffer<sycl::half> kbuf(q, D * N_KV, device);
+    device_buffer<sycl::half> vbuf(q, D * N_KV, device);
+    device_buffer<float> out(q, D, device);
+    device_buffer<float> partial_max(q, 1, device);
+    device_buffer<float> partial_sum(q, 1, device);
+    device_buffer<float> partial_out(q, D, device);
+    ggml_sycl_fattn_xmx_packed_k packed;
+    controlled_gate baseline_gate;
+    controlled_gate_release_guard baseline_guard(baseline_gate, q, q);
+
+    q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
+    q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
+    q.memset(vbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
+    fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
+    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, tiny_plan(params), device, &q, &packed),
+            "production baseline materialization failed");
+    require(launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
+                ctx, params, &q, &packed, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1),
+            "production baseline packed dispatch failed");
+    packed.ready_event.wait_and_throw();
+    packed.reset();
+    q.wait_and_throw();
+    ggml_sycl::drain_retained_handles(true);
 }
 
 struct backend_owner {
@@ -707,6 +766,11 @@ int main(int argc, char ** argv) {
         sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler);
         sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler);
         const int device = ctx.device;
+        initialize_production_baseline(ctx, work_queue, device);
+        dependency_queue.wait_and_throw();
+        work_queue.wait_and_throw();
+        context_queue->wait_and_throw();
+        ggml_sycl::drain_retained_handles(true);
         const size_t registry_baseline = ggml_sycl::alloc_registry::instance().size();
         const size_t bytes_baseline = ggml_sycl::alloc_registry::instance().total_device_bytes(device);
         const size_t arena_baseline = ggml_sycl::unified_cache_arena_non_weight_used(device);
