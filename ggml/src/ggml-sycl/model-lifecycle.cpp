@@ -262,6 +262,10 @@ load_effect_lease Registry::acquire_load_effect(LoadTxnId id) noexcept {
         if (id.value == 0 || active_txn_ != id.value || it == txns_.end() || it->second.phase != finish_phase::ACTIVE) {
             return { error::WRONG_TRANSACTION, {}, 0, nullptr };
         }
+        if (fail_next_load_effect_allocation_) {
+            fail_next_load_effect_allocation_ = false;
+            throw std::bad_alloc();
+        }
         uint64_t serial = next_effect_serial_++;
         if (next_effect_serial_ == 0) {
             next_effect_serial_ = 1;
@@ -914,6 +918,11 @@ void Registry::test_fail_next_begin_allocation() {
 void Registry::test_fail_next_dead_allocation() {
     std::lock_guard<std::mutex> lock(mutex_);
     fail_next_dead_allocation_ = true;
+}
+
+void Registry::test_fail_next_load_effect_allocation() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_next_load_effect_allocation_ = true;
 }
 
 void Registry::test_fail_next_candidate_binding_allocation() {

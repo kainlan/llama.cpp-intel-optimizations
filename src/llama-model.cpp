@@ -157,8 +157,11 @@ struct llama_model_sycl_loading_guard {
         if (!active) return;
         ggml_sycl_model_token token = {};
         const auto            rc    = hooks.end(txn, false, outer ? &token : nullptr);
-        if (outer && out_model && token.model_id != 0) {
-            *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        if (outer && out_model) {
+            const bool retain_cleanup = rc == GGML_SYCL_LIFECYCLE_EFFECT_FAILED && token.model_id != 0;
+            *out_model = retain_cleanup ? llama_sycl_model_token{ token.model_id, token.load_txn_id, token.slot,
+                                                                  token.slot_generation } :
+                                          llama_sycl_model_token{};
         }
         if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
             rc != GGML_SYCL_LIFECYCLE_NESTED) {
@@ -174,14 +177,14 @@ struct llama_model_sycl_loading_guard {
         const auto            rc = hooks.end(txn, false, outer ? &rollback_token : nullptr);
         active                   = false;
         if (outer && out_model) {
-            // Any returned owner still requires quarantine/teardown cleanup,
-            // including EFFECT_FAILED. Only a zero rollback is a clean cancel.
-            *out_model = rollback_token.model_id != 0 ?
+            // Normal abort statuses are terminal and own nothing. Retain only
+            // an exact owner returned for failed/quarantined cleanup.
+            *out_model = rc == GGML_SYCL_LIFECYCLE_EFFECT_FAILED && rollback_token.model_id != 0 ?
                              llama_sycl_model_token{ rollback_token.model_id, rollback_token.load_txn_id,
                                                      rollback_token.slot, rollback_token.slot_generation } :
                              llama_sycl_model_token{};
         }
-        if (rollback_token.model_id == 0 && rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
+        if (rollback_token.model_id == 0 && rc != GGML_SYCL_LIFECYCLE_OK && rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
             rc != GGML_SYCL_LIFECYCLE_POISONED && rc != GGML_SYCL_LIFECYCLE_NESTED) {
             throw std::runtime_error(format("SYCL model lifecycle cancel failed: txn=%llu result=%d",
                                             (unsigned long long) txn.id, (int) rc));

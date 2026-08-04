@@ -274,6 +274,7 @@ class Registry {
     void test_fail_next_begin_allocation();
     void test_fail_next_dead_allocation();
     void test_fail_next_candidate_binding_allocation();
+    void test_fail_next_load_effect_allocation();
     void test_block_next_candidate_binding_allocation();
     void test_wait_for_candidate_binding_failure();
     void test_release_candidate_binding_failure();
@@ -332,6 +333,7 @@ class Registry {
     bool                                                       fail_next_begin_allocation_             = false;
     bool                                                       fail_next_dead_allocation_              = false;
     bool                                                       fail_next_candidate_binding_allocation_ = false;
+    bool                                                       fail_next_load_effect_allocation_       = false;
     bool                                                       candidate_binding_failure_barrier_      = false;
     bool                                                       candidate_binding_failure_blocked_      = false;
     bool                                                       candidate_binding_failure_release_      = false;

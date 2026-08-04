@@ -215,7 +215,7 @@ if (BUILD_TESTING)
                   runtime-update-teardown load-effect-drain load-effect-abort-drain
                   cache-effect-drain cache-effect-abort-drain
                   planning-effect-drain planning-effect-abort-drain
-                  identity-effect-drain identity-effect-abort-drain
+                  identity-effect-drain identity-effect-abort-drain load-effect-allocation-failure
                   durable-replay waiter-rollover
                   committing-teardown load-effect-failure-quarantine rollback-effect-replay dead-allocation-failure
                   latest-live-restoration busy-deferred-quarantine restore-failure-quarantine effect-failure-quarantine
@@ -1287,6 +1287,7 @@ set_tests_properties(mmq-xmx-dispatch PROPERTIES
 add_executable(test-unified-cache-fast-path
     tests/test-unified-cache-fast-path.cpp
     unified-cache.cpp
+    model-lifecycle.cpp
     pinned-pool.cpp
 )
 target_include_directories(test-unified-cache-fast-path PRIVATE
@@ -1379,6 +1380,7 @@ endif() # static SYCL backend fixture
 add_executable(test-mem-handle-eviction
     tests/test-mem-handle-eviction.cpp
     unified-cache.cpp
+    model-lifecycle.cpp
     pinned-pool.cpp
     mem-handle.cpp
 )
@@ -1485,6 +1487,7 @@ endif() # static SYCL backend fixture
 add_executable(test-sycl-runtime-alloc
     tests/test-unified-runtime-alloc.cpp
     unified-cache.cpp
+    model-lifecycle.cpp
     pinned-pool.cpp
 )
 target_include_directories(test-sycl-runtime-alloc PRIVATE

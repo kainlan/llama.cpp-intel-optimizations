@@ -64,6 +64,18 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto ended = r.finalize_end(ticket, true);
         require(ended.committed == commit, "drained end result mismatch");
         require(r.begin_outer().code == error::OK, "next load remained blocked after effect drain");
+    } else if (name == "load-effect-allocation-failure") {
+        Registry r;
+        auto     begin = r.begin_outer();
+        require(begin.code == error::OK, "effect allocation test begin failed");
+        r.bind_candidate(begin.txn);
+        r.test_fail_next_load_effect_allocation();
+        auto failed = r.acquire_load_effect(r.bound_candidate());
+        require(!failed && failed.code == error::ALLOCATION_FAILED, "effect allocation failure did not fail closed");
+        auto recovered = r.acquire_load_effect(r.bound_candidate());
+        require(recovered && recovered.owner == begin.token, "effect allocation failure poisoned later admission");
+        recovered = {};
+        require(r.end(begin.txn, false).code == error::MISSING_SUCCESS, "effect allocation failure cleanup failed");
     } else if (name == "inner-failure" || name == "cancel") {
         Registry r(UINT64_MAX, UINT64_MAX, mutation);
         auto     b = r.begin_outer();

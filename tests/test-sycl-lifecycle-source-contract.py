@@ -311,10 +311,12 @@ checks = {
     "CPU speculative lifecycle cancellation": "sycl_model_loading_guard.cancel()" in llama
     and "if (has_sycl_weight_buffer)" in llama
     and "if (sycl_model_backend)" in llama
-    and "*out_model = rollback_token.model_id != 0" in llama
+    and "rc == GGML_SYCL_LIFECYCLE_EFFECT_FAILED && rollback_token.model_id != 0" in llama
     and "for (int i = 0; i < 40; ++i)" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "authority_before_cpu_cancels" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "load effects drain before end": "struct load_effect_lease" in hpp
+    and "test_fail_next_load_effect_allocation" in hpp
+    and "load-effect-allocation-failure" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
     and "acquire_load_effect" in cpp
     and "load_effect_serials.empty()" in cpp
     and "load-effect-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
@@ -356,8 +358,9 @@ checks = {
     and "if (!ggml_sycl_host_row_authorized(it->second.owner))" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
-    and "stamp_pending_owner(entry_it->second)" in cache_cpp
-    and "stamp_pending_owner(it->second)" in cache_cpp,
+    and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
+    and "stamp_pending_owner(it->second, load_effect_guard)" in cache_cpp
+    and "load_effect_state::FAILED" in cache_cpp,
     "nested loading requires exact outer ownership":
         "llama_model_sycl_loading_guard sycl_loading_guard(sycl_model_backend, sycl_model_loading_guard.txn)" in llama
     and "const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
@@ -386,8 +389,11 @@ checks = {
     "no global host registry clear on load": "Host-weight rows are exact-owner state" in backend
     and "ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);" not in
         re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
-    "bound transaction uses exact effect admission": "registry.acquire_load_effect(registry.bound_candidate())" in cache_cpp
+    "bound transaction uses exact effect admission": "const auto txn      = registry.bound_candidate()" in cache_cpp
+    and "registry.acquire_load_effect(txn)" in cache_cpp
     and "lifecycle_find_candidate_placement_plan(effect.owner.load.value)" in cache_cpp,
+    "direct cache tests link lifecycle authority":
+        (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text().count("model-lifecycle.cpp") >= 6,
     "DL SYCL module has private CPU traits and no CPU linkage":
         re.search(r"if \(NOT GGML_BACKEND_DL\).*?target_link_libraries\(ggml-sycl PRIVATE ggml-cpu\).*?endif",
                   (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(), re.S)
@@ -403,7 +409,7 @@ checks = {
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()
     and "pair.second.pending_load_txn_id != load_txn_id" in cache_cpp
     and "acquire_bound_load_effect" in cache_cpp
-    and "registry.acquire_load_effect(registry.bound_candidate())" in cache_cpp
+    and "registry.acquire_load_effect(txn)" in cache_cpp
     and "g_pending_load_txn_id" not in cache_cpp
     and "unified_cache_note_model_load_abort" in backend
     and "unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value)" in backend,
