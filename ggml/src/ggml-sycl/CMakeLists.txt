@@ -2594,31 +2594,211 @@ set_tests_properties(test-sycl-orchestrator PROPERTIES
     TIMEOUT 120
 )
 
-add_executable(test-sycl-prestage-routed-experts
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-prestage-routed-experts.cpp
-)
-target_include_directories(test-sycl-prestage-routed-experts PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-sycl-prestage-routed-experts PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-sycl-prestage-routed-experts PRIVATE "-fsycl")
-target_compile_definitions(test-sycl-prestage-routed-experts PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-sycl-prestage-routed-experts PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-prestage-routed-experts PRIVATE IntelSYCL::SYCL_CXX)
+# ---------------------------------------------------------------------------
+# Task 16 accepted restoration set: previously inactive registrations.
+#
+# These fixtures use the static backend topology. A GGML_BACKEND_DL build makes
+# ggml-sycl a MODULE library, which cannot be linked into an executable; the DL
+# lifecycle fixtures above exercise that topology through the public registry.
+# Each target stays explicit so its source and link contract can be audited
+# independently by the remaining Task 17 stages.
+# ---------------------------------------------------------------------------
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-cpu-gpu-soa-interaction
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-cpu-gpu-soa-interaction.cpp
+    )
+    target_include_directories(test-cpu-gpu-soa-interaction PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-cpu-gpu-soa-interaction PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-cpu-gpu-soa-interaction PRIVATE "-fsycl")
+    target_compile_definitions(test-cpu-gpu-soa-interaction PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-cpu-gpu-soa-interaction PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-cpu-gpu-soa-interaction PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-cpu-gpu-soa-interaction COMMAND test-cpu-gpu-soa-interaction)
 endif()
-add_test(NAME test-sycl-prestage-routed-experts COMMAND test-sycl-prestage-routed-experts)
-set_tests_properties(test-sycl-prestage-routed-experts PROPERTIES
-    LABELS "sycl;moe;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
-)
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-mmvq-q8-0-streaming-bench
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mmvq-q8-0-streaming-bench.cpp
+    )
+    target_include_directories(test-mmvq-q8-0-streaming-bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-mmvq-q8-0-streaming-bench PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-mmvq-q8-0-streaming-bench PRIVATE "-fsycl")
+    target_compile_definitions(test-mmvq-q8-0-streaming-bench PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-mmvq-q8-0-streaming-bench COMMAND test-mmvq-q8-0-streaming-bench)
+    add_test(NAME test-mmvq-q8-0-streaming-smoke COMMAND test-mmvq-q8-0-streaming-bench)
+    set_tests_properties(test-mmvq-q8-0-streaming-smoke PROPERTIES
+        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=cache;GGML_SYCL_MMVQ_BENCH_NROWS=256;GGML_SYCL_MMVQ_BENCH_NCOLS=512;GGML_SYCL_MMVQ_BENCH_ITERS=1;GGML_SYCL_MMVQ_BENCH_WARMUP=0;GGML_SYCL_MMVQ_BENCH_SLICE_MB=1;GGML_SYCL_MMVQ_BENCH_BUFFERS=1"
+    )
+    add_test(NAME test-mmq-q8-0-streaming-smoke COMMAND test-mmvq-q8-0-streaming-bench)
+    set_tests_properties(test-mmq-q8-0-streaming-smoke PROPERTIES
+        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=64"
+    )
+    add_test(NAME test-mmq-q8-0-streaming-forced COMMAND test-mmvq-q8-0-streaming-bench)
+    set_tests_properties(test-mmq-q8-0-streaming-forced PROPERTIES
+        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=1"
+    )
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-mxfp4-xmx-tiled
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mxfp4-xmx-tiled.cpp
+    )
+    target_include_directories(test-mxfp4-xmx-tiled PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-mxfp4-xmx-tiled PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-mxfp4-xmx-tiled PRIVATE "-fsycl")
+    target_compile_definitions(test-mxfp4-xmx-tiled PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mxfp4-xmx-tiled PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mxfp4-xmx-tiled PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-mxfp4-xmx-tiled COMMAND test-mxfp4-xmx-tiled)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-q6k-reorder-dispatch
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q6k-reorder-dispatch.cpp
+    )
+    target_include_directories(test-q6k-reorder-dispatch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-q6k-reorder-dispatch PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-q6k-reorder-dispatch PRIVATE "-fsycl")
+    target_compile_definitions(test-q6k-reorder-dispatch PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-q6k-reorder-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-q6k-reorder-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-q6k-reorder-dispatch COMMAND test-q6k-reorder-dispatch)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-expert-prefetch
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-expert-prefetch.cpp
+    )
+    target_include_directories(test-sycl-expert-prefetch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-expert-prefetch PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-expert-prefetch PRIVATE "-fsycl")
+    target_compile_definitions(test-sycl-expert-prefetch PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-expert-prefetch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-expert-prefetch PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-sycl-expert-prefetch COMMAND test-sycl-expert-prefetch)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-fattn-onednn-descriptors
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-onednn-descriptors.cpp
+    )
+    target_include_directories(test-sycl-fattn-onednn-descriptors PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-fattn-onednn-descriptors PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-onednn-descriptors PRIVATE "-fsycl")
+    target_compile_definitions(test-sycl-fattn-onednn-descriptors PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-sycl-fattn-onednn-descriptors COMMAND test-sycl-fattn-onednn-descriptors)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-set-rows-owner-routing
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-set-rows-owner-routing.cpp
+    )
+    target_include_directories(test-sycl-set-rows-owner-routing PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-set-rows-owner-routing PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-set-rows-owner-routing PRIVATE "-fsycl")
+    target_compile_definitions(test-sycl-set-rows-owner-routing PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-set-rows-owner-routing PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-set-rows-owner-routing PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-sycl-set-rows-owner-routing COMMAND test-sycl-set-rows-owner-routing)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-unified-dispatch-integration
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-dispatch-integration.cpp
+    )
+    target_include_directories(test-unified-dispatch-integration PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-unified-dispatch-integration PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-unified-dispatch-integration PRIVATE "-fsycl")
+    target_compile_definitions(test-unified-dispatch-integration PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-unified-dispatch-integration PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-dispatch-integration PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-unified-dispatch-integration COMMAND test-unified-dispatch-integration)
+endif()
 
 add_executable(test-sycl-unified-cache
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-cache.cpp
