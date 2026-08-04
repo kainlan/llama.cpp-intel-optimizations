@@ -32,6 +32,7 @@ endforeach()
 foreach(required
         "partial_lock(partial_mutex_);"
         "partial_cache_.emplace(key"
+        "ggml_sycl_reorder_expected_size_for_test(type, ncols, row_count"
         "mem_copy(partial_handle, partial_src"
         "lookup_copy(ptr)")
     string(FIND "${cache_source}" "${required}" pos)
@@ -39,6 +40,12 @@ foreach(required
         message(FATAL_ERROR "missing cache source contract: ${required}")
     endif()
 endforeach()
+
+string(FIND "${cache_source}" "ggml_sycl_reorder_expected_size_for_test(type, ncols, row_count" shape_pos)
+string(FIND "${cache_source}" "ggml_row_size(type, ncols)" row_size_pos)
+if(NOT shape_pos LESS row_size_pos)
+    message(FATAL_ERROR "partial-row block validation must precede ggml_row_size")
+endif()
 
 string(FIND "${cache_source}" "partial_lock(partial_mutex_);" lock_pos)
 string(FIND "${cache_source}" "partial_cache_.emplace(key" publish_pos)
@@ -51,7 +58,9 @@ foreach(required
         "ggml_sycl_set_async_mem_for_test(true);"
         "Deliberately out-of-order"
         "registry.lookup_copy"
-        "registry-authoritative arena suballocation")
+        "registry-authoritative arena suballocation"
+        "ggml_sycl_reorder_expected_size_for_test(GGML_TYPE_Q4_0, 31"
+        "Normalize the initial state accepted by the concurrent reader")
     string(FIND "${fixture}" "${required}" pos)
     if(pos EQUAL -1)
         message(FATAL_ERROR "missing fixture contract: ${required}")

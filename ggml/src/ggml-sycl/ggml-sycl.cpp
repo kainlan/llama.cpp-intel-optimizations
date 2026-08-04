@@ -42610,8 +42610,8 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
     return true;
 }
 
-static bool ggml_sycl_reorder_geometry_valid(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {
-    if (ncols <= 0 || nrows <= 0 || ncols > std::numeric_limits<int>::max() ||
+static bool ggml_sycl_reorder_expected_size(ggml_type type, int64_t ncols, int64_t nrows, size_t * size) {
+    if (!size || ncols <= 0 || nrows <= 0 || ncols > std::numeric_limits<int>::max() ||
         nrows > std::numeric_limits<int>::max()) {
         return false;
     }
@@ -42653,12 +42653,25 @@ static bool ggml_sycl_reorder_geometry_valid(ggml_type type, int64_t ncols, int6
         return false;
     }
     const size_t blocks = blocks_per_row * rows;
-    return blocks <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
-           blocks <= std::numeric_limits<size_t>::max() / block_bytes && size == blocks * block_bytes;
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        blocks > std::numeric_limits<size_t>::max() / block_bytes) {
+        return false;
+    }
+    *size = blocks * block_bytes;
+    return true;
+}
+
+static bool ggml_sycl_reorder_geometry_valid(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {
+    size_t expected_size = 0;
+    return ggml_sycl_reorder_expected_size(type, ncols, nrows, &expected_size) && size == expected_size;
 }
 
 void ggml_sycl_set_async_mem_for_test(bool enabled) {
     g_ggml_sycl_use_async_mem_op = enabled ? 1 : 0;
+}
+
+bool ggml_sycl_reorder_expected_size_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t * size) {
+    return ggml_sycl_reorder_expected_size(type, ncols, nrows, size);
 }
 
 bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {

@@ -2630,17 +2630,19 @@ if (NOT GGML_BACKEND_DL)
         ENVIRONMENT "GGML_SYCL_VRAM_ARENA=0;GGML_SYCL_ASYNC_MEM=1"
         RUN_SERIAL TRUE
     )
-    add_test(NAME test-sycl-soa-reorder-source-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
-            -DCACHE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/unified-cache.cpp
-            -DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-cpu-gpu-soa-interaction.cpp
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-soa-reorder-source-contract.cmake
-    )
-    set_tests_properties(test-sycl-soa-reorder-source-contract PROPERTIES
-        LABELS "sycl;source-contract;soa;restored"
-    )
 endif()
+
+# Source-only contract: valid for both static and dynamic backend topologies.
+add_test(NAME test-sycl-soa-reorder-source-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
+        -DCACHE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/unified-cache.cpp
+        -DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-cpu-gpu-soa-interaction.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-soa-reorder-source-contract.cmake
+)
+set_tests_properties(test-sycl-soa-reorder-source-contract PROPERTIES
+    LABELS "sycl;source-contract;soa;restored"
+)
 
 if (NOT GGML_BACKEND_DL)
     add_executable(test-mmvq-q8-0-streaming-bench

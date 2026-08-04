@@ -1630,6 +1630,7 @@ bool reorder_rows_to_soa(uint8_t *       data_device,
 
 // Host-only contract hooks for raw reorder validation tests.
 void ggml_sycl_set_async_mem_for_test(bool enabled);
+bool ggml_sycl_reorder_expected_size_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t * size);
 bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size);
 bool ggml_sycl_reorder_pointer_contract_for_test(bool                  registered,
                                                  ggml_sycl::alloc_tier registered_tier,

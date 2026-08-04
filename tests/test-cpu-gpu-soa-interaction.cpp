@@ -155,8 +155,10 @@ bool test_reorder_validation_contracts() {
             return false;
         }
     }
-    const int64_t beyond_int = static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
-    if (ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_Q4_0, beyond_int, 1, sizeof(block_q4_0)) ||
+    size_t        malformed_size = 0;
+    const int64_t beyond_int     = static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
+    if (ggml_sycl_reorder_expected_size_for_test(GGML_TYPE_Q4_0, 31, 1, &malformed_size) ||
+        ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_Q4_0, beyond_int, 1, sizeof(block_q4_0)) ||
         ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_Q4_0, QK4_0, beyond_int, sizeof(block_q4_0)) ||
         ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_F32, QK4_0, 1, sizeof(block_q4_0))) {
         fprintf(stderr, "FAIL: reorder geometry accepted non-representable dimensions or unsupported type\n");
@@ -200,6 +202,9 @@ bool test_reorder_validation_contracts() {
         return false;
     }
 
+    // Normalize the initial state accepted by the concurrent reader before
+    // either thread starts; device 1 above was only for the mismatch check.
+    registry.register_alloc(registered_bytes.data(), registered_bytes.size(), 7, ggml_sycl::alloc_type::DEVICE);
     std::atomic<bool> registry_ok{ true };
     std::thread writer([&] {
         for (int i = 0; i < 10000; ++i) {

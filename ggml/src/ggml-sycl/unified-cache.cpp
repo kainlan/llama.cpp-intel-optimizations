@@ -11666,12 +11666,15 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         return existing->second.ptr;
     }
 
-    const size_t row_bytes = ggml_row_size(type, ncols);
-    if (row_bytes == 0 || static_cast<uint64_t>(row_count) > std::numeric_limits<size_t>::max() / row_bytes) {
+    // Validate quant block divisibility and checked shape products before
+    // ggml_row_size(), whose quantized path asserts on malformed ncols.
+    size_t partial_bytes = 0;
+    if (!ggml_sycl_reorder_expected_size_for_test(type, ncols, row_count, &partial_bytes)) {
         return nullptr;
     }
-    const size_t partial_bytes = static_cast<size_t>(row_count) * row_bytes;
-    if (!ggml_sycl_reorder_geometry_valid_for_test(type, ncols, row_count, partial_bytes)) {
+    const size_t row_bytes = ggml_row_size(type, ncols);
+    if (row_bytes == 0 || static_cast<size_t>(row_count) > std::numeric_limits<size_t>::max() / row_bytes ||
+        static_cast<size_t>(row_count) * row_bytes != partial_bytes) {
         return nullptr;
     }
 
