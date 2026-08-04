@@ -4595,17 +4595,17 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
     return dropped;
 }
 
-void unified_cache::register_host_expert(ggml_sycl_cache_id key,
+bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
                                          void *             ptr,
                                          size_t             size,
                                          ggml_layout_mode   layout,
                                          mem_handle *       out_handle) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
-        return;
+        return false;
     }
     if (!planned_materialization_allowed("register_host_expert", key, layout, __func__)) {
-        return;
+        return false;
     }
 
     const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
@@ -4646,7 +4646,7 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
                 goto publish_host_expert_direct;
             }
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_expert")) {
-                return;
+                return false;
             }
             entries_.erase(old);
         }
@@ -4700,7 +4700,7 @@ publish_host_expert_direct:
         }
         direct_handle.reset();
         if (!cache_inserted) {
-            return;
+            return false;
         }
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
         unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
@@ -4712,20 +4712,22 @@ publish_host_expert_direct:
         if (id != id_to_key_.end() && id->second == cache_key) {
             id_to_key_.erase(id);
         }
+        return false;
     }
+    return true;
 }
 
-void unified_cache::register_host_weight(ggml_sycl_cache_id key,
+bool unified_cache::register_host_weight(ggml_sycl_cache_id key,
                                          void *             ptr,
                                          size_t             size,
                                          ggml_layout_mode   layout,
                                          mem_handle *       out_handle) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
-        return;
+        return false;
     }
     if (!planned_materialization_allowed("register_host_weight", key, layout, __func__)) {
-        return;
+        return false;
     }
 
     const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
@@ -4766,7 +4768,7 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
                 goto publish_host_weight_direct;
             }
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_weight")) {
-                return;
+                return false;
             }
             entries_.erase(old);
         }
@@ -4820,7 +4822,7 @@ publish_host_weight_direct:
         }
         direct_handle.reset();
         if (!cache_inserted) {
-            return;
+            return false;
         }
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
         unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
@@ -4832,7 +4834,9 @@ publish_host_weight_direct:
         if (id != id_to_key_.end() && id->second == cache_key) {
             id_to_key_.erase(id);
         }
+        return false;
     }
+    return true;
 }
 
 bool unified_cache::is_cached(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) const {

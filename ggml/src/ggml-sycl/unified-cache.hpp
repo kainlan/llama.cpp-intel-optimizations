@@ -1891,7 +1891,7 @@ class unified_cache {
     // Register a host-arena pointer directly as a HOST_PINNED expert entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned experts.
-    void register_host_expert(ggml_sycl_cache_id key,
+    bool register_host_expert(ggml_sycl_cache_id key,
                               void *             ptr,
                               size_t             size,
                               ggml_layout_mode   layout,
@@ -1900,7 +1900,7 @@ class unified_cache {
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned dense weights.
-    void register_host_weight(ggml_sycl_cache_id key,
+    bool register_host_weight(ggml_sycl_cache_id key,
                               void *             ptr,
                               size_t             size,
                               ggml_layout_mode   layout,

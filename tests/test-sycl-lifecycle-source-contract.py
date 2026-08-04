@@ -163,7 +163,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 8,
+        "ggml_sycl_global_plan_snapshot": 7,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -362,9 +362,15 @@ checks = {
     and "finisher_effect_serials.empty()" in cpp
     and "finisher-effect-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
     "host cache registration uses exact guard":
-        cache_cpp.count("void unified_cache::register_host_") >= 2
+        cache_cpp.count("bool unified_cache::register_host_") >= 2
     and cache_cpp.count("stamp_pending_owner(old->second, load_effect_guard)") >= 2
     and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
+    "preload retains candidate identity": "const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot()" in backend
+    and "ggml_sycl_global_plan_snapshot()" not in re.search(
+        r"static void ggml_sycl_preload_model_weights\(\).*?\n\}", backend, re.S).group(0)
+    and "SYCL host expert registration failed during preload" in backend
+    and "SYCL host weight registration failed during preload" in backend
+    and "unified_free(dn_h)" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp

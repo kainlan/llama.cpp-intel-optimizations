@@ -24661,11 +24661,12 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
                 // (allocated by ggml_backend_sycl_host_buffer_type_alloc_buffer at model load).
                 // Register in-place — no second allocation, no memcpy.
                 ggml_sycl::mem_handle handle;
-                cache->register_host_expert(base_key, const_cast<void *>(static_cast<const void *>(expert_aos)),
-                                            expert_size, GGML_LAYOUT_AOS, &handle);
-                if (handle.resolve().ptr) {
-                    extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle));
+                if (!cache->register_host_expert(base_key, const_cast<void *>(static_cast<const void *>(expert_aos)),
+                                                 expert_size, GGML_LAYOUT_AOS, &handle) ||
+                    !handle.resolve().ptr) {
+                    throw std::runtime_error("SYCL host expert registration failed during preload");
                 }
+                extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle));
                 host_registered++;
                 continue;
             }
@@ -24708,9 +24709,11 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 }
 
 static void ggml_sycl_preload_model_weights() {
-    const auto   global_plan_snapshot = ggml_sycl_global_plan_snapshot();
-    const auto   global_plan_owner    = global_plan_snapshot ? global_plan_snapshot->plan : nullptr;
-    const auto * global_plan          = global_plan_owner.get();
+    // Finisher authority keeps B's candidate immutable for the whole preload;
+    // first load must not require a global plan and A->B must never route by A.
+    const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot();
+    const auto   preload_plan_owner    = preload_plan_snapshot ? preload_plan_snapshot->plan : nullptr;
+    const auto * global_plan           = preload_plan_owner.get();
 
     // Initialize CPU dispatch buffers once at model load time
     // This eliminates per-token resize() calls during inference
@@ -25311,12 +25314,15 @@ static void ggml_sycl_preload_model_weights() {
                                                      host_handle.all_segments[0].size :
                                                      (host_ptr ? expert_size : 0);
                         if (host_ptr && seg0_size < expert_size) {
-                            host_ptr = nullptr;
+                            ggml_sycl::unified_free(host_handle);
+                            host_handle = {};
+                            host_ptr    = nullptr;
                         }
 
                         if (host_ptr) {
                             ggml_sycl::mem_handle host_copy_handle = host_handle.as_mem_handle();
                             if (!host_copy_handle.valid()) {
+                                ggml_sycl::unified_free(host_handle);
                                 return false;
                             }
                             if (tensor_source_is_device) {
@@ -25338,10 +25344,18 @@ static void ggml_sycl_preload_model_weights() {
                         }
 
                         bool remembered_handle = false;
+                        bool allocation_transferred = false;
                         for (const ggml_sycl_cache_id & key : keys) {
                             ggml_sycl::mem_handle handle;
-                            cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle);
-                            if (!remembered_handle && handle.resolve().ptr) {
+                            if (!cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS, &handle) ||
+                                !handle.resolve().ptr) {
+                                if (!allocation_transferred && host_handle.ptr) {
+                                    ggml_sycl::unified_free(host_handle);
+                                }
+                                throw std::runtime_error("SYCL host expert registration failed during preload");
+                            }
+                            allocation_transferred = true;
+                            if (!remembered_handle) {
                                 extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
                                                                    std::move(handle));
                                 remembered_handle = true;
@@ -25816,15 +25830,22 @@ static void ggml_sycl_preload_model_weights() {
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, tensor->data, nbytes);
                                         ggml_sycl::mem_handle handle;
-                                        cache->register_host_weight(host_key, arena_ptr, nbytes, GGML_LAYOUT_AOS,
-                                                                    &handle);
+                                        if (!cache->register_host_weight(host_key, arena_ptr, nbytes, GGML_LAYOUT_AOS,
+                                                                         &handle)) {
+                                            ggml_sycl::unified_free(dn_h);
+                                            throw std::runtime_error(
+                                                "SYCL host weight registration failed during preload");
+                                        }
+                                        auto resolved = handle.resolve(device);
+                                        if (!resolved.ptr) {
+                                            ggml_sycl::unified_free(dn_h);
+                                            throw std::runtime_error(
+                                                "SYCL host weight registration returned no ownership handle");
+                                        }
                                         if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-                                            auto resolved = handle.resolve(device);
-                                            if (resolved.ptr) {
-                                                extra->data_handle[device]      = std::move(handle);
-                                                extra->data_device[device]      = resolved.ptr;
-                                                extra->data_device_size[device] = nbytes;
-                                            }
+                                            extra->data_handle[device]      = std::move(handle);
+                                            extra->data_device[device]      = resolved.ptr;
+                                            extra->data_device_size[device] = nbytes;
                                         }
                                         GGML_SYCL_DEBUG("[S1-PRELOAD] host-arena weight: %s (%.1f MB)\n", tensor->name,
                                                         nbytes / (1024.0f * 1024.0f));
@@ -25833,9 +25854,8 @@ static void ggml_sycl_preload_model_weights() {
                                             "[S1-PRELOAD] host-planned dense allocation failed for %s (%.1f MB); "
                                             "aborting before inference with incomplete host placement\n",
                                             tensor->name ? tensor->name : "?", nbytes / (1024.0 * 1024.0));
-                                        GGML_ABORT(
-                                            "[S1-PRELOAD] planned host dense materialization failed; aborting before "
-                                            "inference");
+                                        throw std::runtime_error(
+                                            "S1 preload planned host dense materialization failed");
                                     }
                                 }
                             }
