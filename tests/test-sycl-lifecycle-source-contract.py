@@ -653,6 +653,8 @@ checks = {
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "const auto settle_state" in registry_backend,
     "completion, callback, arena retry and renamed DSO coverage": "shutdown_completed_" in hpp
+    and "g_sycl_module_inactive.store(true, std::memory_order_release)" in backend
+    and backend.count("if (!ggml_sycl_mutation_admitted())") >= 8
     and "complete_shutdown()" in backend
     and "ggml_backend_reactivate" in backend
     and "device_call_guard" in (root / "ggml/src/ggml-backend.cpp").read_text()

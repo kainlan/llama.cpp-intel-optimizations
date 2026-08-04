@@ -9362,6 +9362,13 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
 }
 
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
+// TU-local so NODELETE cannot route completion and saved mutation procedures
+// through different interposed Registry symbols. Only loader reactivation opens it.
+static std::atomic<bool> g_sycl_module_inactive{ false };
+
+static bool ggml_sycl_mutation_admitted() noexcept {
+    return !g_sycl_module_inactive.load(std::memory_order_acquire);
+}
 
 static bool ggml_sycl_quarantine_enqueue(ggml_sycl_model_token token) noexcept {
     return g_sycl_quarantine_queue.enqueue(ggml_sycl_cpp_token(token));
@@ -9374,6 +9381,7 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
@@ -9409,6 +9417,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(ggml_sycl_model_token token) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
         const auto owner = ggml_sycl_cpp_token(token);
         if (owner.model.value == 0 || owner.load.value == 0 ||
@@ -9668,6 +9677,7 @@ static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!txn) {
         return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
     }
@@ -9749,6 +9759,7 @@ extern "C" void ggml_backend_sycl_test_release_candidate_binding_failure() {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry * registry         = nullptr;
     bool                             candidate_pushed = false;
     bool                             depth_entered    = false;
@@ -9847,6 +9858,7 @@ class ggml_sycl_load_candidate_end_scope {
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
     ggml_sycl::lifecycle::finish_ticket ticket;
     bool                                placement_inserted = false;
@@ -10695,6 +10707,7 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
         const ggml_sycl::lifecycle::ModelToken token{
             { model.model_id },
@@ -11574,6 +11587,7 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
                                                                   bool                                 early) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -11707,6 +11721,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            uint32_t              n_ctx,
                                                                            uint32_t              n_ubatch,
                                                                            uint32_t              n_seq_max) {
+    if (!ggml_sycl_mutation_admitted()) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!backend || !backend->context || n_ctx == 0) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -96088,7 +96103,8 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 };
 
 bool ggml_backend_sycl_can_unload(void) {
-    return ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK;
+    return ggml_sycl_mutation_admitted() &&
+           ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK;
 }
 
 void ggml_backend_sycl_cancel_unload(void) {
@@ -96096,12 +96112,16 @@ void ggml_backend_sycl_cancel_unload(void) {
 }
 
 void ggml_backend_sycl_complete_unload(void) {
+    // Close the non-interposable admission gate before releasing the shutdown
+    // reservation. Saved DSO procedure pointers must fail from this point on.
+    g_sycl_module_inactive.store(true, std::memory_order_release);
     ggml_sycl::lifecycle::global_registry().complete_shutdown();
 }
 
 void ggml_backend_sycl_reactivate(void) {
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
+    g_sycl_module_inactive.store(false, std::memory_order_release);
 }
 
 static void ggml_sycl_reset_moe_module_state() {
@@ -96422,6 +96442,7 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
 }
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
+    if (!ggml_sycl_mutation_admitted()) return nullptr;
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
     auto & lifecycle_registry = ggml_sycl::lifecycle::global_registry();
     if (!lifecycle_registry.acquire_backend_context()) {

@@ -297,12 +297,22 @@ struct ggml_backend_registry {
             return false;
         }
         try {
+            bool needs_reactivation = false;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 const auto known = std::find_if(backends.begin(), backends.end(),
                     [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
                 if (known != backends.end() && (*known)->state != ggml_backend_reg_state::REMOVED) {
                     return false;
+                }
+                needs_reactivation = known != backends.end();
+            }
+            if (needs_reactivation && reg->iface.get_proc_address) {
+                using reactivate_fn = void (*)();
+                auto reactivate = reinterpret_cast<reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_reactivate"));
+                if (reactivate) {
+                    reactivate();
                 }
             }
             // Stage all plugin-owned metadata before taking the publication lock.
@@ -430,12 +440,6 @@ struct ggml_backend_registry {
             ggml_backend_reg_t reg = backend_init_fn();
             if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
                 return nullptr;
-            }
-            using reactivate_fn = void (*)();
-            auto reactivate = reinterpret_cast<reactivate_fn>(
-                reg->iface.get_proc_address ? reg->iface.get_proc_address(reg, "ggml_backend_reactivate") : nullptr);
-            if (reactivate) {
-                reactivate();
             }
             if (!register_backend(reg, std::move(handle), module_path)) {
                 return nullptr;

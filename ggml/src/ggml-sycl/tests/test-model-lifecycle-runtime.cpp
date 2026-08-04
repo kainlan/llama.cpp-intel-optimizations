@@ -223,6 +223,19 @@ static void shutdown_reservation_state_machine_case() {
     require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted ROLLING_BACK load");
     require(registry.finalize_end(rolling, true).code == error::MISSING_SUCCESS,
             "rollback fixture finalize failed");
+
+    require(registry.reserve_shutdown() == error::OK, "completion reservation failed");
+    registry.complete_shutdown();
+    require(registry.shutdown_reserved(), "completed shutdown did not remain inactive");
+    require(registry.begin_outer().code == error::LOAD_BUSY,
+            "completed shutdown reopened mutation admission without reactivation");
+    require(!registry.acquire_backend_context(),
+            "completed shutdown reopened backend admission without reactivation");
+    registry.reactivate();
+    const auto reactivated = registry.begin_outer();
+    require(reactivated.code == error::OK, "explicit registry reactivation did not reopen admission");
+    require(registry.end(reactivated.txn, false).code == error::MISSING_SUCCESS,
+            "reactivation cleanup failed");
 }
 
 static void backend_context_destructor_tail_case() {
