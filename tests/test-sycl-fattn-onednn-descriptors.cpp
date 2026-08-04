@@ -1,6 +1,11 @@
+#include "ggml-backend-impl.h"
 #include "ggml-sycl/fattn-onednn.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +150,18 @@ template <typename T> static T * malloc_device_copy(sycl::queue & q, const std::
     }
 }
 
+struct backend_owner {
+    ggml_backend_t backend = nullptr;
+
+    ~backend_owner() {
+        if (backend) {
+            ggml_backend_free(backend);
+        }
+    }
+
+    ggml_backend_sycl_context & context() const { return *static_cast<ggml_backend_sycl_context *>(backend->context); }
+};
+
 struct case_device_buffers {
     sycl::queue & q;
     sycl::half *  Q    = nullptr;
@@ -280,7 +297,7 @@ static bool run_case(ggml_backend_sycl_context & ctx, const case_shape & sh) {
     return true;
 }
 
-int main() {
+static int run_descriptor_tests() {
     // Keep progress/final markers deterministic even when CTest redirects output.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -313,10 +330,16 @@ int main() {
 
     bool ok = true;
     try {
-        // A backend owns one context for its whole lifetime. Reusing it also
-        // keeps oneDNN's compiled partitions, streams, and engines alive until
-        // every case has drained and released its per-case USM buffers.
-        ggml_backend_sycl_context ctx(0);
+        // Use the production backend owner: ggml_backend_free performs the
+        // global queue/pool drains before deleting its context. Direct stack
+        // construction bypasses that ordering and is not a supported backend
+        // lifetime.
+        backend_owner owner{ ggml_backend_sycl_init(0) };
+        if (!owner.backend) {
+            std::fprintf(stderr, "FAIL: could not initialize SYCL backend\n");
+            return 1;
+        }
+        ggml_backend_sycl_context & ctx = owner.context();
         ok &= run_case(ctx, { "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16 });
         ok &= run_case(ctx, { "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16 });
         ok &= run_case(ctx, { "GQA-5D-materialized", 4, 2, 16, 8, 8, 19, 21 });
@@ -331,6 +354,41 @@ int main() {
     }
     std::printf("SYCL oneDNN FA descriptor tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+int main() {
+    // Run SYCL in a fresh child so waitpid gives an unambiguous mutation proof:
+    // the numerical failure must be WIFEXITED with status 1, never a signal.
+    const pid_t child = fork();
+    if (child < 0) {
+        std::fprintf(stderr, "FAIL: fork failed: errno=%d\n", errno);
+        return 2;
+    }
+    if (child == 0) {
+        const int rc = run_descriptor_tests();
+        std::fflush(nullptr);
+        _exit(rc);
+    }
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            std::fprintf(stderr, "FAIL: waitpid failed: errno=%d\n", errno);
+            return 2;
+        }
+    }
+    if (WIFSIGNALED(status)) {
+        std::fprintf(stderr, "FAIL: descriptor child terminated by signal %d\n", WTERMSIG(status));
+        return 2;
+    }
+    if (!WIFEXITED(status)) {
+        std::fprintf(stderr, "FAIL: descriptor child did not exit normally\n");
+        return 2;
+    }
+
+    const int rc = WEXITSTATUS(status);
+    std::fprintf(stderr, "Descriptor child WIFEXITED status=%d\n", rc);
+    return rc;
 }
 
 #endif
