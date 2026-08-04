@@ -30,11 +30,15 @@ using registry_begin_fn = bool (*)(ggml_backend_reg_t);
 using registry_end_fn   = void (*)(ggml_backend_reg_t);
 using device_begin_fn   = bool (*)(ggml_backend_dev_t);
 using device_end_fn     = void (*)(ggml_backend_dev_t);
+using device_owner_acquire_fn = bool (*)(ggml_backend_dev_t);
+using device_owner_release_fn = void (*)(ggml_backend_dev_t);
 
 std::atomic<registry_begin_fn> g_registry_begin{ nullptr };
 std::atomic<registry_end_fn>   g_registry_end{ nullptr };
 std::atomic<device_begin_fn>   g_device_begin{ nullptr };
 std::atomic<device_end_fn>     g_device_end{ nullptr };
+std::atomic<device_owner_acquire_fn> g_device_owner_acquire{ nullptr };
+std::atomic<device_owner_release_fn> g_device_owner_release{ nullptr };
 
 struct device_call_guard {
     ggml_backend_dev_t device;
@@ -51,6 +55,8 @@ struct device_call_guard {
 }
 
 void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
+    g_device_owner_release.store(iface ? iface->device_owner_release : nullptr, std::memory_order_release);
+    g_device_owner_acquire.store(iface ? iface->device_owner_acquire : nullptr, std::memory_order_release);
     g_registry_end.store(iface ? iface->registry_end : nullptr, std::memory_order_release);
     g_device_end.store(iface ? iface->device_end : nullptr, std::memory_order_release);
     g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
@@ -160,8 +166,16 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .owner_device = */ buft ? buft->device : nullptr,
+        /* .owner_lease  = */ false
     };
+    const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
+    if (buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
+        delete buffer;
+        return nullptr;
+    }
+    buffer->owner_lease = buffer->owner_device && acquire_owner;
 
     {
         std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
@@ -180,8 +194,14 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    if (buffer->iface.free_buffer != NULL) {
+    device_call_guard callback_guard(buffer->owner_device);
+    if (callback_guard && buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
+    }
+    if (buffer->owner_lease) {
+        const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
+        if (release_owner) release_owner(buffer->owner_device);
+        buffer->owner_lease = false;
     }
     {
         std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
@@ -212,6 +232,8 @@ void * ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
         return NULL;
     }
 
+    device_call_guard callback_guard(buffer->owner_device);
+    if (!callback_guard) return nullptr;
     void * base = buffer->iface.get_base(buffer);
 
     GGML_ASSERT(base != NULL && "backend buffer base cannot be NULL");
@@ -221,6 +243,8 @@ void * ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 enum ggml_status ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     GGML_ASSERT(buffer);
+    device_call_guard callback_guard(buffer->owner_device);
+    if (!callback_guard) return GGML_STATUS_FAILED;
     // init_tensor is optional
     if (buffer->iface.init_tensor) {
         return buffer->iface.init_tensor(buffer, tensor);
@@ -235,7 +259,8 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
         return;
     }
 
-    buffer->iface.clear(buffer, value);
+    device_call_guard callback_guard(buffer->owner_device);
+    if (callback_guard) buffer->iface.clear(buffer, value);
 }
 
 size_t ggml_backend_buffer_get_alignment(ggml_backend_buffer_t buffer) {
@@ -284,13 +309,16 @@ ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t bu
 
 void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
-    if (buffer->iface.reset) {
+    device_call_guard callback_guard(buffer->owner_device);
+    if (callback_guard && buffer->iface.reset) {
         buffer->iface.reset(buffer);
     }
 }
 
 uint32_t ggml_backend_buffer_get_caps(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+    device_call_guard callback_guard(buffer->owner_device);
+    if (!callback_guard) return 0;
     uint32_t caps = buffer->iface.get_caps ? buffer->iface.get_caps(buffer) : ggml_backend_buft_get_caps(buffer->buft);
     if (!buffer->iface.get_base) {
         caps &= ~((uint32_t) GGML_BACKEND_BUFFER_CAP_STABLE_BASE);
@@ -331,7 +359,8 @@ size_t ggml_backend_tensor_get_buffer_offset(const struct ggml_tensor * tensor) 
 
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    if (dst_buf->iface.cpy_tensor) {
+    device_call_guard callback_guard(dst_buf->owner_device);
+    if (callback_guard && dst_buf->iface.cpy_tensor) {
         return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
     }
     return false;
@@ -460,7 +489,8 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(ggml_backend_tensor_has_storage(tensor) && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
-    buf->iface.set_tensor(buf, tensor, data, offset, size);
+    device_call_guard callback_guard(buf->owner_device);
+    if (callback_guard) buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -475,7 +505,8 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(ggml_backend_tensor_has_storage(tensor) && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
-    buf->iface.get_tensor(buf, tensor, data, offset, size);
+    device_call_guard callback_guard(buf->owner_device);
+    if (callback_guard) buf->iface.get_tensor(buf, tensor, data, offset, size);
 }
 
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
@@ -497,7 +528,8 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(ggml_backend_tensor_has_storage(tensor) && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
-    buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    device_call_guard callback_guard(buf->owner_device);
+    if (callback_guard) buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
 void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
@@ -519,7 +551,8 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     GGML_ASSERT(ggml_backend_tensor_has_storage(tensor) && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
-    buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    device_call_guard callback_guard(buf->owner_device);
+    if (callback_guard) buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
@@ -535,7 +568,8 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(buf->iface.memset_tensor != NULL && "memset not implemented by backend buffer");
 
-    buf->iface.memset_tensor(buf, tensor, value, offset, size);
+    device_call_guard callback_guard(buf->owner_device);
+    if (callback_guard) buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
 void ggml_backend_synchronize(ggml_backend_t backend) {

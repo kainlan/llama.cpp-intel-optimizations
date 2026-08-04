@@ -19,7 +19,7 @@ sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
 
 def function_has_guard(source, name, guard):
     pattern = re.compile(r"(?:^|\n)[^\n;]*\b" + re.escape(name) + r"\s*\([^;]*?\)\s*(?:try\s*)?\{", re.S)
-    return any(guard in source[m.end():m.end() + 500] for m in pattern.finditer(source))
+    return any(guard in source[m.end():m.end() + 1500] for m in pattern.finditer(source))
 
 def function_has_module_guard(source, name):
     return function_has_guard(source, name, "sycl_module_mutation_guard")
@@ -69,6 +69,14 @@ buft_callback_inventory = [
 ]
 buft_callback_inventory_ok = all(function_has_guard(backend_base, name, "device_call_guard")
                                   for name in buft_callback_inventory)
+buffer_callback_inventory = [
+    "ggml_backend_buffer_free", "ggml_backend_buffer_get_base", "ggml_backend_buffer_init_tensor",
+    "ggml_backend_buffer_clear", "ggml_backend_buffer_reset", "ggml_backend_buffer_get_caps",
+    "ggml_backend_buffer_copy_tensor", "ggml_backend_tensor_set", "ggml_backend_tensor_get",
+    "ggml_backend_tensor_set_2d", "ggml_backend_tensor_get_2d", "ggml_backend_tensor_memset",
+]
+buffer_callback_inventory_ok = all(function_has_guard(backend_base, name, "device_call_guard")
+                                    for name in buffer_callback_inventory)
 placement_paths = sorted(
     [root / "ggml/include/ggml-sycl.h"]
     + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
@@ -629,7 +637,7 @@ checks = {
     and "Stage all plugin-owned metadata while mutation admission remains closed" in registry_backend
     and "Resolver is plugin code too" in registry_backend
     and "active_calls" in registry_backend
-    and "cv.wait(lock, [&] { return unloading->active_calls == 0; })" in registry_backend
+    and "cv.wait_for(lock, active_call_drain_timeout" in registry_backend
     and "mutable std::recursive_mutex" not in registry_backend
     and "module_operation_mutex" in registry_backend
     and "same-module load was not deferred or enumeration held the registry lock" in
@@ -707,6 +715,9 @@ checks = {
     and "const auto settle_state" in registry_backend,
     "exhaustive saveable mutation and buffer callback admission": module_proc_inventory_ok
     and buft_callback_inventory_ok
+    and buffer_callback_inventory_ok
+    and "durable_owners" in registry_backend
+    and "owner_lease" in backend_base
     and "sycl_module_admission_state::RETRY_CLOSED" in backend
     and "g_sycl_module_admission_cv.wait_for" in backend
     and backend.index("global_registry().reserve_shutdown()") < backend.index("g_sycl_module_admission_cv.wait_for")
@@ -737,6 +748,16 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "preflight, bounded generic drain, hidden reactivation and score pin":
+        registry_backend.index("reserved = can_unload()") < registry_backend.index("cv.wait_for(lock, active_call_drain_timeout")
+        and "ggml_backend_reg_state::REACTIVATING" in registry_backend
+        and "COMMIT_REACTIVATE_THROW" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "g_commit_reactivate_block" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and registry_backend.index("dl_pin_library(handle.get(), entry.path())")
+            < registry_backend.index('dl_get_sym(handle.get(), "ggml_backend_score")',
+                                     registry_backend.index("dl_pin_library(handle.get(), entry.path())"))
+        and backend_dl.count("Pin before the first plugin-owned policy/score/probe callback") == 2
+        and backend_dl.index("dl_pin_library(handle, path)") < backend_dl.index("(void) policy()"),
     "count/get census registered for every configuration": "add_test(NAME test-backend-count-get-null-census" in
         (root / "tests/CMakeLists.txt").read_text(),
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"

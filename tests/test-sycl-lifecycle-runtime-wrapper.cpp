@@ -22,7 +22,7 @@ extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token mo
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
 namespace {
-enum class registry_fixture_mode { NORMAL, RESOLVER_THROW, SHUTDOWN_THROW };
+enum class registry_fixture_mode { NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, COMMIT_REACTIVATE_THROW };
 static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
 static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
 static int                    g_registry_fixture_recursive_registrations = 0;
@@ -32,6 +32,10 @@ static std::mutex              g_device_callback_mutex;
 static std::condition_variable g_device_callback_cv;
 static bool                    g_device_callback_block = false;
 static bool                    g_device_callback_entered = false;
+static std::mutex              g_commit_reactivate_mutex;
+static std::condition_variable g_commit_reactivate_cv;
+static bool                    g_commit_reactivate_block = false;
+static bool                    g_commit_reactivate_entered = false;
 
 static const char * registry_fixture_dev_name(ggml_backend_dev_t) { return "TEST-LIFECYCLE0"; }
 static const char * registry_fixture_dev_description(ggml_backend_dev_t) {
@@ -64,6 +68,21 @@ static void registry_fixture_shutdown() {
     }
 }
 static void registry_fixture_cancel() { ++g_registry_fixture_cancels; }
+static bool registry_fixture_prepare_reactivate() { return true; }
+static void registry_fixture_commit_reactivate() {
+    {
+        std::unique_lock<std::mutex> lock(g_commit_reactivate_mutex);
+        if (g_commit_reactivate_block) {
+            g_commit_reactivate_entered = true;
+            g_commit_reactivate_cv.notify_all();
+            g_commit_reactivate_cv.wait(lock, [] { return !g_commit_reactivate_block; });
+        }
+    }
+    if (g_registry_fixture_mode == registry_fixture_mode::COMMIT_REACTIVATE_THROW) {
+        throw std::runtime_error("fixture reactivation commit failure");
+    }
+}
+static void registry_fixture_rollback_reactivate() { ++g_registry_fixture_cancels; }
 static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
     if (g_registry_fixture_mode == registry_fixture_mode::RESOLVER_THROW) {
         throw std::runtime_error("fixture resolver failure");
@@ -72,6 +91,9 @@ static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
     if (std::strcmp(name, "ggml_backend_shutdown") == 0) return (void *) registry_fixture_shutdown;
     if (std::strcmp(name, "ggml_backend_complete_unload") == 0 ||
         std::strcmp(name, "ggml_backend_cancel_unload") == 0) return (void *) registry_fixture_cancel;
+    if (std::strcmp(name, "ggml_backend_prepare_reactivate") == 0) return (void *) registry_fixture_prepare_reactivate;
+    if (std::strcmp(name, "ggml_backend_commit_reactivate") == 0) return (void *) registry_fixture_commit_reactivate;
+    if (std::strcmp(name, "ggml_backend_rollback_reactivate") == 0) return (void *) registry_fixture_rollback_reactivate;
     return nullptr;
 }
 
@@ -160,6 +182,55 @@ static bool run_registry_failure_fixture() {
     }
     if (!unload_waited_for_callback || !callback.get() ||
         blocked_unload.get() != GGML_BACKEND_UNLOAD_OK) return false;
+
+    ggml_backend_register(reg);
+    {
+        std::lock_guard<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_block = true;
+        g_device_callback_entered = false;
+    }
+    auto stalled_callback = std::async(std::launch::async, [&] {
+        return ggml_backend_dev_description(static_cast<ggml_backend_dev_t>(reg->context));
+    });
+    {
+        std::unique_lock<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_cv.wait(lock, [] { return g_device_callback_entered; });
+    }
+    const auto stalled_unload_result = ggml_backend_unload_checked(reg);
+    {
+        std::lock_guard<std::mutex> lock(g_device_callback_mutex);
+        g_device_callback_block = false;
+        g_device_callback_cv.notify_all();
+    }
+    if (stalled_unload_result != GGML_BACKEND_UNLOAD_BUSY || !stalled_callback.get() ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_commit_reactivate_mutex);
+        g_commit_reactivate_block = true;
+        g_commit_reactivate_entered = false;
+    }
+    auto blocked_reactivation = std::async(std::launch::async, [&] { ggml_backend_register(reg); });
+    {
+        std::unique_lock<std::mutex> lock(g_commit_reactivate_mutex);
+        g_commit_reactivate_cv.wait(lock, [] { return g_commit_reactivate_entered; });
+    }
+    const bool reactivation_hidden = ggml_backend_reg_by_name("TEST-LIFECYCLE") == nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_commit_reactivate_mutex);
+        g_commit_reactivate_block = false;
+        g_commit_reactivate_cv.notify_all();
+    }
+    blocked_reactivation.get();
+    if (!reactivation_hidden || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+
+    g_registry_fixture_mode = registry_fixture_mode::COMMIT_REACTIVATE_THROW;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     return g_registry_fixture_recursive_registrations >= 2 && g_registry_fixture_shutdowns >= 2 &&
            g_registry_fixture_cancels >= 2;
 }
@@ -595,6 +666,18 @@ int main() {
         std::fprintf(stderr, "teardown retained placement authority\n");
         return 1;
     }
+    phase("durable buffer owner unload rejection");
+    auto durable_buft = CALL_SYCL(ggml_backend_sycl_host_buffer_type)();
+    auto durable_buffer = durable_buft ? ggml_backend_buft_alloc_buffer(durable_buft, 64) : nullptr;
+    if (!durable_buffer || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "live backend buffer did not block checked unload\n");
+        return 1;
+    }
+    (void) ggml_backend_buffer_get_base(durable_buffer);
+    ggml_backend_buffer_clear(durable_buffer, 0);
+    ggml_backend_buffer_reset(durable_buffer);
+    ggml_backend_buffer_free(durable_buffer);
+
     phase("stateful module unload");
     size_t unloaded_reg_index = ggml_backend_reg_count();
     for (size_t i = 0; i < unloaded_reg_index; ++i) {

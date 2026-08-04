@@ -71,6 +71,8 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        ggml_backend_dev_t owner_device;
+        bool owner_lease;
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
@@ -241,6 +243,8 @@ extern "C" {
         void (*registry_end)(ggml_backend_reg_t reg);
         bool (*device_begin)(ggml_backend_dev_t device);
         void (*device_end)(ggml_backend_dev_t device);
+        bool (*device_owner_acquire)(ggml_backend_dev_t device);
+        void (*device_owner_release)(ggml_backend_dev_t device);
     };
 
     GGML_API void ggml_backend_set_registry_lifecycle(

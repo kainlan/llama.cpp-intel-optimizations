@@ -26,12 +26,14 @@ dl_handle * dl_load_library(const fs::path & path) {
 
     if (handle) {
         try {
-            auto policy = reinterpret_cast<ggml_backend_lifetime_policy_v1_t>(
-                GetProcAddress(handle, "ggml_backend_lifetime_policy_v1"));
-            if (policy && policy() == GGML_BACKEND_LIFETIME_POLICY_PROCESS && !dl_pin_library(handle, path)) {
+            // Pin before the first plugin-owned policy/score/probe callback.
+            if (!dl_pin_library(handle, path)) {
                 FreeLibrary(handle);
                 return nullptr;
             }
+            auto policy = reinterpret_cast<ggml_backend_lifetime_policy_v1_t>(
+                GetProcAddress(handle, "ggml_backend_lifetime_policy_v1"));
+            if (policy) (void) policy();
         } catch (...) {
             FreeLibrary(handle);
             return nullptr;
@@ -76,12 +78,14 @@ dl_handle * dl_load_library(const fs::path & path) {
     dl_handle * handle = dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle) {
         try {
-            auto policy = reinterpret_cast<ggml_backend_lifetime_policy_v1_t>(
-                dlsym(handle, "ggml_backend_lifetime_policy_v1"));
-            if (policy && policy() == GGML_BACKEND_LIFETIME_POLICY_PROCESS && !dl_pin_library(handle, path)) {
+            // Pin before the first plugin-owned policy/score/probe callback.
+            if (!dl_pin_library(handle, path)) {
                 dlclose(handle);
                 return nullptr;
             }
+            auto policy = reinterpret_cast<ggml_backend_lifetime_policy_v1_t>(
+                dlsym(handle, "ggml_backend_lifetime_policy_v1"));
+            if (policy) (void) policy();
         } catch (...) {
             dlclose(handle);
             return nullptr;
