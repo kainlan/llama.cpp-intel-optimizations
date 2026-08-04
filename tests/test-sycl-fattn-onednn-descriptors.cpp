@@ -23,6 +23,13 @@ int main() {
             }                                            \
         } while (0)
 
+static bool configure_bounded_runtime() {
+    // Materialized K/V intentionally enter the unified allocator. This tiny
+    // descriptor fixture must not initialize the model-scale full-VRAM arena
+    // or its default 2 GiB pinned chunks merely to allocate a few KiB.
+    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0 && setenv("GGML_SYCL_PINNED_CHUNK_MB", "16", 1) == 0;
+}
+
 struct case_shape {
     const char * name;
     int          H_q;
@@ -280,6 +287,11 @@ int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
+    if (!configure_bounded_runtime()) {
+        std::fprintf(stderr, "FAIL: could not configure bounded SYCL test allocations\n");
+        return 1;
+    }
+    std::printf("Bounded runtime: VRAM arena disabled, pinned chunks capped at 16 MiB\n");
 
     std::vector<sycl::device> gpus;
     try {
