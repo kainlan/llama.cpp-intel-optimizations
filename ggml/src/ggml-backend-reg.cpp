@@ -183,6 +183,8 @@ struct ggml_backend_reg_entry {
     bool                     dynamic = false;
     size_t                   active_calls = 0;
     size_t                   durable_owners = 0;
+    uint64_t                 current_generation = 0;
+    uint64_t                 generation_counter = 0;
     std::string              cached_name;
     std::string              module_path;
 };
@@ -192,6 +194,7 @@ using ggml_backend_reg_entry_ptr = std::shared_ptr<ggml_backend_reg_entry>;
 struct ggml_backend_device_entry {
     ggml_backend_dev_t         dev;
     ggml_backend_reg_entry_ptr owner;
+    uint64_t                   generation;
 };
 
 // count()/get() use one bounded per-thread snapshot. It is enumeration state,
@@ -353,10 +356,11 @@ struct ggml_backend_registry {
             }
             const bool dynamic = handle != nullptr;
             auto candidate = std::make_shared<ggml_backend_reg_entry>(
-                ggml_backend_reg_entry{ reg, std::move(handle), ggml_backend_reg_state::ACTIVE, dynamic, 0, 0,
+                ggml_backend_reg_entry{ reg, std::move(handle), ggml_backend_reg_state::ACTIVE, dynamic, 0, 0, 0, 0,
                                         name ? name : "", std::move(module_path) });
 
             ggml_backend_reg_entry_ptr published_entry;
+            uint64_t staged_generation = 0;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto existing = std::find_if(backends.begin(), backends.end(),
@@ -368,18 +372,20 @@ struct ggml_backend_registry {
                 ggml_backend_reg_entry_ptr entry = is_new ? candidate : *existing;
                 backends.reserve(backends.size() + (is_new ? 1 : 0));
                 devices.reserve(devices.size() + staged_devices.size());
+                staged_generation = ++entry->generation_counter;
                 if (is_new) {
                     backends.push_back(entry);
                 } else {
-                    devices.erase(std::remove_if(devices.begin(), devices.end(),
-                        [&](const ggml_backend_device_entry & item) { return item.owner == entry; }), devices.end());
+                    // Retain every prior generation row forever: saved raw
+                    // device identities must remain recognizable tombstones.
                     entry->handle = std::move(candidate->handle);
                     entry->dynamic = candidate->dynamic;
                     entry->module_path = std::move(candidate->module_path);
                     entry->state = reactivation_prepared ? ggml_backend_reg_state::REACTIVATING :
                                                            ggml_backend_reg_state::ACTIVE;
                 }
-                for (auto dev : staged_devices) devices.push_back({ dev, entry });
+                for (auto dev : staged_devices) devices.push_back({ dev, entry, staged_generation });
+                if (!reactivation_prepared) entry->current_generation = staged_generation;
                 published_entry = entry;
             }
             if (reactivation_prepared) {
@@ -394,6 +400,7 @@ struct ggml_backend_registry {
                     return false;
                 }
                 std::lock_guard<std::mutex> lock(mutex);
+                published_entry->current_generation = staged_generation;
                 published_entry->state = ggml_backend_reg_state::ACTIVE;
                 reactivation_prepared = false;
             }
@@ -422,7 +429,7 @@ struct ggml_backend_registry {
                     [device](const ggml_backend_device_entry & entry) { return entry.dev == device; })) {
                 return;
             }
-            devices.push_back({ device, *owner });
+            devices.push_back({ device, *owner, (*owner)->current_generation });
         } catch (...) {
         }
     }
@@ -729,7 +736,8 @@ struct ggml_backend_registry {
             std::lock_guard<std::mutex> lock(mutex);
             g_backend_dev_enumeration.clear();
             for (const auto & entry : devices) {
-                if (entry.owner->state == ggml_backend_reg_state::ACTIVE) {
+                if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                    entry.generation == entry.owner->current_generation) {
                     g_backend_dev_enumeration.push_back(entry);
                 }
             }
@@ -744,7 +752,9 @@ struct ggml_backend_registry {
         try {
             std::lock_guard<std::mutex> lock(mutex);
             if (index >= g_backend_dev_enumeration.size() ||
-                g_backend_dev_enumeration[index].owner->state != ggml_backend_reg_state::ACTIVE) {
+                g_backend_dev_enumeration[index].owner->state != ggml_backend_reg_state::ACTIVE ||
+                g_backend_dev_enumeration[index].generation !=
+                    g_backend_dev_enumeration[index].owner->current_generation) {
                 return nullptr;
             }
             return g_backend_dev_enumeration[index].dev;
@@ -759,7 +769,8 @@ struct ggml_backend_registry {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 for (const auto & entry : devices) {
-                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE) {
+                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                        entry.generation == entry.owner->current_generation) {
                         live.push_back(entry);
                     }
                 }
@@ -776,7 +787,8 @@ struct ggml_backend_registry {
                 end_call(entry.owner);
                 if (matches) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    return entry.owner->state == ggml_backend_reg_state::ACTIVE ? entry.dev : nullptr;
+                    return entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                           entry.generation == entry.owner->current_generation ? entry.dev : nullptr;
                 }
             }
         } catch (...) {
@@ -790,7 +802,8 @@ struct ggml_backend_registry {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 for (const auto & entry : devices) {
-                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE) {
+                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                        entry.generation == entry.owner->current_generation) {
                         live.push_back(entry);
                     }
                 }
@@ -807,7 +820,8 @@ struct ggml_backend_registry {
                 end_call(entry.owner);
                 if (matches) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    return entry.owner->state == ggml_backend_reg_state::ACTIVE ? entry.dev : nullptr;
+                    return entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                           entry.generation == entry.owner->current_generation ? entry.dev : nullptr;
                 }
             }
         } catch (...) {
@@ -969,7 +983,8 @@ bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept {
         if (found == registry.devices.end()) {
             return true;
         }
-        if (found->owner->state != ggml_backend_reg_state::ACTIVE || found->owner->active_calls == SIZE_MAX) {
+        if (found->owner->state != ggml_backend_reg_state::ACTIVE ||
+            found->generation != found->owner->current_generation || found->owner->active_calls == SIZE_MAX) {
             return false;
         }
         ++found->owner->active_calls;
@@ -987,7 +1002,8 @@ bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept {
         const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
             [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
         if (found == registry.devices.end()) return device->reg == nullptr;
-        if (found->owner->state != ggml_backend_reg_state::ACTIVE || found->owner->durable_owners == SIZE_MAX) {
+        if (found->owner->state != ggml_backend_reg_state::ACTIVE ||
+            found->generation != found->owner->current_generation || found->owner->durable_owners == SIZE_MAX) {
             return false;
         }
         ++found->owner->durable_owners;

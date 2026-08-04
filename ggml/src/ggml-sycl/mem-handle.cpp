@@ -3,6 +3,8 @@
 
 #include "mem-handle.hpp"
 
+#include <chrono>
+
 #include "common.hpp"
 #include "pinned-pool.hpp"    // pinned_chunk_pool chunk-lease API (dyhdl)
 #include "unified-cache.hpp"  // get_unified_cache_for_device, unified_cache
@@ -1193,17 +1195,18 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
     return true;
 }
 
-void drain_retained_handles(bool wait_all) {
+bool drain_retained_handles(bool wait_all, uint32_t timeout_ms) {
     if (!wait_all) {
         // Retained handles are released by the background drain worker.  Avoid
         // get_info(command_execution_status) polling on inference threads:
         // that Level Zero query can block on in-flight events.
-        return;
+        return true;
     }
 
     auto &                       state = *g_retained_handles_state;
     std::unique_lock<std::mutex> lock(state.mutex);
-    state.cv.wait(lock, [&state] { return state.queue.empty() && state.active == 0; });
+    return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                             [&state] { return state.queue.empty() && state.active == 0; });
 }
 
 size_t graph_retained_handle_count() {

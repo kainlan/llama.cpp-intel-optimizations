@@ -21,8 +21,9 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -86,8 +87,31 @@ struct device_call_guard {
 };
 }
 
-static std::mutex                                g_backend_buffer_registry_mutex;
-static std::unordered_set<ggml_backend_buffer_t> g_backend_buffer_registry;
+enum class live_owner_state { OPEN, ADOPTING };
+struct live_owner_record {
+    ggml_backend_dev_t device;
+    bool lease;
+    live_owner_state state = live_owner_state::OPEN;
+};
+static std::mutex g_live_owner_mutex;
+static std::condition_variable g_live_owner_cv;
+static std::unordered_map<void *, live_owner_record> g_live_buffers;
+static std::unordered_map<void *, live_owner_record> g_live_events;
+static std::mutex g_owner_adoption_test_mutex;
+static std::condition_variable g_owner_adoption_test_cv;
+static bool g_owner_adoption_test_block = false;
+static bool g_owner_adoption_test_blocked = false;
+
+void ggml_backend_test_block_owner_adoption(bool block) {
+    std::lock_guard<std::mutex> lock(g_owner_adoption_test_mutex);
+    g_owner_adoption_test_block = block;
+    if (!block) g_owner_adoption_test_cv.notify_all();
+}
+
+bool ggml_backend_test_owner_adoption_blocked(void) {
+    std::lock_guard<std::mutex> lock(g_owner_adoption_test_mutex);
+    return g_owner_adoption_test_blocked;
+}
 
 void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
     g_device_owner_release.store(iface ? iface->device_owner_release : nullptr, std::memory_order_release);
@@ -104,36 +128,52 @@ void ggml_backend_refresh_buffer_lifecycle(void) {
     const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
     const auto release = g_device_owner_release.load(std::memory_order_acquire);
     if (!acquire) return;
-    struct adoption_candidate { ggml_backend_buffer_t buffer; ggml_backend_dev_t device; };
+    struct adoption_candidate { void * object; ggml_backend_dev_t device; bool event; };
     std::vector<adoption_candidate> candidates;
     {
-        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
-        for (auto * buffer : g_backend_buffer_registry) {
-            if (buffer && buffer->owner_device && !buffer->owner_lease) {
-                candidates.push_back({ buffer, buffer->owner_device });
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        auto stage = [&](auto & objects, bool event) {
+            for (auto & [object, owner] : objects) {
+                if (owner.device && !owner.lease && owner.state == live_owner_state::OPEN) {
+                    owner.state = live_owner_state::ADOPTING;
+                    candidates.push_back({ object, owner.device, event });
+                }
             }
+        };
+        stage(g_live_buffers, false);
+        stage(g_live_events, true);
+    }
+    if (!candidates.empty()) {
+        std::unique_lock<std::mutex> test_lock(g_owner_adoption_test_mutex);
+        if (g_owner_adoption_test_block) {
+            g_owner_adoption_test_blocked = true;
+            g_owner_adoption_test_cv.notify_all();
+            g_owner_adoption_test_cv.wait(test_lock, [] { return !g_owner_adoption_test_block; });
+            g_owner_adoption_test_blocked = false;
         }
     }
-    std::vector<adoption_candidate> acquired;
-    for (const auto & candidate : candidates) {
-        if (!acquire(candidate.device)) {
-            for (const auto & prior : acquired) if (release) release(prior.device);
-            return;
-        }
-        acquired.push_back(candidate);
+    size_t acquired = 0;
+    for (; acquired < candidates.size(); ++acquired) {
+        if (!acquire(candidates[acquired].device)) break;
     }
-    std::vector<ggml_backend_dev_t> release_later;
+    if (acquired != candidates.size()) {
+        for (size_t i = 0; i < acquired; ++i) if (release) release(candidates[i].device);
+    }
     {
-        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
-        for (const auto & candidate : acquired) {
-            if (g_backend_buffer_registry.count(candidate.buffer) != 0 && !candidate.buffer->owner_lease) {
-                candidate.buffer->owner_lease = true;
-            } else {
-                release_later.push_back(candidate.device);
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        for (const auto & candidate : candidates) {
+            auto & objects = candidate.event ? g_live_events : g_live_buffers;
+            auto found = objects.find(candidate.object);
+            if (found != objects.end() && found->second.state == live_owner_state::ADOPTING) {
+                found->second.lease = acquired == candidates.size();
+                found->second.state = live_owner_state::OPEN;
+                if (!candidate.event) {
+                    static_cast<ggml_backend_buffer_t>(candidate.object)->owner_lease = found->second.lease;
+                }
             }
         }
     }
-    for (auto * device : release_later) if (release) release(device);
+    g_live_owner_cv.notify_all();
 }
 
 #ifdef __APPLE__
@@ -247,6 +287,14 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
     buffer->buft = buft;
     buffer->owner_device = new_device;
     buffer->owner_lease = new_lease;
+    {
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        auto found = g_live_buffers.find(buffer);
+        if (found != g_live_buffers.end()) {
+            found->second.device = new_device;
+            found->second.lease = new_lease;
+        }
+    }
     return true;
 }
 
@@ -273,8 +321,12 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     buffer->owner_lease = consumed_production || (buffer->owner_device && acquire_owner);
 
     {
-        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
-        g_backend_buffer_registry.insert(buffer);
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        g_live_buffers.emplace(buffer, live_owner_record{ buffer->owner_device, buffer->owner_lease });
+    }
+    if (buffer->owner_device && !buffer->owner_lease &&
+        g_device_owner_acquire.load(std::memory_order_acquire)) {
+        ggml_backend_refresh_buffer_lifecycle();
     }
 
     return buffer;
@@ -289,18 +341,27 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    device_call_guard callback_guard(buffer->owner_device);
-    if (callback_guard && buffer->iface.free_buffer != NULL) {
-        buffer->iface.free_buffer(buffer);
-    }
-    if (buffer->owner_lease) {
-        const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
-        if (release_owner) release_owner(buffer->owner_device);
+    ggml_backend_dev_t owner_device = buffer->owner_device;
+    bool owner_lease = false;
+    {
+        std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        g_live_owner_cv.wait(lock, [&] {
+            auto found = g_live_buffers.find(buffer);
+            return found == g_live_buffers.end() || found->second.state != live_owner_state::ADOPTING;
+        });
+        auto found = g_live_buffers.find(buffer);
+        if (found != g_live_buffers.end()) {
+            owner_device = found->second.device;
+            owner_lease = found->second.lease;
+            g_live_buffers.erase(found);
+        }
         buffer->owner_lease = false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
-        g_backend_buffer_registry.erase(buffer);
+    device_call_guard callback_guard(owner_device);
+    if (callback_guard && buffer->iface.free_buffer != NULL) buffer->iface.free_buffer(buffer);
+    if (owner_lease) {
+        const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
+        if (release_owner) release_owner(owner_device);
     }
     delete buffer;
 }
@@ -789,7 +850,13 @@ ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
         if (acquire && release) release(device);
         return nullptr;
     }
-    event->owner_lease = acquire != nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        g_live_events.emplace(event, live_owner_record{ device, acquire != nullptr });
+    }
+    if (!acquire && g_device_owner_acquire.load(std::memory_order_acquire)) {
+        ggml_backend_refresh_buffer_lifecycle();
+    }
     return event;
 }
 
@@ -798,7 +865,20 @@ void ggml_backend_event_free(ggml_backend_event_t event) {
         return;
     }
     ggml_backend_dev_t owner_device = event->device;
-    const bool owner_lease = event->owner_lease;
+    bool owner_lease = false;
+    {
+        std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        g_live_owner_cv.wait(lock, [&] {
+            auto found = g_live_events.find(event);
+            return found == g_live_events.end() || found->second.state != live_owner_state::ADOPTING;
+        });
+        auto found = g_live_events.find(event);
+        if (found != g_live_events.end()) {
+            owner_device = found->second.device;
+            owner_lease = found->second.lease;
+            g_live_events.erase(found);
+        }
+    }
     device_call_guard guard(owner_device);
     if (guard) owner_device->iface.event_free(owner_device, event);
     if (owner_lease) {

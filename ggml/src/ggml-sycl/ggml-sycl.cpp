@@ -96412,7 +96412,9 @@ void ggml_backend_sycl_shutdown(void) {
     // allocations. Drain events synchronously, return the scratch lease, then
     // erase/free every offload-pool owner before queue or cache destruction.
     ggml_sycl::release_graph_retained_handles();
-    ggml_sycl::drain_retained_handles(true);
+    if (!ggml_sycl::drain_retained_handles(true, 10000)) {
+        throw std::runtime_error("SYCL retained-handle drain timed out");
+    }
     if (!ggml_sycl_cpu_retained_cleanup() || !ggml_sycl::offload_buffer_pool_shutdown() ||
         ggml_sycl_cpu_retained_active()) {
         throw std::runtime_error("SYCL retained/offload state survived shutdown cleanup");

@@ -634,7 +634,10 @@ checks = {
     and "published_entry->state = ggml_backend_reg_state::REMOVED" in registry_backend,
     "pre-registry buffer adoption and durable events": "ggml_backend_refresh_buffer_lifecycle" in backend_base
     and "adoption_candidate" in backend_base
-    and "event->owner_lease" in backend_base
+    and "g_live_events" in backend_base
+    and "legacy_v2_event_layout" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "sizeof(legacy_v2_event_layout) == sizeof(ggml_backend_event)" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "pre_registry_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "live backend event did not block checked unload" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
@@ -778,10 +781,28 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "generation tombstones retained": "current_generation" in registry_backend
+    and "Retain every prior generation row forever" in registry_backend
+    and "devices.erase(std::remove_if" not in registry_backend,
+    "synchronized buffer/event adoption": "live_owner_state::ADOPTING" in backend_base
+    and "g_live_owner_cv.wait" in backend_base
+    and "g_live_buffers.erase(found)" in backend_base
+    and "g_live_events.erase(found)" in backend_base
+    and "ggml_backend_test_owner_adoption_blocked" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "overlapping_free.wait_for" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "cache shutdown owner snapshot avoids rw-lock callbacks":
+        "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp
+        and cache_cpp.index("caches = g_device_caches")
+            < cache_cpp.index("item.second->shutdown_resources()"),
+    "bounded retained handle drain": "wait_for(lock, std::chrono::milliseconds(timeout_ms)" in
+        (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
+        and "SYCL retained-handle drain timed out" in backend,
     "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_cpu_retained_cleanup()")
         < backend.index("ggml_sycl::shutdown_unified_cache()")
         and "offload_buffer_pool_shutdown()" in backend
-        and backend.index("drain_retained_handles(true)", backend.index("void ggml_backend_sycl_shutdown"))
+        and backend.index("drain_retained_handles(true, 10000)", backend.index("void ggml_backend_sycl_shutdown"))
             < backend.index("ggml_sycl_cpu_retained_cleanup()", backend.index("void ggml_backend_sycl_shutdown"))
         and "!ggml_sycl_cpu_retained_active()" in backend
         and "g_runtime_alloc_registry.empty()" in cache_cpp

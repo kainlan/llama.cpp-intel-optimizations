@@ -51,6 +51,14 @@ static enum ggml_backend_dev_type registry_fixture_dev_type(ggml_backend_dev_t) 
     return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
 static ggml_backend_t registry_fixture_dev_init(ggml_backend_dev_t, const char *) { return nullptr; }
+struct legacy_v2_event_layout { ggml_backend_dev_t device; void * context; };
+static ggml_backend_event_t registry_fixture_event_new(ggml_backend_dev_t device) {
+    static_assert(sizeof(legacy_v2_event_layout) == sizeof(ggml_backend_event), "event ABI v2 layout changed");
+    return reinterpret_cast<ggml_backend_event_t>(new legacy_v2_event_layout{ device, nullptr });
+}
+static void registry_fixture_event_free(ggml_backend_dev_t, ggml_backend_event_t event) {
+    delete reinterpret_cast<legacy_v2_event_layout *>(event);
+}
 static const char * registry_fixture_reg_name(ggml_backend_reg_t) { return "TEST-LIFECYCLE"; }
 static size_t registry_fixture_reg_count(ggml_backend_reg_t) { return 1; }
 static ggml_backend_dev_t registry_fixture_reg_get(ggml_backend_reg_t reg, size_t index) {
@@ -105,6 +113,8 @@ static ggml_backend_reg_t registry_fixture() {
         dev.iface.get_description = registry_fixture_dev_description;
         dev.iface.get_type = registry_fixture_dev_type;
         dev.iface.init_backend = registry_fixture_dev_init;
+        dev.iface.event_new = registry_fixture_event_new;
+        dev.iface.event_free = registry_fixture_event_free;
         dev.reg = &reg;
         reg.api_version = GGML_BACKEND_API_VERSION;
         reg.iface.get_name = registry_fixture_reg_name;
@@ -124,10 +134,31 @@ static bool run_registry_failure_fixture() {
     static ggml_backend_buffer_type pre_registry_buft{};
     pre_registry_buft.device = static_cast<ggml_backend_dev_t>(reg->context);
     auto pre_registry_buffer = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
-    if (!pre_registry_buffer) return false;
-    ggml_backend_register(reg);
+    auto pre_registry_event = ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context));
+    if (!pre_registry_buffer || !pre_registry_event) return false;
+    ggml_backend_test_block_owner_adoption(true);
+    auto adopting_register = std::async(std::launch::async, [reg] { ggml_backend_register(reg); });
+    for (int i = 0; i < 1000 && !ggml_backend_test_owner_adoption_blocked(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!ggml_backend_test_owner_adoption_blocked()) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        return false;
+    }
+    auto overlapping_free = std::async(std::launch::async,
+        [pre_registry_buffer] { ggml_backend_buffer_free(pre_registry_buffer); });
+    if (overlapping_free.wait_for(std::chrono::milliseconds(50)) != std::future_status::timeout) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        overlapping_free.get();
+        return false;
+    }
+    ggml_backend_test_block_owner_adoption(false);
+    adopting_register.get();
+    overlapping_free.get();
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
-    ggml_backend_buffer_free(pre_registry_buffer);
+    ggml_backend_event_free(pre_registry_event);
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     ggml_backend_register(reg);
     const size_t initial_reg_count = ggml_backend_reg_count();

@@ -518,7 +518,7 @@ residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
 }
 
 // Per-device cache storage (for PER_DEVICE and AUTO modes)
-static std::unordered_map<int, std::unique_ptr<unified_cache>> g_device_caches;
+static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;
 static std::shared_mutex                                       g_cache_rw_mutex;
 static size_t                                                  g_unified_cache_budget      = 0;  // 0 = auto-calculate
 static int                                                     g_unified_cache_budget_pct  = 100;
@@ -12735,17 +12735,19 @@ bool shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
     // mem_handle release callbacks cannot deadlock on cache lookup.
-    std::unordered_map<int, std::unique_ptr<unified_cache>> caches;
+    std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
     {
-        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        for (auto & item : g_device_caches) {
-            if (item.second && !item.second->shutdown_resources()) {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] arena release failed; retaining cache owner for unload retry\n");
-                return false;
-            }
+        // Module mutation admission is closed. Retain a stable owner snapshot,
+        // then drop the map lock before callbacks/free paths that may re-enter
+        // cache lookup or allocation bookkeeping.
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        caches = g_device_caches;
+    }
+    for (auto & item : caches) {
+        if (item.second && !item.second->shutdown_resources()) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] arena release failed; retaining cache owner for unload retry\n");
+            return false;
         }
-        caches.swap(g_device_caches);
-        g_cache_mode_locked.store(false, std::memory_order_release);
     }
     g_sycl_shutting_down.store(false, std::memory_order_release);
     // Keep the drained cache owners movable until every postcondition passes;
@@ -12753,9 +12755,12 @@ bool shutdown_unified_cache() {
     // Preserve deterministic retry coverage before irreversible owner teardown.
     if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic shutdown-clean failure; retaining owners for retry\n");
-        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        caches.swap(g_device_caches);
         return false;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        g_device_caches.clear();
+        g_cache_mode_locked.store(false, std::memory_order_release);
     }
     // Cache destruction tears down host_arena_/pinned_chunk_pool while their
     // SYCL queues and single-device contexts are still valid. Only after every

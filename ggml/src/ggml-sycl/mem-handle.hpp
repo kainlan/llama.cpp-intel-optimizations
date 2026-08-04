@@ -520,7 +520,7 @@ void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
 // retained event before dropping the retained mem_handle copies. This only runs
 // normal mem_handle destructors; backing memory is freed only when the last
 // refcounted owner is gone.
-void drain_retained_handles(bool wait_all = false);
+bool drain_retained_handles(bool wait_all = false, uint32_t timeout_ms = 10000);
 
 // Release handles retained for command-graph lifetime when the executable graph
 // is invalidated. These handles are not event-waitable, so drain_retained_handles()
