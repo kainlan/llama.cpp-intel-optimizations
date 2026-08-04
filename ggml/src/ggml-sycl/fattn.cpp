@@ -217,10 +217,7 @@ static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int      n_kv,
     if (n_kv <= 0 || H_kv <= 0 || batch <= 0) {
         return false;
     }
-    if (n_kv > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
-        return false;
-    }
-    const int    blocks  = (n_kv + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    const int    blocks  = ggml_sycl_fattn_xmx_packed_k_n_blocks(n_kv);
     const size_t sbatch  = static_cast<size_t>(batch);
     const size_t sheads  = static_cast<size_t>(H_kv);
     const size_t sblocks = static_cast<size_t>(blocks);
@@ -398,12 +395,7 @@ ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const f
         params.ne12 <= 0 || params.ne13 <= 0 || !params.K_handle_valid || params.K_view_offs != 0) {
         return nullptr;
     }
-    if (params.ne11 > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
-        return nullptr;
-    }
-    const int n_partitions =
-        (static_cast<int>(params.ne11) + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) /
-        GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);
 
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
     for (const auto & entry : g_packed_k_sidecars) {
@@ -1523,12 +1515,7 @@ bool ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
         return false;
     }
 
-    if (params.ne11 > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
-        return false;
-    }
-    const int n_blocks =
-        (static_cast<int>(params.ne11) + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) /
-        GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    const int n_blocks = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);
     const size_t seq_count   = static_cast<size_t>(params.ne13);
     const size_t head_count  = static_cast<size_t>(params.ne12);
     const size_t block_count = static_cast<size_t>(n_blocks);
@@ -2560,8 +2547,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                                                                                v_device_resident);
                         if (plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE) {
                             fattn_xmx_v2_device_cache * cache = fattn_xmx_v2_get_or_create_cache(ctx);
-                            const int                   n_partitions =
-                                (params.ne11 + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV;
+                            const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);
                             const int selected_tk = force_tk16 ? 16 : force_tk32 ? 32 : plan.preferred_tk;
                             float *   partial_max = nullptr;
                             float *   partial_sum = nullptr;

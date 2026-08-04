@@ -2324,11 +2324,8 @@ static bool fattn_xmx_v2_decode_gqa_split_supported(const fattn_params & params,
         if (gqa_ratio <= 0 || gqa_ratio > XMX_V2_DECODE_GQA_MAX) {
             return false;
         }
-        if (params.ne11 > std::numeric_limits<int>::max() - (XMX_V2_DECODE_BATCH_KV - 1)) {
-            return false;
-        }
-        const int expected_partitions =
-            (static_cast<int>(params.ne11) + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV;
+        static_assert(XMX_V2_DECODE_BATCH_KV == GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS);
+        const int expected_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);
         if (n_partitions != expected_partitions) {
             return false;
         }

@@ -115,6 +115,11 @@ static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK = 2 * GGML_
 static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK =
     GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK * sizeof(sycl::half);
 
+// Overflow-safe ceil(n_kv / 64), shared by planning and forced dispatch.
+static constexpr int ggml_sycl_fattn_xmx_packed_k_n_blocks(int n_kv) {
+    return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0;
+}
+
 static inline size_t ggml_sycl_fattn_xmx_packed_k_element_offset_half(int kv_local, int d) {
     if (kv_local < 0 || kv_local >= GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS || d < 0 ||
         d >= GGML_SYCL_FATTN_XMX_PACKED_K_D) {

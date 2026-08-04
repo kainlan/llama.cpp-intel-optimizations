@@ -136,12 +136,20 @@ void verify_token_boundaries() {
     float * dummy_float = reinterpret_cast<float *>(uintptr_t{ 0x2000 });
     const fattn_params ordinary = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float);
     const auto ordinary_plan = tiny_plan(ordinary);
-    fattn_params overflowing = ordinary;
-    overflowing.ne11 = std::numeric_limits<int64_t>::max();
-    ggml_sycl_fattn_xmx_packed_k_materialization_desc overflow_desc{};
-    require(!ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
-                overflowing, ordinary_plan, 0, &overflow_desc),
-            "overflowing packed-K block rounding was accepted");
+    constexpr int32_t max_tokens = std::numeric_limits<int32_t>::max();
+    constexpr int expected_max_blocks = 1 + (max_tokens - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    require(ggml_sycl_fattn_xmx_packed_k_n_blocks(0) == 0,
+            "forced packed dispatch accepted a non-positive token count");
+    require(ggml_sycl_fattn_xmx_packed_k_n_blocks(max_tokens) == expected_max_blocks,
+            "forced packed dispatch block rounding overflowed at int32 max");
+    fattn_params maximum = ordinary;
+    maximum.ne11 = max_tokens;
+    ggml_sycl_fattn_xmx_packed_k_materialization_desc maximum_desc{};
+    require(ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+                maximum, ordinary_plan, 0, &maximum_desc),
+            "int32-max packed-K materialization descriptor was rejected");
+    require(maximum_desc.n_blocks == expected_max_blocks,
+            "int32-max packed-K descriptor block calculation mismatch");
     for (const auto [tokens, expected_blocks] :
          { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 64, 1 }, std::pair<int, int>{ 65, 2 } }) {
         const fattn_params params = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float, tokens);

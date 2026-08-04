@@ -11,11 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVE_PATH = ROOT / "ggml/src/ggml-sycl/tests/test-fattn-packed-k-lifecycle.cpp"
 CMAKE_PATH = ROOT / "ggml/src/ggml-sycl/CMakeLists.txt"
 FATTN_PATH = ROOT / "ggml/src/ggml-sycl/fattn.cpp"
+FATTN_HPP_PATH = ROOT / "ggml/src/ggml-sycl/fattn.hpp"
 XMX_PATH = ROOT / "ggml/src/ggml-sycl/fattn-xmx-f16-v2.hpp"
 
 LIVE = LIVE_PATH.read_text(encoding="utf-8")
 CMAKE = CMAKE_PATH.read_text(encoding="utf-8")
 FATTN = FATTN_PATH.read_text(encoding="utf-8")
+FATTN_HPP = FATTN_HPP_PATH.read_text(encoding="utf-8")
 XMX = XMX_PATH.read_text(encoding="utf-8")
 
 CHECKPOINTS = (
@@ -27,7 +29,7 @@ CHECKPOINTS = (
 GUARD = 'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)'
 
 
-def production_contract(fattn: str, xmx: str) -> bool:
+def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> bool:
     fattn_needles = (
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
@@ -45,7 +47,8 @@ def production_contract(fattn: str, xmx: str) -> bool:
         'std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT")',
         "g_packed_k_profile_error_after_submit_count.fetch_add",
         "throw std::bad_alloc{}",
-        "params.ne11 > std::numeric_limits<int>::max() -",
+        "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
+        "                            const int selected_tk",
         "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
         "if (size > std::numeric_limits<uintptr_t>::max() - begin)",
@@ -69,7 +72,13 @@ def production_contract(fattn: str, xmx: str) -> bool:
         "first_callsite",
         "merge_callsite",
     )
-    return all(needle in fattn for needle in fattn_needles) and all(needle in xmx for needle in xmx_needles)
+    hpp_needles = (
+        "static constexpr int ggml_sycl_fattn_xmx_packed_k_n_blocks(int n_kv)",
+        "return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0",
+    )
+    return (all(needle in fattn for needle in fattn_needles) and
+            all(needle in xmx for needle in xmx_needles) and
+            all(needle in fattn_hpp for needle in hpp_needles))
 
 
 def live_contract(source: str) -> bool:
@@ -97,7 +106,10 @@ def live_contract(source: str) -> bool:
         '"packed-first", "packed-merge"',
         "packed consumer post-submit profiler error hook was not observed exactly once",
         "packed consumer post-submit profiler error lost accepted event or payload",
-        "overflowing packed-K block rounding was accepted",
+        "forced packed dispatch accepted a non-positive token count",
+        "forced packed dispatch block rounding overflowed at int32 max",
+        "int32-max packed-K materialization descriptor was rejected",
+        "int32-max packed-K descriptor block calculation mismatch",
         "end-exclusive range ending at K removed sidecar",
         "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",
@@ -171,7 +183,8 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "*accepted_event = event",
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
-        "params.ne11 > std::numeric_limits<int>::max() -",
+        "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
+        "                            const int selected_tk",
         "host_submit_begin_us",
         "host_submit_end_us",
         "ggml_sycl_kernel_profile_record_event(",
@@ -180,6 +193,11 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "if (k >= begin && k < end)",
     ):
         assert not production_contract(FATTN.replace(needle, "/* mutation removed seam */"), XMX)
+    assert not production_contract(
+        FATTN, XMX,
+        FATTN_HPP.replace(
+            "return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0",
+            "return 0"))
     for needle in (
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
@@ -208,7 +226,8 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "post-submit profiler error hook was not observed exactly once",
         "sidecar post-submit profiler error hook was not observed exactly once",
         "packed consumer post-submit profiler error hook was not observed exactly once",
-        "overflowing packed-K block rounding was accepted",
+        "forced packed dispatch block rounding overflowed at int32 max",
+        "int32-max packed-K descriptor block calculation mismatch",
         "end-exclusive range ending at K removed sidecar",
         "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",
