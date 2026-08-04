@@ -23,7 +23,9 @@ struct stable_handle_fixture {
                           const void *     tag       = nullptr) {
         entry.in_use_count.store(1);
         ggml_sycl_cache_id id = ggml_sycl::test_make_cache_id(tag ? tag : storage);
-        handle = ggml_sycl::mem_handle::from_weight_lease(id, device, storage, layout, on_device, &entry);
+        handle = ggml_sycl::mem_handle::from_weight_lease_snapshot(id, device, storage, layout, on_device, &entry,
+                                                                   entry.storage_owner, entry.has_ready_event,
+                                                                   entry.ready_event);
         handle.set_debug_owner("descriptor-entry");
     }
 };

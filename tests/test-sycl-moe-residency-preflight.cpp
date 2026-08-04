@@ -21,7 +21,8 @@ struct stable_handle_fixture {
     explicit stable_handle_fixture(ggml_layout_mode layout = GGML_LAYOUT_XMX_TILED) {
         entry.in_use_count.store(1);
         ggml_sycl_cache_id id = ggml_sycl::test_make_cache_id(storage);
-        handle                = ggml_sycl::mem_handle::from_weight_lease(id, 0, storage, layout, true, &entry);
+        handle                = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+            id, 0, storage, layout, true, &entry, entry.storage_owner, entry.has_ready_event, entry.ready_event);
         handle.set_debug_owner("preflight-required");
     }
 };

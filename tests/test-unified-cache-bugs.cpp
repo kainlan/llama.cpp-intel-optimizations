@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 

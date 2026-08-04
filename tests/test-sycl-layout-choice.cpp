@@ -1233,10 +1233,10 @@ static bool run_regression_guard_policy_test() {
     uint8_t               abi_a = 0;
     uint8_t               abi_b = 0;
     ggml_sycl_cache_id    id    = ggml_sycl::test_make_cache_id(&abi_a);
-    ggml_sycl::mem_handle weight_a =
-        ggml_sycl::mem_handle::from_weight_lease(id, 0, &abi_a, GGML_LAYOUT_SOA, true, nullptr);
-    ggml_sycl::mem_handle weight_b =
-        ggml_sycl::mem_handle::from_weight_lease(id, 0, &abi_b, GGML_LAYOUT_SOA, true, nullptr);
+    ggml_sycl::mem_handle weight_a = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        id, 0, &abi_a, GGML_LAYOUT_SOA, true, nullptr, {}, false, sycl::event{});
+    ggml_sycl::mem_handle weight_b = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        id, 0, &abi_b, GGML_LAYOUT_SOA, true, nullptr, {}, false, sycl::event{});
     if (weight_a.hash() == weight_b.hash()) {
         printf("FAIL: test setup expected distinct ABI pointer hashes for moved weight handles\n");
         return false;
