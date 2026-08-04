@@ -11,11 +11,13 @@
 
 #include <sycl/sycl.hpp>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <vector>
 
 static bool configure_bounded_runtime() {
@@ -23,7 +25,7 @@ static bool configure_bounded_runtime() {
     // temporary device copy.  This unit-sized fixture must not reserve the
     // default full-VRAM arena to do that.  Do not override the pinned chunk
     // contract: the raw device reorder path must not allocate host staging.
-    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0;
+    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0 && setenv("GGML_SYCL_ASYNC_MEM", "1", 1) == 0;
 }
 
 template <typename T>
@@ -140,7 +142,12 @@ bool test_reorder_validation_contracts() {
         const int64_t ncols = test.block_elements * 4;
         const int64_t nrows = 3;
         const size_t  size  = 12 * test.block_bytes;
+        const size_t boundary_size = static_cast<size_t>(std::numeric_limits<int>::max()) * test.block_bytes;
         if (!ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, nrows, size) ||
+            !ggml_sycl_reorder_geometry_valid_for_test(
+                test.type, test.block_elements, std::numeric_limits<int>::max(), boundary_size) ||
+            ggml_sycl_reorder_geometry_valid_for_test(
+                test.type, test.block_elements * 2, std::numeric_limits<int>::max(), boundary_size) ||
             ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols - 1, nrows, size) ||
             ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, nrows, size - 1) ||
             ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, 0, size)) {
@@ -176,7 +183,50 @@ bool test_reorder_validation_contracts() {
         return false;
     }
 
-    printf("Test 0: PASS: reorder geometry and pointer contracts\n");
+    // Exercise the real copy-out registry path with an interior pointer. The
+    // backing bytes are host memory deliberately registered as device metadata;
+    // no SYCL probe is allowed to override this registry authority.
+    std::vector<uint8_t> registered_bytes(4096);
+    auto & registry = ggml_sycl::alloc_registry::instance();
+    registry.register_alloc(registered_bytes.data(), registered_bytes.size(), queue_device,
+                            ggml_sycl::alloc_type::DEVICE);
+    ggml_sycl::memory_location registered_location{};
+    if (!ggml_sycl::query_registered_location(registered_bytes.data() + 127, &registered_location) ||
+        registered_location.tier != alloc_tier::DEVICE_VRAM || registered_location.device != queue_device ||
+        ggml_sycl_reorder_pointer_contract_for_test(true, registered_location.tier, registered_location.device,
+                                                     sycl::usm::alloc::unknown, -1, 0)) {
+        registry.unregister_alloc(registered_bytes.data());
+        fprintf(stderr, "FAIL: real registry interior/mismatched-device contract\n");
+        return false;
+    }
+
+    std::atomic<bool> registry_ok{ true };
+    std::thread writer([&] {
+        for (int i = 0; i < 10000; ++i) {
+            registry.unregister_alloc(registered_bytes.data());
+            registry.register_alloc(registered_bytes.data(), registered_bytes.size(), i & 1 ? 7 : 8,
+                                    ggml_sycl::alloc_type::DEVICE);
+        }
+    });
+    std::thread reader([&] {
+        for (int i = 0; i < 10000; ++i) {
+            const auto info = registry.lookup_copy(registered_bytes.data() + 127);
+            if (info && (info->base != reinterpret_cast<uintptr_t>(registered_bytes.data()) ||
+                         info->size != registered_bytes.size() || (info->device_id != 7 && info->device_id != 8) ||
+                         info->type != ggml_sycl::alloc_type::DEVICE)) {
+                registry_ok.store(false);
+            }
+        }
+    });
+    writer.join();
+    reader.join();
+    registry.unregister_alloc(registered_bytes.data());
+    if (!registry_ok.load()) {
+        fprintf(stderr, "FAIL: alloc registry copy-out concurrency contract\n");
+        return false;
+    }
+
+    printf("Test 0: PASS: reorder geometry, registry, and pointer contracts\n");
     return true;
 }
 
@@ -662,6 +712,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "FAIL: could not configure bounded SYCL test allocations\n");
         return 1;
     }
+    // Pair async copies with Test 2's out-of-order queue so removing the
+    // production copy_event dependency corrupts the reorder oracle.
+    ggml_sycl_set_async_mem_for_test(true);
 
     printf("=== CPU→GPU SoA Interaction Tests ===\n");
     printf("Using production dequantization and Q4_0 reorder paths\n");

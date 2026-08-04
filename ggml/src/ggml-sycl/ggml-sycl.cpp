@@ -42204,10 +42204,14 @@ static sycl::event sycl_reorder_parallel_for(dpct::queue_ptr        stream,
                                              const sycl::event &    copy_event,
                                              const ExecutionRange & range,
                                              Kernel                 kernel) {
-    return stream->submit([&](sycl::handler & cgh) {
+    sycl::event reorder_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
         cgh.parallel_for(range, kernel);
     });
+    // reorder_rows_to_soa() is a boolean publication API: success means the
+    // destination is complete and may be published/reused immediately.
+    reorder_event.wait_and_throw();
+    return reorder_event;
 }
 
 static bool reorder_qw_q4_0(uint8_t * data_device,
@@ -42221,7 +42225,7 @@ static bool reorder_qw_q4_0(uint8_t * data_device,
                             dpct::queue_ptr stream) {
     GGML_SYCL_KTRACE("reorder_qw_q4_0", " ncols=%d nrows=%d size=%zu offset=%zu nblocks=%zu", ncols, nrows, size,
                      offset, size / sizeof(block_q4_0));
-    if (size % sizeof(block_q4_0) != 0 || offset % sizeof(block_q4_0) != 0) {
+    if (size % sizeof(block_q4_0) != 0 || offset != 0) {
         return false;
     }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
@@ -42237,18 +42241,17 @@ static bool reorder_qw_q4_0(uint8_t * data_device,
         copy_event.wait();
     }
 
-    int offset_blks = offset / sizeof(block_q4_0);
+    const size_t offset_blks = offset / sizeof(block_q4_0);
 
-    size_t nblocks       = size / sizeof(block_q4_0);
-    auto   qs_ptr        = data_device + offset_blks * QK4_0 / 2;
-    size_t d_byte_offset = ncols * nrows / 2;  // where d values start in SoA
+    auto         qs_ptr        = data_device + offset_blks * (QK4_0 / 2);
+    const size_t d_byte_offset = static_cast<size_t>(ncols) * static_cast<size_t>(nrows) / 2;
     auto   d_ptr         = (sycl::half *) (qs_ptr + d_byte_offset) + offset_blks;
     auto   reorder_event =
 
         sycl_reorder_parallel_for(stream, copy_event, size / sizeof(block_q4_0),
                                   [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const block_q4_0 * x  = (const block_q4_0 *) tmp_buf;
-            const int          ib = i;
+            const size_t       ib = i;
             for (int j = 0; j < QK4_0 / 2; j++) {
                 *(qs_ptr + ib * QK4_0 / 2 + j) = x[ib].qs[j];
             }
@@ -42263,11 +42266,11 @@ static bool reorder_qw_q4_0(uint8_t * data_device,
 }
 
 static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    if (size % sizeof(block_q4_K) != 0 || offset % sizeof(block_q4_K) != 0) {
+    if (size % sizeof(block_q4_K) != 0 || offset != 0) {
         return false;
     }
 
-    const int   nblocks = size / sizeof(block_q4_K);
+    const size_t nblocks = size / sizeof(block_q4_K);
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
@@ -42286,7 +42289,7 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
 
     auto reorder_event = sycl_reorder_parallel_for(stream, copy_event, nblocks, [=](auto i) {
         const block_q4_K * x  = (const block_q4_K *) tmp_buf;
-        const int          ib = i;
+        const size_t       ib = i;
         for (int j = 0; j < QK_K / 2; ++j) {
             qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
         }
@@ -42303,10 +42306,10 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
 }
 
 static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    if (size % sizeof(block_q6_K) != 0 || offset % sizeof(block_q6_K) != 0) {
+    if (size % sizeof(block_q6_K) != 0 || offset != 0) {
         return false;
     }
-    const int nblocks = size / sizeof(block_q6_K);
+    const size_t nblocks = size / sizeof(block_q6_K);
     auto      tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     if (!tmp_buf) {
@@ -42326,7 +42329,7 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     sycl::half * dm_ptr        = (sycl::half *) (scales_ptr + (QK_K / 16) * nblocks);
     auto         reorder_event = sycl_reorder_parallel_for(stream, copy_event, nblocks, [=](auto i) {
         const block_q6_K * x  = (const block_q6_K *) tmp_buf;
-        const int          ib = i;
+        const size_t       ib = i;
         const uint8_t *    ql = x[ib].ql;
         const uint8_t *    qh = x[ib].qh;
 
@@ -42403,7 +42406,7 @@ static bool reorder_qw_q8_0(uint8_t * data_device,
 
                             size_t          offset,
                             dpct::queue_ptr stream) {
-    if (size % sizeof(block_q8_0) != 0 || offset % sizeof(block_q8_0) != 0) {
+    if (size % sizeof(block_q8_0) != 0 || offset != 0) {
         return false;
     }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
@@ -42419,15 +42422,16 @@ static bool reorder_qw_q8_0(uint8_t * data_device,
         copy_event.wait();
     }
 
-    int  offset_blks = offset / sizeof(block_q8_0);
-    auto qs_ptr      = data_device + offset_blks * QK8_0;
-    auto d_ptr       = (sycl::half *) (qs_ptr + ncols * nrows) + offset_blks;
+    const size_t offset_blks = offset / sizeof(block_q8_0);
+    auto         qs_ptr      = data_device + offset_blks * QK8_0;
+    const size_t d_offset    = static_cast<size_t>(ncols) * static_cast<size_t>(nrows);
+    auto         d_ptr       = (sycl::half *) (qs_ptr + d_offset) + offset_blks;
 
     auto reorder_event = sycl_reorder_parallel_for(
         stream, copy_event, size / sizeof(block_q8_0), [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const block_q8_0 * x = (const block_q8_0 *) tmp_buf;
 
-            const int ib = i;
+            const size_t ib = i;
             // Copy 32 int8 quants
             for (int j = 0; j < QK8_0; j++) {
                 *(qs_ptr + ib * QK8_0 + j) = x[ib].qs[j];
@@ -42456,7 +42460,7 @@ static bool reorder_qw_mxfp4(uint8_t *       data_device,
                              size_t          size,
                              size_t          offset,
                              dpct::queue_ptr stream) {
-    if (size % sizeof(block_mxfp4) != 0 || offset % sizeof(block_mxfp4) != 0) {
+    if (size % sizeof(block_mxfp4) != 0 || offset != 0) {
         return false;
     }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
@@ -42471,10 +42475,11 @@ static bool reorder_qw_mxfp4(uint8_t *       data_device,
         copy_event.wait();
     }
     const size_t num_blocks  = size / sizeof(block_mxfp4);
-    const int    offset_blks = offset / sizeof(block_mxfp4);
+    const size_t offset_blks = offset / sizeof(block_mxfp4);
 
     uint8_t *     qs_out          = data_device + offset_blks * (QK_MXFP4 / 2);
-    uint8_t *     scale_out       = qs_out + (ncols / 2) * nrows + offset_blks;
+    const size_t  scale_offset    = (static_cast<size_t>(ncols) / 2) * static_cast<size_t>(nrows);
+    uint8_t *     scale_out       = qs_out + scale_offset + offset_blks;
     // Constants for tiled processing
     constexpr int BYTES_PER_BLOCK = QK_MXFP4 / 2;         // 16 bytes of qs per block
     constexpr int INTS_PER_BLOCK  = BYTES_PER_BLOCK / 4;  // 4 ints per block
@@ -42650,6 +42655,10 @@ static bool ggml_sycl_reorder_geometry_valid(ggml_type type, int64_t ncols, int6
     const size_t blocks = blocks_per_row * rows;
     return blocks <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
            blocks <= std::numeric_limits<size_t>::max() / block_bytes && size == blocks * block_bytes;
+}
+
+void ggml_sycl_set_async_mem_for_test(bool enabled) {
+    g_ggml_sycl_use_async_mem_op = enabled ? 1 : 0;
 }
 
 bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {

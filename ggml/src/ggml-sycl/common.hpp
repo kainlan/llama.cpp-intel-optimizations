@@ -1618,7 +1618,8 @@ bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr str
 
 // Reorder a raw device buffer from AOS to SOA layout for a given quantized type.
 // Operates on partial row ranges (ncols x nrows). The device buffer must already
-// contain AOS data and will be transformed in-place.
+// contain AOS data and will be transformed in-place. This boolean API is
+// synchronous: true means the destination reorder is complete and publishable.
 // Used by unified cache for partial-row loading in multi-device tensor split.
 bool reorder_rows_to_soa(uint8_t *       data_device,
                          ggml_type       type,
@@ -1628,6 +1629,7 @@ bool reorder_rows_to_soa(uint8_t *       data_device,
                          dpct::queue_ptr stream);
 
 // Host-only contract hooks for raw reorder validation tests.
+void ggml_sycl_set_async_mem_for_test(bool enabled);
 bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size);
 bool ggml_sycl_reorder_pointer_contract_for_test(bool                  registered,
                                                  ggml_sycl::alloc_tier registered_tier,

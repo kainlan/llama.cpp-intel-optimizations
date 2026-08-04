@@ -11639,25 +11639,39 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
                                         int64_t                    row_start,
                                         int64_t                    row_count,
                                         int                        device_idx) {
-    if (!tensor_name || !tensor_id.valid || !src_host || row_start < 0 || row_count <= 0 || ncols <= 0) {
+    if (!tensor_name || !tensor_id.valid || !src_host || row_start < 0 || row_count <= 0 || ncols <= 0 ||
+        ncols > std::numeric_limits<int>::max() || row_count > std::numeric_limits<int>::max() ||
+        row_start > std::numeric_limits<int64_t>::max() - row_count) {
         return nullptr;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+            break;
+        default:
+            return nullptr;
     }
 
     partial_rows_key key{ tensor_id, device_idx, type, ncols, row_start, row_count };
 
-    // Check if already loaded
-    {
-        std::lock_guard<std::mutex> lock(partial_mutex_);
-        auto                        it = partial_cache_.find(key);
-        if (it != partial_cache_.end()) {
-            return it->second.ptr;
-        }
+    // Serialize construction through publication for a key. A coarse lock is
+    // intentional here: misses are load-time operations, and it prevents two
+    // constructors from allocating, charging, then overwriting one live owner.
+    std::unique_lock<std::mutex> partial_lock(partial_mutex_);
+    auto                         existing = partial_cache_.find(key);
+    if (existing != partial_cache_.end()) {
+        return existing->second.ptr;
     }
 
-    const size_t row_bytes     = ggml_row_size(type, ncols);
+    const size_t row_bytes = ggml_row_size(type, ncols);
+    if (row_bytes == 0 || static_cast<uint64_t>(row_count) > std::numeric_limits<size_t>::max() / row_bytes) {
+        return nullptr;
+    }
     const size_t partial_bytes = static_cast<size_t>(row_count) * row_bytes;
-
-    if (partial_bytes == 0) {
+    if (!ggml_sycl_reorder_geometry_valid_for_test(type, ncols, row_count, partial_bytes)) {
         return nullptr;
     }
 
@@ -11685,14 +11699,13 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         return nullptr;
     }
 
-    // Copy AOS data from host to device through the smart-handle copy helper.
-    // The reorder kernel below is submitted to the same in-order queue_, so it
-    // still observes the copy before it starts.
+    // Complete the AOS upload before the synchronous reorder publication API;
+    // queue_ may be out-of-order.
     mem_handle partial_src =
         mem_handle::from_direct(const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
-    mem_copy_async(partial_handle, partial_src, partial_bytes, queue_, {});
+    mem_copy(partial_handle, partial_src, partial_bytes, queue_, {});
 
-    // Apply in-place SOA reorder on device (same queue, implicitly ordered)
+    // Apply the synchronous in-place SOA reorder only after upload completion.
     bool reordered =
         reorder_rows_to_soa(static_cast<uint8_t *>(dev_ptr), type, ncols, row_count, partial_bytes, &queue_);
     if (!reordered) {
@@ -11702,14 +11715,10 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         return nullptr;
     }
 
-    // Track in partial cache
-    {
-        std::lock_guard<std::mutex> lock(partial_mutex_);
-        partial_cache_[key] = { dev_ptr,   device_idx, type,          ncols,
-                                row_start, row_count,  partial_bytes, std::move(partial_handle) };
-    }
-
-    // Update budget tracking (count as weight bytes on this device)
+    // Publish owner and accounting exactly once while construction remains
+    // serialized. Readers cannot observe a pointer before reorder completion.
+    partial_cache_.emplace(key, partial_entry{ dev_ptr,   device_idx, type,          ncols,
+                                               row_start, row_count,  partial_bytes, std::move(partial_handle) });
     used_.fetch_add(partial_bytes, std::memory_order_relaxed);
 
     GGML_SYCL_DEBUG("[PARTIAL-ROWS] Loaded '%s' device %d: rows [%lld, %lld), %.2f MB SOA\n", tensor_name, device_idx,
@@ -13351,7 +13360,7 @@ bool query_registered_location(const void * ptr, memory_location * out) {
         }
     }
 
-    const auto * info = alloc_registry::instance().lookup(ptr);
+    const auto info = alloc_registry::instance().lookup_copy(ptr);
     if (!info) {
         return false;
     }

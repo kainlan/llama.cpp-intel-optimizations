@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <vector>
 
@@ -96,8 +97,28 @@ class alloc_registry {
         }
     }
 
-    // Look up a pointer (may be interior to an allocation). Thread-safe.
-    // Returns pointer to alloc_info if found, nullptr otherwise.
+    // Look up a pointer (may be interior to an allocation) and copy metadata
+    // while the shared lock is held. The returned value never aliases entries_.
+    std::optional<alloc_info> lookup_copy(const void * ptr) const {
+        if (ptr == nullptr) {
+            return std::nullopt;
+        }
+        uintptr_t                           addr = reinterpret_cast<uintptr_t>(ptr);
+        std::shared_lock<std::shared_mutex> lock(mu_);
+        auto                                it = std::upper_bound(entries_.begin(), entries_.end(), addr,
+                                                                  [](uintptr_t val, const alloc_info & a) { return val < a.base; });
+        if (it == entries_.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        if (addr >= it->base && addr - it->base < it->size) {
+            return *it;
+        }
+        return std::nullopt;
+    }
+
+    // Legacy borrowed lookup. Prefer lookup_copy() whenever metadata is used
+    // after this call; concurrent mutation can invalidate the returned pointer.
     const alloc_info * lookup(const void * ptr) const {
         if (ptr == nullptr) {
             return nullptr;
@@ -111,8 +132,8 @@ class alloc_registry {
             return nullptr;  // addr is before all allocations
         }
         --it;
-        // Check if addr falls within [base, base + size)
-        if (addr >= it->base && addr < it->base + it->size) {
+        // Check without overflowing base + size.
+        if (addr >= it->base && addr - it->base < it->size) {
             return &(*it);
         }
         return nullptr;
@@ -123,8 +144,8 @@ class alloc_registry {
     // Returns false for DEVICE.
     // Returns false if pointer is not in the registry (unknown = not host-accessible).
     bool is_host_accessible(const void * ptr) const {
-        const alloc_info * info = lookup(ptr);
-        if (info == nullptr) {
+        const auto info = lookup_copy(ptr);
+        if (!info) {
             return false;  // Unknown pointer — conservative: treat as not host-accessible
         }
         return info->type != alloc_type::DEVICE;
@@ -132,15 +153,15 @@ class alloc_registry {
 
     // Convenience: is this pointer on a device?
     bool is_device(const void * ptr) const {
-        const alloc_info * info = lookup(ptr);
-        return info != nullptr && info->type == alloc_type::DEVICE;
+        const auto info = lookup_copy(ptr);
+        return info && info->type == alloc_type::DEVICE;
     }
 
     // Convenience: get the sycl::usm::alloc equivalent for compatibility with existing code.
     // Note: this header does NOT include sycl.hpp — callers must convert.
     alloc_type get_alloc_type(const void * ptr) const {
-        const alloc_info * info = lookup(ptr);
-        if (info == nullptr) {
+        const auto info = lookup_copy(ptr);
+        if (!info) {
             return alloc_type::UNKNOWN;  // Not registered — caller must handle
         }
         return info->type;
@@ -148,7 +169,7 @@ class alloc_registry {
 
     // Get owning device ID. Returns -1 for host/mmap or unknown pointers.
     int owning_device(const void * ptr) const {
-        const alloc_info * info = lookup(ptr);
+        const auto info = lookup_copy(ptr);
         return info ? info->device_id : -1;
     }
 
