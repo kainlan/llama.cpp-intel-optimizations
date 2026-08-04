@@ -424,6 +424,15 @@ checks = {
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
     "all direct mirrors carry transaction ownership": len(re.findall(
         r"pending_load_txn_id\s*=\s*load_effect_guard\.load_txn_id\(\)", cache_cpp)) >= 4,
+    "lease result snapshots storage ownership": "std::shared_ptr<void> storage_owner" in cache_hpp
+    and re.search(r"result\.storage_owner\s*=\s*entry\.storage_owner", cache_cpp)
+    and "fresh.storage_owner = std::move(result.storage_owner)" in
+        (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
+    and "from_weight_lease_snapshot" in (root / "ggml/src/ggml-sycl/cpu-dispatch.cpp").read_text(),
+    "external host registrations remain borrowed": "non_owning_external_host = !allocation_owner" in cache_cpp
+    and "test_external_host_registration_never_freed" in
+        (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
+    "no parser-breaking shared-owner defaults": "std::shared_ptr<void> allocation_owner = {}" not in cache_hpp,
     "cache-owned preload allocation lifetime": "allocation_released_via_owner" in cache_hpp
     and "ggml_sycl_transfer_alloc_owner" in backend
     and "leased_storage_owner_" in (root / "ggml/src/ggml-sycl/mem-handle.hpp").read_text()

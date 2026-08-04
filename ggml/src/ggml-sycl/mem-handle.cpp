@@ -202,40 +202,67 @@ mem_handle mem_handle::from_weight(const unified_cache_key & key, int device) {
 // caller has already incremented entry->in_use_count via
 // unified_cache::acquire_weight_lease — ownership of that increment is
 // transferred to the new handle, whose dtor will release exactly once.
-mem_handle mem_handle::from_weight_lease(const ggml_sycl_cache_id & key_id,
-                                         int                        device,
-                                         void *                     ptr,
-                                         ggml_layout_mode           layout,
-                                         bool                       on_device,
-                                         unified_cache_entry *      entry) {
+mem_handle mem_handle::from_weight_lease_locked(const ggml_sycl_cache_id & key_id,
+                                                int                        device,
+                                                void *                     ptr,
+                                                ggml_layout_mode           layout,
+                                                bool                       on_device,
+                                                unified_cache_entry *      entry) {
     unified_cache_key key;
     key.type      = cache_entry_type::DENSE_WEIGHT;
     key.id        = key_id;
     key.layer_id  = -1;
     key.expert_id = -1;
-    return from_weight_lease(key, device, ptr, layout, on_device, entry);
+    return from_weight_lease_locked(key, device, ptr, layout, on_device, entry);
 }
 
-mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
-                                         int                       device,
-                                         void *                    ptr,
-                                         ggml_layout_mode          layout,
-                                         bool                      on_device,
-                                         unified_cache_entry *     entry) {
+mem_handle mem_handle::from_weight_lease_snapshot(const ggml_sycl_cache_id & key_id,
+                                                  int                        device,
+                                                  void *                     ptr,
+                                                  ggml_layout_mode           layout,
+                                                  bool                       on_device,
+                                                  unified_cache_entry *      entry,
+                                                  std::shared_ptr<void>      storage_owner,
+                                                  bool                       has_ready_event,
+                                                  const sycl::event &        ready_event) {
+    unified_cache_key key{ cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
+    return from_weight_lease_snapshot(key, device, ptr, layout, on_device, entry, std::move(storage_owner),
+                                      has_ready_event, ready_event);
+}
+
+mem_handle mem_handle::from_weight_lease_locked(const unified_cache_key & key,
+                                                int                       device,
+                                                void *                    ptr,
+                                                ggml_layout_mode          layout,
+                                                bool                      on_device,
+                                                unified_cache_entry *     entry) {
+    const auto        owner     = entry ? entry->storage_owner : std::shared_ptr<void>{};
+    const bool        has_event = entry && entry->has_ready_event;
+    const sycl::event event     = has_event ? entry->ready_event : sycl::event{};
+    return from_weight_lease_snapshot(key, device, ptr, layout, on_device, entry, owner, has_event, event);
+}
+
+mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
+                                                  int                       device,
+                                                  void *                    ptr,
+                                                  ggml_layout_mode          layout,
+                                                  bool                      on_device,
+                                                  unified_cache_entry *     entry,
+                                                  std::shared_ptr<void>     storage_owner,
+                                                  bool                      has_ready_event,
+                                                  const sycl::event &       ready_event) {
     mem_handle h;
     h.kind_   = mem_handle_kind::WEIGHT;
     h.device_ = device;
     h.key_    = key;
     h.gen_    = cache_generation();  // Fresh — no slow-path re-query
     h.cached_ = { ptr, layout, on_device };
-    if (entry && entry->has_ready_event) {
+    if (has_ready_event) {
         h.cached_.has_ready_event = true;
-        h.cached_.ready_event     = entry->ready_event;
+        h.cached_.ready_event     = ready_event;
     }
-    h.leased_entry_ = entry;  // ownership of the refcount bump transferred
-    if (entry) {
-        h.leased_storage_owner_ = entry->storage_owner;
-    }
+    h.leased_entry_         = entry;  // ownership of the refcount bump transferred
+    h.leased_storage_owner_ = std::move(storage_owner);
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
@@ -546,7 +573,8 @@ resolved_ptr mem_handle::resolve_slow() const {
     }
 
     lease_state fresh;
-    fresh.entry = result.entry;  // may be nullptr for S1-PRELOAD direct entries
+    fresh.entry         = result.entry;  // may be nullptr for S1-PRELOAD direct entries
+    fresh.storage_owner = std::move(result.storage_owner);
 
     // llama.cpp-dyhdl: also pin the underlying arena chunk.  Belt + suspenders
     // alongside the cache_entry lease: entry refcount prevents cache-layer

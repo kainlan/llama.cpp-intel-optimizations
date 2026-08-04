@@ -3183,8 +3183,9 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_weight/cache-hit-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
-                                                            it->second.layout, !it->second.host_resident, &it->second);
+                *out_handle =
+                    mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
+                                                         it->second.layout, !it->second.host_resident, &it->second);
             }
             result.ok = true;
             return result;
@@ -3336,8 +3337,8 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_weight/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                        !stored.host_resident, &stored);
+            *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                               stored.layout, !stored.host_resident, &stored);
         }
         id_to_key_[key] = cache_key;
     }
@@ -3377,7 +3378,7 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
                                                             const char *              site) {
     entry.in_use_count.fetch_add(1);
     entry.debug_last_lease_site = site;
-    return std::make_shared<mem_handle>(mem_handle::from_weight_lease(
+    return std::make_shared<mem_handle>(mem_handle::from_weight_lease_locked(
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
 
@@ -3427,8 +3428,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_expert/cache-hit-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
-                                                            it->second.layout, true, &it->second);
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
+                                                                   it->second.layout, true, &it->second);
             }
             result.ok = true;
             return result;
@@ -3569,8 +3570,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert/host-publish-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                            stored.location == cache_location::DEVICE, &stored);
+                *out_handle =
+                    mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr, stored.layout,
+                                                         stored.location == cache_location::DEVICE, &stored);
             }
             id_to_key_[key] = cache_key;
         }
@@ -3705,8 +3707,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_expert/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                        !stored.host_resident, &stored);
+            *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                               stored.layout, !stored.host_resident, &stored);
         }
         id_to_key_[key] = cache_key;
     }
@@ -3799,8 +3801,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                     auto & entry = entries_.find(cache_key)->second;
                     entry.in_use_count.fetch_add(1);
                     entry.debug_last_lease_site = "direct_stage_expert_tensor/all-existing";
-                    out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, entry.device_ptr,
-                                                                         entry.layout, true, &entry));
+                    out_handles->push_back(mem_handle::from_weight_lease_locked(
+                        cache_key, cache_device, entry.device_ptr, entry.layout, true, &entry));
                 }
             }
             result.ptr = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, keys.front(), layout))
@@ -3984,8 +3986,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             if (out_handles) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert_tensor/publish-out_handles";
-                out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr,
-                                                                     stored.layout, true, &stored));
+                out_handles->push_back(mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                                            stored.layout, true, &stored));
             }
             id_to_key_[key] = cache_key;
         }
@@ -4200,7 +4202,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                         result.ready_event = entry.ready_event;
                     }
                     result.reason   = expert_resolve_reason::FOUND;
-                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
+                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_locked(
                         entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry));
                     return result;
                 }
@@ -4293,7 +4295,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             result.cpu_accessible  = !lease.on_device;
             result.has_ready_event = entry_has_ready_event;
             result.reason          = expert_resolve_reason::FOUND;
-            result.lifetime        = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
+            result.lifetime        = std::make_unique<mem_handle>(mem_handle::from_weight_lease_locked(
                 mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry));
             return result;
         }
@@ -4638,6 +4640,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 stamp_pending_owner(old->second, load_effect_guard);
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
+                    old->second.non_owning_external_host = !allocation_owner;
                 }
                 old->second.access_count++;
                 old->second.last_access = time_++;
@@ -4646,9 +4649,9 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_expert/existing-out_handle";
-                    *out_handle =
-                        mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
-                                                      old->second.location == cache_location::DEVICE, &old->second);
+                    *out_handle                       = mem_handle::from_weight_lease_locked(
+                        cache_key, dev, old->second.device_ptr, old->second.layout,
+                        old->second.location == cache_location::DEVICE, &old->second);
                 }
                 goto publish_host_expert_direct;
             }
@@ -4677,7 +4680,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
-        cache_entry.storage_owner    = allocation_owner;
+        cache_entry.storage_owner            = allocation_owner;
+        cache_entry.non_owning_external_host = !allocation_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
@@ -4694,8 +4698,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                            stored.location == cache_location::DEVICE, &stored);
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
+                                                                   stored.location == cache_location::DEVICE, &stored);
             }
             id_to_key_[key] = cache_key;
         } catch (...) {
@@ -4782,6 +4786,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
                 stamp_pending_owner(old->second, load_effect_guard);
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
+                    old->second.non_owning_external_host = !allocation_owner;
                 }
                 old->second.access_count++;
                 old->second.last_access = time_++;
@@ -4790,9 +4795,9 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_weight/existing-out_handle";
-                    *out_handle =
-                        mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
-                                                      old->second.location == cache_location::DEVICE, &old->second);
+                    *out_handle                       = mem_handle::from_weight_lease_locked(
+                        cache_key, dev, old->second.device_ptr, old->second.layout,
+                        old->second.location == cache_location::DEVICE, &old->second);
                 }
                 goto publish_host_weight_direct;
             }
@@ -4821,7 +4826,8 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
-        cache_entry.storage_owner    = allocation_owner;
+        cache_entry.storage_owner            = allocation_owner;
+        cache_entry.non_owning_external_host = !allocation_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
@@ -4838,8 +4844,8 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                            stored.location == cache_location::DEVICE, &stored);
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
+                                                                   stored.location == cache_location::DEVICE, &stored);
             }
             id_to_key_[key] = cache_key;
         } catch (...) {
@@ -6095,7 +6101,8 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
-            result.entry     = &entry;  // pointer stable across unordered_map inserts
+            result.entry                = &entry;  // pointer stable across unordered_map inserts
+            result.storage_owner        = entry.storage_owner;
             if (entry.has_ready_event) {
                 result.has_ready_event = true;
                 result.ready_event     = entry.ready_event;
@@ -8273,7 +8280,8 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                 entry.pinned = false;
                 entries_unpinned++;
             }
-            if (entry.device_ptr && !entry.storage_owner) {
+            if (entry.device_ptr && !entry.storage_owner && !entry.non_owning_external_host &&
+                !entry.allocation_released_via_owner) {
                 to_free.push_back(
                     { entry.device_ptr, entry.size, entry.location, entry.host_resident, entry.pool_allocated });
             }

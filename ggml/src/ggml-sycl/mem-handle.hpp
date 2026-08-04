@@ -164,18 +164,36 @@ class mem_handle {
     // whose dtor releases automatically (llama.cpp-vtf7f).
     //
     // `entry` may be nullptr for S1-PRELOAD direct entries (no refcount).
-    static mem_handle from_weight_lease(const ggml_sycl_cache_id & key_id,
-                                        int                        device,
-                                        void *                     ptr,
-                                        ggml_layout_mode           layout,
-                                        bool                       on_device,
-                                        unified_cache_entry *      entry);
-    static mem_handle from_weight_lease(const unified_cache_key & key,
-                                        int                       device,
-                                        void *                    ptr,
-                                        ggml_layout_mode          layout,
-                                        bool                      on_device,
-                                        unified_cache_entry *     entry);
+    static mem_handle from_weight_lease_locked(const ggml_sycl_cache_id & key_id,
+                                               int                        device,
+                                               void *                     ptr,
+                                               ggml_layout_mode           layout,
+                                               bool                       on_device,
+                                               unified_cache_entry *      entry);
+    static mem_handle from_weight_lease_snapshot(const ggml_sycl_cache_id & key_id,
+                                                 int                        device,
+                                                 void *                     ptr,
+                                                 ggml_layout_mode           layout,
+                                                 bool                       on_device,
+                                                 unified_cache_entry *      entry,
+                                                 std::shared_ptr<void>      storage_owner,
+                                                 bool                       has_ready_event,
+                                                 const sycl::event &        ready_event);
+    static mem_handle from_weight_lease_locked(const unified_cache_key & key,
+                                               int                       device,
+                                               void *                    ptr,
+                                               ggml_layout_mode          layout,
+                                               bool                      on_device,
+                                               unified_cache_entry *     entry);
+    static mem_handle from_weight_lease_snapshot(const unified_cache_key & key,
+                                                 int                       device,
+                                                 void *                    ptr,
+                                                 ggml_layout_mode          layout,
+                                                 bool                      on_device,
+                                                 unified_cache_entry *     entry,
+                                                 std::shared_ptr<void>     storage_owner,
+                                                 bool                      has_ready_event,
+                                                 const sycl::event &       ready_event);
 
     // Create a WEIGHT handle from a bare cache ID + device.
     // Convenience factory for callers that have ggml_sycl_cache_id (e.g.

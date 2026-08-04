@@ -2650,8 +2650,9 @@ static void * get_host_ptr(const ggml_tensor *     t,
                 if (cache) {
                     auto leased = cache->acquire_weight_lease(key);
                     if (leased && leased.ptr) {
-                        *out_lease = ggml_sycl::mem_handle::from_weight_lease(key, device, leased.ptr, leased.layout,
-                                                                              leased.on_device, leased.entry);
+                        *out_lease = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry,
+                            std::move(leased.storage_owner), leased.has_ready_event, leased.ready_event);
                         // Host-accessible: the lease holder's ptr is the correct
                         // pointer to hand to DNNL; it matches the resolved/
                         // t->data path when the data is cache-managed.
@@ -2695,8 +2696,9 @@ static void * get_host_ptr(const ggml_tensor *     t,
                         // directly via a named factory below.
                         // NOTE: the caller must keep out_lease alive until
                         // the downstream DNNL / host_task completes.
-                        *out_lease = ggml_sycl::mem_handle::from_weight_lease(
-                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry);
+                        *out_lease = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry,
+                            std::move(leased.storage_owner), leased.has_ready_event, leased.ready_event);
                         // Return pointer regardless of location: HOST_PINNED
                         // is host-accessible (PCIe zero-copy), and device
                         // is NOT host-accessible so callers that need

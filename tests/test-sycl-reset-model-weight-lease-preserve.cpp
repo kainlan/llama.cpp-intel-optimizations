@@ -435,6 +435,31 @@ static bool test_host_registration_initial_insert_failures(sycl::queue & q) {
     return true;
 }
 
+static bool test_external_host_registration_never_freed(sycl::queue & q) {
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     dense(128, 0x51), expert(128, 0x52);
+    const auto               dense_key  = ggml_sycl::test_make_cache_id(dense.data());
+    const auto               expert_key = ggml_sycl::test_make_cache_id(expert.data());
+    if (!cache.register_host_weight(dense_key, dense.data(), dense.size(), GGML_LAYOUT_AOS) ||
+        !cache.register_host_expert(expert_key, expert.data(), expert.size(), GGML_LAYOUT_AOS)) {
+        return false;
+    }
+    cache.test_mark_all_entries_touched_by_load(301);
+    cache.note_model_load_end(0, 301);
+    cache.release_model_slot(0);
+    if (dense[0] != 0x51 || expert[0] != 0x52) {
+        return false;
+    }
+
+    if (!cache.register_host_weight(dense_key, dense.data(), dense.size(), GGML_LAYOUT_AOS) ||
+        !cache.register_host_expert(expert_key, expert.data(), expert.size(), GGML_LAYOUT_AOS)) {
+        return false;
+    }
+    cache.test_mark_all_entries_touched_by_load(302);
+    cache.note_model_load_abort(302);
+    return dense[0] == 0x51 && expert[0] == 0x52;
+}
+
 static bool test_shared_entry_exact_two_owner_unload(sycl::queue & q) {
     printf("\n=== Test: shared entry retains exact two-model ownership ===\n");
 
@@ -673,6 +698,7 @@ int main() {
     ok &= test_reset_preserves_leased_entry_and_remaps_id(q);
     ok &= test_live_model_idle_weights_survive_load_boundary(q);
     ok &= test_host_registration_initial_insert_failures(q);
+    ok &= test_external_host_registration_never_freed(q);
     ok &= test_shared_entry_exact_two_owner_unload(q);
     ok &= test_unrelated_thread_entry_not_claimed(q);
     ok &= test_replan_frees_own_staging_but_spares_a_live_model(q);

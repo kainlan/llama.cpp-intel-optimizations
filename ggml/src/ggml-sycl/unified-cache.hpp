@@ -1738,6 +1738,7 @@ class unified_cache {
         ggml_layout_mode      layout          = GGML_LAYOUT_AOS;
         bool                  on_device       = false;
         unified_cache_entry * entry           = nullptr;  // opaque handle for lease release
+        std::shared_ptr<void> storage_owner;
         bool                  has_ready_event = false;
         sycl::event           ready_event;
 
@@ -1898,8 +1899,16 @@ class unified_cache {
                               void *                ptr,
                               size_t                size,
                               ggml_layout_mode      layout,
-                              mem_handle *          out_handle       = nullptr,
-                              std::shared_ptr<void> allocation_owner = {});
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> allocation_owner);
+
+    bool register_host_expert(ggml_sycl_cache_id key,
+                              void *             ptr,
+                              size_t             size,
+                              ggml_layout_mode   layout,
+                              mem_handle *       out_handle = nullptr) {
+        return register_host_expert(key, ptr, size, layout, out_handle, {});
+    }
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -1908,8 +1917,16 @@ class unified_cache {
                               void *                ptr,
                               size_t                size,
                               ggml_layout_mode      layout,
-                              mem_handle *          out_handle       = nullptr,
-                              std::shared_ptr<void> allocation_owner = {});
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> allocation_owner);
+
+    bool register_host_weight(ggml_sycl_cache_id key,
+                              void *             ptr,
+                              size_t             size,
+                              ggml_layout_mode   layout,
+                              mem_handle *       out_handle = nullptr) {
+        return register_host_weight(key, ptr, size, layout, out_handle, {});
+    }
 
     // Placement-plan materialization authority.  In planned mode direct staging
     // and host registration are only legal while model load or an explicit
