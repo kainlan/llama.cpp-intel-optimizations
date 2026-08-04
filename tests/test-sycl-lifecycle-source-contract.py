@@ -718,6 +718,10 @@ checks = {
     and buffer_callback_inventory_ok
     and "durable_owners" in registry_backend
     and "owner_lease" in backend_base
+    and "ggml_backend_buffer_set_type" in backend_base
+    and "ggml_backend_buffer_set_type(buffer, buft)" in backend
+    and "remaining host-compute buffer lost durable ownership" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "sycl_module_admission_state::RETRY_CLOSED" in backend
     and "g_sycl_module_admission_cv.wait_for" in backend
     and backend.index("global_registry().reserve_shutdown()") < backend.index("g_sycl_module_admission_cv.wait_for")

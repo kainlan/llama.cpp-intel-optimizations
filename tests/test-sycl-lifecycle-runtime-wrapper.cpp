@@ -668,8 +668,12 @@ int main() {
     }
     phase("durable buffer owner unload rejection");
     auto durable_buft = CALL_SYCL(ggml_backend_sycl_host_buffer_type)();
+    auto durable_compute_buft = CALL_SYCL(ggml_backend_sycl_host_compute_buffer_type)(0);
     auto durable_buffer = durable_buft ? ggml_backend_buft_alloc_buffer(durable_buft, 64) : nullptr;
-    if (!durable_buffer || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+    auto durable_compute_buffer = durable_compute_buft ?
+                                      ggml_backend_buft_alloc_buffer(durable_compute_buft, 64) : nullptr;
+    if (!durable_buffer || !durable_compute_buffer ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
         std::fprintf(stderr, "live backend buffer did not block checked unload\n");
         return 1;
     }
@@ -677,6 +681,11 @@ int main() {
     ggml_backend_buffer_clear(durable_buffer, 0);
     ggml_backend_buffer_reset(durable_buffer);
     ggml_backend_buffer_free(durable_buffer);
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "remaining host-compute buffer lost durable ownership\n");
+        return 1;
+    }
+    ggml_backend_buffer_free(durable_compute_buffer);
 
     phase("stateful module unload");
     size_t unloaded_reg_index = ggml_backend_reg_count();

@@ -32946,7 +32946,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     auto *                ctx    = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle) };
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
 
-    buffer->buft              = buft;
+    if (!ggml_backend_buffer_set_type(buffer, buft)) {
+        ggml_backend_buffer_free(buffer);
+        delete ctx;
+        return nullptr;
+    }
     buffer->context           = ctx;
     buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
     buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;

@@ -75,6 +75,10 @@ extern "C" {
         bool owner_lease;
     };
 
+    // Transfer a buffer produced through a proxy type to its true product
+    // owner, preserving durable registry ownership without double counting.
+    GGML_API bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft);
+
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
                    ggml_backend_buffer_type_t buft,
             struct ggml_backend_buffer_i      iface,

@@ -156,6 +156,27 @@ bool ggml_backend_buft_has_cap(ggml_backend_buffer_type_t buft, enum ggml_backen
 
 // backend buffer
 
+bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft) {
+    if (!buffer || !buft) return false;
+    ggml_backend_dev_t new_device = buft->device;
+    if (buffer->owner_device == new_device) {
+        buffer->buft = buft;
+        return true;
+    }
+    const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
+    const bool new_lease = new_device && acquire_owner;
+    if (new_lease && !acquire_owner(new_device)) return false;
+
+    if (buffer->owner_lease) {
+        const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
+        if (release_owner) release_owner(buffer->owner_device);
+    }
+    buffer->buft = buft;
+    buffer->owner_device = new_device;
+    buffer->owner_lease = new_lease;
+    return true;
+}
+
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
