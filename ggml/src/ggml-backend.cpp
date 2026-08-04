@@ -454,8 +454,8 @@ bool ggml_backend_buffer_is_valid(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_backend_buffer_registry_mutex);
-    return g_backend_buffer_registry.find(buffer) != g_backend_buffer_registry.end();
+    std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+    return g_live_buffers.find(buffer) != g_live_buffers.end();
 }
 
 ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t buffer) {
