@@ -96142,13 +96142,22 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     }
 }
 
+extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
+    if (ggml_sycl_info().device_count <= 0) {
+        return false;
+    }
+    return g_expert_predictors[0].test_allocate_scores(ggml_sycl_get_device(0).default_queue(), 16);
+}
+
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
     return !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
            !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
-           g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty();
+           g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
+           !g_expert_predictors[0].test_scores_allocated() &&
+           ggml_sycl::unified_alloc_validate_registry(-1, "module-reload-clean");
 }
 
 void ggml_backend_sycl_shutdown(void) {
@@ -96178,8 +96187,11 @@ void ggml_backend_sycl_shutdown(void) {
             queue = nullptr;
         }
     }
-    ggml_sycl::shutdown_unified_cache();
+    // Predictor score handles are unified-cache-owned allocations. Reset all
+    // owning MoE handles while the allocation registry and queues are live;
+    // only then set the cache shutdown flag and drain the registry.
     ggml_sycl_reset_moe_module_state();
+    ggml_sycl::shutdown_unified_cache();
 
     GGML_LOG_INFO("[SYCL-MODULE] shutdown complete\n");
     // The generic loader releases the reservation only after registry/device
@@ -96293,6 +96305,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_release_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_release_live_update;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_backend_publish") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_backend_publish;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
+        return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
+    }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_candidate_binding_allocation;
     }
@@ -96372,6 +96390,12 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
     return &reg;
 }
 
+static std::atomic<bool> g_test_fail_next_backend_publish{ false };
+
+extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
+    g_test_fail_next_backend_publish.store(true, std::memory_order_release);
+}
+
 ggml_backend_t ggml_backend_sycl_init(int device) {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
     auto & lifecycle_registry = ggml_sycl::lifecycle::global_registry();
@@ -96387,46 +96411,54 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
             }
         }
     } admission{ lifecycle_registry };
-    if (ggml_sycl_alloc_trace_enabled_impl()) {
-        ggml_sycl_alloc_trace_init();
-    }
-
-    ggml_check_sycl();
-    // Watchdog deferred to first graph_compute — model loading (60GB for 120B)
-    // can take >60s and doesn't need hang detection.
-    check_allow_gpu_index(device);
-    ggml_backend_sycl_context * ctx = new ggml_backend_sycl_context(device);
-    if (ctx == nullptr) {
-        GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
-        return nullptr;
-    };
-    {
-        std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-        g_backend_context_by_device[device] = ctx;
-    }
-
-    // Initialize L2 prefetch manager for TG optimization (owned by context)
-    // Note: Can't use make_unique with custom deleter, use explicit construction
-    if (ggml_sycl::is_l2_prefetch_enabled() && ctx->stream()) {
-        try {
-            ctx->l2_prefetch_manager.reset(new ggml_sycl::L2PrefetchManager(ctx->stream()));
-        } catch (const sycl::exception & e) {
-            GGML_LOG_ERROR("[L2-PREFETCH] Failed to create manager (SYCL): %s\n", e.what());
-        } catch (const std::exception & e) {
-            GGML_LOG_ERROR("[L2-PREFETCH] Failed to create manager (std): %s\n", e.what());
+    try {
+        if (ggml_sycl_alloc_trace_enabled_impl()) {
+            ggml_sycl_alloc_trace_init();
         }
+
+        ggml_check_sycl();
+        // Watchdog deferred to first graph_compute — model loading (60GB for 120B)
+        // can take >60s and doesn't need hang detection.
+        check_allow_gpu_index(device);
+        auto ctx = std::make_unique<ggml_backend_sycl_context>(device);
+
+        // Initialize L2 prefetch manager for TG optimization (owned by context).
+        if (ggml_sycl::is_l2_prefetch_enabled() && ctx->stream()) {
+            try {
+                ctx->l2_prefetch_manager.reset(new ggml_sycl::L2PrefetchManager(ctx->stream()));
+            } catch (const sycl::exception & e) {
+                GGML_LOG_ERROR("[L2-PREFETCH] Failed to create manager (SYCL): %s\n", e.what());
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("[L2-PREFETCH] Failed to create manager (std): %s\n", e.what());
+            }
+        }
+
+        if (g_test_fail_next_backend_publish.exchange(false, std::memory_order_acq_rel)) {
+            throw std::bad_alloc();
+        }
+        auto sycl_backend = std::make_unique<ggml_backend>(ggml_backend{
+            /* .guid    = */ ggml_backend_sycl_guid(),
+            /* .iface   = */ ggml_backend_sycl_interface,
+            /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
+            /* .context = */ ctx.get(),
+        });
+
+        // Publish only after both allocations succeeded. From this point the
+        // backend owns ctx and the admission count represents a reachable object.
+        {
+            std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
+            g_backend_context_by_device[device] = ctx.get();
+        }
+        g_sycl_backend_refcount.fetch_add(1, std::memory_order_acq_rel);
+        admission.committed = true;
+        ctx.release();
+        return sycl_backend.release();
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: backend construction failed: %s\n", __func__, e.what());
+    } catch (...) {
+        GGML_LOG_ERROR("%s: backend construction failed\n", __func__);
     }
-
-    ggml_backend_t sycl_backend =
-
-        new ggml_backend{ /* .guid    = */ ggml_backend_sycl_guid(),
-                          /* .iface   = */ ggml_backend_sycl_interface,
-                          /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
-                          /* .context = */ ctx };
-    g_sycl_backend_refcount.fetch_add(1, std::memory_order_acq_rel);
-    admission.committed = true;
-
-    return sycl_backend;
+    return nullptr;
 }
 
 // ============================================================================

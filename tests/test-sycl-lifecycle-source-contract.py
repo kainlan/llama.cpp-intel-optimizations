@@ -7,6 +7,7 @@ root = Path(__file__).resolve().parents[1]
 hpp = (root / "ggml/src/ggml-sycl/model-lifecycle.hpp").read_text()
 cpp = (root / "ggml/src/ggml-sycl/model-lifecycle.cpp").read_text()
 backend = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+registry_backend = (root / "ggml/src/ggml-backend-reg.cpp").read_text()
 public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
@@ -548,10 +549,9 @@ checks = {
     and "test_block_backend_context_release" in hpp
     and "checked unload crossed final backend destructor tail" in
         (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
-    "serialized dynamic registry transactions": "mutable std::recursive_mutex mutex" in
-        (root / "ggml/src/ggml-backend-reg.cpp").read_text()
-    and "backend_snapshot() const" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
-    and "device_snapshot() const" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    "serialized dynamic registry transactions": "mutable std::recursive_mutex" in registry_backend
+    and "backend_get(size_t index) const" in registry_backend
+    and "device_get(size_t index) const" in registry_backend
     and "Serialize dlopen/init/register" in (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "registry load/enumeration crossed checked-unload transaction" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
@@ -563,6 +563,34 @@ checks = {
     and "g_adaptive_prestage.reset_after_stop()" in backend
     and "g_expert_predictors[d].reset()" in backend
     and "NODELETE reload retained model-bound MoE state" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "owned dynamic registry lifetime and logical removal": all(
+        token in registry_backend
+        for token in (
+            "ggml_backend_reg_entry_ptr",
+            "g_backend_raw_handle_leases",
+            "backend_get(size_t index)",
+            "backends.erase(it)",
+            "if (shutdown) {\n                shutdown();",
+            "test_reentrant_mutation_on_next_unload",
+        )
+    )
+    and registry_backend.index("backends.erase(it)") < registry_backend.index("if (shutdown) {\n                shutdown();"),
+    "registry count-get races return null not assert": "if (index >= backends.size())" in registry_backend
+    and "if (index >= devices.size())" in registry_backend
+    and "GGML_ASSERT(index < snapshot.size())" not in registry_backend,
+    "optional unload hooks cannot throw across C API": registry_backend.count("catch (...)") >= 4
+    and "eligibility_threw" in registry_backend
+    and "cancel_noexcept" in registry_backend,
+    "predictor ownership reset precedes cache shutdown": backend.index("ggml_sycl_reset_moe_module_state();\n    ggml_sycl::shutdown_unified_cache();")
+    > 0
+    and "test_allocate_predictor_scores" in backend
+    and "unified_alloc_validate_registry(-1, \"module-reload-clean\")" in backend,
+    "backend construction publish rollback": "g_test_fail_next_backend_publish" in backend
+    and "auto ctx = std::make_unique<ggml_backend_sycl_context>(device)" in backend
+    and backend.index("auto sycl_backend = std::make_unique<ggml_backend>")
+    < backend.index("g_backend_context_by_device[device] = ctx.get()")
+    and "backend construction failure leaked publication or admission" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "atomic shutdown reservation": "reserve_shutdown()" in hpp
     and "shutdown_reserved_" in hpp
@@ -576,8 +604,7 @@ checks = {
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "ggml_backend_complete_unload" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
-    and "dl_handle_ptr keep_alive" in
-        (root / "ggml/src/ggml-backend-reg.cpp").read_text(),
+    and "const ggml_backend_reg_entry_ptr unloading" in registry_backend,
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()

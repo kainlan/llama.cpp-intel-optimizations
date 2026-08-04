@@ -2,14 +2,18 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <future>
 #include <thread>
 
 extern "C" void ggml_backend_test_block_next_unload();
 extern "C" void ggml_backend_test_wait_unload_blocked();
+extern "C" void ggml_backend_test_reentrant_mutation_on_next_unload();
 extern "C" void ggml_backend_test_release_unload();
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state();
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
+extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
+extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
@@ -38,6 +42,12 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_moe_module_state"));
     if (!seed_moe_state) {
         std::fprintf(stderr, "missing MoE reload-state seed procedure\n");
+        return 1;
+    }
+    auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_allocate_predictor_scores"));
+    if (!allocate_predictor_scores || !allocate_predictor_scores()) {
+        std::fprintf(stderr, "failed to create real predictor unified allocation\n");
         return 1;
     }
     seed_moe_state();
@@ -76,6 +86,7 @@ int main() {
             return 1;                                                                                      \
         }
     LOAD_SYCL(ggml_backend_sycl_shutdown)
+    LOAD_SYCL(ggml_backend_sycl_test_fail_next_backend_publish)
     LOAD_SYCL(ggml_backend_sycl_can_unload)
     LOAD_SYCL(ggml_backend_sycl_cancel_unload)
     LOAD_SYCL(ggml_backend_sycl_test_hold_live_update)
@@ -111,6 +122,15 @@ int main() {
     if (!CALL_SYCL(ggml_backend_sycl_can_unload)() ||
         CALL_SYCL(ggml_backend_sycl_model_load_begin)(&reserved_begin) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
         std::fprintf(stderr, "shutdown reservation admitted a post-check load\n");
+        return 1;
+    }
+    CALL_SYCL(ggml_backend_sycl_cancel_unload)();
+
+    phase("backend construction failpoint rollback");
+    CALL_SYCL(ggml_backend_sycl_test_fail_next_backend_publish)();
+    if (ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr) != nullptr ||
+        !CALL_SYCL(ggml_backend_sycl_can_unload)()) {
+        std::fprintf(stderr, "backend construction failure leaked publication or admission\n");
         return 1;
     }
     CALL_SYCL(ggml_backend_sycl_cancel_unload)();
@@ -257,8 +277,21 @@ int main() {
         return 1;
     }
     phase("stateful module unload");
+    size_t unloaded_reg_index = ggml_backend_reg_count();
+    for (size_t i = 0; i < unloaded_reg_index; ++i) {
+        if (ggml_backend_reg_get(i) == reg) {
+            unloaded_reg_index = i;
+            break;
+        }
+    }
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
         std::fprintf(stderr, "dead-owner module unload failed\n");
+        return 1;
+    }
+    if (ggml_backend_reg_by_name("SYCL") != nullptr ||
+        (unloaded_reg_index < ggml_backend_reg_count() && ggml_backend_reg_get(unloaded_reg_index) == reg) ||
+        std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        std::fprintf(stderr, "logical unload lookup or retained raw-handle lease failed\n");
         return 1;
     }
     reg = nullptr;
@@ -290,6 +323,7 @@ int main() {
         return 1;
     }
     phase("serialized unload/load/enumeration overlap");
+    ggml_backend_test_reentrant_mutation_on_next_unload();
     ggml_backend_test_block_next_unload();
     auto final_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
     ggml_backend_test_wait_unload_blocked();

@@ -485,6 +485,34 @@ void ExpertPredictor::reset() {
     prefetch_disabled_.store(false, std::memory_order_relaxed);
 }
 
+bool ExpertPredictor::test_allocate_scores(sycl::queue & queue, int count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (count <= 0) {
+        return false;
+    }
+    ggml_sycl::alloc_request req{};
+    req.queue                           = &queue;
+    req.device                          = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                            = static_cast<size_t>(count) * sizeof(float);
+    req.intent.role                     = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                 = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.constraints.must_device  = true;
+    ggml_sycl::alloc_handle owner{};
+    if (!ggml_sycl::unified_alloc(req, &owner) || !owner.ptr) {
+        return false;
+    }
+    scores_dev_    = static_cast<float *>(owner.ptr);
+    scores_dev_n_  = count;
+    scores_queue_  = &queue;
+    scores_handle_ = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    return scores_handle_.valid();
+}
+
+bool ExpertPredictor::test_scores_allocated() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return scores_handle_.valid();
+}
+
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
     if (initialized_) {
         return;

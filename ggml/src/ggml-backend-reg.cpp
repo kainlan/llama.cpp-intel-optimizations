@@ -102,6 +102,7 @@ static std::condition_variable g_registry_test_cv;
 static bool                    g_registry_test_block_next_unload = false;
 static bool                    g_registry_test_unload_blocked = false;
 static bool                    g_registry_test_release_unload = false;
+static bool                    g_registry_test_reentrant_mutation = false;
 
 extern "C" void ggml_backend_test_block_next_unload() {
     std::lock_guard<std::mutex> lock(g_registry_test_mutex);
@@ -113,6 +114,11 @@ extern "C" void ggml_backend_test_block_next_unload() {
 extern "C" void ggml_backend_test_wait_unload_blocked() {
     std::unique_lock<std::mutex> lock(g_registry_test_mutex);
     g_registry_test_cv.wait(lock, [] { return g_registry_test_unload_blocked; });
+}
+
+extern "C" void ggml_backend_test_reentrant_mutation_on_next_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_reentrant_mutation = true;
 }
 
 extern "C" void ggml_backend_test_release_unload() {
@@ -158,15 +164,30 @@ static std::string path_str(const fs::path & path) {
     }
 }
 
+static bool striequals(const char * a, const char * b);
+
 struct ggml_backend_reg_entry {
     ggml_backend_reg_t reg;
-    dl_handle_ptr handle;
+    dl_handle_ptr      handle;
 };
 
+using ggml_backend_reg_entry_ptr = std::shared_ptr<ggml_backend_reg_entry>;
+
+struct ggml_backend_device_entry {
+    ggml_backend_dev_t           dev;
+    ggml_backend_reg_entry_ptr   owner;
+};
+
+// Raw public registry/device handles cannot carry a C++ lease. Retain every
+// dynamic entry returned to a thread so its DSO remains mapped for as long as
+// that thread can use the raw handle. Logical removal is still immediate: all
+// lookups validate against the live vectors before adding a lease.
+static thread_local std::vector<ggml_backend_reg_entry_ptr> g_backend_raw_handle_leases;
+
 struct ggml_backend_registry {
-    mutable std::recursive_mutex mutex;
-    std::vector<ggml_backend_reg_entry> backends;
-    std::vector<ggml_backend_dev_t> devices;
+    mutable std::recursive_mutex             mutex;
+    std::vector<ggml_backend_reg_entry_ptr>  backends;
+    std::vector<ggml_backend_device_entry>   devices;
 
     ggml_backend_registry() {
         // Only referenced inside the per-backend GGML_USE_* blocks below, so it
@@ -252,8 +273,8 @@ struct ggml_backend_registry {
         // FIXME: backends cannot be safely unloaded without a function to destroy all the backend resources,
         // since backend threads may still be running and accessing resources from the dynamic library
         for (auto & entry : backends) {
-            if (entry.handle) {
-                entry.handle.release(); // NOLINT
+            if (entry->handle) {
+                entry->handle.release(); // NOLINT
             }
         }
     }
@@ -265,7 +286,7 @@ struct ggml_backend_registry {
         }
 
         for (auto & entry : backends) {
-            if (entry.reg == reg) {
+            if (entry->reg == reg) {
                 return;
             }
         }
@@ -274,16 +295,25 @@ struct ggml_backend_registry {
         GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n",
             __func__, ggml_backend_reg_name(reg), ggml_backend_reg_dev_count(reg));
 #endif
-        backends.push_back({ reg, std::move(handle) });
+        auto entry = std::make_shared<ggml_backend_reg_entry>(ggml_backend_reg_entry{ reg, std::move(handle) });
+        backends.push_back(entry);
         for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
-            register_device(ggml_backend_reg_dev_get(reg, i));
+            register_device(ggml_backend_reg_dev_get(reg, i), entry);
         }
     }
 
-    void register_device(ggml_backend_dev_t device) {
+    void register_device(ggml_backend_dev_t device, ggml_backend_reg_entry_ptr owner = {}) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        for (auto & dev : devices) {
-            if (dev == device) {
+        if (!owner && device) {
+            const auto reg = ggml_backend_dev_backend_reg(device);
+            const auto it = std::find_if(backends.begin(), backends.end(),
+                [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+            if (it != backends.end()) {
+                owner = *it;
+            }
+        }
+        for (auto & entry : devices) {
+            if (entry.dev == device) {
                 return;
             }
         }
@@ -291,7 +321,7 @@ struct ggml_backend_registry {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: registered device %s (%s)\n", __func__, ggml_backend_dev_name(device), ggml_backend_dev_description(device));
 #endif
-        devices.push_back(device);
+        devices.push_back({ device, std::move(owner) });
     }
 
     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
@@ -357,7 +387,7 @@ struct ggml_backend_registry {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         ggml_backend_test_unload_barrier();
         auto it = std::find_if(backends.begin(), backends.end(),
-                               [reg](const ggml_backend_reg_entry & entry) { return entry.reg == reg; });
+                               [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
 
         if (it == backends.end()) {
             if (!silent) {
@@ -369,6 +399,8 @@ struct ggml_backend_registry {
         if (!silent) {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
         }
+        // Capture lifetime-owned identity before any reentrant plugin callback.
+        const ggml_backend_reg_entry_ptr unloading = *it;
 
         // A module with exact live lifecycle owners must retain both its
         // devices and procedure table so model destruction can still perform
@@ -376,8 +408,20 @@ struct ggml_backend_registry {
         using can_unload_fn = bool (*)();
         auto can_unload = reinterpret_cast<can_unload_fn>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_can_unload"));
-        if (can_unload && !can_unload()) {
-            return GGML_BACKEND_UNLOAD_BUSY;
+        bool shutdown_reserved = false;
+        bool eligibility_threw = false;
+        try {
+            if (can_unload) {
+                shutdown_reserved = can_unload();
+                if (!shutdown_reserved) {
+                    return GGML_BACKEND_UNLOAD_BUSY;
+                }
+            }
+        } catch (...) {
+            // Conservatively assume a throwing hook reserved admission before
+            // it failed; cancellation below is required to make retry possible.
+            shutdown_reserved = can_unload != nullptr;
+            eligibility_threw = true;
         }
 
         // Give a dynamic backend one last chance to join module-owned threads
@@ -387,58 +431,139 @@ struct ggml_backend_registry {
         auto shutdown = reinterpret_cast<shutdown_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_shutdown"));
         auto complete = reinterpret_cast<shutdown_fn>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_complete_unload"));
-        if (can_unload && !complete) {
-            auto cancel = reinterpret_cast<shutdown_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload"));
-            if (cancel) {
-                cancel();
+        auto cancel = reinterpret_cast<shutdown_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload"));
+        const auto cancel_noexcept = [&] {
+            if (shutdown_reserved && cancel) {
+                try {
+                    cancel();
+                } catch (...) {
+                }
             }
-            return GGML_BACKEND_UNLOAD_BUSY;
-        }
-        if (shutdown) {
-            shutdown();
-        } else if (can_unload) {
-            // A successful eligibility callback may have atomically reserved
-            // shutdown. If the paired shutdown hook is unavailable, release
-            // that reservation before reporting that unload cannot proceed.
-            auto cancel = reinterpret_cast<shutdown_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload"));
-            if (cancel) {
-                cancel();
-            }
+        };
+        if (eligibility_threw || (can_unload && (!shutdown_reserved || !complete)) || (!shutdown && can_unload)) {
+            cancel_noexcept();
             return GGML_BACKEND_UNLOAD_BUSY;
         }
 
-        // remove devices
-        devices.erase(
-            std::remove_if(devices.begin(), devices.end(),
-                            [reg](ggml_backend_dev_t dev) { return ggml_backend_dev_backend_reg(dev) == reg; }),
-            devices.end());
-
-        // Keep the DSO mapped while removing its registry entry, then consume
-        // the atomic reservation only after devices and backend registration
-        // are gone. This closes the can_unload -> shutdown -> erase TOCTOU.
-        dl_handle_ptr keep_alive = std::move(it->handle);
+        // Reentrant hooks may mutate and reallocate the vectors. Re-find the
+        // shared entry identity, then remove it logically before shutdown so
+        // recursive lookup/init cannot enter a module being torn down.
+        {
+            std::lock_guard<std::mutex> test_lock(g_registry_test_mutex);
+            if (g_registry_test_reentrant_mutation) {
+                // Deterministically emulate a registration callback that grows
+                // the vector after iterator capture. Only shared identity may
+                // be used after this point.
+                backends.reserve(backends.capacity() + 1);
+                g_registry_test_reentrant_mutation = false;
+            }
+        }
+        it = std::find(backends.begin(), backends.end(), unloading);
+        if (it == backends.end()) {
+            cancel_noexcept();
+            return GGML_BACKEND_UNLOAD_NOT_FOUND;
+        }
+        std::vector<ggml_backend_device_entry> removed_devices;
+        for (auto dev = devices.begin(); dev != devices.end();) {
+            if (dev->owner == unloading || ggml_backend_dev_backend_reg(dev->dev) == reg) {
+                removed_devices.push_back(*dev);
+                dev = devices.erase(dev);
+            } else {
+                ++dev;
+            }
+        }
         backends.erase(it);
+
+        try {
+            if (shutdown) {
+                shutdown();
+            }
+        } catch (...) {
+            // Restore logical visibility when shutdown itself failed. The
+            // shared entry kept the DSO mapped throughout rollback.
+            backends.push_back(unloading);
+            devices.insert(devices.end(), removed_devices.begin(), removed_devices.end());
+            cancel_noexcept();
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
         if (complete) {
-            complete();
+            try {
+                complete();
+            } catch (...) {
+                // Completion is optional plugin code too. Its failure must not
+                // escape or leave admission reserved after logical removal.
+                cancel_noexcept();
+            }
         }
         return GGML_BACKEND_UNLOAD_OK;
     }
 
-    std::vector<ggml_backend_reg_t> backend_snapshot() const {
+    size_t backend_count() const {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        std::vector<ggml_backend_reg_t> result;
-        result.reserve(backends.size());
-        for (const auto & entry : backends) {
-            result.push_back(entry.reg);
-        }
-        return result;
+        return backends.size();
     }
 
-    std::vector<ggml_backend_dev_t> device_snapshot() const {
+    ggml_backend_reg_t backend_get(size_t index) const {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        return devices;
+        if (index >= backends.size()) {
+            return nullptr;
+        }
+        g_backend_raw_handle_leases.push_back(backends[index]);
+        return backends[index]->reg;
+    }
+
+    ggml_backend_reg_t backend_by_name(const char * name) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (const auto & entry : backends) {
+            if (striequals(ggml_backend_reg_name(entry->reg), name)) {
+                g_backend_raw_handle_leases.push_back(entry);
+                return entry->reg;
+            }
+        }
+        return nullptr;
+    }
+
+    size_t device_count() const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        return devices.size();
+    }
+
+    ggml_backend_dev_t device_get(size_t index) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if (index >= devices.size()) {
+            return nullptr;
+        }
+        if (devices[index].owner) {
+            g_backend_raw_handle_leases.push_back(devices[index].owner);
+        }
+        return devices[index].dev;
+    }
+
+    ggml_backend_dev_t device_by_name(const char * name) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (const auto & entry : devices) {
+            if (striequals(ggml_backend_dev_name(entry.dev), name)) {
+                if (entry.owner) {
+                    g_backend_raw_handle_leases.push_back(entry.owner);
+                }
+                return entry.dev;
+            }
+        }
+        return nullptr;
+    }
+
+    ggml_backend_dev_t device_by_type(enum ggml_backend_dev_type type) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (const auto & entry : devices) {
+            if (ggml_backend_dev_type(entry.dev) == type) {
+                if (entry.owner) {
+                    g_backend_raw_handle_leases.push_back(entry.owner);
+                }
+                return entry.dev;
+            }
+        }
+        return nullptr;
     }
 };
 
@@ -471,55 +596,31 @@ static bool striequals(const char * a, const char * b) {
 }
 
 size_t ggml_backend_reg_count() {
-    return get_reg().backend_snapshot().size();
+    return get_reg().backend_count();
 }
 
 ggml_backend_reg_t ggml_backend_reg_get(size_t index) {
-    const auto snapshot = get_reg().backend_snapshot();
-    GGML_ASSERT(index < snapshot.size());
-    return snapshot[index];
+    return get_reg().backend_get(index);
 }
 
 ggml_backend_reg_t ggml_backend_reg_by_name(const char * name) {
-    const auto snapshot = get_reg().backend_snapshot();
-    for (ggml_backend_reg_t reg : snapshot) {
-        if (striequals(ggml_backend_reg_name(reg), name)) {
-            return reg;
-        }
-    }
-    return nullptr;
+    return get_reg().backend_by_name(name);
 }
 
-// Device enumeration. Each reader operates on one immutable vector snapshot,
-// never directly on storage being changed by load/unload.
 size_t ggml_backend_dev_count() {
-    return get_reg().device_snapshot().size();
+    return get_reg().device_count();
 }
 
 ggml_backend_dev_t ggml_backend_dev_get(size_t index) {
-    const auto snapshot = get_reg().device_snapshot();
-    GGML_ASSERT(index < snapshot.size());
-    return snapshot[index];
+    return get_reg().device_get(index);
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_name(const char * name) {
-    const auto snapshot = get_reg().device_snapshot();
-    for (ggml_backend_dev_t dev : snapshot) {
-        if (striequals(ggml_backend_dev_name(dev), name)) {
-            return dev;
-        }
-    }
-    return nullptr;
+    return get_reg().device_by_name(name);
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
-    const auto snapshot = get_reg().device_snapshot();
-    for (ggml_backend_dev_t dev : snapshot) {
-        if (ggml_backend_dev_type(dev) == type) {
-            return dev;
-        }
-    }
-    return nullptr;
+    return get_reg().device_by_type(type);
 }
 
 // Convenience functions
