@@ -679,9 +679,22 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
     return device->reg;
 }
 
+bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
+void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
+
 ggml_backend_t ggml_backend_dev_init(ggml_backend_dev_t device, const char * params) {
     GGML_ASSERT(device);
-    return device->iface.init_backend(device, params);
+    if (!ggml_backend_device_begin_call(device)) {
+        return nullptr;
+    }
+    try {
+        ggml_backend_t result = device->iface.init_backend(device, params);
+        ggml_backend_device_end_call(device);
+        return result;
+    } catch (...) {
+        ggml_backend_device_end_call(device);
+        return nullptr;
+    }
 }
 
 ggml_backend_buffer_type_t ggml_backend_dev_buffer_type(ggml_backend_dev_t device) {
@@ -729,22 +742,52 @@ const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
     return reg->iface.get_name(reg);
 }
 
+bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept;
+void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
+
 size_t ggml_backend_reg_dev_count(ggml_backend_reg_t reg) {
     GGML_ASSERT(reg);
-    return reg->iface.get_device_count(reg);
+    if (!ggml_backend_registry_begin_call(reg)) {
+        return 0;
+    }
+    try {
+        const size_t result = reg->iface.get_device_count(reg);
+        ggml_backend_registry_end_call(reg);
+        return result;
+    } catch (...) {
+        ggml_backend_registry_end_call(reg);
+        return 0;
+    }
 }
 
 ggml_backend_dev_t ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(reg);
-    return reg->iface.get_device(reg, index);
+    if (!ggml_backend_registry_begin_call(reg)) {
+        return nullptr;
+    }
+    try {
+        ggml_backend_dev_t result = reg->iface.get_device(reg, index);
+        ggml_backend_registry_end_call(reg);
+        return result;
+    } catch (...) {
+        ggml_backend_registry_end_call(reg);
+        return nullptr;
+    }
 }
 
 void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_ASSERT(reg);
-    if (!reg->iface.get_proc_address) {
+    if (!reg->iface.get_proc_address || !ggml_backend_registry_begin_call(reg)) {
         return NULL;
     }
-    return reg->iface.get_proc_address(reg, name);
+    try {
+        void * result = reg->iface.get_proc_address(reg, name);
+        ggml_backend_registry_end_call(reg);
+        return result;
+    } catch (...) {
+        ggml_backend_registry_end_call(reg);
+        return NULL;
+    }
 }
 
 // multi-buffer buffer

@@ -10190,8 +10190,12 @@ int main(int argc, char ** argv) {
 
     size_t n_ok = 0;
 
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
 
         if (backend_filter != NULL && strcmp(backend_filter, ggml_backend_dev_name(dev)) != 0) {
             output_printer->print_backend_init(

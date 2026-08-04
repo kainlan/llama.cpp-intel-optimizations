@@ -157,11 +157,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         std::vector<llama_device> igpus;
         std::vector<llama_device> rpc_servers;
 
+        const size_t backend_dev_count = ggml_backend_dev_count();
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             std::vector<ggml_backend_dev_t> devs;
-            devs.reserve(ggml_backend_dev_count());
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            devs.reserve(backend_dev_count);
+            for (size_t i = 0; i < backend_dev_count; ++i) {
                 auto * dev = ggml_backend_dev_get(i);
+                if (!dev) {
+                    continue;
+                }
                 if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
                     LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
                     continue;
@@ -186,8 +190,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            for (size_t i = 0; i < backend_dev_count; ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (!dev) {
+                    continue;
+                }
                 switch (ggml_backend_dev_type(dev)) {
                     case GGML_BACKEND_DEVICE_TYPE_CPU:
                     case GGML_BACKEND_DEVICE_TYPE_ACCEL:
@@ -560,8 +567,12 @@ const char * llama_print_system_info(void) {
     static std::string s;
     s.clear(); // Clear the string, since it's static, otherwise it will accumulate data from previous calls.
 
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+    const size_t backend_reg_count = ggml_backend_reg_count();
+    for (size_t i = 0; i < backend_reg_count; i++) {
         auto * reg = ggml_backend_reg_get(i);
+        if (!reg) {
+            continue;
+        }
         auto * get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
         if (get_features_fn) {
             ggml_backend_feature * features = get_features_fn(reg);

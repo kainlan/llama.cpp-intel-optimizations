@@ -73,7 +73,8 @@ struct llama_model_sycl_lifecycle_hooks {
 
 static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
     llama_model_sycl_lifecycle_hooks result;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         auto * dev = ggml_backend_dev_get(i);
         auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
@@ -1267,9 +1268,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     buft_list_t buft_list;
 
     // add ACCEL buffer types
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
             if (buft != ggml_backend_cpu_buffer_type()) {
@@ -1314,9 +1316,9 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     }
 
     // add the CPU buffer type
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
         }
     }

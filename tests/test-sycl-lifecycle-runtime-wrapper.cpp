@@ -1,9 +1,11 @@
 #include "ggml-sycl.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <future>
+#include <stdexcept>
 #include <thread>
 
 extern "C" void ggml_backend_test_block_next_unload();
@@ -17,12 +19,115 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
+namespace {
+enum class registry_fixture_mode { NORMAL, RESOLVER_THROW, SHUTDOWN_THROW };
+static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
+static int                    g_registry_fixture_recursive_registrations = 0;
+static int                    g_registry_fixture_shutdowns = 0;
+static int                    g_registry_fixture_cancels = 0;
+
+static const char * registry_fixture_dev_name(ggml_backend_dev_t) { return "TEST-LIFECYCLE0"; }
+static const char * registry_fixture_dev_description(ggml_backend_dev_t) { return "registry lifecycle fixture"; }
+static ggml_backend_dev_type registry_fixture_dev_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; }
+static ggml_backend_t registry_fixture_dev_init(ggml_backend_dev_t, const char *) { return nullptr; }
+static const char * registry_fixture_reg_name(ggml_backend_reg_t) { return "TEST-LIFECYCLE"; }
+static size_t registry_fixture_reg_count(ggml_backend_reg_t) { return 1; }
+static ggml_backend_dev_t registry_fixture_reg_get(ggml_backend_reg_t reg, size_t index) {
+    return index == 0 ? static_cast<ggml_backend_dev_t>(reg->context) : nullptr;
+}
+static bool registry_fixture_can_unload() {
+    ++g_registry_fixture_recursive_registrations;
+    ggml_backend_register(g_registry_fixture_reg);
+    return true;
+}
+static void registry_fixture_shutdown() {
+    ++g_registry_fixture_shutdowns;
+    if (g_registry_fixture_mode == registry_fixture_mode::SHUTDOWN_THROW) {
+        throw std::runtime_error("fixture partial shutdown");
+    }
+}
+static void registry_fixture_cancel() { ++g_registry_fixture_cancels; }
+static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
+    if (g_registry_fixture_mode == registry_fixture_mode::RESOLVER_THROW) {
+        throw std::runtime_error("fixture resolver failure");
+    }
+    if (std::strcmp(name, "ggml_backend_can_unload") == 0) return (void *) registry_fixture_can_unload;
+    if (std::strcmp(name, "ggml_backend_shutdown") == 0) return (void *) registry_fixture_shutdown;
+    if (std::strcmp(name, "ggml_backend_complete_unload") == 0 ||
+        std::strcmp(name, "ggml_backend_cancel_unload") == 0) return (void *) registry_fixture_cancel;
+    return nullptr;
+}
+
+static ggml_backend_reg_t registry_fixture() {
+    static ggml_backend_device dev{};
+    static ggml_backend_reg reg{};
+    static const bool initialized = [] {
+        dev.iface.get_name = registry_fixture_dev_name;
+        dev.iface.get_description = registry_fixture_dev_description;
+        dev.iface.get_type = registry_fixture_dev_type;
+        dev.iface.init_backend = registry_fixture_dev_init;
+        dev.reg = &reg;
+        reg.api_version = GGML_BACKEND_API_VERSION;
+        reg.iface.get_name = registry_fixture_reg_name;
+        reg.iface.get_device_count = registry_fixture_reg_count;
+        reg.iface.get_device = registry_fixture_reg_get;
+        reg.iface.get_proc_address = registry_fixture_resolve;
+        reg.context = &dev;
+        g_registry_fixture_reg = &reg;
+        return true;
+    }();
+    (void) initialized;
+    return &reg;
+}
+
+static bool run_registry_failure_fixture() {
+    auto reg = registry_fixture();
+    ggml_backend_register(reg);
+
+    g_registry_fixture_mode = registry_fixture_mode::RESOLVER_THROW;
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
+        ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    for (int i = 0; i < 1000; ++i) {
+        if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    }
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+
+    const size_t before_reg_count = ggml_backend_reg_count();
+    const size_t before_dev_count = ggml_backend_dev_count();
+    ggml_backend_register(reg);
+    const size_t reg_count = ggml_backend_reg_count();
+    const size_t dev_count = ggml_backend_dev_count();
+    if (reg_count != before_reg_count + 1 || dev_count != before_dev_count + 1) return false;
+    size_t reg_index = reg_count;
+    size_t dev_index = dev_count;
+    for (size_t i = 0; i < reg_count; ++i) if (ggml_backend_reg_get(i) == reg) reg_index = i;
+    for (size_t i = 0; i < dev_count; ++i) if (ggml_backend_dev_get(i) == reg->context) dev_index = i;
+
+    g_registry_fixture_mode = registry_fixture_mode::SHUTDOWN_THROW;
+    if (reg_index == reg_count || dev_index == dev_count ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
+        ggml_backend_reg_get(reg_index) != nullptr || ggml_backend_dev_get(dev_index) != nullptr ||
+        ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    return g_registry_fixture_recursive_registrations >= 2 && g_registry_fixture_shutdowns >= 2 &&
+           g_registry_fixture_cancels >= 2;
+}
+} // namespace
+
 static void phase(const char * name) {
     std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
     std::fflush(stderr);
 }
 
 int main() {
+    phase("generic registry tombstone/failure fixture");
+    if (!run_registry_failure_fixture()) {
+        std::fprintf(stderr, "generic registry lifecycle fixture failed\n");
+        return 1;
+    }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
     // Exercise real registry late registration and module lifetime: load,
     // unregister/unload, then reload before resolving lifecycle operations.
@@ -125,16 +230,20 @@ int main() {
         return 1;
     }
     CALL_SYCL(ggml_backend_sycl_cancel_unload)();
+#endif
 
     phase("backend construction failpoint rollback");
     CALL_SYCL(ggml_backend_sycl_test_fail_next_backend_publish)();
-    if (ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr) != nullptr ||
-        !CALL_SYCL(ggml_backend_sycl_can_unload)()) {
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    ggml_backend_t failed_backend = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr);
+#else
+    ggml_backend_t failed_backend = ggml_backend_sycl_init(0);
+#endif
+    if (failed_backend != nullptr || !CALL_SYCL(ggml_backend_sycl_can_unload)()) {
         std::fprintf(stderr, "backend construction failure leaked publication or admission\n");
         return 1;
     }
     CALL_SYCL(ggml_backend_sycl_cancel_unload)();
-#endif
 
     // Allocation-parity procedures must resolve from the current registry in
     // both static and DL modes. Null metadata calls are defined no-ops.
@@ -284,13 +393,25 @@ int main() {
             break;
         }
     }
-    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
-        std::fprintf(stderr, "dead-owner module unload failed\n");
+    ggml_backend_dev_t sycl_dev = ggml_backend_reg_dev_get(reg, 0);
+    size_t unloaded_dev_index = ggml_backend_dev_count();
+    for (size_t i = 0; i < unloaded_dev_index; ++i) {
+        if (ggml_backend_dev_get(i) == sycl_dev) {
+            unloaded_dev_index = i;
+            break;
+        }
+    }
+    if (unloaded_reg_index == ggml_backend_reg_count() || unloaded_dev_index == ggml_backend_dev_count() ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "dead-owner module enumeration/unload failed\n");
         return 1;
     }
-    if (ggml_backend_reg_by_name("SYCL") != nullptr ||
-        (unloaded_reg_index < ggml_backend_reg_count() && ggml_backend_reg_get(unloaded_reg_index) == reg) ||
-        std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+    // These get() calls consume the count snapshots captured before removal;
+    // both must reject the now-tombstoned identity deterministically.
+    if (ggml_backend_reg_by_name("SYCL") != nullptr || ggml_backend_reg_get(unloaded_reg_index) != nullptr ||
+        ggml_backend_dev_get(unloaded_dev_index) != nullptr || ggml_backend_reg_dev_get(reg, 0) != nullptr ||
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin") != nullptr ||
+        ggml_backend_dev_init(sycl_dev, nullptr) != nullptr || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
         std::fprintf(stderr, "logical unload lookup or retained raw-handle lease failed\n");
         return 1;
     }
@@ -322,24 +443,24 @@ int main() {
         std::fprintf(stderr, "post-shutdown lifecycle reuse left dirty authority/token state\n");
         return 1;
     }
-    phase("serialized unload/load/enumeration overlap");
+    phase("unlocked tombstone load/enumeration overlap");
     ggml_backend_test_reentrant_mutation_on_next_unload();
     ggml_backend_test_block_next_unload();
     auto final_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
     ggml_backend_test_wait_unload_blocked();
     auto concurrent_load = std::async(std::launch::async, [&] { return ggml_backend_load(GGML_SYCL_RUNTIME_MODULE); });
     auto concurrent_enumeration = std::async(std::launch::async, [] { return ggml_backend_dev_count(); });
-    if (concurrent_load.wait_for(std::chrono::milliseconds(20)) != std::future_status::timeout ||
-        concurrent_enumeration.wait_for(std::chrono::milliseconds(20)) != std::future_status::timeout) {
-        std::fprintf(stderr, "registry load/enumeration crossed checked-unload transaction\n");
-        return 1;
-    }
-    ggml_backend_test_release_unload();
-    if (final_unload.get() != GGML_BACKEND_UNLOAD_OK || !(reg = concurrent_load.get())) {
-        std::fprintf(stderr, "serialized unload/reload failed\n");
+    if (concurrent_load.wait_for(std::chrono::milliseconds(100)) != std::future_status::timeout ||
+        concurrent_enumeration.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        std::fprintf(stderr, "same-module load was not deferred or enumeration held the registry lock\n");
         return 1;
     }
     (void) concurrent_enumeration.get();
+    ggml_backend_test_release_unload();
+    if (final_unload.get() != GGML_BACKEND_UNLOAD_OK || !(reg = concurrent_load.get())) {
+        std::fprintf(stderr, "deferred logical reload failed\n");
+        return 1;
+    }
     phase("complete");
 #endif
     return 0;

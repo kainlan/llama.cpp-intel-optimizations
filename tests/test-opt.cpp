@@ -907,12 +907,16 @@ int main(void) {
     std::vector<ggml_backend_t>     backends;
 
     for (size_t i = 0; i < dev_count; ++i) {
-        devs.push_back(ggml_backend_dev_get(i));
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
+        devs.push_back(dev);
 
-        ggml_backend_t backend = ggml_backend_dev_init(devs[i], NULL);
+        ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
         GGML_ASSERT(backend != NULL);
 
-        auto * reg = ggml_backend_dev_backend_reg(devs[i]);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
             ggml_backend_set_n_threads_fn(backend, std::thread::hardware_concurrency() / 2);
@@ -922,7 +926,7 @@ int main(void) {
 
     size_t n_total = 0;
     for (enum ggml_opt_optimizer_type optim : { GGML_OPT_OPTIMIZER_TYPE_ADAMW, GGML_OPT_OPTIMIZER_TYPE_SGD }) {
-        for (size_t i = 0; i < dev_count; ++i) {
+        for (size_t i = 0; i < devs.size(); ++i) {
             // Put the backend to be tested in front so that it's prioritized:
             std::vector<ggml_backend_t> backends_modded = { backends[i] };
             backends_modded.insert(backends_modded.end(), backends.begin(), backends.end());
@@ -931,7 +935,7 @@ int main(void) {
                 backends_modded.data(), nullptr, backends_modded.size(), GGML_DEFAULT_GRAPH_SIZE, false, true);
 
             char const* devname = ggml_backend_dev_name(devs[i]);
-            printf("Backend %zu/%zu: %s\n", i + 1, dev_count, devname);
+            printf("Backend %zu/%zu: %s\n", i + 1, devs.size(), devname);
             printf("  Device description: %s\n", ggml_backend_dev_description(devs[i]));
             size_t free, total;  // NOLINT
             ggml_backend_dev_memory(devs[i], &free, &total);

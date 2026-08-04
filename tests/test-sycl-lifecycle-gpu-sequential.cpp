@@ -180,6 +180,9 @@ bool selected_device(ggml_backend_dev_t & backend_device, std::string & uuid) {
     std::vector<ggml_backend_dev_t> backend_devices;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev  = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
         const char *       name = ggml_backend_dev_name(dev);
         if (name && std::string(name).rfind("SYCL", 0) == 0) {
             backend_devices.push_back(dev);

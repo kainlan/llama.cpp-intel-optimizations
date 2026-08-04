@@ -280,9 +280,11 @@ extern "C" {
         GGML_BACKEND_UNLOAD_NOT_FOUND,
     };
 
-    // Attempt to unload a dynamically loaded backend. A backend may reject
-    // removal while it still owns live model state; in that case its devices
-    // and teardown procedures remain registered.
+    // Attempt to logically unload a dynamically loaded backend. Dynamic DSOs
+    // are process-pinned because raw registry/device handles have no release
+    // API. A clean unload hides lookup/init immediately and runs teardown; an
+    // eligibility rejection remains visible, while partial teardown failure
+    // remains mapped but hidden and may be retried with the original handle.
     GGML_API enum ggml_backend_unload_result ggml_backend_unload_checked(ggml_backend_reg_t reg);
     // Compatibility wrapper; use ggml_backend_unload_checked() when the result
     // must be observed.
