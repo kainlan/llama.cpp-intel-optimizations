@@ -708,7 +708,9 @@ checks = {
     "exhaustive saveable mutation and buffer callback admission": module_proc_inventory_ok
     and buft_callback_inventory_ok
     and "sycl_module_admission_state::RETRY_CLOSED" in backend
-    and "g_sycl_module_admission_cv.wait" in backend
+    and "g_sycl_module_admission_cv.wait_for" in backend
+    and backend.index("global_registry().reserve_shutdown()") < backend.index("g_sycl_module_admission_cv.wait_for")
+    and "mutation drain timed out: calls=%zu txn=%llu models=%llu contexts=%llu" in backend
     and "g_sycl_module_shutdown_started = true" in backend
     and "if (!g_sycl_module_shutdown_started" in backend
     and "Reconcile the internal Registry gate" in backend

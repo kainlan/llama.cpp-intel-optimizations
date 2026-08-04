@@ -96211,7 +96211,6 @@ bool ggml_backend_sycl_can_unload(void) {
             return false;
         }
         g_sycl_module_shutdown_started = false;
-        g_sycl_module_admission_cv.wait(lock, [] { return g_sycl_module_mutations == 0; });
     }
     if (newly_closed) {
         // ACTIVE is published only by initial construction or a successful
@@ -96220,14 +96219,39 @@ bool ggml_backend_sycl_can_unload(void) {
         // unload after NODELETE re-publication.
         ggml_sycl::lifecycle::global_registry().reactivate();
     }
-    if (ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK) {
-        return true;
+    if (ggml_sycl::lifecycle::global_registry().reserve_shutdown() != ggml_sycl::lifecycle::error::OK) {
+        if (newly_closed) {
+            std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+            g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+        }
+        return false;
     }
-    if (newly_closed) {
-        std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
-        g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+
+    // Reserve lifecycle ownership before draining module calls. A teardown call
+    // may itself be waiting for a live update; checking Registry blockers first
+    // avoids waiting on that call while its releasing test/control path waits
+    // for can_unload() to return BUSY.
+    std::unique_lock<std::mutex> lock(g_sycl_module_admission_mutex);
+    constexpr auto mutation_drain_timeout = std::chrono::seconds(5);
+    if (!g_sycl_module_admission_cv.wait_for(lock, mutation_drain_timeout,
+                                             [] { return g_sycl_module_mutations == 0; })) {
+        const size_t stuck_mutations = g_sycl_module_mutations;
+        lock.unlock();
+        const auto lifecycle = ggml_sycl::lifecycle::global_registry().admission_diagnostics();
+        GGML_LOG_ERROR("[SYCL-MODULE] mutation drain timed out: calls=%zu txn=%llu models=%llu contexts=%llu "
+                       "updates=%llu reserved=%d completed=%d\n",
+                       stuck_mutations, (unsigned long long) lifecycle.active_txn,
+                       (unsigned long long) lifecycle.models, (unsigned long long) lifecycle.backend_contexts,
+                       (unsigned long long) lifecycle.live_updates, lifecycle.shutdown_reserved ? 1 : 0,
+                       lifecycle.shutdown_completed ? 1 : 0);
+        ggml_sycl::lifecycle::global_registry().cancel_shutdown();
+        if (newly_closed) {
+            lock.lock();
+            g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+        }
+        return false;
     }
-    return false;
+    return true;
 }
 
 void ggml_backend_sycl_cancel_unload(void) {
