@@ -121,16 +121,74 @@ static bool test_portable_reference_known_vectors() {
     q8[0].d = ggml_fp32_to_fp16(0.5f);
     q8[2].d = ggml_fp32_to_fp16(0.25f);
 
-    const float dot = cpu_vec_dot_q6_K_q8_1(&q6, q8, 0);
-    const bool dot_ok = dot == -58.0f;
-    printf("Portable reference known vectors: %s\n", packing_ok && dot_ok ? "PASS" : "FAIL");
+    const float dot_iqs0 = cpu_vec_dot_q6_K_q8_1(&q6, q8, 0);
+    const bool dot_iqs0_ok = dot_iqs0 == -58.0f;
+
+    block_q6_K q6_iqs8 = {};
+    block_q8_1 q8_iqs8[QK_K / QK8_1] = {};
+
+    // iqs=8 reads ql[32..35], bits 2..3 and 6..7 of qh[0..3], scales 2/6,
+    // and Q8 blocks 1/3.  The decoded Q6 values are {1,18,35,52} and
+    // {62,45,16,3}.  Independently: 2*0.5*(-108) + (-3)*0.25*(-222) = 58.5,
+    // then q6.d=2 gives 117.
+    const uint8_t ql_iqs8[4] = { 0xe1, 0xd2, 0x03, 0x34 };
+    const uint8_t qh_iqs8[4] = { 0xc0, 0x84, 0x48, 0x0c };
+    const int8_t q8_iqs8_group0[4] = { 2, -3, 4, -5 };
+    const int8_t q8_iqs8_group1[4] = { -6, 7, -8, 9 };
+    for (int lane = 0; lane < 4; ++lane) {
+        q6_iqs8.ql[32 + lane] = ql_iqs8[lane];
+        q6_iqs8.qh[lane] = qh_iqs8[lane];
+        q8_iqs8[1].qs[lane] = q8_iqs8_group0[lane];
+        q8_iqs8[3].qs[lane] = q8_iqs8_group1[lane];
+    }
+    q6_iqs8.scales[2] = 2;
+    q6_iqs8.scales[6] = -3;
+    q6_iqs8.d = ggml_fp32_to_fp16(2.0f);
+    q8_iqs8[1].d = ggml_fp32_to_fp16(0.5f);
+    q8_iqs8[3].d = ggml_fp32_to_fp16(0.25f);
+    const float dot_iqs8 = cpu_vec_dot_q6_K_q8_1(&q6_iqs8, q8_iqs8, 8);
+    const bool dot_iqs8_ok = dot_iqs8 == 117.0f;
+
+    block_q6_K q6_iqs24 = {};
+    block_q8_1 q8_iqs24[QK_K / QK8_1] = {};
+
+    // iqs=24 additionally selects the second half: ql[96..99], qh[32..35],
+    // scales 10/14, and Q8 blocks 5/7.  The decoded Q6 values are
+    // {63,0,33,30} and {8,40,55,17}.  Independently:
+    // (-4)*0.25*(-44) + 1*0.5*331 = 209.5, then q6.d=1.5 gives 314.25.
+    const uint8_t ql_iqs24[4] = { 0x8f, 0x80, 0x71, 0x1e };
+    const uint8_t qh_iqs24[4] = { 0x0c, 0x80, 0xc8, 0x44 };
+    const int8_t q8_iqs24_group0[4] = { 1, 2, -3, 4 };
+    const int8_t q8_iqs24_group1[4] = { -2, 5, 6, -7 };
+    for (int lane = 0; lane < 4; ++lane) {
+        q6_iqs24.ql[96 + lane] = ql_iqs24[lane];
+        q6_iqs24.qh[32 + lane] = qh_iqs24[lane];
+        q8_iqs24[5].qs[lane] = q8_iqs24_group0[lane];
+        q8_iqs24[7].qs[lane] = q8_iqs24_group1[lane];
+    }
+    q6_iqs24.scales[10] = -4;
+    q6_iqs24.scales[14] = 1;
+    q6_iqs24.d = ggml_fp32_to_fp16(1.5f);
+    q8_iqs24[5].d = ggml_fp32_to_fp16(0.25f);
+    q8_iqs24[7].d = ggml_fp32_to_fp16(0.5f);
+    const float dot_iqs24 = cpu_vec_dot_q6_K_q8_1(&q6_iqs24, q8_iqs24, 24);
+    const bool dot_iqs24_ok = dot_iqs24 == 314.25f;
+
+    const bool vectors_ok = packing_ok && dot_iqs0_ok && dot_iqs8_ok && dot_iqs24_ok;
+    printf("Portable reference known vectors: %s\n", vectors_ok ? "PASS" : "FAIL");
     if (!packing_ok) {
         printf("  Packed words: u8=0x%08x i8=0x%08x\n", unsigned(u8_word), unsigned(i8_word));
     }
-    if (!dot_ok) {
-        printf("  Q6_K x Q8_1 dot: got %.6f expected -58.000000\n", dot);
+    if (!dot_iqs0_ok) {
+        printf("  iqs=0 Q6_K x Q8_1 dot: got %.6f expected -58.000000\n", dot_iqs0);
     }
-    return packing_ok && dot_ok;
+    if (!dot_iqs8_ok) {
+        printf("  iqs=8 Q6_K x Q8_1 dot: got %.6f expected 117.000000\n", dot_iqs8);
+    }
+    if (!dot_iqs24_ok) {
+        printf("  iqs=24 Q6_K x Q8_1 dot: got %.6f expected 314.250000\n", dot_iqs24);
+    }
+    return vectors_ok;
 }
 
 static float cpu_row_dot_q6_K_q8_1(const block_q6_K* x_row, const block_q8_1* y, int ncols) {
