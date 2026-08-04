@@ -26,12 +26,14 @@
 #include "sycl-profiling.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -50,6 +52,12 @@ static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES == XMX_V2_DECODE_ACTIVE_
               "Packed-K materializer lane compaction must match XMX-v2 decode");
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK == fattn_v2_decode_gqa_slm<64>::K_PACKED_ELEMS,
               "Packed-K materializer byte count must match the proven ext_intel_packed ABI");
+
+static std::atomic<uint64_t> g_packed_k_profile_error_after_submit_count{ 0 };
+
+uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() {
+    return g_packed_k_profile_error_after_submit_count.load(std::memory_order_relaxed);
+}
 
 void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint) {
     const char * selected = std::getenv("GGML_SYCL_TEST_PACKED_K_FAIL_AFTER");
@@ -587,7 +595,12 @@ void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size
     if (!ptr || size == 0) {
         return;
     }
-    const uintptr_t             begin = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    // Reject a wrapped half-open range rather than accidentally matching an
+    // unrelated low address after uintptr_t overflow.
+    if (size > std::numeric_limits<uintptr_t>::max() - begin) {
+        return;
+    }
     const uintptr_t             end   = begin + size;
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
     auto                        it = g_packed_k_sidecars.begin();
@@ -1619,6 +1632,12 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         profile_label.metadata   = "role=pack";
         profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
         profile_label.bytes      = 0;
+        const bool pack_profile_enabled = ggml_sycl_kernel_profile_enabled();
+        const uint64_t host_submit_begin_us =
+            pack_profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                              std::chrono::steady_clock::now().time_since_epoch())
+                                                              .count()) :
+                                   0;
         // Publish the accepted event before optional profiler bookkeeping.
         // Recording may allocate and throw (notably std::bad_alloc); that must
         // never turn an accepted pack into an unpublished lifetime hole.
@@ -1653,10 +1672,22 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                 packed_ptr[block_base_half + elem_off_half] = k_val;
             });
         });
+        const uint64_t host_submit_end_us =
+            pack_profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                              std::chrono::steady_clock::now().time_since_epoch())
+                                                              .count()) :
+                                   0;
         out->ready_event = pack_event;
         try {
-            if (ggml_sycl_kernel_profile_enabled()) {
-                ggml_sycl_kernel_profile_record_event(profile_label, pack_event);
+            if (std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT") != nullptr) {
+                g_packed_k_profile_error_after_submit_count.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+            if (pack_profile_enabled) {
+                ggml_sycl_kernel_profile_record_event(
+                    profile_label, pack_event,
+                    ggml_sycl::sycl_timeline_callsite{ __builtin_FILE(), __builtin_LINE(), __builtin_FUNCTION() },
+                    host_submit_begin_us, host_submit_end_us);
             }
         } catch (...) {
             GGML_LOG_WARN("[SYCL] packed-K profiler bookkeeping failed after accepted pack submit\n");

@@ -236,6 +236,10 @@ void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size
 // GGML_SYCL_TEST_PACKED_K_FAIL_AFTER names an exact lifecycle checkpoint.
 void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint);
 
+// Number of deterministic post-submit profiler bookkeeping errors requested by
+// the packed-K lifecycle test. Production remains inert unless its test env is set.
+uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
+
 #if GGML_SYCL_DNNL
 enum class ggml_sycl_onednn_fa_layout_kind {
     DIRECT,

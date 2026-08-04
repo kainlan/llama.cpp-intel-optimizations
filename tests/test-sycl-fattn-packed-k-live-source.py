@@ -4,6 +4,7 @@ This gate does not compile SYCL or claim GPU execution. The registered commands
 remain for a locked validation GPU; the lead may explicitly select level_zero:0.
 """
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,7 @@ CHECKPOINTS = (
     "materializer-zero-to-pack",
     "packed-first-to-merge",
 )
+GUARD = 'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)'
 
 
 def production_contract(fattn: str, xmx: str) -> bool:
@@ -30,13 +32,19 @@ def production_contract(fattn: str, xmx: str) -> bool:
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
         'ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack")',
-        "Publish every field used by retry reuse before any submission can throw",
         "zero_deps.push_back(previous_use)",
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
-        "ggml_sycl_kernel_profile_record_event(profile_label, pack_event)",
-        "catch (...) {\n            GGML_LOG_WARN(\"[SYCL] packed-K profiler bookkeeping failed",
+        "host_submit_begin_us",
+        "host_submit_end_us",
+        "ggml_sycl_kernel_profile_record_event(",
+        "ggml_sycl::sycl_timeline_callsite{ __builtin_FILE(), __builtin_LINE(), __builtin_FUNCTION() }",
+        'std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT")',
+        "g_packed_k_profile_error_after_submit_count.fetch_add",
+        "throw std::bad_alloc{}",
+        "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
+        "if (size > std::numeric_limits<uintptr_t>::max() - begin)",
         "if (k >= begin && k < end)",
     )
     xmx_needles = (
@@ -51,55 +59,76 @@ def production_contract(fattn: str, xmx: str) -> bool:
 
 def live_contract(source: str) -> bool:
     required = (
-        "constexpr int D = 64",
-        "constexpr int N_KV = 64",
-        "constexpr int H_KV = 1",
-        "constexpr int BATCH = 1",
         "SKIP_UNSUPPORTED = 77",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
         "dev.has(sycl::aspect::fp16)",
         "fattn_xmx_v2_decode_m1n64_supported(dev, 16)",
-        "local_mem_size>() < required_slm",
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
-        "submit_delay(dependency_q, delay_sink.ptr)",
-        "packed->ready_event = submit_rows_payload",
-        "packed.ready_event = submit_half_payload",
-        "sidecar ready-event dependency did not order delayed payload",
-        "materializer ready-event dependency did not order delayed payload",
-        "consumer ready-event dependency did not order delayed first/merge payload",
+        "cgh.host_task([=]() { gate->wait(); })",
+        "submit_retry_before_gate_release",
+        "retry submission blocked on an unreleased dependency event",
+        "gate.release()",
+        "retry_thread.join()",
+        "before->ready_event = submit_rows_payload",
+        "after->ready_event.wait_and_throw()",
+        "sidecar ready-event dependency did not order controlled payload",
+        "materializer ready-event dependency did not order controlled payload",
+        "consumer ready-event dependency did not order controlled first/merge payload",
+        "post-submit profiler error hook was not observed exactly once",
+        "post-submit profiler error lost accepted pack event or payload",
         "end-exclusive range ending at K removed sidecar",
+        "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",
-        "std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 65, 2 }",
+        "overflowing range was not rejected",
+        "std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 64, 1 }, std::pair<int, int>{ 65, 2 }",
         "async_failures.load() == 0",
-        "async_wait_failures=%d",
         "unified_cache_arena_non_weight_used(device) == arena_baseline",
-        "total_device_bytes(device) == bytes_baseline",
         "size() == registry_baseline",
         "work_queue.wait_and_throw()",
     )
     return all(needle in source for needle in required) and all(cp in source for cp in CHECKPOINTS)
 
 
+def guarded_cmake_block(source: str) -> str | None:
+    lines = source.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == GUARD)
+    except StopIteration:
+        return None
+    depth = 0
+    for i in range(start, len(lines)):
+        stripped = lines[i].strip()
+        if re.match(r"^if\s*\(", stripped):
+            depth += 1
+        elif re.match(r"^endif\s*\(", stripped):
+            depth -= 1
+            if depth == 0:
+                return "\n".join(lines[start : i + 1])
+    return None
+
+
 def cmake_contract(source: str) -> bool:
-    target = "test-fattn-packed-k-lifecycle"
-    return (
-        'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)' in source
-        and f"add_executable({target}" in source
-        and "tests/test-fattn-packed-k-lifecycle.cpp" in source
-        and f"target_link_libraries({target} PRIVATE ggml-base ggml ggml-sycl)" in source
-        and "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}" in source
-        and "ONEAPI_DEVICE_SELECTOR=level_zero:1" in source
-        and "SKIP_RETURN_CODE 77" in source
-        and all(cp in source for cp in CHECKPOINTS)
+    block = guarded_cmake_block(source)
+    if block is None:
+        return False
+    required = (
+        "add_executable(test-fattn-packed-k-lifecycle",
+        "tests/test-fattn-packed-k-lifecycle.cpp",
+        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl)",
+        "foreach(_packed_k_checkpoint IN ITEMS",
+        "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}",
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1",
+        "SKIP_RETURN_CODE 77",
     )
+    return all(needle in block for needle in required) and all(cp in block for cp in CHECKPOINTS)
 
 
-def test_production_live_driver_and_registration_contracts() -> None:
+def test_production_live_driver_and_structural_registration_contracts() -> None:
     assert production_contract(FATTN, XMX)
     assert live_contract(LIVE)
     assert cmake_contract(CMAKE)
-    assert CMAKE.index("add_executable(test-fattn-packed-k-lifecycle") > CMAKE.index("# Un-guarded SYCL tests")
+    assert CMAKE.index(GUARD) > CMAKE.index("# Un-guarded SYCL tests")
 
 
 def test_checkpoint_mutations_are_killed() -> None:
@@ -112,36 +141,41 @@ def test_checkpoint_mutations_are_killed() -> None:
         assert not cmake_contract(CMAKE.replace(checkpoint, "mutated-checkpoint"))
 
 
-def test_event_assignment_dependency_and_range_predicate_mutations_are_killed() -> None:
-    fattn_mutations = (
+def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
+    for needle in (
         "zero_deps.push_back(previous_use)",
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
+        "host_submit_begin_us",
+        "host_submit_end_us",
+        "ggml_sycl_kernel_profile_record_event(",
+        "throw std::bad_alloc{}",
+        "if (size > std::numeric_limits<uintptr_t>::max() - begin)",
         "if (k >= begin && k < end)",
-        "ggml_sycl_kernel_profile_record_event(profile_label, pack_event)",
-    )
-    for needle in fattn_mutations:
+    ):
         assert not production_contract(FATTN.replace(needle, "/* mutation removed seam */"), XMX)
-
-    xmx_mutations = (
+    for needle in (
         "cgh.depends_on(packed_ready_event)",
         "*packed_k_ready_event = first_event",
         "cgh.depends_on(first_event)",
         "packed_k->ready_event = merge_event",
-    )
-    for needle in xmx_mutations:
+    ):
         assert not production_contract(FATTN, XMX.replace(needle, "/* mutation removed seam */"))
 
 
-def test_live_observation_mutations_are_killed() -> None:
+def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     for needle in (
-        "packed->ready_event = submit_rows_payload",
-        "packed.ready_event = submit_half_payload",
+        "cgh.host_task([=]() { gate->wait(); })",
+        "before->ready_event = submit_rows_payload",
+        "after->ready_event.wait_and_throw()",
+        "post-submit profiler error hook was not observed exactly once",
         "end-exclusive range ending at K removed sidecar",
+        "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",
+        "std::pair<int, int>{ 64, 1 }",
         "async_failures.load() == 0",
-        "std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 65, 2 }",
-        "work_queue.wait_and_throw()",
         "size() == registry_baseline",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
+    assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
+    assert not cmake_contract(CMAKE.replace("endforeach()\nendif()", "endforeach()", 1))

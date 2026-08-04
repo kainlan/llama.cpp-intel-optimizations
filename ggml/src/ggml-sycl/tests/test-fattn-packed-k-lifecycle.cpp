@@ -6,13 +6,17 @@
 #include "../unified-cache.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <condition_variable>
 #include <exception>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,6 +46,18 @@ void enable_sidecar() {
     (void) _putenv_s("GGML_SYCL_PACKED_K_SIDECAR", "1");
 #else
     (void) setenv("GGML_SYCL_PACKED_K_SIDECAR", "1", 1);
+#endif
+}
+
+void set_profile_error_after_submit(bool enabled) {
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", enabled ? "1" : "");
+#else
+    if (enabled) {
+        (void) setenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", "1", 1);
+    } else {
+        (void) unsetenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT");
+    }
 #endif
 }
 
@@ -119,45 +135,66 @@ void verify_token_boundaries() {
     sycl::half * dummy_half = reinterpret_cast<sycl::half *>(uintptr_t{ 0x1000 });
     float * dummy_float = reinterpret_cast<float *>(uintptr_t{ 0x2000 });
     for (const auto [tokens, expected_blocks] :
-         { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 65, 2 } }) {
+         { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 64, 1 }, std::pair<int, int>{ 65, 2 } }) {
         const fattn_params params = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float, tokens);
         ggml_sycl_fattn_xmx_packed_k_materialization_desc desc{};
         require(ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
                     params, tiny_plan(params), 0, &desc),
-                "63/65-token materialization descriptor rejected");
-        require(desc.n_blocks == expected_blocks, "63/65-token block boundary mismatch");
+                "63/64/65-token materialization descriptor rejected");
+        require(desc.n_blocks == expected_blocks, "63/64/65-token block boundary mismatch");
         require(desc.total_packed_bytes ==
                     static_cast<size_t>(expected_blocks) * GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK,
-                "63/65-token packed-byte boundary mismatch");
+                "63/64/65-token packed-byte boundary mismatch");
     }
 }
 
-class packed_k_delay_kernel;
 class packed_k_half_payload_kernel;
 class packed_k_rows_payload_kernel;
 
-sycl::event submit_delay(sycl::queue & q, int * sink) {
-    return q.parallel_for<packed_k_delay_kernel>(sycl::range<1>(65536), [=](sycl::id<1>) {
-        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                         sycl::access::address_space::global_space> value(*sink);
-        value.fetch_add(1);
-    });
+class controlled_gate {
+  public:
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&]() { return released_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    bool released() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return released_;
+    }
+
+  private:
+    mutable std::mutex      mutex_;
+    std::condition_variable cv_;
+    bool                    released_ = false;
+};
+
+sycl::event submit_controlled_gate(sycl::queue & q, controlled_gate * gate) {
+    return q.submit([&](sycl::handler & cgh) { cgh.host_task([=]() { gate->wait(); }); });
 }
 
-sycl::event submit_half_payload(sycl::queue & q, const sycl::event & delay, sycl::half * ptr, sycl::half value) {
+sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
     return q.submit([&](sycl::handler & cgh) {
-        cgh.depends_on(delay);
+        cgh.depends_on(gate_event);
         cgh.single_task<packed_k_half_payload_kernel>([=]() { ptr[0] = value; });
     });
 }
 
 sycl::event submit_rows_payload(sycl::queue & q,
-                                const sycl::event & delay,
+                                const sycl::event & gate_event,
                                 float * values,
                                 int32_t * indices,
                                 float value) {
     return q.submit([&](sycl::handler & cgh) {
-        cgh.depends_on(delay);
+        cgh.depends_on(gate_event);
         cgh.single_task<packed_k_rows_payload_kernel>([=]() {
             for (int i = 0; i < D; ++i) {
                 values[i] = value;
@@ -165,6 +202,44 @@ sycl::event submit_rows_payload(sycl::queue & q,
             indices[0] = 0;
         });
     });
+}
+
+template <typename Fn>
+bool submit_retry_before_gate_release(controlled_gate & gate, Fn && fn) {
+    std::mutex              mutex;
+    std::condition_variable cv;
+    bool                    returned = false;
+    bool                    result = false;
+    std::exception_ptr      error;
+    std::thread retry_thread([&]() {
+        try {
+            result = fn();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            returned = true;
+        }
+        cv.notify_one();
+    });
+
+    bool returned_before_release = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        returned_before_release = cv.wait_for(lock, std::chrono::seconds(10), [&]() { return returned; });
+    }
+    // Always release and join, including the timeout/error path, so a blocked
+    // host task cannot outlive stack-owned state or deadlock test teardown.
+    const bool was_unreleased = !gate.released();
+    gate.release();
+    retry_thread.join();
+    require(was_unreleased, "controlled gate released before retry submission returned");
+    require(returned_before_release, "retry submission blocked on an unreleased dependency event");
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    return result;
 }
 
 template <typename T>
@@ -223,14 +298,23 @@ struct sidecar_fixture {
     }
 };
 
-void verify_range_teardown(sidecar_fixture & fixture, int device) {
+void verify_range_teardown(sidecar_fixture & fixture, sycl::queue & q, int device) {
     auto find = [&]() { return ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device); };
     require(find() != nullptr, "sidecar missing before range teardown");
     const uintptr_t k = reinterpret_cast<uintptr_t>(fixture.k.ptr);
+    require(k > 0, "unexpected null-adjacent K allocation");
+
     ggml_sycl_fattn_xmx_unregister_packed_k_range(reinterpret_cast<void *>(k - 1), 1);
     require(find() != nullptr, "end-exclusive range ending at K removed sidecar");
-    ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.values.ptr, D * sizeof(float));
-    require(find() != nullptr, "non-overlap range removed sidecar");
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(
+        reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 1), 3);
+    require(find() != nullptr, "overflowing range was not rejected");
+
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(reinterpret_cast<void *>(k), 1);
+    require(find() == nullptr, "exact-start [K,K+1) range retained sidecar");
+    require(fixture.update(q, device), "sidecar recreation after exact-start teardown failed");
+    require(find() != nullptr, "sidecar recreation did not publish owner");
+
     ggml_sycl_fattn_xmx_unregister_packed_k_range(reinterpret_cast<void *>(k - 1), 2);
     require(find() == nullptr, "interior overlap retained sidecar");
 }
@@ -241,14 +325,14 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
                             int device) {
     enable_sidecar();
     sidecar_fixture fixture(q, device);
-    device_buffer<int> delay_sink(q, 1, device);
-    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     set_failpoint(checkpoint.c_str());
 
     if (checkpoint == "sidecar-before-initial-fill") {
         require(!fixture.update(q, device), "initial-fill failpoint was not observed");
         require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
                 "initial-fill failure retained registry owner");
+        set_failpoint(nullptr);
+        require(fixture.update(q, device), "same-owner sidecar retry failed");
     } else {
         bool threw = false;
         try {
@@ -257,26 +341,29 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
             threw = true;
         }
         require(threw, "zero-to-update failpoint did not throw");
-        auto * packed = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
-        require(packed != nullptr, "zero event was not published before throw");
-        const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
-        packed->ready_event = submit_rows_payload(dependency_q, delay, fixture.values.ptr, fixture.indices.ptr, 3.0f);
+        require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) != nullptr,
+                "zero event was not published before throw");
+        set_failpoint(nullptr);
     }
 
-    set_failpoint(nullptr);
     auto * before = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
-    void * retained_ptr = before ? before->ptr : nullptr;
-    require(fixture.update(q, device), "same-owner sidecar retry failed");
+    require(before != nullptr, "sidecar missing before controlled retry");
+    before->ready_event.wait_and_throw();
+    void * retained_ptr = before->ptr;
+    controlled_gate gate;
+    const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    before->ready_event = submit_rows_payload(dependency_q, gate_event, fixture.values.ptr, fixture.indices.ptr, 3.0f);
+    require(submit_retry_before_gate_release(gate, [&]() { return fixture.update(q, device); }),
+            "controlled sidecar retry failed");
+
     auto * after = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
-    require(after != nullptr, "sidecar retry did not publish owner");
-    if (checkpoint == "sidecar-zero-to-update") {
-        require(after->ptr == retained_ptr, "sidecar retry replaced surviving owner");
-        const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
-        const sycl::half payload = copy_after(q, after->ready_event, static_cast<sycl::half *>(after->ptr) + offset);
-        require(std::fabs(static_cast<float>(payload) - 3.0f) < 0.01f,
-                "sidecar ready-event dependency did not order delayed payload");
-    }
-    verify_range_teardown(fixture, device);
+    require(after != nullptr && after->ptr == retained_ptr, "sidecar retry replaced surviving owner");
+    after->ready_event.wait_and_throw();
+    const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
+    const sycl::half payload = copy_after(q, after->ready_event, static_cast<sycl::half *>(after->ptr) + offset);
+    require(std::fabs(static_cast<float>(payload) - 3.0f) < 0.01f,
+            "sidecar ready-event dependency did not order controlled payload");
+    verify_range_teardown(fixture, q, device);
 }
 
 void run_materializer_checkpoint(const std::string & checkpoint,
@@ -287,9 +374,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     device_buffer<sycl::half> kbuf(q, D * N_KV, device);
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
-    device_buffer<int> delay_sink(q, 1, device);
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
-    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
     const auto plan = tiny_plan(params);
     require(plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE, "tiny packed plan rejected");
@@ -299,21 +384,40 @@ void run_materializer_checkpoint(const std::string & checkpoint,
             "materializer prerequisite failed");
     packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
-    packed.ready_event = submit_half_payload(dependency_q, delay, kbuf.ptr, sycl::half(2.0f));
+    controlled_gate gate;
+    const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    packed.ready_event = submit_half_payload(dependency_q, gate_event, kbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
     require(!ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
             "materializer checkpoint was not observed");
     require(packed.handle.valid() && packed.ptr == retained_ptr, "materializer zero event lost owner");
     set_failpoint(nullptr);
-    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
+    require(submit_retry_before_gate_release(gate, [&]() {
+                return ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
+            }),
             "same-object materializer retry failed");
     require(packed.ptr == retained_ptr, "materializer retry replaced surviving owner");
     const size_t offset = ggml_sycl_fattn_xmx_packed_k_element_offset_half(0, 0);
     const sycl::half payload = copy_after(q, packed.ready_event, static_cast<sycl::half *>(packed.ptr) + offset);
     require(std::fabs(static_cast<float>(payload) - 2.0f) < 0.01f,
-            "materializer ready-event dependency did not order delayed payload");
+            "materializer ready-event dependency did not order controlled payload");
+
+    const sycl::half profile_source(4.0f);
+    q.memcpy(kbuf.ptr, &profile_source, sizeof(profile_source)).wait_and_throw();
+    const uint64_t profile_errors_before = ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
+    set_profile_error_after_submit(true);
+    const bool profile_error_ok = ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
+    set_profile_error_after_submit(false);
+    require(profile_error_ok, "post-submit profiler error changed materializer success");
+    require(packed.ptr == retained_ptr && packed.handle.valid(), "post-submit profiler error lost owner");
+    require(ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() == profile_errors_before + 1,
+            "post-submit profiler error hook was not observed exactly once");
+    packed.ready_event.wait_and_throw();
+    const sycl::half profile_payload =
+        copy_after(q, packed.ready_event, static_cast<sycl::half *>(packed.ptr) + offset);
+    require(std::fabs(static_cast<float>(profile_payload) - 4.0f) < 0.01f,
+            "post-submit profiler error lost accepted pack event or payload");
     packed.reset();
 }
 
@@ -329,20 +433,20 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     device_buffer<float> partial_max(q, 1, device);
     device_buffer<float> partial_sum(q, 1, device);
     device_buffer<float> partial_out(q, D, device);
-    device_buffer<int> delay_sink(q, 1, device);
     q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
     std::vector<sycl::half> ones(D * N_KV, sycl::half(1.0f));
     q.memcpy(vbuf.ptr, ones.data(), ones.size() * sizeof(sycl::half)).wait_and_throw();
-    q.memset(delay_sink.ptr, 0, sizeof(int)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
 
     ggml_sycl_fattn_xmx_packed_k packed;
     require(ggml_sycl_fattn_xmx_materialize_packed_k(params, tiny_plan(params), device, &q, &packed),
             "consumer prerequisite materialization failed");
+    packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    const sycl::event delay = submit_delay(dependency_q, delay_sink.ptr);
-    packed.ready_event = submit_half_payload(dependency_q, delay, vbuf.ptr, sycl::half(2.0f));
+    controlled_gate gate;
+    const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    packed.ready_event = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
     bool threw = false;
@@ -356,13 +460,15 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     require(packed.handle.valid() && packed.ptr == retained_ptr,
             "consumer first-event publication lost packed owner");
     set_failpoint(nullptr);
-    require(launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
-                ctx, params, &q, &packed, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1),
+    require(submit_retry_before_gate_release(gate, [&]() {
+                return launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
+                    ctx, params, &q, &packed, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1);
+            }),
             "same-object consumer retry failed");
     require(packed.ptr == retained_ptr, "consumer retry replaced packed owner");
     const float payload = copy_after(q, packed.ready_event, out.ptr);
     require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
-            "consumer ready-event dependency did not order delayed first/merge payload");
+            "consumer ready-event dependency did not order controlled first/merge payload");
     packed.reset();
 }
 
@@ -412,6 +518,7 @@ int main(int argc, char ** argv) {
     }
 
     set_failpoint(nullptr);
+    set_profile_error_after_submit(false);
     std::atomic<int> async_failures{ 0 };
     try {
         ggml_backend_sycl_context ctx(0);
@@ -443,6 +550,7 @@ int main(int argc, char ** argv) {
             run_consumer_checkpoint(checkpoint, ctx, work_queue, dependency_queue, device);
         }
         set_failpoint(nullptr);
+        set_profile_error_after_submit(false);
         dependency_queue.wait_and_throw();
         work_queue.wait_and_throw();
         context_queue->wait_and_throw();
@@ -460,11 +568,13 @@ int main(int argc, char ** argv) {
     } catch (const sycl::exception & e) {
         ++async_failures;
         set_failpoint(nullptr);
+        set_profile_error_after_submit(false);
         std::fprintf(stderr, "FAIL checkpoint=%s SYCL: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
     } catch (const std::exception & e) {
         set_failpoint(nullptr);
+        set_profile_error_after_submit(false);
         std::fprintf(stderr, "FAIL checkpoint=%s: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
