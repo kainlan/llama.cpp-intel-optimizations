@@ -42190,6 +42190,16 @@ static inline void sycl_unified_device_temp_release(sycl_unified_device_temp && 
     temp.device = ggml_sycl::mem_handle::HOST_DEVICE;
 }
 
+static inline ggml_sycl::mem_handle sycl_reorder_raw_device_handle(dpct::queue_ptr stream, void * ptr) {
+    GGML_ASSERT(stream != nullptr && ptr != nullptr);
+    const int device = ggml_sycl_get_device_id_from_queue(*stream);
+    // The reorder entry points take raw device USM.  Do not route an
+    // unregistered-but-valid device pointer through query_location(): its
+    // conservative MMAP classification would select host staging and then
+    // memcpy from device USM on the CPU.
+    return ggml_sycl::mem_handle::from_chunk_ptr(ptr, device, GGML_LAYOUT_AOS, true);
+}
+
 static void reorder_qw_q4_0(uint8_t * data_device,
                             const int ncols,
                             const int nrows,
@@ -42206,9 +42216,8 @@ static void reorder_qw_q4_0(uint8_t * data_device,
     sycl::event copy_event;
     GGML_ASSERT(tmp_buf != nullptr);
 
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_copy_handle_for_raw_ptr(data_device, GGML_LAYOUT_AOS, queue_device);
-    copy_event                         = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
+    ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
+    copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
@@ -42247,9 +42256,8 @@ static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
     GGML_ASSERT(tmp_buf != nullptr);
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_copy_handle_for_raw_ptr(data_device, GGML_LAYOUT_AOS, queue_device);
-    copy_event                         = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
+    ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
+    copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
@@ -42284,9 +42292,8 @@ static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     GGML_ASSERT(tmp_buf != nullptr);
 
     sycl::event           copy_event;
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_copy_handle_for_raw_ptr(data_device, GGML_LAYOUT_AOS, queue_device);
-    copy_event                         = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
+    ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
+    copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
@@ -42378,9 +42385,8 @@ static void reorder_qw_q8_0(uint8_t * data_device,
     sycl::event copy_event;
     GGML_ASSERT(tmp_buf != nullptr);
 
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_copy_handle_for_raw_ptr(data_device, GGML_LAYOUT_AOS, queue_device);
-    copy_event                         = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
+    ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
+    copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
@@ -42427,9 +42433,8 @@ static void reorder_qw_mxfp4(uint8_t *       data_device,
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
     GGML_ASSERT(tmp_buf != nullptr);
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_copy_handle_for_raw_ptr(data_device, GGML_LAYOUT_AOS, queue_device);
-    copy_event                         = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
+    ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
+    copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
@@ -42581,7 +42586,16 @@ bool reorder_rows_to_soa(uint8_t *       data_device,
                          int64_t         nrows,
                          size_t          size,
                          dpct::queue_ptr stream) {
-    if (!data_device || size == 0 || nrows == 0) {
+    if (!data_device || !stream || size == 0 || nrows == 0) {
+        return false;
+    }
+    try {
+        if (sycl::get_pointer_type(data_device, stream->get_context()) != sycl::usm::alloc::device) {
+            GGML_LOG_ERROR("[REORDER-ROWS] input %p is not device USM in the supplied queue context\n", data_device);
+            return false;
+        }
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR("[REORDER-ROWS] could not validate device input %p: %s\n", data_device, e.what());
         return false;
     }
     switch (type) {

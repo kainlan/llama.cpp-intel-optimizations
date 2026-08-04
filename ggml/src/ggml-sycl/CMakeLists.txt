@@ -2627,7 +2627,7 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME test-cpu-gpu-soa-interaction COMMAND test-cpu-gpu-soa-interaction)
     set_tests_properties(test-cpu-gpu-soa-interaction PROPERTIES
         LABELS "sycl;sycl-restored;gpu;soa;interaction;restored"
-        ENVIRONMENT "GGML_SYCL_VRAM_ARENA=0;GGML_SYCL_PINNED_CHUNK_MB=16"
+        ENVIRONMENT "GGML_SYCL_VRAM_ARENA=0"
         RUN_SERIAL TRUE
     )
 endif()

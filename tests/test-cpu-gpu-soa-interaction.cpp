@@ -20,9 +20,9 @@
 static bool configure_bounded_runtime() {
     // reorder_rows_to_soa() intentionally enters the unified allocator for its
     // temporary device copy.  This unit-sized fixture must not reserve the
-    // default full-VRAM arena or a 2 GiB pinned backing chunk to do that.
-    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0 &&
-           setenv("GGML_SYCL_PINNED_CHUNK_MB", "16", 1) == 0;
+    // default full-VRAM arena to do that.  Do not override the pinned chunk
+    // contract: the raw device reorder path must not allocate host staging.
+    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0;
 }
 
 template <typename T>
@@ -603,7 +603,7 @@ int main(int argc, char ** argv) {
 
     printf("=== CPU→GPU SoA Interaction Tests ===\n");
     printf("Using production dequantization and Q4_0 reorder paths\n");
-    printf("Bounded runtime: VRAM arena disabled, pinned chunks capped at 16 MiB\n\n");
+    printf("Bounded runtime: VRAM arena disabled; raw device reorder requires no host staging\n\n");
 
     try {
         int passed = 0;
