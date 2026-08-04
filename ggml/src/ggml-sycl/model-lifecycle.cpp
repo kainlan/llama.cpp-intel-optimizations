@@ -781,17 +781,19 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
         (txn->second.phase == finish_phase::COMMITTING || txn->second.phase == finish_phase::ROLLING_BACK)) {
         return { error::BUSY, token };
     }
+    auto model = models_.find(token.model.value);
+    if (model == models_.end()) {
+        // Durable DEAD identity is authoritative even after its physical slot
+        // has been reused. Consult it before current slot generation state.
+        auto dead = dead_.find(token.model.value);
+        if (dead != dead_.end()) {
+            return { dead->second.first == token ? error::OK_ALREADY_DEAD : error::STALE_IDENTITY, token, 0, false };
+        }
+        return { error::NOT_FOUND };
+    }
     auto & slot = slots_[token.owner.slot];
     if (slot.reserved && (!(slot.model == token.model) || slot.generation != token.owner.generation)) {
         return { error::STALE_IDENTITY };
-    }
-    auto model = models_.find(token.model.value);
-    if (model == models_.end()) {
-        auto dead = dead_.find(token.model.value);
-        if (dead == dead_.end()) {
-            return { error::NOT_FOUND };
-        }
-        return { dead->second.first == token ? error::OK_ALREADY_DEAD : error::STALE_IDENTITY, token, 0, false };
     }
     if (!(model->second.token == token)) {
         return { error::STALE_IDENTITY };

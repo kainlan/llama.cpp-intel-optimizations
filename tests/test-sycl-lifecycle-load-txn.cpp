@@ -298,9 +298,11 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto     b = commit_one(r);
         require(r.latest_live()->token == b, "latest LIVE did not select B");
         require(r.teardown(b) == error::OK && r.latest_live()->token == a, "B teardown did not restore A authority");
-        auto c = r.begin_outer();
-        r.end(c.txn, false);
-        require(r.latest_live()->token == a, "failed C changed A restoration authority");
+        auto c = commit_one(r);
+        // Model A is the selected authority in the integration layer. Tearing
+        // down unrelated C must leave the selected/live A identity available.
+        require(r.teardown(c) == error::OK && r.find(a.model)->token == a,
+                "unloading non-authoritative C displaced A");
         require(r.teardown(a) == error::OK && !r.latest_live(), "A teardown left stale restoration authority");
     } else if (name == "busy-deferred-quarantine") {
         Registry r;
@@ -355,7 +357,8 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto fresh = commit_one(r);
         require(fresh.owner.slot == old.owner.slot && fresh.owner.generation != old.owner.generation,
                 "slot not reused with generation");
-        require(r.teardown(old) == error::STALE_IDENTITY, "stale token after reuse accepted");
+        require(r.teardown(old) == error::OK_ALREADY_DEAD,
+                "exact durable DEAD token replay changed after slot reuse");
     } else if (name == "slot-exhaustion") {
         Registry r;
         for (int i = 0; i < 32; ++i) {

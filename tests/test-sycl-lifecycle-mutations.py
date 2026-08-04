@@ -10,6 +10,11 @@ CASES = {
     "M2": ("nested-success",),
     "M3": ("inner-failure", "cancel", "wrong-txn", "depth-overflow"),
 }
+MARKERS = {
+    "M1": "stale slot generation accepted\n",
+    "M2": "nested load committed\n",
+    "M3": "poisoned transaction published LIVE\n",
+}
 
 
 def run(binary: str, case: str, mutation: Optional[str] = None) -> subprocess.CompletedProcess:
@@ -34,9 +39,10 @@ def main() -> int:
         if mutant.returncode == 0:
             print(f"mutant unexpectedly passed: {mutation} case={case}", file=sys.stderr)
             return 1
-        if mutation == "M3" and "poisoned transaction published LIVE\n" not in mutant.stdout:
+        lines = [line + "\n" for line in mutant.stdout.splitlines()]
+        if MARKERS[mutation] not in lines:
             sys.stderr.write(mutant.stdout)
-            print(f"M3 case lacked exact poison marker: {case}", file=sys.stderr)
+            print(f"{mutation} case lacked exact mutation marker: {case}", file=sys.stderr)
             return 1
 
         replay = run(binary, case)

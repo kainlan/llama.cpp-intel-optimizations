@@ -1036,6 +1036,13 @@ inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycl
     return authority && cache && authority->plan && cache->plan && authority.get() == cache.get();
 }
 
+inline bool lifecycle_plan_snapshot_owned_by(const std::shared_ptr<const lifecycle_plan_snapshot> & authority,
+                                             uint64_t model_id, uint64_t load_txn_id,
+                                             uint32_t slot, uint64_t slot_generation) noexcept {
+    return authority && authority->model_id == model_id && authority->load_txn_id == load_txn_id &&
+           authority->slot == slot && authority->slot_generation == slot_generation;
+}
+
 class unified_cache;
 enum class placement_cache_coherence : uint8_t { MATCH, GENUINE_NO_PLAN, TRANSIENT_MISMATCH };
 

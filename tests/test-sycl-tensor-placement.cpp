@@ -176,6 +176,33 @@ int main() {
         n_fail++;
     }
 
+    // A/B/C regression: after explicitly publishing A, unloading unrelated C
+    // must preserve the exact A shared authority. Only unloading A may replace
+    // it (here with B).
+    auto selected_a = authority;
+    selected_a->slot = 2;
+    selected_a->slot_generation = 3;
+    auto live_b = std::make_shared<lifecycle_plan_snapshot>(*selected_a);
+    live_b->model_id = 20;
+    auto dying_c = std::make_shared<lifecycle_plan_snapshot>(*selected_a);
+    dying_c->model_id = 30;
+    auto publication = selected_a;
+    if (lifecycle_plan_snapshot_owned_by(publication, dying_c->model_id, dying_c->load_txn_id,
+                                         dying_c->slot, dying_c->slot_generation)) {
+        publication = live_b;
+    }
+    const bool c_preserved_exact_a = publication.get() == selected_a.get();
+    if (lifecycle_plan_snapshot_owned_by(publication, selected_a->model_id, selected_a->load_txn_id,
+                                         selected_a->slot, selected_a->slot_generation)) {
+        publication = live_b;
+    }
+    if (c_preserved_exact_a && publication.get() == live_b.get()) {
+        n_pass++;
+    } else {
+        printf("FAIL non-authoritative C teardown displaced exact A publication\n");
+        n_fail++;
+    }
+
     placement_plan exhausted_candidate{};
     lifecycle_stage_placement_plan(9001, exhausted_candidate);
     lifecycle_set_next_plan_publication_id_for_test(UINT64_MAX);

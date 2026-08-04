@@ -158,9 +158,12 @@ enum ggml_backend_sycl_tensor_usage {
     GGML_SYCL_TENSOR_USAGE_NORM,
 };
 
-// Register per-tensor usage metadata (used for layout selection).
-GGML_BACKEND_API bool ggml_backend_sycl_register_weight_usage(const char *                        tensor_name,
+// ABI-compatible registration entry point. The original API returned void.
+GGML_BACKEND_API void ggml_backend_sycl_register_weight_usage(const char *                        tensor_name,
                                                               enum ggml_backend_sycl_tensor_usage usage);
+// Status-bearing extension for callers that need transactional admission.
+GGML_BACKEND_API bool ggml_backend_sycl_try_register_weight_usage(const char *                        tensor_name,
+                                                                  enum ggml_backend_sycl_tensor_usage usage);
 
 // Tensor inventory for tiered memory placement
 struct ggml_sycl_tensor_info {
@@ -786,6 +789,7 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED,
     GGML_SYCL_LIFECYCLE_EFFECT_FAILED,
     GGML_SYCL_LIFECYCLE_BUSY,
+    GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
 };
 
 // Registry-resolved static/DL parity entry point. Applies the exact inventory

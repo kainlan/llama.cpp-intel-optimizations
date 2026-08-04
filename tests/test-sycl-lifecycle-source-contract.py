@@ -39,7 +39,11 @@ resolve_expert_body = re.search(
     r"expert_resolve_result unified_cache::resolve_expert\(.*?^}\n", cache_cpp, re.S | re.M
 ).group(0)
 register_usage_body = re.search(
-    r"bool ggml_backend_sycl_register_weight_usage\(.*?^}\n", backend, re.S | re.M
+    r"bool ggml_backend_sycl_try_register_weight_usage\(.*?^}\n", backend, re.S | re.M
+).group(0)
+exact_runtime_body = re.search(
+    r"ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model\(.*?^}\n",
+    backend, re.S | re.M
 ).group(0)
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
@@ -171,7 +175,7 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 7,
+        "ggml_sycl_global_plan_snapshot": 8,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
@@ -458,7 +462,19 @@ checks = {
     and resolve_expert_body.count("from_weight_lease_snapshot") == 2
     and "test_expert_abort_after_resolve_snapshot" in
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
-    "weight usage mutation holds exact load effect": "bool ggml_backend_sycl_register_weight_usage" in backend
+    "non-authoritative teardown preserves exact publication":
+    "const bool owns_publication" in backend
+    and "if (owns_publication)" in backend
+    and "ggml_sycl_global_plan_snapshot()" in backend,
+    "runtime context rejects foreign registry before mutation":
+    "GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND" in public
+    and "ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()" in exact_runtime_body
+    and exact_runtime_body.index("return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND") <
+        exact_runtime_body.index("registry.prepare_live_update(token)"),
+    "weight usage ABI wrapper and status mutation hold exact load effect":
+    "void ggml_backend_sycl_register_weight_usage" in backend
+    and "bool ggml_backend_sycl_try_register_weight_usage" in backend
+    and "(void) ggml_backend_sycl_try_register_weight_usage" in backend
     and "acquire_load_effect(registry.bound_candidate())" in register_usage_body
     and "catch (...)" in register_usage_body
     and "usage-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),

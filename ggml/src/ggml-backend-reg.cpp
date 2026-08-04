@@ -116,21 +116,6 @@ static std::string path_str(const fs::path & path) {
     }
 }
 
-static bool backend_requires_logical_unload(const fs::path & path) {
-#if !defined(_WIN32) && defined(RTLD_NODELETE)
-    std::string filename = path_str(path.filename());
-    std::transform(filename.begin(), filename.end(), filename.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    // SYCL runtimes register process-exit callbacks from the backend DSO. Keep
-    // only that canonical backend mapped; all other modules retain physical
-    // unload semantics.
-    return filename.find("ggml-sycl") != std::string::npos || filename.find("ggml_sycl") != std::string::npos;
-#else
-    (void) path;
-    return false;
-#endif
-}
-
 struct ggml_backend_reg_entry {
     ggml_backend_reg_t reg;
     dl_handle_ptr handle;
@@ -265,7 +250,7 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
-        dl_handle_ptr handle{ dl_load_library(path, backend_requires_logical_unload(path)) };
+        dl_handle_ptr handle{ dl_load_library(path) };
         if (!handle) {
             if (!silent) {
                 GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(path).c_str(), dl_error());
@@ -290,6 +275,16 @@ struct ggml_backend_registry {
         }
 
         ggml_backend_reg_t reg = backend_init_fn();
+        // Compatibility fallback for an older initialized SYCL registry that
+        // predates the pre-score export. Renamed DSOs remain safe because this
+        // uses registry identity, never the filename.
+        if (reg && !dl_get_sym(handle.get(), "ggml_backend_lifetime_policy_v1") &&
+            std::strcmp(ggml_backend_reg_name(reg), "SYCL") == 0 && !dl_pin_library(handle.get(), path)) {
+            if (!silent) {
+                GGML_LOG_ERROR("%s: failed to process-pin SYCL backend %s\n", __func__, path_str(path).c_str());
+            }
+            return nullptr;
+        }
         if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
             if (!silent) {
                 if (!reg) {
@@ -574,7 +569,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 auto filename = entry.path().filename();
                 auto ext = entry.path().extension();
                 if (filename.native().find(file_prefix) == 0 && ext == file_extension) {
-                    dl_handle_ptr handle{ dl_load_library(entry, backend_requires_logical_unload(entry.path())) };
+                    dl_handle_ptr handle{ dl_load_library(entry) };
                     if (!handle && !silent) {
                         GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(entry.path()).c_str(), dl_error());
                     }

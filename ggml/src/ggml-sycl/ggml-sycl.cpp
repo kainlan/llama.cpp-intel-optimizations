@@ -9591,17 +9591,19 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
     try {
         ggml_sycl_plan_restoration_bundle restoration;
         {
-            // Refetch latest-LIVE only after acquiring the canonical publication
-            // writer lock. A completed A runtime update therefore cannot be
-            // overwritten by a stale pre-lock restoration bundle.
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-            if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
-                return false;
+            const auto published = ggml_sycl_global_plan_snapshot();
+            const bool owns_publication = ggml_sycl::lifecycle_plan_snapshot_owned_by(
+                published, owner.model.value, owner.load.value, owner.owner.slot, owner.owner.generation);
+            // A non-authoritative model teardown must not republish a registry
+            // snapshot over the exact (possibly runtime-updated) A authority.
+            if (owns_publication) {
+                if (!ggml_sycl_prepare_latest_live_plan(restoration)) {
+                    return false;
+                }
+                ggml_sycl_publish_plan_locked(restoration.snapshot);
             }
-            ggml_sycl_publish_plan_locked(restoration.snapshot);
         }
-        // Replacement authority is visible before any dying-owner resource can
-        // be reclaimed. Failure retains the exact owner in quarantine.
         ggml_sycl_release_model_slot_resources(owner);
         return true;
     } catch (...) {
@@ -10270,7 +10272,7 @@ static tensor_usage ggml_sycl_usage_from_api(ggml_backend_sycl_tensor_usage usag
     }
 }
 
-bool ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
+bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
     try {
         if (tensor_name == nullptr || tensor_name[0] == '\0') {
             return false;
@@ -10301,6 +10303,10 @@ bool ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_back
     } catch (...) {
         return false;
     }
+}
+
+void ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
+    (void) ggml_backend_sycl_try_register_weight_usage(tensor_name, usage);
 }
 
 tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
@@ -11638,6 +11644,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            uint32_t              n_seq_max) {
     if (!backend || !backend->context || n_ctx == 0) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    // Validate the complete backend identity before taking a lifecycle lease or
+    // publishing any model plan. GUID-only acceptance admits forged/foreign or
+    // stale-registry backend objects.
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
     }
     const ggml_sycl::lifecycle::ModelToken token{
         { model.model_id },
@@ -50354,7 +50367,10 @@ struct split_device_config {
     bool          enabled   = false;                 // any non-trivial split active
 };
 
-static split_device_config g_split_config;
+static split_device_config          g_split_config;
+static std::unique_ptr<sycl::queue> g_split_secondary_queue_owner;
+static std::unique_ptr<sycl::queue> g_split_merge_queue_owner;
+static std::unique_ptr<sycl::queue> g_split_coord_queue_owner;
 
 // ---------------------------------------------------------------------------
 // Persistent TG multi-device sync resources (host-pinned via primary context)
@@ -50625,8 +50641,9 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
     // needs an independent queue to poll progress and write merge_complete
     // concurrently with the running persistent kernel.
     if (!r.coord_queue) {
-        static sycl::queue coord_q(primary_queue.get_context(), primary_queue.get_device());
-        r.coord_queue = &coord_q;
+        g_split_coord_queue_owner =
+            std::make_unique<sycl::queue>(primary_queue.get_context(), primary_queue.get_device());
+        r.coord_queue = g_split_coord_queue_owner.get();
     }
 
     r.allocated = true;
@@ -50728,6 +50745,29 @@ static void cpu_worker_shutdown() {
     if (g_cpu_worker.thread.joinable()) {
         g_cpu_worker.thread.join();
     }
+    g_cpu_worker.has_work = false;
+    g_cpu_worker.done     = true;
+    g_cpu_worker.e_src1   = sycl::event{};
+    g_cpu_worker.src0     = nullptr;
+    g_cpu_worker.src1     = nullptr;
+    g_cpu_worker.output   = nullptr;
+}
+
+// Logical module unload leaves NODELETE statics mapped. Drop every queue/config
+// authority so the next registry open rebuilds against fresh backend contexts.
+static void split_config_shutdown_reset() {
+    split_merge_drain();
+    g_pending_merges.clear();
+    g_cached_secondary_ops.clear();
+    g_split_secondary_kernel.reset();
+    g_split_plan_cached          = false;
+    g_split_merge_queue          = nullptr;
+    g_split_persistent.coord_queue = nullptr;
+    g_split_config               = {};
+    g_split_coord_queue_owner.reset();
+    g_split_merge_queue_owner.reset();
+    g_split_secondary_queue_owner.reset();
+    g_cpu_worker.shutdown = false;
 }
 
 // Initialize 3-device split config. Called once (idempotent).
@@ -50799,8 +50839,10 @@ static void split_config_init(sycl::queue * primary_queue) {
             }
             if (have_primary && have_secondary) {
                 // Platform default context already contains both GPUs
-                static sycl::queue q1(secondary_dev, sycl::property::queue::in_order{});
-                const int          secondary_device = ggml_sycl_get_device_id_from_queue(q1);
+                g_split_secondary_queue_owner =
+                    std::make_unique<sycl::queue>(secondary_dev, sycl::property::queue::in_order{});
+                sycl::queue & q1 = *g_split_secondary_queue_owner;
+                const int     secondary_device = ggml_sycl_get_device_id_from_queue(q1);
                 if (secondary_device < 0) {
                     GGML_LOG_WARN("SYCL: secondary GPU queue did not map to a ggml SYCL device id\n");
                     continue;
@@ -50820,8 +50862,8 @@ static void split_config_init(sycl::queue * primary_queue) {
                 // OOQ so that depends_on(e_second_out) doesn't stall any
                 // other submission.
                 {
-                    static sycl::queue merge_q(primary_dev);
-                    g_split_merge_queue = &merge_q;
+                    g_split_merge_queue_owner = std::make_unique<sycl::queue>(primary_dev);
+                    g_split_merge_queue       = g_split_merge_queue_owner.get();
                 }
 
                 GGML_LOG_INFO("SYCL 3-device split: %s + %s + CPU (%.0f%%/%.0f%%/%.0f%%)\n",
@@ -50832,6 +50874,9 @@ static void split_config_init(sycl::queue * primary_queue) {
             }
         }
         if (!found) {
+            g_split_secondary_queue_owner.reset();
+            g_split_merge_queue_owner.reset();
+            g_split_merge_queue = nullptr;
             // Secondary GPU not found — redistribute its share to primary
             GGML_LOG_WARN("SYCL: secondary GPU not found, falling back to 2-device split (GPU+CPU)\n");
             g_split_config.ratio[0] += g_split_config.ratio[1];
@@ -92594,10 +92639,9 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
         ~graph_inflight_guard() { counter.fetch_sub(1, std::memory_order_relaxed); }
     };
 
-    // Start watchdog on first graph_compute (deferred from backend init to
-    // allow model loading to complete without false timeout on large models).
-    static std::once_flag watchdog_once;
-    std::call_once(watchdog_once, []() { ggml_sycl_watchdog_start(); });
+    // start() is synchronized and idempotent. Unlike once_flag it can restart
+    // after NODELETE logical shutdown/reload.
+    ggml_sycl_watchdog_start();
 
     const int inflight_prev = g_sycl_graph_inflight.fetch_add(1, std::memory_order_relaxed);
 
@@ -95984,6 +96028,7 @@ void ggml_backend_sycl_shutdown(void) {
     g_adaptive_prestage.stop();
     ggml_sycl_tp_worker_shutdown();
     cpu_worker_shutdown();
+    split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();
     {
@@ -96076,6 +96121,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_register_weight_usage") == 0) {
         return (void *) ggml_backend_sycl_register_weight_usage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_try_register_weight_usage") == 0) {
+        return (void *) ggml_backend_sycl_try_register_weight_usage;
     }
     if (strcmp(name, "ggml_backend_sycl_stage_inventory_plan") == 0) {
         return (void *) ggml_backend_sycl_stage_inventory_plan;
@@ -96327,4 +96375,11 @@ void ggml_sycl_copy_device_to_host(void * src_device, void * dst_host, size_t by
                                                 /*fallback_unknown=*/true);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, q);
 }
+
+// Queried by the central loader immediately after RTLD_NOW/LoadLibrary and
+// before score/init. Versioned independently from the backend registry ABI.
+extern "C" GGML_BACKEND_API uint32_t ggml_backend_lifetime_policy_v1(void) {
+    return 1u; // GGML_BACKEND_LIFETIME_POLICY_PROCESS
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_sycl_reg)
