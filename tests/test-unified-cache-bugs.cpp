@@ -310,10 +310,31 @@ static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
 static bool test_planned_materialization_guard(sycl::queue & q) {
     printf("\n=== Test: planned materialization guard ===\n");
 
-    ggml_sycl::unified_cache  cache(q, 4096);
+    ggml_sycl::unified_cache cache(q, 4096);
+    ggml_sycl_load_txn       txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK || txn.id == 0) {
+        fprintf(stderr, "Failed to begin planned-materialization test transaction\n");
+        return false;
+    }
+
+    struct load_abort_guard {
+        ggml_sycl_load_txn txn;
+
+        ~load_abort_guard() { (void) ggml_backend_sycl_model_load_end(txn, false, nullptr); }
+    } abort_guard{ txn };
+
     ggml_sycl::placement_plan plan{};
     plan.build_index();
-    cache.set_placement_plan(std::move(plan));
+    ggml_sycl::lifecycle_stage_placement_plan(txn.id, plan);
+    const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn.id);
+    auto &     registry  = ggml_sycl::lifecycle::global_registry();
+    auto       effect    = registry.acquire_load_effect(registry.bound_candidate());
+    if (!candidate || !candidate->plan || candidate->load_txn_id != txn.id || !effect ||
+        effect.owner.load.value != txn.id) {
+        fprintf(stderr, "Failed to stage exact planned-materialization candidate authority\n");
+        return false;
+    }
+    effect = {};
 
     std::vector<uint8_t> data(128, 0xcd);
     ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
