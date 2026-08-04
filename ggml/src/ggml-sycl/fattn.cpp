@@ -1524,6 +1524,17 @@ bool ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
     if (total_blocks > std::numeric_limits<size_t>::max() / plan.packed_k_bytes_per_block) {
         return false;
     }
+    const size_t int64_max = static_cast<size_t>(std::numeric_limits<int64_t>::max());
+    if (plan.packed_k_bytes_per_block > int64_max ||
+        block_count > int64_max / plan.packed_k_bytes_per_block) {
+        return false;
+    }
+    const int64_t packed_block_stride = static_cast<int64_t>(plan.packed_k_bytes_per_block);
+    const int64_t packed_head_stride  = static_cast<int64_t>(block_count * plan.packed_k_bytes_per_block);
+    if (head_count > int64_max / static_cast<size_t>(packed_head_stride)) {
+        return false;
+    }
+    const int64_t packed_batch_stride = static_cast<int64_t>(head_count) * packed_head_stride;
 
     out->required                    = true;
     out->target_device               = target_device;
@@ -1543,9 +1554,9 @@ bool ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
     out->k_src_nb1                   = params.nb11;
     out->k_src_nb2                   = params.nb12;
     out->k_src_nb3                   = params.nb13;
-    out->packed_block_stride         = static_cast<int64_t>(plan.packed_k_bytes_per_block);
-    out->packed_head_stride          = static_cast<int64_t>(block_count * plan.packed_k_bytes_per_block);
-    out->packed_batch_stride         = static_cast<int64_t>(head_count) * out->packed_head_stride;
+    out->packed_block_stride         = packed_block_stride;
+    out->packed_head_stride          = packed_head_stride;
+    out->packed_batch_stride         = packed_batch_stride;
     return true;
 }
 

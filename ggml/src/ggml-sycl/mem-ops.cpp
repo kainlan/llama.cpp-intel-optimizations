@@ -5,11 +5,28 @@
 #include "sycl-kernel-profiler.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace ggml_sycl {
+
+static std::atomic<uint64_t> g_mem_fill_profile_error_after_submit_count{ 0 };
+
+uint64_t mem_fill_test_profile_error_after_submit_count() {
+    return g_mem_fill_profile_error_after_submit_count.load(std::memory_order_relaxed);
+}
+
+static void mem_fill_test_profile_error_after_submit() {
+    const char * selected = std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT");
+    if (selected != nullptr && selected[0] != '\0') {
+        g_mem_fill_profile_error_after_submit_count.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc{};
+    }
+}
 
 static void add_deps(sycl::handler & cgh, const std::vector<sycl::event> & deps) {
     if (!deps.empty()) {
@@ -426,13 +443,34 @@ static sycl::event mem_fill_direct_submit(const mem_handle &               h,
         return sycl::event{};
     }
 
-    return ggml_sycl_memcpy_profile_submit(
-        queue, "sycl.memcpy.mem_fill", "role=memfill;path=mem_ops", "copy", size, [&](sycl::queue & profiled_q) {
-            return profiled_q.submit([&](sycl::handler & cgh) {
-                add_deps(cgh, deps);
-                cgh.memset(ptr, value, size);
-            });
-        }, file, line, function);
+    const bool profile_enabled = ggml_sycl_kernel_profile_enabled();
+    const ggml_sycl_profile_label profile_label =
+        make_memcpy_profile_label(queue, "sycl.memcpy.mem_fill", "role=memfill;path=mem_ops", "copy", size);
+    const uint64_t host_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    const sycl_timeline_callsite callsite{ file, line, function };
+    sycl::event event = queue.submit([&](sycl::handler & cgh) {
+        add_deps(cgh, deps);
+        cgh.memset(ptr, value, size);
+    });
+    const uint64_t host_submit_end_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    try {
+        mem_fill_test_profile_error_after_submit();
+        if (profile_enabled) {
+            ggml_sycl_kernel_profile_record_event(
+                profile_label, event, callsite, host_submit_begin_us, host_submit_end_us);
+        }
+    } catch (...) {
+        GGML_LOG_WARN("[SYCL] mem_fill profiler bookkeeping failed after accepted submit\n");
+    }
+    return event;
 }
 
 static sycl::event mem_fill_submit(const mem_handle &               h,

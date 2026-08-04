@@ -61,6 +61,18 @@ void set_profile_error_after_submit(const char * checkpoint) {
 #endif
 }
 
+void set_mem_fill_profile_error_after_submit(bool enabled) {
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT", enabled ? "1" : "");
+#else
+    if (enabled) {
+        (void) setenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT", "1", 1);
+    } else {
+        (void) unsetenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT");
+    }
+#endif
+}
+
 void require(bool condition, const char * message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -150,6 +162,20 @@ void verify_host_boundaries() {
             "int32-max packed-K materialization descriptor was rejected");
     require(maximum_desc.n_blocks == expected_max_blocks,
             "int32-max packed-K descriptor block calculation mismatch");
+    fattn_params stride_boundary = maximum;
+    stride_boundary.ne12 = std::numeric_limits<int64_t>::max() / maximum_desc.packed_head_stride;
+    ggml_sycl_fattn_xmx_packed_k_materialization_desc stride_boundary_desc{};
+    require(ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+                stride_boundary, ordinary_plan, 0, &stride_boundary_desc),
+            "int64 packed batch stride boundary was rejected");
+    require(stride_boundary_desc.packed_batch_stride <= std::numeric_limits<int64_t>::max(),
+            "int64 packed batch stride boundary overflowed");
+    fattn_params stride_overflow = stride_boundary;
+    ++stride_overflow.ne12;
+    ggml_sycl_fattn_xmx_packed_k_materialization_desc stride_overflow_desc{};
+    require(!ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+                stride_overflow, ordinary_plan, 0, &stride_overflow_desc),
+            "signed packed batch stride overflow was accepted");
     constexpr uintptr_t address = uintptr_t{ 0x1000 };
     require(!ggml_sycl_fattn_xmx_range_contains_address(address - 1, 1, address),
             "host end-exclusive range arithmetic included its end");
@@ -209,11 +235,16 @@ sycl::event submit_controlled_gate(sycl::queue & q, controlled_gate * gate) {
 
 class controlled_gate_release_guard {
   public:
-    controlled_gate_release_guard(controlled_gate & gate, sycl::queue & queue) : gate_(gate), queue_(queue) {}
+    controlled_gate_release_guard(controlled_gate & gate, sycl::queue & dependency_queue, sycl::queue & work_queue) :
+        gate_(gate), dependency_queue_(dependency_queue), work_queue_(work_queue) {}
     ~controlled_gate_release_guard() noexcept {
         gate_.release();
         try {
-            queue_.wait();
+            dependency_queue_.wait();
+        } catch (...) {
+        }
+        try {
+            work_queue_.wait();
         } catch (...) {
         }
     }
@@ -223,7 +254,8 @@ class controlled_gate_release_guard {
 
   private:
     controlled_gate & gate_;
-    sycl::queue &     queue_;
+    sycl::queue &     dependency_queue_;
+    sycl::queue &     work_queue_;
 };
 
 sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
@@ -370,8 +402,25 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
                             int device) {
     enable_sidecar();
     sidecar_fixture fixture(q, device);
-    set_failpoint(checkpoint.c_str());
+    controlled_gate gate;
+    controlled_gate_release_guard gate_guard(gate, dependency_q, q);
 
+    const uint64_t fill_errors_before = ggml_sycl::mem_fill_test_profile_error_after_submit_count();
+    set_mem_fill_profile_error_after_submit(true);
+    const bool fill_profile_error_ok = fixture.update(q, device);
+    set_mem_fill_profile_error_after_submit(false);
+    require(fill_profile_error_ok, "post-submit mem_fill profiler error changed sidecar success");
+    auto * fill_sidecar = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
+    require(fill_sidecar != nullptr && fill_sidecar->handle.valid(),
+            "post-submit mem_fill profiler error lost sidecar fill owner");
+    require(ggml_sycl::mem_fill_test_profile_error_after_submit_count() == fill_errors_before + 1,
+            "sidecar mem_fill profiler error hook was not observed exactly once");
+    fill_sidecar->ready_event.wait_and_throw();
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));
+    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
+            "sidecar mem_fill profiler test owner survived teardown");
+
+    set_failpoint(checkpoint.c_str());
     if (checkpoint == "sidecar-before-initial-fill") {
         require(!fixture.update(q, device), "initial-fill failpoint was not observed");
         require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
@@ -395,9 +444,7 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
     require(before != nullptr, "sidecar missing before controlled retry");
     before->ready_event.wait_and_throw();
     void * retained_ptr = before->ptr;
-    controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
-    controlled_gate_release_guard gate_guard(gate, dependency_q);
     before->ready_event = submit_rows_payload(dependency_q, gate_event, fixture.values.ptr, fixture.indices.ptr, 3.0f);
     require(submit_retry_before_gate_release(gate, [&]() { return fixture.update(q, device); }),
             "controlled sidecar retry failed");
@@ -437,19 +484,27 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     device_buffer<sycl::half> kbuf(q, D * N_KV, device);
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
+    controlled_gate gate;
+    controlled_gate_release_guard gate_guard(gate, dependency_q, q);
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
     const auto plan = tiny_plan(params);
     require(plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE, "tiny packed plan rejected");
 
     ggml_sycl_fattn_xmx_packed_k packed;
-    require(ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed),
-            "materializer prerequisite failed");
+    const uint64_t fill_errors_before = ggml_sycl::mem_fill_test_profile_error_after_submit_count();
+    set_mem_fill_profile_error_after_submit(true);
+    const bool fill_profile_error_ok =
+        ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
+    set_mem_fill_profile_error_after_submit(false);
+    require(fill_profile_error_ok, "post-submit mem_fill profiler error changed materializer success");
+    require(packed.handle.valid() && packed.ptr != nullptr,
+            "post-submit mem_fill profiler error lost materializer fill owner");
+    require(ggml_sycl::mem_fill_test_profile_error_after_submit_count() == fill_errors_before + 1,
+            "materializer mem_fill profiler error hook was not observed exactly once");
     packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
-    controlled_gate_release_guard gate_guard(gate, dependency_q);
     packed.ready_event = submit_half_payload(dependency_q, gate_event, kbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -497,6 +552,8 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     device_buffer<float> partial_max(q, 1, device);
     device_buffer<float> partial_sum(q, 1, device);
     device_buffer<float> partial_out(q, D, device);
+    controlled_gate gate;
+    controlled_gate_release_guard gate_guard(gate, dependency_q, q);
     q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
     std::vector<sycl::half> ones(D * N_KV, sycl::half(1.0f));
@@ -508,9 +565,7 @@ void run_consumer_checkpoint(const std::string & checkpoint,
             "consumer prerequisite materialization failed");
     packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
-    controlled_gate_release_guard gate_guard(gate, dependency_q);
     packed.ready_event = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -607,6 +662,7 @@ int main(int argc, char ** argv) {
 
     set_failpoint(nullptr);
     set_profile_error_after_submit(nullptr);
+    set_mem_fill_profile_error_after_submit(false);
     std::atomic<int> async_failures{ 0 };
     try {
         ggml_backend_sycl_context ctx(0);
@@ -638,6 +694,7 @@ int main(int argc, char ** argv) {
         }
         set_failpoint(nullptr);
         set_profile_error_after_submit(nullptr);
+        set_mem_fill_profile_error_after_submit(false);
         dependency_queue.wait_and_throw();
         work_queue.wait_and_throw();
         context_queue->wait_and_throw();
@@ -656,12 +713,14 @@ int main(int argc, char ** argv) {
         ++async_failures;
         set_failpoint(nullptr);
         set_profile_error_after_submit(nullptr);
+        set_mem_fill_profile_error_after_submit(false);
         std::fprintf(stderr, "FAIL checkpoint=%s SYCL: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
     } catch (const std::exception & e) {
         set_failpoint(nullptr);
         set_profile_error_after_submit(nullptr);
+        set_mem_fill_profile_error_after_submit(false);
         std::fprintf(stderr, "FAIL checkpoint=%s: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;

@@ -13,12 +13,14 @@ CMAKE_PATH = ROOT / "ggml/src/ggml-sycl/CMakeLists.txt"
 FATTN_PATH = ROOT / "ggml/src/ggml-sycl/fattn.cpp"
 FATTN_HPP_PATH = ROOT / "ggml/src/ggml-sycl/fattn.hpp"
 XMX_PATH = ROOT / "ggml/src/ggml-sycl/fattn-xmx-f16-v2.hpp"
+MEM_OPS_PATH = ROOT / "ggml/src/ggml-sycl/mem-ops.cpp"
 
 LIVE = LIVE_PATH.read_text(encoding="utf-8")
 CMAKE = CMAKE_PATH.read_text(encoding="utf-8")
 FATTN = FATTN_PATH.read_text(encoding="utf-8")
 FATTN_HPP = FATTN_HPP_PATH.read_text(encoding="utf-8")
 XMX = XMX_PATH.read_text(encoding="utf-8")
+MEM_OPS = MEM_OPS_PATH.read_text(encoding="utf-8")
 
 CHECKPOINTS = (
     "sidecar-before-initial-fill",
@@ -29,7 +31,8 @@ CHECKPOINTS = (
 GUARD = 'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)'
 
 
-def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> bool:
+def production_contract(
+        fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP, mem_ops: str = MEM_OPS) -> bool:
     fattn_needles = (
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
@@ -52,6 +55,8 @@ def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> boo
         "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
         "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
+        "head_count > int64_max / static_cast<size_t>(packed_head_stride)",
+        "const int64_t packed_batch_stride = static_cast<int64_t>(head_count) * packed_head_stride",
     )
     xmx_needles = (
         'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
@@ -78,10 +83,38 @@ def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> boo
         "size <= std::numeric_limits<uintptr_t>::max() - begin",
         "address >= begin && address < begin + size",
     )
+    mem_fill_needles = (
+        'std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
+        "sycl::event event = queue.submit",
+        "mem_fill_test_profile_error_after_submit();",
+        "ggml_sycl_kernel_profile_record_event(",
+        "mem_fill profiler bookkeeping failed after accepted submit",
+        "retain_handles_until_event({ h }, event)",
+    )
     return (all(needle in fattn for needle in fattn_needles) and
             all(needle in xmx for needle in xmx_needles) and
             all(needle in fattn_hpp for needle in hpp_needles) and
+            all(needle in mem_ops for needle in mem_fill_needles) and
+            mem_fill_attribution_contract(mem_ops) and
             profile_attribution_contract(xmx))
+
+
+def mem_fill_attribution_contract(mem_ops: str) -> bool:
+    direct_begin = mem_ops.index("static sycl::event mem_fill_direct_submit")
+    submit_begin = mem_ops.index("static sycl::event mem_fill_submit", direct_begin)
+    direct = mem_ops[direct_begin:submit_begin]
+    public_begin = mem_ops.index("sycl::event mem_copy_async", submit_begin)
+    submit = mem_ops[submit_begin:public_begin]
+    try:
+        return (
+            direct.index("sycl::event event = queue.submit") <
+            direct.index("mem_fill_test_profile_error_after_submit();") <
+            direct.index("return event;") and
+            submit.index("mem_fill_direct_submit") <
+            submit.index("retain_handles_until_event({ h }, event)") <
+            submit.index("return event;"))
+    except ValueError:
+        return False
 
 
 def profile_attribution_contract(xmx: str) -> bool:
@@ -100,6 +133,36 @@ def profile_attribution_contract(xmx: str) -> bool:
         return False
 
 
+def lifecycle_teardown_contract(source: str) -> bool:
+    guard_begin = source.index("~controlled_gate_release_guard() noexcept")
+    guard_end = source.index("controlled_gate_release_guard(const controlled_gate_release_guard &)", guard_begin)
+    destructor = source[guard_begin:guard_end]
+    drain_order = (
+        "gate_.release();",
+        "dependency_queue_.wait();",
+        "} catch (...) {",
+        "work_queue_.wait();",
+    )
+    try:
+        positions = [destructor.index(needle) for needle in drain_order]
+        if positions != sorted(positions) or destructor.count("catch (...)") != 2:
+            return False
+        starts = (
+            "void run_sidecar_checkpoint",
+            "void run_materializer_checkpoint",
+            "void run_consumer_checkpoint",
+        )
+        for index, start_name in enumerate(starts):
+            begin = source.index(start_name)
+            end = source.index(starts[index + 1], begin) if index + 1 < len(starts) else source.index("bool preflight_device", begin)
+            body = source[begin:end]
+            if body.index("controlled_gate_release_guard gate_guard") > body.index("require("):
+                return False
+        return True
+    except ValueError:
+        return False
+
+
 def live_contract(source: str) -> bool:
     required = (
         "SKIP_UNSUPPORTED = 77",
@@ -112,7 +175,9 @@ def live_contract(source: str) -> bool:
         "class controlled_gate_release_guard",
         "~controlled_gate_release_guard() noexcept",
         "gate_.release()",
-        "queue_.wait()",
+        "dependency_queue_.wait()",
+        "work_queue_.wait()",
+        "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
         "submit_retry_before_gate_release",
         "retry submission blocked on an unreleased dependency event",
         "gate.release()",
@@ -133,6 +198,12 @@ def live_contract(source: str) -> bool:
         "forced packed dispatch block rounding overflowed at int32 max",
         "int32-max packed-K materialization descriptor was rejected",
         "int32-max packed-K descriptor block calculation mismatch",
+        "int64 packed batch stride boundary was rejected",
+        "signed packed batch stride overflow was accepted",
+        "post-submit mem_fill profiler error changed sidecar success",
+        "sidecar mem_fill profiler error hook was not observed exactly once",
+        "post-submit mem_fill profiler error changed materializer success",
+        "materializer mem_fill profiler error hook was not observed exactly once",
         "host end-exclusive range arithmetic included its end",
         "host overflowing range arithmetic wrapped",
         "host exact-start range arithmetic rejected its start",
@@ -149,12 +220,11 @@ def live_contract(source: str) -> bool:
         "size() == registry_baseline",
         "work_queue.wait_and_throw()",
     )
-    guard_adjacency = (
-        "const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);\n"
-        "    controlled_gate_release_guard gate_guard(gate, dependency_q);")
+    guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
     return (all(needle in source for needle in required) and
             all(cp in source for cp in CHECKPOINTS) and
-            source.count(guard_adjacency) == 3)
+            source.count(guard_construction) == 3 and
+            lifecycle_teardown_contract(source))
 
 
 def guarded_cmake_block(source: str) -> str | None:
@@ -208,14 +278,16 @@ def test_checkpoint_mutations_are_killed() -> None:
         assert not live_contract(LIVE.replace(checkpoint, "mutated-checkpoint"))
         assert not cmake_contract(CMAKE.replace(checkpoint, "mutated-checkpoint"))
 
-    guard_adjacency = (
-        "const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);\n"
-        "    controlled_gate_release_guard gate_guard(gate, dependency_q);")
-    assert not live_contract(LIVE.replace(guard_adjacency, "/* missing teardown guard */", 1))
+    guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
+    assert not live_contract(LIVE.replace(guard_construction, "/* missing teardown guard */", 1))
     assert not live_contract(
-        LIVE.replace(
-            "controlled_gate_release_guard gate_guard(gate, dependency_q)",
-            "controlled_gate_release_guard gate_guard(gate, work_queue)", 1))
+        LIVE.replace(guard_construction,
+                     "controlled_gate_release_guard gate_guard(gate, q, dependency_q);", 1))
+    assert not live_contract(
+        LIVE.replace("dependency_queue_.wait();", "work_queue_.wait();", 1))
+    assert not live_contract(
+        LIVE.replace("controlled_gate_release_guard gate_guard(gate, dependency_q, q);",
+                     "/* guard moved after assertion */", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -234,6 +306,7 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "ggml_sycl_kernel_profile_record_event(",
         "throw std::bad_alloc{}",
         "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
+        "head_count > int64_max / static_cast<size_t>(packed_head_stride)",
     ):
         assert not production_contract(FATTN.replace(needle, "/* mutation removed seam */"), XMX)
     assert not production_contract(
@@ -260,6 +333,15 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
             "first_profile_label, first_event, first_callsite,",
             "first_profile_label, first_event, merge_callsite,", 1))
     for needle in (
+        'std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
+        "sycl::event event = queue.submit",
+        "mem_fill_test_profile_error_after_submit();",
+        "mem_fill profiler bookkeeping failed after accepted submit",
+        "retain_handles_until_event({ h }, event)",
+    ):
+        assert not production_contract(
+            FATTN, XMX, mem_ops=MEM_OPS.replace(needle, "/* mutation removed fill seam */", 1))
+    for needle in (
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
         "*packed_k_ready_event = first_event",
@@ -282,9 +364,10 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
 def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     for needle in (
         "cgh.host_task([=]() { gate->wait(); })",
-        "controlled_gate_release_guard gate_guard(gate, dependency_q)",
+        "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
         "gate_.release()",
-        "queue_.wait()",
+        "dependency_queue_.wait()",
+        "work_queue_.wait()",
         "before->ready_event = submit_rows_payload",
         "after->ready_event.wait_and_throw()",
         "post-submit profiler error hook was not observed exactly once",
@@ -294,6 +377,9 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "FAIL host packed-K boundary checks",
         "forced packed dispatch block rounding overflowed at int32 max",
         "int32-max packed-K descriptor block calculation mismatch",
+        "signed packed batch stride overflow was accepted",
+        "sidecar mem_fill profiler error hook was not observed exactly once",
+        "materializer mem_fill profiler error hook was not observed exactly once",
         "end-exclusive range ending at K removed sidecar",
         "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",

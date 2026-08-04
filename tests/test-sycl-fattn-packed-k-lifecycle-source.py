@@ -134,8 +134,8 @@ def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> N
         "packed.ready_event = zero_event",
         'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
         "ggml_sycl_fattn_xmx_submit_set_rows_update",
-        "packed.ready_event = update_event",
     )
+    assert update.count("&packed.ready_event") == 2
 
 
 def test_forced_materializer_propagates_prior_event_and_replaces_success() -> None:
@@ -239,8 +239,8 @@ def test_unregister_is_half_open_range_isolated_and_waits_via_destructor() -> No
         "void ggml_sycl_fattn_xmx_unregister_packed_k_range",
         "// Kernel names for VTune profiling",
     )
-    assert "end   = begin + size;" in unregister
-    assert "if (k >= begin && k < end)" in unregister
+    assert "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)" in unregister
+    assert "begin + size" not in unregister
     assert "g_packed_k_sidecars.erase(it)" in unregister
     assert "else {\n            ++it;" in unregister
     assert ".wait(" not in unregister  # erase invokes packed destructor/reset; no queue-global wait

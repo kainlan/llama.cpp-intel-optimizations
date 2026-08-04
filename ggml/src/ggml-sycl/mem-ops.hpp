@@ -37,6 +37,10 @@ sycl::event mem_fill_async(const mem_handle &               h,
                            sycl::queue &                    queue,
                            const std::vector<sycl::event> & deps = {});
 
+// Test observation for the deterministic post-submit bookkeeping failpoint.
+// Production is inert unless GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT is set.
+uint64_t mem_fill_test_profile_error_after_submit_count();
+
 void mem_copy(const mem_handle &               dst,
               const mem_handle &               src,
               size_t                           size,
