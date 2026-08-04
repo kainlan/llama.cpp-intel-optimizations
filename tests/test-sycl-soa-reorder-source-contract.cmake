@@ -60,11 +60,22 @@ foreach(required
         "registry.lookup_copy"
         "registry-authoritative arena suballocation"
         "ggml_sycl_reorder_expected_size_for_test(GGML_TYPE_Q4_0, 31"
-        "Normalize the initial state accepted by the concurrent reader")
+        "Normalize the initial state accepted by the concurrent reader"
+        "std::atomic<int>  registry_phase{ 0 };"
+        "const auto saved_info = registry.lookup_copy"
+        "registry_phase.store(1, std::memory_order_release);"
+        "const auto fresh_info = registry.lookup_copy"
+        "fresh_info->device_id != 8"
+        "registry_phase.store(2, std::memory_order_release);")
     string(FIND "${fixture}" "${required}" pos)
     if(pos EQUAL -1)
         message(FATAL_ERROR "missing fixture contract: ${required}")
     endif()
 endforeach()
+
+string(FIND "${fixture}" "for (int i = 0; i < 10000;" probabilistic_loop)
+if(NOT probabilistic_loop EQUAL -1)
+    message(FATAL_ERROR "registry copy-out test must use deterministic phases, not an iteration race")
+endif()
 
 message(STATUS "SoA reorder source contracts verified")

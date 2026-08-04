@@ -206,22 +206,30 @@ bool test_reorder_validation_contracts() {
     // either thread starts; device 1 above was only for the mismatch check.
     registry.register_alloc(registered_bytes.data(), registered_bytes.size(), 7, ggml_sycl::alloc_type::DEVICE);
     std::atomic<bool> registry_ok{ true };
-    std::thread writer([&] {
-        for (int i = 0; i < 10000; ++i) {
-            registry.unregister_alloc(registered_bytes.data());
-            registry.register_alloc(registered_bytes.data(), registered_bytes.size(), i & 1 ? 7 : 8,
-                                    ggml_sycl::alloc_type::DEVICE);
+    std::atomic<int>  registry_phase{ 0 };
+    std::thread reader([&] {
+        const auto saved_info = registry.lookup_copy(registered_bytes.data() + 127);
+        if (!saved_info || saved_info->device_id != 7 || saved_info->type != ggml_sycl::alloc_type::DEVICE) {
+            registry_ok.store(false);
+        }
+        // The saved value is now detached from registry storage; permit mutation.
+        registry_phase.store(1, std::memory_order_release);
+        while (registry_phase.load(std::memory_order_acquire) != 2) {
+            std::this_thread::yield();
+        }
+        const auto fresh_info = registry.lookup_copy(registered_bytes.data() + 127);
+        if (!saved_info || saved_info->device_id != 7 || !fresh_info || fresh_info->device_id != 8 ||
+            fresh_info->type != ggml_sycl::alloc_type::DEVICE) {
+            registry_ok.store(false);
         }
     });
-    std::thread reader([&] {
-        for (int i = 0; i < 10000; ++i) {
-            const auto info = registry.lookup_copy(registered_bytes.data() + 127);
-            if (info && (info->base != reinterpret_cast<uintptr_t>(registered_bytes.data()) ||
-                         info->size != registered_bytes.size() || (info->device_id != 7 && info->device_id != 8) ||
-                         info->type != ggml_sycl::alloc_type::DEVICE)) {
-                registry_ok.store(false);
-            }
+    std::thread writer([&] {
+        while (registry_phase.load(std::memory_order_acquire) != 1) {
+            std::this_thread::yield();
         }
+        registry.unregister_alloc(registered_bytes.data());
+        registry.register_alloc(registered_bytes.data(), registered_bytes.size(), 8, ggml_sycl::alloc_type::DEVICE);
+        registry_phase.store(2, std::memory_order_release);
     });
     writer.join();
     reader.join();
