@@ -591,6 +591,91 @@ and Task 19's final clean build plus accepted-set runtime. This is the owner
 decision that removes `llama.cpp-awcp`'s policy blocker while
 preserving the roughly 83-row post-merge assignment to `lead`.
 
+## Task 17d: final restored-registration audit
+
+This source-side audit is pinned at `fc606640e`, after the approved Task
+17a–17c changes. It reconciles the normative Task 16 tables above against every
+live `CMakeLists.txt`, rather than treating a source-name match or a zero-match
+`ctest -R` as proof.
+
+### Complete Task 16 reconciliation
+
+| Task 16 set | source rows / targets | selectable CTest names in the canonical static configuration | audit result |
+|---|---:|---:|---|
+| accepted and already live before Task 17 | 40 | 40 | every target has exactly one `add_executable` and every exact Task 16 command name has exactly one `add_test` |
+| accepted and restored by Task 17 | 8 | 11 | eight targets, including the four historical streaming modes from one executable; all are selectable |
+| **accepted total** | **48** | **51** | **48/48 unique accepted targets active; 51/51 unique exact test names registered once** |
+| declined | **16** | **0** | **no declined basename has an active `add_executable` or `add_test` in either CMake file** |
+
+Thus the source-row decision remains **48 accepted + 16 declined = 64/64**.
+The difference between 48 accepted rows and 51 CTest names is intentional and
+comes only from `test-mmvq-q8-0-streaming-bench.cpp`, whose one executable has
+four required modes. The `sycl-restored` label identifies only the 11
+registrations added by Task 17; it is not retroactively applied to the 40
+registrations that were already live.
+
+### Restored target/property table
+
+`static` below means the target and its tests are inside
+`if (NOT GGML_BACKEND_DL)`. The descriptor fixture has the additional
+`GGML_SYCL_DNNL` guard and directly links `DNNL::dnnl`; no other restored row
+acquires that oneDNN-only guard. Every target links the static
+`ggml-base;ggml;ggml-cpu;ggml-sycl` topology, with `IntelSYCL::SYCL_CXX` added
+when found.
+
+| restored target | CTest names | guard | `sycl-restored` | `RUN_SERIAL` names | skip-77 names | manual names |
+|---|---:|---|---:|---:|---:|---:|
+| `test-cpu-gpu-soa-interaction` | 1 | static | 1 | 1 | 0 | 0 |
+| `test-mmvq-q8-0-streaming-bench` | 4 | static | 4 | 0 | 3 | 4 |
+| `test-mxfp4-xmx-tiled` | 1 | static | 1 | 1 | 1 | 0 |
+| `test-q6k-reorder-dispatch` | 1 | static | 1 | 1 | 0 | 0 |
+| `test-sycl-expert-prefetch` | 1 | static | 1 | 1 | 1 | 0 |
+| `test-sycl-fattn-onednn-descriptors` | 1 | static + oneDNN | 1 | 1 | 1 | 0 |
+| `test-sycl-set-rows-owner-routing` | 1 | static | 1 | 1 | 0 | 0 |
+| `test-unified-dispatch-integration` | 1 | static | 1 | 1 | 1 | 0 |
+| **total** | **11** | **8 targets** | **11** | **7** | **7** | **4** |
+
+The four streaming names share one label property call. Their bare benchmark,
+MMQ smoke, and forced-MMQ modes have `SKIP_RETURN_CODE 77`; the cache smoke
+mode is deliberately not included because its configured path has no exit-77
+branch (unavailable cache/device work is a failure there). The other four
+skip-77 registrations match explicit source exits of 77. The seven ordinary
+GPU fixtures are `RUN_SERIAL`; the four opt-in streaming modes instead carry
+the `manual` label as a group. A substring-regex scan of every restored label
+found zero matches for the throttled-sweep denylist
+`residency|mem-handle|cache`.
+
+### Generated CTest evidence and lead handoff
+
+The lead supplied generated evidence at the same `fc606640e` snapshot; Task
+17d did not configure, build, or run a GPU. The supplied
+`cmake -S . -B build` completed with rc=0. Its CTest JSON contained **250**
+tests total and exactly **11** `sycl-restored` names, with **7** `RUN_SERIAL`,
+**7** `SKIP_RETURN_CODE 77`, **4** `manual`, and **0** forbidden-label
+matches. `ctest -N -L sycl-restored` selected 11 and `ctest -N -L manual`
+selected 4, so neither selector proof is a zero-match pass.
+
+Exact commands for the lead's clean handoff (configure/build remain lead-only;
+these listing commands execute no tests) are:
+
+```sh
+cmake -S . -B build
+cmake --build build --target \
+  test-cpu-gpu-soa-interaction test-mmvq-q8-0-streaming-bench \
+  test-mxfp4-xmx-tiled test-q6k-reorder-dispatch \
+  test-sycl-expert-prefetch test-sycl-fattn-onednn-descriptors \
+  test-sycl-set-rows-owner-routing test-unified-dispatch-integration -j 1
+ctest --test-dir build -N -L '^sycl-restored$'  # expected: 11 tests
+ctest --test-dir build -N -L '^manual$'         # expected: 4 tests
+ctest --test-dir build --show-only=json-v1 > /tmp/kdfh-ctest.json
+```
+
+The JSON proof must remain nonzero and reconcile to total 250,
+`sycl-restored=11`, `RUN_SERIAL=7`, `SKIP_RETURN_CODE 77=7`, `manual=4`, and
+forbidden restored-label matches=0 before runtime delegation. Mutation proofs
+remain with `llama.cpp-8u22`, and clean accepted-set GPU runtime remains with
+Task 19 (`llama.cpp-8kyi`); this audit claims neither.
+
 
 ## Two instances named in the ticket
 
