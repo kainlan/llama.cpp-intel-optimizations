@@ -10107,6 +10107,7 @@ static void ggml_backend_sycl_test_wait_kv_push_blocked() {
 static void ggml_backend_sycl_test_release_kv_push() {
     std::lock_guard<std::mutex> lock(g_test_kv_push_mutex);
     g_test_block_next_kv_push = false;
+    g_test_kv_push_blocked = false;
     g_test_kv_push_cv.notify_all();
 }
 
@@ -96209,6 +96210,13 @@ bool ggml_backend_sycl_can_unload(void) {
         }
         g_sycl_module_shutdown_started = false;
         g_sycl_module_admission_cv.wait(lock, [] { return g_sycl_module_mutations == 0; });
+    }
+    if (newly_closed) {
+        // ACTIVE is published only by initial construction or a successful
+        // reactivation commit. Reconcile the internal Registry gate before
+        // reserving so a stale completed bit cannot reject the first checked
+        // unload after NODELETE re-publication.
+        ggml_sycl::lifecycle::global_registry().reactivate();
     }
     if (ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK) {
         return true;

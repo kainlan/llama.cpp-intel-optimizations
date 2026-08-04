@@ -711,6 +711,9 @@ checks = {
     and "g_sycl_module_admission_cv.wait" in backend
     and "g_sycl_module_shutdown_started = true" in backend
     and "if (!g_sycl_module_shutdown_started" in backend
+    and "Reconcile the internal Registry gate" in backend
+    and "CALL_SYCL(ggml_backend_sycl_model_load_end)(aborted, false, nullptr)" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_prepare_reactivate" in backend
     and "ggml_backend_commit_reactivate" in backend
     and "ggml_backend_rollback_reactivate" in backend,
