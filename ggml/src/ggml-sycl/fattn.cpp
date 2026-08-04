@@ -633,18 +633,12 @@ void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size
     if (!ptr || size == 0) {
         return;
     }
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-    // Reject a wrapped half-open range rather than accidentally matching an
-    // unrelated low address after uintptr_t overflow.
-    if (size > std::numeric_limits<uintptr_t>::max() - begin) {
-        return;
-    }
-    const uintptr_t             end   = begin + size;
+    const uintptr_t             begin = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
     auto                        it = g_packed_k_sidecars.begin();
     while (it != g_packed_k_sidecars.end()) {
         const uintptr_t k = reinterpret_cast<uintptr_t>((*it)->k_base);
-        if (k >= begin && k < end) {
+        if (ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)) {
             it = g_packed_k_sidecars.erase(it);
         } else {
             ++it;

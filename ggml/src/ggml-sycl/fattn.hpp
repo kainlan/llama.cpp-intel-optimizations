@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 // Check if flash attention is supported for the given tensor configuration
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst);
@@ -118,6 +119,11 @@ static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK =
 // Overflow-safe ceil(n_kv / 64), shared by planning and forced dispatch.
 static constexpr int ggml_sycl_fattn_xmx_packed_k_n_blocks(int n_kv) {
     return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0;
+}
+
+static constexpr bool ggml_sycl_fattn_xmx_range_contains_address(uintptr_t begin, size_t size, uintptr_t address) {
+    return size > 0 && size <= std::numeric_limits<uintptr_t>::max() - begin &&
+           address >= begin && address < begin + size;
 }
 
 static inline size_t ggml_sycl_fattn_xmx_packed_k_element_offset_half(int kv_local, int d) {

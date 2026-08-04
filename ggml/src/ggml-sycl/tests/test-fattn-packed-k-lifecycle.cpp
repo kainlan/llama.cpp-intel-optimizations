@@ -131,7 +131,7 @@ ggml_sycl_fattn_xmx_decode_kv_layout_plan tiny_plan(const fattn_params & params)
     return ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(params, D, caps);
 }
 
-void verify_token_boundaries() {
+void verify_host_boundaries() {
     sycl::half * dummy_half = reinterpret_cast<sycl::half *>(uintptr_t{ 0x1000 });
     float * dummy_float = reinterpret_cast<float *>(uintptr_t{ 0x2000 });
     const fattn_params ordinary = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float);
@@ -150,6 +150,16 @@ void verify_token_boundaries() {
             "int32-max packed-K materialization descriptor was rejected");
     require(maximum_desc.n_blocks == expected_max_blocks,
             "int32-max packed-K descriptor block calculation mismatch");
+    constexpr uintptr_t address = uintptr_t{ 0x1000 };
+    require(!ggml_sycl_fattn_xmx_range_contains_address(address - 1, 1, address),
+            "host end-exclusive range arithmetic included its end");
+    require(!ggml_sycl_fattn_xmx_range_contains_address(
+                std::numeric_limits<uintptr_t>::max() - 1, 3, address),
+            "host overflowing range arithmetic wrapped");
+    require(ggml_sycl_fattn_xmx_range_contains_address(address, 1, address),
+            "host exact-start range arithmetic rejected its start");
+    require(ggml_sycl_fattn_xmx_range_contains_address(address - 1, 2, address),
+            "host interior range arithmetic rejected an interior address");
     for (const auto [tokens, expected_blocks] :
          { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 64, 1 }, std::pair<int, int>{ 65, 2 } }) {
         const fattn_params params = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float, tokens);
@@ -196,6 +206,25 @@ class controlled_gate {
 sycl::event submit_controlled_gate(sycl::queue & q, controlled_gate * gate) {
     return q.submit([&](sycl::handler & cgh) { cgh.host_task([=]() { gate->wait(); }); });
 }
+
+class controlled_gate_release_guard {
+  public:
+    controlled_gate_release_guard(controlled_gate & gate, sycl::queue & queue) : gate_(gate), queue_(queue) {}
+    ~controlled_gate_release_guard() noexcept {
+        gate_.release();
+        try {
+            queue_.wait();
+        } catch (...) {
+        }
+    }
+
+    controlled_gate_release_guard(const controlled_gate_release_guard &) = delete;
+    controlled_gate_release_guard & operator=(const controlled_gate_release_guard &) = delete;
+
+  private:
+    controlled_gate & gate_;
+    sycl::queue &     queue_;
+};
 
 sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
     return q.submit([&](sycl::handler & cgh) {
@@ -368,6 +397,7 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
     void * retained_ptr = before->ptr;
     controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    controlled_gate_release_guard gate_guard(gate, dependency_q);
     before->ready_event = submit_rows_payload(dependency_q, gate_event, fixture.values.ptr, fixture.indices.ptr, 3.0f);
     require(submit_retry_before_gate_release(gate, [&]() { return fixture.update(q, device); }),
             "controlled sidecar retry failed");
@@ -419,6 +449,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     void * retained_ptr = packed.ptr;
     controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    controlled_gate_release_guard gate_guard(gate, dependency_q);
     packed.ready_event = submit_half_payload(dependency_q, gate_event, kbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -479,6 +510,7 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     void * retained_ptr = packed.ptr;
     controlled_gate gate;
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    controlled_gate_release_guard gate_guard(gate, dependency_q);
     packed.ready_event = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -561,8 +593,15 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    try {
+        verify_host_boundaries();
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "FAIL host packed-K boundary checks: %s\n", e.what());
+        return 1;
+    }
+
     if (!preflight_device()) {
-        std::fprintf(stderr, "SKIP: packed-K lifecycle requires GPU FP16, XMX m1n64-k16, and sufficient SLM\n");
+        std::fprintf(stderr, "SKIP: host packed-K boundaries passed; GPU FP16/XMX/SLM unavailable\n");
         return SKIP_UNSUPPORTED;
     }
 
@@ -589,7 +628,6 @@ int main(int argc, char ** argv) {
         const size_t registry_baseline = ggml_sycl::alloc_registry::instance().size();
         const size_t bytes_baseline = ggml_sycl::alloc_registry::instance().total_device_bytes(device);
         const size_t arena_baseline = ggml_sycl::unified_cache_arena_non_weight_used(device);
-        verify_token_boundaries();
 
         if (checkpoint.rfind("sidecar-", 0) == 0) {
             run_sidecar_checkpoint(checkpoint, work_queue, dependency_queue, device);

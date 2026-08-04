@@ -51,8 +51,7 @@ def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> boo
         "                            const int selected_tk",
         "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
-        "if (size > std::numeric_limits<uintptr_t>::max() - begin)",
-        "if (k >= begin && k < end)",
+        "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
     )
     xmx_needles = (
         'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
@@ -75,10 +74,30 @@ def production_contract(fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP) -> boo
     hpp_needles = (
         "static constexpr int ggml_sycl_fattn_xmx_packed_k_n_blocks(int n_kv)",
         "return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0",
+        "static constexpr bool ggml_sycl_fattn_xmx_range_contains_address",
+        "size <= std::numeric_limits<uintptr_t>::max() - begin",
+        "address >= begin && address < begin + size",
     )
     return (all(needle in fattn for needle in fattn_needles) and
             all(needle in xmx for needle in xmx_needles) and
-            all(needle in fattn_hpp for needle in hpp_needles))
+            all(needle in fattn_hpp for needle in hpp_needles) and
+            profile_attribution_contract(xmx))
+
+
+def profile_attribution_contract(xmx: str) -> bool:
+    first_name = '"fattn.compute.xmx_v2_decode_gqa_split_first"'
+    merge_name = '"fattn.compute.xmx_v2_decode_gqa_split_merge"'
+    first_record = (
+        "first_profile_label, first_event, first_callsite, "
+        "first_submit_begin_us, first_submit_end_us")
+    merge_record = (
+        "merge_profile_label, merge_event, merge_callsite, "
+        "merge_submit_begin_us, merge_submit_end_us")
+    try:
+        return (xmx.index(first_name) < xmx.index(first_record) <
+                xmx.index(merge_name) < xmx.index(merge_record))
+    except ValueError:
+        return False
 
 
 def live_contract(source: str) -> bool:
@@ -90,6 +109,10 @@ def live_contract(source: str) -> bool:
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "cgh.host_task([=]() { gate->wait(); })",
+        "class controlled_gate_release_guard",
+        "~controlled_gate_release_guard() noexcept",
+        "gate_.release()",
+        "queue_.wait()",
         "submit_retry_before_gate_release",
         "retry submission blocked on an unreleased dependency event",
         "gate.release()",
@@ -110,6 +133,12 @@ def live_contract(source: str) -> bool:
         "forced packed dispatch block rounding overflowed at int32 max",
         "int32-max packed-K materialization descriptor was rejected",
         "int32-max packed-K descriptor block calculation mismatch",
+        "host end-exclusive range arithmetic included its end",
+        "host overflowing range arithmetic wrapped",
+        "host exact-start range arithmetic rejected its start",
+        "host interior range arithmetic rejected an interior address",
+        "FAIL host packed-K boundary checks",
+        "SKIP: host packed-K boundaries passed",
         "end-exclusive range ending at K removed sidecar",
         "exact-start [K,K+1) range retained sidecar",
         "interior overlap retained sidecar",
@@ -120,7 +149,12 @@ def live_contract(source: str) -> bool:
         "size() == registry_baseline",
         "work_queue.wait_and_throw()",
     )
-    return all(needle in source for needle in required) and all(cp in source for cp in CHECKPOINTS)
+    guard_adjacency = (
+        "const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);\n"
+        "    controlled_gate_release_guard gate_guard(gate, dependency_q);")
+    return (all(needle in source for needle in required) and
+            all(cp in source for cp in CHECKPOINTS) and
+            source.count(guard_adjacency) == 3)
 
 
 def guarded_cmake_block(source: str) -> str | None:
@@ -162,6 +196,7 @@ def test_production_live_driver_and_structural_registration_contracts() -> None:
     assert live_contract(LIVE)
     assert cmake_contract(CMAKE)
     assert CMAKE.index(GUARD) > CMAKE.index("# Un-guarded SYCL tests")
+    assert LIVE.index("verify_host_boundaries();") < LIVE.index("if (!preflight_device())")
 
 
 def test_checkpoint_mutations_are_killed() -> None:
@@ -172,6 +207,15 @@ def test_checkpoint_mutations_are_killed() -> None:
             assert not production_contract(FATTN.replace(checkpoint, "mutated-checkpoint", 1), XMX)
         assert not live_contract(LIVE.replace(checkpoint, "mutated-checkpoint"))
         assert not cmake_contract(CMAKE.replace(checkpoint, "mutated-checkpoint"))
+
+    guard_adjacency = (
+        "const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);\n"
+        "    controlled_gate_release_guard gate_guard(gate, dependency_q);")
+    assert not live_contract(LIVE.replace(guard_adjacency, "/* missing teardown guard */", 1))
+    assert not live_contract(
+        LIVE.replace(
+            "controlled_gate_release_guard gate_guard(gate, dependency_q)",
+            "controlled_gate_release_guard gate_guard(gate, work_queue)", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -189,15 +233,32 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "host_submit_end_us",
         "ggml_sycl_kernel_profile_record_event(",
         "throw std::bad_alloc{}",
-        "if (size > std::numeric_limits<uintptr_t>::max() - begin)",
-        "if (k >= begin && k < end)",
+        "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
     ):
         assert not production_contract(FATTN.replace(needle, "/* mutation removed seam */"), XMX)
     assert not production_contract(
         FATTN, XMX,
         FATTN_HPP.replace(
             "return n_kv > 0 ? 1 + (n_kv - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0",
-            "return 0"))
+            "return n_kv > 0 ? n_kv / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS : 0"))
+    assert not production_contract(
+        FATTN, XMX,
+        FATTN_HPP.replace(
+            "address >= begin && address < begin + size",
+            "address > begin && address < begin + size"))
+    swapped_labels = XMX.replace(
+        '"fattn.compute.xmx_v2_decode_gqa_split_first"', '"temporary-profile-label"', 1)
+    swapped_labels = swapped_labels.replace(
+        '"fattn.compute.xmx_v2_decode_gqa_split_merge"',
+        '"fattn.compute.xmx_v2_decode_gqa_split_first"', 1)
+    swapped_labels = swapped_labels.replace(
+        '"temporary-profile-label"', '"fattn.compute.xmx_v2_decode_gqa_split_merge"', 1)
+    assert not production_contract(FATTN, swapped_labels)
+    assert not production_contract(
+        FATTN,
+        XMX.replace(
+            "first_profile_label, first_event, first_callsite,",
+            "first_profile_label, first_event, merge_callsite,", 1))
     for needle in (
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
@@ -221,11 +282,16 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
 def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     for needle in (
         "cgh.host_task([=]() { gate->wait(); })",
+        "controlled_gate_release_guard gate_guard(gate, dependency_q)",
+        "gate_.release()",
+        "queue_.wait()",
         "before->ready_event = submit_rows_payload",
         "after->ready_event.wait_and_throw()",
         "post-submit profiler error hook was not observed exactly once",
         "sidecar post-submit profiler error hook was not observed exactly once",
         "packed consumer post-submit profiler error hook was not observed exactly once",
+        "host overflowing range arithmetic wrapped",
+        "FAIL host packed-K boundary checks",
         "forced packed dispatch block rounding overflowed at int32 max",
         "int32-max packed-K descriptor block calculation mismatch",
         "end-exclusive range ending at K removed sidecar",
