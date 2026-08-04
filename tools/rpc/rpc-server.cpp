@@ -257,6 +257,9 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
                 fprintf(stderr, "available devices:\n");
                 for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
                     auto * dev = ggml_backend_dev_get(i);
+                    if (!dev) {
+                        continue;
+                    }
                     size_t free, total;
                     ggml_backend_dev_memory(dev, &free, &total);
                     printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
@@ -270,6 +273,9 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     if (devices.empty()) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) {
+                continue;
+            }
             if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 devices.push_back(dev);
             }

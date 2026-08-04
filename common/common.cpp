@@ -409,6 +409,9 @@ void common_params_print_info(const common_params & params, bool print_devices) 
         COM_TRC("%s", "device_info:\n");
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto * dev = ggml_backend_dev_get(i);
+            if (!dev) {
+                continue;
+            }
             size_t free, total;
             ggml_backend_dev_memory(dev, &free, &total);
             COM_TRC("  - %-8s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);

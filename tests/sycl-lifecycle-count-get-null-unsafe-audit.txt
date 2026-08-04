@@ -1,19 +1,59 @@
-Remaining count()/get() snapshot-race null-unsafe callers outside the lifecycle pathScope
-(audited at d0fdde5da; intentionally not edited in this change):
+Backend count()/get() snapshot-race census
+==========================================
 
-common/arg.cpp:254
-common/arg.cpp:2443
-common/common.cpp:411
-examples/llama.android/lib/src/main/cpp/ai_chat.cpp:128
-tools/llama-bench/llama-bench.cpp:122
-tools/llama-bench/llama-bench.cpp:134
-tools/llama-bench/llama-bench.cpp:674
-tools/llama-bench/llama-bench.cpp:893
-tools/llama-bench/llama-bench.cpp:1512
-tools/rpc/rpc-server.cpp:259
-tools/rpc/rpc-server.cpp:272
-tools/server/server-context.cpp:1119
+Baseline: viu2 04261ba5.  The deterministic source audit is
+`python3 tests/test-backend-count-get-null-census.py`.
 
-Each location consumes ggml_backend_{dev,reg}_get() after a separate count() and
-uses or stores the result without first rejecting nullptr. server-context.cpp:1074
-only compares the nullable result and is therefore not included.
+Result: 36/36 getter calls classified; 0 null-unsafe consumers.
+
+Classification summary
+----------------------
+- 26 null-checked consumers (the nullable value is rejected or conditionally used)
+- 9 comparison-only consumers (a null result is safe)
+- 1 index-aligned null placeholder (must not be skipped)
+
+Complete per-file census
+------------------------
+common/arg.cpp                                             2 null-checked
+common/common.cpp                                          1 null-checked
+examples/llama.android/lib/src/main/cpp/ai_chat.cpp         1 null-checked
+src/llama.cpp                                              3 null-checked
+src/llama-context.cpp                                      1 null-checked
+src/llama-model.cpp                                        3 null-checked
+tests/test-backend-ops.cpp                                 1 null-checked
+tests/test-gguf.cpp                                        1 null-checked
+tests/test-llama-archs.cpp                                 1 null-checked
+tests/test-opt.cpp                                         1 null-checked
+tests/test-planner-canary-cpy-visibility.cpp               2 null-checked
+tests/test-sycl-lifecycle-gpu-sequential.cpp               1 null-checked
+tests/test-thread-safety.cpp                               1 null-checked
+tests/test-sycl-lifecycle-runtime-wrapper.cpp              8 comparison-only
+tools/llama-bench/llama-bench.cpp                          5 null-checked
+tools/rpc/rpc-server.cpp                                   2 null-checked
+tools/server/server-context.cpp                            1 comparison-only,
+                                                            1 index-aligned placeholder
+
+Guards added by this change (11)
+--------------------------------
+common/arg.cpp:254                                         continue on null dev
+common/arg.cpp:2446                                        continue on null dev
+common/common.cpp:411                                      continue on null dev
+examples/llama.android/lib/src/main/cpp/ai_chat.cpp:128     continue on null reg
+tools/llama-bench/llama-bench.cpp:122                      continue on null dev
+tools/llama-bench/llama-bench.cpp:137                      continue on null dev
+tools/llama-bench/llama-bench.cpp:680                      continue on null dev
+tools/llama-bench/llama-bench.cpp:902                      continue on null dev
+tools/llama-bench/llama-bench.cpp:1524                     continue on null reg
+tools/rpc/rpc-server.cpp:259                               continue on null dev
+tools/rpc/rpc-server.cpp:275                               continue on null dev
+
+Server index-alignment invariant
+--------------------------------
+`tools/server/server-context.cpp` is intentionally unchanged.  Its target-device
+construction still contains exactly one:
+
+    tgt_devices.push_back(ggml_backend_dev_get(i));
+
+The nullable placeholder preserves the count-snapshot index mapping; changing it
+to `continue` would shift `fit_params_target` indices.  The other server getter is
+comparison-only and therefore nullable-safe.
