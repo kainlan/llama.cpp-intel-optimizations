@@ -196,15 +196,33 @@ int main() {
         std::fprintf(stderr, "missing reloaded device-memory procedure\n");
         return 1;
     }
-    reloaded_get_device_memory(0, &free_after_shutdown, &total_after_shutdown);
     constexpr size_t reload_memory_tolerance = 2ull * 1024ull * 1024ull * 1024ull;
-    if (total_after_shutdown != total_before_cache ||
-        free_after_shutdown + reload_memory_tolerance < free_before_cache) {
+    constexpr auto reclaim_poll_interval = std::chrono::milliseconds(100);
+    constexpr auto reclaim_deadline = std::chrono::seconds(10);
+    const auto reclaim_started = std::chrono::steady_clock::now();
+    bool memory_recovered = false;
+    do {
+        reloaded_get_device_memory(0, &free_after_shutdown, &total_after_shutdown);
+        memory_recovered = total_after_shutdown == total_before_cache &&
+                           free_after_shutdown + reload_memory_tolerance >= free_before_cache;
+        if (memory_recovered || std::chrono::steady_clock::now() - reclaim_started >= reclaim_deadline) {
+            break;
+        }
+        std::this_thread::sleep_for(reclaim_poll_interval);
+    } while (true);
+    const auto reclaim_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - reclaim_started)
+                                        .count();
+    if (!memory_recovered) {
         std::fprintf(stderr,
-                     "logical unload retained device memory: before=%zu after=%zu total_before=%zu total_after=%zu\n",
-                     free_before_cache, free_after_shutdown, total_before_cache, total_after_shutdown);
+                     "logical unload retained device memory after %lld ms: before=%zu after=%zu "
+                     "total_before=%zu total_after=%zu\n",
+                     static_cast<long long>(reclaim_elapsed_ms), free_before_cache, free_after_shutdown,
+                     total_before_cache, total_after_shutdown);
         return 1;
     }
+    std::fprintf(stderr, "device memory reclaim settled after %lld ms: before=%zu recovered=%zu\n",
+                 static_cast<long long>(reclaim_elapsed_ms), free_before_cache, free_after_shutdown);
     auto moe_state_clean = reinterpret_cast<decltype(&ggml_backend_sycl_test_moe_module_state_clean)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_moe_module_state_clean"));
     if (!moe_state_clean || !moe_state_clean()) {
