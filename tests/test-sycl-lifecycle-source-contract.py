@@ -615,6 +615,14 @@ checks = {
     > 0
     and "test_allocate_predictor_scores" in backend
     and "unified_alloc_validate_registry(-1, \"module-reload-clean\")" in backend,
+    "reload validation does not create invalid caches": "active_devices = std::min(ggml_sycl_info().device_count" in cache_cpp
+    and "tracked = arena_non_weight_used_locked(d)" in cache_cpp
+    and "Validation is observational: never create a cache" in cache_cpp,
+    "explicit arena shutdown releases registered chunks": "alloc_registry::instance().unregister_alloc(c.ptr);" in cache_cpp
+    and "sycl::free(c.ptr, arena_queue_->get_context())" in cache_cpp
+    and "pre-destroy queue drain failed" in cache_cpp
+    and "logical unload retained device memory" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "backend construction publish rollback": "g_test_fail_next_backend_publish" in backend
     and "auto ctx = std::make_unique<ggml_backend_sycl_context>(device)" in backend
     and backend.index("auto sycl_backend = std::make_unique<ggml_backend>")

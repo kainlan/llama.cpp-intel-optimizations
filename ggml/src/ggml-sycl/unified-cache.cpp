@@ -10613,13 +10613,29 @@ bool unified_alloc_validate_registry(int device, const char * where) {
         }
     }
 
+    int active_devices = 0;
+    try {
+        active_devices = std::min(ggml_sycl_info().device_count, GGML_SYCL_MAX_DEVICES);
+    } catch (...) {
+        return false;
+    }
+    if (device >= active_devices) {
+        return false;
+    }
+
     bool ok = true;
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+    for (int d = 0; d < active_devices; ++d) {
         if (device >= 0 && d != device) {
             continue;
         }
-        const size_t tracked = unified_cache_arena_non_weight_used(d);
-        const size_t reg     = registry_device[d];
+        size_t tracked = 0;
+        {
+            // Validation is observational: never create a cache merely to
+            // inspect accounting, especially across NODELETE reload.
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            tracked = arena_non_weight_used_locked(d);
+        }
+        const size_t reg = registry_device[d];
         if (tracked != reg) {
             ok = false;
             GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s dev=%d tracked=%zu registry=%zu\n",
@@ -15672,6 +15688,13 @@ void unified_cache::arena_destroy() {
     if (!arena_queue_) {
         return;
     }
+    try {
+        arena_queue_->wait_and_throw();
+    } catch (const sycl::exception & e) {
+        GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed: %s\n", e.what());
+    } catch (...) {
+        GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed\n");
+    }
     for (auto & c : arena_chunks_) {
         if (c.ptr) {
             // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
@@ -15695,9 +15718,15 @@ void unified_cache::arena_destroy() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
+            alloc_registry::instance().unregister_alloc(c.ptr);
             try {
-                sycl::free(c.ptr, *arena_queue_);
+                sycl::free(c.ptr, arena_queue_->get_context());
+            } catch (const sycl::exception & e) {
+                GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed: %s\n", c.ptr,
+                               c.size / (1024.0 * 1024.0), e.what());
             } catch (...) {
+                GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed\n", c.ptr,
+                               c.size / (1024.0 * 1024.0));
             }
         }
     }

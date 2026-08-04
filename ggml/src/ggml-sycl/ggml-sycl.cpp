@@ -96234,6 +96234,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
     }
+    if (strcmp(name, "ggml_backend_sycl_get_device_memory") == 0) {
+        return (void *) ggml_backend_sycl_get_device_memory;
+    }
     if (strcmp(name, "ggml_backend_can_unload") == 0 || strcmp(name, "ggml_backend_sycl_can_unload") == 0) {
         return (void *) ggml_backend_sycl_can_unload;
     }

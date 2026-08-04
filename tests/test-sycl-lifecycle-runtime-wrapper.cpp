@@ -159,6 +159,15 @@ int main() {
         std::fprintf(stderr, "missing MoE reload-state seed procedure\n");
         return 1;
     }
+    auto initial_get_device_memory = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_memory)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_memory"));
+    size_t free_before_cache = 0;
+    size_t total_before_cache = 0;
+    if (!initial_get_device_memory) {
+        std::fprintf(stderr, "missing initial device-memory procedure\n");
+        return 1;
+    }
+    initial_get_device_memory(0, &free_before_cache, &total_before_cache);
     auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_allocate_predictor_scores"));
     if (!allocate_predictor_scores || !allocate_predictor_scores()) {
@@ -179,6 +188,23 @@ int main() {
     // Generic loader hooks and public SYCL names must both be rebuilt by the
     // reloaded registry. Checking alias identity catches a stale/incomplete
     // proc table before any lifecycle work begins.
+    auto reloaded_get_device_memory = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_memory)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_memory"));
+    size_t free_after_shutdown = 0;
+    size_t total_after_shutdown = 0;
+    if (!reloaded_get_device_memory) {
+        std::fprintf(stderr, "missing reloaded device-memory procedure\n");
+        return 1;
+    }
+    reloaded_get_device_memory(0, &free_after_shutdown, &total_after_shutdown);
+    constexpr size_t reload_memory_tolerance = 2ull * 1024ull * 1024ull * 1024ull;
+    if (total_after_shutdown != total_before_cache ||
+        free_after_shutdown + reload_memory_tolerance < free_before_cache) {
+        std::fprintf(stderr,
+                     "logical unload retained device memory: before=%zu after=%zu total_before=%zu total_after=%zu\n",
+                     free_before_cache, free_after_shutdown, total_before_cache, total_after_shutdown);
+        return 1;
+    }
     auto moe_state_clean = reinterpret_cast<decltype(&ggml_backend_sycl_test_moe_module_state_clean)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_moe_module_state_clean"));
     if (!moe_state_clean || !moe_state_clean()) {
