@@ -86,7 +86,7 @@ checks = {
     and "g_load_candidate_txn_id" not in backend
     and "ggml_sycl_publish_plan_locked(have_plan ? plan_snapshot : nullptr)" not in backend
     and "ggml_sycl_reset_model_load_scratch_state(true)" in backend
-    and "lifecycle_stage_no_placement_plan(token.load.value" in backend
+    and "lifecycle_stage_no_placement_plan(g_sycl_plan_load_effect_txn" in backend
     and "if (!ggml_sycl::vram_arena_enabled())" in backend,
     "explicit exact activation": "ggml_backend_sycl_activate_model_plan" in public
     and "lifecycle_select_placement_plan" in backend
@@ -318,7 +318,18 @@ checks = {
     and "acquire_load_effect" in cpp
     and "load_effect_serials.empty()" in cpp
     and "load-effect-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
-    and "load-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
+    and "load-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
+    and "cache-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
+    and "planning-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text()
+    and "identity-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
+    "planning and identity hold exact effects": backend.count("registry.acquire_load_effect(registry.bound_candidate())") >= 3
+    and "const auto token = effect.owner" in backend
+    and "plan_effect_scope" in backend
+    and "g_sycl_plan_load_effect_txn" in backend,
+    "parser-supported event catch boundary":
+        "static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event) {" in backend
+    and "static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {" in backend
+    and "event_record(ggml_backend_t backend, ggml_backend_event_t event) try" not in backend,
     "host registration uses one leased owner": "load_effect_lease effect" in backend
     and "const auto owner = effect.owner" in backend
     and backend.count("sycl_host_weight_extra_entry new_entry{ tensor, extra, owner }") == 1,
@@ -344,6 +355,7 @@ checks = {
     and backend.count("if (!ggml_sycl_host_row_authorized(entry.second.owner))") >= 2
     and "if (!ggml_sycl_host_row_authorized(it->second.owner))" in backend,
     "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
+    and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second)" in cache_cpp
     and "stamp_pending_owner(it->second)" in cache_cpp,
     "nested loading requires exact outer ownership":
@@ -374,7 +386,8 @@ checks = {
     "no global host registry clear on load": "Host-weight rows are exact-owner state" in backend
     and "ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);" not in
         re.search(r"ggml_sycl_model_loading_effects\(.*?\n\}", backend, re.S).group(0),
-    "bound transaction uses explicit value check": "txn.value != 0 && lifecycle_find_candidate_placement_plan(txn.value)" in cache_cpp,
+    "bound transaction uses exact effect admission": "registry.acquire_load_effect(registry.bound_candidate())" in cache_cpp
+    and "lifecycle_find_candidate_placement_plan(effect.owner.load.value)" in cache_cpp,
     "DL SYCL module has private CPU traits and no CPU linkage":
         re.search(r"if \(NOT GGML_BACKEND_DL\).*?target_link_libraries\(ggml-sycl PRIVATE ggml-cpu\).*?endif",
                   (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(), re.S)
@@ -389,8 +402,8 @@ checks = {
     and "test_unrelated_thread_entry_not_claimed" in
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()
     and "pair.second.pending_load_txn_id != load_txn_id" in cache_cpp
-    and "unified_cache_bound_load_txn" in cache_cpp
-    and "global_registry().bound_candidate()" in cache_cpp
+    and "acquire_bound_load_effect" in cache_cpp
+    and "registry.acquire_load_effect(registry.bound_candidate())" in cache_cpp
     and "g_pending_load_txn_id" not in cache_cpp
     and "unified_cache_note_model_load_abort" in backend
     and "unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value)" in backend,

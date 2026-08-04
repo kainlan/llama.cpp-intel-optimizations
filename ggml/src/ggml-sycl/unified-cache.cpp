@@ -44,19 +44,24 @@
 
 namespace ggml_sycl {
 
-uint64_t unified_cache_bound_load_txn() noexcept {
+namespace {
+lifecycle::load_effect_lease acquire_bound_load_effect() noexcept {
     try {
-        const auto txn = lifecycle::global_registry().bound_candidate();
-        return txn.value != 0 && lifecycle_find_candidate_placement_plan(txn.value) ? txn.value : 0;
+        auto & registry = lifecycle::global_registry();
+        auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
+        if (!effect || !lifecycle_find_candidate_placement_plan(effect.owner.load.value)) {
+            return {};
+        }
+        return effect;
     } catch (...) {
-        return 0;
+        return {};
     }
 }
 
-namespace {
 void stamp_pending_owner(unified_cache_entry & entry) noexcept {
-    if (const uint64_t txn = unified_cache_bound_load_txn()) {
-        entry.pending_load_txn_id = txn;
+    auto effect = acquire_bound_load_effect();
+    if (effect) {
+        entry.pending_load_txn_id = effect.owner.load.value;
     }
 }
 
@@ -2529,6 +2534,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                                     int                        expert_id,
                                     ggml_layout_mode           layout,
                                     bool                       validate_content) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key_id.valid || !src_ptr || size == 0) {
         return nullptr;
     }
@@ -2905,6 +2911,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 
     // Store in cache
+    stamp_pending_owner(entry);
     entries_[key] = entry;
     auto id_it    = id_to_key_.find(key_id);
     if (id_it == id_to_key_.end()) {
@@ -3113,6 +3120,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     const auto          placement = cache_placement_coherence(this);
     if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
@@ -3292,6 +3300,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             }
             release_entry_allocation_locked(old->second);
         }
+        stamp_pending_owner(entry);
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
         direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_weight/mirror");
@@ -3352,6 +3361,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     const auto          placement = cache_placement_coherence(this);
     if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
@@ -3519,6 +3529,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.pool_allocated   = false;
             entry.last_write_event = {};
             entry.has_write_event  = false;
+            stamp_pending_owner(entry);
             entries_[cache_key]    = entry;
             auto & stored          = entries_[cache_key];
             direct_handle =
@@ -3654,6 +3665,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             }
             release_entry_allocation_locked(old->second);
         }
+        stamp_pending_owner(entry);
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
         direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert/mirror");
@@ -3695,6 +3707,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               const void *                            fill_ctx,
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     const auto          placement = cache_placement_coherence(this);
     if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
@@ -3917,6 +3930,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != view_ptr) {
                 release_entry_allocation_locked(old->second);
             }
+            stamp_pending_owner(entry);
             entries_[cache_key] = std::move(entry);
             auto &       stored = entries_[cache_key];
             weight_entry direct_entry{};
@@ -4788,6 +4802,7 @@ bool unified_cache::is_cached_any(const ggml_sycl_cache_id & key_id) const {
 }
 
 void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key_id.valid) {
         return nullptr;
     }
@@ -4842,6 +4857,7 @@ void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key_id.valid) {
         return nullptr;
     }
@@ -4897,6 +4913,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                                                 ggml_layout_mode           layout,
                                                 sycl::event *              out_event,
                                                 bool *                     out_has_event) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (out_event) {
         *out_event = sycl::event{};
     }
@@ -4976,6 +4993,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                                     cache_entry_type           type,
                                     int                        layer_id,
                                     int                        expert_id) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key.valid || size == 0) {
         return nullptr;
     }
@@ -5136,6 +5154,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = !is_pool_alloc;
 
+    stamp_pending_owner(entry);
     entries_[cache_key] = entry;
     auto id_it          = id_to_key_.find(key);
     if (id_it == id_to_key_.end()) {
@@ -5162,6 +5181,7 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
                                    int                        expert_id,
                                    const void *               src_ptr,
                                    int64_t                    onednn_pack_m) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key.valid || !device_ptr) {
         return;
     }
@@ -5214,6 +5234,7 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
         entry.location        = cache_location::DEVICE;
         entry.pool_allocated  = false;
 
+        stamp_pending_owner(entry);
         entries_[cache_key] = entry;
         auto id_it          = id_to_key_.find(key);
         if (id_it == id_to_key_.end()) {
@@ -5671,6 +5692,7 @@ void * unified_cache::lookup(const ggml_sycl_cache_id & key, ggml_layout_mode la
 }
 
 void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (!key.valid) {
         return nullptr;
     }
@@ -5707,6 +5729,7 @@ void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_la
 }
 
 unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_cache_id & key) {
+    auto              load_effect_guard = acquire_bound_load_effect();
     weight_ptr_result result{};
     if (!key.valid) {
         return result;
@@ -5868,6 +5891,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const
 }
 
 unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {
+    auto                    load_effect_guard = acquire_bound_load_effect();
     weight_ptr_lease_result result{};
     if (!key.id.valid) {
         return result;
@@ -12401,6 +12425,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                                           ggml_layout_mode           layout,
                                           bool                       validate_content,
                                           bool *                     needs_fill) {
+    auto load_effect_guard = acquire_bound_load_effect();
     if (needs_fill) {
         *needs_fill = true;
     }
@@ -12622,6 +12647,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = true;
 
+    stamp_pending_owner(entry);
     entries_[key] = entry;
     auto id_it    = id_to_key_.find(key_id);
     if (id_it == id_to_key_.end()) {

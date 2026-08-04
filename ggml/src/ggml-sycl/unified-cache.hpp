@@ -1549,9 +1549,6 @@ struct stale_weight_alloc {
 };
 
 // Metadata for a cached entry
-// Returns the current thread's validated Registry candidate, or zero.
-uint64_t unified_cache_bound_load_txn() noexcept;
-
 struct unified_cache_entry {
     void *                device_ptr;       // GPU memory pointer (or host memory if host_resident)
     const void *          src_ptr;          // Source data pointer (for change detection)
@@ -1606,7 +1603,7 @@ struct unified_cache_entry {
     // runtime, outside a load) -- the latter is kept while any model is live.
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
-    uint64_t              pending_load_txn_id   = unified_cache_bound_load_txn();
+    uint64_t              pending_load_txn_id   = 0;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().

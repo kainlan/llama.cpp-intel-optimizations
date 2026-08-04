@@ -41,7 +41,10 @@ static void run_case(const std::string & name, test_mutation mutation) {
         }
         require(inner.code == error::NESTED && !inner.committed, "nested load committed");
         require(r.end(b.txn, true).committed && r.publication_count() == 1, "outer did not commit exactly once");
-    } else if (name == "load-effect-drain" || name == "load-effect-abort-drain") {
+    } else if (name == "load-effect-drain" || name == "load-effect-abort-drain" || name == "cache-effect-drain" ||
+               name == "cache-effect-abort-drain" || name == "planning-effect-drain" ||
+               name == "planning-effect-abort-drain" || name == "identity-effect-drain" ||
+               name == "identity-effect-abort-drain") {
         Registry r;
         auto     begin = r.begin_outer();
         require(begin.code == error::OK, "effect lease begin failed");
@@ -49,7 +52,7 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto lease = r.acquire_load_effect(r.bound_candidate());
         require(lease && lease.owner == begin.token, "effect lease authority mismatch");
 
-        const bool commit     = name == "load-effect-drain";
+        const bool commit     = name.find("abort") == std::string::npos;
         auto       end_future = std::async(std::launch::async, [&] { return r.prepare_end(begin.txn, commit); });
         require(end_future.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
                 "end did not wait for outstanding load effect");

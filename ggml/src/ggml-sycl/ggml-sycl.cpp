@@ -10198,18 +10198,23 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
         return;
     }
 
-    if (model_id == 0) {
-        model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
-    }
-    if (model_id == 0) {
+    auto &                                  registry = ggml_sycl::lifecycle::global_registry();
+    ggml_sycl::lifecycle::load_effect_lease effect;
+    try {
+        effect = registry.acquire_load_effect(registry.bound_candidate());
+    } catch (...) {
         return;
     }
+    if (!effect) {
+        return;
+    }
+    const auto token = effect.owner;
+    if (model_id != 0 && token.model.value != model_id) {
+        return;
+    }
+    model_id = token.model.value;
     ggml_sycl::dispatch_tuning::ensure_model_loaded(model_id);
 
-    const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
-    if (token.model.value != model_id) {
-        return;
-    }
     const ggml_sycl_weight_identity identity = { file_idx,         file_offs,        tensor_nbytes,         model_id,
                                                  token.load.value, token.owner.slot, token.owner.generation };
 
@@ -11051,6 +11056,8 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
     return cu_score * xmx_factor * fp16_factor * usm_factor * subgroup_factor;
 }
 
+thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
@@ -11058,9 +11065,9 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     ggml_sycl::placement_plan plan_candidate;
     bool                      have_plan = false;
     if (!ggml_sycl::vram_arena_enabled()) {
-        const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
-        if (token.load.value != 0) {
-            ggml_sycl::lifecycle_stage_no_placement_plan(token.load.value, g_placement_kv_info, g_model_n_layer);
+        if (g_sycl_plan_load_effect_txn != 0) {
+            ggml_sycl::lifecycle_stage_no_placement_plan(g_sycl_plan_load_effect_txn, g_placement_kv_info,
+                                                         g_model_n_layer);
         }
         return;
     }
@@ -11207,9 +11214,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
     // Stage a full immutable transaction-owned candidate. Process-global and
     // per-cache copies remain legacy execution routing, not model identity.
-    const auto active_plan_owner = ggml_sycl::lifecycle::global_registry().current_active_token();
-    if (active_plan_owner.load.value != 0 && have_plan) {
-        ggml_sycl::lifecycle_stage_placement_plan(active_plan_owner.load.value, ggml_sycl::placement_plan(plan),
+    if (g_sycl_plan_load_effect_txn != 0 && have_plan) {
+        ggml_sycl::lifecycle_stage_placement_plan(g_sycl_plan_load_effect_txn, ggml_sycl::placement_plan(plan),
                                                   plan_snapshot->kv_info, plan_snapshot->model_n_layer);
     }
 
@@ -11473,6 +11479,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     try {
+        auto & registry = ggml_sycl::lifecycle::global_registry();
+        auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
+        if (!effect) {
+            return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
+        }
+
+        struct plan_effect_scope {
+            uint64_t previous;
+
+            explicit plan_effect_scope(uint64_t txn) : previous(g_sycl_plan_load_effect_txn) {
+                g_sycl_plan_load_effect_txn = txn;
+            }
+
+            ~plan_effect_scope() { g_sycl_plan_load_effect_txn = previous; }
+        } authority{ effect.owner.load.value };
         bool applied = false;
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
@@ -92484,8 +92505,7 @@ static bool should_use_persistent_tg(ggml_backend_sycl_context & ctx, ggml_cgrap
     return true;
 }
 
-static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    try {
+static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // Phase timing: measure each stage of graph_compute to find overhead
     static const bool phase_timing = (std::getenv("GGML_SYCL_PHASE_TIMING") != nullptr);
     auto              t_phase      = std::chrono::high_resolution_clock::now();
@@ -94608,9 +94628,12 @@ normal_dispatch:
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    try {
+        return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
     } catch (const ggml_sycl_fallback_error & error) {
-        // Cleanup must never mask the recoverable status. Drain prior work
-        // before releasing leases or allowing deferred cache frees.
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
         if (cleanup_ctx) {
@@ -94618,12 +94641,14 @@ normal_dispatch:
                 if (cleanup_ctx->last_graph_event) {
                     cleanup_ctx->last_graph_event->wait_and_throw();
                 }
-            } catch (...) {}
+            } catch (...) {
+            }
             try {
                 if (cleanup_ctx->stream()) {
                     cleanup_ctx->stream()->wait_and_throw();
                 }
-            } catch (...) {}
+            } catch (...) {
+            }
             try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
             try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
             try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
@@ -94631,8 +94656,8 @@ normal_dispatch:
             cleanup_ctx->last_graph_event_deferred_decode = false;
         }
         g_ggml_sycl_graph_recording = false;
-        g_recording_graph_ptr = nullptr;
-        g_recording_queue_ptr = nullptr;
+        g_recording_graph_ptr       = nullptr;
+        g_recording_queue_ptr       = nullptr;
         ggml_sycl::set_graph_retained_handle_sink(nullptr);
         ggml_sycl::unified_cache_set_graph_compute_active(false);
         GGML_LOG_ERROR("[SYCL] recoverable runtime fallback failure: %s\n", error.what());
@@ -94640,36 +94665,40 @@ normal_dispatch:
     }
 }
 
-static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
-
-    sycl::event *     sycl_event = static_cast<sycl::event *>(event->context);
-    const queue_ptr & stream     = sycl_ctx->stream(sycl_ctx->device, 0);
-    // Record the current state of the queue
-    SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
-
-} catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+template <typename F> static void ggml_backend_sycl_event_boundary(F && operation) {
+    try {
+        operation();
+    } catch (const sycl::exception & exc) {
+        std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+        std::exit(1);
+    }
 }
 
-static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) try {
-    GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
-    sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
-    if (ggml_backend_is_sycl(backend)) {
-        if (g_ggml_sycl_debug) {
-            ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
-            GGML_SYCL_DEBUG("[SYCL] event_wait: device=%d event=%p graph_recording=%d\n",
-                            sycl_ctx ? sycl_ctx->device : -1, (void *) sycl_event, g_ggml_sycl_graph_recording ? 1 : 0);
-        }
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_sycl_event_boundary([&] {
+        ggml_backend_sycl_context * sycl_ctx   = (ggml_backend_sycl_context *) backend->context;
+        sycl::event *               sycl_event = static_cast<sycl::event *>(event->context);
+        const queue_ptr &           stream     = sycl_ctx->stream(sycl_ctx->device, 0);
+        SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
+    });
+}
 
-    } else {
-        GGML_ABORT("fatal error");
-    }
-} catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_sycl_event_boundary([&] {
+        GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+        sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
+        if (ggml_backend_is_sycl(backend)) {
+            if (g_ggml_sycl_debug) {
+                ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+                GGML_SYCL_DEBUG("[SYCL] event_wait: device=%d event=%p graph_recording=%d\n",
+                                sycl_ctx ? sycl_ctx->device : -1, (void *) sycl_event,
+                                g_ggml_sycl_graph_recording ? 1 : 0);
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+        } else {
+            GGML_ABORT("fatal error");
+        }
+    });
 }
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_get_name,
