@@ -412,12 +412,13 @@ bool test_q6k_mul_mat_single_token() {
         float gpu_val = gpu_output[row];
         const float cpu_q8_reference = corrupt_q8_positive_control
             ? corrupted_q8_reference(cpu_q8_val) : cpu_q8_val;
+        const float enforced_reference = use_f32_positive_control ? cpu_val : cpu_q8_reference;
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_reference);
-        float gpu_q8_rel = (std::abs(cpu_q8_reference) > 1e-6f)
-            ? gpu_q8_abs / std::abs(cpu_q8_reference) : gpu_q8_abs;
+        float gpu_ref_abs = std::abs(gpu_val - enforced_reference);
+        float gpu_ref_rel = (std::abs(enforced_reference) > 1e-6f)
+            ? gpu_ref_abs / std::abs(enforced_reference) : gpu_ref_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
         if (std::abs(cpu_val) > 1e-6f) {
@@ -426,17 +427,17 @@ bool test_q6k_mul_mat_single_token() {
         }
 
         char gpu_f32_rel_text[32];
-        char gpu_q8_rel_text[32];
+        char gpu_ref_rel_text[32];
         char q8_f32_rel_text[32];
         format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
-        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_reference, gpu_q8_rel);
+        format_relative_metric(gpu_ref_rel_text, sizeof(gpu_ref_rel_text), enforced_reference, gpu_ref_rel);
         format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
         const bool contract_match = reference_contract_match(gpu_val, cpu_q8_reference, cpu_val);
         printf("    Row %2d: GPU=%10.6f CPU_F32=%10.6f CPU_Q8=%10.6f MATCH_REF=%10.6f "
                "GPU-F32 abs=%9.6f rel=%7s GPU-REF abs=%9.6f rel=%7s "
                "Q8-F32 abs=%9.6f rel=%7s contract=%s\n",
-               row, gpu_val, cpu_val, cpu_q8_val, cpu_q8_reference,
-               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               row, gpu_val, cpu_val, cpu_q8_val, enforced_reference,
+               abs_diff, gpu_f32_rel_text, gpu_ref_abs, gpu_ref_rel_text,
                q8_f32_abs, q8_f32_rel_text, contract_match ? "OK" : "FAIL");
 
         if (!contract_match) {
@@ -588,12 +589,13 @@ bool test_q6k_mistral_dimensions() {
         float gpu_val = gpu_output[idx];
         const float cpu_q8_reference = corrupt_q8_positive_control
             ? corrupted_q8_reference(cpu_q8_val) : cpu_q8_val;
+        const float enforced_reference = use_f32_positive_control ? cpu_val : cpu_q8_reference;
 
         float abs_diff = std::abs(gpu_val - cpu_val);
         float rel_error = (std::abs(cpu_val) > 1e-6f) ? abs_diff / std::abs(cpu_val) : abs_diff;
-        float gpu_q8_abs = std::abs(gpu_val - cpu_q8_reference);
-        float gpu_q8_rel = (std::abs(cpu_q8_reference) > 1e-6f)
-            ? gpu_q8_abs / std::abs(cpu_q8_reference) : gpu_q8_abs;
+        float gpu_ref_abs = std::abs(gpu_val - enforced_reference);
+        float gpu_ref_rel = (std::abs(enforced_reference) > 1e-6f)
+            ? gpu_ref_abs / std::abs(enforced_reference) : gpu_ref_abs;
         float q8_f32_abs = std::abs(cpu_q8_val - cpu_val);
         float q8_f32_rel = (std::abs(cpu_val) > 1e-6f) ? q8_f32_abs / std::abs(cpu_val) : q8_f32_abs;
         if (std::abs(cpu_val) > 1e-6f) {
@@ -602,17 +604,17 @@ bool test_q6k_mistral_dimensions() {
         }
 
         char gpu_f32_rel_text[32];
-        char gpu_q8_rel_text[32];
+        char gpu_ref_rel_text[32];
         char q8_f32_rel_text[32];
         format_relative_metric(gpu_f32_rel_text, sizeof(gpu_f32_rel_text), cpu_val, rel_error);
-        format_relative_metric(gpu_q8_rel_text, sizeof(gpu_q8_rel_text), cpu_q8_reference, gpu_q8_rel);
+        format_relative_metric(gpu_ref_rel_text, sizeof(gpu_ref_rel_text), enforced_reference, gpu_ref_rel);
         format_relative_metric(q8_f32_rel_text, sizeof(q8_f32_rel_text), cpu_val, q8_f32_rel);
         const bool contract_match = reference_contract_match(gpu_val, cpu_q8_reference, cpu_val);
         printf("    Row %5d: GPU=%10.4f CPU_F32=%10.4f CPU_Q8=%10.4f MATCH_REF=%10.4f "
                "GPU-F32 abs=%9.4f rel=%7s GPU-REF abs=%9.4f rel=%7s "
                "Q8-F32 abs=%9.4f rel=%7s contract=%s\n",
-               idx, gpu_val, cpu_val, cpu_q8_val, cpu_q8_reference,
-               abs_diff, gpu_f32_rel_text, gpu_q8_abs, gpu_q8_rel_text,
+               idx, gpu_val, cpu_val, cpu_q8_val, enforced_reference,
+               abs_diff, gpu_f32_rel_text, gpu_ref_abs, gpu_ref_rel_text,
                q8_f32_abs, q8_f32_rel_text, contract_match ? "OK" : "FAIL");
 
         if (!contract_match) {
