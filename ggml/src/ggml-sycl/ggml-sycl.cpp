@@ -42193,14 +42193,24 @@ static inline void sycl_unified_device_temp_release(sycl_unified_device_temp && 
 static inline ggml_sycl::mem_handle sycl_reorder_raw_device_handle(dpct::queue_ptr stream, void * ptr) {
     GGML_ASSERT(stream != nullptr && ptr != nullptr);
     const int device = ggml_sycl_get_device_id_from_queue(*stream);
-    // The reorder entry points take raw device USM.  Do not route an
-    // unregistered-but-valid device pointer through query_location(): its
-    // conservative MMAP classification would select host staging and then
-    // memcpy from device USM on the CPU.
+    // Validation is registry-first because driver probes may report `unknown`
+    // for valid arena suballocations. Borrow the pointer; ownership remains
+    // with the caller or its registered arena allocation.
     return ggml_sycl::mem_handle::from_chunk_ptr(ptr, device, GGML_LAYOUT_AOS, true);
 }
 
-static void reorder_qw_q4_0(uint8_t * data_device,
+template <typename ExecutionRange, typename Kernel>
+static sycl::event sycl_reorder_parallel_for(dpct::queue_ptr        stream,
+                                             const sycl::event &    copy_event,
+                                             const ExecutionRange & range,
+                                             Kernel                 kernel) {
+    return stream->submit([&](sycl::handler & cgh) {
+        cgh.depends_on(copy_event);
+        cgh.parallel_for(range, kernel);
+    });
+}
+
+static bool reorder_qw_q4_0(uint8_t * data_device,
                             const int ncols,
                             const int nrows,
 
@@ -42211,10 +42221,15 @@ static void reorder_qw_q4_0(uint8_t * data_device,
                             dpct::queue_ptr stream) {
     GGML_SYCL_KTRACE("reorder_qw_q4_0", " ncols=%d nrows=%d size=%zu offset=%zu nblocks=%zu", ncols, nrows, size,
                      offset, size / sizeof(block_q4_0));
+    if (size % sizeof(block_q4_0) != 0 || offset % sizeof(block_q4_0) != 0) {
+        return false;
+    }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
-    GGML_ASSERT(tmp_buf != nullptr);
+    if (!tmp_buf) {
+        return false;
+    }
 
     ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
     copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
@@ -42222,8 +42237,6 @@ static void reorder_qw_q4_0(uint8_t * data_device,
         copy_event.wait();
     }
 
-    GGML_ASSERT((size % sizeof(block_q4_0) == 0));
-    GGML_ASSERT((offset % sizeof(block_q4_0) == 0));
     int offset_blks = offset / sizeof(block_q4_0);
 
     size_t nblocks       = size / sizeof(block_q4_0);
@@ -42232,7 +42245,8 @@ static void reorder_qw_q4_0(uint8_t * data_device,
     auto   d_ptr         = (sycl::half *) (qs_ptr + d_byte_offset) + offset_blks;
     auto   reorder_event =
 
-        stream->parallel_for(size / sizeof(block_q4_0), [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        sycl_reorder_parallel_for(stream, copy_event, size / sizeof(block_q4_0),
+                                  [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const block_q4_0 * x  = (const block_q4_0 *) tmp_buf;
             const int          ib = i;
             for (int j = 0; j < QK4_0 / 2; j++) {
@@ -42245,17 +42259,21 @@ static void reorder_qw_q4_0(uint8_t * data_device,
         reorder_event.wait_and_throw();
     }
     sycl_unified_device_temp_release(std::move(tmp), &reorder_event);
+    return true;
 }
 
-static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    GGML_ASSERT(size % sizeof(block_q4_K) == 0);
-    GGML_ASSERT(offset % sizeof(block_q4_K) == 0);
+static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    if (size % sizeof(block_q4_K) != 0 || offset % sizeof(block_q4_K) != 0) {
+        return false;
+    }
 
     const int   nblocks = size / sizeof(block_q4_K);
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
-    GGML_ASSERT(tmp_buf != nullptr);
+    if (!tmp_buf) {
+        return false;
+    }
     ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
     copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
@@ -42266,7 +42284,7 @@ static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
     auto * scales_ptr = qs_ptr + QK_K / 2 * nblocks;
     auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * nblocks);
 
-    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+    auto reorder_event = sycl_reorder_parallel_for(stream, copy_event, nblocks, [=](auto i) {
         const block_q4_K * x  = (const block_q4_K *) tmp_buf;
         const int          ib = i;
         for (int j = 0; j < QK_K / 2; ++j) {
@@ -42281,15 +42299,19 @@ static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
         reorder_event.wait_and_throw();
     }
     sycl_unified_device_temp_release(std::move(tmp), &reorder_event);
+    return true;
 }
 
-static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    GGML_ASSERT(size % sizeof(block_q6_K) == 0);
-    GGML_ASSERT(offset % sizeof(block_q6_K) == 0);
+static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    if (size % sizeof(block_q6_K) != 0 || offset % sizeof(block_q6_K) != 0) {
+        return false;
+    }
     const int nblocks = size / sizeof(block_q6_K);
     auto      tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
-    GGML_ASSERT(tmp_buf != nullptr);
+    if (!tmp_buf) {
+        return false;
+    }
 
     sycl::event           copy_event;
     ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
@@ -42302,7 +42324,7 @@ static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     auto *       qh_ptr        = ql_ptr + (QK_K / 2) * nblocks;
     auto *       scales_ptr    = qh_ptr + (QK_K / 4) * nblocks;
     sycl::half * dm_ptr        = (sycl::half *) (scales_ptr + (QK_K / 16) * nblocks);
-    auto         reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+    auto         reorder_event = sycl_reorder_parallel_for(stream, copy_event, nblocks, [=](auto i) {
         const block_q6_K * x  = (const block_q6_K *) tmp_buf;
         const int          ib = i;
         const uint8_t *    ql = x[ib].ql;
@@ -42327,6 +42349,7 @@ static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
         reorder_event.wait_and_throw();
     }
     sycl_unified_device_temp_release(std::move(tmp), &reorder_event);
+    return true;
 }
 
 static bool reorder_aos_to_soa_device(const ggml_tensor * tensor,
@@ -42373,17 +42396,22 @@ static bool reorder_aos_to_soa_device(const ggml_tensor * tensor,
 // Q8_0: 32 int8 quants + fp16 scale = 34 bytes per block
 // Reordered layout: [qs0..qsN] [d0..dN]
 
-static void reorder_qw_q8_0(uint8_t * data_device,
+static bool reorder_qw_q8_0(uint8_t * data_device,
                             const int ncols,
                             const int nrows,
                             size_t    size,
 
                             size_t          offset,
                             dpct::queue_ptr stream) {
+    if (size % sizeof(block_q8_0) != 0 || offset % sizeof(block_q8_0) != 0) {
+        return false;
+    }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
-    GGML_ASSERT(tmp_buf != nullptr);
+    if (!tmp_buf) {
+        return false;
+    }
 
     ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
     copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
@@ -42391,14 +42419,12 @@ static void reorder_qw_q8_0(uint8_t * data_device,
         copy_event.wait();
     }
 
-    GGML_ASSERT((size % sizeof(block_q8_0) == 0));
-    GGML_ASSERT((offset % sizeof(block_q8_0) == 0));
     int  offset_blks = offset / sizeof(block_q8_0);
     auto qs_ptr      = data_device + offset_blks * QK8_0;
     auto d_ptr       = (sycl::half *) (qs_ptr + ncols * nrows) + offset_blks;
 
-    auto reorder_event =
-        stream->parallel_for(size / sizeof(block_q8_0), [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+    auto reorder_event = sycl_reorder_parallel_for(
+        stream, copy_event, size / sizeof(block_q8_0), [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const block_q8_0 * x = (const block_q8_0 *) tmp_buf;
 
             const int ib = i;
@@ -42413,6 +42439,7 @@ static void reorder_qw_q8_0(uint8_t * data_device,
         reorder_event.wait_and_throw();
     }
     sycl_unified_device_temp_release(std::move(tmp), &reorder_event);
+    return true;
 }
 
 // MXFP4: 16 packed bytes (32 4-bit elements) + 1 byte E8M0 exponent = 17 bytes per block
@@ -42423,23 +42450,26 @@ static void reorder_qw_q8_0(uint8_t * data_device,
 // - Uses vectorized 4-byte writes (4 ints per block) instead of byte-by-byte
 // - Tiled approach: work-group processes BLOCKS_PER_TILE blocks together
 // - Adjacent threads write to adjacent memory addresses within a tile
-static void reorder_qw_mxfp4(uint8_t *       data_device,
+static bool reorder_qw_mxfp4(uint8_t *       data_device,
                              const int       ncols,
                              const int       nrows,
                              size_t          size,
                              size_t          offset,
                              dpct::queue_ptr stream) {
+    if (size % sizeof(block_mxfp4) != 0 || offset % sizeof(block_mxfp4) != 0) {
+        return false;
+    }
     auto        tmp     = sycl_unified_device_temp_alloc(stream, size);
     uint8_t *   tmp_buf = static_cast<uint8_t *>(tmp.ptr);
     sycl::event copy_event;
-    GGML_ASSERT(tmp_buf != nullptr);
+    if (!tmp_buf) {
+        return false;
+    }
     ggml_sycl::mem_handle src_handle = sycl_reorder_raw_device_handle(stream, data_device);
     copy_event                       = ggml_sycl::mem_copy_async(tmp.owner, src_handle, size, *stream);
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
     }
-    GGML_ASSERT((size % sizeof(block_mxfp4) == 0));
-    GGML_ASSERT((offset % sizeof(block_mxfp4) == 0));
     const size_t num_blocks  = size / sizeof(block_mxfp4);
     const int    offset_blks = offset / sizeof(block_mxfp4);
 
@@ -42452,7 +42482,8 @@ static void reorder_qw_mxfp4(uint8_t *       data_device,
     // Calculate grid dimensions
     // Each work-group has BLOCKS_PER_TILE threads, each handling one block
     const size_t  num_tiles       = (num_blocks + BLOCKS_PER_TILE - 1) / BLOCKS_PER_TILE;
-    auto          reorder_event   = stream->parallel_for(
+    auto reorder_event = sycl_reorder_parallel_for(
+        stream, copy_event,
         sycl::nd_range<1>(sycl::range<1>(num_tiles * BLOCKS_PER_TILE), sycl::range<1>(BLOCKS_PER_TILE)),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             const block_mxfp4 * src       = (const block_mxfp4 *) tmp_buf;
@@ -42479,11 +42510,12 @@ static void reorder_qw_mxfp4(uint8_t *       data_device,
         reorder_event.wait_and_throw();
     }
     sycl_unified_device_temp_release(std::move(tmp), &reorder_event);
+    return true;
 }
 
 // INTERNAL: Do NOT call directly - use reorder_tensor_to_soa() instead!
 // This only transforms data, does NOT set the flag.
-static void reorder_data_internal_(const ggml_tensor * src0, dpct::queue_ptr stream) {
+static bool reorder_data_internal_(const ggml_tensor * src0, dpct::queue_ptr stream) {
     uint8_t * data_device = (uint8_t *) src0->data;
     size_t    ncols       = src0->ne[0];
 
@@ -42494,25 +42526,17 @@ static void reorder_data_internal_(const ggml_tensor * src0, dpct::queue_ptr str
     size_t size  = ggml_nbytes(src0);
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-            reorder_qw_q4_0(data_device, ncols, nrows, size, 0, stream);
-            break;
+            return reorder_qw_q4_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_Q4_K:
-            reorder_qw_q4_k(data_device, size, 0, stream);
-            break;
+            return reorder_qw_q4_k(data_device, size, 0, stream);
         case GGML_TYPE_Q6_K:
-            reorder_qw_q6_k(data_device, size, 0, stream);
-            break;
+            return reorder_qw_q6_k(data_device, size, 0, stream);
         case GGML_TYPE_Q8_0:
-            reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
-
-            break;
+            return reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_MXFP4:
-
-            reorder_qw_mxfp4(data_device, ncols, nrows, size, 0, stream);
-            break;
+            return reorder_qw_mxfp4(data_device, ncols, nrows, size, 0, stream);
         default:
-            GGML_ABORT("reorder_data_internal_() called with unsupported type");
-            break;
+            return false;
     }
 }
 
@@ -42559,7 +42583,10 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
     }
     // DO THE REORDER - transform data from AoS to SoA
 
-    reorder_data_internal_(tensor, stream);
+    if (!reorder_data_internal_(tensor, stream)) {
+        fprintf(stderr, "[REORDER-UNIFIED] ERROR: temporary allocation failed for tensor '%s'\n", tensor->name);
+        return false;
+    }
     // SET THE FLAG - mark tensor as SoA (using private method via friend access)
     extra->optimized_feature.set_reorder_mode_(reorder_mode::SOA, tensor->name, caller);
     extra->layout.mode        = GGML_LAYOUT_SOA;
@@ -42578,6 +42605,92 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
     return true;
 }
 
+static bool ggml_sycl_reorder_geometry_valid(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {
+    if (ncols <= 0 || nrows <= 0 || ncols > std::numeric_limits<int>::max() ||
+        nrows > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    size_t block_elements = 0;
+    size_t block_bytes    = 0;
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            block_elements = QK4_0;
+            block_bytes    = sizeof(block_q4_0);
+            break;
+        case GGML_TYPE_Q4_K:
+            block_elements = QK_K;
+            block_bytes    = sizeof(block_q4_K);
+            break;
+        case GGML_TYPE_Q6_K:
+            block_elements = QK_K;
+            block_bytes    = sizeof(block_q6_K);
+            break;
+        case GGML_TYPE_Q8_0:
+            block_elements = QK8_0;
+            block_bytes    = sizeof(block_q8_0);
+            break;
+        case GGML_TYPE_MXFP4:
+            block_elements = QK_MXFP4;
+            block_bytes    = sizeof(block_mxfp4);
+            break;
+        default:
+            return false;
+    }
+
+    const size_t cols = static_cast<size_t>(ncols);
+    const size_t rows = static_cast<size_t>(nrows);
+    if (cols % block_elements != 0) {
+        return false;
+    }
+    const size_t blocks_per_row = cols / block_elements;
+    if (blocks_per_row > std::numeric_limits<size_t>::max() / rows) {
+        return false;
+    }
+    const size_t blocks = blocks_per_row * rows;
+    return blocks <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+           blocks <= std::numeric_limits<size_t>::max() / block_bytes && size == blocks * block_bytes;
+}
+
+bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size) {
+    return ggml_sycl_reorder_geometry_valid(type, ncols, nrows, size);
+}
+
+bool ggml_sycl_reorder_pointer_contract_for_test(bool                  registered,
+                                                 ggml_sycl::alloc_tier registered_tier,
+                                                 int                   registered_device,
+                                                 sycl::usm::alloc      external_type,
+                                                 int                   external_device,
+                                                 int                   queue_device) {
+    if (registered) {
+        return registered_tier == ggml_sycl::alloc_tier::DEVICE_VRAM && registered_device == queue_device;
+    }
+    return external_type == sycl::usm::alloc::device && external_device == queue_device;
+}
+
+static bool ggml_sycl_reorder_pointer_valid(uint8_t * data_device, dpct::queue_ptr stream) {
+    const int queue_device = ggml_sycl_get_device_id_from_queue(*stream);
+
+    ggml_sycl::memory_location registered_location{};
+    if (ggml_sycl::query_registered_location(data_device, &registered_location)) {
+        return ggml_sycl_reorder_pointer_contract_for_test(true, registered_location.tier,
+                                                           registered_location.device, sycl::usm::alloc::unknown, -1,
+                                                           queue_device);
+    }
+
+    try {
+        const sycl::context & context       = stream->get_context();
+        const auto            external_type = sycl::get_pointer_type(data_device, context);
+        if (external_type != sycl::usm::alloc::device) {
+            return false;
+        }
+        const sycl::device external_device = sycl::get_pointer_device(data_device, context);
+        return external_device == stream->get_device();
+    } catch (const sycl::exception &) {
+        return false;
+    }
+}
+
 // Reorder a raw device buffer from AOS to SOA layout for partial row ranges.
 // Used by unified cache for multi-device tensor split weight distribution.
 bool reorder_rows_to_soa(uint8_t *       data_device,
@@ -42586,36 +42699,25 @@ bool reorder_rows_to_soa(uint8_t *       data_device,
                          int64_t         nrows,
                          size_t          size,
                          dpct::queue_ptr stream) {
-    if (!data_device || !stream || size == 0 || nrows == 0) {
+    if (!data_device || !stream || !ggml_sycl_reorder_geometry_valid(type, ncols, nrows, size)) {
         return false;
     }
-    try {
-        if (sycl::get_pointer_type(data_device, stream->get_context()) != sycl::usm::alloc::device) {
-            GGML_LOG_ERROR("[REORDER-ROWS] input %p is not device USM in the supplied queue context\n", data_device);
-            return false;
-        }
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[REORDER-ROWS] could not validate device input %p: %s\n", data_device, e.what());
+    if (!ggml_sycl_reorder_pointer_valid(data_device, stream)) {
+        GGML_LOG_ERROR("[REORDER-ROWS] input %p is not device USM owned by the supplied queue device\n", data_device);
         return false;
     }
     switch (type) {
         case GGML_TYPE_Q4_0:
-            reorder_qw_q4_0(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
-            return true;
+            return reorder_qw_q4_0(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
         case GGML_TYPE_Q4_K:
-            reorder_qw_q4_k(data_device, size, 0, stream);
-            return true;
+            return reorder_qw_q4_k(data_device, size, 0, stream);
         case GGML_TYPE_Q6_K:
-            reorder_qw_q6_k(data_device, size, 0, stream);
-            return true;
+            return reorder_qw_q6_k(data_device, size, 0, stream);
         case GGML_TYPE_Q8_0:
-            reorder_qw_q8_0(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
-            return true;
+            return reorder_qw_q8_0(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
         case GGML_TYPE_MXFP4:
-            reorder_qw_mxfp4(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
-            return true;
+            return reorder_qw_mxfp4(data_device, static_cast<int>(ncols), static_cast<int>(nrows), size, 0, stream);
         default:
-            GGML_LOG_WARN("[REORDER-ROWS] unsupported type %d for partial SOA reorder\n", (int) type);
             return false;
     }
 }

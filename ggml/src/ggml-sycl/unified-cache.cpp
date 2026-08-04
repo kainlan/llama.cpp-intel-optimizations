@@ -13324,59 +13324,67 @@ void * unified_cache_kv_arena_alloc(int device_id, size_t size) {
     return cache->zone_alloc(vram_zone_id::KV, size);
 }
 
+bool query_registered_location(const void * ptr, memory_location * out) {
+    if (!ptr || !out) {
+        return false;
+    }
+    *out     = {};
+    out->ptr = const_cast<void *>(ptr);
+
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        auto                        it = g_runtime_alloc_registry.find(out->ptr);
+        if (it != g_runtime_alloc_registry.end()) {
+            const alloc_handle & h = it->second.handle;
+            out->device            = h.device;
+            out->tier              = h.tier;
+            out->role              = h.role;
+            out->zone              = h.vram_zone;
+            out->from_arena        = h.zone_managed && h.vram_zone != vram_zone_id::COUNT;
+            out->layout            = GGML_LAYOUT_AOS;
+            if (h.host_zone != host_zone_id::COUNT && out->role == alloc_role::OTHER) {
+                out->role = h.host_zone == host_zone_id::KV     ? alloc_role::KV :
+                            h.host_zone == host_zone_id::WEIGHT ? alloc_role::WEIGHT :
+                                                                  alloc_role::STAGING;
+            }
+            return true;
+        }
+    }
+
+    const auto * info = alloc_registry::instance().lookup(ptr);
+    if (!info) {
+        return false;
+    }
+    out->device = info->device_id;
+    switch (info->type) {
+        case alloc_type::DEVICE:
+            out->tier = alloc_tier::DEVICE_VRAM;
+            break;
+        case alloc_type::HOST_PINNED:
+        case alloc_type::SHARED:
+            out->tier = alloc_tier::HOST_PINNED;
+            break;
+        case alloc_type::MMAP:
+        default:
+            out->tier = alloc_tier::MMAP_TRACKED;
+            break;
+    }
+    return true;
+}
+
 memory_location query_location(const void * ptr, int device_hint) {
     memory_location loc{};
     if (!ptr) {
         return loc;
     }
 
-    loc.ptr = const_cast<void *>(ptr);
-
-    {
-        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        auto                        it = g_runtime_alloc_registry.find(loc.ptr);
-        if (it != g_runtime_alloc_registry.end()) {
-            const alloc_handle & h = it->second.handle;
-            loc.device             = h.device;
-            loc.tier               = h.tier;
-            loc.role               = h.role;
-            loc.zone               = h.vram_zone;
-            loc.from_arena         = h.zone_managed && h.vram_zone != vram_zone_id::COUNT;
-            loc.layout             = GGML_LAYOUT_AOS;
-            if (h.host_zone != host_zone_id::COUNT && loc.role == alloc_role::OTHER) {
-                loc.role = h.host_zone == host_zone_id::KV     ? alloc_role::KV :
-                           h.host_zone == host_zone_id::WEIGHT ? alloc_role::WEIGHT :
-                                                                 alloc_role::STAGING;
-            }
-            return loc;
+    if (!query_registered_location(ptr, &loc)) {
+        loc.ptr = const_cast<void *>(ptr);
+        if (device_hint >= 0) {
+            // Not registered — assume host/mmap (conservative).
+            loc.device = device_hint;
+            loc.tier   = alloc_tier::MMAP_TRACKED;
         }
-    }
-
-    // Step 1: Check alloc_registry for tier classification (O(1) binary search).
-    const auto * info = alloc_registry::instance().lookup(ptr);
-    if (info) {
-        loc.device = info->device_id;
-        switch (info->type) {
-            case alloc_type::DEVICE:
-                loc.tier = alloc_tier::DEVICE_VRAM;
-                break;
-            case alloc_type::HOST_PINNED:
-                loc.tier = alloc_tier::HOST_PINNED;
-                break;
-            case alloc_type::SHARED:
-                loc.tier = alloc_tier::HOST_PINNED;  // treat shared as host-accessible
-                break;
-            case alloc_type::MMAP:
-                loc.tier = alloc_tier::MMAP_TRACKED;
-                break;
-            default:
-                loc.tier = alloc_tier::MMAP_TRACKED;
-                break;
-        }
-    } else if (device_hint >= 0) {
-        // Not registered — assume host/mmap (conservative).
-        loc.device = device_hint;
-        loc.tier   = alloc_tier::MMAP_TRACKED;
     }
 
     // Step 2: Check arena zone ownership (device allocations only).

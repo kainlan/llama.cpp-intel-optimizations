@@ -3273,6 +3273,11 @@ struct memory_location {
     bool host_accessible() const { return tier != alloc_tier::DEVICE_VRAM; }
 };
 
+// Query only registered allocations, preserving registry authority even when
+// a driver pointer probe would report `unknown` for an arena suballocation.
+// Returns false for external/unregistered pointers.
+bool query_registered_location(const void * ptr, memory_location * out);
+
 // Query current location of any pointer.  Uses alloc_registry for tier
 // classification and arena zone ownership detection.  O(1) via binary search.
 // Does NOT acquire SYCL runtime locks — safe to call at graph build time.

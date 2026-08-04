@@ -1626,6 +1626,15 @@ bool reorder_rows_to_soa(uint8_t *       data_device,
                          int64_t         nrows,
                          size_t          size,
                          dpct::queue_ptr stream);
+
+// Host-only contract hooks for raw reorder validation tests.
+bool ggml_sycl_reorder_geometry_valid_for_test(ggml_type type, int64_t ncols, int64_t nrows, size_t size);
+bool ggml_sycl_reorder_pointer_contract_for_test(bool                  registered,
+                                                 ggml_sycl::alloc_tier registered_tier,
+                                                 int                   registered_device,
+                                                 sycl::usm::alloc      external_type,
+                                                 int                   external_device,
+                                                 int                   queue_device);
 bool ggml_sycl_is_optimize_feature_live(const optimize_feature * feature);
 void ggml_sycl_register_optimize_feature(optimize_feature * feature);
 void ggml_sycl_unregister_optimize_feature(optimize_feature * feature);

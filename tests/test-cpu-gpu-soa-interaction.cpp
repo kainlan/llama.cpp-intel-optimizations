@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 static bool configure_bounded_runtime() {
@@ -120,6 +121,65 @@ void cpu_dequantize_q4_0(const block_q4_0* src, float* dst, int nblocks) {
 // TESTS
 // ============================================================================
 
+// Test 0: host-only validation contracts for all raw reorder types.
+bool test_reorder_validation_contracts() {
+    struct geometry_case {
+        ggml_type type;
+        int64_t   block_elements;
+        size_t    block_bytes;
+    };
+    const geometry_case cases[] = {
+        { GGML_TYPE_Q4_0, QK4_0, sizeof(block_q4_0) },
+        { GGML_TYPE_Q4_K, QK_K, sizeof(block_q4_K) },
+        { GGML_TYPE_Q6_K, QK_K, sizeof(block_q6_K) },
+        { GGML_TYPE_Q8_0, QK8_0, sizeof(block_q8_0) },
+        { GGML_TYPE_MXFP4, QK_MXFP4, sizeof(block_mxfp4) },
+    };
+
+    for (const auto & test : cases) {
+        const int64_t ncols = test.block_elements * 4;
+        const int64_t nrows = 3;
+        const size_t  size  = 12 * test.block_bytes;
+        if (!ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, nrows, size) ||
+            ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols - 1, nrows, size) ||
+            ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, nrows, size - 1) ||
+            ggml_sycl_reorder_geometry_valid_for_test(test.type, ncols, 0, size)) {
+            fprintf(stderr, "FAIL: reorder geometry contract for type %d\n", (int) test.type);
+            return false;
+        }
+    }
+    const int64_t beyond_int = static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
+    if (ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_Q4_0, beyond_int, 1, sizeof(block_q4_0)) ||
+        ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_Q4_0, QK4_0, beyond_int, sizeof(block_q4_0)) ||
+        ggml_sycl_reorder_geometry_valid_for_test(GGML_TYPE_F32, QK4_0, 1, sizeof(block_q4_0))) {
+        fprintf(stderr, "FAIL: reorder geometry accepted non-representable dimensions or unsupported type\n");
+        return false;
+    }
+
+    using ggml_sycl::alloc_tier;
+    const int queue_device = 1;
+    // registered=true models a registry-authoritative arena suballocation:
+    // external_type stays unknown and must never override its registered owner.
+    if (!ggml_sycl_reorder_pointer_contract_for_test(true, alloc_tier::DEVICE_VRAM, queue_device,
+                                                      sycl::usm::alloc::unknown, -1, queue_device) ||
+        ggml_sycl_reorder_pointer_contract_for_test(true, alloc_tier::DEVICE_VRAM, 0,
+                                                     sycl::usm::alloc::unknown, -1, queue_device) ||
+        ggml_sycl_reorder_pointer_contract_for_test(true, alloc_tier::HOST_PINNED, queue_device,
+                                                     sycl::usm::alloc::device, queue_device, queue_device) ||
+        !ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+                                                      sycl::usm::alloc::device, queue_device, queue_device) ||
+        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+                                                     sycl::usm::alloc::device, 0, queue_device) ||
+        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+                                                     sycl::usm::alloc::unknown, queue_device, queue_device)) {
+        fprintf(stderr, "FAIL: reorder registered/external pointer contract\n");
+        return false;
+    }
+
+    printf("Test 0: PASS: reorder geometry and pointer contracts\n");
+    return true;
+}
+
 // Test 1: Verify production dequantize functions match
 bool test_actual_dequantize_functions() {
     printf("Test 1: Verify production dequantize_q4_0 vs dequantize_q4_0_reorder\n");
@@ -193,7 +253,9 @@ bool test_actual_dequantize_functions() {
 bool test_actual_reorder_kernel(bool corrupt_post_copy) {
     printf("Test 2: Verify production GPU reorder path\n");
 
-    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    // Deliberately out-of-order: every production reorder kernel must carry
+    // the temporary-copy event as an explicit dependency.
+    sycl::queue q{sycl::gpu_selector_v};
 
     const int nrows = 128;
     const int ncols = 4096;
@@ -608,6 +670,9 @@ int main(int argc, char ** argv) {
     try {
         int passed = 0;
         int failed = 0;
+
+        if (test_reorder_validation_contracts()) passed++; else failed++;
+        printf("\n");
 
         if (test_actual_dequantize_functions()) passed++; else failed++;
         printf("\n");
