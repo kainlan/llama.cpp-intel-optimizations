@@ -7,6 +7,9 @@
 #include "../fattn.hpp"
 #include "../unified-cache.hpp"
 
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -17,6 +20,7 @@
 #include <condition_variable>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <string>
@@ -204,8 +208,6 @@ void verify_host_boundaries() {
 
 class packed_k_half_payload_kernel;
 class packed_k_rows_payload_kernel;
-class packed_k_device_spin_gate_kernel;
-class packed_k_device_spin_gate_release_kernel;
 
 class controlled_gate {
   public:
@@ -262,28 +264,51 @@ class controlled_gate_release_guard {
     sycl::queue &     work_queue_;
 };
 
-// Level Zero may synchronously block queue.submit behind an incomplete host_task.
-// Keep the dependency load-bearing with a device-only atomic, and release it
-// through a separate compatible queue so no shared/system-atomic USM is needed.
-class device_spin_gate {
+// A native HOST_VISIBLE Level Zero event is incomplete without occupying a
+// compute engine. SYCL keeps a non-owning wrapper while this fixture owns the
+// ze_event and pool, and RAII host-signals before draining on every exit path.
+class level_zero_host_gate {
   public:
-    device_spin_gate(sycl::queue & dependency_queue, sycl::queue & work_queue) :
-        dependency_queue_(dependency_queue),
-        release_queue_(dependency_queue.get_context(), dependency_queue.get_device()),
-        work_queue_(work_queue) {
-        flag_ = sycl::malloc_device<uint32_t>(1, dependency_queue_);
-        if (flag_ == nullptr) {
-            throw std::runtime_error("device spin gate allocation failed");
+    level_zero_host_gate(sycl::queue & dependency_queue, sycl::queue & work_queue) :
+        dependency_queue_(dependency_queue), sycl_context_(dependency_queue.get_context()), work_queue_(work_queue) {
+        if (sycl_context_.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            throw std::runtime_error("packed-K native gate requires Level Zero");
         }
-        release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw();
+        ze_context_ = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_context_);
+
+        ze_event_pool_desc_t pool_desc{};
+        pool_desc.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+        pool_desc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+        pool_desc.count = 1;
+        if (zeEventPoolCreate(ze_context_, &pool_desc, 0, nullptr, &pool_) != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Level Zero event pool creation failed");
+        }
+
+        ze_event_desc_t event_desc{};
+        event_desc.stype  = ZE_STRUCTURE_TYPE_EVENT_DESC;
+        event_desc.index  = 0;
+        event_desc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+        event_desc.wait   = ZE_EVENT_SCOPE_FLAG_HOST;
+        if (zeEventCreate(pool_, &event_desc, &event_) != ZE_RESULT_SUCCESS) {
+            zeEventPoolDestroy(pool_);
+            pool_ = nullptr;
+            throw std::runtime_error("Level Zero event creation failed");
+        }
+
+        try {
+            wrapped_event_.emplace(sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+                { event_, sycl::ext::oneapi::level_zero::ownership::keep }, sycl_context_));
+        } catch (...) {
+            (void) zeEventDestroy(event_);
+            (void) zeEventPoolDestroy(pool_);
+            event_ = nullptr;
+            pool_  = nullptr;
+            throw;
+        }
     }
 
-    ~device_spin_gate() noexcept {
+    ~level_zero_host_gate() noexcept {
         release();
-        try {
-            release_queue_.wait();
-        } catch (...) {
-        }
         try {
             dependency_queue_.wait();
         } catch (...) {
@@ -292,57 +317,37 @@ class device_spin_gate {
             work_queue_.wait();
         } catch (...) {
         }
-        try {
-            sycl::free(flag_, dependency_queue_);
-        } catch (...) {
+        wrapped_event_.reset();
+        if (event_ != nullptr) {
+            (void) zeEventDestroy(event_);
+        }
+        if (pool_ != nullptr) {
+            (void) zeEventPoolDestroy(pool_);
         }
     }
 
-    sycl::event submit() {
-        uint32_t * flag = flag_;
-        return dependency_queue_.submit([&](sycl::handler & cgh) {
-            cgh.single_task<packed_k_device_spin_gate_kernel>([=]() {
-                using atomic_type = sycl::atomic_ref<uint32_t,
-                                                     sycl::memory_order::relaxed,
-                                                     sycl::memory_scope::device,
-                                                     sycl::access::address_space::global_space>;
-                while (atomic_type(*flag).load(sycl::memory_order::acquire) == 0) {
-                }
-            });
-        });
-    }
+    const sycl::event & event() const { return *wrapped_event_; }
 
     void release() noexcept {
-        if (flag_ == nullptr || released_) {
-            return;
-        }
-        uint32_t * flag = flag_;
-        try {
-            release_queue_.submit([&](sycl::handler & cgh) {
-                cgh.single_task<packed_k_device_spin_gate_release_kernel>([=]() {
-                    using atomic_type = sycl::atomic_ref<uint32_t,
-                                                         sycl::memory_order::relaxed,
-                                                         sycl::memory_scope::device,
-                                                         sycl::access::address_space::global_space>;
-                    atomic_type(*flag).store(1, sycl::memory_order::release);
-                });
-            }).wait();
-            released_ = true;
-        } catch (...) {
+        if (event_ != nullptr && !released_) {
+            released_ = zeEventHostSignal(event_) == ZE_RESULT_SUCCESS;
         }
     }
 
     bool released() const noexcept { return released_; }
 
-    device_spin_gate(const device_spin_gate &) = delete;
-    device_spin_gate & operator=(const device_spin_gate &) = delete;
+    level_zero_host_gate(const level_zero_host_gate &) = delete;
+    level_zero_host_gate & operator=(const level_zero_host_gate &) = delete;
 
   private:
-    sycl::queue & dependency_queue_;
-    sycl::queue   release_queue_;
-    sycl::queue & work_queue_;
-    uint32_t *    flag_ = nullptr;
-    bool          released_ = false;
+    sycl::queue &              dependency_queue_;
+    sycl::context              sycl_context_;
+    sycl::queue &              work_queue_;
+    ze_context_handle_t        ze_context_ = nullptr;
+    ze_event_pool_handle_t     pool_ = nullptr;
+    ze_event_handle_t          event_ = nullptr;
+    std::optional<sycl::event> wrapped_event_;
+    bool                       released_ = false;
 };
 
 sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
@@ -600,7 +605,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
     ggml_sycl_fattn_xmx_packed_k packed;
-    device_spin_gate gate(dependency_q, q);
+    level_zero_host_gate gate(dependency_q, q);
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
     const auto plan = tiny_plan(params);
@@ -618,7 +623,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
             "materializer mem_fill profiler error hook was not observed exactly once");
     packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    const sycl::event gate_event = gate.submit();
+    const sycl::event gate_event = gate.event();
     packed.ready_event = submit_half_payload(dependency_q, gate_event, kbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -779,8 +784,8 @@ bool preflight_device() {
         }
         const sycl::device & dev = devices.front();
         const size_t required_slm = fattn_v2_decode_gqa_slm<D>::TOTAL * sizeof(sycl::half);
-        if (!dev.has(sycl::aspect::fp16) ||
-            !dev.has(sycl::aspect::usm_device_allocations) ||
+        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero ||
+            !dev.has(sycl::aspect::fp16) ||
             !fattn_xmx_v2_decode_m1n64_supported(dev, 16) ||
             dev.get_info<sycl::info::device::local_mem_size>() < required_slm) {
             return false;
@@ -820,7 +825,7 @@ int main(int argc, char ** argv) {
     }
 
     if (!preflight_device()) {
-        std::fprintf(stderr, "SKIP: host packed-K boundaries passed; GPU FP16/XMX/SLM unavailable\n");
+        std::fprintf(stderr, "SKIP: host packed-K boundaries passed; Level Zero GPU FP16/XMX/SLM unavailable\n");
         return SKIP_UNSUPPORTED;
     }
 

@@ -1093,6 +1093,14 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
+# Its deterministic incomplete dependency is a native Level Zero event.
+find_library(LEVEL_ZERO_LOADER
+    NAMES ze_loader
+    HINTS
+        ENV LEVEL_ZERO_V1_SDK_PATH
+        ENV LEVEL_ZERO_SDK_PATH
+    PATH_SUFFIXES lib lib/x64
+    REQUIRED)
 if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)
 add_executable(test-fattn-packed-k-lifecycle
     tests/test-fattn-packed-k-lifecycle.cpp
@@ -1121,7 +1129,7 @@ target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
-target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl ${LEVEL_ZERO_LOADER})
 if (IntelSYCL_FOUND)
     target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -3227,16 +3235,7 @@ endif()
 add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
 set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
 
-# On Linux libze_loader.so is on the default search path; on Windows the loader
-# import lib (ze_loader.lib) ships in the Level Zero SDK the CI installs, so hint
-# find_library with the SDK path env vars set by the workflow.
-find_library(LEVEL_ZERO_LOADER
-    NAMES ze_loader
-    HINTS
-        ENV LEVEL_ZERO_V1_SDK_PATH
-        ENV LEVEL_ZERO_SDK_PATH
-    PATH_SUFFIXES lib lib/x64
-    REQUIRED)
+# LEVEL_ZERO_LOADER was located above for the packed-K native-event fixture.
 add_executable(test-sycl-level-zero-vmem-feasibility
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-level-zero-vmem-feasibility.cpp
 )

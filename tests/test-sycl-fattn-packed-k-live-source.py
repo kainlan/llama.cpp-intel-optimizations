@@ -162,7 +162,7 @@ def lifecycle_teardown_contract(source: str) -> bool:
                    if index + 1 < len(starts) else source.index("void initialize_production_baseline", begin))
             body = source[begin:end]
             if start_name == "void run_materializer_checkpoint":
-                gate = body.index("device_spin_gate gate(dependency_q, q);")
+                gate = body.index("level_zero_host_gate gate(dependency_q, q);")
             else:
                 gate = body.index("controlled_gate_release_guard gate_guard")
             if gate > body.index("require("):
@@ -187,32 +187,35 @@ def lifecycle_teardown_contract(source: str) -> bool:
                     accepted_positions.append(accepted_cursor)
                 if accepted_positions != sorted(accepted_positions):
                     return False
-        device_gate_begin = source.index("class device_spin_gate")
-        device_gate_end = source.index("sycl::event submit_half_payload", device_gate_begin)
-        device_gate = source[device_gate_begin:device_gate_end]
-        device_gate_needles = (
-            "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
-            "sycl::malloc_device<uint32_t>",
-            "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
-            "~device_spin_gate() noexcept",
-            "release();",
-            "release_queue_.wait();",
+        native_gate_begin = source.index("class level_zero_host_gate")
+        native_gate_end = source.index("sycl::event submit_half_payload", native_gate_begin)
+        native_gate = source[native_gate_begin:native_gate_end]
+        native_gate_needles = (
+            "sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_context_)",
+            "ZE_EVENT_POOL_FLAG_HOST_VISIBLE",
+            "zeEventPoolCreate",
+            "zeEventCreate",
+            "sycl::make_event<sycl::backend::ext_oneapi_level_zero>",
+            "sycl::ext::oneapi::level_zero::ownership::keep",
+            "zeEventHostSignal",
+            "~level_zero_host_gate() noexcept",
             "dependency_queue_.wait();",
             "work_queue_.wait();",
-            "sycl::free(flag_, dependency_queue_);",
-            "cgh.single_task<packed_k_device_spin_gate_kernel>",
-            "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
-            "sycl::memory_scope::device",
-            "atomic_type(*flag).load(sycl::memory_order::acquire)",
-            "atomic_type(*flag).store(1, sycl::memory_order::release)",
+            "wrapped_event_.reset();",
+            "zeEventDestroy(event_);",
+            "zeEventPoolDestroy(pool_);",
         )
-        if not all(needle in device_gate for needle in device_gate_needles):
+        if not all(needle in native_gate for needle in native_gate_needles):
             return False
-        destructor = device_gate[device_gate.index("~device_spin_gate() noexcept"):device_gate.index("sycl::event submit()")]
+        destructor = native_gate[
+            native_gate.index("~level_zero_host_gate() noexcept"):native_gate.index("const sycl::event & event()")]
         destructor_needles = (
-            "release();", "release_queue_.wait();", "dependency_queue_.wait();", "work_queue_.wait();", "sycl::free")
+            "release();", "dependency_queue_.wait();", "work_queue_.wait();",
+            "wrapped_event_.reset();", "zeEventDestroy(event_);", "zeEventPoolDestroy(pool_);")
         if [destructor.index(needle) for needle in destructor_needles] != sorted(
                 destructor.index(needle) for needle in destructor_needles):
+            return False
+        if "device_spin_gate" in source or "memory_scope::device" in source:
             return False
         signal_begin = source.index("bool submit_retry_after_accepted_signal")
         signal_end = source.index("template <typename T>", signal_begin)
@@ -309,8 +312,8 @@ def live_contract(source: str) -> bool:
     required = (
         "SKIP_UNSUPPORTED = 77",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
+        "dev.get_backend() != sycl::backend::ext_oneapi_level_zero",
         "dev.has(sycl::aspect::fp16)",
-        "dev.has(sycl::aspect::usm_device_allocations)",
         "fattn_xmx_v2_decode_m1n64_supported(dev, 16)",
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
@@ -324,14 +327,17 @@ def live_contract(source: str) -> bool:
         "dependency_queue_.wait()",
         "work_queue_.wait()",
         "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
-        "class device_spin_gate",
-        "sycl::malloc_device<uint32_t>",
-        "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
-        "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
-        "cgh.single_task<packed_k_device_spin_gate_kernel>",
-        "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
-        "device_spin_gate gate(dependency_q, q)",
-        "const sycl::event gate_event = gate.submit()",
+        "#include <level_zero/ze_api.h>",
+        "#include <sycl/ext/oneapi/backend/level_zero.hpp>",
+        "class level_zero_host_gate",
+        "ZE_EVENT_POOL_FLAG_HOST_VISIBLE",
+        "zeEventPoolCreate",
+        "zeEventCreate",
+        "sycl::make_event<sycl::backend::ext_oneapi_level_zero>",
+        "sycl::ext::oneapi::level_zero::ownership::keep",
+        "zeEventHostSignal",
+        "level_zero_host_gate gate(dependency_q, q)",
+        "const sycl::event gate_event = gate.event()",
         "submit_retry_before_gate_release",
         "submit_retry_after_accepted_signal",
         "retry fill submission was not accepted before gate release",
@@ -416,13 +422,15 @@ def cmake_contract(source: str) -> bool:
     required = (
         "add_executable(test-fattn-packed-k-lifecycle",
         "tests/test-fattn-packed-k-lifecycle.cpp",
-        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl)",
+        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl ${LEVEL_ZERO_LOADER})",
         "foreach(_packed_k_checkpoint IN ITEMS",
         "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}",
         "ONEAPI_DEVICE_SELECTOR=level_zero:1",
         "SKIP_RETURN_CODE 77",
     )
-    return all(needle in block for needle in required) and all(cp in block for cp in CHECKPOINTS)
+    return (all(needle in block for needle in required) and
+            all(cp in block for cp in CHECKPOINTS) and
+            source.count("find_library(LEVEL_ZERO_LOADER") == 1)
 
 
 def test_production_live_driver_and_structural_registration_contracts() -> None:
@@ -480,11 +488,11 @@ def test_checkpoint_mutations_are_killed() -> None:
     assert not live_contract(LIVE.replace(
         "submit_retry_after_accepted_signal(", "submit_retry_before_gate_release(", 1))
     assert not live_contract(LIVE.replace(
-        "const sycl::event gate_event = gate.submit();",
+        "const sycl::event gate_event = gate.event();",
         "const sycl::event gate_event = submit_controlled_gate(dependency_q, nullptr);", 1))
     assert not live_contract(LIVE.replace(
-        "~device_spin_gate() noexcept {\n        release();",
-        "~device_spin_gate() noexcept {", 1))
+        "~level_zero_host_gate() noexcept {\n        release();",
+        "~level_zero_host_gate() noexcept {", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -604,18 +612,21 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "initialize_production_baseline(ctx, work_queue, device)",
         "submit_retry_after_accepted_signal",
         "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
-        "class device_spin_gate",
-        "sycl::malloc_device<uint32_t>",
-        "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
-        "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
-        "cgh.single_task<packed_k_device_spin_gate_kernel>",
-        "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
-        "device_spin_gate gate(dependency_q, q)",
-        "const sycl::event gate_event = gate.submit()",
-        "dev.has(sycl::aspect::usm_device_allocations)",
-        "release_queue_.wait()",
-        "sycl::memory_scope::device",
+        "#include <level_zero/ze_api.h>",
+        "#include <sycl/ext/oneapi/backend/level_zero.hpp>",
+        "class level_zero_host_gate",
+        "ZE_EVENT_POOL_FLAG_HOST_VISIBLE",
+        "zeEventPoolCreate",
+        "zeEventCreate",
+        "sycl::make_event<sycl::backend::ext_oneapi_level_zero>",
+        "sycl::ext::oneapi::level_zero::ownership::keep",
+        "zeEventHostSignal",
+        "level_zero_host_gate gate(dependency_q, q)",
+        "const sycl::event gate_event = gate.event()",
+        "dev.get_backend() != sycl::backend::ext_oneapi_level_zero",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
     assert not cmake_contract(CMAKE.replace("endforeach()\nendif()", "endforeach()", 1))
+    assert not cmake_contract(CMAKE.replace("find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER", 1))
+    assert not cmake_contract(CMAKE.replace(" ${LEVEL_ZERO_LOADER})", ")", 1))
