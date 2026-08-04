@@ -274,8 +274,19 @@ extern "C" {
 
     // Load a backend from a dynamic library and register it
     GGML_API ggml_backend_reg_t ggml_backend_load(const char * path);
-    // Unload a backend if loaded dynamically and unregister it
-    GGML_API void               ggml_backend_unload(ggml_backend_reg_t reg);
+    enum ggml_backend_unload_result {
+        GGML_BACKEND_UNLOAD_OK = 0,
+        GGML_BACKEND_UNLOAD_BUSY,
+        GGML_BACKEND_UNLOAD_NOT_FOUND,
+    };
+
+    // Attempt to unload a dynamically loaded backend. A backend may reject
+    // removal while it still owns live model state; in that case its devices
+    // and teardown procedures remain registered.
+    GGML_API enum ggml_backend_unload_result ggml_backend_unload_checked(ggml_backend_reg_t reg);
+    // Compatibility wrapper; use ggml_backend_unload_checked() when the result
+    // must be observed.
+    GGML_API void                            ggml_backend_unload(ggml_backend_reg_t reg);
     // Load all known backends from dynamic libraries
     GGML_API void               ggml_backend_load_all(void);
     GGML_API void               ggml_backend_load_all_from_path(const char * dir_path);

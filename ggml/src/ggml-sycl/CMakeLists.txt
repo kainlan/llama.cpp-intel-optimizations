@@ -1815,17 +1815,10 @@ set_tests_properties(test-sycl-tensor-usage PROPERTIES
     TIMEOUT 120
 )
 
-# Cross-model state-leak regression (llama.cpp-k7b0): g_sycl_weight_usages
-# (ggml-sycl.cpp) is name-keyed and previously never cleared between model
-# loads, so a name one architecture's tied-weight detection forced to
-# UNKNOWN could poison a later, unrelated architecture's first (and only)
-# registration of that same name. Exercises the REAL load boundary,
-# ggml_backend_sycl_set_model_loading(), not a mock -- see the file header
-# for the full defect writeup and the one-line mutation that makes this
-# fail specifically. Loads no model and touches no VRAM beyond what
-# ggml_sycl_info() enumerates, but the load-boundary reset path this test
-# exercises still expects a real device (mirrors test-layout-cache.cpp's
-# SKIP_RETURN_CODE convention below).
+# Exact-owner weight-usage regression: concurrent LIVE A/B models classify a
+# same-name tensor differently, then A is reactivated. The lookup must follow
+# the exact ModelToken and load boundaries must not clear another live owner.
+# This fixture loads no model and performs no GPU work.
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)

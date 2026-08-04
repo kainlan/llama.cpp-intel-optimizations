@@ -305,7 +305,7 @@ struct ggml_backend_registry {
         return reg;
     }
 
-    void unload_backend(ggml_backend_reg_t reg, bool silent) {
+    ggml_backend_unload_result unload_backend(ggml_backend_reg_t reg, bool silent) {
         auto it = std::find_if(backends.begin(), backends.end(),
                                [reg](const ggml_backend_reg_entry & entry) { return entry.reg == reg; });
 
@@ -313,11 +313,21 @@ struct ggml_backend_registry {
             if (!silent) {
                 GGML_LOG_ERROR("%s: backend not found\n", __func__);
             }
-            return;
+            return GGML_BACKEND_UNLOAD_NOT_FOUND;
         }
 
         if (!silent) {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
+        }
+
+        // A module with exact live lifecycle owners must retain both its
+        // devices and procedure table so model destruction can still perform
+        // exact-token teardown. This optional typed gate runs before shutdown.
+        using can_unload_fn = bool (*)();
+        auto can_unload = reinterpret_cast<can_unload_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_can_unload"));
+        if (can_unload && !can_unload()) {
+            return GGML_BACKEND_UNLOAD_BUSY;
         }
 
         // Give a dynamic backend one last chance to join module-owned threads
@@ -337,6 +347,7 @@ struct ggml_backend_registry {
 
         // remove backend
         backends.erase(it);
+        return GGML_BACKEND_UNLOAD_OK;
     }
 };
 
@@ -449,8 +460,12 @@ ggml_backend_reg_t ggml_backend_load(const char * path) {
     return get_reg().load_backend(path, false);
 }
 
+ggml_backend_unload_result ggml_backend_unload_checked(ggml_backend_reg_t reg) {
+    return get_reg().unload_backend(reg, true);
+}
+
 void ggml_backend_unload(ggml_backend_reg_t reg) {
-    get_reg().unload_backend(reg, true);
+    (void) ggml_backend_unload_checked(reg);
 }
 
 static fs::path get_executable_path() {

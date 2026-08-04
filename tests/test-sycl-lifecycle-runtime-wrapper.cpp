@@ -149,6 +149,14 @@ int main() {
         std::fprintf(stderr, "runtime no-allocation commit failed\n");
         return 1;
     }
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    phase("live-owner unload rejection");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
+        !ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token")) {
+        std::fprintf(stderr, "live-owner unload was not observably deferred\n");
+        return 1;
+    }
+#endif
     phase("model teardown");
     if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(token) != GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "runtime teardown failed\n");
@@ -160,8 +168,47 @@ int main() {
         return 1;
     }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
-    phase("final module unload with shutdown hook");
-    ggml_backend_unload(reg);
+    if (CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+        std::fprintf(stderr, "teardown retained placement authority\n");
+        return 1;
+    }
+    phase("stateful module unload");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "dead-owner module unload failed\n");
+        return 1;
+    }
+    reg = nullptr;
+
+    phase("reload after stateful shutdown");
+    reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE);
+    if (!reg) {
+        std::fprintf(stderr, "stateful module reload failed\n");
+        return 1;
+    }
+    auto begin_again = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_begin)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
+    auto end_again = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_end)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
+    auto unload_again = reinterpret_cast<decltype(&ggml_backend_sycl_model_unloaded_token)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
+    auto stage_again = reinterpret_cast<decltype(&ggml_backend_sycl_stage_inventory_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
+    auto authority_again = reinterpret_cast<decltype(&ggml_backend_sycl_has_active_placement_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
+    ggml_sycl_load_txn reload_txn{};
+    ggml_sycl_model_token reload_token{};
+    if (!begin_again || !end_again || !unload_again || !stage_again || !authority_again || authority_again() ||
+        begin_again(&reload_txn) != GGML_SYCL_LIFECYCLE_OK ||
+        stage_again(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        end_again(reload_txn, true, &reload_token) != GGML_SYCL_LIFECYCLE_OK || reload_token.model_id == 0 ||
+        unload_again(reload_token) != GGML_SYCL_LIFECYCLE_OK || authority_again()) {
+        std::fprintf(stderr, "post-shutdown lifecycle reuse left dirty authority/token state\n");
+        return 1;
+    }
+    phase("final clean module unload");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        return 1;
+    }
     reg = nullptr;
     phase("complete");
 #endif

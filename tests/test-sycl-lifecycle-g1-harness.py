@@ -23,11 +23,11 @@ class G1HarnessTests(unittest.TestCase):
     def test_a_shared_is_mandatory_but_not_inferred(self):
         source = Path(__file__).with_name("test-sycl-lifecycle-gpu-sequential.cpp").read_text()
         self.assertIn("!o.a_shared.empty()", source)
-        self.assertNotIn("infer(o.a_shared", source)
+        self.assertEqual(source.count("infer(o.a_shared, o, selected)"), 1)
         sequence = '\n'.join([
             '        runs.push_back({ "A", infer(o.a, o, selected) });',
             '        runs.push_back({ "B", infer(o.b, o, selected) });',
-            '        runs.push_back({ "A", infer(o.a, o, selected) });',
+            '        // The final A oracle must come from the distinct renamed A-shared',
         ])
         self.assertIn(sequence, source)
 

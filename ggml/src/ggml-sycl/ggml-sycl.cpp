@@ -9167,6 +9167,9 @@ static std::mutex                                                 g_sycl_weight_
 static std::unordered_map<std::string, ggml_sycl_weight_identity> g_sycl_weight_identities_by_name;
 static std::unordered_map<std::string, uint64_t>                  g_sycl_named_weight_cache_uuids;
 static std::mutex                                                 g_sycl_weight_usage_mutex;
+// Weight classification is immutable model-owned metadata. The exact owner
+// prefix prevents a same-name tensor in a later model from mutating a still
+// LIVE model's classification.
 static std::unordered_map<std::string, tensor_usage>              g_sycl_weight_usages;
 static std::mutex                                                 g_sycl_usage_unknown_mutex;
 static std::unordered_set<std::string>                            g_sycl_usage_unknown_once;
@@ -9291,14 +9294,25 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
 }
 
 static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
-    std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
-    for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
-        const auto & id = it->second;
-        if (id.model_id == owner.model.value && id.load_txn_id == owner.load.value && id.slot == owner.owner.slot &&
-            id.slot_generation == owner.owner.generation) {
-            it = g_sycl_weight_identities_by_name.erase(it);
-        } else {
-            ++it;
+    const std::string prefix = std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
+                               std::to_string(owner.owner.slot) + ":" +
+                               std::to_string(owner.owner.generation) + ":";
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+        for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
+            const auto & id = it->second;
+            if (id.model_id == owner.model.value && id.load_txn_id == owner.load.value && id.slot == owner.owner.slot &&
+                id.slot_generation == owner.owner.generation) {
+                it = g_sycl_weight_identities_by_name.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
+        for (auto it = g_sycl_weight_usages.begin(); it != g_sycl_weight_usages.end();) {
+            it = it->first.rfind(prefix, 0) == 0 ? g_sycl_weight_usages.erase(it) : std::next(it);
         }
     }
 }
@@ -10289,8 +10303,12 @@ bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_
             return false;
         }
 
+        const auto                  owner = effect.owner;
+        const std::string           name  = ggml_sycl_owner_name_key(owner, tensor_name);
+        if (name.empty()) {
+            return false;
+        }
         std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
-        const std::string           name(tensor_name);
         auto                        it = g_sycl_weight_usages.find(name);
         if (it == g_sycl_weight_usages.end()) {
             return g_sycl_weight_usages.emplace(name, mapped).second;
@@ -10316,10 +10334,24 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
-        auto                        it = g_sycl_weight_usages.find(std::string(name));
-        if (it != g_sycl_weight_usages.end()) {
-            return it->second;
+        ggml_sycl::lifecycle::ModelToken owner{};
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+        if (extra && extra->model_id != 0) {
+            const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
+            if (state) {
+                owner = state->token;
+            }
+        }
+        if (owner.model.value == 0) {
+            owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+        }
+        const std::string key = ggml_sycl_owner_name_key(owner, name);
+        if (!key.empty()) {
+            std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
+            auto                        it = g_sycl_weight_usages.find(key);
+            if (it != g_sycl_weight_usages.end()) {
+                return it->second;
+            }
         }
     }
 
@@ -10567,15 +10599,10 @@ std::atomic<bool>                                    g_tiered_enabled{ false };
 // keyed by exact ModelToken plus name and are erased on abort/teardown; they
 // must never be reset process-wide while another model remains LIVE.
 //
-// g_sycl_weight_usages IS a real bug, fixed here: registration only
-// *emplaces* on first sight of a name and forces UNKNOWN on a *mismatch*
-// against whatever is already mapped (tied-weight detection within one
-// model's own load). Never clearing it between models means a name a
-// PREVIOUS model forced to UNKNOWN for its own tied-weight reasons poisons a
-// DIFFERENT model's first (and only) registration of that same name --
-// `it->second != mapped` reads true against the stale UNKNOWN, so the new
-// model's real classification is discarded before it is ever used. The map
-// only makes sense for the model currently loading, so it is wiped here.
+// Weight usages are not scratch: they are immutable rows keyed by exact
+// ModelToken plus tensor name and survive until that owner is torn down.
+// Resetting them here would let loading B erase still-LIVE A's runtime
+// classification, so owner-scoped teardown removes them instead.
 static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_authority) {
     {
         std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
@@ -10602,10 +10629,6 @@ static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_aut
         if (!preserve_placement_authority) {
             ggml_sycl_publish_plan_locked(nullptr);
         }
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
-        g_sycl_weight_usages.clear();
     }
     {
         std::lock_guard<std::mutex> lock(g_sycl_usage_unknown_mutex);
@@ -96018,6 +96041,10 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
     /* .event_synchronize       = */ ggml_backend_sycl_device_event_synchronize,
 };
 
+bool ggml_backend_sycl_can_unload(void) {
+    return ggml_sycl::lifecycle::global_registry().live_mask() == 0;
+}
+
 void ggml_backend_sycl_shutdown(void) {
     static std::mutex           shutdown_mutex;
     std::lock_guard<std::mutex> lock(shutdown_mutex);
@@ -96082,6 +96109,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_get_device_uuid") == 0) {
         return (void *) ggml_backend_sycl_get_device_uuid;
+    }
+    if (strcmp(name, "ggml_backend_can_unload") == 0) {
+        return (void *) ggml_backend_sycl_can_unload;
     }
     if (strcmp(name, "ggml_backend_shutdown") == 0 || strcmp(name, "ggml_backend_sycl_shutdown") == 0) {
         return (void *) ggml_backend_sycl_shutdown;

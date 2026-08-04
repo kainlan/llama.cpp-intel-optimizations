@@ -62,6 +62,9 @@ GGML_BACKEND_API int ggml_backend_sycl_get_tp_rank(void);
 
 // Check if running in multi-process TP mode
 GGML_BACKEND_API bool ggml_backend_sycl_is_multiprocess_tp(void);
+// Dynamic registry unload gate. False means exact LIVE model owners still need
+// this module's teardown procedures and devices.
+GGML_BACKEND_API bool ggml_backend_sycl_can_unload(void);
 // Drain module-owned threads, queues and caches before ggml_backend_unload().
 GGML_BACKEND_API void ggml_backend_sycl_shutdown(void);
 

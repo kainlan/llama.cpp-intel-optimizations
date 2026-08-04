@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <future>
 #include <iostream>
+#include <optional>
 #include <thread>
+#include <vector>
 
 using namespace ggml_sycl::lifecycle;
 
@@ -121,6 +123,56 @@ static void quarantine_wrapper_busy_overlap_case() {
             "reaper retry did not finalize quarantined model");
 }
 
+static void live_update_ticket_saturation_case() {
+    Registry registry;
+    const ModelToken model = commit_one(registry);
+    std::vector<live_update_ticket> held;
+    held.reserve(model_slot_count);
+    for (size_t i = 0; i < model_slot_count; ++i) {
+        auto ticket = registry.prepare_live_update(model);
+        require(ticket.active, "failed to saturate live-update ticket capacity");
+        held.emplace_back(std::move(ticket));
+    }
+    require(registry.prepare_live_update(model).code == error::BUSY,
+            "saturated live-update pool did not report BUSY");
+
+    std::thread release_one([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(registry.finalize_live_update(held[0]) == error::OK,
+                "failed to free transient ticket capacity");
+    });
+    std::optional<live_update_ticket> acquired;
+    for (int wait = 0; wait < 7 && !acquired; ++wait) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
+        auto attempt = registry.prepare_live_update(model);
+        if (attempt.active) {
+            acquired.emplace(std::move(attempt));
+        }
+    }
+    release_one.join();
+    require(acquired && acquired->active, "bounded backoff did not survive transient ticket exhaustion");
+    require(registry.finalize_live_update(*acquired) == error::OK, "transient ticket finalize failed");
+    auto replacement = registry.prepare_live_update(model);
+    require(replacement.active, "failed to restore saturated capacity");
+
+    const auto started = std::chrono::steady_clock::now();
+    error persistent = error::BUSY;
+    for (int wait = 0; persistent == error::BUSY && wait < 7; ++wait) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
+        auto attempt = registry.prepare_live_update(model);
+        persistent = attempt.code;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    require(persistent == error::BUSY, "persistent exhaustion changed result contract");
+    require(elapsed < std::chrono::seconds(1), "persistent exhaustion was not bounded");
+
+    require(registry.finalize_live_update(replacement) == error::OK, "replacement ticket finalize failed");
+    for (size_t i = 1; i < held.size(); ++i) {
+        require(registry.finalize_live_update(held[i]) == error::OK, "held ticket finalize failed");
+    }
+    require(registry.teardown(model) == error::OK, "saturation model teardown failed");
+}
+
 static void duplicate_publication_case() {
     Registry           registry;
     const auto         begin = registry.begin_outer();
@@ -160,6 +212,7 @@ int main() {
     durable_replay_case();
     finite_id_limit_case();
     quarantine_wrapper_busy_overlap_case();
+    live_update_ticket_saturation_case();
     duplicate_publication_case();
     return 0;
 }

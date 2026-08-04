@@ -450,7 +450,9 @@ checks = {
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "ggml_backend_sycl_shutdown" in backend
     and "g_watchdog_thread.detach()" not in (root / "ggml/src/ggml-sycl/common.cpp").read_text()
-    and "final module unload with shutdown hook" in
+    and "final clean module unload" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "ggml_backend_unload_checked(reg)" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "DL SYCL module has private CPU traits and no CPU linkage":
         re.search(r"if \(NOT GGML_BACKEND_DL\).*?target_link_libraries\(ggml-sycl PRIVATE ggml-cpu\).*?endif",
@@ -548,6 +550,8 @@ checks = {
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count("ggml_backend_load(") >= 2,
     "canonical G1 registration": "sycl-lifecycle-gpu-sequential"
     in (root / "tests/CMakeLists.txt").read_text()
+    and "infer(o.a_shared, o, selected)"
+    in (root / "tests/test-sycl-lifecycle-gpu-sequential.cpp").read_text()
     and "GGML_SYCL_G1_MODEL_A"
     not in (root / "tests/test-sycl-lifecycle-g1-aba.sh").read_text(),
 }

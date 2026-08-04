@@ -1,26 +1,7 @@
-// Cross-model state-leak regression test (llama.cpp-k7b0).
-//
-// test-llama-archs loads ~131 architectures sequentially in ONE process.
-// Any process-global that describes "the model currently being loaded" and
-// is never reset between loads leaks into the next model -- the same shape
-// of bug as the kv_tier_manager resize()-vs-assign() defect that motivated
-// this audit, one level up (a process-global instead of a per-device
-// singleton). This test proves one confirmed instance of that class
-// end-to-end through the REAL production API:
-// ggml_backend_sycl_register_weight_usage() / ggml_sycl_get_tensor_usage()
-// (g_sycl_weight_usages, ggml-sycl.cpp), bracketed by the REAL load
-// boundary, ggml_backend_sycl_model_load_begin(), whose outer branch
-// calls ggml_sycl_reset_model_load_scratch_state() (the fix under test).
-//
-// The bug: ggml_backend_sycl_register_weight_usage() only *emplaces* a
-// name's usage on first sight, and forces UNKNOWN on a *mismatch* against
-// whatever is already mapped -- correct within one model's own tied-weight
-// detection (e.g. a legacy checkpoint tying output.weight to
-// token_embd.weight). Never clearing the map between models means a name a
-// PREVIOUS, unrelated model forced to UNKNOWN for its own reasons poisons a
-// DIFFERENT model's first, and only, registration of that same name:
-// `it->second != mapped` reads true against the stale UNKNOWN, so the new
-// model's real classification is silently discarded before it is ever used.
+// Exact-owner weight-usage regression. A and B remain LIVE concurrently and
+// classify the same tensor name differently. Activating A, then B, then A
+// again must select immutable metadata by exact ModelToken rather than a
+// process-global name row or "most recently loaded" state.
 //
 // All tensor names below are synthetic ("zzz_test_*") and deliberately
 // unlike any real GGUF tensor name, so ggml_sycl_get_tensor_usage()'s
@@ -30,12 +11,8 @@
 // registry/reset behavior, not of the fallback classifier -- see
 // tests/test-sycl-tensor-usage.cpp for that.
 //
-// Mutation that proves this test is specific to the fix and not a
-// tautology: comment out the `g_sycl_weight_usages.clear();` line inside
-// ggml_sycl_reset_model_load_scratch_state() (ggml-sycl.cpp). Only check 4
-// fails ("model B: shared name gets its OWN usage, not model A's stale
-// UNKNOWN"); checks 1-3 stay green. That is the specificity bar this test
-// is held to: it detects THIS leak, not "something changed".
+// Mutation control: key g_sycl_weight_usages by bare name, or clear it at B's
+// load boundary. The B or reactivated-A exact-owner checks then fail.
 
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -74,14 +51,6 @@ int main() {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
-    const auto & info = ggml_sycl_info();
-    if (info.device_count <= 0) {
-        // 77 (ctest SKIP_RETURN_CODE), not 0: nothing was verified, so this
-        // must not report success.
-        fprintf(stderr, "SKIP: no SYCL devices available -- NO DEVICE WORK WAS PERFORMED.\n");
-        return 77;
-    }
-
     ggml_init_params params{};
     params.mem_size    = 16 * 1024 * 1024;
     params.mem_buffer  = nullptr;
@@ -93,9 +62,19 @@ int main() {
     }
 
     // ---- Model A --------------------------------------------------------
+    ggml_sycl_tensor_inventory inventory{};
+    inventory.n_ctx = 32;
+    inventory.n_ubatch = 8;
+    ggml_sycl_placement_envelope envelope{};
+    envelope.n_ctx = 32;
+    envelope.n_ubatch = 8;
+    envelope.n_seq_max = 1;
+
     ggml_sycl_load_txn load_a{};
     ggml_sycl_model_token model_a{};
     check(ggml_backend_sycl_model_load_begin(&load_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle begin");
+    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+          "model A plan stage");
 
     // Check 1 (positive control): first-sight registration of a name unique
     // to this run classifies correctly. Failing this means the harness
@@ -126,6 +105,8 @@ int main() {
     ggml_sycl_load_txn load_b{};
     ggml_sycl_model_token model_b{};
     check(ggml_backend_sycl_model_load_begin(&load_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle begin");
+    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+          "model B plan stage");
 
     // Check 3 (negative control): the reused name, registered fresh with
     // the SAME usage as model A, must still read correctly after the reset.
@@ -144,6 +125,15 @@ int main() {
           "check 4: model B's shared name gets its OWN usage, not model A's stale UNKNOWN");
 
     check(ggml_backend_sycl_model_load_end(load_b, true, &model_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle commit");
+
+    // Reactivating A must select A's exact immutable metadata even though B's
+    // LIVE same-name row has a different classification.
+    check(ggml_backend_sycl_activate_model_plan(model_a) == GGML_SYCL_LIFECYCLE_OK, "reactivate exact model A");
+    check(usage_of(ctx, "zzz_test_tied") == tensor_usage::UNKNOWN,
+          "check 5: A->B->reactivate-A lookup restores A exact same-name usage");
+    check(ggml_backend_sycl_activate_model_plan(model_b) == GGML_SYCL_LIFECYCLE_OK, "reactivate exact model B");
+    check(usage_of(ctx, "zzz_test_tied") == tensor_usage::EMBEDDING,
+          "check 6: exact B lookup remains independent of A");
     ggml_free(ctx);
     (void) ggml_backend_sycl_model_unloaded_token(model_b);
     (void) ggml_backend_sycl_model_unloaded_token(model_a);

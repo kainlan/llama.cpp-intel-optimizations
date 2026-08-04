@@ -17,12 +17,14 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 //
 // llama_context
@@ -416,8 +418,14 @@ llama_context::llama_context(
                 }
                 const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                       owner.slot_generation };
-                auto                        rc    = GGML_SYCL_LIFECYCLE_BUSY;
-                for (int attempt = 0; attempt < 3 && rc == GGML_SYCL_LIFECYCLE_BUSY; ++attempt) {
+                auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max);
+                // Context construction may overlap enough live updates to
+                // exhaust the model's finite ticket pool transiently. Wait
+                // with bounded exponential backoff instead of spinning three
+                // immediate calls; preserve BUSY if capacity never frees.
+                constexpr int max_busy_waits = 7;
+                for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                     rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max);
                 }
                 if (rc != GGML_SYCL_LIFECYCLE_OK) {

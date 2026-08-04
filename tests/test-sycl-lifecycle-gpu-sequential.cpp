@@ -249,7 +249,10 @@ int main(int argc, char ** argv) {
     } else {
         runs.push_back({ "A", infer(o.a, o, selected) });
         runs.push_back({ "B", infer(o.b, o, selected) });
-        runs.push_back({ "A", infer(o.a, o, selected) });
+        // The final A oracle must come from the distinct renamed A-shared
+        // path; using o.a again would not exercise shared/deduplicated owner
+        // identity across distinct model objects.
+        runs.push_back({ "A", infer(o.a_shared, o, selected) });
     }
     llama_backend_free();
     for (const auto & run : runs) {
