@@ -2625,6 +2625,10 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-cpu-gpu-soa-interaction PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-cpu-gpu-soa-interaction COMMAND test-cpu-gpu-soa-interaction)
+    set_tests_properties(test-cpu-gpu-soa-interaction PROPERTIES
+        LABELS "sycl;gpu;soa;interaction;restored"
+        RUN_SERIAL TRUE
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2660,6 +2664,21 @@ if (NOT GGML_BACKEND_DL)
     set_tests_properties(test-mmq-q8-0-streaming-forced PROPERTIES
         ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=1"
     )
+    set_tests_properties(
+        test-mmvq-q8-0-streaming-bench
+        test-mmvq-q8-0-streaming-smoke
+        test-mmq-q8-0-streaming-smoke
+        test-mmq-q8-0-streaming-forced
+        PROPERTIES
+        LABELS "sycl;gpu;benchmark;manual;streaming;restored"
+    )
+    set_tests_properties(
+        test-mmvq-q8-0-streaming-bench
+        test-mmq-q8-0-streaming-smoke
+        test-mmq-q8-0-streaming-forced
+        PROPERTIES
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2683,6 +2702,11 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-mxfp4-xmx-tiled PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-mxfp4-xmx-tiled COMMAND test-mxfp4-xmx-tiled)
+    set_tests_properties(test-mxfp4-xmx-tiled PROPERTIES
+        LABELS "sycl;gpu;xmx;tiled;restored"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2706,6 +2730,10 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-q6k-reorder-dispatch PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-q6k-reorder-dispatch COMMAND test-q6k-reorder-dispatch)
+    set_tests_properties(test-q6k-reorder-dispatch PROPERTIES
+        LABELS "sycl;gpu;q6k;reorder;dispatch;restored"
+        RUN_SERIAL TRUE
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2729,6 +2757,11 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-sycl-expert-prefetch PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-sycl-expert-prefetch COMMAND test-sycl-expert-prefetch)
+    set_tests_properties(test-sycl-expert-prefetch PROPERTIES
+        LABELS "sycl;gpu;moe;prefetch;restored"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
@@ -2752,6 +2785,11 @@ if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
         target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-sycl-fattn-onednn-descriptors COMMAND test-sycl-fattn-onednn-descriptors)
+    set_tests_properties(test-sycl-fattn-onednn-descriptors PROPERTIES
+        LABELS "sycl;gpu;onednn;fattn;descriptors;restored"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2775,6 +2813,10 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-sycl-set-rows-owner-routing PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-sycl-set-rows-owner-routing COMMAND test-sycl-set-rows-owner-routing)
+    set_tests_properties(test-sycl-set-rows-owner-routing PROPERTIES
+        LABELS "sycl;gpu;set-rows;owner-routing;restored"
+        RUN_SERIAL TRUE
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)
@@ -2798,6 +2840,11 @@ if (NOT GGML_BACKEND_DL)
         target_link_libraries(test-unified-dispatch-integration PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME test-unified-dispatch-integration COMMAND test-unified-dispatch-integration)
+    set_tests_properties(test-unified-dispatch-integration PROPERTIES
+        LABELS "sycl;gpu;unified;dispatch;integration;restored"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 add_executable(test-sycl-unified-cache
