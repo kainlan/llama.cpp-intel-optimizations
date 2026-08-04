@@ -362,7 +362,6 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
                     packed_ptr[block_base_half + elem_off_half] = sycl::half(src_val);
                 }
             });
-        });
     });
     // Publish accepted work to the owner before optional bookkeeping can throw.
     if (accepted_event != nullptr) {

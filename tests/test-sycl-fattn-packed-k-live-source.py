@@ -41,6 +41,8 @@ def production_contract(
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
         "sycl::event event = stream->submit",
+        "            });\n    });\n    // Publish accepted work",
+        "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
@@ -336,6 +338,8 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
         "sycl::event event = stream->submit",
+        "            });\n    });\n    // Publish accepted work",
+        "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
@@ -349,6 +353,11 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "head_count > int64_max / static_cast<size_t>(packed_head_stride)",
     ):
         assert not production_contract(FATTN.replace(needle, "/* mutation removed seam */"), XMX)
+    assert not production_contract(
+        FATTN.replace(
+            "            });\n    });\n    // Publish accepted work",
+            "            });\n        });\n    });\n    // Publish accepted work", 1),
+        XMX)
     assert not production_contract(
         FATTN, XMX,
         FATTN_HPP.replace(
