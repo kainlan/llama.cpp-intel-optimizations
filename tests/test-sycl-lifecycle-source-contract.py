@@ -554,6 +554,13 @@ checks = {
     "runtime wrapper links aggregate registry in static and DL builds":
         sycl_cmake.count("target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml") == 2
         and "propagates the selected SYCL/CPU backend libraries" in sycl_cmake,
+    "registry builtins initialize after object construction": "ggml_backend_registry() = default" in registry_backend
+    and "void register_builtin_backends()" in registry_backend
+    and "!reg->iface.get_device_count || !reg->iface.get_device" in registry_backend
+    and "!device || device->reg != reg" in registry_backend
+    and "std::call_once(builtin_once, [&] { reg.register_builtin_backends(); })" in registry_backend
+    and "generic registry tombstone/failure fixture" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "base-safe lifecycle admission function table": "ggml_backend_set_registry_lifecycle" in backend_base
     and "g_registry_begin.load" in backend_base
     and "ggml_backend_registry_begin_call(reg)" not in backend_base

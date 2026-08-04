@@ -202,7 +202,13 @@ struct ggml_backend_registry {
     std::vector<ggml_backend_reg_entry_ptr>  backends;
     std::vector<ggml_backend_device_entry>   devices;
 
-    ggml_backend_registry() {
+    ggml_backend_registry() = default;
+
+    // Run only after the registry object is fully constructed and published by
+    // get_reg(). Backend constructors may enter complex runtime code; invoking
+    // them from this object's constructor exposes a partially-initialized
+    // registry to any indirect generic registration path.
+    void register_builtin_backends() {
         // Only referenced inside the per-backend GGML_USE_* blocks below, so it
         // is unused in a CPU-only build.
         [[maybe_unused]] const bool disable_device_backends = ggml_backend_device_backends_disabled();
@@ -286,7 +292,7 @@ struct ggml_backend_registry {
 
     bool register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr,
                           std::string module_path = {}) noexcept {
-        if (!reg) {
+        if (!reg || !reg->iface.get_name || !reg->iface.get_device_count || !reg->iface.get_device) {
             return false;
         }
         try {
@@ -304,7 +310,11 @@ struct ggml_backend_registry {
             std::vector<ggml_backend_dev_t> staged_devices;
             staged_devices.reserve(count);
             for (size_t i = 0; i < count; ++i) {
-                staged_devices.push_back(reg->iface.get_device(reg, i));
+                ggml_backend_dev_t device = reg->iface.get_device(reg, i);
+                if (!device || device->reg != reg) {
+                    return false;
+                }
+                staged_devices.push_back(device);
             }
             const bool dynamic = handle != nullptr;
             auto candidate = std::make_shared<ggml_backend_reg_entry>(
@@ -741,6 +751,8 @@ void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
 
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
+    static std::once_flag builtin_once;
+    std::call_once(builtin_once, [&] { reg.register_builtin_backends(); });
     static const ggml_backend_registry_lifecycle_i lifecycle_iface = {
         ggml_backend_registry_begin_call,
         ggml_backend_registry_end_call,
