@@ -4,7 +4,8 @@
 //
 // Available after Task 17 registers this test target:
 // Build: cmake --build build --target test-cpu-gpu-soa-interaction
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-cpu-gpu-soa-interaction
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-cpu-gpu-soa-interaction  # rc 0
+// Positive control: append --corrupt-post-copy  # [SOA-REACH], [SOA-POSITIVE-CONTROL], rc 1
 
 #include "dequantize.hpp"
 
@@ -12,7 +13,17 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
+
+static bool configure_bounded_runtime() {
+    // reorder_rows_to_soa() intentionally enters the unified allocator for its
+    // temporary device copy.  This unit-sized fixture must not reserve the
+    // default full-VRAM arena or a 2 GiB pinned backing chunk to do that.
+    return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0 &&
+           setenv("GGML_SYCL_PINNED_CHUNK_MB", "16", 1) == 0;
+}
 
 template <typename T>
 class usm_allocation {
@@ -179,7 +190,7 @@ bool test_actual_dequantize_functions() {
 }
 
 // Test 2: Verify the production GPU reorder path
-bool test_actual_reorder_kernel() {
+bool test_actual_reorder_kernel(bool corrupt_post_copy) {
     printf("Test 2: Verify production GPU reorder path\n");
 
     sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
@@ -217,6 +228,11 @@ bool test_actual_reorder_kernel() {
     // Copy back
     std::vector<uint8_t> soa_result(size);
     q.memcpy(soa_result.data(), gpu_data, size).wait();
+    fprintf(stderr, "[SOA-REACH] production reorder copy reached post-copy oracle\n");
+    if (corrupt_post_copy) {
+        soa_result[0] ^= 0xFF;
+        fprintf(stderr, "[SOA-POSITIVE-CONTROL] corrupted post-copy result; oracle must fail\n");
+    }
 
     // Verify SoA layout
     const size_t d_offset = nrows * ncols / 2;
@@ -570,9 +586,24 @@ bool test_dmmv_soa_reference() {
     return true;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    bool corrupt_post_copy = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--corrupt-post-copy") == 0) {
+            corrupt_post_copy = true;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!configure_bounded_runtime()) {
+        fprintf(stderr, "FAIL: could not configure bounded SYCL test allocations\n");
+        return 1;
+    }
+
     printf("=== CPU→GPU SoA Interaction Tests ===\n");
-    printf("Using production dequantization and Q4_0 reorder paths\n\n");
+    printf("Using production dequantization and Q4_0 reorder paths\n");
+    printf("Bounded runtime: VRAM arena disabled, pinned chunks capped at 16 MiB\n\n");
 
     try {
         int passed = 0;
@@ -581,7 +612,7 @@ int main() {
         if (test_actual_dequantize_functions()) passed++; else failed++;
         printf("\n");
 
-        if (test_actual_reorder_kernel()) passed++; else failed++;
+        if (test_actual_reorder_kernel(corrupt_post_copy)) passed++; else failed++;
         printf("\n");
 
         if (test_cpu_gpu_path_with_soa()) passed++; else failed++;
