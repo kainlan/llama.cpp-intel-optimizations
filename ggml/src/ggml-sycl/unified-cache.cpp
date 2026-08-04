@@ -7930,7 +7930,12 @@ static bool weight_entry_reclaimable(const unified_cache_entry & entry, weight_r
     if (mode == weight_reclaim_mode::MID_LOAD_REPLAN) {
         return true;
     }
-    if (!entry.owner_tagged && live_mask != 0) {
+    // A model teardown may reclaim only state attributed to that model. An
+    // untagged entry was created with no load/finisher authority on its thread;
+    // claiming it merely because another thread is loading would violate the
+    // exact transaction boundary. Generic load-boundary cleanup may still reap
+    // it once no model is live.
+    if (!entry.owner_tagged && (mode == weight_reclaim_mode::MODEL_TEARDOWN || live_mask != 0)) {
         return false;
     }
     return true;
@@ -7999,6 +8004,16 @@ bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
         }
     }
     return found;
+}
+
+uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    for (const auto & pair : entries_) {
+        if (detail::cache_id_equal(pair.first.id, key) && pair.second.layout == layout) {
+            return pair.second.pending_load_txn_id;
+        }
+    }
+    return 0;
 }
 
 void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
@@ -8277,6 +8292,13 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                     entries_owned++;
                 } else {
                     entries_untagged++;
+                    if (mode == weight_reclaim_mode::MODEL_TEARDOWN) {
+                        GGML_SYCL_DEBUG(
+                            "[UNIFIED-CACHE] model teardown preserved unattributed runtime entry "
+                            "model=%llu name_hash=0x%llx layout=%d pending_load=%llu\n",
+                            (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
+                            (int) entry.layout, (unsigned long long) entry.pending_load_txn_id);
+                    }
                 }
                 ++it;
                 continue;

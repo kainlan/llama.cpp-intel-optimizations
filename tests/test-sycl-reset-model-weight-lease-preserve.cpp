@@ -94,6 +94,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 
@@ -527,23 +528,54 @@ static bool test_unrelated_thread_entry_not_claimed(sycl::queue & q) {
     std::vector<uint8_t>     runtime_data(128, 0x32);
     ggml_sycl_cache_id       loading_key = ggml_sycl::test_make_cache_id(loading_data.data());
     ggml_sycl_cache_id       runtime_key = ggml_sycl::test_make_cache_id(runtime_data.data());
-    if (!stage_with_idle_aos_sibling(cache, q, loading_key, loading_data, "B staging")) {
+    auto &                   registry    = ggml_sycl::lifecycle::global_registry();
+    auto                     begin       = registry.begin_outer();
+    if (begin.code != ggml_sycl::lifecycle::error::OK) {
+        fprintf(stderr, "failed to begin exact B load transaction\n");
         return false;
     }
 
-    bool        thread_ok = false;
+    struct load_abort_guard {
+        ggml_sycl::lifecycle::Registry * registry;
+        ggml_sycl::lifecycle::LoadTxnId  txn;
+
+        ~load_abort_guard() {
+            registry->unbind_candidate(txn);
+            ggml_sycl::lifecycle_abort_placement_plan(txn.value);
+            (void) registry->end(txn, false);
+        }
+    } load_guard{ &registry, begin.txn };
+
+    registry.bind_candidate(begin.txn);
+    ggml_sycl::placement_plan plan{};
+    plan.build_index();
+    ggml_sycl::lifecycle_stage_placement_plan(begin.txn.value, std::move(plan));
+
+    {
+        ggml_sycl::scoped_planned_materialization materialize(&cache, "exact B load staging");
+        if (!stage_with_idle_aos_sibling(cache, q, loading_key, loading_data, "B staging")) {
+            return false;
+        }
+    }
+
+    bool        thread_ok      = false;
+    bool        thread_unbound = false;
     std::thread unrelated([&] {
+        thread_unbound = registry.bound_candidate().value == 0 && registry.bound_finisher_effect().load.value == 0;
         thread_ok = stage_with_idle_aos_sibling(cache, q, runtime_key, runtime_data, "unrelated runtime staging");
     });
     unrelated.join();
-    if (!thread_ok) {
+    if (!thread_ok || !thread_unbound) {
+        fprintf(stderr, "unrelated runtime thread inherited load or finisher authority\n");
         return false;
     }
 
-    if (!cache.test_mark_entry_touched_by_load(loading_key, GGML_LAYOUT_AOS, 201)) {
+    if (cache.test_entry_pending_load_txn(loading_key, GGML_LAYOUT_AOS) != begin.txn.value ||
+        cache.test_entry_pending_load_txn(runtime_key, GGML_LAYOUT_AOS) != 0) {
+        fprintf(stderr, "load attribution crossed the explicit thread-local B scope\n");
         return false;
     }
-    cache.note_model_load_end(0, 201);
+    cache.note_model_load_end(0, begin.txn.value);
     cache.release_model_slot(0);
     if (cache.is_cached(loading_key, GGML_LAYOUT_AOS)) {
         return false;

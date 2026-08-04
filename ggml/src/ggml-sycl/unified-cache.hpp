@@ -2400,7 +2400,8 @@ class unified_cache {
     // after S1-PRELOAD, so it covers both what this load staged and anything it
     // reused from an earlier model (identical GGUF weights dedupe to one entry).
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
-    bool test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
+    bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
+    uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
 
     void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
     void note_model_load_abort(uint64_t load_txn_id);
