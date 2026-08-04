@@ -11,6 +11,8 @@ public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+sycl_cmake = (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
 placement_paths = sorted(
     [root / "ggml/include/ggml-sycl.h"]
     + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
@@ -415,8 +417,24 @@ checks = {
     "bound transaction uses exact effect admission": "const auto txn      = registry.bound_candidate()" in cache_cpp
     and "registry.acquire_load_effect(txn)" in cache_cpp
     and "lifecycle_find_candidate_placement_plan(effect.owner.load.value)" in cache_cpp,
-    "direct cache tests link lifecycle authority":
-        (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text().count("model-lifecycle.cpp") >= 6,
+    "direct cache tests link lifecycle authority": sycl_cmake.count("model-lifecycle.cpp") >= 6,
+    "DL excludes only incomplete direct-source cache fixtures": all(
+        re.search(r"if \(NOT GGML_BACKEND_DL\)\s+add_executable\(" + re.escape(target), sycl_cmake)
+        for target in (
+            "test-unified-cache-fast-path",
+            "test-mem-handle-eviction",
+            "test-sycl-runtime-alloc",
+        )
+    )
+    and all(name in sycl_cmake for name in (
+        "test-sycl-lifecycle-load-txn",
+        "test-sycl-lifecycle-runtime-host",
+        "test-sycl-lifecycle-runtime-wrapper",
+        "test-sycl-module-dlopen",
+        "test-sycl-lifecycle-public-api",
+    ))
+    and re.search(r"if \(NOT GGML_BACKEND_DL\)\s+set\(TARGET sycl-kernel-bench\)", sycl_bench_cmake)
+    and "sycl-mxfp4-source-line-probe" in sycl_bench_cmake,
     "DL unload drains module state before dlclose": "ggml_backend_shutdown" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
     and "ggml_backend_sycl_shutdown" in backend

@@ -1291,6 +1291,11 @@ set_tests_properties(mmq-xmx-dispatch PROPERTIES
 
 # Reader-writer lock optimization on the cache-hit fast path (TDD).
 # LABELS drop the old "cache" -- see rule 2 above.
+# This fixture compiles unified-cache.cpp directly and relies on the static
+# ggml-sycl target to close its full internal symbol graph. A MODULE library is
+# not linkable into an executable, so the same partial-TU fixture is invalid in
+# DL builds; dynamic lifecycle/module coverage remains registered above.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-fast-path
     tests/test-unified-cache-fast-path.cpp
     unified-cache.cpp
@@ -1318,6 +1323,7 @@ set_tests_properties(unified-cache-fast-path PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # direct-source static SYCL fixture
 
 # Evict accounting, realloc failure handling, unaligned hash.
 # LABELS drop the old "cache" -- see rule 2 above.
@@ -1384,6 +1390,10 @@ set_tests_properties(sycl-kv-view-resolution PROPERTIES
 # LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
 endif() # static SYCL backend fixture
 
+# Direct internal-TU fixture: static ggml-sycl supplies the remaining runtime,
+# watchdog, queue, debug, and placement definitions. Do not manufacture mocks
+# for the DL build that would test a different dependency graph.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-eviction
     tests/test-mem-handle-eviction.cpp
     unified-cache.cpp
@@ -1412,6 +1422,7 @@ set_tests_properties(mem-handle-eviction PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # direct-source static SYCL fixture
 
 # mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11).
 # Single-GPU: tests 1-4 run; multi-device tests skip gracefully.
@@ -1491,6 +1502,9 @@ set_tests_properties(mem-ops PROPERTIES
 # unified_alloc lifetime, offload-pool hit/miss accounting.
 endif() # static SYCL backend fixture
 
+# Like the two direct-source cache fixtures above, this target depends on the
+# static backend to complete unified-cache.cpp's internal symbol closure.
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-runtime-alloc
     tests/test-unified-runtime-alloc.cpp
     unified-cache.cpp
@@ -1518,6 +1532,7 @@ set_tests_properties(sycl-runtime-alloc PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
 )
+endif() # direct-source static SYCL fixture
 
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
