@@ -484,6 +484,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     device_buffer<sycl::half> kbuf(q, D * N_KV, device);
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
+    ggml_sycl_fattn_xmx_packed_k packed;
     controlled_gate gate;
     controlled_gate_release_guard gate_guard(gate, dependency_q, q);
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
@@ -491,7 +492,6 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     const auto plan = tiny_plan(params);
     require(plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE, "tiny packed plan rejected");
 
-    ggml_sycl_fattn_xmx_packed_k packed;
     const uint64_t fill_errors_before = ggml_sycl::mem_fill_test_profile_error_after_submit_count();
     set_mem_fill_profile_error_after_submit(true);
     const bool fill_profile_error_ok =
@@ -552,6 +552,7 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     device_buffer<float> partial_max(q, 1, device);
     device_buffer<float> partial_sum(q, 1, device);
     device_buffer<float> partial_out(q, D, device);
+    ggml_sycl_fattn_xmx_packed_k packed;
     controlled_gate gate;
     controlled_gate_release_guard gate_guard(gate, dependency_q, q);
     q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
@@ -560,7 +561,6 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     q.memcpy(vbuf.ptr, ones.data(), ones.size() * sizeof(sycl::half)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
 
-    ggml_sycl_fattn_xmx_packed_k packed;
     require(ggml_sycl_fattn_xmx_materialize_packed_k(params, tiny_plan(params), device, &q, &packed),
             "consumer prerequisite materialization failed");
     packed.ready_event.wait_and_throw();
@@ -698,6 +698,7 @@ int main(int argc, char ** argv) {
         dependency_queue.wait_and_throw();
         work_queue.wait_and_throw();
         context_queue->wait_and_throw();
+        ggml_sycl::drain_retained_handles(true);
 
         require(async_failures.load() == 0, "observed asynchronous wait failures");
         require(ggml_sycl::unified_cache_arena_non_weight_used(device) == arena_baseline,

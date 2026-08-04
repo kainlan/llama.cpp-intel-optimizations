@@ -154,11 +154,35 @@ def lifecycle_teardown_contract(source: str) -> bool:
         )
         for index, start_name in enumerate(starts):
             begin = source.index(start_name)
-            end = source.index(starts[index + 1], begin) if index + 1 < len(starts) else source.index("bool preflight_device", begin)
+            end = (source.index(starts[index + 1], begin)
+                   if index + 1 < len(starts) else source.index("bool preflight_device", begin))
             body = source[begin:end]
-            if body.index("controlled_gate_release_guard gate_guard") > body.index("require("):
+            guard = body.index("controlled_gate_release_guard gate_guard")
+            if guard > body.index("require("):
                 return False
+            if start_name != "void run_sidecar_checkpoint":
+                packed = body.index("ggml_sycl_fattn_xmx_packed_k packed;")
+                if packed > guard or guard > body.index("q.memset("):
+                    return False
         return True
+    except ValueError:
+        return False
+
+
+def final_retention_drain_contract(source: str) -> bool:
+    main = source[source.index("int main(int argc, char ** argv)"):]
+    needles = (
+        "dependency_queue.wait_and_throw();",
+        "work_queue.wait_and_throw();",
+        "context_queue->wait_and_throw();",
+        "ggml_sycl::drain_retained_handles(true);",
+        "unified_cache_arena_non_weight_used(device) == arena_baseline",
+        "alloc_registry::instance().total_device_bytes(device) == bytes_baseline",
+        "alloc_registry::instance().size() == registry_baseline",
+    )
+    try:
+        positions = [main.index(needle) for needle in needles]
+        return positions == sorted(positions)
     except ValueError:
         return False
 
@@ -219,12 +243,14 @@ def live_contract(source: str) -> bool:
         "unified_cache_arena_non_weight_used(device) == arena_baseline",
         "size() == registry_baseline",
         "work_queue.wait_and_throw()",
+        "ggml_sycl::drain_retained_handles(true)",
     )
     guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
     return (all(needle in source for needle in required) and
             all(cp in source for cp in CHECKPOINTS) and
             source.count(guard_construction) == 3 and
-            lifecycle_teardown_contract(source))
+            lifecycle_teardown_contract(source) and
+            final_retention_drain_contract(source))
 
 
 def guarded_cmake_block(source: str) -> str | None:
@@ -288,6 +314,18 @@ def test_checkpoint_mutations_are_killed() -> None:
     assert not live_contract(
         LIVE.replace("controlled_gate_release_guard gate_guard(gate, dependency_q, q);",
                      "/* guard moved after assertion */", 1))
+    safe_lifetime = (
+        "ggml_sycl_fattn_xmx_packed_k packed;\n"
+        "    controlled_gate gate;\n"
+        "    controlled_gate_release_guard gate_guard(gate, dependency_q, q);")
+    unsafe_lifetime = (
+        "controlled_gate gate;\n"
+        "    controlled_gate_release_guard gate_guard(gate, dependency_q, q);\n"
+        "    ggml_sycl_fattn_xmx_packed_k packed;")
+    assert not live_contract(LIVE.replace(safe_lifetime, unsafe_lifetime))
+    assert not live_contract(LIVE.replace(
+        "context_queue->wait_and_throw();\n        ggml_sycl::drain_retained_handles(true);",
+        "ggml_sycl::drain_retained_handles(true);\n        context_queue->wait_and_throw();", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -386,6 +424,7 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "std::pair<int, int>{ 64, 1 }",
         "async_failures.load() == 0",
         "size() == registry_baseline",
+        "ggml_sycl::drain_retained_handles(true)",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
