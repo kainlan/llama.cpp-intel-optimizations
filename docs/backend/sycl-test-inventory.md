@@ -660,10 +660,11 @@ sycl-restored` selected 11 and `ctest -N -L manual` selected 4, so neither
 selector proof is a zero-match pass.
 
 The reproducible clean configuration below expands
-`scripts/sycl-build.sh`'s `configure_args` and additionally pins its default
-static topology (`BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`) instead of
-relying on a pre-existing cache. The ccache launchers are included under the
-same availability check as the script.
+`scripts/sycl-build.sh`'s `configure_args` and explicitly pins the required
+source/direct-link backend topology (`GGML_BACKEND_DL=OFF`) instead of relying
+on a pre-existing cache. It leaves `BUILD_SHARED_LIBS` at the script/project
+default because that setting does not govern direct backend linkage. The ccache
+launchers are included under the same availability check as the script.
 
 ```sh
 set -euo pipefail
@@ -683,7 +684,6 @@ configure_args=(
   -DGGML_SYCL_TARGET=INTEL
   -DGGML_SYCL_ONECCL=ON
   -DGGML_SYCL_F16=ON
-  -DBUILD_SHARED_LIBS=OFF
   -DGGML_BACKEND_DL=OFF
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
   '-DCMAKE_INSTALL_RPATH=$ORIGIN'
