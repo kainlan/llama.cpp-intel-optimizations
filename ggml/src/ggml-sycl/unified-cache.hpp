@@ -4233,6 +4233,7 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 // Call this during ggml_backend_sycl_free() to avoid static destruction order issues
 // After calling this, the cache destructors will skip sycl::free() calls
 void shutdown_unified_cache();
+void prepare_unified_cache_for_module_use() noexcept;
 
 // Returns true if SYCL runtime teardown has begun (atexit handler fired).
 // Used by ExpertCache/ExpertPrefetcher to skip sycl::free() during static destruction.

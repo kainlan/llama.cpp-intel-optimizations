@@ -158,6 +158,10 @@ if (BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dependencies.py
                     $<TARGET_FILE:ggml-sycl>)
         set_tests_properties(sycl-module-no-cpu-dependency PROPERTIES LABELS "sycl;module;host")
+        add_test(NAME sycl-module-nodelete-source
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
+        set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host")
     endif()
 
     add_executable(test-sycl-lifecycle-runtime-wrapper

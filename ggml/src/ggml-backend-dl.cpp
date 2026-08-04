@@ -2,7 +2,8 @@
 
 #ifdef _WIN32
 
-dl_handle * dl_load_library(const fs::path & path) {
+dl_handle * dl_load_library(const fs::path & path, bool keep_loaded) {
+    (void) keep_loaded;
     // suppress error dialogs for missing DLLs
     DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
@@ -31,8 +32,16 @@ const char * dl_error() {
 
 #else
 
-dl_handle * dl_load_library(const fs::path & path) {
-    dl_handle * handle = dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+dl_handle * dl_load_library(const fs::path & path, bool keep_loaded) {
+    int flags = RTLD_NOW | RTLD_LOCAL;
+#    if defined(RTLD_NODELETE)
+    if (keep_loaded) {
+        flags |= RTLD_NODELETE;
+    }
+#    else
+    (void) keep_loaded;
+#    endif
+    dl_handle * handle = dlopen(path.string().c_str(), flags);
     return handle;
 }
 

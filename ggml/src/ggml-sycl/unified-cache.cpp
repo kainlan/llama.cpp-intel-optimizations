@@ -12622,6 +12622,10 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     return handle;
 }
 
+void prepare_unified_cache_for_module_use() noexcept {
+    g_sycl_shutting_down.store(false, std::memory_order_release);
+}
+
 void shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so

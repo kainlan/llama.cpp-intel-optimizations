@@ -96131,6 +96131,9 @@ static const ggml_backend_reg_i ggml_backend_sycl_reg_interface = {
 
 // backend registry
 ggml_backend_reg_t ggml_backend_sycl_reg() {
+    // RTLD_NODELETE reloads reuse this module's statics after logical unload.
+    // Re-enable cache allocation before exposing the registry again.
+    ggml_sycl::prepare_unified_cache_for_module_use();
     static ggml_backend_reg reg;
     static bool             initialized = false;
     {
