@@ -649,26 +649,73 @@ found zero matches for the throttled-sweep denylist
 
 The lead supplied generated evidence at the same `fc606640e` snapshot; Task
 17d did not configure, build, or run a GPU. The supplied
-`cmake -S . -B build` completed with rc=0. Its CTest JSON contained **250**
-tests total and exactly **11** `sycl-restored` names, with **7** `RUN_SERIAL`,
-**7** `SKIP_RETURN_CODE 77`, **4** `manual`, and **0** forbidden-label
-matches. `ctest -N -L sycl-restored` selected 11 and `ctest -N -L manual`
-selected 4, so neither selector proof is a zero-match pass.
+`cmake -S . -B build` completed with rc=0 **against an existing configured
+build tree**. That is valid provenance for the generated evidence below, but it
+is only a cache-preserving reconfigure command: in a fresh directory it would
+leave the default `GGML_SYCL=OFF` and would not reproduce these registrations.
+The supplied CTest JSON contained **250** tests total and exactly **11**
+`sycl-restored` names, with **7** `RUN_SERIAL`, **7** `SKIP_RETURN_CODE 77`,
+**4** `manual`, and **0** forbidden-label matches. `ctest -N -L
+sycl-restored` selected 11 and `ctest -N -L manual` selected 4, so neither
+selector proof is a zero-match pass.
 
-Exact commands for the lead's clean handoff (configure/build remain lead-only;
-these listing commands execute no tests) are:
+The reproducible clean configuration below expands
+`scripts/sycl-build.sh`'s `configure_args` and additionally pins its default
+static topology (`BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`) instead of
+relying on a pre-existing cache. The ccache launchers are included under the
+same availability check as the script.
 
 ```sh
-cmake -S . -B build
-cmake --build build --target \
+set -euo pipefail
+set +u
+source /opt/intel/oneapi/setvars.sh --force >/dev/null
+set -u
+
+rm -rf build
+configure_args=(
+  -S .
+  -B build
+  -G Ninja
+  -DCMAKE_BUILD_TYPE=Release
+  '-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG'
+  '-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG'
+  -DGGML_SYCL=ON
+  -DGGML_SYCL_TARGET=INTEL
+  -DGGML_SYCL_ONECCL=ON
+  -DGGML_SYCL_F16=ON
+  -DBUILD_SHARED_LIBS=OFF
+  -DGGML_BACKEND_DL=OFF
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+  '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+  -DCMAKE_C_COMPILER=icx
+  -DCMAKE_CXX_COMPILER=icpx
+)
+if command -v ccache >/dev/null 2>&1; then
+  configure_args+=(
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  )
+fi
+cmake "${configure_args[@]}"
+
+cmake --build build --config Release --target \
   test-cpu-gpu-soa-interaction test-mmvq-q8-0-streaming-bench \
   test-mxfp4-xmx-tiled test-q6k-reorder-dispatch \
   test-sycl-expert-prefetch test-sycl-fattn-onednn-descriptors \
   test-sycl-set-rows-owner-routing test-unified-dispatch-integration -j 1
+
+# Registration/property inspection only; these commands execute no tests.
 ctest --test-dir build -N -L '^sycl-restored$'  # expected: 11 tests
 ctest --test-dir build -N -L '^manual$'         # expected: 4 tests
 ctest --test-dir build --show-only=json-v1 > /tmp/kdfh-ctest.json
 ```
+
+There is intentionally no `-DGGML_SYCL_DNNL=ON` option to add: for
+`GGML_SYCL_TARGET=INTEL`, the SYCL CMake requires `find_package(DNNL REQUIRED)`
+and sets its internal `GGML_SYCL_DNNL=1` only after finding an Intel oneDNN
+package. A clean configure that cannot find that package fails rather than
+silently omitting oneDNN. This is the oneDNN-enabled assumption under which
+`test-sycl-fattn-onednn-descriptors` contributes the eleventh restored name.
 
 The JSON proof must remain nonzero and reconcile to total 250,
 `sycl-restored=11`, `RUN_SERIAL=7`, `SKIP_RETURN_CODE 77=7`, `manual=4`, and
