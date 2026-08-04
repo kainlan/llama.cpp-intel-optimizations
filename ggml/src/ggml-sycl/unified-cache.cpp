@@ -4201,9 +4201,11 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                     if (result.has_ready_event) {
                         result.ready_event = entry.ready_event;
                     }
-                    result.reason   = expert_resolve_reason::FOUND;
-                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_locked(
-                        entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry));
+                    auto lease_owner = entry.storage_owner;
+                    result.reason    = expert_resolve_reason::FOUND;
+                    result.lifetime  = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
+                        entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry,
+                        std::move(lease_owner), result.has_ready_event, result.ready_event));
                     return result;
                 }
                 apply_miss(reject_reason);
@@ -4279,7 +4281,6 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
 
         const size_t         entry_size            = entry.size;
         const cache_location entry_location        = entry.location;
-        const bool           entry_has_ready_event = entry.has_ready_event;
         unified_cache_key    mirror_key =
             make_direct_stage_key(cache_entry_type::MOE_EXPERT, req.key, req.requested_layout);
         lock.unlock();
@@ -4293,10 +4294,14 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             result.owning_device   = owner;
             result.actual_layout   = lease.layout;
             result.cpu_accessible  = !lease.on_device;
-            result.has_ready_event = entry_has_ready_event;
-            result.reason          = expert_resolve_reason::FOUND;
-            result.lifetime        = std::make_unique<mem_handle>(mem_handle::from_weight_lease_locked(
-                mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry));
+            result.has_ready_event = lease.has_ready_event;
+            if (lease.has_ready_event) {
+                result.ready_event = lease.ready_event;
+            }
+            result.reason   = expert_resolve_reason::FOUND;
+            result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
+                mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry,
+                std::move(lease.storage_owner), lease.has_ready_event, lease.ready_event));
             return result;
         }
 

@@ -33,6 +33,12 @@ raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*
 census_fixture = (
     "if (g_has_placement_plan) use(g_placement_plan); cache->get_placement_plan();"
 )
+resolve_expert_body = re.search(
+    r"expert_resolve_result unified_cache::resolve_expert\(.*?^}\n", cache_cpp, re.S | re.M
+).group(0)
+register_usage_body = re.search(
+    r"bool ggml_backend_sycl_register_weight_usage\(.*?^}\n", backend, re.S | re.M
+).group(0)
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -424,6 +430,14 @@ checks = {
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
     "all direct mirrors carry transaction ownership": len(re.findall(
         r"pending_load_txn_id\s*=\s*load_effect_guard\.load_txn_id\(\)", cache_cpp)) >= 4,
+    "expert resolution consumes lease snapshots": "from_weight_lease_locked" not in resolve_expert_body
+    and resolve_expert_body.count("from_weight_lease_snapshot") == 2
+    and "test_expert_abort_after_resolve_snapshot" in
+        (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
+    "weight usage mutation holds exact load effect": "bool ggml_backend_sycl_register_weight_usage" in backend
+    and "acquire_load_effect(registry.bound_candidate())" in register_usage_body
+    and "catch (...)" in register_usage_body
+    and "usage-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
     "lease result snapshots storage ownership": "std::shared_ptr<void> storage_owner" in cache_hpp
     and re.search(r"result\.storage_owner\s*=\s*entry\.storage_owner", cache_cpp)
     and "fresh.storage_owner = std::move(result.storage_owner)" in

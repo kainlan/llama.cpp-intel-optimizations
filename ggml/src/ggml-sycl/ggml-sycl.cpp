@@ -10270,26 +10270,36 @@ static tensor_usage ggml_sycl_usage_from_api(ggml_backend_sycl_tensor_usage usag
     }
 }
 
-void ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
-    if (tensor_name == nullptr || tensor_name[0] == '\0') {
-        return;
-    }
+bool ggml_backend_sycl_register_weight_usage(const char * tensor_name, ggml_backend_sycl_tensor_usage usage) {
+    try {
+        if (tensor_name == nullptr || tensor_name[0] == '\0') {
+            return false;
+        }
 
-    const tensor_usage mapped = ggml_sycl_usage_from_api(usage);
-    if (mapped == tensor_usage::UNKNOWN) {
-        return;
-    }
+        const tensor_usage mapped = ggml_sycl_usage_from_api(usage);
+        if (mapped == tensor_usage::UNKNOWN) {
+            return true;
+        }
 
-    std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
-    const std::string           name(tensor_name);
-    auto                        it = g_sycl_weight_usages.find(name);
-    if (it == g_sycl_weight_usages.end()) {
-        g_sycl_weight_usages.emplace(name, mapped);
-        return;
-    }
+        auto & registry = ggml_sycl::lifecycle::global_registry();
+        auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
+        if (!effect) {
+            return false;
+        }
 
-    if (it->second != mapped) {
-        it->second = tensor_usage::UNKNOWN;  // Tied weights: force safe layout
+        std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
+        const std::string           name(tensor_name);
+        auto                        it = g_sycl_weight_usages.find(name);
+        if (it == g_sycl_weight_usages.end()) {
+            return g_sycl_weight_usages.emplace(name, mapped).second;
+        }
+
+        if (it->second != mapped) {
+            it->second = tensor_usage::UNKNOWN;  // Tied weights: force safe layout
+        }
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 

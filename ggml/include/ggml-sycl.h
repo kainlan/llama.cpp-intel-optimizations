@@ -157,7 +157,7 @@ enum ggml_backend_sycl_tensor_usage {
 };
 
 // Register per-tensor usage metadata (used for layout selection).
-GGML_BACKEND_API void ggml_backend_sycl_register_weight_usage(const char *                        tensor_name,
+GGML_BACKEND_API bool ggml_backend_sycl_register_weight_usage(const char *                        tensor_name,
                                                               enum ggml_backend_sycl_tensor_usage usage);
 
 // Tensor inventory for tiered memory placement

@@ -44,7 +44,8 @@ static void run_case(const std::string & name, test_mutation mutation) {
     } else if (name == "load-effect-drain" || name == "load-effect-abort-drain" || name == "cache-effect-drain" ||
                name == "cache-effect-abort-drain" || name == "planning-effect-drain" ||
                name == "planning-effect-abort-drain" || name == "identity-effect-drain" ||
-               name == "identity-effect-abort-drain") {
+               name == "identity-effect-abort-drain" || name == "usage-effect-drain" ||
+               name == "usage-effect-abort-drain") {
         Registry r;
         auto     begin = r.begin_outer();
         require(begin.code == error::OK, "effect lease begin failed");

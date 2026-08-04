@@ -16,6 +16,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <stdexcept>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1468,7 +1469,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         };
 
-        sycl_hooks.register_usage(ggml_get_name(tensor), usage_from_tensor(selected_tn_tensor));
+        if (!sycl_hooks.register_usage(ggml_get_name(tensor), usage_from_tensor(selected_tn_tensor))) {
+            throw std::runtime_error("SYCL rejected weight-usage metadata for " + std::string(ggml_get_name(tensor)));
+        }
 #else
         GGML_UNUSED(tensor);
 #endif
