@@ -556,10 +556,16 @@ checks = {
         and "propagates the selected SYCL/CPU backend libraries" in sycl_cmake,
     "registry builtins initialize after object construction": "ggml_backend_registry() = default" in registry_backend
     and "void register_builtin_backends()" in registry_backend
-    and "!reg->iface.get_device_count || !reg->iface.get_device" in registry_backend
-    and "!device || device->reg != reg" in registry_backend
+    and "ggml_backend_reg_dev_count_unchecked(reg, &count)" in registry_backend
+    and "ggml_backend_reg_dev_get_unchecked(reg, i, &device)" in registry_backend
+    and "device->reg != reg" not in registry_backend
+    and registry_backend.index("const bool is_new = existing == backends.end()")
+        < registry_backend.index("backends.reserve(backends.size() + (is_new ? 1 : 0))")
+    and "No iterator into backends is used after this point" in registry_backend
     and "std::call_once(builtin_once, [&] { reg.register_builtin_backends(); })" in registry_backend
     and "generic registry tombstone/failure fixture" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "initial_reg_count < 2 || ggml_backend_reg_by_name(\"SYCL\") == nullptr" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "base-safe lifecycle admission function table": "ggml_backend_set_registry_lifecycle" in backend_base
     and "g_registry_begin.load" in backend_base

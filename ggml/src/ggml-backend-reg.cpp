@@ -292,7 +292,7 @@ struct ggml_backend_registry {
 
     bool register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr,
                           std::string module_path = {}) noexcept {
-        if (!reg || !reg->iface.get_name || !reg->iface.get_device_count || !reg->iface.get_device) {
+        if (!reg) {
             return false;
         }
         try {
@@ -306,12 +306,15 @@ struct ggml_backend_registry {
             }
             // Stage all plugin-owned metadata before taking the publication lock.
             const char * name = ggml_backend_reg_name(reg);
-            const size_t count = reg->iface.get_device_count(reg);
+            size_t count = 0;
+            if (!ggml_backend_reg_dev_count_unchecked(reg, &count)) {
+                return false;
+            }
             std::vector<ggml_backend_dev_t> staged_devices;
             staged_devices.reserve(count);
             for (size_t i = 0; i < count; ++i) {
-                ggml_backend_dev_t device = reg->iface.get_device(reg, i);
-                if (!device || device->reg != reg) {
+                ggml_backend_dev_t device = nullptr;
+                if (!ggml_backend_reg_dev_get_unchecked(reg, i, &device)) {
                     return false;
                 }
                 staged_devices.push_back(device);
@@ -327,11 +330,14 @@ struct ggml_backend_registry {
             if (existing != backends.end() && (*existing)->state != ggml_backend_reg_state::REMOVED) {
                 return false;
             }
+            // Capture identity before reserve: reserve may invalidate even the
+            // end iterator. No iterator into backends is used after this point.
+            const bool is_new = existing == backends.end();
+            ggml_backend_reg_entry_ptr entry = is_new ? candidate : *existing;
             // Every potentially-throwing allocation precedes state/vector mutation.
-            backends.reserve(backends.size() + (existing == backends.end() ? 1 : 0));
+            backends.reserve(backends.size() + (is_new ? 1 : 0));
             devices.reserve(devices.size() + staged_devices.size());
-            ggml_backend_reg_entry_ptr entry = existing == backends.end() ? candidate : *existing;
-            if (existing == backends.end()) {
+            if (is_new) {
                 backends.push_back(entry);
             } else {
                 devices.erase(std::remove_if(devices.begin(), devices.end(),

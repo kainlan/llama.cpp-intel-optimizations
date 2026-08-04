@@ -765,6 +765,32 @@ const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
     return reg->iface.get_name(reg);
 }
 
+bool ggml_backend_reg_dev_count_unchecked(ggml_backend_reg_t reg, size_t * count) {
+    if (!reg || !count || !reg->iface.get_device_count) {
+        return false;
+    }
+    try {
+        *count = reg->iface.get_device_count(reg);
+        return true;
+    } catch (...) {
+        *count = 0;
+        return false;
+    }
+}
+
+bool ggml_backend_reg_dev_get_unchecked(ggml_backend_reg_t reg, size_t index, ggml_backend_dev_t * device) {
+    if (!reg || !device || !reg->iface.get_device) {
+        return false;
+    }
+    try {
+        *device = reg->iface.get_device(reg, index);
+        return *device != nullptr;
+    } catch (...) {
+        *device = nullptr;
+        return false;
+    }
+}
+
 size_t ggml_backend_reg_dev_count(ggml_backend_reg_t reg) {
     GGML_ASSERT(reg);
     const auto begin = g_registry_begin.load(std::memory_order_acquire);

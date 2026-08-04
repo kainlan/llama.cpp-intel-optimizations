@@ -86,6 +86,14 @@ static ggml_backend_reg_t registry_fixture() {
 static bool run_registry_failure_fixture() {
     auto reg = registry_fixture();
     ggml_backend_register(reg);
+    const size_t initial_reg_count = ggml_backend_reg_count();
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    if (initial_reg_count < 1) return false;
+#else
+    // Static first-use registration must finish publishing built-in SYCL/CPU
+    // entries before the custom fixture is admitted.
+    if (initial_reg_count < 2 || ggml_backend_reg_by_name("SYCL") == nullptr) return false;
+#endif
 
     g_registry_fixture_mode = registry_fixture_mode::RESOLVER_THROW;
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||

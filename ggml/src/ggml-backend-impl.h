@@ -246,6 +246,12 @@ extern "C" {
     GGML_API void ggml_backend_set_registry_lifecycle(
         const struct ggml_backend_registry_lifecycle_i * iface);
 
+    // Raw metadata access for registry publication/reactivation. These remain
+    // in ggml-base so the opaque registry/device layout is interpreted in one
+    // TU and lifecycle admission is intentionally bypassed only while staging.
+    GGML_API bool ggml_backend_reg_dev_count_unchecked(ggml_backend_reg_t reg, size_t * count);
+    GGML_API bool ggml_backend_reg_dev_get_unchecked(ggml_backend_reg_t reg, size_t index, ggml_backend_dev_t * device);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend
