@@ -422,10 +422,16 @@ checks = {
     "host registration insertion faults roll back": "fail_next_host_registration_insert_.exchange(false)" in cache_cpp
     and "test_host_registration_initial_insert_failures" in
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text(),
+    "all direct mirrors carry transaction ownership": len(re.findall(
+        r"pending_load_txn_id\s*=\s*load_effect_guard\.load_txn_id\(\)", cache_cpp)) >= 4,
+    "cache-owned preload allocation lifetime": "allocation_released_via_owner" in cache_hpp
+    and "ggml_sycl_transfer_alloc_owner" in backend
+    and "leased_storage_owner_" in (root / "ggml/src/ggml-sycl/mem-handle.hpp").read_text()
+    and "entry.storage_owner.reset()" in cache_cpp,
     "abort removes exact pending cache ownership": "direct_expert_entries_.erase(it)" in cache_cpp
     and "direct_weight_entries_.erase(it)" in cache_cpp
     and "entry.owner_mask != 0" in cache_cpp
-    and "entry.pinned && entry.host_resident" in cache_cpp,
+    and "non_owning_external_host" in cache_cpp,
     "transaction-scoped cache ownership promotion": "pending_load_txn_id" in cache_hpp
     and "test_shared_entry_exact_two_owner_unload" in
         (root / "tests/test-sycl-reset-model-weight-lease-preserve.cpp").read_text()

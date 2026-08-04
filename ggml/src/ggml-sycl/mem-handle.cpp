@@ -233,6 +233,9 @@ mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
         h.cached_.ready_event     = entry->ready_event;
     }
     h.leased_entry_ = entry;  // ownership of the refcount bump transferred
+    if (entry) {
+        h.leased_storage_owner_ = entry->storage_owner;
+    }
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
@@ -588,12 +591,14 @@ mem_handle::lease_state mem_handle::take_lease_state_locked() const {
     state.host_chunk_handle = host_chunk_handle_;
     state.vram_chunk_idx    = vram_chunk_idx_;
     state.chunk_device      = chunk_device_;
+    state.storage_owner     = std::move(leased_storage_owner_);
 
     leased_entry_      = nullptr;
     chunk_source_      = 0;
     host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
     vram_chunk_idx_    = -1;
     chunk_device_      = -1;
+    leased_storage_owner_.reset();
 
     return state;
 }
@@ -604,6 +609,7 @@ void mem_handle::store_lease_state_locked(const lease_state & state) const {
     host_chunk_handle_ = state.host_chunk_handle;
     vram_chunk_idx_    = state.vram_chunk_idx;
     chunk_device_      = state.chunk_device;
+    leased_storage_owner_ = state.storage_owner;
 }
 
 void mem_handle::release_lease_state(const lease_state & state) noexcept {
@@ -874,8 +880,9 @@ mem_handle::mem_handle(const mem_handle & other) :
         mem_handle_lock_guard g(other.lock_);
         gen_          = other.gen_;
         cached_       = other.cached_;
-        leased_entry_ = other.leased_entry_;
-        chunk_source_ = other.chunk_source_;
+        leased_entry_         = other.leased_entry_;
+        leased_storage_owner_ = other.leased_storage_owner_;
+        chunk_source_         = other.chunk_source_;
         chunk_device_ = other.chunk_device_;
         if (leased_entry_) {
             leased_entry_->in_use_count.fetch_add(1);
@@ -917,8 +924,9 @@ mem_handle::mem_handle(mem_handle && other) noexcept :
     gen_                 = other.gen_;
     cached_              = other.cached_;
     const lease_state st = other.take_lease_state_locked();
-    leased_entry_        = st.entry;
-    chunk_source_        = st.chunk_source;
+    leased_entry_         = st.entry;
+    leased_storage_owner_ = std::move(st.storage_owner);
+    chunk_source_         = st.chunk_source;
     host_chunk_handle_   = st.host_chunk_handle;
     vram_chunk_idx_      = st.vram_chunk_idx;
     chunk_device_        = st.chunk_device;
@@ -935,13 +943,15 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     unified_cache_entry * new_entry        = nullptr;
     uint8_t               new_chunk_source = 0;
     int                   new_chunk_device = -1;
+    std::shared_ptr<void> new_storage_owner;
     {
         mem_handle_lock_guard g(other.lock_);
         new_gen          = other.gen_;
         new_cached       = other.cached_;
         new_entry        = other.leased_entry_;
         new_chunk_source = other.chunk_source_;
-        new_chunk_device = other.chunk_device_;
+        new_chunk_device  = other.chunk_device_;
+        new_storage_owner = other.leased_storage_owner_;
         if (new_entry) {
             new_entry->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: see the copy ctor -- the copy holds the lease it
@@ -986,6 +996,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         fresh.host_chunk_handle = new_host_chunk_handle;
         fresh.vram_chunk_idx    = new_vram_chunk_idx;
         fresh.chunk_device      = new_chunk_device;
+        fresh.storage_owner     = std::move(new_storage_owner);
         store_lease_state_locked(fresh);
     }
 

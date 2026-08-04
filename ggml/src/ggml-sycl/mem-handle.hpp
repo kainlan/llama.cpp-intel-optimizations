@@ -342,6 +342,7 @@ class mem_handle {
         uint64_t              host_chunk_handle = UINT64_MAX;
         int32_t               vram_chunk_idx    = -1;
         int                   chunk_device      = -1;
+        std::shared_ptr<void> storage_owner;
     };
 
     // Detach this handle's lease state (caller holds lock_).  The handle no
@@ -402,6 +403,7 @@ class mem_handle {
     // MUST NOT erase entries with in_use_count > 0, which is the contract
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
     mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
+    mutable std::shared_ptr<void> leased_storage_owner_;    // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from

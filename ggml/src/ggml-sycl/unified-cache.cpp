@@ -3719,8 +3719,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         direct_entry.location        = cache_location::DEVICE;
         direct_entry.has_ready_event = true;
         direct_entry.ready_event     = last_event;
-        direct_entry.handle          = std::move(direct_handle);
-        direct_expert_entries_[key]  = std::move(direct_entry);
+        direct_entry.handle              = std::move(direct_handle);
+        direct_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+        direct_expert_entries_[key]      = std::move(direct_entry);
         moe_direct_trace_key("insert-device", key, layout, "", direct_expert_entries_.size(),
                              &direct_expert_entries_.find(key)->second);
     }
@@ -3975,7 +3976,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             direct_entry.layout          = layout;
             direct_entry.location        = cache_location::DEVICE;
             direct_entry.has_ready_event = true;
-            direct_entry.ready_event     = fill_event;
+            direct_entry.ready_event         = fill_event;
+            direct_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
             direct_entry.handle =
                 make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert_tensor/mirror");
             direct_entries.push_back(std::move(direct_entry));
@@ -4596,11 +4598,12 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
     return dropped;
 }
 
-bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
-                                         void *             ptr,
-                                         size_t             size,
-                                         ggml_layout_mode   layout,
-                                         mem_handle *       out_handle) {
+bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -4633,6 +4636,9 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
                 stamp_pending_owner(old->second, load_effect_guard);
+                if (allocation_owner && !old->second.storage_owner) {
+                    old->second.storage_owner = allocation_owner;
+                }
                 old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
@@ -4671,6 +4677,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
+        cache_entry.storage_owner    = allocation_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
@@ -4735,11 +4742,12 @@ publish_host_expert_direct:
     return true;
 }
 
-bool unified_cache::register_host_weight(ggml_sycl_cache_id key,
-                                         void *             ptr,
-                                         size_t             size,
-                                         ggml_layout_mode   layout,
-                                         mem_handle *       out_handle) {
+bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -4772,6 +4780,9 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id key,
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
                 stamp_pending_owner(old->second, load_effect_guard);
+                if (allocation_owner && !old->second.storage_owner) {
+                    old->second.storage_owner = allocation_owner;
+                }
                 old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
@@ -4810,6 +4821,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
+        cache_entry.storage_owner    = allocation_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
@@ -7300,6 +7312,10 @@ void unified_cache::release_entry_allocation_locked(unified_cache_entry & entry,
         return;
     }
 
+    if (entry.allocation_released_via_owner || entry.non_owning_external_host) {
+        return;
+    }
+
     if (entry.storage_owner) {
         // Tensor-bulk expert views share a base owner. The owner releases the
         // allocation when the final view drops; individual views do not free.
@@ -8005,14 +8021,18 @@ void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
         }
         if (entry.in_use_count.load() != 0) {
             entry.retired             = true;
-            entry.device_ptr          = nullptr;
-            entry.src_ptr             = nullptr;
             entry.pending_load_txn_id = 0;
+            if (entry.storage_owner) {
+                entry.storage_owner.reset();
+                entry.allocation_released_via_owner = true;
+            }
             ++it;
             continue;
         }
-        // In-place host registrations are model storage, not cache allocations.
-        if (!(entry.pinned && entry.host_resident)) {
+        if (entry.storage_owner) {
+            entry.storage_owner.reset();
+            entry.allocation_released_via_owner = true;
+        } else if (!entry.non_owning_external_host) {
             release_entry_allocation_locked(entry);
         }
         it = entries_.erase(it);

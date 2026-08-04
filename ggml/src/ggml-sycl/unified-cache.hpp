@@ -1580,6 +1580,8 @@ struct unified_cache_entry {
     // When non-null, individual entries must not free device_ptr directly; the
     // shared owner releases the allocation base after the last view is erased.
     std::shared_ptr<void> storage_owner;
+    bool                  allocation_released_via_owner = false;
+    bool                  non_owning_external_host      = false;
     // Optional allocation owner for single-entry direct materializations that
     // are not arena or pool suballocations.
     mem_handle            direct_alloc_owner;
@@ -1892,20 +1894,22 @@ class unified_cache {
     // Register a host-arena pointer directly as a HOST_PINNED expert entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned experts.
-    bool register_host_expert(ggml_sycl_cache_id key,
-                              void *             ptr,
-                              size_t             size,
-                              ggml_layout_mode   layout,
-                              mem_handle *       out_handle = nullptr);
+    bool register_host_expert(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle       = nullptr,
+                              std::shared_ptr<void> allocation_owner = {});
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned dense weights.
-    bool register_host_weight(ggml_sycl_cache_id key,
-                              void *             ptr,
-                              size_t             size,
-                              ggml_layout_mode   layout,
-                              mem_handle *       out_handle = nullptr);
+    bool register_host_weight(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle       = nullptr,
+                              std::shared_ptr<void> allocation_owner = {});
 
     // Placement-plan materialization authority.  In planned mode direct staging
     // and host registration are only legal while model load or an explicit
