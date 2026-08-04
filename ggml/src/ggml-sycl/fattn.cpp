@@ -55,6 +55,14 @@ static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK == fattn_v2_decode_gq
 
 static std::atomic<uint64_t> g_packed_k_profile_error_after_submit_count{ 0 };
 
+void ggml_sycl_fattn_xmx_test_profile_error_after_submit(const char * checkpoint) {
+    const char * selected = std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT");
+    if (selected != nullptr && checkpoint != nullptr && std::strcmp(selected, checkpoint) == 0) {
+        g_packed_k_profile_error_after_submit_count.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc{};
+    }
+}
+
 uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() {
     return g_packed_k_profile_error_after_submit_count.load(std::memory_order_relaxed);
 }
@@ -209,6 +217,9 @@ static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int      n_kv,
     if (n_kv <= 0 || H_kv <= 0 || batch <= 0) {
         return false;
     }
+    if (n_kv > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
+        return false;
+    }
     const int    blocks  = (n_kv + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
     const size_t sbatch  = static_cast<size_t>(batch);
     const size_t sheads  = static_cast<size_t>(H_kv);
@@ -252,7 +263,8 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
                                                               const sycl::event & zero_event,
                                                               const sycl::event & previous_sidecar_event,
                                                               bool                add_zero_dep,
-                                                              bool                add_prev_dep) {
+                                                              bool                add_prev_dep,
+                                                              sycl::event *       accepted_event) {
     const char * src0_base  = static_cast<const char *>(src0_ptr);
     const char * index_base = static_cast<const char *>(index_ptr);
 
@@ -284,8 +296,16 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
     profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
     profile_label.bytes      = static_cast<size_t>(total_elements) * sizeof(float);
 
-    return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
-        return profiled_queue.submit([&](sycl::handler & cgh) {
+    const bool profile_enabled = ggml_sycl_kernel_profile_enabled();
+    const uint64_t host_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    const ggml_sycl::sycl_timeline_callsite callsite{
+        __builtin_FILE(), __builtin_LINE(), __builtin_FUNCTION()
+    };
+    sycl::event event = stream->submit([&](sycl::handler & cgh) {
         if (add_set_rows_dep) {
             cgh.depends_on(set_rows_event);
         }
@@ -347,6 +367,25 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
             });
         });
     });
+    // Publish accepted work to the owner before optional bookkeeping can throw.
+    if (accepted_event != nullptr) {
+        *accepted_event = event;
+    }
+    const uint64_t host_submit_end_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    try {
+        ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update");
+        if (profile_enabled) {
+            ggml_sycl_kernel_profile_record_event(
+                profile_label, event, callsite, host_submit_begin_us, host_submit_end_us);
+        }
+    } catch (...) {
+        GGML_LOG_WARN("[SYCL] packed-K sidecar profiler bookkeeping failed after accepted update submit\n");
+    }
+    return event;
 }
 
 }  // namespace
@@ -359,8 +398,12 @@ ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const f
         params.ne12 <= 0 || params.ne13 <= 0 || !params.K_handle_valid || params.K_view_offs != 0) {
         return nullptr;
     }
+    if (params.ne11 > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
+        return nullptr;
+    }
     const int n_partitions =
-        (params.ne11 + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+        (static_cast<int>(params.ne11) + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) /
+        GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
 
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
     for (const auto & entry : g_packed_k_sidecars) {
@@ -566,15 +609,18 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                     ggml_sycl_fattn_xmx_submit_set_rows_update<int64_t>(
                         src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks, heads_per_i02,
                         static_cast<sycl::half *>(packed.ptr), stream, set_rows_event, zero_event, packed.ready_event,
-                        add_zero_dep, add_prev_dep) :
+                        add_zero_dep, add_prev_dep, &packed.ready_event) :
                     ggml_sycl_fattn_xmx_submit_set_rows_update<int32_t>(
                         src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks, heads_per_i02,
                         static_cast<sycl::half *>(packed.ptr), stream, set_rows_event, zero_event, packed.ready_event,
-                        add_zero_dep, add_prev_dep);
-            packed.ready_event = update_event;
-            if (ggml_sycl::e2e_tg_profile_enabled()) {
-                ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV, "packed_k_sidecar", 0.0, 0.0, total_bytes,
-                                                 1);
+                        add_zero_dep, add_prev_dep, &packed.ready_event);
+            try {
+                if (ggml_sycl::e2e_tg_profile_enabled()) {
+                    ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV, "packed_k_sidecar", 0.0, 0.0,
+                                                     total_bytes, 1);
+                }
+            } catch (...) {
+                GGML_LOG_WARN("[SYCL] packed-K sidecar E2E bookkeeping failed after accepted update submit\n");
             }
             if (out_event) {
                 *out_event = update_event;
@@ -1477,7 +1523,12 @@ bool ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
         return false;
     }
 
-    const int n_blocks = (params.ne11 + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    if (params.ne11 > std::numeric_limits<int>::max() - (GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1)) {
+        return false;
+    }
+    const int n_blocks =
+        (static_cast<int>(params.ne11) + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) /
+        GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
     const size_t seq_count   = static_cast<size_t>(params.ne13);
     const size_t head_count  = static_cast<size_t>(params.ne12);
     const size_t block_count = static_cast<size_t>(n_blocks);
@@ -1679,10 +1730,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                                    0;
         out->ready_event = pack_event;
         try {
-            if (std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT") != nullptr) {
-                g_packed_k_profile_error_after_submit_count.fetch_add(1, std::memory_order_relaxed);
-                throw std::bad_alloc{};
-            }
+            ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack");
             if (pack_profile_enabled) {
                 ggml_sycl_kernel_profile_record_event(
                     profile_label, pack_event,

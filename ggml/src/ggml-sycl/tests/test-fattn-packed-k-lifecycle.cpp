@@ -49,12 +49,12 @@ void enable_sidecar() {
 #endif
 }
 
-void set_profile_error_after_submit(bool enabled) {
+void set_profile_error_after_submit(const char * checkpoint) {
 #if defined(_WIN32)
-    (void) _putenv_s("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", enabled ? "1" : "");
+    (void) _putenv_s("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", checkpoint ? checkpoint : "");
 #else
-    if (enabled) {
-        (void) setenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", "1", 1);
+    if (checkpoint) {
+        (void) setenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT", checkpoint, 1);
     } else {
         (void) unsetenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT");
     }
@@ -134,6 +134,14 @@ ggml_sycl_fattn_xmx_decode_kv_layout_plan tiny_plan(const fattn_params & params)
 void verify_token_boundaries() {
     sycl::half * dummy_half = reinterpret_cast<sycl::half *>(uintptr_t{ 0x1000 });
     float * dummy_float = reinterpret_cast<float *>(uintptr_t{ 0x2000 });
+    const fattn_params ordinary = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float);
+    const auto ordinary_plan = tiny_plan(ordinary);
+    fattn_params overflowing = ordinary;
+    overflowing.ne11 = std::numeric_limits<int64_t>::max();
+    ggml_sycl_fattn_xmx_packed_k_materialization_desc overflow_desc{};
+    require(!ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+                overflowing, ordinary_plan, 0, &overflow_desc),
+            "overflowing packed-K block rounding was accepted");
     for (const auto [tokens, expected_blocks] :
          { std::pair<int, int>{ 63, 1 }, std::pair<int, int>{ 64, 1 }, std::pair<int, int>{ 65, 2 } }) {
         const fattn_params params = tiny_params(dummy_half, dummy_half, dummy_half, dummy_float, tokens);
@@ -363,6 +371,23 @@ void run_sidecar_checkpoint(const std::string & checkpoint,
     const sycl::half payload = copy_after(q, after->ready_event, static_cast<sycl::half *>(after->ptr) + offset);
     require(std::fabs(static_cast<float>(payload) - 3.0f) < 0.01f,
             "sidecar ready-event dependency did not order controlled payload");
+
+    std::vector<float> profile_values(D, 5.0f);
+    q.memcpy(fixture.values.ptr, profile_values.data(), D * sizeof(float)).wait_and_throw();
+    const uint64_t profile_errors_before = ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
+    set_profile_error_after_submit("sidecar-update");
+    const bool profile_error_ok = fixture.update(q, device);
+    set_profile_error_after_submit(nullptr);
+    require(profile_error_ok, "post-submit profiler error changed sidecar update success");
+    after = ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device);
+    require(after != nullptr && after->ptr == retained_ptr && after->handle.valid(),
+            "post-submit profiler error lost sidecar owner");
+    require(ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() == profile_errors_before + 1,
+            "sidecar post-submit profiler error hook was not observed exactly once");
+    const sycl::half profile_payload =
+        copy_after(q, after->ready_event, static_cast<sycl::half *>(after->ptr) + offset);
+    require(std::fabs(static_cast<float>(profile_payload) - 5.0f) < 0.01f,
+            "sidecar post-submit profiler error lost accepted update event or payload");
     verify_range_teardown(fixture, q, device);
 }
 
@@ -406,9 +431,9 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     const sycl::half profile_source(4.0f);
     q.memcpy(kbuf.ptr, &profile_source, sizeof(profile_source)).wait_and_throw();
     const uint64_t profile_errors_before = ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
-    set_profile_error_after_submit(true);
+    set_profile_error_after_submit("materializer-pack");
     const bool profile_error_ok = ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, device, &q, &packed);
-    set_profile_error_after_submit(false);
+    set_profile_error_after_submit(nullptr);
     require(profile_error_ok, "post-submit profiler error changed materializer success");
     require(packed.ptr == retained_ptr && packed.handle.valid(), "post-submit profiler error lost owner");
     require(ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() == profile_errors_before + 1,
@@ -469,6 +494,22 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     const float payload = copy_after(q, packed.ready_event, out.ptr);
     require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
             "consumer ready-event dependency did not order controlled first/merge payload");
+
+    for (const char * profile_checkpoint : { "packed-first", "packed-merge" }) {
+        const uint64_t profile_errors_before = ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
+        set_profile_error_after_submit(profile_checkpoint);
+        const bool profile_error_ok = launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
+            ctx, params, &q, &packed, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1);
+        set_profile_error_after_submit(nullptr);
+        require(profile_error_ok, "post-submit profiler error changed packed consumer success");
+        require(packed.handle.valid() && packed.ptr == retained_ptr,
+                "post-submit profiler error lost packed consumer owner");
+        require(ggml_sycl_fattn_xmx_test_profile_error_after_submit_count() == profile_errors_before + 1,
+                "packed consumer post-submit profiler error hook was not observed exactly once");
+        const float profile_payload = copy_after(q, packed.ready_event, out.ptr);
+        require(std::isfinite(profile_payload) && std::fabs(profile_payload - (65.0f / 64.0f)) < 0.01f,
+                "packed consumer post-submit profiler error lost accepted event or payload");
+    }
     packed.reset();
 }
 
@@ -518,7 +559,7 @@ int main(int argc, char ** argv) {
     }
 
     set_failpoint(nullptr);
-    set_profile_error_after_submit(false);
+    set_profile_error_after_submit(nullptr);
     std::atomic<int> async_failures{ 0 };
     try {
         ggml_backend_sycl_context ctx(0);
@@ -550,7 +591,7 @@ int main(int argc, char ** argv) {
             run_consumer_checkpoint(checkpoint, ctx, work_queue, dependency_queue, device);
         }
         set_failpoint(nullptr);
-        set_profile_error_after_submit(false);
+        set_profile_error_after_submit(nullptr);
         dependency_queue.wait_and_throw();
         work_queue.wait_and_throw();
         context_queue->wait_and_throw();
@@ -568,13 +609,13 @@ int main(int argc, char ** argv) {
     } catch (const sycl::exception & e) {
         ++async_failures;
         set_failpoint(nullptr);
-        set_profile_error_after_submit(false);
+        set_profile_error_after_submit(nullptr);
         std::fprintf(stderr, "FAIL checkpoint=%s SYCL: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;
     } catch (const std::exception & e) {
         set_failpoint(nullptr);
-        set_profile_error_after_submit(false);
+        set_profile_error_after_submit(nullptr);
         std::fprintf(stderr, "FAIL checkpoint=%s: %s async_wait_failures=%d\n",
                      checkpoint.c_str(), e.what(), async_failures.load());
         return 1;

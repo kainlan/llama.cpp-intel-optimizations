@@ -47,6 +47,7 @@
 
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2080,8 +2081,16 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     ggml_sycl_profile_label first_profile_label = fattn_xmx_v2_profile_label(
         *stream, "fattn.compute.xmx_v2_decode_gqa_split_first",
         "role=compute;path=xmx-v2;variant=decode-gqa-split-first");
-    sycl::event first_event = ggml_sycl_profile_submit(*stream, first_profile_label, [&](sycl::queue & profiled_queue) {
-        return profiled_queue.submit([&](sycl::handler & cgh) {
+    const bool profile_enabled = ggml_sycl_kernel_profile_enabled();
+    const uint64_t first_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    const ggml_sycl::sycl_timeline_callsite first_callsite{
+        __builtin_FILE(), __builtin_LINE(), __builtin_FUNCTION()
+    };
+    sycl::event first_event = stream->submit([&](sycl::handler & cgh) {
         if constexpr (PACKED_K) {
             if (add_packed_dep) {
                 cgh.depends_on(packed_ready_event);
@@ -2104,6 +2113,26 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     if constexpr (PACKED_K) {
         if (packed_k_ready_event != nullptr) {
             *packed_k_ready_event = first_event;
+        }
+    }
+    const uint64_t first_submit_end_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    try {
+        if constexpr (PACKED_K) {
+            ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first");
+        }
+        if (profile_enabled) {
+            ggml_sycl_kernel_profile_record_event(
+                first_profile_label, first_event, first_callsite, first_submit_begin_us, first_submit_end_us);
+        }
+    } catch (...) {
+        GGML_LOG_WARN("[SYCL] packed-K first-kernel profiler bookkeeping failed after accepted submit\n");
+    }
+    if constexpr (PACKED_K) {
+        if (packed_k_ready_event != nullptr) {
             ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge");
         }
     }
@@ -2114,8 +2143,15 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     ggml_sycl_profile_label merge_profile_label = fattn_xmx_v2_profile_label(
         *stream, "fattn.compute.xmx_v2_decode_gqa_split_merge",
         "role=compute;path=xmx-v2;variant=decode-gqa-split-merge");
-    sycl::event merge_event = ggml_sycl_profile_submit(*stream, merge_profile_label, [&](sycl::queue & profiled_queue) {
-        return profiled_queue.submit([&](sycl::handler & cgh) {
+    const uint64_t merge_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    const ggml_sycl::sycl_timeline_callsite merge_callsite{
+        __builtin_FILE(), __builtin_LINE(), __builtin_FUNCTION()
+    };
+    sycl::event merge_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(first_event);
         cgh.parallel_for(sycl::nd_range<3>(merge_grid * merge_block, merge_block),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
@@ -2125,6 +2161,27 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                          });
         });
     });
+    if constexpr (PACKED_K) {
+        if (packed_k_ready_event != nullptr) {
+            *packed_k_ready_event = merge_event;
+        }
+    }
+    const uint64_t merge_submit_end_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    try {
+        if constexpr (PACKED_K) {
+            ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge");
+        }
+        if (profile_enabled) {
+            ggml_sycl_kernel_profile_record_event(
+                merge_profile_label, merge_event, merge_callsite, merge_submit_begin_us, merge_submit_end_us);
+        }
+    } catch (...) {
+        GGML_LOG_WARN("[SYCL] packed-K merge-kernel profiler bookkeeping failed after accepted submit\n");
+    }
     return merge_event;
 }
 
@@ -2267,7 +2324,11 @@ static bool fattn_xmx_v2_decode_gqa_split_supported(const fattn_params & params,
         if (gqa_ratio <= 0 || gqa_ratio > XMX_V2_DECODE_GQA_MAX) {
             return false;
         }
-        const int expected_partitions = (params.ne11 + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV;
+        if (params.ne11 > std::numeric_limits<int>::max() - (XMX_V2_DECODE_BATCH_KV - 1)) {
+            return false;
+        }
+        const int expected_partitions =
+            (static_cast<int>(params.ne11) + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV;
         if (n_partitions != expected_partitions) {
             return false;
         }
