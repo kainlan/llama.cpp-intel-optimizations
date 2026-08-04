@@ -205,6 +205,7 @@ void verify_host_boundaries() {
 class packed_k_half_payload_kernel;
 class packed_k_rows_payload_kernel;
 class packed_k_device_spin_gate_kernel;
+class packed_k_device_spin_gate_release_kernel;
 
 class controlled_gate {
   public:
@@ -262,21 +263,27 @@ class controlled_gate_release_guard {
 };
 
 // Level Zero may synchronously block queue.submit behind an incomplete host_task.
-// A device-side USM atomic keeps the dependency event load-bearing while allowing
-// the retry fill submission to return and publish its accepted event to the host.
+// Keep the dependency load-bearing with a device-only atomic, and release it
+// through a separate compatible queue so no shared/system-atomic USM is needed.
 class device_spin_gate {
   public:
     device_spin_gate(sycl::queue & dependency_queue, sycl::queue & work_queue) :
-        dependency_queue_(dependency_queue), work_queue_(work_queue) {
-        flag_ = sycl::malloc_shared<uint32_t>(1, dependency_queue_);
+        dependency_queue_(dependency_queue),
+        release_queue_(dependency_queue.get_context(), dependency_queue.get_device()),
+        work_queue_(work_queue) {
+        flag_ = sycl::malloc_device<uint32_t>(1, dependency_queue_);
         if (flag_ == nullptr) {
             throw std::runtime_error("device spin gate allocation failed");
         }
-        *flag_ = 0;
+        release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw();
     }
 
     ~device_spin_gate() noexcept {
         release();
+        try {
+            release_queue_.wait();
+        } catch (...) {
+        }
         try {
             dependency_queue_.wait();
         } catch (...) {
@@ -297,7 +304,7 @@ class device_spin_gate {
             cgh.single_task<packed_k_device_spin_gate_kernel>([=]() {
                 using atomic_type = sycl::atomic_ref<uint32_t,
                                                      sycl::memory_order::relaxed,
-                                                     sycl::memory_scope::system,
+                                                     sycl::memory_scope::device,
                                                      sycl::access::address_space::global_space>;
                 while (atomic_type(*flag).load(sycl::memory_order::acquire) == 0) {
                 }
@@ -306,33 +313,36 @@ class device_spin_gate {
     }
 
     void release() noexcept {
-        if (flag_ != nullptr) {
-            using atomic_type = sycl::atomic_ref<uint32_t,
-                                                 sycl::memory_order::relaxed,
-                                                 sycl::memory_scope::system,
-                                                 sycl::access::address_space::global_space>;
-            atomic_type(*flag_).store(1, sycl::memory_order::release);
+        if (flag_ == nullptr || released_) {
+            return;
+        }
+        uint32_t * flag = flag_;
+        try {
+            release_queue_.submit([&](sycl::handler & cgh) {
+                cgh.single_task<packed_k_device_spin_gate_release_kernel>([=]() {
+                    using atomic_type = sycl::atomic_ref<uint32_t,
+                                                         sycl::memory_order::relaxed,
+                                                         sycl::memory_scope::device,
+                                                         sycl::access::address_space::global_space>;
+                    atomic_type(*flag).store(1, sycl::memory_order::release);
+                });
+            }).wait();
+            released_ = true;
+        } catch (...) {
         }
     }
 
-    bool released() const noexcept {
-        if (flag_ == nullptr) {
-            return true;
-        }
-        using atomic_type = sycl::atomic_ref<uint32_t,
-                                             sycl::memory_order::relaxed,
-                                             sycl::memory_scope::system,
-                                             sycl::access::address_space::global_space>;
-        return atomic_type(*flag_).load(sycl::memory_order::acquire) != 0;
-    }
+    bool released() const noexcept { return released_; }
 
     device_spin_gate(const device_spin_gate &) = delete;
     device_spin_gate & operator=(const device_spin_gate &) = delete;
 
   private:
     sycl::queue & dependency_queue_;
+    sycl::queue   release_queue_;
     sycl::queue & work_queue_;
     uint32_t *    flag_ = nullptr;
+    bool          released_ = false;
 };
 
 sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
@@ -770,8 +780,7 @@ bool preflight_device() {
         const sycl::device & dev = devices.front();
         const size_t required_slm = fattn_v2_decode_gqa_slm<D>::TOTAL * sizeof(sycl::half);
         if (!dev.has(sycl::aspect::fp16) ||
-            !dev.has(sycl::aspect::usm_shared_allocations) ||
-            !dev.has(sycl::aspect::usm_atomic_shared_allocations) ||
+            !dev.has(sycl::aspect::usm_device_allocations) ||
             !fattn_xmx_v2_decode_m1n64_supported(dev, 16) ||
             dev.get_info<sycl::info::device::local_mem_size>() < required_slm) {
             return false;

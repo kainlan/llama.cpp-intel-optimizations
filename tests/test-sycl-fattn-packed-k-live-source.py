@@ -191,19 +191,26 @@ def lifecycle_teardown_contract(source: str) -> bool:
         device_gate_end = source.index("sycl::event submit_half_payload", device_gate_begin)
         device_gate = source[device_gate_begin:device_gate_end]
         device_gate_needles = (
-            "sycl::malloc_shared<uint32_t>",
+            "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
+            "sycl::malloc_device<uint32_t>",
+            "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
             "~device_spin_gate() noexcept",
             "release();",
+            "release_queue_.wait();",
             "dependency_queue_.wait();",
             "work_queue_.wait();",
             "sycl::free(flag_, dependency_queue_);",
             "cgh.single_task<packed_k_device_spin_gate_kernel>",
+            "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
+            "sycl::memory_scope::device",
             "atomic_type(*flag).load(sycl::memory_order::acquire)",
+            "atomic_type(*flag).store(1, sycl::memory_order::release)",
         )
         if not all(needle in device_gate for needle in device_gate_needles):
             return False
         destructor = device_gate[device_gate.index("~device_spin_gate() noexcept"):device_gate.index("sycl::event submit()")]
-        destructor_needles = ("release();", "dependency_queue_.wait();", "work_queue_.wait();", "sycl::free")
+        destructor_needles = (
+            "release();", "release_queue_.wait();", "dependency_queue_.wait();", "work_queue_.wait();", "sycl::free")
         if [destructor.index(needle) for needle in destructor_needles] != sorted(
                 destructor.index(needle) for needle in destructor_needles):
             return False
@@ -303,8 +310,7 @@ def live_contract(source: str) -> bool:
         "SKIP_UNSUPPORTED = 77",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
         "dev.has(sycl::aspect::fp16)",
-        "dev.has(sycl::aspect::usm_shared_allocations)",
-        "dev.has(sycl::aspect::usm_atomic_shared_allocations)",
+        "dev.has(sycl::aspect::usm_device_allocations)",
         "fattn_xmx_v2_decode_m1n64_supported(dev, 16)",
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
@@ -319,8 +325,11 @@ def live_contract(source: str) -> bool:
         "work_queue_.wait()",
         "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
         "class device_spin_gate",
-        "sycl::malloc_shared<uint32_t>",
+        "sycl::malloc_device<uint32_t>",
+        "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
+        "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
         "cgh.single_task<packed_k_device_spin_gate_kernel>",
+        "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
         "device_spin_gate gate(dependency_q, q)",
         "const sycl::event gate_event = gate.submit()",
         "submit_retry_before_gate_release",
@@ -596,11 +605,16 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "submit_retry_after_accepted_signal",
         "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
         "class device_spin_gate",
-        "sycl::malloc_shared<uint32_t>",
+        "sycl::malloc_device<uint32_t>",
+        "release_queue_(dependency_queue.get_context(), dependency_queue.get_device())",
+        "release_queue_.memset(flag_, 0, sizeof(*flag_)).wait_and_throw()",
         "cgh.single_task<packed_k_device_spin_gate_kernel>",
+        "cgh.single_task<packed_k_device_spin_gate_release_kernel>",
         "device_spin_gate gate(dependency_q, q)",
         "const sycl::event gate_event = gate.submit()",
-        "dev.has(sycl::aspect::usm_atomic_shared_allocations)",
+        "dev.has(sycl::aspect::usm_device_allocations)",
+        "release_queue_.wait()",
+        "sycl::memory_scope::device",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
