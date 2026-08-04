@@ -204,6 +204,7 @@ void verify_host_boundaries() {
 
 class packed_k_half_payload_kernel;
 class packed_k_rows_payload_kernel;
+class packed_k_device_spin_gate_kernel;
 
 class controlled_gate {
   public:
@@ -258,6 +259,80 @@ class controlled_gate_release_guard {
     controlled_gate & gate_;
     sycl::queue &     dependency_queue_;
     sycl::queue &     work_queue_;
+};
+
+// Level Zero may synchronously block queue.submit behind an incomplete host_task.
+// A device-side USM atomic keeps the dependency event load-bearing while allowing
+// the retry fill submission to return and publish its accepted event to the host.
+class device_spin_gate {
+  public:
+    device_spin_gate(sycl::queue & dependency_queue, sycl::queue & work_queue) :
+        dependency_queue_(dependency_queue), work_queue_(work_queue) {
+        flag_ = sycl::malloc_shared<uint32_t>(1, dependency_queue_);
+        if (flag_ == nullptr) {
+            throw std::runtime_error("device spin gate allocation failed");
+        }
+        *flag_ = 0;
+    }
+
+    ~device_spin_gate() noexcept {
+        release();
+        try {
+            dependency_queue_.wait();
+        } catch (...) {
+        }
+        try {
+            work_queue_.wait();
+        } catch (...) {
+        }
+        try {
+            sycl::free(flag_, dependency_queue_);
+        } catch (...) {
+        }
+    }
+
+    sycl::event submit() {
+        uint32_t * flag = flag_;
+        return dependency_queue_.submit([&](sycl::handler & cgh) {
+            cgh.single_task<packed_k_device_spin_gate_kernel>([=]() {
+                using atomic_type = sycl::atomic_ref<uint32_t,
+                                                     sycl::memory_order::relaxed,
+                                                     sycl::memory_scope::system,
+                                                     sycl::access::address_space::global_space>;
+                while (atomic_type(*flag).load(sycl::memory_order::acquire) == 0) {
+                }
+            });
+        });
+    }
+
+    void release() noexcept {
+        if (flag_ != nullptr) {
+            using atomic_type = sycl::atomic_ref<uint32_t,
+                                                 sycl::memory_order::relaxed,
+                                                 sycl::memory_scope::system,
+                                                 sycl::access::address_space::global_space>;
+            atomic_type(*flag_).store(1, sycl::memory_order::release);
+        }
+    }
+
+    bool released() const noexcept {
+        if (flag_ == nullptr) {
+            return true;
+        }
+        using atomic_type = sycl::atomic_ref<uint32_t,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::system,
+                                             sycl::access::address_space::global_space>;
+        return atomic_type(*flag_).load(sycl::memory_order::acquire) != 0;
+    }
+
+    device_spin_gate(const device_spin_gate &) = delete;
+    device_spin_gate & operator=(const device_spin_gate &) = delete;
+
+  private:
+    sycl::queue & dependency_queue_;
+    sycl::queue & work_queue_;
+    uint32_t *    flag_ = nullptr;
 };
 
 sycl::event submit_half_payload(sycl::queue & q, const sycl::event & gate_event, sycl::half * ptr, sycl::half value) {
@@ -321,8 +396,8 @@ bool submit_retry_before_gate_release(controlled_gate & gate, Fn && fn) {
     return result;
 }
 
-template <typename Fn, typename AcceptedFn>
-bool submit_retry_after_accepted_signal(controlled_gate & gate, Fn && fn, AcceptedFn && accepted) {
+template <typename Gate, typename Fn, typename AcceptedFn>
+bool submit_retry_after_accepted_signal(Gate & gate, Fn && fn, AcceptedFn && accepted) {
     bool               result = false;
     std::exception_ptr error;
     std::thread retry_thread([&]() {
@@ -515,8 +590,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     device_buffer<sycl::half> vbuf(q, D * N_KV, device);
     device_buffer<float> out(q, D, device);
     ggml_sycl_fattn_xmx_packed_k packed;
-    controlled_gate gate;
-    controlled_gate_release_guard gate_guard(gate, dependency_q, q);
+    device_spin_gate gate(dependency_q, q);
     q.memset(kbuf.ptr, 0, D * N_KV * sizeof(sycl::half)).wait_and_throw();
     fattn_params params = tiny_params(qbuf.ptr, kbuf.ptr, vbuf.ptr, out.ptr);
     const auto plan = tiny_plan(params);
@@ -534,7 +608,7 @@ void run_materializer_checkpoint(const std::string & checkpoint,
             "materializer mem_fill profiler error hook was not observed exactly once");
     packed.ready_event.wait_and_throw();
     void * retained_ptr = packed.ptr;
-    const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    const sycl::event gate_event = gate.submit();
     packed.ready_event = submit_half_payload(dependency_q, gate_event, kbuf.ptr, sycl::half(2.0f));
 
     set_failpoint(checkpoint.c_str());
@@ -696,6 +770,8 @@ bool preflight_device() {
         const sycl::device & dev = devices.front();
         const size_t required_slm = fattn_v2_decode_gqa_slm<D>::TOTAL * sizeof(sycl::half);
         if (!dev.has(sycl::aspect::fp16) ||
+            !dev.has(sycl::aspect::usm_shared_allocations) ||
+            !dev.has(sycl::aspect::usm_atomic_shared_allocations) ||
             !fattn_xmx_v2_decode_m1n64_supported(dev, 16) ||
             dev.get_info<sycl::info::device::local_mem_size>() < required_slm) {
             return false;

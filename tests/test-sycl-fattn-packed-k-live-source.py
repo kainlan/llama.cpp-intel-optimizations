@@ -161,12 +161,15 @@ def lifecycle_teardown_contract(source: str) -> bool:
             end = (source.index(starts[index + 1], begin)
                    if index + 1 < len(starts) else source.index("void initialize_production_baseline", begin))
             body = source[begin:end]
-            guard = body.index("controlled_gate_release_guard gate_guard")
-            if guard > body.index("require("):
+            if start_name == "void run_materializer_checkpoint":
+                gate = body.index("device_spin_gate gate(dependency_q, q);")
+            else:
+                gate = body.index("controlled_gate_release_guard gate_guard")
+            if gate > body.index("require("):
                 return False
             if start_name != "void run_sidecar_checkpoint":
                 packed = body.index("ggml_sycl_fattn_xmx_packed_k packed;")
-                if packed > guard or guard > body.index("q.memset("):
+                if packed > gate or gate > body.index("q.memset("):
                     return False
             if start_name == "void run_materializer_checkpoint":
                 accepted_needles = (
@@ -184,6 +187,26 @@ def lifecycle_teardown_contract(source: str) -> bool:
                     accepted_positions.append(accepted_cursor)
                 if accepted_positions != sorted(accepted_positions):
                     return False
+        device_gate_begin = source.index("class device_spin_gate")
+        device_gate_end = source.index("sycl::event submit_half_payload", device_gate_begin)
+        device_gate = source[device_gate_begin:device_gate_end]
+        device_gate_needles = (
+            "sycl::malloc_shared<uint32_t>",
+            "~device_spin_gate() noexcept",
+            "release();",
+            "dependency_queue_.wait();",
+            "work_queue_.wait();",
+            "sycl::free(flag_, dependency_queue_);",
+            "cgh.single_task<packed_k_device_spin_gate_kernel>",
+            "atomic_type(*flag).load(sycl::memory_order::acquire)",
+        )
+        if not all(needle in device_gate for needle in device_gate_needles):
+            return False
+        destructor = device_gate[device_gate.index("~device_spin_gate() noexcept"):device_gate.index("sycl::event submit()")]
+        destructor_needles = ("release();", "dependency_queue_.wait();", "work_queue_.wait();", "sycl::free")
+        if [destructor.index(needle) for needle in destructor_needles] != sorted(
+                destructor.index(needle) for needle in destructor_needles):
+            return False
         signal_begin = source.index("bool submit_retry_after_accepted_signal")
         signal_end = source.index("template <typename T>", signal_begin)
         signal = source[signal_begin:signal_end]
@@ -280,6 +303,8 @@ def live_contract(source: str) -> bool:
         "SKIP_UNSUPPORTED = 77",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
         "dev.has(sycl::aspect::fp16)",
+        "dev.has(sycl::aspect::usm_shared_allocations)",
+        "dev.has(sycl::aspect::usm_atomic_shared_allocations)",
         "fattn_xmx_v2_decode_m1n64_supported(dev, 16)",
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
@@ -293,6 +318,11 @@ def live_contract(source: str) -> bool:
         "dependency_queue_.wait()",
         "work_queue_.wait()",
         "controlled_gate_release_guard gate_guard(gate, dependency_q, q)",
+        "class device_spin_gate",
+        "sycl::malloc_shared<uint32_t>",
+        "cgh.single_task<packed_k_device_spin_gate_kernel>",
+        "device_spin_gate gate(dependency_q, q)",
+        "const sycl::event gate_event = gate.submit()",
         "submit_retry_before_gate_release",
         "submit_retry_after_accepted_signal",
         "retry fill submission was not accepted before gate release",
@@ -345,7 +375,7 @@ def live_contract(source: str) -> bool:
     guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
     return (all(needle in source for needle in required) and
             all(cp in source for cp in CHECKPOINTS) and
-            source.count(guard_construction) == 3 and
+            source.count(guard_construction) == 2 and
             lifecycle_teardown_contract(source) and
             backend_owner_contract(source) and
             baseline_accounting_contract(source) and
@@ -440,6 +470,12 @@ def test_checkpoint_mutations_are_killed() -> None:
         "const bool accepted_before_release = false;\n    const bool was_unreleased", 1))
     assert not live_contract(LIVE.replace(
         "submit_retry_after_accepted_signal(", "submit_retry_before_gate_release(", 1))
+    assert not live_contract(LIVE.replace(
+        "const sycl::event gate_event = gate.submit();",
+        "const sycl::event gate_event = submit_controlled_gate(dependency_q, nullptr);", 1))
+    assert not live_contract(LIVE.replace(
+        "~device_spin_gate() noexcept {\n        release();",
+        "~device_spin_gate() noexcept {", 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -559,6 +595,12 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "initialize_production_baseline(ctx, work_queue, device)",
         "submit_retry_after_accepted_signal",
         "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
+        "class device_spin_gate",
+        "sycl::malloc_shared<uint32_t>",
+        "cgh.single_task<packed_k_device_spin_gate_kernel>",
+        "device_spin_gate gate(dependency_q, q)",
+        "const sycl::event gate_event = gate.submit()",
+        "dev.has(sycl::aspect::usm_atomic_shared_allocations)",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
