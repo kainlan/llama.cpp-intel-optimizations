@@ -29,7 +29,7 @@ struct llama_model_loader_sycl_hooks {
     decltype(&ggml_backend_sycl_host_buffer_type_for_device) host_buffer_type_for_device = nullptr;
     decltype(&ggml_backend_sycl_register_host_weight_tensor) register_host_weight        = nullptr;
     decltype(&ggml_backend_sycl_register_weight_identity)    register_identity           = nullptr;
-    decltype(&ggml_backend_sycl_register_weight_usage)       register_usage              = nullptr;
+    decltype(&ggml_backend_sycl_try_register_weight_usage)   try_register_usage          = nullptr;
 };
 
 static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_backend_dev_t dev) {
@@ -47,7 +47,7 @@ static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_back
     LOAD_SYCL_PROC(host_buffer_type_for_device, "ggml_backend_sycl_host_buffer_type_for_device");
     LOAD_SYCL_PROC(register_host_weight, "ggml_backend_sycl_register_host_weight_tensor");
     LOAD_SYCL_PROC(register_identity, "ggml_backend_sycl_register_weight_identity");
-    LOAD_SYCL_PROC(register_usage, "ggml_backend_sycl_register_weight_usage");
+    LOAD_SYCL_PROC(try_register_usage, "ggml_backend_sycl_try_register_weight_usage");
 #    undef LOAD_SYCL_PROC
     return hooks;
 }
@@ -1331,7 +1331,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         const auto sycl_hooks = llama_model_loader_sycl_hooks_for(selected_final_dev);
         if (!sycl_hooks.reg || !sycl_hooks.weights_evictable || !sycl_hooks.register_host_weight ||
-            !sycl_hooks.register_identity || !sycl_hooks.register_usage) {
+            !sycl_hooks.register_identity || !sycl_hooks.try_register_usage) {
             return;
         }
 
@@ -1469,7 +1469,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         };
 
-        if (!sycl_hooks.register_usage(ggml_get_name(tensor), usage_from_tensor(selected_tn_tensor))) {
+        if (!sycl_hooks.try_register_usage(ggml_get_name(tensor), usage_from_tensor(selected_tn_tensor))) {
             throw std::runtime_error("SYCL rejected weight-usage metadata for " + std::string(ggml_get_name(tensor)));
         }
 #else

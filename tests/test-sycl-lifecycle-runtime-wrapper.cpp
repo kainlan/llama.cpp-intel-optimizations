@@ -55,6 +55,7 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_register_host_weight_tensor)
     LOAD_SYCL(ggml_backend_sycl_register_weight_identity)
     LOAD_SYCL(ggml_backend_sycl_register_weight_usage)
+    LOAD_SYCL(ggml_backend_sycl_try_register_weight_usage)
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
     LOAD_SYCL(ggml_backend_sycl_model_load_end)
@@ -75,6 +76,10 @@ int main() {
     CALL_SYCL(ggml_backend_sycl_register_host_weight_tensor)(nullptr, nullptr);
     CALL_SYCL(ggml_backend_sycl_register_weight_identity)(nullptr, 0, 0, 0, 0);
     CALL_SYCL(ggml_backend_sycl_register_weight_usage)(nullptr, GGML_SYCL_TENSOR_USAGE_UNKNOWN);
+    if (CALL_SYCL(ggml_backend_sycl_try_register_weight_usage)(nullptr, GGML_SYCL_TENSOR_USAGE_UNKNOWN)) {
+        std::fprintf(stderr, "status weight-usage API accepted null metadata\n");
+        return 1;
+    }
 
     ggml_sycl_model_token zero{};
     if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||

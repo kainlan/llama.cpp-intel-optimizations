@@ -301,7 +301,7 @@ checks = {
             ("host_buffer_type_for_device", "ggml_backend_sycl_host_buffer_type_for_device"),
             ("register_host_weight", "ggml_backend_sycl_register_host_weight_tensor"),
             ("register_identity", "ggml_backend_sycl_register_weight_identity"),
-            ("register_usage", "ggml_backend_sycl_register_weight_usage"),
+            ("try_register_usage", "ggml_backend_sycl_try_register_weight_usage"),
         )
     )
     and "defined(GGML_BACKEND_DL)" in (root / "src/llama-model-loader.cpp").read_text()
@@ -311,7 +311,13 @@ checks = {
     and "final_sycl_hooks.reg && final_sycl_hooks.weights_evictable" in
         (root / "src/llama-model-loader.cpp").read_text()
     and "sycl_hooks.register_identity" in (root / "src/llama-model-loader.cpp").read_text()
-    and "sycl_hooks.register_usage" in (root / "src/llama-model-loader.cpp").read_text()
+    and "sycl_hooks.try_register_usage" in (root / "src/llama-model-loader.cpp").read_text()
+    and "ggml_backend_sycl_register_weight_usage" not in
+        (root / "src/llama-model-loader.cpp").read_text()
+    and "LOAD_SYCL(ggml_backend_sycl_register_weight_usage)" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "LOAD_SYCL(ggml_backend_sycl_try_register_weight_usage)" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and all(f'strcmp(name, "{name}")' in backend for name in (
         "ggml_backend_sycl_weights_evictable",
         "ggml_backend_sycl_host_buffer_type",
@@ -319,6 +325,7 @@ checks = {
         "ggml_backend_sycl_register_host_weight_tensor",
         "ggml_backend_sycl_register_weight_identity",
         "ggml_backend_sycl_register_weight_usage",
+        "ggml_backend_sycl_try_register_weight_usage",
     )),
     "CPU speculative lifecycle cancellation": "sycl_model_loading_guard.cancel()" in llama
     and "if (has_sycl_weight_buffer)" in llama
