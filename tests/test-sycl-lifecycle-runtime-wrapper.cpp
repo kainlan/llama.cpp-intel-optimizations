@@ -1,6 +1,12 @@
 #include "ggml-sycl.h"
 
+#include <chrono>
 #include <cstdio>
+#include <future>
+#include <thread>
+
+extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
+extern "C" void ggml_backend_sycl_test_release_live_update();
 
 static void phase(const char * name) {
     std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
@@ -40,6 +46,10 @@ int main() {
             return 1;                                                                                      \
         }
     LOAD_SYCL(ggml_backend_sycl_shutdown)
+    LOAD_SYCL(ggml_backend_sycl_can_unload)
+    LOAD_SYCL(ggml_backend_sycl_cancel_unload)
+    LOAD_SYCL(ggml_backend_sycl_test_hold_live_update)
+    LOAD_SYCL(ggml_backend_sycl_test_release_live_update)
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
@@ -63,6 +73,17 @@ int main() {
 #    define CALL_SYCL(name) name##_fn
 #else
 #    define CALL_SYCL(name) name
+#endif
+
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    phase("post-check admission reservation");
+    ggml_sycl_load_txn reserved_begin{};
+    if (!CALL_SYCL(ggml_backend_sycl_can_unload)() ||
+        CALL_SYCL(ggml_backend_sycl_model_load_begin)(&reserved_begin) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
+        std::fprintf(stderr, "shutdown reservation admitted a post-check load\n");
+        return 1;
+    }
+    CALL_SYCL(ggml_backend_sycl_cancel_unload)();
 #endif
 
     // Allocation-parity procedures must resolve from the current registry in
@@ -104,6 +125,12 @@ int main() {
         std::fprintf(stderr, "runtime begin failed\n");
         return 1;
     }
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "active load did not reject checked unload\n");
+        return 1;
+    }
+#endif
     const auto abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(aborted, false, nullptr);
     if (abort_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && abort_rc != GGML_SYCL_LIFECYCLE_POISONED) {
         std::fprintf(stderr, "runtime abort returned %d\n", (int) abort_rc);
@@ -150,24 +177,51 @@ int main() {
         return 1;
     }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
-    phase("live-owner unload rejection");
+    phase("live-owner and teardown-overlap unload rejection");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
-        !ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token")) {
+        !CALL_SYCL(ggml_backend_sycl_test_hold_live_update)(token)) {
         std::fprintf(stderr, "live-owner unload was not observably deferred\n");
         return 1;
     }
-#endif
+    auto overlapping_teardown = std::async(std::launch::async, [&] {
+        return CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(token);
+    });
+    if (overlapping_teardown.wait_for(std::chrono::milliseconds(20)) != std::future_status::timeout ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
+        std::fprintf(stderr, "DRAINING_UPDATES unload overlap was not rejected\n");
+        return 1;
+    }
+    CALL_SYCL(ggml_backend_sycl_test_release_live_update)();
+    if (overlapping_teardown.get() != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "overlapping teardown did not recover\n");
+        return 1;
+    }
+#else
     phase("model teardown");
     if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(token) != GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "runtime teardown failed\n");
         return 1;
     }
+#endif
     const auto repeat = CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(token);
     if (repeat != GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD && repeat != GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
         std::fprintf(stderr, "runtime repeated teardown returned %d\n", (int) repeat);
         return 1;
     }
 #if defined(GGML_SYCL_RUNTIME_MODULE)
+    phase("quarantined-owner unload rejection");
+    ggml_sycl_load_txn quarantine_txn{};
+    ggml_sycl_model_token quarantine_token{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&quarantine_txn) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_model_load_end)(quarantine_txn, true, &quarantine_token) !=
+            GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_model_quarantine_token)(quarantine_token) != GGML_SYCL_LIFECYCLE_OK ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
+        CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(quarantine_token) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "quarantined owner unload guard/recovery failed\n");
+        return 1;
+    }
     if (CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
         std::fprintf(stderr, "teardown retained placement authority\n");
         return 1;

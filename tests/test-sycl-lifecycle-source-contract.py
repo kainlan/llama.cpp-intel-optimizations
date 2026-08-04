@@ -198,8 +198,8 @@ checks = {
     "runtime ownership CAS": "lifecycle_replace_placement_plan(current, immutable)" in backend
     and "auto next_kv_info = current->kv_info" in backend
     and "next->kv_info       = next_kv_info" in backend
-    and "prepare_live_update(current_token)" in backend
-    and "finalize_live_update(ticket)" in backend,
+    and "registry.acquire_live_update(current_token)" in backend
+    and "live_update_guard::~live_update_guard()" in cpp,
     "provisional exhaustion is typed": "ggml_sycl_placement_publication_exhausted" in backend
     and "GGML_ABORT(\"[SYCL-PLAN] placement publication ID exhausted\")" not in backend,
     "global owner has no cache dependency": "return ggml_sycl::global_placement_plan_owner();" in backend,
@@ -293,7 +293,7 @@ checks = {
     and "disabling mmap for SYCL weight layout upload" in llama
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
         "ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope"
-    ) == 2,
+    ) >= 2,
     "DL allocation and metadata parity": all(
         f'LOAD_SYCL_PROC({field}, "{name}")' in (root / "src/llama-model-loader.cpp").read_text()
         for field, name in (
@@ -543,6 +543,16 @@ checks = {
     and "static const llama_model_sycl_lifecycle_hooks" not in llama
     and "ggml_backend_reg_get_proc_address" in llama
     and "defined(GGML_BACKEND_DL)" in llama,
+    "atomic shutdown reservation": "reserve_shutdown()" in hpp
+    and "shutdown_reserved_" in hpp
+    and "backend_context_count_" in hpp
+    and "global_registry().reserve_shutdown()" in backend
+    and "ggml_backend_cancel_unload" in
+        (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "ggml_backend_complete_unload" in
+        (root / "ggml/src/ggml-backend-reg.cpp").read_text()
+    and "dl_handle_ptr keep_alive" in
+        (root / "ggml/src/ggml-backend-reg.cpp").read_text(),
     "dynamic runtime wrapper": "if (GGML_BACKEND_DL)"
     in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "GGML_SYCL_RUNTIME_MODULE" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()

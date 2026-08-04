@@ -173,6 +173,82 @@ static void live_update_ticket_saturation_case() {
     require(registry.teardown(model) == error::OK, "saturation model teardown failed");
 }
 
+static void shutdown_reservation_state_machine_case() {
+    Registry registry;
+
+    const auto active = registry.begin_outer();
+    require(active.code == error::OK, "active-load reservation fixture failed");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted ACTIVE load");
+    const auto committing = registry.prepare_end(active.txn, true);
+    require(committing.finisher && committing.commit, "commit reservation fixture failed");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted COMMITTING load");
+    require(registry.finalize_end(committing, true).committed, "commit fixture finalize failed");
+
+    const ModelToken model = committing.token;
+    auto update = registry.prepare_live_update(model);
+    require(update.active, "teardown-overlap update fixture failed");
+    auto draining = std::async(std::launch::async, [&] { return registry.prepare_teardown(model); });
+    require(draining.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+            "teardown did not wait in DRAINING_UPDATES");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted DRAINING_UPDATES model");
+    require(registry.finalize_live_update(update) == error::OK, "draining update release failed");
+    const auto tearing = draining.get();
+    require(tearing.finisher, "teardown did not enter TEARING_DOWN");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted TEARING_DOWN model");
+    require(registry.finalize_teardown(tearing, false) == error::EFFECT_FAILED,
+            "failed teardown did not quarantine model");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted QUARANTINED model");
+    const auto retry = registry.prepare_teardown(model);
+    require(retry.finisher && registry.finalize_teardown(retry, true) == error::OK,
+            "quarantined model recovery failed");
+
+    require(registry.acquire_backend_context(), "backend-context fixture admission failed");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted live backend context");
+    registry.release_backend_context();
+
+    require(registry.reserve_shutdown() == error::OK, "clean shutdown reservation failed");
+    require(registry.shutdown_reserved(), "successful shutdown was not reserved");
+    require(registry.begin_outer().code == error::LOAD_BUSY, "post-check begin crossed shutdown reservation");
+    require(!registry.acquire_backend_context(), "post-check backend context crossed shutdown reservation");
+    require(registry.prepare_live_update(model).code == error::BUSY,
+            "post-check update crossed shutdown reservation");
+    require(registry.prepare_teardown(model).code == error::BUSY,
+            "post-check teardown crossed shutdown reservation");
+    registry.release_shutdown();
+    require(!registry.shutdown_reserved(), "shutdown cancellation retained reservation");
+    const auto after = registry.begin_outer();
+    require(after.code == error::OK, "shutdown cancellation did not restore admission");
+    const auto rolling = registry.prepare_end(after.txn, false);
+    require(rolling.finisher && !rolling.commit, "rollback reservation fixture failed");
+    require(registry.reserve_shutdown() == error::BUSY, "shutdown admitted ROLLING_BACK load");
+    require(registry.finalize_end(rolling, true).code == error::MISSING_SUCCESS,
+            "rollback fixture finalize failed");
+}
+
+static void allocation_free_live_update_guard_case() {
+    Registry registry;
+    const ModelToken model = commit_one(registry);
+    try {
+        auto guard = registry.acquire_live_update(model);
+        require(bool(guard), "RAII update guard acquisition failed");
+        throw std::bad_alloc(); // deterministic post-prepare allocation failure
+    } catch (const std::bad_alloc &) {
+    }
+
+    // If guard construction/allocation leaked the prepared ticket, teardown
+    // would block or the finite capacity below would be one short.
+    std::vector<live_update_guard> capacity;
+    capacity.reserve(model_slot_count);
+    for (size_t i = 0; i < model_slot_count; ++i) {
+        auto guard = registry.acquire_live_update(model);
+        require(bool(guard), "post-fault ticket capacity did not recover");
+        capacity.emplace_back(std::move(guard));
+    }
+    require(!registry.acquire_live_update(model), "ticket pool exceeded fixed capacity");
+    capacity.clear();
+    require(registry.teardown(model) == error::OK, "post-fault teardown remained wedged");
+}
+
 static void duplicate_publication_case() {
     Registry           registry;
     const auto         begin = registry.begin_outer();
@@ -213,6 +289,8 @@ int main() {
     finite_id_limit_case();
     quarantine_wrapper_busy_overlap_case();
     live_update_ticket_saturation_case();
+    shutdown_reservation_state_machine_case();
+    allocation_free_live_update_guard_case();
     duplicate_publication_case();
     return 0;
 }

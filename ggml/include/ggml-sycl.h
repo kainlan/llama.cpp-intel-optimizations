@@ -65,6 +65,8 @@ GGML_BACKEND_API bool ggml_backend_sycl_is_multiprocess_tp(void);
 // Dynamic registry unload gate. False means exact LIVE model owners still need
 // this module's teardown procedures and devices.
 GGML_BACKEND_API bool ggml_backend_sycl_can_unload(void);
+// Cancel a successful unload reservation if the generic loader cannot proceed.
+GGML_BACKEND_API void ggml_backend_sycl_cancel_unload(void);
 // Drain module-owned threads, queues and caches before ggml_backend_unload().
 GGML_BACKEND_API void ggml_backend_sycl_shutdown(void);
 

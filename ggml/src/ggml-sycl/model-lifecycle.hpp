@@ -196,6 +196,22 @@ struct live_update_ticket {
     live_update_ticket & operator=(live_update_ticket &&) = delete;
 };
 
+struct live_update_guard {
+    Registry *         registry = nullptr;
+    live_update_ticket ticket{};
+
+    live_update_guard() = default;
+    live_update_guard(Registry * registry, live_update_ticket && ticket) noexcept :
+        registry(registry), ticket(std::move(ticket)) {}
+    ~live_update_guard();
+    live_update_guard(const live_update_guard &) = delete;
+    live_update_guard & operator=(const live_update_guard &) = delete;
+    live_update_guard(live_update_guard && other) noexcept;
+    live_update_guard & operator=(live_update_guard &&) = delete;
+
+    explicit operator bool() const noexcept { return registry != nullptr && ticket.active; }
+};
+
 struct teardown_ticket {
     error      code = error::OK;
     ModelToken token{};
@@ -278,7 +294,17 @@ class Registry {
                       tier_verdict verdict            = tier_verdict::UNKNOWN);
 
     live_update_ticket prepare_live_update(ModelToken token);
+    live_update_guard  acquire_live_update(ModelToken token) noexcept;
     error              finalize_live_update(const live_update_ticket & ticket) noexcept;
+
+    // Atomic shutdown reservation. Eligibility and reservation are one locked
+    // transition; all lifecycle and backend-context admission remains closed
+    // until generic registry/device removal consumes the reservation.
+    error reserve_shutdown() noexcept;
+    void  release_shutdown() noexcept;
+    bool  shutdown_reserved() const noexcept;
+    bool  acquire_backend_context() noexcept;
+    void  release_backend_context() noexcept;
     teardown_ticket    prepare_teardown(ModelToken token);
     error              finalize_teardown(const teardown_ticket & ticket, bool effects_ok) noexcept;
     error              teardown(ModelToken token);
@@ -348,6 +374,8 @@ class Registry {
     const test_mutation                       mutation_;
     uint64_t                                  next_model_id_ = 1, next_load_id_ = 1, next_finish_serial_ = 1;
     uint64_t                                                   next_effect_serial_ = 1;
+    uint64_t                                                   backend_context_count_ = 0;
+    bool                                                       shutdown_reserved_ = false;
     std::array<slot_state, model_slot_count>  slots_{};
     // Terminal transaction and dead-model rows are intentionally append-only.
     // Process-lifetime exact replay is required for idempotent end/unload;

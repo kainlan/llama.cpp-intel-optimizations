@@ -335,8 +335,28 @@ struct ggml_backend_registry {
         // still loaded. The hook is optional and must be idempotent.
         using shutdown_fn = void (*)();
         auto shutdown = reinterpret_cast<shutdown_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_shutdown"));
+        auto complete = reinterpret_cast<shutdown_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_complete_unload"));
+        if (can_unload && !complete) {
+            auto cancel = reinterpret_cast<shutdown_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload"));
+            if (cancel) {
+                cancel();
+            }
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
         if (shutdown) {
             shutdown();
+        } else if (can_unload) {
+            // A successful eligibility callback may have atomically reserved
+            // shutdown. If the paired shutdown hook is unavailable, release
+            // that reservation before reporting that unload cannot proceed.
+            auto cancel = reinterpret_cast<shutdown_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cancel_unload"));
+            if (cancel) {
+                cancel();
+            }
+            return GGML_BACKEND_UNLOAD_BUSY;
         }
 
         // remove devices
@@ -345,8 +365,14 @@ struct ggml_backend_registry {
                             [reg](ggml_backend_dev_t dev) { return ggml_backend_dev_backend_reg(dev) == reg; }),
             devices.end());
 
-        // remove backend
+        // Keep the DSO mapped while removing its registry entry, then consume
+        // the atomic reservation only after devices and backend registration
+        // are gone. This closes the can_unload -> shutdown -> erase TOCTOU.
+        dl_handle_ptr keep_alive = std::move(it->handle);
         backends.erase(it);
+        if (complete) {
+            complete();
+        }
         return GGML_BACKEND_UNLOAD_OK;
     }
 };

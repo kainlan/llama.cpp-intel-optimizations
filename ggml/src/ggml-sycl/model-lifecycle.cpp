@@ -82,6 +82,17 @@ finisher_effect_scope & finisher_effect_scope::operator=(finisher_effect_scope &
     return *this;
 }
 
+live_update_guard::~live_update_guard() {
+    if (registry && ticket.active) {
+        (void) registry->finalize_live_update(ticket);
+    }
+}
+
+live_update_guard::live_update_guard(live_update_guard && other) noexcept :
+    registry(other.registry), ticket(std::move(other.ticket)) {
+    other.registry = nullptr;
+}
+
 bool quarantine_queue::enqueue(ModelToken token) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -155,7 +166,7 @@ void Registry::poison_active_locked() {
 begin_result Registry::begin_outer() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (active_txn_ != 0) {
+        if (shutdown_reserved_ || active_txn_ != 0) {
             return { error::LOAD_BUSY };
         }
         for (const auto & model : models_) {
@@ -206,6 +217,9 @@ begin_result Registry::begin_outer() noexcept {
 
 error Registry::enter_nested(LoadTxnId id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_reserved_) {
+        return error::BUSY;
+    }
     // Owner identity is checked before terminal/depth state. A mismatched call
     // poisons the actual active transaction.
     if (active_txn_ != id.value) {
@@ -297,7 +311,8 @@ load_effect_lease Registry::acquire_load_effect(LoadTxnId id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = txns_.find(id.value);
-        if (id.value == 0 || active_txn_ != id.value || it == txns_.end() || it->second.phase != finish_phase::ACTIVE) {
+        if (shutdown_reserved_ || id.value == 0 || active_txn_ != id.value || it == txns_.end() ||
+            it->second.phase != finish_phase::ACTIVE) {
             return { error::WRONG_TRANSACTION, {}, 0, nullptr };
         }
         if (fail_next_load_effect_allocation_) {
@@ -330,7 +345,8 @@ finisher_effect_scope Registry::acquire_finisher_effect(const finish_ticket & ti
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = txns_.find(ticket.token.load.value);
-        if (!ticket.finisher || !ticket.commit || it == txns_.end() || active_txn_ != ticket.token.load.value ||
+        if (shutdown_reserved_ || !ticket.finisher || !ticket.commit || it == txns_.end() ||
+            active_txn_ != ticket.token.load.value ||
             it->second.finish_serial != ticket.serial || it->second.phase != finish_phase::COMMITTING ||
             !it->second.load_effect_serials.empty()) {
             return { error::STALE_IDENTITY, {}, 0, nullptr };
@@ -712,6 +728,9 @@ end_result Registry::end(LoadTxnId id, bool success, uint64_t planned, uint64_t 
 
 live_update_ticket Registry::prepare_live_update(ModelToken token) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_reserved_) {
+        return { error::BUSY, token };
+    }
     if (token.model.value == 0 || token.load.value == 0 || token.owner.slot >= model_slot_count) {
         return { error::STALE_IDENTITY, token };
     }
@@ -732,6 +751,11 @@ live_update_ticket Registry::prepare_live_update(ModelToken token) {
     model->second.next_live_update_serial                                = serial == UINT64_MAX ? 0 : serial + 1;
     model->second.live_update_serials[model->second.live_update_count++] = serial;
     return { error::OK, token, serial, true };
+}
+
+live_update_guard Registry::acquire_live_update(ModelToken token) noexcept {
+    auto ticket = prepare_live_update(token);
+    return ticket.active ? live_update_guard(this, std::move(ticket)) : live_update_guard(nullptr, std::move(ticket));
 }
 
 error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept {
@@ -764,6 +788,9 @@ error Registry::finalize_live_update(const live_update_ticket & ticket) noexcept
 
 teardown_ticket Registry::prepare_teardown(ModelToken token) {
     std::unique_lock<std::mutex> lock(mutex_);
+    if (shutdown_reserved_) {
+        return { error::BUSY, token };
+    }
     if (token.model.value == 0 || token.owner.slot >= model_slot_count) {
         return { error::NOT_FOUND };
     }
@@ -942,6 +969,69 @@ error Registry::defer_quarantine(ModelToken token) noexcept {
 error Registry::teardown(ModelToken token) {
     auto ticket = prepare_teardown(token);
     return ticket.finisher ? finalize_teardown(ticket, true) : ticket.code;
+}
+
+error Registry::reserve_shutdown() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_reserved_ || active_txn_ != 0 || backend_context_count_ != 0 || !models_.empty()) {
+            return error::BUSY;
+        }
+        for (const auto & item : txns_) {
+            const auto & txn = item.second;
+            if (txn.phase == finish_phase::ACTIVE || txn.phase == finish_phase::COMMITTING ||
+                txn.phase == finish_phase::ROLLING_BACK || !txn.load_effect_serials.empty() ||
+                !txn.finisher_effect_serials.empty()) {
+                return error::BUSY;
+            }
+        }
+        shutdown_reserved_ = true;
+        return error::OK;
+    } catch (...) {
+        return error::EFFECT_FAILED;
+    }
+}
+
+void Registry::release_shutdown() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown_reserved_ = false;
+        cv_.notify_all();
+    } catch (...) {
+    }
+}
+
+bool Registry::shutdown_reserved() const noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return shutdown_reserved_;
+    } catch (...) {
+        return true;
+    }
+}
+
+bool Registry::acquire_backend_context() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_reserved_ || backend_context_count_ == UINT64_MAX) {
+            return false;
+        }
+        ++backend_context_count_;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void Registry::release_backend_context() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (backend_context_count_ != 0) {
+            --backend_context_count_;
+            cv_.notify_all();
+        }
+    } catch (...) {
+    }
 }
 
 std::shared_ptr<const ModelState> Registry::find(ModelId id) const {

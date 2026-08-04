@@ -9680,6 +9680,27 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
     }
 }
 
+static std::mutex                                                g_test_live_update_mutex;
+static std::optional<ggml_sycl::lifecycle::live_update_guard>   g_test_live_update_guard;
+
+extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model) {
+    std::lock_guard<std::mutex> lock(g_test_live_update_mutex);
+    if (g_test_live_update_guard) {
+        return false;
+    }
+    auto guard = ggml_sycl::lifecycle::global_registry().acquire_live_update(ggml_sycl_cpp_token(model));
+    if (!guard) {
+        return false;
+    }
+    g_test_live_update_guard.emplace(std::move(guard));
+    return true;
+}
+
+extern "C" void ggml_backend_sycl_test_release_live_update() {
+    std::lock_guard<std::mutex> lock(g_test_live_update_mutex);
+    g_test_live_update_guard.reset();
+}
+
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
     ggml_sycl::lifecycle::global_registry().test_fail_next_candidate_binding_allocation();
 }
@@ -11596,25 +11617,15 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         { current->load_txn_id },
         { current->slot, current->slot_generation }
     };
-    auto &                                                    registry = ggml_sycl::lifecycle::global_registry();
-    std::unique_ptr<ggml_sycl::lifecycle::live_update_ticket> owned_ticket;
-    if (!g_runtime_external_lease) {
-        auto ticket = registry.prepare_live_update(current_token);
-        if (!ticket.active) {
-            return;
-        }
-        owned_ticket = std::make_unique<ggml_sycl::lifecycle::live_update_ticket>(std::move(ticket));
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    // acquire_live_update() returns an allocation-free owning guard. The
+    // ticket is protected by RAII before any subsequent plan-copy allocation
+    // can throw, so teardown capacity cannot leak on exceptional exits.
+    auto owned_update = g_runtime_external_lease ? ggml_sycl::lifecycle::live_update_guard{} :
+                                                   registry.acquire_live_update(current_token);
+    if (!g_runtime_external_lease && !owned_update) {
+        return;
     }
-    struct live_update_guard {
-        ggml_sycl::lifecycle::Registry &           registry;
-        ggml_sycl::lifecycle::live_update_ticket * ticket;
-
-        ~live_update_guard() {
-            if (ticket) {
-                (void) registry.finalize_live_update(*ticket);
-            }
-        }
-    } update_guard{ registry, owned_ticket.get() };
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
@@ -74168,6 +74179,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     g_split_weight_cache.clear();
     g_split_merge_queue = nullptr;
     g_sycl_backend_refcount.fetch_sub(1, std::memory_order_acq_rel);
+    ggml_sycl::lifecycle::global_registry().release_backend_context();
     // Clean up FP16 weight cache VRAM allocations
     if (g_fp16_cache.has_entries()) {
         GGML_LOG_INFO("[SYCL] FP16 weight cache: freeing (%.1fMB)\n", g_fp16_cache.total_bytes / (1024.0f * 1024.0f));
@@ -96042,7 +96054,11 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 };
 
 bool ggml_backend_sycl_can_unload(void) {
-    return ggml_sycl::lifecycle::global_registry().live_mask() == 0;
+    return ggml_sycl::lifecycle::global_registry().reserve_shutdown() == ggml_sycl::lifecycle::error::OK;
+}
+
+void ggml_backend_sycl_cancel_unload(void) {
+    ggml_sycl::lifecycle::global_registry().release_shutdown();
 }
 
 void ggml_backend_sycl_shutdown(void) {
@@ -96075,6 +96091,9 @@ void ggml_backend_sycl_shutdown(void) {
     ggml_sycl::shutdown_unified_cache();
 
     GGML_LOG_INFO("[SYCL-MODULE] shutdown complete\n");
+    // The generic loader releases the reservation only after registry/device
+    // removal completes. Keeping it here closes the check->shutdown->erase
+    // admission window.
 }
 
 // backend reg
@@ -96112,6 +96131,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_can_unload") == 0) {
         return (void *) ggml_backend_sycl_can_unload;
+    }
+    if (strcmp(name, "ggml_backend_cancel_unload") == 0 || strcmp(name, "ggml_backend_complete_unload") == 0) {
+        return (void *) ggml_backend_sycl_cancel_unload;
     }
     if (strcmp(name, "ggml_backend_shutdown") == 0 || strcmp(name, "ggml_backend_sycl_shutdown") == 0) {
         return (void *) ggml_backend_sycl_shutdown;
@@ -96166,6 +96188,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {
+        return (void *) ggml_backend_sycl_test_hold_live_update;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_release_live_update") == 0) {
+        return (void *) ggml_backend_sycl_test_release_live_update;
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_candidate_binding_allocation;
@@ -96248,6 +96276,19 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
+    auto & lifecycle_registry = ggml_sycl::lifecycle::global_registry();
+    if (!lifecycle_registry.acquire_backend_context()) {
+        return nullptr;
+    }
+    struct context_admission_rollback {
+        ggml_sycl::lifecycle::Registry & registry;
+        bool committed = false;
+        ~context_admission_rollback() {
+            if (!committed) {
+                registry.release_backend_context();
+            }
+        }
+    } admission{ lifecycle_registry };
     if (ggml_sycl_alloc_trace_enabled_impl()) {
         ggml_sycl_alloc_trace_init();
     }
@@ -96285,6 +96326,7 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
                           /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
                           /* .context = */ ctx };
     g_sycl_backend_refcount.fetch_add(1, std::memory_order_acq_rel);
+    admission.committed = true;
 
     return sycl_backend;
 }
