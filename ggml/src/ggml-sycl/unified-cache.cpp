@@ -545,6 +545,7 @@ static std::atomic<bool>     g_atexit_registered{ false };  // Ensure atexit han
 static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
+static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 
 static std::mutex            g_runtime_alloc_mutex;
 static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
@@ -12642,6 +12643,40 @@ void prepare_unified_cache_for_module_use() noexcept {
     g_sycl_shutting_down.store(false, std::memory_order_release);
 }
 
+static void shutdown_shared_context_queues() noexcept {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        sycl::queue * queue = g_shared_ctx_queues[d];
+        g_shared_ctx_queues[d] = nullptr;
+        if (!queue) {
+            continue;
+        }
+        try {
+            queue->wait_and_throw();
+        } catch (...) {
+        }
+        delete queue;
+    }
+    g_shared_ctx_queues_initialized = false;
+    g_shared_ctx_queues_initialized_for = 0;
+}
+
+bool unified_cache_shutdown_state_clean() noexcept {
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        if (!g_device_caches.empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+        for (const auto * queue : g_shared_ctx_queues) {
+            if (queue != nullptr) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
@@ -12650,9 +12685,19 @@ void shutdown_unified_cache() {
     {
         std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
         caches.swap(g_device_caches);
+        g_cache_mode_locked.store(false, std::memory_order_release);
     }
     g_sycl_shutting_down.store(false, std::memory_order_release);
     caches.clear();
+    // Cache queues own the single-device contexts used for arena allocation.
+    // Destroy them only after every cache destructor has freed its chunks; the
+    // Level Zero runtime may retain large freed USM blocks until context release.
+    shutdown_shared_context_queues();
+    const bool clean = unified_cache_shutdown_state_clean();
+    if (!clean) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown retained cache/arena/queue ownership\n");
+    }
+    GGML_ASSERT(clean && "explicit unified cache shutdown retained owners");
     // Any later static destructors must not re-enter SYCL after explicit DSO
     // shutdown. A freshly loaded module gets a fresh false-initialized flag.
     g_sycl_shutting_down.store(true, std::memory_order_release);
@@ -14819,6 +14864,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
             arena_chunks_.clear();
             arena_chunks_.push_back({ ptr, alloc_size });
+            g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
 
@@ -15000,6 +15046,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                 auto & c = arena_chunks_[j];
                 if (c.ptr) {
                     alloc_registry::instance().unregister_alloc(c.ptr);
+                    g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
                     try {
                         sycl::free(c.ptr, queue);
                     } catch (const sycl::exception & e) {
@@ -15015,6 +15062,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         }
         alloc_registry::instance().register_alloc(p, chunk_sizes[i], dev_id, alloc_type::DEVICE);
         arena_chunks_.push_back({ p, chunk_sizes[i] });
+        g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
     }
 
     arena_base_ = arena_chunks_.front().ptr;
@@ -15695,6 +15743,11 @@ void unified_cache::arena_destroy() {
     } catch (...) {
         GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed\n");
     }
+    const size_t released_chunk_count = arena_chunks_.size();
+    size_t released_chunk_bytes = 0;
+    for (const auto & chunk : arena_chunks_) {
+        released_chunk_bytes += chunk.size;
+    }
     for (auto & c : arena_chunks_) {
         if (c.ptr) {
             // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
@@ -15719,6 +15772,10 @@ void unified_cache::arena_destroy() {
                 }
             }
             alloc_registry::instance().unregister_alloc(c.ptr);
+            GGML_ASSERT(alloc_registry::instance().lookup(c.ptr) == nullptr &&
+                        "arena chunk remained registered after unregister");
+            const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
+            GGML_ASSERT(live_before > 0 && "arena chunk ownership counter underflow");
             try {
                 sycl::free(c.ptr, arena_queue_->get_context());
             } catch (const sycl::exception & e) {
@@ -15730,6 +15787,8 @@ void unified_cache::arena_destroy() {
             }
         }
     }
+    GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
+                  released_chunk_bytes / (1024.0 * 1024.0));
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;

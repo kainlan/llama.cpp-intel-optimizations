@@ -96156,7 +96156,7 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
            g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
-           !g_expert_predictors[0].test_scores_allocated() &&
+           !g_expert_predictors[0].test_scores_allocated() && ggml_sycl::unified_cache_shutdown_state_clean() &&
            ggml_sycl::unified_alloc_validate_registry(-1, "module-reload-clean");
 }
 

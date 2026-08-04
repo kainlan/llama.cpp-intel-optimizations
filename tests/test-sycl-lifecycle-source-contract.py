@@ -623,6 +623,13 @@ checks = {
     and "pre-destroy queue drain failed" in cache_cpp
     and "logical unload retained device memory" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "explicit cache ownership drain": "shutdown_shared_context_queues();" in cache_cpp
+    and "g_live_arena_chunks.fetch_sub" in cache_cpp
+    and "unified_cache_shutdown_state_clean()" in cache_cpp
+    and "explicit shutdown retained cache/arena/queue ownership" in cache_cpp
+    and "arena chunk remained registered after unregister" in cache_cpp
+    and "Destroyed %zu chunk(s), released %.1f MB" in cache_cpp
+    and "unified_cache_shutdown_state_clean()" in backend,
     "backend construction publish rollback": "g_test_fail_next_backend_publish" in backend
     and "auto ctx = std::make_unique<ggml_backend_sycl_context>(device)" in backend
     and backend.index("auto sycl_backend = std::make_unique<ggml_backend>")
