@@ -1,6 +1,8 @@
 // Model-free live coverage for packed-K partial-submit lifetime checkpoints.
 // The lead runs each --checkpoint case on a locked Level Zero GPU.
 
+#include "ggml-backend-impl.h"
+
 #include "../fattn-xmx-f16-v2.hpp"
 #include "../fattn.hpp"
 #include "../unified-cache.hpp"
@@ -608,6 +610,24 @@ void run_consumer_checkpoint(const std::string & checkpoint,
     packed.reset();
 }
 
+struct backend_owner {
+    ggml_backend_t backend;
+
+    explicit backend_owner(ggml_backend_t backend) : backend(backend) {}
+    ~backend_owner() {
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
+    }
+
+    backend_owner(const backend_owner &)             = delete;
+    backend_owner & operator=(const backend_owner &) = delete;
+
+    ggml_backend_sycl_context & context() const {
+        return *static_cast<ggml_backend_sycl_context *>(backend->context);
+    }
+};
+
 bool preflight_device() {
     try {
         const auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
@@ -665,7 +685,13 @@ int main(int argc, char ** argv) {
     set_mem_fill_profile_error_after_submit(false);
     std::atomic<int> async_failures{ 0 };
     try {
-        ggml_backend_sycl_context ctx(0);
+        {
+        // Use the production backend owner so ggml_backend_free performs its
+        // global queue/pool shutdown before deleting the context. A raw stack
+        // context bypasses that ordering and crashes during final cleanup.
+        backend_owner owner{ ggml_backend_sycl_init(0) };
+        require(owner.backend != nullptr, "SYCL backend initialization failed");
+        ggml_backend_sycl_context & ctx = owner.context();
         sycl::queue * context_queue = ctx.stream();
         require(context_queue != nullptr, "SYCL context returned no queue");
         auto async_handler = [&](sycl::exception_list failures) {
@@ -707,6 +733,7 @@ int main(int argc, char ** argv) {
                 "final registered device bytes did not return to baseline");
         require(ggml_sycl::alloc_registry::instance().size() == registry_baseline,
                 "final allocation registry count did not return to baseline");
+        }
         std::printf("PASS checkpoint=%s shape=D64,Hkv1,batch1,nkv64 async_wait_failures=%d\n",
                     checkpoint.c_str(), async_failures.load());
         return 0;

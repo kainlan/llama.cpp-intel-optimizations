@@ -173,6 +173,34 @@ def lifecycle_teardown_contract(source: str) -> bool:
         return False
 
 
+def backend_owner_contract(source: str) -> bool:
+    owner_begin = source.index("struct backend_owner")
+    owner_end = source.index("bool preflight_device", owner_begin)
+    owner = source[owner_begin:owner_end]
+    main = source[source.index("int main(int argc, char ** argv)"):]
+    ordered_needles = (
+        "backend_owner owner{ ggml_backend_sycl_init(0) };",
+        "ggml_backend_sycl_context & ctx = owner.context();",
+        "sycl::queue * context_queue = ctx.stream();",
+        "dependency_queue.wait_and_throw();",
+        "work_queue.wait_and_throw();",
+        "context_queue->wait_and_throw();",
+        "ggml_sycl::drain_retained_handles(true);",
+        '"final allocation registry count did not return to baseline");',
+        "std::printf(\"PASS checkpoint=",
+    )
+    try:
+        positions = [main.index(needle) for needle in ordered_needles]
+        return (positions == sorted(positions) and
+                "ggml_backend_free(backend);" in owner and
+                "backend->context" in owner and
+                "ggml_backend_sycl_context ctx(0)" not in source and
+                "_exit(" not in source and
+                '"final allocation registry count did not return to baseline");\n        }\n        std::printf' in main)
+    except ValueError:
+        return False
+
+
 def final_retention_drain_contract(source: str) -> bool:
     main = source[source.index("int main(int argc, char ** argv)"):]
     needles = (
@@ -199,6 +227,9 @@ def live_contract(source: str) -> bool:
         "fattn_xmx_v2_decode_m1n64_supported(dev, 16)",
         "sycl::queue work_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
         "sycl::queue dependency_queue(context_queue->get_context(), context_queue->get_device(), async_handler)",
+        "backend_owner owner{ ggml_backend_sycl_init(0) }",
+        "ggml_backend_sycl_context & ctx = owner.context()",
+        "ggml_backend_free(backend)",
         "cgh.host_task([=]() { gate->wait(); })",
         "class controlled_gate_release_guard",
         "~controlled_gate_release_guard() noexcept",
@@ -254,6 +285,7 @@ def live_contract(source: str) -> bool:
             all(cp in source for cp in CHECKPOINTS) and
             source.count(guard_construction) == 3 and
             lifecycle_teardown_contract(source) and
+            backend_owner_contract(source) and
             final_retention_drain_contract(source))
 
 
@@ -330,6 +362,13 @@ def test_checkpoint_mutations_are_killed() -> None:
     assert not live_contract(LIVE.replace(
         "context_queue->wait_and_throw();\n        ggml_sycl::drain_retained_handles(true);",
         "ggml_sycl::drain_retained_handles(true);\n        context_queue->wait_and_throw();", 1))
+    assert not live_contract(LIVE.replace(
+        "backend_owner owner{ ggml_backend_sycl_init(0) };",
+        "ggml_backend_sycl_context ctx(0);", 1))
+    assert not live_contract(LIVE.replace("return 0;", "_exit(0);", 1))
+    assert not live_contract(LIVE.replace(
+        '"final allocation registry count did not return to baseline");\n        }\n        std::printf',
+        '"final allocation registry count did not return to baseline");\n        std::printf', 1))
 
 
 def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
@@ -443,6 +482,9 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "async_failures.load() == 0",
         "size() == registry_baseline",
         "ggml_sycl::drain_retained_handles(true)",
+        "backend_owner owner{ ggml_backend_sycl_init(0) }",
+        "ggml_backend_sycl_context & ctx = owner.context()",
+        "ggml_backend_free(backend)",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
