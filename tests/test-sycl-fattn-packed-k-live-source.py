@@ -75,6 +75,8 @@ def production_contract(
         "merge_submit_end_us",
         "first_callsite",
         "merge_callsite",
+        "            });\n    });\n\n    if constexpr (PACKED_K)",
+        "                         });\n    });\n    if constexpr (PACKED_K)",
     )
     hpp_needles = (
         "static constexpr int ggml_sycl_fattn_xmx_packed_k_n_blocks(int n_kv)",
@@ -395,8 +397,15 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "merge_submit_end_us",
         "first_callsite",
         "merge_callsite",
+        "            });\n    });\n\n    if constexpr (PACKED_K)",
+        "                         });\n    });\n    if constexpr (PACKED_K)",
     ):
         assert not production_contract(FATTN, XMX.replace(needle, "/* mutation removed seam */"))
+    assert not production_contract(
+        FATTN,
+        XMX.replace(
+            "            });\n    });\n\n    if constexpr (PACKED_K)",
+            "            });\n        });\n    });\n\n    if constexpr (PACKED_K)", 1))
 
 
 def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:

@@ -2107,7 +2107,6 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                     nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, packed_batch_stride, packed_head_stride,
                     packed_block_stride, n_partitions, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
             });
-        });
     });
 
     if constexpr (PACKED_K) {
@@ -2159,7 +2158,6 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                                                                                 partial_out, dst_ptr, ne01, ne02, ne03,
                                                                                 n_partitions, item);
                          });
-        });
     });
     if constexpr (PACKED_K) {
         if (packed_k_ready_event != nullptr) {
