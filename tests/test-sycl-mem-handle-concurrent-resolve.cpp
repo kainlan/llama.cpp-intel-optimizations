@@ -146,7 +146,7 @@ int test_resolve_never_observes_a_half_written_state() {
 // both decremented -- one lease, two releases.
 //
 // Device-free by construction: unified_cache_entry is a plain struct, and
-// from_weight_lease() skips its chunk-lease cache lookup at HOST_DEVICE
+// from_weight_lease_snapshot() skips its chunk-lease cache lookup at HOST_DEVICE
 // (mem-handle.cpp gates it on valid_cache_device_id), so no cache, queue or
 // device is ever touched.  Only the refcount arithmetic is under test.
 int test_lease_is_released_exactly_once() {
@@ -156,15 +156,17 @@ int test_lease_is_released_exactly_once() {
     ggml_sycl::unified_cache_entry entry_a = {};
     ggml_sycl::unified_cache_entry entry_b = {};
 
-    // Each template handle owns one lease -- from_weight_lease() takes ownership
+    // Each template handle owns one lease -- from_weight_lease_snapshot() takes ownership
     // of a bump the caller is expected to have already made.
     entry_a.in_use_count.v.store(1, std::memory_order_release);
     entry_b.in_use_count.v.store(1, std::memory_order_release);
 
-    const ggml_sycl::mem_handle lease_a = ggml_sycl::mem_handle::from_weight_lease(
-        make_key(0xa11a), ggml_sycl::mem_handle::HOST_DEVICE, buf_a, GGML_LAYOUT_AOS, false, &entry_a);
-    const ggml_sycl::mem_handle lease_b = ggml_sycl::mem_handle::from_weight_lease(
-        make_key(0xb22b), ggml_sycl::mem_handle::HOST_DEVICE, buf_b, GGML_LAYOUT_SOA, true, &entry_b);
+    const ggml_sycl::mem_handle lease_a = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        make_key(0xa11a), ggml_sycl::mem_handle::HOST_DEVICE, buf_a, GGML_LAYOUT_AOS, false, &entry_a,
+        entry_a.storage_owner, entry_a.has_ready_event, entry_a.ready_event);
+    const ggml_sycl::mem_handle lease_b = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        make_key(0xb22b), ggml_sycl::mem_handle::HOST_DEVICE, buf_b, GGML_LAYOUT_SOA, true, &entry_b,
+        entry_b.storage_owner, entry_b.has_ready_event, entry_b.ready_event);
 
     {
         ggml_sycl::mem_handle shared = lease_a;  // +1 on entry_a
@@ -240,8 +242,9 @@ int test_concurrent_resolve_under_generation_churn() {
     {
         // HOST_DEVICE keeps resolve_slow() out of the unified cache entirely, so
         // this exercises the handle's own state machine with no device present.
-        const ggml_sycl::mem_handle shared = ggml_sycl::mem_handle::from_weight_lease(
-            make_key(0xc33c), ggml_sycl::mem_handle::HOST_DEVICE, buf, GGML_LAYOUT_AOS, false, &entry);
+        const ggml_sycl::mem_handle shared = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+            make_key(0xc33c), ggml_sycl::mem_handle::HOST_DEVICE, buf, GGML_LAYOUT_AOS, false, &entry,
+            entry.storage_owner, entry.has_ready_event, entry.ready_event);
 
         std::atomic<bool> stop{ false };
 

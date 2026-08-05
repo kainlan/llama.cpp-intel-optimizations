@@ -9,7 +9,6 @@
 #include "alloc-registry.hpp"
 #include "common.hpp"
 #include "e2e-profile.hpp"
-#include "sycl-timeline.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
@@ -17,6 +16,8 @@
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "model-lifecycle.hpp"
+#include "sycl-timeline.hpp"
 #include "zone-sizing.hpp"
 
 #include <algorithm>
@@ -42,6 +43,249 @@
 #endif
 
 namespace ggml_sycl {
+
+namespace {
+enum class load_effect_state { NONE, ACQUIRED, FAILED };
+
+struct cache_load_effect {
+    load_effect_state            state = load_effect_state::NONE;
+    lifecycle::ModelToken        owner{};
+    lifecycle::load_effect_lease lease;
+
+    bool failed() const noexcept { return state == load_effect_state::FAILED; }
+
+    uint64_t load_txn_id() const noexcept { return state == load_effect_state::ACQUIRED ? owner.load.value : 0; }
+};
+
+cache_load_effect acquire_bound_load_effect() noexcept {
+    try {
+        auto &     registry = lifecycle::global_registry();
+        const auto txn      = registry.bound_candidate();
+        if (txn.value == 0) {
+            return {};
+        }
+        auto effect = registry.acquire_load_effect(txn);
+        if (effect) {
+            if (!lifecycle_find_candidate_placement_plan(effect.owner.load.value)) {
+                return { load_effect_state::FAILED, {}, {} };
+            }
+            const auto owner = effect.owner;
+            return { load_effect_state::ACQUIRED, owner, std::move(effect) };
+        }
+        const auto finisher = registry.bound_finisher_effect();
+        if (finisher.load.value == txn.value && lifecycle_find_candidate_placement_plan(finisher.load.value)) {
+            return { load_effect_state::ACQUIRED, finisher, {} };
+        }
+        return { load_effect_state::FAILED, {}, {} };
+    } catch (...) {
+        return { load_effect_state::FAILED, {}, {} };
+    }
+}
+
+void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & effect) noexcept {
+    if (const uint64_t txn = effect.load_txn_id()) {
+        entry.pending_load_txn_id = txn;
+    }
+}
+
+std::mutex                                                                   g_lifecycle_plan_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
+    g_lifecycle_plan_models;
+std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
+}  // namespace
+
+uint64_t lifecycle_next_plan_publication_id() noexcept {
+    uint64_t next = g_lifecycle_plan_next_version.load(std::memory_order_relaxed);
+    for (;;) {
+        if (next == 0 || next == UINT64_MAX) {
+            return 0;
+        }
+        if (g_lifecycle_plan_next_version.compare_exchange_weak(next, next + 1, std::memory_order_relaxed,
+                                                                std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
+
+void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
+    g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
+}
+
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info,
+                                    uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
+    snapshot->load_txn_id   = load_txn_id;
+    snapshot->model_n_layer = model_n_layer;
+    snapshot->kv_info       = kv_info;
+    snapshot->plan          = std::make_shared<const placement_plan>(std::move(plan));
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+}
+
+void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
+                                       const placement_kv_info & kv_info,
+                                       uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot              = std::make_shared<lifecycle_plan_snapshot>();
+    snapshot->load_txn_id      = load_txn_id;
+    snapshot->explicit_no_plan = true;
+    snapshot->model_n_layer    = model_n_layer;
+    snapshot->kv_info          = kv_info;
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
+        return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        g_lifecycle_plan_candidates.erase(load_txn_id);
+    } catch (...) {
+    }
+}
+
+bool lifecycle_publish_placement_plan(uint64_t model_id,
+                                      uint64_t load_txn_id,
+                                      uint32_t slot,
+                                      uint64_t slot_generation,
+                                      uint64_t actual_host_bytes,
+                                      uint64_t actual_device_bytes,
+                                      bool     have_actual,
+                                      std::shared_ptr<const lifecycle_plan_snapshot> * published_out) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
+        if (candidate == g_lifecycle_plan_candidates.end()) {
+            return false;
+        }
+        auto published                                 = std::make_shared<lifecycle_plan_snapshot>(*candidate->second);
+        published->model_id                            = model_id;
+        published->slot                                = slot;
+        published->slot_generation                     = slot_generation;
+        if (published->plan) {
+            published->planned_host_bytes  = published->plan->weight_host_bytes;
+            published->actual_host_bytes   = have_actual ? actual_host_bytes : published->planned_host_bytes;
+            const uint64_t reported_host   = published->actual_host_bytes;
+            const uint64_t reported_device = have_actual ? actual_device_bytes : published->plan->weight_vram_bytes;
+            published->verdict = reported_host == 0 && reported_device == 0 ? lifecycle_plan_verdict::UNKNOWN :
+                                 reported_host == 0                         ? lifecycle_plan_verdict::DEVICE :
+                                 reported_device == 0                       ? lifecycle_plan_verdict::HOST :
+                                                                              lifecycle_plan_verdict::MIXED;
+        } else {
+            // no_alloc is an explicit successful UNKNOWN, never a stale DEVICE
+            // verdict inherited from a prior model.
+            published->planned_host_bytes = 0;
+            published->actual_host_bytes  = 0;
+            published->verdict            = lifecycle_plan_verdict::UNKNOWN;
+        }
+        published->version = lifecycle_next_plan_publication_id();
+        if (published->version == 0) {
+            g_lifecycle_plan_candidates.erase(candidate);
+            return false;
+        }
+        std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
+        g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
+        g_lifecycle_plan_candidates.erase(candidate);
+        if (published_out) {
+            *published_out = std::move(immutable);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id) {
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    auto                        model = g_lifecycle_plan_models.find(model_id);
+    if (model == g_lifecycle_plan_models.end()) {
+        return nullptr;
+    }
+    auto plan = model->second.find(load_txn_id);
+    return plan == model->second.end() ? nullptr : plan->second;
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(uint64_t model_id,
+                                                                               uint64_t load_txn_id,
+                                                                               uint32_t slot,
+                                                                               uint64_t slot_generation) noexcept {
+    try {
+        const auto plan = lifecycle_find_placement_plan(model_id, load_txn_id);
+        return plan && plan->model_id == model_id && plan->load_txn_id == load_txn_id && plan->slot == slot &&
+                       plan->slot_generation == slot_generation ?
+                   plan :
+                   nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
+                                      const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
+    if (!expected || !replacement || expected->model_id == 0 || expected->load_txn_id == 0) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        model = g_lifecycle_plan_models.find(expected->model_id);
+        if (model == g_lifecycle_plan_models.end()) {
+            return false;
+        }
+        auto current = model->second.find(expected->load_txn_id);
+        if (current == model->second.end() || current->second.get() != expected.get()) {
+            return false;
+        }
+        current->second = replacement;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        auto                        model = g_lifecycle_plan_models.find(model_id);
+        if (model == g_lifecycle_plan_models.end()) {
+            return;
+        }
+        model->second.erase(load_txn_id);
+        if (model->second.empty()) {
+            g_lifecycle_plan_models.erase(model);
+        }
+    } catch (...) {
+    }
+}
+
+size_t lifecycle_published_placement_plan_count_for_test() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        size_t                      count = 0;
+        for (const auto & model : g_lifecycle_plan_models) {
+            count += model.second.size();
+        }
+        return count;
+    } catch (...) {
+        return 0;
+    }
+}
 
 const char * residency_reject_reason_name(residency_reject_reason reason) {
     switch (reason) {
@@ -274,7 +518,7 @@ residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
 }
 
 // Per-device cache storage (for PER_DEVICE and AUTO modes)
-static std::unordered_map<int, std::unique_ptr<unified_cache>> g_device_caches;
+static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;
 static std::shared_mutex                                       g_cache_rw_mutex;
 static size_t                                                  g_unified_cache_budget      = 0;  // 0 = auto-calculate
 static int                                                     g_unified_cache_budget_pct  = 100;
@@ -301,6 +545,9 @@ static std::atomic<bool>     g_atexit_registered{ false };  // Ensure atexit han
 static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
+static std::atomic<size_t>   g_live_arena_chunks{ 0 };
+static std::atomic<bool>     g_test_fail_next_arena_free{ false };
+static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
 static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
@@ -1863,6 +2110,15 @@ bool unified_cache::ensure_planned_arena_zones() {
 }
 
 unified_cache::~unified_cache() {
+    if (!shutdown_resources()) {
+        arena_abandon();
+    }
+}
+
+bool unified_cache::shutdown_resources() {
+    if (resources_shutdown_) {
+        return true;
+    }
     // Mispredict accounting, reported here because this is the last point at
     // which the cache is guaranteed to run any code. It is placed ahead of the
     // shutdown early-return below so a teardown that skips resource cleanup
@@ -1909,7 +2165,8 @@ unified_cache::~unified_cache() {
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
-        return;
+        resources_shutdown_ = true;
+        return true;
     }
 
     // Try to verify SYCL context is still valid before freeing
@@ -1938,7 +2195,8 @@ unified_cache::~unified_cache() {
         staging_owner_                    = {};
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
-        return;
+        resources_shutdown_ = true;
+        return true;
     }
 
     // Check arena state before destroying anything.
@@ -2046,8 +2304,11 @@ unified_cache::~unified_cache() {
     }
     persistent_scratches_.clear();
 
-    // Destroy the VRAM arena (frees the pre-allocated chunks).
-    arena_destroy();
+    // Destroy the VRAM arena (frees the pre-allocated chunks). A failed free
+    // keeps the cache object and chunk registration intact for unload retry.
+    if (!arena_destroy()) {
+        return false;
+    }
 
     // Destroy layout pool before SYCL context goes away.
     // The pool's reset() returns physical bytes freed so we can decrement used_.
@@ -2165,6 +2426,8 @@ unified_cache::~unified_cache() {
         }
     }
     partial_cache_.clear();
+    resources_shutdown_ = true;
+    return true;
 }
 
 // Fast 64-bit hash of entire data buffer (xxHash-style)
@@ -2313,6 +2576,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                                     int                        expert_id,
                                     ggml_layout_mode           layout,
                                     bool                       validate_content) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (!key_id.valid || !src_ptr || size == 0) {
         return nullptr;
     }
@@ -2329,9 +2596,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // Create key for lookup (identity-only, no layout)
     unified_cache_key key{ type, key_id, layer_id, expert_id };
 
-    // Check if already cached
+    // Check if already cached. Reuse is a touch by this exact bound load.
     auto it = entries_.find(key);
     if (it != entries_.end()) {
+        stamp_pending_owner(it->second, load_effect_guard);
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
             id_to_key_.emplace(key_id, key);
@@ -2688,6 +2956,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 
     // Store in cache
+    stamp_pending_owner(entry, load_effect_guard);
     entries_[key] = entry;
     auto id_it    = id_to_key_.find(key_id);
     if (id_it == id_to_key_.end()) {
@@ -2737,11 +3006,17 @@ bool unified_cache::planned_materialization_active() const {
     return planned_materialization_depth_.load(std::memory_order_acquire) > 0;
 }
 
-bool unified_cache::planned_materialization_allowed(const char *               op,
-                                                    const ggml_sycl_cache_id & key,
-                                                    ggml_layout_mode           layout,
-                                                    const char *               caller) const {
-    if (!has_placement_plan_) {
+bool unified_cache::planned_materialization_allowed(const char *                 op,
+                                                    const ggml_sycl_cache_id &   key,
+                                                    ggml_layout_mode             layout,
+                                                    const char *                 caller,
+                                                    const placement_cache_read * retained_read) const {
+    const auto   owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);
+    const auto & placement  = retained_read ? *retained_read : owned_read;
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return false;
+    }
+    if (placement.coherence == placement_cache_coherence::GENUINE_NO_PLAN) {
         return true;
     }
     if (planned_materialization_active()) {
@@ -2890,7 +3165,15 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
+    if (load_effect_guard.failed()) {
+        return result;
+    }
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN(
@@ -2906,11 +3189,12 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
 
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
         auto                    it        = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
             it->second.location != cache_location::HOST_MMAP && !it->second.retired) {
+            stamp_pending_owner(it->second, load_effect_guard);
             result.ptr = it->second.device_ptr;
             if (it->second.has_ready_event) {
                 result.event = it->second.ready_event;
@@ -2918,14 +3202,15 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_weight/cache-hit-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
-                                                            it->second.layout, !it->second.host_resident, &it->second);
+                *out_handle =
+                    mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
+                                                         it->second.layout, !it->second.host_resident, &it->second);
             }
             result.ok = true;
             return result;
         }
     }
-    if (!planned_materialization_allowed("direct_stage_weight", key, layout, __func__)) {
+    if (!planned_materialization_allowed("direct_stage_weight", key, layout, __func__, &placement)) {
         return result;
     }
 
@@ -2934,7 +3219,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !has_placement_plan()) {
+    if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3064,14 +3349,15 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             }
             release_entry_allocation_locked(old->second);
         }
+        stamp_pending_owner(entry, load_effect_guard);
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
         direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_weight/mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_weight/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                        !stored.host_resident, &stored);
+            *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                               stored.layout, !stored.host_resident, &stored);
         }
         id_to_key_[key] = cache_key;
     }
@@ -3111,7 +3397,7 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
                                                             const char *              site) {
     entry.in_use_count.fetch_add(1);
     entry.debug_last_lease_site = site;
-    return std::make_shared<mem_handle>(mem_handle::from_weight_lease(
+    return std::make_shared<mem_handle>(mem_handle::from_weight_lease_locked(
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
 
@@ -3124,7 +3410,15 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
+    if (load_effect_guard.failed()) {
+        return result;
+    }
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (!key.valid || !src_ptr || src_size == 0 || dst_size == 0) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN(
@@ -3140,11 +3434,12 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
 
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
         auto                    it        = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
             it->second.location == cache_location::DEVICE && !it->second.retired) {
+            stamp_pending_owner(it->second, load_effect_guard);
             result.ptr = it->second.device_ptr;
             if (it->second.has_ready_event) {
                 result.event = it->second.ready_event;
@@ -3152,14 +3447,14 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_expert/cache-hit-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, it->second.device_ptr,
-                                                            it->second.layout, true, &it->second);
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
+                                                                   it->second.layout, true, &it->second);
             }
             result.ok = true;
             return result;
         }
     }
-    if (!planned_materialization_allowed("direct_stage_expert", key, layout, __func__)) {
+    if (!planned_materialization_allowed("direct_stage_expert", key, layout, __func__, &placement)) {
         if (moe_direct_trace_enabled()) {
             GGML_LOG_WARN("[DIRECT-STAGE] planned materialization rejected for expert layout=%d\n", (int) layout);
         }
@@ -3171,8 +3466,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             GGML_LOG_INFO(
                 "[DIRECT-STAGE] begin expert device=%d layout=%d src=%p src_size=%zu dst_size=%zu plan=%d "
                 "arena=%d weight_used=%.1f MB avail=%.1f MB largest=%.1f MB\n",
-                cache_device, (int) layout, src_ptr, src_size, dst_size, has_placement_plan() ? 1 : 0,
-                arena_active() ? 1 : 0, zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+                cache_device, (int) layout, src_ptr, src_size, dst_size,
+                !coherent_cache_placement_plan_owner(this)->entries.empty() ? 1 : 0, arena_active() ? 1 : 0,
+                zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
                 zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
         }
@@ -3183,7 +3479,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     mem_handle direct_alloc_owner;
-    if (!ptr && !has_placement_plan()) {
+    if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
         req.device                         = cache_device;
@@ -3199,7 +3495,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
     }
     if (!ptr) {
-        if (has_placement_plan()) {
+        if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {
             static std::atomic<int> planned_stage_fail_log{ 0 };
             if (planned_stage_fail_log.fetch_add(1, std::memory_order_relaxed) < 10) {
                 size_t entry_count         = 0;
@@ -3285,6 +3581,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.pool_allocated   = false;
             entry.last_write_event = {};
             entry.has_write_event  = false;
+            stamp_pending_owner(entry, load_effect_guard);
             entries_[cache_key]    = entry;
             auto & stored          = entries_[cache_key];
             direct_handle =
@@ -3292,8 +3589,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert/host-publish-out_handle";
-                *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                            stored.location == cache_location::DEVICE, &stored);
+                *out_handle =
+                    mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr, stored.layout,
+                                                         stored.location == cache_location::DEVICE, &stored);
             }
             id_to_key_[key] = cache_key;
         }
@@ -3305,6 +3603,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.layout                = GGML_LAYOUT_AOS;
             entry.location              = loc;
             entry.handle                = std::move(direct_handle);
+            entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
             direct_expert_entries_[key] = std::move(entry);
             moe_direct_trace_key("insert-host", key, GGML_LAYOUT_AOS, "zone-full", direct_expert_entries_.size(),
                                  &direct_expert_entries_.find(key)->second);
@@ -3420,14 +3719,15 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             }
             release_entry_allocation_locked(old->second);
         }
+        stamp_pending_owner(entry, load_effect_guard);
         entries_[cache_key] = entry;
         auto & stored       = entries_[cache_key];
         direct_handle       = make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert/mirror");
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_expert/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr, stored.layout,
-                                                        !stored.host_resident, &stored);
+            *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                               stored.layout, !stored.host_resident, &stored);
         }
         id_to_key_[key] = cache_key;
     }
@@ -3440,8 +3740,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         direct_entry.location        = cache_location::DEVICE;
         direct_entry.has_ready_event = true;
         direct_entry.ready_event     = last_event;
-        direct_entry.handle          = std::move(direct_handle);
-        direct_expert_entries_[key]  = std::move(direct_entry);
+        direct_entry.handle              = std::move(direct_handle);
+        direct_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+        direct_expert_entries_[key]      = std::move(direct_entry);
         moe_direct_trace_key("insert-device", key, layout, "", direct_expert_entries_.size(),
                              &direct_expert_entries_.find(key)->second);
     }
@@ -3461,7 +3762,15 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               const void *                            fill_ctx,
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
+    auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
+    if (load_effect_guard.failed()) {
+        return result;
+    }
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return result;
+    }
     if (keys.empty() || !src_ptr || src_size == 0 || expert_dst_size == 0) {
         return result;
     }
@@ -3490,7 +3799,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
 
     bool all_existing = true;
     {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         for (const ggml_sycl_cache_id & key : keys) {
             const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
             auto                    it        = entries_.find(cache_key);
@@ -3499,6 +3808,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                 all_existing = false;
                 break;
             }
+            stamp_pending_owner(it->second, load_effect_guard);
         }
         if (all_existing) {
             if (out_handles) {
@@ -3510,8 +3820,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                     auto & entry = entries_.find(cache_key)->second;
                     entry.in_use_count.fetch_add(1);
                     entry.debug_last_lease_site = "direct_stage_expert_tensor/all-existing";
-                    out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, entry.device_ptr,
-                                                                         entry.layout, true, &entry));
+                    out_handles->push_back(mem_handle::from_weight_lease_locked(
+                        cache_key, cache_device, entry.device_ptr, entry.layout, true, &entry));
                 }
             }
             result.ptr = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, keys.front(), layout))
@@ -3539,7 +3849,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         }
     }
     for (const ggml_sycl_cache_id & key : keys) {
-        if (!planned_materialization_allowed("direct_stage_expert_tensor", key, layout, __func__)) {
+        if (!planned_materialization_allowed("direct_stage_expert_tensor", key, layout, __func__, &placement)) {
             return result;
         }
     }
@@ -3678,6 +3988,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != view_ptr) {
                 release_entry_allocation_locked(old->second);
             }
+            stamp_pending_owner(entry, load_effect_guard);
             entries_[cache_key] = std::move(entry);
             auto &       stored = entries_[cache_key];
             weight_entry direct_entry{};
@@ -3686,15 +3997,16 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             direct_entry.layout          = layout;
             direct_entry.location        = cache_location::DEVICE;
             direct_entry.has_ready_event = true;
-            direct_entry.ready_event     = fill_event;
+            direct_entry.ready_event         = fill_event;
+            direct_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
             direct_entry.handle =
                 make_direct_entry_handle(cache_key, cache_device, stored, "direct_stage_expert_tensor/mirror");
             direct_entries.push_back(std::move(direct_entry));
             if (out_handles) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert_tensor/publish-out_handles";
-                out_handles->push_back(mem_handle::from_weight_lease(cache_key, cache_device, stored.device_ptr,
-                                                                     stored.layout, true, &stored));
+                out_handles->push_back(mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
+                                                                            stored.layout, true, &stored));
             }
             id_to_key_[key] = cache_key;
         }
@@ -3908,9 +4220,11 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                     if (result.has_ready_event) {
                         result.ready_event = entry.ready_event;
                     }
-                    result.reason   = expert_resolve_reason::FOUND;
-                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
-                        entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry));
+                    auto lease_owner = entry.storage_owner;
+                    result.reason    = expert_resolve_reason::FOUND;
+                    result.lifetime  = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
+                        entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry,
+                        std::move(lease_owner), result.has_ready_event, result.ready_event));
                     return result;
                 }
                 apply_miss(reject_reason);
@@ -3986,7 +4300,6 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
 
         const size_t         entry_size            = entry.size;
         const cache_location entry_location        = entry.location;
-        const bool           entry_has_ready_event = entry.has_ready_event;
         unified_cache_key    mirror_key =
             make_direct_stage_key(cache_entry_type::MOE_EXPERT, req.key, req.requested_layout);
         lock.unlock();
@@ -4000,10 +4313,14 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             result.owning_device   = owner;
             result.actual_layout   = lease.layout;
             result.cpu_accessible  = !lease.on_device;
-            result.has_ready_event = entry_has_ready_event;
-            result.reason          = expert_resolve_reason::FOUND;
-            result.lifetime        = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
-                mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry));
+            result.has_ready_event = lease.has_ready_event;
+            if (lease.has_ready_event) {
+                result.ready_event = lease.ready_event;
+            }
+            result.reason   = expert_resolve_reason::FOUND;
+            result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
+                mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry,
+                std::move(lease.storage_owner), lease.has_ready_event, lease.ready_event));
             return result;
         }
 
@@ -4307,13 +4624,18 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
     return dropped;
 }
 
-void unified_cache::register_host_expert(ggml_sycl_cache_id key,
-                                         void *             ptr,
-                                         size_t             size,
-                                         ggml_layout_mode   layout,
-                                         mem_handle *       out_handle) {
+bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return false;
+    }
     if (!planned_materialization_allowed("register_host_expert", key, layout, __func__)) {
-        return;
+        return false;
     }
 
     const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
@@ -4332,12 +4654,18 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
     }
 
     std::shared_ptr<mem_handle> direct_handle;
+    bool                        cache_inserted = false;
     {
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
         unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
         auto                                old = entries_.find(cache_key);
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
+                stamp_pending_owner(old->second, load_effect_guard);
+                if (allocation_owner && !old->second.storage_owner) {
+                    old->second.storage_owner = allocation_owner;
+                    old->second.non_owning_external_host = !allocation_owner;
+                }
                 old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
@@ -4345,14 +4673,14 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_expert/existing-out_handle";
-                    *out_handle =
-                        mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
-                                                      old->second.location == cache_location::DEVICE, &old->second);
+                    *out_handle                       = mem_handle::from_weight_lease_locked(
+                        cache_key, dev, old->second.device_ptr, old->second.layout,
+                        old->second.location == cache_location::DEVICE, &old->second);
                 }
                 goto publish_host_expert_direct;
             }
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_expert")) {
-                return;
+                return false;
             }
             entries_.erase(old);
         }
@@ -4376,36 +4704,84 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
-        entries_[cache_key]          = cache_entry;
-        auto & stored                = entries_[cache_key];
-        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_expert/publish-mirror");
-        if (out_handle) {
-            stored.in_use_count.fetch_add(1);
-            stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                        stored.location == cache_location::DEVICE, &stored);
+        cache_entry.storage_owner            = allocation_owner;
+        cache_entry.non_owning_external_host = !allocation_owner;
+        stamp_pending_owner(cache_entry, load_effect_guard);
+        try {
+            if (fail_next_host_registration_insert_.exchange(false)) {
+                throw std::bad_alloc();
+            }
+            entries_[cache_key] = cache_entry;
+            cache_inserted      = true;
+        } catch (...) {
+            return false;
         }
-        id_to_key_[key] = cache_key;
+        try {
+            auto & stored = entries_[cache_key];
+            direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_expert/publish-mirror");
+            if (out_handle) {
+                stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
+                                                                   stored.location == cache_location::DEVICE, &stored);
+            }
+            id_to_key_[key] = cache_key;
+        } catch (...) {
+            if (out_handle) {
+                *out_handle = {};
+            }
+            direct_handle.reset();
+            entries_.erase(cache_key);
+            return false;
+        }
     }
 
 publish_host_expert_direct:
-    std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    weight_entry                        entry{};
-    entry.ptr                   = ptr;
-    entry.size                  = size;
-    entry.layout                = layout;
-    entry.location              = cache_loc;
-    entry.handle                = std::move(direct_handle);
-    direct_expert_entries_[key] = std::move(entry);
+    try {
+        std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
+        weight_entry                        entry{};
+        entry.ptr                   = ptr;
+        entry.size                  = size;
+        entry.layout                = layout;
+        entry.location              = cache_loc;
+        entry.handle                = std::move(direct_handle);
+        entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
+        direct_expert_entries_[key] = std::move(entry);
+    } catch (...) {
+        if (out_handle) {
+            *out_handle = {};
+        }
+        direct_handle.reset();
+        if (!cache_inserted) {
+            return false;
+        }
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        auto                                it = entries_.find(cache_key);
+        if (it != entries_.end() && it->second.device_ptr == ptr) {
+            entries_.erase(it);
+        }
+        auto id = id_to_key_.find(key);
+        if (id != id_to_key_.end() && id->second == cache_key) {
+            id_to_key_.erase(id);
+        }
+        return false;
+    }
+    return true;
 }
 
-void unified_cache::register_host_weight(ggml_sycl_cache_id key,
-                                         void *             ptr,
-                                         size_t             size,
-                                         ggml_layout_mode   layout,
-                                         mem_handle *       out_handle) {
+bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
+                                         void *                ptr,
+                                         size_t                size,
+                                         ggml_layout_mode      layout,
+                                         mem_handle *          out_handle,
+                                         std::shared_ptr<void> allocation_owner) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return false;
+    }
     if (!planned_materialization_allowed("register_host_weight", key, layout, __func__)) {
-        return;
+        return false;
     }
 
     const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
@@ -4424,12 +4800,18 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
     }
 
     std::shared_ptr<mem_handle> direct_handle;
+    bool                        cache_inserted = false;
     {
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
         unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
         auto                                old = entries_.find(cache_key);
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
+                stamp_pending_owner(old->second, load_effect_guard);
+                if (allocation_owner && !old->second.storage_owner) {
+                    old->second.storage_owner = allocation_owner;
+                    old->second.non_owning_external_host = !allocation_owner;
+                }
                 old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
@@ -4437,14 +4819,14 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_weight/existing-out_handle";
-                    *out_handle =
-                        mem_handle::from_weight_lease(cache_key, dev, old->second.device_ptr, old->second.layout,
-                                                      old->second.location == cache_location::DEVICE, &old->second);
+                    *out_handle                       = mem_handle::from_weight_lease_locked(
+                        cache_key, dev, old->second.device_ptr, old->second.layout,
+                        old->second.location == cache_location::DEVICE, &old->second);
                 }
                 goto publish_host_weight_direct;
             }
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_weight")) {
-                return;
+                return false;
             }
             entries_.erase(old);
         }
@@ -4468,27 +4850,70 @@ void unified_cache::register_host_weight(ggml_sycl_cache_id key,
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
-        entries_[cache_key]          = cache_entry;
-        auto & stored                = entries_[cache_key];
-        direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_weight/publish-mirror");
-        if (out_handle) {
-            stored.in_use_count.fetch_add(1);
-            stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
-            *out_handle = mem_handle::from_weight_lease(cache_key, dev, stored.device_ptr, stored.layout,
-                                                        stored.location == cache_location::DEVICE, &stored);
+        cache_entry.storage_owner            = allocation_owner;
+        cache_entry.non_owning_external_host = !allocation_owner;
+        stamp_pending_owner(cache_entry, load_effect_guard);
+        try {
+            if (fail_next_host_registration_insert_.exchange(false)) {
+                throw std::bad_alloc();
+            }
+            entries_[cache_key] = cache_entry;
+            cache_inserted      = true;
+        } catch (...) {
+            return false;
         }
-        id_to_key_[key] = cache_key;
+        try {
+            auto & stored = entries_[cache_key];
+            direct_handle = make_direct_entry_handle(cache_key, dev, stored, "register_host_weight/publish-mirror");
+            if (out_handle) {
+                stored.in_use_count.fetch_add(1);
+                stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
+                *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
+                                                                   stored.location == cache_location::DEVICE, &stored);
+            }
+            id_to_key_[key] = cache_key;
+        } catch (...) {
+            if (out_handle) {
+                *out_handle = {};
+            }
+            direct_handle.reset();
+            entries_.erase(cache_key);
+            return false;
+        }
     }
 
 publish_host_weight_direct:
-    std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    weight_entry                        entry{};
-    entry.ptr                   = ptr;
-    entry.size                  = size;
-    entry.layout                = layout;
-    entry.location              = cache_loc;
-    entry.handle                = std::move(direct_handle);
-    direct_weight_entries_[key] = std::move(entry);
+    try {
+        std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
+        weight_entry                        entry{};
+        entry.ptr                   = ptr;
+        entry.size                  = size;
+        entry.layout                = layout;
+        entry.location              = cache_loc;
+        entry.handle                = std::move(direct_handle);
+        entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
+        direct_weight_entries_[key] = std::move(entry);
+    } catch (...) {
+        if (out_handle) {
+            *out_handle = {};
+        }
+        direct_handle.reset();
+        if (!cache_inserted) {
+            return false;
+        }
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+        auto                                it = entries_.find(cache_key);
+        if (it != entries_.end() && it->second.device_ptr == ptr) {
+            entries_.erase(it);
+        }
+        auto id = id_to_key_.find(key);
+        if (id != id_to_key_.end() && id->second == cache_key) {
+            id_to_key_.erase(id);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool unified_cache::is_cached(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) const {
@@ -4549,6 +4974,10 @@ bool unified_cache::is_cached_any(const ggml_sycl_cache_id & key_id) const {
 }
 
 void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (!key_id.valid) {
         return nullptr;
     }
@@ -4598,14 +5027,19 @@ void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
             return nullptr;
         }
     }
+    stamp_pending_owner(entry, load_effect_guard);
     return entry.device_ptr;
 }
 
 void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (!key_id.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
@@ -4632,7 +5066,7 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
         }
         return nullptr;
     }
-    const auto & entry = entry_it->second;
+    auto & entry = entry_it->second;
     if (entry.retired || entry.layout != layout) {
         return nullptr;
     }
@@ -4649,6 +5083,7 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
     if (entry.location == cache_location::HOST_MMAP) {
         return nullptr;
     }
+    stamp_pending_owner(entry, load_effect_guard);
     return entry.device_ptr;
 }
 
@@ -4656,6 +5091,10 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                                                 ggml_layout_mode           layout,
                                                 sycl::event *              out_event,
                                                 bool *                     out_has_event) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (out_event) {
         *out_event = sycl::event{};
     }
@@ -4665,7 +5104,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
     if (!key_id.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
@@ -4707,6 +5146,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                 *out_has_event = true;
             }
         }
+        stamp_pending_owner(entry_it->second, load_effect_guard);
         return entry.device_ptr;
     }
     // IN_PROGRESS entries: return pointer + ready_event so the caller can
@@ -4720,6 +5160,7 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
                 *out_has_event = true;
             }
         }
+        stamp_pending_owner(entry_it->second, load_effect_guard);
         return entry.device_ptr;
     }
     return nullptr;
@@ -4733,6 +5174,10 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                                     cache_entry_type           type,
                                     int                        layer_id,
                                     int                        expert_id) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (!key.valid || size == 0) {
         return nullptr;
     }
@@ -4788,7 +5233,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     // Check VRAM budget and evict if needed.
     // Skip the legacy layout_pool_ when the cache has a placement plan: the arena manages
     // all VRAM allocations in that mode, making pool sub-allocation redundant.
-    const bool skip_pool     = has_placement_plan();
+    const bool skip_pool     = !coherent_cache_placement_plan_owner(this)->entries.empty();
     bool       is_pool_alloc = false;
     void *     device_ptr    = nullptr;
     mem_handle direct_alloc_owner;
@@ -4893,6 +5338,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = !is_pool_alloc;
 
+    stamp_pending_owner(entry, load_effect_guard);
     entries_[cache_key] = entry;
     auto id_it          = id_to_key_.find(key);
     if (id_it == id_to_key_.end()) {
@@ -4919,6 +5365,10 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
                                    int                        expert_id,
                                    const void *               src_ptr,
                                    int64_t                    onednn_pack_m) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return;
+    }
     if (!key.valid || !device_ptr) {
         return;
     }
@@ -4938,7 +5388,8 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
         }
     }
     if (it != entries_.end()) {
-        auto & entry          = it->second;
+        auto & entry = it->second;
+        stamp_pending_owner(entry, load_effect_guard);
         entry.device_ptr      = device_ptr;
         entry.state           = cache_entry_state::READY;
         entry.has_ready_event = false;
@@ -4971,6 +5422,7 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
         entry.location        = cache_location::DEVICE;
         entry.pool_allocated  = false;
 
+        stamp_pending_owner(entry, load_effect_guard);
         entries_[cache_key] = entry;
         auto id_it          = id_to_key_.find(key);
         if (id_it == id_to_key_.end()) {
@@ -5428,10 +5880,14 @@ void * unified_cache::lookup(const ggml_sycl_cache_id & key, ggml_layout_mode la
 }
 
 void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_layout_mode layout) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (!key.valid) {
         return nullptr;
     }
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_weight_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
     const unified_cache_key direct_expert_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
     auto                    entry_it          = entries_.find(direct_weight_key);
@@ -5459,11 +5915,16 @@ void * unified_cache::lookup_device_only(const ggml_sycl_cache_id & key, ggml_la
     if (entry.host_resident) {
         return nullptr;
     }
+    stamp_pending_owner(entry_it->second, load_effect_guard);
     return entry.device_ptr;
 }
 
 unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_cache_id & key) {
+    auto              load_effect_guard = acquire_bound_load_effect();
     weight_ptr_result result{};
+    if (load_effect_guard.failed()) {
+        return result;
+    }
     if (!key.valid) {
         return result;
     }
@@ -5471,7 +5932,7 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
     // This ensures the best available layout is returned, not whatever
     // id_to_key_ happens to point at (which can be ONEDNN_PACKED from PP).
     static const ggml_layout_mode       try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
     auto try_entry = [&](const unified_cache_key & ckey) {
         auto entry_it = entries_.find(ckey);
@@ -5491,6 +5952,7 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
         if (entry.location == cache_location::HOST_MMAP) {
             return false;
         }
+        stamp_pending_owner(entry_it->second, load_effect_guard);
         result.ptr       = entry.device_ptr;
         result.layout    = entry.layout;
         result.on_device = !entry.host_resident;
@@ -5623,7 +6085,11 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const
 }
 
 unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {
+    auto                    load_effect_guard = acquire_bound_load_effect();
     weight_ptr_lease_result result{};
+    if (load_effect_guard.failed()) {
+        return result;
+    }
     if (!key.id.valid) {
         return result;
     }
@@ -5632,6 +6098,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
         auto entry_it = entries_.find(key);
         if (entry_it != entries_.end()) {
             auto & entry = entry_it->second;
+            stamp_pending_owner(entry, load_effect_guard);
             if (entry.retired) {
                 return result;
             }
@@ -5658,7 +6125,8 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
-            result.entry     = &entry;  // pointer stable across unordered_map inserts
+            result.entry                = &entry;  // pointer stable across unordered_map inserts
+            result.storage_owner        = entry.storage_owner;
             if (entry.has_ready_event) {
                 result.has_ready_event = true;
                 result.ready_event     = entry.ready_event;
@@ -5892,7 +6360,14 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
     }
 }
 
-void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+void unified_cache::unpin(const ggml_sycl_cache_id &   key_id,
+                          ggml_layout_mode             layout,
+                          const placement_cache_read * retained_read) {
+    const auto   owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);
+    const auto & placement  = retained_read ? *retained_read : owned_read;
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     if (!key_id.valid) {
         return;
     }
@@ -5925,7 +6400,11 @@ void unified_cache::unpin(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
 }
 
 void unified_cache::unpin_experts() {
-    if (has_placement_plan_) {
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
+    if (placement.coherence == placement_cache_coherence::MATCH) {
         // Placement-plan experts are model-load residency decisions.  Runtime
         // prestage/LRU helpers must not invalidate those smart-handle routes.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] ignoring expert unpin request while placement plan is active\n");
@@ -5940,6 +6419,9 @@ void unified_cache::unpin_experts() {
 }
 
 void unified_cache::unpin_all() {
+    if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     for (auto & pair : entries_) {
         pair.second.pinned = false;
@@ -6043,12 +6525,16 @@ int unified_cache::pin_layer_weights(int layer_id, const layer_weight_set & weig
 }
 
 void unified_cache::unpin_layer_weights(int layer_id, const layer_weight_set & weights, ggml_layout_mode layout) {
+    const auto placement = cache_placement_coherence(this);
+    if (placement.coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
+        return;
+    }
     // Helper lambda to try unpinning a single key
     auto try_unpin = [&](const ggml_sycl_cache_id & key) {
         if (!key.valid) {
             return;
         }
-        unpin(key, layout);
+        unpin(key, layout, &placement);
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] bulk unpin layer=%d model=%llu name_hash=0x%llx layout=%d\n", layer_id,
                         (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout);
     };
@@ -6857,6 +7343,10 @@ void unified_cache::release_entry_allocation_locked(unified_cache_entry & entry,
         return;
     }
 
+    if (entry.allocation_released_via_owner || entry.non_owning_external_host) {
+        return;
+    }
+
     if (entry.storage_owner) {
         // Tensor-bulk expert views share a base owner. The owner releases the
         // allocation when the final view drops; individual views do not free.
@@ -7459,7 +7949,12 @@ static bool weight_entry_reclaimable(const unified_cache_entry & entry, weight_r
     if (mode == weight_reclaim_mode::MID_LOAD_REPLAN) {
         return true;
     }
-    if (!entry.owner_tagged && live_mask != 0) {
+    // A model teardown may reclaim only state attributed to that model. An
+    // untagged entry was created with no load/finisher authority on its thread;
+    // claiming it merely because another thread is loading would violate the
+    // exact transaction boundary. Generic load-boundary cleanup may still reap
+    // it once no model is live.
+    if (!entry.owner_tagged && (mode == weight_reclaim_mode::MODEL_TEARDOWN || live_mask != 0)) {
         return false;
     }
     return true;
@@ -7509,7 +8004,88 @@ size_t unified_cache::owner_tagged_entry_count() const {
     return n;
 }
 
-void unified_cache::note_model_load_end(uint32_t slot) {
+void unified_cache::test_mark_all_entries_touched_by_load(uint64_t load_txn_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto & pair : entries_) {
+        pair.second.pending_load_txn_id = load_txn_id;
+    }
+}
+
+bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
+                                                    ggml_layout_mode   layout,
+                                                    uint64_t           load_txn_id) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    bool                                found = false;
+    for (auto & pair : entries_) {
+        if (detail::cache_id_equal(pair.first.id, key) && pair.second.layout == layout) {
+            pair.second.pending_load_txn_id = load_txn_id;
+            found                           = true;
+        }
+    }
+    return found;
+}
+
+uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    for (const auto & pair : entries_) {
+        if (detail::cache_id_equal(pair.first.id, key) && pair.second.layout == layout) {
+            return pair.second.pending_load_txn_id;
+        }
+    }
+    return 0;
+}
+
+void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
+    // End admission has already drained producers. Drop direct leases before
+    // erasing their canonical cache entries so no mem_handle can dangle.
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+        for (auto it = direct_expert_entries_.begin(); it != direct_expert_entries_.end();) {
+            it = it->second.pending_load_txn_id == load_txn_id ? direct_expert_entries_.erase(it) : std::next(it);
+        }
+        for (auto it = direct_weight_entries_.begin(); it != direct_weight_entries_.end();) {
+            it = it->second.pending_load_txn_id == load_txn_id ? direct_weight_entries_.erase(it) : std::next(it);
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        auto & entry = it->second;
+        if (entry.pending_load_txn_id != load_txn_id) {
+            ++it;
+            continue;
+        }
+        if (entry.owner_mask != 0) {
+            // Shared/pre-existing ownership survives; remove only B's touch.
+            entry.pending_load_txn_id = 0;
+            ++it;
+            continue;
+        }
+        auto mapped = id_to_key_.find(it->first.id);
+        if (mapped != id_to_key_.end() && mapped->second == it->first) {
+            id_to_key_.erase(mapped);
+        }
+        if (entry.in_use_count.load() != 0) {
+            entry.retired             = true;
+            entry.pending_load_txn_id = 0;
+            if (entry.storage_owner) {
+                entry.storage_owner.reset();
+                entry.allocation_released_via_owner = true;
+            }
+            ++it;
+            continue;
+        }
+        if (entry.storage_owner) {
+            entry.storage_owner.reset();
+            entry.allocation_released_via_owner = true;
+        } else if (!entry.non_owning_external_host) {
+            release_entry_allocation_locked(entry);
+        }
+        it = entries_.erase(it);
+    }
+}
+
+void unified_cache::note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
     if (slot >= MODEL_SLOT_COUNT) {
         // No slot was available (more than 32 concurrent models).  Leaving the
         // entries untagged is the safe outcome: weight_entry_reclaimable() keeps
@@ -7522,13 +8098,14 @@ void unified_cache::note_model_load_end(uint32_t slot) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     live_model_mask_ |= bit;
     size_t tagged = 0;
-    // Claim everything this model can now resolve, which is more than what it
-    // staged: two llama_models over the same GGUF dedupe to one entry (model_id
-    // is deliberately excluded from cache_id_equal for GGUF weights), so an
-    // entry an earlier model created must gain this model's bit too.
+    // Promote only entries created or staged by this exact load transaction.
     for (auto & pair : entries_) {
+        if (pair.second.pending_load_txn_id != load_txn_id) {
+            continue;
+        }
         pair.second.owner_mask |= bit;
         pair.second.owner_tagged = true;
+        pair.second.pending_load_txn_id = 0;
         tagged++;
     }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] model slot %u claimed %zu weight entries (live mask 0x%08x)\n", slot, tagged,
@@ -7734,6 +8311,13 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                     entries_owned++;
                 } else {
                     entries_untagged++;
+                    if (mode == weight_reclaim_mode::MODEL_TEARDOWN) {
+                        GGML_SYCL_DEBUG(
+                            "[UNIFIED-CACHE] model teardown preserved unattributed runtime entry "
+                            "model=%llu name_hash=0x%llx layout=%d pending_load=%llu\n",
+                            (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
+                            (int) entry.layout, (unsigned long long) entry.pending_load_txn_id);
+                    }
                 }
                 ++it;
                 continue;
@@ -7742,7 +8326,8 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                 entry.pinned = false;
                 entries_unpinned++;
             }
-            if (entry.device_ptr && !entry.storage_owner) {
+            if (entry.device_ptr && !entry.storage_owner && !entry.non_owning_external_host &&
+                !entry.allocation_released_via_owner) {
                 to_free.push_back(
                     { entry.device_ptr, entry.size, entry.location, entry.host_resident, entry.pool_allocated });
             }
@@ -7943,7 +8528,7 @@ void unified_cache::update_reserved_bytes(size_t reserved_bytes) {
 void unified_cache::unpin_on_event(const ggml_sycl_cache_id & key_id,
                                    ggml_layout_mode           layout,
                                    const sycl::event &        event) {
-    if (!key_id.valid) {
+    if (!key_id.valid || cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {
         return;
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
@@ -9689,6 +10274,36 @@ void offload_buffer_pool_trim(int device) {
     }
 }
 
+bool offload_buffer_pool_shutdown() {
+    std::vector<offload_pool_slot> owners;
+    {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (const auto & [ptr, slot] : g_offload_pool_slots) {
+            (void) ptr;
+            if (slot.in_use) return false;
+            owners.push_back(slot);
+        }
+        // Drop both indexes atomically before releasing allocations: unified
+        // free may re-enter cache bookkeeping, but can no longer observe stale
+        // offload-pool ownership.
+        g_offload_pool_slots.clear();
+        g_offload_pool_free.clear();
+    }
+    std::vector<offload_pool_slot> failed;
+    for (const auto & owner : owners) {
+        if (!unified_free(owner.handle)) failed.push_back(owner);
+    }
+    if (!failed.empty()) {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (const auto & owner : failed) {
+            g_offload_pool_slots[owner.handle.ptr] = owner;
+            g_offload_pool_free[owner.key].push_back(owner.handle.ptr);
+        }
+        return false;
+    }
+    return true;
+}
+
 static size_t offload_buffer_pool_trim_host_zone(host_zone_id zone) {
     std::vector<alloc_handle> free_list;
     {
@@ -10047,13 +10662,29 @@ bool unified_alloc_validate_registry(int device, const char * where) {
         }
     }
 
+    int active_devices = 0;
+    try {
+        active_devices = std::min(ggml_sycl_info().device_count, GGML_SYCL_MAX_DEVICES);
+    } catch (...) {
+        return false;
+    }
+    if (device >= active_devices) {
+        return false;
+    }
+
     bool ok = true;
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+    for (int d = 0; d < active_devices; ++d) {
         if (device >= 0 && d != device) {
             continue;
         }
-        const size_t tracked = unified_cache_arena_non_weight_used(d);
-        const size_t reg     = registry_device[d];
+        size_t tracked = 0;
+        {
+            // Validation is observational: never create a cache merely to
+            // inspect accounting, especially across NODELETE reload.
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            tracked = arena_non_weight_used_locked(d);
+        }
+        const size_t reg = registry_device[d];
         if (tracked != reg) {
             ok = false;
             GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s dev=%d tracked=%zu registry=%zu\n",
@@ -12068,16 +12699,276 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     return handle;
 }
 
-void shutdown_unified_cache() {
-    // Set shutdown flag FIRST so destructors skip sycl::free() calls
-    g_sycl_shutting_down.store(true);
+void prepare_unified_cache_for_module_use() noexcept {
+    g_sycl_shutting_down.store(false, std::memory_order_release);
+}
 
-    // Clear all device caches
-    // The destructors will skip cleanup due to the shutdown flag
-    std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-    g_device_caches.clear();
+void rollback_unified_cache_module_use() noexcept {
+    g_sycl_shutting_down.store(true, std::memory_order_release);
+}
 
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Shutdown complete\n");
+static void shutdown_shared_context_queues() noexcept {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        sycl::queue * queue = g_shared_ctx_queues[d];
+        g_shared_ctx_queues[d] = nullptr;
+        if (!queue) {
+            continue;
+        }
+        try {
+            queue->wait_and_throw();
+        } catch (...) {
+        }
+        delete queue;
+    }
+    g_shared_ctx_queues_initialized = false;
+    g_shared_ctx_queues_initialized_for = 0;
+}
+
+using runtime_allocation_owner_snapshot = std::vector<std::pair<int, std::shared_ptr<unified_cache>>>;
+
+static bool runtime_allocation_owned_by_cache_snapshot(const runtime_alloc_record &                   rec,
+                                                       const runtime_allocation_owner_snapshot & snapshot,
+                                                       int *                                       owner_device = nullptr) noexcept {
+    try {
+        auto owns_record = [&](const unified_cache & cache) {
+            if (cache.contains_pinned(rec.handle.ptr) ||
+                cache.contains_pinned_backing_allocation(rec.handle.ptr, rec.handle.size)) {
+                return true;
+            }
+            for (const auto & seg : rec.handle.all_segments) {
+                if (cache.contains_pinned(seg.ptr) ||
+                    cache.contains_pinned_backing_allocation(seg.ptr, seg.size)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (const auto & item : snapshot) {
+            if (!item.second) {
+                continue;
+            }
+            if (owns_record(*item.second)) {
+                if (owner_device) {
+                    *owner_device = item.first;
+                }
+                return true;
+            }
+        }
+    } catch (...) {
+    }
+    if (owner_device) {
+        *owner_device = -1;
+    }
+    return false;
+}
+
+static runtime_allocation_owner_snapshot capture_runtime_allocation_owner_snapshot() {
+    runtime_allocation_owner_snapshot snapshot;
+    snapshot.reserve(g_device_caches.size());
+    for (const auto & item : g_device_caches) {
+        if (item.second) {
+            snapshot.push_back(item);
+        }
+    }
+    return snapshot;
+}
+
+static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & rec, int * owner_device = nullptr) noexcept {
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        const auto snapshot = capture_runtime_allocation_owner_snapshot();
+        lock.unlock();
+        return runtime_allocation_owned_by_cache_snapshot(rec, snapshot, owner_device);
+    } catch (...) {
+    }
+    if (owner_device) {
+        *owner_device = -1;
+    }
+    return false;
+}
+
+static bool unified_cache_shutdown_retryable_postconditions_clean(
+    const runtime_allocation_owner_snapshot & owner_snapshot) noexcept {
+    try {
+        if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic dirty shutdown postcondition; retaining owners for retry\n");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            for (const auto & kv : g_runtime_alloc_registry) {
+                if (!runtime_allocation_owned_by_cache_snapshot(kv.second, owner_snapshot, nullptr)) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
+                    return false;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
+            if (!g_offload_pool_slots.empty() || !g_offload_pool_free.empty()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] offload pool still populated at shutdown boundary\n");
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool unified_cache_shutdown_state_clean() noexcept {
+    try {
+        runtime_allocation_owner_snapshot owner_snapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            if (!g_device_caches.empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
+                return false;
+            }
+            for (const auto * queue : g_shared_ctx_queues) {
+                if (queue != nullptr) return false;
+            }
+            owner_snapshot = capture_runtime_allocation_owner_snapshot();
+        }
+        return unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
+    if (!out) {
+        return false;
+    }
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        out[0] = g_device_caches.size();
+        for (const auto & item : g_device_caches) {
+            if (item.second && item.second->arena_active()) {
+                ++out[1];
+            }
+        }
+        out[2] = g_live_arena_chunks.load(std::memory_order_acquire);
+        for (const auto * queue : g_shared_ctx_queues) {
+            if (queue != nullptr) {
+                ++out[3];
+            }
+        }
+        return true;
+    } catch (...) {
+        out[0] = 0;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+        return false;
+    }
+}
+
+bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept {
+    if (!out) {
+        return false;
+    }
+    for (size_t i = 0; i < 8; ++i) {
+        out[i] = 0;
+    }
+    try {
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            for (const auto & kv : g_runtime_alloc_registry) {
+                const runtime_alloc_record & rec = kv.second;
+                if (!rec.handle.ptr || rec.handle.size == 0) {
+                    continue;
+                }
+                ++out[0];
+                if (rec.handle.tier == alloc_tier::HOST_PINNED) {
+                    ++out[1];
+                }
+                int owner_device = -1;
+                if (runtime_allocation_owned_by_live_cache(rec, &owner_device)) {
+                    ++out[2];
+                    if (out[4] == 0) {
+                        out[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rec.handle.ptr));
+                        out[5] = rec.handle.size;
+                        out[6] = owner_device >= 0 ? static_cast<uint64_t>(owner_device) : UINT64_MAX;
+                        out[7] = 1;
+                    }
+                } else if (out[4] == 0) {
+                    out[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rec.handle.ptr));
+                    out[5] = rec.handle.size;
+                    out[6] = UINT64_MAX;
+                    out[7] = 0;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
+            out[3] = g_offload_pool_slots.size();
+        }
+        return true;
+    } catch (...) {
+        for (size_t i = 0; i < 8; ++i) {
+            out[i] = 0;
+        }
+        return false;
+    }
+}
+
+bool shutdown_unified_cache() {
+    // Explicit module shutdown runs while SYCL is still valid. Detach the map
+    // under its lock, then destroy caches without the registry lock held so
+    // mem_handle release callbacks cannot deadlock on cache lookup.
+    std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
+    runtime_allocation_owner_snapshot                      owner_snapshot;
+    {
+        // Module mutation admission is closed. Retain a stable owner snapshot,
+        // then drop the map lock before callbacks/free paths that may re-enter
+        // cache lookup or allocation bookkeeping.
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        caches = g_device_caches;
+        owner_snapshot = capture_runtime_allocation_owner_snapshot();
+    }
+    for (auto & item : caches) {
+        if (item.second && !item.second->shutdown_resources()) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] arena release failed; retaining cache owner for unload retry\n");
+            return false;
+        }
+    }
+    g_sycl_shutting_down.store(false, std::memory_order_release);
+    // Any retryable dirty boundary must be detected before destroying the last
+    // cache owners or shared queues, so a failed unload can retry exactly.
+    if (!unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot)) {
+        return false;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        // Detach cache owners atomically, then destroy the last shared_ptr
+        // snapshots outside the lock so canonical mem_handle destruction can
+        // unregister/free pinned backing exactly once.
+        g_device_caches.clear();
+        g_cache_mode_locked.store(false, std::memory_order_release);
+    }
+    // Cache destruction tears down host_arena_/pinned_chunk_pool while their
+    // SYCL queues and single-device contexts are still valid. Only after every
+    // cache destructor has released its chunks may those queues be destroyed.
+    caches.clear();
+    owner_snapshot.clear();
+    shutdown_shared_context_queues();
+    // The clean postcondition is meaningful only after these final allocation
+    // owners are gone; otherwise a 2 GiB chunk can survive until DSO destruction.
+    const bool clean = unified_cache_shutdown_state_clean();
+    if (!clean) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown invariant failed after owner teardown\n");
+        return false;
+    }
+    // Any later static destructors must not re-enter SYCL after explicit DSO
+    // shutdown. A freshly loaded module gets a fresh false-initialized flag.
+    g_sycl_shutting_down.store(true, std::memory_order_release);
+
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Explicit shutdown drained and destroyed all device caches\n");
+    return clean;
 }
 
 // ============================================================================
@@ -12118,6 +13009,10 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                                           ggml_layout_mode           layout,
                                           bool                       validate_content,
                                           bool *                     needs_fill) {
+    auto load_effect_guard = acquire_bound_load_effect();
+    if (load_effect_guard.failed()) {
+        return nullptr;
+    }
     if (needs_fill) {
         *needs_fill = true;
     }
@@ -12339,6 +13234,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = true;
 
+    stamp_pending_owner(entry, load_effect_guard);
     entries_[key] = entry;
     auto id_it    = id_to_key_.find(key_id);
     if (id_it == id_to_key_.end()) {
@@ -12521,6 +13417,13 @@ bool unified_cache::contains_pinned(const void * ptr) const {
         return false;
     }
     return host_arena_->contains(ptr);
+}
+
+bool unified_cache::contains_pinned_backing_allocation(const void * ptr, size_t size) const {
+    if (!host_arena_ || !ptr || size == 0) {
+        return false;
+    }
+    return host_arena_->contains_backing_allocation(ptr, size);
 }
 
 size_t unified_cache::pre_allocate_host_pool(size_t total_bytes) {
@@ -13726,11 +14629,20 @@ void unified_cache_set_live_model_mask(uint32_t mask) {
     }
 }
 
-void unified_cache_note_model_load_end(uint32_t slot) {
+void unified_cache_note_model_load_abort(uint64_t load_txn_id) {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
-            cache->note_model_load_end(slot);
+            cache->note_model_load_abort(load_txn_id);
+        }
+    }
+}
+
+void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
+    std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+    for (auto & [device_id, cache] : g_device_caches) {
+        if (cache) {
+            cache->note_model_load_end(slot, load_txn_id);
         }
     }
 }
@@ -14233,6 +15145,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
             arena_chunks_.clear();
             arena_chunks_.push_back({ ptr, alloc_size });
+            g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
 
@@ -14414,6 +15327,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                 auto & c = arena_chunks_[j];
                 if (c.ptr) {
                     alloc_registry::instance().unregister_alloc(c.ptr);
+                    g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
                     try {
                         sycl::free(c.ptr, queue);
                     } catch (const sycl::exception & e) {
@@ -14429,6 +15343,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         }
         alloc_registry::instance().register_alloc(p, chunk_sizes[i], dev_id, alloc_type::DEVICE);
         arena_chunks_.push_back({ p, chunk_sizes[i] });
+        g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
     }
 
     arena_base_ = arena_chunks_.front().ptr;
@@ -15098,10 +16013,28 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     return zone_available(zone);
 }
 
-void unified_cache::arena_destroy() {
+void unified_cache_test_fail_next_arena_free() {
+    g_test_fail_next_arena_free.store(true, std::memory_order_release);
+}
+
+void unified_cache_test_fail_next_shutdown_clean() {
+    g_test_fail_next_shutdown_clean.store(true, std::memory_order_release);
+}
+
+bool unified_cache::arena_destroy() {
     if (!arena_queue_) {
-        return;
+        return true;
     }
+    try {
+        arena_queue_->wait_and_throw();
+    } catch (const sycl::exception & e) {
+        GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed: %s\n", e.what());
+    } catch (...) {
+        GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed\n");
+    }
+    size_t released_chunk_count = 0;
+    size_t released_chunk_bytes = 0;
+    bool all_freed = true;
     for (auto & c : arena_chunks_) {
         if (c.ptr) {
             // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
@@ -15125,11 +16058,37 @@ void unified_cache::arena_destroy() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
-            try {
-                sycl::free(c.ptr, *arena_queue_);
+            bool freed = false;
+            if (g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel)) {
+                GGML_LOG_ERROR("[VRAM-ARENA] deterministic test free failure for chunk %p\n", c.ptr);
+            } else try {
+                sycl::free(c.ptr, arena_queue_->get_context());
+                freed = true;
+            } catch (const sycl::exception & e) {
+                GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed: %s\n", c.ptr,
+                               c.size / (1024.0 * 1024.0), e.what());
             } catch (...) {
+                GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed\n", c.ptr,
+                               c.size / (1024.0 * 1024.0));
             }
+            if (!freed) {
+                all_freed = false;
+                continue;
+            }
+            alloc_registry::instance().unregister_alloc(c.ptr);
+            GGML_ASSERT(alloc_registry::instance().lookup(c.ptr) == nullptr &&
+                        "arena chunk remained registered after unregister");
+            const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
+            GGML_ASSERT(live_before > 0 && "arena chunk ownership counter underflow");
+            c.ptr = nullptr;
+            ++released_chunk_count;
+            released_chunk_bytes += c.size;
         }
+    }
+    GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
+                  released_chunk_bytes / (1024.0 * 1024.0));
+    if (!all_freed) {
+        return false;
     }
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
@@ -15143,6 +16102,7 @@ void unified_cache::arena_destroy() {
         z.size  = 0;
         z.used.store(0, std::memory_order_relaxed);
     }
+    return true;
 }
 
 // === Arena chunk lease API (llama.cpp-dyhdl) ===

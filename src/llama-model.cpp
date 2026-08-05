@@ -20,7 +20,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 #    include "ggml-sycl.h"
 #endif
 
@@ -40,8 +40,7 @@
 #include <string>
 #include <vector>
 
-
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 static bool llama_model_buffer_is_sycl(ggml_backend_buffer_t buf) {
     if (buf == nullptr) {
         return false;
@@ -58,40 +57,153 @@ static bool llama_model_buft_is_sycl(ggml_backend_buffer_type_t buft) {
     return name != nullptr && std::strncmp(name, GGML_SYCL_NAME, std::strlen(GGML_SYCL_NAME)) == 0;
 }
 
+struct llama_model_sycl_lifecycle_hooks {
+    ggml_backend_reg_t                                   reg        = nullptr;
+    decltype(&ggml_backend_sycl_model_load_begin)        begin      = nullptr;
+    decltype(&ggml_backend_sycl_model_load_enter_nested) nested     = nullptr;
+    decltype(&ggml_backend_sycl_model_load_end)          end        = nullptr;
+    decltype(&ggml_backend_sycl_model_unloaded_token)    unload     = nullptr;
+    decltype(&ggml_backend_sycl_model_quarantine_token)  quarantine = nullptr;
+    decltype(&ggml_backend_sycl_activate_model_plan)           activate        = nullptr;
+    decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context = nullptr;
+    decltype(&ggml_backend_sycl_stage_inventory_plan)          stage_inventory = nullptr;
+    decltype(&ggml_backend_sycl_weights_evictable)             weights_evictable           = nullptr;
+    decltype(&ggml_backend_sycl_host_buffer_type_for_device)   host_buffer_type_for_device = nullptr;
+};
+
+static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
+    llama_model_sycl_lifecycle_hooks result;
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+            continue;
+        }
+        result.reg   = reg;
+        result.begin = reinterpret_cast<decltype(result.begin)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
+        result.nested = reinterpret_cast<decltype(result.nested)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_enter_nested"));
+        result.end = reinterpret_cast<decltype(result.end)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
+        result.unload = reinterpret_cast<decltype(result.unload)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
+        result.quarantine = reinterpret_cast<decltype(result.quarantine)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_quarantine_token"));
+        result.activate = reinterpret_cast<decltype(result.activate)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_activate_model_plan"));
+        result.runtime_context = reinterpret_cast<decltype(result.runtime_context)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
+        result.stage_inventory = reinterpret_cast<decltype(result.stage_inventory)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
+        result.weights_evictable = reinterpret_cast<decltype(result.weights_evictable)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_weights_evictable"));
+        result.host_buffer_type_for_device = reinterpret_cast<decltype(result.host_buffer_type_for_device)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_buffer_type_for_device"));
+        break;
+    }
+    return result;
+}
+
+static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
+    return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
+           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.stage_inventory &&
+           hooks.weights_evictable && hooks.host_buffer_type_for_device;
+}
+
 static bool llama_model_sycl_hooks_enabled() {
-    return !ggml_backend_device_backends_disabled();
+    return llama_model_sycl_hooks_enabled(llama_model_sycl_hooks());
 }
 
 static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
-    return llama_model_sycl_hooks_enabled() && dev != nullptr &&
-           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+    const auto hooks = llama_model_sycl_hooks();
+    return llama_model_sycl_hooks_enabled(hooks) && dev != nullptr && ggml_backend_dev_backend_reg(dev) == hooks.reg;
 }
 
 struct llama_model_sycl_loading_guard {
-    bool       active   = false;
-    uint32_t * out_slot = nullptr;
+    llama_model_sycl_lifecycle_hooks hooks{};
+    bool                             active    = false;
+    bool outer = false;
+    ggml_sycl_load_txn txn = {};
+    llama_sycl_model_token * out_model = nullptr;
 
-    // `out_slot`, when given, receives the backend's ownership slot for the model
-    // whose load this guard brackets (llama.cpp-0qlw).  Only the OUTERMOST guard
-    // should pass it: the nested load_all_data guard does not end a model load,
-    // so no slot is published when it finishes.
-    explicit llama_model_sycl_loading_guard(bool enabled, uint32_t * out_slot = nullptr) :
-        active(enabled && llama_model_sycl_hooks_enabled()),
-        out_slot(out_slot) {
+    llama_model_sycl_loading_guard(const llama_model_sycl_loading_guard &) = delete;
+    llama_model_sycl_loading_guard & operator=(const llama_model_sycl_loading_guard &) = delete;
+    llama_model_sycl_loading_guard(llama_model_sycl_loading_guard &&) = delete;
+    llama_model_sycl_loading_guard & operator=(llama_model_sycl_loading_guard &&) = delete;
+
+    explicit llama_model_sycl_loading_guard(bool enabled, llama_sycl_model_token * out = nullptr) :
+        hooks(llama_model_sycl_hooks()),
+        active(enabled && llama_model_sycl_hooks_enabled(hooks)),
+        outer(true),
+        out_model(out) {
         if (active) {
-            ggml_backend_sycl_set_model_loading(true);
+            const auto rc = hooks.begin(&txn);
+            if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL model lifecycle begin failed: result=%d", (int) rc));
         }
     }
 
-    ~llama_model_sycl_loading_guard() { finish(); }
-
-    void finish() {
+    llama_model_sycl_loading_guard(bool enabled, ggml_sycl_load_txn parent) :
+        hooks(llama_model_sycl_hooks()),
+        active(enabled && llama_model_sycl_hooks_enabled(hooks)),
+        txn(parent) {
         if (active) {
-            ggml_backend_sycl_set_model_loading(false);
-            if (out_slot) {
-                *out_slot = ggml_backend_sycl_model_slot_current();
-            }
-            active = false;
+            const auto rc = hooks.nested(txn);
+            if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL nested model lifecycle begin failed: txn=%llu result=%d", (unsigned long long) txn.id, (int) rc));
+        }
+    }
+
+    ~llama_model_sycl_loading_guard() {
+        if (!active) return;
+        ggml_sycl_model_token token = {};
+        const auto            rc    = hooks.end(txn, false, outer ? &token : nullptr);
+        if (outer && out_model) {
+            const bool retain_cleanup = rc == GGML_SYCL_LIFECYCLE_EFFECT_FAILED && token.model_id != 0;
+            *out_model = retain_cleanup ? llama_sycl_model_token{ token.model_id, token.load_txn_id, token.slot,
+                                                                  token.slot_generation } :
+                                          llama_sycl_model_token{};
+        }
+        if (rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rc != GGML_SYCL_LIFECYCLE_POISONED &&
+            rc != GGML_SYCL_LIFECYCLE_NESTED) {
+            LLAMA_LOG_ERROR("SYCL model lifecycle abort failed: txn=%llu result=%d\n", (unsigned long long) txn.id, (int) rc);
+        }
+    }
+
+    void cancel() {
+        if (!active) {
+            return;
+        }
+        ggml_sycl_model_token rollback_token{};
+        const auto            rc = hooks.end(txn, false, outer ? &rollback_token : nullptr);
+        active                   = false;
+        if (outer && out_model) {
+            // Normal abort statuses are terminal and own nothing. Retain only
+            // an exact owner returned for failed/quarantined cleanup.
+            *out_model = rc == GGML_SYCL_LIFECYCLE_EFFECT_FAILED && rollback_token.model_id != 0 ?
+                             llama_sycl_model_token{ rollback_token.model_id, rollback_token.load_txn_id,
+                                                     rollback_token.slot, rollback_token.slot_generation } :
+                             llama_sycl_model_token{};
+        }
+        if (rollback_token.model_id == 0 && rc != GGML_SYCL_LIFECYCLE_OK && rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
+            rc != GGML_SYCL_LIFECYCLE_POISONED && rc != GGML_SYCL_LIFECYCLE_NESTED) {
+            throw std::runtime_error(format("SYCL model lifecycle cancel failed: txn=%llu result=%d",
+                                            (unsigned long long) txn.id, (int) rc));
+        }
+    }
+
+    void finish(bool explicit_success) {
+        if (!active) return;
+        ggml_sycl_model_token token = {};
+        const auto            rc    = hooks.end(txn, explicit_success, outer ? &token : nullptr);
+        active = false;
+        if (outer && out_model && token.model_id != 0) {
+            *out_model = { token.model_id, token.load_txn_id, token.slot, token.slot_generation };
+        }
+        const bool expected = rc == GGML_SYCL_LIFECYCLE_OK || (!outer && rc == GGML_SYCL_LIFECYCLE_NESTED);
+        if (!expected) {
+            throw std::runtime_error(format("SYCL model lifecycle end failed: txn=%llu outer=%d success=%d result=%d",
+                                            (unsigned long long) txn.id, outer, explicit_success, (int) rc));
         }
     }
 };
@@ -194,22 +306,13 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
                                              const ggml_sycl_placement_envelope & envelope,
                                              bool                                 early) {
-    if (!llama_model_sycl_hooks_enabled()) {
+    const auto hooks = llama_model_sycl_hooks();
+    if (!llama_model_sycl_hooks_enabled(hooks)) {
         return;
     }
-
-    for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
-        ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
-        if (!sycl_backend) {
-            continue;
-        }
-        ggml_backend_sycl_set_placement_envelope(sycl_backend, &envelope);
-        if (early) {
-            ggml_backend_sycl_compute_placement_plan_early(sycl_backend, &inventory);
-        } else {
-            ggml_backend_sycl_set_tensor_inventory(sycl_backend, &inventory);
-        }
-        ggml_backend_free(sycl_backend);
+    const auto rc = hooks.stage_inventory(&inventory, &envelope, early);
+    if (rc != GGML_SYCL_LIFECYCLE_OK) {
+        throw std::runtime_error(format("SYCL inventory planning failed: early=%d result=%d", early, (int) rc));
     }
 }
 
@@ -326,7 +429,7 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     LLAMA_LOG_INFO("%s: SYCL tensor inventory: %zu tensors, %.2f GiB (enables unified placement before allocation)\n",
                    log_func, tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
 }
-#endif
+#endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1165,9 +1268,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     buft_list_t buft_list;
 
     // add ACCEL buffer types
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
             if (buft != ggml_backend_cpu_buffer_type()) {
@@ -1212,9 +1316,9 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     }
 
     // add the CPU buffer type
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
         }
     }
@@ -1253,9 +1357,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
-#ifdef GGML_USE_SYCL
-    if (llama_model_dev_is_sycl(dev) && ggml_backend_sycl_weights_evictable()) {
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    const auto sycl_hooks = llama_model_sycl_hooks();
+    if (llama_model_sycl_hooks_enabled(sycl_hooks) && dev != nullptr &&
+        ggml_backend_dev_backend_reg(dev) == sycl_hooks.reg && sycl_hooks.weights_evictable()) {
+        ggml_backend_buffer_type_t host_buft = sycl_hooks.host_buffer_type_for_device(dev);
         if (host_buft != nullptr) {
             buft_list.emplace_back(dev, host_buft);
         }
@@ -1333,7 +1439,7 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     // Model teardown is the SYCL backend's only chance to reclaim this model's
     // cached weights (llama.cpp-0qlw).  Nothing else can: preload pins every
     // dense weight and eviction skips pinned entries, so without this hook a
@@ -1344,12 +1450,22 @@ llama_model::~llama_model() {
     // pimpl owns the ggml contexts and buffers, so it must be destroyed FIRST:
     // the hook reports any surviving weight lease as a leak, and this model's own
     // tensors hold leases until their extras go.
-    if (sycl_model_slot != GGML_SYCL_MODEL_SLOT_NONE) {
-        const uint32_t slot = sycl_model_slot;
-        sycl_model_slot     = GGML_SYCL_MODEL_SLOT_NONE;
+    if (sycl_model_token.model_id != 0) {
+        const ggml_sycl_model_token token = { sycl_model_token.model_id, sycl_model_token.load_txn_id,
+                                              sycl_model_token.slot, sycl_model_token.slot_generation };
         pimpl.reset();
-        if (llama_model_sycl_hooks_enabled()) {
-            ggml_backend_sycl_model_unloaded(slot);
+        const auto hooks = llama_model_sycl_hooks();
+        if (llama_model_sycl_hooks_enabled(hooks)) {
+            const auto rc = hooks.unload(token);
+            if (rc == GGML_SYCL_LIFECYCLE_OK || rc == GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD) {
+                sycl_model_token = {};
+            } else {
+                const auto queued = hooks.quarantine(token);
+                LLAMA_LOG_ERROR(
+                    "SYCL model teardown failed: model=%llu txn=%llu slot=%u generation=%llu result=%d quarantine=%d\n",
+                    (unsigned long long) token.model_id, (unsigned long long) token.load_txn_id, token.slot,
+                    (unsigned long long) token.slot_generation, (int) rc, (int) queued);
+            }
         }
     }
 #endif
@@ -1549,9 +1665,25 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
-#ifdef GGML_USE_SYCL
-    llama_model_sycl_loading_guard sycl_model_loading_guard(true, &sycl_model_slot);
-    llama_model_sycl_compute_early_plan(ml, hparams, __func__);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    const bool sycl_layer_assignment =
+        this->n_gpu_layers() > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
+            return llama_model_dev_is_sycl(device.dev);
+        });
+    bool sycl_tensor_override = false;
+    if (params.tensor_buft_overrides) {
+        for (const auto * override = params.tensor_buft_overrides; override->pattern != nullptr; ++override) {
+            if (llama_model_buft_is_sycl(override->buft) || llama_model_buft_backend_is_sycl(override->buft)) {
+                sycl_tensor_override = true;
+                break;
+            }
+        }
+    }
+    const bool                     resolved_sycl_weight_owner = sycl_layer_assignment || sycl_tensor_override;
+    llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);
+    if (sycl_model_loading_guard.active) {
+        llama_model_sycl_compute_early_plan(ml, hparams, __func__);
+    }
 #endif
 
     const auto & split_mode   = params.split_mode;
@@ -1829,9 +1961,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-#ifdef GGML_USE_SYCL
-    llama_model_sycl_set_late_inventory(ml, hparams, __func__);
-
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     bool has_sycl_weight_buft = false;
     for (const auto & [buft, _] : ml.ctx_map) {
         if (llama_model_buft_is_sycl(buft) || llama_model_buft_backend_is_sycl(buft)) {
@@ -1839,7 +1969,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             break;
         }
     }
-    if (has_sycl_weight_buft && ml.use_mmap) {
+    const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
+    if (sycl_model_backend) {
+        llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+    }
+    if (sycl_model_backend && ml.use_mmap) {
         LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
         ml.use_mmap = false;
     }
@@ -1856,7 +1990,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     bool has_sycl_weight_buffer = false;
 #endif
 
@@ -1936,7 +2070,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
             if (llama_model_buffer_is_sycl(buf.get())) {
                 has_sycl_weight_buffer = true;
             }
@@ -1973,20 +2107,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        if (sycl_model_backend) {
+            sycl_model_loading_guard.finish(true);
+        } else {
+            sycl_model_loading_guard.cancel();
+        }
+#endif
         return true;
     }
 
     // load tensor data
-#ifdef GGML_USE_SYCL
-    llama_model_sycl_loading_guard sycl_loading_guard(has_sycl_weight_buffer);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    llama_model_sycl_loading_guard sycl_loading_guard(sycl_model_backend, sycl_model_loading_guard.txn);
 #endif
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
-#ifdef GGML_USE_SYCL
-    sycl_loading_guard.finish();
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    sycl_loading_guard.finish(true);
 #endif
 
     if (use_mmap_buffer) {
@@ -1995,6 +2136,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (has_sycl_weight_buffer) {
+        sycl_model_loading_guard.finish(true);
+    } else {
+        sycl_model_loading_guard.cancel();
+    }
+#endif
     return true;
 }
 

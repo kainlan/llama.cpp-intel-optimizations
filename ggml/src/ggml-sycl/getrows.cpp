@@ -281,6 +281,12 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
                                           ggml_tensor *               dst,
                                           const void *                src0_override,
                                           const char *                reason) {
+#ifdef GGML_BACKEND_DL
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src0_override);
+    throw ggml_sycl_fallback_error(reason);
+#else
     if (!dst || !dst->src[0] || !dst->src[1]) {
         return false;
     }
@@ -416,6 +422,7 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
     dst_host_owner  = {};
 
     return ok;
+#endif
 }
 
 static bool ggml_sycl_wait_after_get_rows_q6_k_soa() {

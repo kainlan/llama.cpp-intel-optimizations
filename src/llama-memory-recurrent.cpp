@@ -6,7 +6,7 @@
 #include "llama-batch.h"
 #include "llama-model.h"
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 #    include "ggml-sycl.h"
 #endif
 
@@ -16,6 +16,21 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+static ggml_backend_buffer_type_t llama_recurrent_sycl_kv_buft(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return nullptr;
+    }
+    auto fn = reinterpret_cast<decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_buffer_type_from_dev"));
+    return fn ? fn(dev) : nullptr;
+}
+#endif
 
 //
 // llama_memory_recurrent
@@ -88,8 +103,11 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         if (offload) {
             auto * dev = model.dev_layer(i);
-#ifdef GGML_USE_SYCL
-            buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+            buft = llama_recurrent_sycl_kv_buft(dev);
+            if (!buft) {
+                buft = ggml_backend_dev_buffer_type(dev);
+            }
 #else
             buft = ggml_backend_dev_buffer_type(dev);
 #endif

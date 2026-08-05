@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <limits.h>
+#include <stdint.h>
 
 #define GGML_SYCL_NAME        "SYCL"
 #define GGML_SYCL_MAX_DEVICES 48
@@ -35,6 +36,11 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
 
+// Copy the native UUID of this exact SYCL backend device. Returns false when
+// device/uuid is null, device is not owned by this backend, or the compiler or
+// runtime does not expose the 16-byte Intel device UUID extension.
+GGML_BACKEND_API bool ggml_backend_sycl_get_device_uuid(ggml_backend_dev_t device, uint8_t uuid[16]);
+
 // devide buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 
@@ -56,6 +62,13 @@ GGML_BACKEND_API int ggml_backend_sycl_get_tp_rank(void);
 
 // Check if running in multi-process TP mode
 GGML_BACKEND_API bool ggml_backend_sycl_is_multiprocess_tp(void);
+// Dynamic registry unload gate. False means exact LIVE model owners still need
+// this module's teardown procedures and devices.
+GGML_BACKEND_API bool ggml_backend_sycl_can_unload(void);
+// Cancel a successful unload reservation if the generic loader cannot proceed.
+GGML_BACKEND_API void ggml_backend_sycl_cancel_unload(void);
+// Drain module-owned threads, queues and caches before ggml_backend_unload().
+GGML_BACKEND_API void ggml_backend_sycl_shutdown(void);
 
 // KV buffer type for a backend device (falls back to default buffer type if not SYCL)
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backend_dev_t device);
@@ -72,6 +85,9 @@ GGML_BACKEND_API size_t ggml_backend_sycl_get_tp_data_offset(const char *    ten
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
+// Exact current-registry host buffer type for a specific SYCL device. Returns
+// NULL for foreign/stale devices; never falls back to a default device.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
 
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.
@@ -147,9 +163,12 @@ enum ggml_backend_sycl_tensor_usage {
     GGML_SYCL_TENSOR_USAGE_NORM,
 };
 
-// Register per-tensor usage metadata (used for layout selection).
+// ABI-compatible registration entry point. The original API returned void.
 GGML_BACKEND_API void ggml_backend_sycl_register_weight_usage(const char *                        tensor_name,
                                                               enum ggml_backend_sycl_tensor_usage usage);
+// Status-bearing extension for callers that need transactional admission.
+GGML_BACKEND_API bool ggml_backend_sycl_try_register_weight_usage(const char *                        tensor_name,
+                                                                  enum ggml_backend_sycl_tensor_usage usage);
 
 // Tensor inventory for tiered memory placement
 struct ggml_sycl_tensor_info {
@@ -745,10 +764,69 @@ GGML_BACKEND_API void ggml_backend_sycl_wait_barrier(ggml_backend_t backend);
 // Weight Streaming Control API
 // ===========================================================================
 
-// Signal model load phase to SYCL backend
-// When loading=true: weight caching is disabled to avoid OOM on large models
-// When loading=false: weight caching is enabled for inference
-// Use this to bracket model loading to prevent cache allocation during load
+// Stable model/load identity. A numeric slot is valid only together with its
+// generation; zero IDs and GGML_SYCL_MODEL_SLOT_NONE fail closed.
+struct ggml_sycl_model_token {
+    uint64_t model_id;
+    uint64_t load_txn_id;
+    uint32_t slot;
+    uint64_t slot_generation;
+};
+
+struct ggml_sycl_load_txn { uint64_t id; };
+
+enum ggml_sycl_lifecycle_result {
+    GGML_SYCL_LIFECYCLE_OK = 0,
+    GGML_SYCL_LIFECYCLE_NESTED,
+    GGML_SYCL_LIFECYCLE_ABORTED,
+    GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD,
+    GGML_SYCL_LIFECYCLE_SLOT_EXHAUSTED,
+    GGML_SYCL_LIFECYCLE_ID_EXHAUSTED,
+    GGML_SYCL_LIFECYCLE_LOAD_BUSY,
+    GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION,
+    GGML_SYCL_LIFECYCLE_DEPTH_UNDERFLOW,
+    GGML_SYCL_LIFECYCLE_DEPTH_OVERFLOW,
+    GGML_SYCL_LIFECYCLE_MISSING_SUCCESS,
+    GGML_SYCL_LIFECYCLE_POISONED,
+    GGML_SYCL_LIFECYCLE_NOT_FOUND,
+    GGML_SYCL_LIFECYCLE_STALE_IDENTITY,
+    GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
+    GGML_SYCL_LIFECYCLE_ALLOCATION_FAILED,
+    GGML_SYCL_LIFECYCLE_EFFECT_FAILED,
+    GGML_SYCL_LIFECYCLE_BUSY,
+    GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
+};
+
+// Registry-resolved static/DL parity entry point. Applies the exact inventory
+// and placement envelope to every current SYCL device and stages the same
+// immutable load candidate used by direct static calls.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(
+    const struct ggml_sycl_tensor_inventory *   inventory,
+    const struct ggml_sycl_placement_envelope * envelope,
+    bool                                        early);
+
+// Explicit transaction API. begin reserves slot+generation and both IDs as one
+// side-effect-free operation. Nested calls must carry the outer transaction.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(
+    struct ggml_sycl_load_txn * txn);
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(
+    struct ggml_sycl_load_txn txn);
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(
+    struct ggml_sycl_load_txn txn, bool explicit_success, struct ggml_sycl_model_token * model);
+// Select exact immutable LIVE model authority for explicit A/B/A routing.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(
+    struct ggml_sycl_model_token model);
+// Foundation model-bound runtime update. Context/graph code will call this
+// automatically in 1q72; callers currently bind explicitly.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
+    ggml_backend_t               backend,
+    struct ggml_sycl_model_token model,
+    uint32_t                     n_ctx,
+    uint32_t                     n_ubatch,
+    uint32_t                     n_seq_max);
+
+// Deprecated bool compatibility boundary. It is abort-default and cannot be
+// used to obtain ownership identity; migrated callers use the APIs above.
 GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 
 // === Model ownership (llama.cpp-0qlw) ===
@@ -760,22 +838,21 @@ GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 // handle.  A slot is the model-lifetime token that answers it directly.
 #define GGML_SYCL_MODEL_SLOT_NONE 0xFFFFFFFFu
 
-// Slot assigned to the model whose load has just completed.  Read it right after
-// the matching ggml_backend_sycl_set_model_loading(false) and store it with the
-// model; it is the token ggml_backend_sycl_model_unloaded() expects.  Returns
-// GGML_SYCL_MODEL_SLOT_NONE when no slot was available (>32 concurrent models),
-// in which case that model's weights stay unattributed and are simply retained
-// for longer.
+// Deprecated reporting snapshot only. It is not ownership authority and may
+// return GGML_SYCL_MODEL_SLOT_NONE; use the token returned by load_end.
 GGML_BACKEND_API uint32_t ggml_backend_sycl_model_slot_current(void);
 
-// The model owning `slot` has been destroyed.  Releases the model's host weight
-// extras, then UNPINS and reclaims every cached weight that no live model owns.
-// The unpin is the load-bearing half: eviction skips pinned entries and model
-// preload pins every dense weight it caches, so without it a dead model's
-// weights are unreachable by LRU for the process lifetime.
-// Call AFTER the model's tensors and buffers are gone, so its weight leases have
-// already been dropped; a lease surviving this call is reported as a leak.
+// Deprecated bare-slot teardown fails closed because it cannot prove the slot
+// generation. Migrated owners must use model_unloaded_token after dropping
+// their tensors/buffers.
 GGML_BACKEND_API void ggml_backend_sycl_model_unloaded(uint32_t slot);
+// Generation-safe teardown used by migrated model owners.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(
+    struct ggml_sycl_model_token model);
+// Transfer a quarantined full owner token to the backend reaper when RAII can
+// no longer retain it. Retries occur at safe lifecycle entry and shutdown.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_model_quarantine_token(
+    struct ggml_sycl_model_token model);
 
 // Release all host-backed weight extras (layout metadata, accessors, etc.)
 // Call this when unloading a model to free SYCL resources associated with tensors.

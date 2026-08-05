@@ -2,7 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 #    include "ggml-sycl.h"
 #endif
 #include "llama-arch.h"
@@ -17,12 +17,14 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 //
 // llama_context
@@ -100,6 +102,58 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
     if (llama_context_sycl_hooks_enabled() && sched != nullptr && llama_context_has_sycl_backend(backends)) {
         ggml_backend_sycl_set_sched_placement_plan(sched);
     }
+}
+#endif
+
+#if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
+struct llama_context_sycl_dl_compute_hooks {
+    decltype(&ggml_backend_sycl_host_compute_buffer_type)        host_compute  = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_compute_buffer_type) cpu_compute   = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_available)           cpu_available   = nullptr;
+    decltype(&ggml_backend_sycl_has_active_placement_plan)       has_active_plan = nullptr;
+    int                                                          device_index    = -1;
+};
+
+static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
+    llama_context_sycl_dl_compute_hooks hooks;
+    if (!dev) {
+        return hooks;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return hooks;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            hooks.device_index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (hooks.device_index < 0) {
+        return {};
+    }
+    hooks.host_compute = reinterpret_cast<decltype(hooks.host_compute)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_compute_buffer_type"));
+    hooks.cpu_compute = reinterpret_cast<decltype(hooks.cpu_compute)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_compute_buffer_type"));
+    hooks.cpu_available = reinterpret_cast<decltype(hooks.cpu_available)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_available"));
+    hooks.has_active_plan = reinterpret_cast<decltype(hooks.has_active_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
+    return hooks;
+}
+
+static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
 }
 #endif
 
@@ -348,20 +402,44 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            if (llama_context_dev_is_sycl(dev)) {
-                ggml_backend_sycl_set_runtime_context(backend.get(), cparams.n_ctx, cparams.n_ubatch,
-                                                      cparams.n_seq_max);
+#    ifdef GGML_USE_SYCL
+            auto runtime_context_fn =
+                llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_set_runtime_context_for_model : nullptr;
+#    else
+            auto runtime_context_fn = llama_context_sycl_runtime_proc(dev);
+#    endif
+            if (runtime_context_fn) {
+                const auto & owner = model.get_sycl_model_token();
+                if (owner.model_id == 0 || owner.load_txn_id == 0) {
+                    continue;
+                }
+                const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
+                                                      owner.slot_generation };
+                auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max);
+                // Context construction may overlap enough live updates to
+                // exhaust the model's finite ticket pool transiently. Wait
+                // with bounded exponential backoff instead of spinning three
+                // immediate calls; preserve BUSY if capacity never frees.
+                constexpr int max_busy_waits = 7;
+                for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
+                    rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max);
+                }
+                if (rc != GGML_SYCL_LIFECYCLE_OK) {
+                    throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+                }
             }
         }
 #endif
 
         // add ACCEL backends (such as BLAS)
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const size_t backend_dev_count = ggml_backend_dev_count();
+        for (size_t i = 0; i < backend_dev_count; ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
@@ -481,6 +559,20 @@ llama_context::llama_context(
 
                 sycl_gpu_idx++;
             }
+#elif defined(GGML_BACKEND_DL)
+            else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                const auto hooks = llama_context_sycl_compute_procs(dev);
+                if (hooks.host_compute && hooks.cpu_compute && hooks.cpu_available) {
+                    const int sycl_dev = hooks.device_index;
+                    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                        buft = hooks.host_compute(sycl_dev);
+                    } else if (const char * env = std::getenv("GGML_SYCL_HOST_COMPUTE"); env && std::atoi(env) != 0) {
+                        buft = hooks.cpu_compute(sycl_dev);
+                    } else if (const char * env = std::getenv("GGML_SYCL_CPU_OFFLOAD"); env && std::atoi(env) != 0) {
+                        (void) hooks.cpu_available();
+                    }
+                }
+            }
 #endif
 
             backend_buft.push_back(buft);
@@ -502,6 +594,16 @@ llama_context::llama_context(
 #ifdef GGML_USE_SYCL
         if (pipeline_parallel && llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan()) {
             pipeline_parallel = false;
+        }
+#elif defined(GGML_BACKEND_DL)
+        if (pipeline_parallel) {
+            for (const auto & backend : backends) {
+                const auto hooks = llama_context_sycl_compute_procs(ggml_backend_get_device(backend.get()));
+                if (hooks.has_active_plan && hooks.has_active_plan()) {
+                    pipeline_parallel = false;
+                    break;
+                }
+            }
         }
 #endif
 

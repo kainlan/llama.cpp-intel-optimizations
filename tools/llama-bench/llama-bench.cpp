@@ -120,6 +120,9 @@ static std::string get_cpu_info() {
     std::vector<std::string> cpu_list;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         auto * dev      = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
         auto   dev_type = ggml_backend_dev_type(dev);
         if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             cpu_list.push_back(ggml_backend_dev_description(dev));
@@ -132,6 +135,9 @@ static std::string get_gpu_info() {
     std::vector<std::string> gpu_list;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         auto * dev      = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
         auto   dev_type = ggml_backend_dev_type(dev);
         if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
             gpu_list.push_back(ggml_backend_dev_description(dev));
@@ -672,6 +678,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 std::vector<ggml_backend_dev_t> devices;
                 for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     auto * dev = ggml_backend_dev_get(i);
+                    if (!dev) {
+                        continue;
+                    }
                     if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                         devices.push_back(dev);
                     }
@@ -891,6 +900,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     // enumerate all the devices and add their buffer types to the list
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         auto * dev = ggml_backend_dev_get(i);
+                        if (!dev) {
+                            continue;
+                        }
                         auto * buft = ggml_backend_dev_buffer_type(dev);
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
@@ -1510,6 +1522,9 @@ struct test {
         bool                     rpc_used = false;
         for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
             auto *      reg  = ggml_backend_reg_get(i);
+            if (!reg) {
+                continue;
+            }
             std::string name = ggml_backend_reg_name(reg);
             if (string_starts_with(name, "RPC")) {
                 if (ggml_backend_reg_dev_count(reg) > 0) {

@@ -1,3 +1,8 @@
+# The benchmark invokes private SYCL backend symbols directly. That is valid
+# only when ggml-sycl is a linkable static target; a MODULE backend must be
+# exercised through registry procedures instead. Keep the self-contained
+# source-line probe below available in both configurations.
+if (NOT GGML_BACKEND_DL)
 set(TARGET sycl-kernel-bench)
 add_executable(${TARGET}
     main.cpp
@@ -60,6 +65,7 @@ if (GGML_SYCL)
         target_compile_definitions(${TARGET} PRIVATE GGML_SYCL_DNNL=1)
     endif()
 endif()
+endif() # private-symbol static SYCL benchmark
 
 if (GGML_SYCL)
     add_executable(sycl-mxfp4-source-line-probe

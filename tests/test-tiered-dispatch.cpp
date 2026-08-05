@@ -81,7 +81,9 @@ void run_placement_case(ggml_backend_t backend,
 
     // This outer boundary must invalidate the preceding model's verdict before
     // the incoming inventory is known.
-    ggml_backend_sycl_set_model_loading(true);
+    ggml_sycl_load_txn load{};
+    ggml_sycl_model_token model{};
+    check(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "explicit model lifecycle begin failed");
     check(!ggml_backend_sycl_is_tiered_enabled(backend), "outer model-load boundary did not reset verdict");
 
     inventory_fixture fixture(label, count, bytes_per_tensor);
@@ -98,10 +100,11 @@ void run_placement_case(ggml_backend_t backend,
     check(verdict == oracle, "tiered query disagrees with independent planned-target oracle");
     check(ggml_backend_sycl_has_tensor_cache(backend), "unified cache gate unavailable for planned model");
 
-    ggml_backend_sycl_set_model_loading(false);
+    check(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK, "explicit model lifecycle commit failed");
     check(ggml_backend_sycl_is_tiered_enabled(backend) == oracle,
           "planner verdict did not survive model-load completion");
 
+    (void) ggml_backend_sycl_model_unloaded_token(model);
     if (failures == failures_before) {
         std::printf("PASS: %s (%zu tensors, %.1f MiB each, planner_host=%s)\n", label, count,
                     bytes_per_tensor / (1024.0 * 1024.0), oracle ? "true" : "false");

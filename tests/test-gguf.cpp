@@ -1409,8 +1409,12 @@ int main(int argc, char ** argv) {
         ntest += result.second;
     }
 
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    const size_t backend_dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < backend_dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
 
         for (bool only_meta : {true, false}) {
             std::pair<int, int> result = test_roundtrip(dev, seed, only_meta, ROUNDTRIP_READ_MODE_FILE);

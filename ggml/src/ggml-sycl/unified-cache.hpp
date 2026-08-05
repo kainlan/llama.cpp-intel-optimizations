@@ -1009,6 +1009,95 @@ struct placement_plan {
     size_t expert_placement_unclassified_count_ = 0;
 };
 
+// Immutable lifecycle-owned plan snapshots. A null plan with
+// explicit_no_plan=true is the published no_alloc/UNKNOWN outcome.
+enum class lifecycle_plan_verdict : uint8_t { UNKNOWN, DEVICE, HOST, MIXED };
+
+struct lifecycle_plan_snapshot {
+    uint64_t                              model_id           = 0;
+    uint64_t                              load_txn_id        = 0;
+    uint32_t                              slot               = UINT32_MAX;
+    uint64_t                              slot_generation    = 0;
+    uint64_t                              version            = 0;
+    uint64_t                              planned_host_bytes = 0;
+    uint64_t                              actual_host_bytes  = 0;
+    lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
+    bool                                  explicit_no_plan   = false;
+    uint32_t                              model_n_layer      = 0;
+    placement_kv_info                     kv_info;
+    std::shared_ptr<const placement_plan> plan;
+};
+
+// Pointer identity is definitive: every participating cache receives the same
+// shared owner as the process authority. Equal metadata on a different object
+// is not a coherent publication.
+inline bool lifecycle_plan_snapshot_matches(const std::shared_ptr<const lifecycle_plan_snapshot> & authority,
+                                            const std::shared_ptr<const lifecycle_plan_snapshot> & cache) noexcept {
+    return authority && cache && authority->plan && cache->plan && authority.get() == cache.get();
+}
+
+inline bool lifecycle_plan_snapshot_owned_by(const std::shared_ptr<const lifecycle_plan_snapshot> & authority,
+                                             uint64_t model_id, uint64_t load_txn_id,
+                                             uint32_t slot, uint64_t slot_generation) noexcept {
+    return authority && authority->model_id == model_id && authority->load_txn_id == load_txn_id &&
+           authority->slot == slot && authority->slot_generation == slot_generation;
+}
+
+class unified_cache;
+enum class placement_cache_coherence : uint8_t { MATCH, GENUINE_NO_PLAN, TRANSIENT_MISMATCH };
+
+// Single production ordering primitive: every participating cache is updated
+// before the global authority callback. Host tests use this exact template so
+// reversing either callback order is mutation-killed without a SYCL device.
+template <typename CachePublish, typename GlobalPublish>
+void publish_cache_first_global_last(int cache_count, CachePublish && publish_cache, GlobalPublish && publish_global) {
+    for (int i = 0; i < cache_count; ++i) {
+        publish_cache(i);
+    }
+    publish_global();
+}
+
+struct placement_cache_read {
+    placement_cache_coherence             coherence = placement_cache_coherence::GENUINE_NO_PLAN;
+    std::shared_ptr<const placement_plan> owner;
+};
+std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept;
+// Policy readers retain immutable global authority during cache-first publication.
+std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept;
+// Cache-local readers require exact shared-owner identity and fail closed.
+std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;
+placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
+uint64_t                              lifecycle_next_plan_publication_id() noexcept;
+
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info       = {},
+                                    uint32_t                  model_n_layer = 0);
+void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
+                                       const placement_kv_info & kv_info       = {},
+                                       uint32_t                  model_n_layer = 0);
+void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept;
+bool lifecycle_publish_placement_plan(
+    uint64_t                                         model_id,
+    uint64_t                                         load_txn_id,
+    uint32_t                                         slot,
+    uint64_t                                         slot_generation,
+    uint64_t                                         actual_host_bytes,
+    uint64_t                                         actual_device_bytes,
+    bool                                             have_actual,
+    std::shared_ptr<const lifecycle_plan_snapshot> * published_out = nullptr) noexcept;
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id);
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(uint64_t model_id,
+                                                                               uint64_t load_txn_id,
+                                                                               uint32_t slot,
+                                                                               uint64_t slot_generation) noexcept;
+void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
+size_t lifecycle_published_placement_plan_count_for_test() noexcept;
+bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
+                                        const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
+void   lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
+
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.
 // vram_budget: available VRAM bytes for weights.
@@ -1306,6 +1395,7 @@ struct weight_entry {
     bool                        has_ready_event = false;
     sycl::event                 ready_event;
     std::shared_ptr<mem_handle> handle;
+    uint64_t                    pending_load_txn_id = 0;
     // Transient direct lookup mirror only. The handle is the canonical lifetime
     // token; ptr is a resolved mirror for diagnostics and legacy ABI boundaries.
 };
@@ -1497,6 +1587,8 @@ struct unified_cache_entry {
     // When non-null, individual entries must not free device_ptr directly; the
     // shared owner releases the allocation base after the last view is erased.
     std::shared_ptr<void> storage_owner;
+    bool                  allocation_released_via_owner = false;
+    bool                  non_owning_external_host      = false;
     // Optional allocation owner for single-entry direct materializations that
     // are not arena or pool suballocations.
     mem_handle            direct_alloc_owner;
@@ -1519,8 +1611,9 @@ struct unified_cache_entry {
     // decisions actually need.  owner_tagged distinguishes "no owner left"
     // (reclaimable) from "never attributed to any model" (e.g. materialized at
     // runtime, outside a load) -- the latter is kept while any model is live.
-    uint32_t              owner_mask   = 0;
-    bool                  owner_tagged = false;
+    uint32_t              owner_mask            = 0;
+    bool                  owner_tagged          = false;
+    uint64_t              pending_load_txn_id   = 0;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -1605,6 +1698,7 @@ class unified_cache {
                   size_t        dma_reserved_bytes = 0,
                   size_t        device_total_vram  = 0);
     ~unified_cache();
+    bool shutdown_resources();
 
     // Non-copyable, non-movable
     unified_cache(const unified_cache &)             = delete;
@@ -1652,6 +1746,7 @@ class unified_cache {
         ggml_layout_mode      layout          = GGML_LAYOUT_AOS;
         bool                  on_device       = false;
         unified_cache_entry * entry           = nullptr;  // opaque handle for lease release
+        std::shared_ptr<void> storage_owner;
         bool                  has_ready_event = false;
         sycl::event           ready_event;
 
@@ -1808,20 +1903,38 @@ class unified_cache {
     // Register a host-arena pointer directly as a HOST_PINNED expert entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned experts.
-    void register_host_expert(ggml_sycl_cache_id key,
+    bool register_host_expert(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> allocation_owner);
+
+    bool register_host_expert(ggml_sycl_cache_id key,
                               void *             ptr,
                               size_t             size,
                               ggml_layout_mode   layout,
-                              mem_handle *       out_handle = nullptr);
+                              mem_handle *       out_handle = nullptr) {
+        return register_host_expert(key, ptr, size, layout, out_handle, {});
+    }
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
     // No zone_alloc, no device copy.  Used by S1-PRELOAD for host-planned dense weights.
-    void register_host_weight(ggml_sycl_cache_id key,
+    bool register_host_weight(ggml_sycl_cache_id    key,
+                              void *                ptr,
+                              size_t                size,
+                              ggml_layout_mode      layout,
+                              mem_handle *          out_handle,
+                              std::shared_ptr<void> allocation_owner);
+
+    bool register_host_weight(ggml_sycl_cache_id key,
                               void *             ptr,
                               size_t             size,
                               ggml_layout_mode   layout,
-                              mem_handle *       out_handle = nullptr);
+                              mem_handle *       out_handle = nullptr) {
+        return register_host_weight(key, ptr, size, layout, out_handle, {});
+    }
 
     // Placement-plan materialization authority.  In planned mode direct staging
     // and host registration are only legal while model load or an explicit
@@ -1938,7 +2051,9 @@ class unified_cache {
     // === Pinning for Graphs ===
 
     void pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
-    void unpin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
+    void unpin(const ggml_sycl_cache_id &   key,
+               ggml_layout_mode             layout,
+               const placement_cache_read * retained_read = nullptr);
     void unpin_experts();
     void unpin_all();
     bool is_pinned(const ggml_sycl_cache_id & key, ggml_layout_mode layout) const;
@@ -2160,56 +2275,14 @@ class unified_cache {
     // When active, S1-PRELOAD uses the plan to decide VRAM vs host placement
     // instead of first-come-first-served.  Gated by GGML_SYCL_VRAM_ARENA=1.
 
-    void set_placement_plan(placement_plan && plan) {
-        placement_plan_     = std::move(plan);
-        has_placement_plan_ = true;
+    // C++17 atomic shared_ptr publication. Readers must retain the returned
+    // owner for the complete operation; no plan reference escapes a snapshot.
+    void set_placement_plan_snapshot(std::shared_ptr<const lifecycle_plan_snapshot> snapshot) {
+        std::atomic_store_explicit(&placement_plan_snapshot_, std::move(snapshot), std::memory_order_release);
     }
 
-    void update_placement_plan_runtime_kv(uint32_t n_ctx, size_t kv_per_layer, size_t kv_per_swa_layer) {
-        if (!has_placement_plan_) {
-            return;
-        }
-        placement_plan_.update_runtime_kv_sizes(n_ctx, kv_per_layer, kv_per_swa_layer);
-    }
-
-    bool plan_on_device(const std::string & tensor_name) const {
-        if (!has_placement_plan_) {
-            return true;
-        }
-        return placement_plan_.is_on_device(tensor_name);
-    }
-
-    // P4.5: Check if tensor is assigned to THIS device in a multi-device plan.
-    bool plan_on_this_device(const std::string & tensor_name, int this_device) const {
-        if (!has_placement_plan_) {
-            return true;
-        }
-        if (!placement_plan_.multi_device) {
-            // Single-device plan: original behavior
-            return placement_plan_.is_on_device(tensor_name);
-        }
-        return placement_plan_.is_on_device(tensor_name, this_device);
-    }
-
-    bool has_placement_plan() const { return has_placement_plan_; }
-
-    // Returns true if any expert of a MoE tensor is planned for host memory on device_id.
-    // Replaces ad-hoc static cache maps in dispatch code: placement_plan::expert_index_ is
-    // already O(1) per lookup, so no caller-side memoization is needed.
-    bool moe_tensor_has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
-        if (!has_placement_plan_) {
-            return false;  // No plan → all experts are device-resident (default)
-        }
-        return placement_plan_.has_host_experts(tensor_name, n_experts, device_id);
-    }
-
-    const placement_plan & get_placement_plan() const { return placement_plan_; }
-
-    bool demote_expert_placement_to_host(const std::string & tensor_name, int expert_id) {
-        if (!has_placement_plan_) {
-            return false;
-        }
-        return placement_plan_.demote_expert_placement_to_host(tensor_name, expert_id);
+    std::shared_ptr<const lifecycle_plan_snapshot> get_placement_plan_snapshot() const {
+        return std::atomic_load_explicit(&placement_plan_snapshot_, std::memory_order_acquire);
     }
 
     // Access the internal SYCL queue (for deferred free of temp allocations
@@ -2301,7 +2374,8 @@ class unified_cache {
     void     host_release_chunk_lease(uint64_t handle);
 
     // Destroy arena (free all chunks).
-    void arena_destroy();
+    bool arena_destroy();
+    bool resources_shutdown_ = false;
 
     // Abandon arena without freeing (for shutdown when SYCL context is invalid).
     void arena_abandon();
@@ -2334,7 +2408,13 @@ class unified_cache {
     // A model's load has finished: claim every entry it can now resolve.  Called
     // after S1-PRELOAD, so it covers both what this load staged and anything it
     // reused from an earlier model (identical GGUF weights dedupe to one entry).
-    void note_model_load_end(uint32_t slot);
+    void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
+    bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
+    uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
+
+    void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
+    void note_model_load_abort(uint64_t load_txn_id);
+    void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
     // A model has been destroyed: drop its ownership bit, then UNPIN and reclaim
     // every entry no live model owns.  The unpin is load-bearing -- evict_one()
@@ -2655,6 +2735,7 @@ class unified_cache {
     size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
     bool   contains_pinned(const void * ptr) const;
+    bool   contains_pinned_backing_allocation(const void * ptr, size_t size) const;
     size_t pre_allocate_host_pool(size_t total_bytes);
 
     // Deprecated shim — tests written against the old API. Migrate callers to unified_alloc().
@@ -2675,6 +2756,8 @@ class unified_cache {
     void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
 
   private:
+    std::atomic<bool> fail_next_host_registration_insert_{ false };
+
     // Sub-allocate from a zone.
     void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
 
@@ -3057,14 +3140,14 @@ class unified_cache {
     std::mutex                                                                 partial_mutex_;
 
     // === Placement Plan (P4) ===
-    placement_plan   placement_plan_;
-    bool             has_placement_plan_ = false;
-    std::atomic<int> planned_materialization_depth_{ 0 };
+    mutable std::shared_ptr<const lifecycle_plan_snapshot> placement_plan_snapshot_;
+    std::atomic<int>                                       planned_materialization_depth_{ 0 };
 
-    bool planned_materialization_allowed(const char *               op,
-                                         const ggml_sycl_cache_id & key,
-                                         ggml_layout_mode           layout,
-                                         const char *               caller) const;
+    bool planned_materialization_allowed(const char *                 op,
+                                         const ggml_sycl_cache_id &   key,
+                                         ggml_layout_mode             layout,
+                                         const char *                 caller,
+                                         const placement_cache_read * retained_read = nullptr) const;
 
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };
@@ -3435,6 +3518,7 @@ void unified_cache_deallocate(void * ptr, int device);
 bool acquire_offload_buffer(const offload_buffer_request & req, offload_buffer_lease * out);
 bool release_offload_buffer(const offload_buffer_lease & lease);
 void offload_buffer_pool_trim(int device = -1);
+bool offload_buffer_pool_shutdown();
 
 struct offload_stats_snapshot {
     uint64_t wait_count                                = 0;
@@ -4017,7 +4101,8 @@ void   unified_cache_reset_model_weight_entries(int                 device_id,
                                                 weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
 // Model lifetime fan-out over every device's cache (llama.cpp-0qlw).
 void   unified_cache_set_live_model_mask(uint32_t mask);
-void   unified_cache_note_model_load_end(uint32_t slot);
+void   unified_cache_note_model_load_abort(uint64_t load_txn_id);
+void   unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 size_t unified_cache_release_model_slot(uint32_t slot);
 size_t unified_cache_host_zone_used(host_zone_id zone);
 size_t unified_cache_host_zone_capacity(host_zone_id zone);
@@ -4163,7 +4248,14 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 // Shutdown the unified cache system before SYCL runtime destruction
 // Call this during ggml_backend_sycl_free() to avoid static destruction order issues
 // After calling this, the cache destructors will skip sycl::free() calls
-void shutdown_unified_cache();
+bool shutdown_unified_cache();
+bool unified_cache_shutdown_state_clean() noexcept;
+bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
+bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
+void unified_cache_test_fail_next_arena_free();
+void unified_cache_test_fail_next_shutdown_clean();
+void prepare_unified_cache_for_module_use() noexcept;
+void rollback_unified_cache_module_use() noexcept;
 
 // Returns true if SYCL runtime teardown has begun (atexit handler fired).
 // Used by ExpertCache/ExpertPrefetcher to skip sycl::free() during static destruction.

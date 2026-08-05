@@ -19,9 +19,15 @@
 // cache is touched.
 
 #include "common.hpp"
+#include "ggml-sycl-test.hpp"
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <thread>
 
 // expert_tensor_role and its helpers live in namespace ggml_sycl
 // (unified-cache.hpp:43), while tensor_usage / infer_tensor_usage resolve
@@ -33,6 +39,66 @@ namespace {
 
 int n_pass = 0;
 int n_fail = 0;
+
+void check_concurrent_snapshot_publication() {
+    using snapshot_ptr = std::shared_ptr<const lifecycle_plan_snapshot>;
+    snapshot_ptr                authority;
+    std::array<snapshot_ptr, 2> caches;
+    std::atomic<bool>           stop{ false };
+    std::atomic<int>            mixed_accepted{ 0 };
+
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto global = std::atomic_load_explicit(&authority, std::memory_order_acquire);
+            if (!global) {
+                continue;
+            }
+            for (auto & slot : caches) {
+                const auto cached = std::atomic_load_explicit(&slot, std::memory_order_acquire);
+                if (lifecycle_plan_snapshot_matches(global, cached) &&
+                    (cached->plan->weight_host_bytes != cached->version || cached->model_id != 77 ||
+                     cached->load_txn_id != 88)) {
+                    mixed_accepted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+
+    for (uint64_t version = 1; version <= 20000; ++version) {
+        auto plan               = std::make_shared<placement_plan>();
+        plan->weight_host_bytes = version;
+        auto next               = std::make_shared<lifecycle_plan_snapshot>();
+        next->model_id          = 77;
+        next->load_txn_id       = 88;
+        next->slot              = 3;
+        next->slot_generation   = 9;
+        next->version           = version;
+        next->plan              = std::move(plan);
+        snapshot_ptr immutable  = std::move(next);
+        // Invoke the exact production ordering primitive. The global callback
+        // asserts both caches already contain this immutable generation, so an
+        // ordering mutation is killed deterministically.
+        publish_cache_first_global_last(
+            2, [&](int i) { std::atomic_store_explicit(&caches[i], immutable, std::memory_order_release); },
+            [&] {
+                for (const auto & slot : caches) {
+                    if (!lifecycle_plan_snapshot_matches(immutable,
+                                                         std::atomic_load_explicit(&slot, std::memory_order_acquire))) {
+                        mixed_accepted.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                std::atomic_store_explicit(&authority, immutable, std::memory_order_release);
+            });
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+    if (mixed_accepted.load(std::memory_order_relaxed) == 0) {
+        n_pass++;
+    } else {
+        printf("FAIL concurrent snapshot publication accepted a mixed version\n");
+        n_fail++;
+    }
+}
 
 void check_usage(const char * name, tensor_usage expected) {
     const tensor_usage got = infer_tensor_usage(name);
@@ -58,6 +124,203 @@ void check_role(const char * name, expert_tensor_role expected) {
 }  // namespace
 
 int main() {
+    check_concurrent_snapshot_publication();
+    if (test_plan_publication_prepare_failure_is_caught()) {
+        n_pass++;
+    } else {
+        printf("FAIL publication preparation failure escaped noexcept boundary\n");
+        n_fail++;
+    }
+    if (test_provisional_placement_id_exhaustion_is_caught()) {
+        n_pass++;
+    } else {
+        printf("FAIL provisional placement exhaustion was not caught\n");
+        n_fail++;
+    }
+
+    // Hot owning reads retain shared immutable storage; they do not deep-copy a
+    // placement plan or allocate per call. The broad bound catches accidental
+    // plan copying/locking without depending on a particular host CPU.
+    const auto hot_begin = std::chrono::steady_clock::now();
+    const auto hot_owner = global_placement_plan_owner();
+    bool       hot_same  = true;
+    for (int i = 0; i < 1000000; ++i) {
+        hot_same = hot_same && global_placement_plan_owner().get() == hot_owner.get();
+    }
+    const auto hot_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hot_begin).count();
+    if (hot_same && hot_ms < 5000) {
+        n_pass++;
+    } else {
+        printf("FAIL hot placement owner copied/allocated or took too long: %lld ms\n", (long long) hot_ms);
+        n_fail++;
+    }
+
+    // Equal metadata is insufficient: only the exact shared publication owner
+    // distributed to authority and cache is coherent. Null authority also
+    // fails closed even when a stale cache owner remains.
+    auto identity_plan = std::make_shared<placement_plan>();
+    identity_plan->entries.push_back({});
+    auto authority         = std::make_shared<lifecycle_plan_snapshot>();
+    authority->model_id    = 9;
+    authority->load_txn_id = 10;
+    authority->version     = 11;
+    authority->plan        = identity_plan;
+    auto metadata_clone    = std::make_shared<lifecycle_plan_snapshot>(*authority);
+    if (lifecycle_plan_snapshot_matches(authority, authority) &&
+        !lifecycle_plan_snapshot_matches(authority, metadata_clone) &&
+        !lifecycle_plan_snapshot_matches({}, authority)) {
+        n_pass++;
+    } else {
+        printf("FAIL placement snapshot pointer identity/null authority\n");
+        n_fail++;
+    }
+
+    // A/B/C regression: after explicitly publishing A, unloading unrelated C
+    // must preserve the exact A shared authority. Only unloading A may replace
+    // it (here with B).
+    auto selected_a = authority;
+    selected_a->slot = 2;
+    selected_a->slot_generation = 3;
+    auto live_b = std::make_shared<lifecycle_plan_snapshot>(*selected_a);
+    live_b->model_id = 20;
+    auto dying_c = std::make_shared<lifecycle_plan_snapshot>(*selected_a);
+    dying_c->model_id = 30;
+    auto publication = selected_a;
+    if (lifecycle_plan_snapshot_owned_by(publication, dying_c->model_id, dying_c->load_txn_id,
+                                         dying_c->slot, dying_c->slot_generation)) {
+        publication = live_b;
+    }
+    const bool c_preserved_exact_a = publication.get() == selected_a.get();
+    if (lifecycle_plan_snapshot_owned_by(publication, selected_a->model_id, selected_a->load_txn_id,
+                                         selected_a->slot, selected_a->slot_generation)) {
+        publication = live_b;
+    }
+    if (c_preserved_exact_a && publication.get() == live_b.get()) {
+        n_pass++;
+    } else {
+        printf("FAIL non-authoritative C teardown displaced exact A publication\n");
+        n_fail++;
+    }
+
+    placement_plan exhausted_candidate{};
+    lifecycle_stage_placement_plan(9001, exhausted_candidate);
+    lifecycle_set_next_plan_publication_id_for_test(UINT64_MAX);
+    const bool exhausted = !lifecycle_publish_placement_plan(9002, 9001, 0, 1, 0, 0, false);
+    lifecycle_set_next_plan_publication_id_for_test(1);
+    // The failed publication must erase its staged candidate: retrying with a
+    // live ID must still fail rather than publishing residue.
+    const bool candidate_erased = !lifecycle_publish_placement_plan(9002, 9001, 0, 1, 0, 0, false);
+    if (exhausted && candidate_erased) {
+        n_pass++;
+    } else {
+        printf("FAIL publication version exhaustion wrapped or retained candidate\n");
+        n_fail++;
+    }
+
+    // Lifecycle snapshots own one full plan per model, not one summary per
+    // device cache. This also verifies explicit no-plan publication and plan
+    // deletion without requiring a GPU queue.
+    placement_plan plan{};
+    plan.weight_host_bytes = 11;
+    plan.weight_vram_bytes = 22;
+    plan.multi_device      = true;
+    plan.devices           = { 0, 1, 2 };
+    placement_kv_info kv_a{};
+    kv_a.n_layer  = 12;
+    kv_a.n_ctx    = 4096;
+    kv_a.n_ubatch = 512;
+    lifecycle_stage_placement_plan(1001, plan, kv_a, 12);
+    if (!lifecycle_publish_placement_plan(2001, 1001, 3, 7, 0, 0, false)) {
+        printf("FAIL lifecycle plan publish\n");
+        n_fail++;
+    } else {
+        auto published = lifecycle_find_placement_plan(2001, 1001);
+        if (published && published->planned_host_bytes == 11 && published->actual_host_bytes == 11 &&
+            published->verdict == lifecycle_plan_verdict::MIXED && published->model_n_layer == 12 &&
+            published->kv_info.n_ctx == 4096 && published->kv_info.n_ubatch == 512) {
+            n_pass++;
+        } else {
+            printf("FAIL lifecycle multi-device single count\n");
+            n_fail++;
+        }
+    }
+    placement_kv_info kv_b{};
+    kv_b.n_layer  = 24;
+    kv_b.n_ctx    = 8192;
+    kv_b.n_ubatch = 1024;
+    lifecycle_stage_no_placement_plan(1002, kv_b, 24);
+    if (!lifecycle_publish_placement_plan(2002, 1002, 4, 8, 99, 99, true)) {
+        printf("FAIL lifecycle no-plan publish\n");
+        n_fail++;
+    } else {
+        auto no_plan = lifecycle_find_placement_plan(2002, 1002);
+        auto prior   = lifecycle_find_placement_plan(2001, 1001);
+        if (no_plan && no_plan->explicit_no_plan && !no_plan->plan &&
+            no_plan->verdict == lifecycle_plan_verdict::UNKNOWN && no_plan->planned_host_bytes == 0 &&
+            no_plan->model_n_layer == 24 && no_plan->kv_info.n_ctx == 8192 && prior && prior->model_n_layer == 12 &&
+            prior->kv_info.n_ctx == 4096) {
+            n_pass++;
+        } else {
+            printf("FAIL lifecycle no-plan isolation\n");
+            n_fail++;
+        }
+    }
+    // Exact generation-safe manual A/B/A selection is independent of the
+    // latest-loaded model, and a transaction-local B candidate/abort cannot
+    // replace or null the already published A snapshot.
+    const auto manual_a1 = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    const auto manual_b  = lifecycle_select_placement_plan(2002, 1002, 4, 8);
+    lifecycle_stage_placement_plan(1003, plan, kv_a, 12);
+    const auto during_b_load = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    lifecycle_abort_placement_plan(1003);
+    lifecycle_stage_no_placement_plan(1004, kv_b, 24);
+    const auto        no_arena_candidate = lifecycle_find_candidate_placement_plan(1004);
+    std::atomic<bool> cross_thread_candidate{ false };
+    std::thread       candidate_reader([&] {
+        const auto candidate = lifecycle_find_candidate_placement_plan(1004);
+        cross_thread_candidate.store(candidate && candidate->explicit_no_plan, std::memory_order_release);
+    });
+    candidate_reader.join();
+    const auto during_no_arena_load = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    lifecycle_abort_placement_plan(1004);
+    const auto manual_a2 = lifecycle_select_placement_plan(2001, 1001, 3, 7);
+    const auto stale_a   = lifecycle_select_placement_plan(2001, 1001, 3, 8);
+    if (manual_a1 && manual_b && during_b_load.get() == manual_a1.get() && no_arena_candidate &&
+        no_arena_candidate->explicit_no_plan && cross_thread_candidate.load(std::memory_order_acquire) &&
+        during_no_arena_load.get() == manual_a1.get() && manual_a2.get() == manual_a1.get() && !stale_a) {
+        n_pass++;
+    } else {
+        printf("FAIL exact A/B/A activation or B-abort continuity\n");
+        n_fail++;
+    }
+
+    // Simulate A runtime KV CAS while B is independently live. Removing B must
+    // leave lifecycle ownership pointing at A-prime geometry, not A's original
+    // process-global metadata or B's geometry.
+    auto a_before          = lifecycle_find_placement_plan(2001, 1001);
+    auto a_prime           = std::make_shared<lifecycle_plan_snapshot>(*a_before);
+    a_prime->kv_info.n_ctx = 6144;
+    a_prime->version       = lifecycle_next_plan_publication_id();
+    std::shared_ptr<const lifecycle_plan_snapshot> a_prime_immutable = a_prime;
+    const bool a_updated = lifecycle_replace_placement_plan(a_before, a_prime_immutable);
+    lifecycle_erase_placement_plan(2002, 1002);
+    const auto restored_a = lifecycle_find_placement_plan(2001, 1001);
+    if (a_updated && restored_a.get() == a_prime_immutable.get() && restored_a->kv_info.n_ctx == 6144 &&
+        restored_a->model_n_layer == 12) {
+        n_pass++;
+    } else {
+        printf("FAIL A/B unload did not retain A-prime KV geometry\n");
+        n_fail++;
+    }
+    lifecycle_erase_placement_plan(2001, 1001);
+    if (lifecycle_published_placement_plan_count_for_test() == 0) {
+        n_pass++;
+    } else {
+        printf("FAIL lifecycle plan deletion\n");
+        n_fail++;
+    }
+
     // Non-expert tensors -- must NOT classify as MOE_EXPERT_WEIGHT / a routed role.
     check_usage("blk.0.attn_q.weight", tensor_usage::ATTENTION_WEIGHT);
     check_usage("blk.0.attn_k.weight", tensor_usage::ATTENTION_WEIGHT);

@@ -700,6 +700,38 @@ bool pinned_chunk_pool::contains(const void * ptr) const {
     return false;
 }
 
+bool pinned_chunk_pool::contains_backing_allocation(const void * ptr, size_t size) const {
+    if (!ptr || size == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const uintptr_t             lo = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t             hi = lo + size;
+    auto in_owner = [&](const chunk & c) {
+        if (!c.base || !c.owner.valid()) {
+            return false;
+        }
+        auto resolved = c.owner.resolve();
+        if (!resolved.ptr) {
+            return false;
+        }
+        const uintptr_t owner_lo = reinterpret_cast<uintptr_t>(resolved.ptr);
+        const uintptr_t owner_hi = owner_lo + c.owner.size();
+        return lo >= owner_lo && hi <= owner_hi;
+    };
+    for (const auto & c : chunks_) {
+        if (in_owner(c)) {
+            return true;
+        }
+    }
+    for (const auto & c : runtime_chunks_) {
+        if (in_owner(c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t pinned_chunk_pool::allocated() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return total_allocated_;

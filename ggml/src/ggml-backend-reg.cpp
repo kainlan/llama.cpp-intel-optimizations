@@ -6,10 +6,14 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
+#include <thread>
 #include <vector>
 #include <cctype>
 
@@ -91,6 +95,73 @@
 namespace fs = std::filesystem;
 
 static std::atomic<bool> g_disable_device_backends{false};
+static std::atomic<size_t> g_test_unload_attempts{0};
+static std::atomic<size_t> g_external_hook_active{0};
+static thread_local size_t g_external_hook_depth = 0;
+static std::mutex g_deferred_registration_mutex;
+static std::vector<ggml_backend_reg_t> g_deferred_registrations;
+static void defer_static_registration(ggml_backend_reg_t reg) {
+    if (!reg) return;
+    std::lock_guard<std::mutex> lock(g_deferred_registration_mutex);
+    if (std::find(g_deferred_registrations.begin(), g_deferred_registrations.end(), reg) ==
+        g_deferred_registrations.end()) g_deferred_registrations.push_back(reg);
+}
+static std::vector<ggml_backend_reg_t> take_deferred_registrations() {
+    std::vector<ggml_backend_reg_t> deferred;
+    std::lock_guard<std::mutex> lock(g_deferred_registration_mutex);
+    deferred.swap(g_deferred_registrations);
+    return deferred;
+}
+struct external_hook_scope {
+    external_hook_scope() { ++g_external_hook_depth; g_external_hook_active.fetch_add(1, std::memory_order_acq_rel); }
+    ~external_hook_scope() { g_external_hook_active.fetch_sub(1, std::memory_order_acq_rel); --g_external_hook_depth; }
+};
+
+// Deterministic host-test barrier: pauses one checked unload after publishing
+// its UNLOADING tombstone. Readers and recursive registration remain unlocked
+// and must observe/reject that identity without blocking.
+static std::mutex              g_registry_test_mutex;
+static std::condition_variable g_registry_test_cv;
+static bool                    g_registry_test_block_next_unload = false;
+static bool                    g_registry_test_unload_blocked = false;
+static bool                    g_registry_test_release_unload = false;
+static bool                    g_registry_test_reentrant_mutation = false;
+
+extern "C" void ggml_backend_test_block_next_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_block_next_unload = true;
+    g_registry_test_unload_blocked = false;
+    g_registry_test_release_unload = false;
+}
+
+extern "C" void ggml_backend_test_wait_unload_blocked() {
+    std::unique_lock<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_cv.wait(lock, [] { return g_registry_test_unload_blocked; });
+}
+
+extern "C" void ggml_backend_test_reentrant_mutation_on_next_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_reentrant_mutation = true;
+}
+
+extern "C" void ggml_backend_test_release_unload() {
+    std::lock_guard<std::mutex> lock(g_registry_test_mutex);
+    g_registry_test_release_unload = true;
+    g_registry_test_cv.notify_all();
+}
+
+static void ggml_backend_test_unload_barrier() {
+    std::unique_lock<std::mutex> lock(g_registry_test_mutex);
+    if (!g_registry_test_block_next_unload) {
+        return;
+    }
+    g_registry_test_unload_blocked = true;
+    g_registry_test_cv.notify_all();
+    g_registry_test_cv.wait(lock, [] { return g_registry_test_release_unload; });
+    g_registry_test_block_next_unload = false;
+    g_registry_test_unload_blocked = false;
+    g_registry_test_release_unload = false;
+}
 
 bool ggml_backend_device_backends_disabled(void) {
     if (g_disable_device_backends.load(std::memory_order_acquire)) {
@@ -116,16 +187,70 @@ static std::string path_str(const fs::path & path) {
     }
 }
 
-struct ggml_backend_reg_entry {
-    ggml_backend_reg_t reg;
-    dl_handle_ptr handle;
+static bool striequals(const char * a, const char * b);
+
+enum class ggml_backend_reg_state : uint8_t {
+    ACTIVE,
+    REACTIVATING,
+    UNLOADING,
+    HIDDEN_FAILED,
+    REMOVED,
 };
 
-struct ggml_backend_registry {
-    std::vector<ggml_backend_reg_entry> backends;
-    std::vector<ggml_backend_dev_t> devices;
+struct ggml_backend_reg_entry {
+    ggml_backend_reg_t       reg;
+    dl_handle_ptr            handle;
+    ggml_backend_reg_state   state = ggml_backend_reg_state::ACTIVE;
+    bool                     dynamic = false;
+    bool                     ever_active = false;
+    size_t                   active_calls = 0;
+    size_t                   durable_owners = 0;
+    uint64_t                 current_generation = 0;
+    uint64_t                 generation_counter = 0;
+    std::string              cached_name;
+    std::string              module_path;
+};
 
-    ggml_backend_registry() {
+using ggml_backend_reg_entry_ptr = std::shared_ptr<ggml_backend_reg_entry>;
+
+struct ggml_backend_device_entry {
+    ggml_backend_dev_t         dev;
+    ggml_backend_reg_entry_ptr owner;
+    uint64_t                   generation;
+};
+
+template <typename Entries>
+static auto find_device_identity(Entries & entries, ggml_backend_dev_t device) {
+    // A backend may reuse the same static device object on reactivation. Prefer
+    // its current committed row; retain an older matching row only as a
+    // rejectable tombstone when no current generation exists.
+    auto current = std::find_if(entries.begin(), entries.end(), [device](const auto & entry) {
+        return entry.dev == device && entry.generation == entry.owner->current_generation;
+    });
+    return current != entries.end() ? current :
+        std::find_if(entries.begin(), entries.end(), [device](const auto & entry) { return entry.dev == device; });
+}
+
+// count()/get() use one bounded per-thread snapshot. It is enumeration state,
+// never a DSO lifetime mechanism: every dynamic module is process-pinned before
+// score/init/publication because raw C handles have no transferable release API.
+static thread_local std::vector<ggml_backend_reg_entry_ptr> g_backend_reg_enumeration;
+static thread_local std::vector<ggml_backend_device_entry>  g_backend_dev_enumeration;
+
+struct ggml_backend_registry {
+    mutable std::mutex                       mutex;
+    mutable std::condition_variable          cv;
+    std::recursive_mutex                     module_operation_mutex;
+    std::vector<ggml_backend_reg_entry_ptr>  backends;
+    std::vector<ggml_backend_device_entry>   devices;
+
+    ggml_backend_registry() = default;
+
+    // Run only after the registry object is fully constructed and published by
+    // get_reg(). Backend constructors may enter complex runtime code; invoking
+    // them from this object's constructor exposes a partially-initialized
+    // registry to any indirect generic registration path.
+    void register_builtin_backends() {
         // Only referenced inside the per-backend GGML_USE_* blocks below, so it
         // is unused in a CPU-only build.
         [[maybe_unused]] const bool disable_device_backends = ggml_backend_device_backends_disabled();
@@ -205,134 +330,917 @@ struct ggml_backend_registry {
 #endif
     }
 
-    ~ggml_backend_registry() {
-        // FIXME: backends cannot be safely unloaded without a function to destroy all the backend resources,
-        // since backend threads may still be running and accessing resources from the dynamic library
-        for (auto & entry : backends) {
-            if (entry.handle) {
-                entry.handle.release(); // NOLINT
+    ~ggml_backend_registry() = default;
+
+    void drain_deferred_registrations() noexcept {
+        try {
+            while (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) == 0) {
+                auto deferred = take_deferred_registrations();
+                if (deferred.empty()) {
+                    return;
+                }
+                for (auto * pending : deferred) {
+                    ggml_backend_register(pending);
+                }
             }
+        } catch (...) {
         }
     }
 
-    void register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr) {
+    bool register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr,
+                          std::string module_path = {}) noexcept {
         if (!reg) {
+            return false;
+        }
+        // Serialize staging, hidden adoption, and ACTIVE publication with
+        // checked unload. Recursive plugin registration remains supported.
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
+            }
+        } drain_guard{ this };
+        std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
+        while (!operation_lock.try_lock()) {
+            if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) return false;
+            std::this_thread::yield();
+        }
+        try {
+            bool needs_reactivation = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const auto known = std::find_if(backends.begin(), backends.end(),
+                    [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+                if (known != backends.end() && (*known)->state != ggml_backend_reg_state::REMOVED) {
+                    return false;
+                }
+                needs_reactivation = known != backends.end() && (*known)->ever_active;
+            }
+            using prepare_reactivate_fn = bool (*)();
+            using settle_reactivate_fn = void (*)();
+            prepare_reactivate_fn prepare_reactivate = nullptr;
+            settle_reactivate_fn commit_reactivate = nullptr;
+            settle_reactivate_fn finalize_reactivate = nullptr;
+            settle_reactivate_fn rollback_reactivate = nullptr;
+            bool reactivation_prepared = false;
+            struct reactivation_rollback_guard {
+                settle_reactivate_fn * rollback;
+                bool * prepared;
+                ~reactivation_rollback_guard() noexcept {
+                    if (*prepared && *rollback) {
+                        try { external_hook_scope hook; (*rollback)(); }
+                        catch (...) { GGML_LOG_ERROR("backend reactivation rollback threw; retaining tombstone\n"); }
+                    }
+                }
+            } rollback_guard{ &rollback_reactivate, &reactivation_prepared };
+            if (needs_reactivation && reg->iface.get_proc_address) {
+                external_hook_scope resolver_hook;
+                prepare_reactivate = reinterpret_cast<prepare_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_prepare_reactivate"));
+                commit_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_commit_reactivate"));
+                finalize_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_finalize_reactivate"));
+                rollback_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_rollback_reactivate"));
+                const bool any_hook = prepare_reactivate || commit_reactivate || finalize_reactivate || rollback_reactivate;
+                // Legacy reactivation ABI is a prepare/commit/rollback triplet;
+                // finalize is an optional containment hook for newer DSOs.
+                if (any_hook && (!prepare_reactivate || !commit_reactivate || !rollback_reactivate)) return false;
+                reactivation_prepared = any_hook;
+                if (any_hook) {
+                    try {
+                        external_hook_scope hook;
+                        if (!prepare_reactivate()) return false;
+                    } catch (...) {
+                        return false;
+                    }
+                }
+            }
+            // Stage all plugin-owned metadata while mutation admission remains closed.
+            const char * name = nullptr;
+            {
+                external_hook_scope hook;
+                name = ggml_backend_reg_name_unchecked(reg);
+            }
+            size_t count = 0;
+            {
+                external_hook_scope hook;
+                if (!ggml_backend_reg_dev_count_unchecked(reg, &count)) return false;
+            }
+            std::vector<ggml_backend_dev_t> staged_devices;
+            staged_devices.reserve(count);
+            for (size_t i = 0; i < count; ++i) {
+                ggml_backend_dev_t device = nullptr;
+                external_hook_scope hook;
+                if (!ggml_backend_reg_dev_get_unchecked(reg, i, &device)) return false;
+                staged_devices.push_back(device);
+            }
+            const bool dynamic = handle != nullptr;
+            auto candidate = std::make_shared<ggml_backend_reg_entry>(
+                ggml_backend_reg_entry{ reg, std::move(handle), ggml_backend_reg_state::ACTIVE, dynamic, false, 0, 0, 0, 0,
+                                        name ? name : "", std::move(module_path) });
+
+            ggml_backend_reg_entry_ptr published_entry;
+            uint64_t staged_generation = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto existing = std::find_if(backends.begin(), backends.end(),
+                    [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+                if (existing != backends.end() && (*existing)->state != ggml_backend_reg_state::REMOVED) {
+                    return false;
+                }
+                const bool is_new = existing == backends.end();
+                ggml_backend_reg_entry_ptr entry = is_new ? candidate : *existing;
+                backends.reserve(backends.size() + (is_new ? 1 : 0));
+                devices.reserve(devices.size() + staged_devices.size());
+                staged_generation = ++entry->generation_counter;
+                if (is_new) {
+                    backends.push_back(entry);
+                } else {
+                    // Retain every prior generation row forever: saved raw
+                    // device identities must remain recognizable tombstones.
+                    entry->handle = std::move(candidate->handle);
+                    entry->dynamic = candidate->dynamic;
+                    entry->module_path = std::move(candidate->module_path);
+                }
+                // Keep all new/current device identities hidden while live
+                // pre-registry owners are adopted under module serialization.
+                entry->state = ggml_backend_reg_state::REACTIVATING;
+                for (auto dev : staged_devices) devices.push_back({ dev, entry, staged_generation });
+                entry->current_generation = staged_generation;
+                published_entry = entry;
+            }
+            if (reactivation_prepared) {
+                try {
+                    external_hook_scope hook;
+                    commit_reactivate();
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // Keep staged device identities linked to their REMOVED
+                    // owner tombstone so saved handles reject rather than
+                    // falling through as standalone/unmanaged devices.
+                    published_entry->state = ggml_backend_reg_state::REMOVED;
+                    return false;
+                }
+            }
+            // module_operation_mutex remains held: unload cannot pass preflight,
+            // and enumeration stays hidden until adoption has settled.
+            try {
+                ggml_backend_refresh_buffer_lifecycle();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                published_entry->state = ggml_backend_reg_state::REMOVED;
+                return false;
+            }
+            if (reactivation_prepared && finalize_reactivate) {
+                try {
+                    external_hook_scope hook;
+                    finalize_reactivate();
+                } catch (...) {
+                    // Commit plus owner adoption is the roll-forward point.
+                    // Finalize is containment-only: never roll admitted owners
+                    // back into a plugin state that may already be active.
+                    GGML_LOG_ERROR("backend reactivation finalize threw; publishing committed generation\n");
+                }
+            }
+            reactivation_prepared = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (published_entry->state != ggml_backend_reg_state::REACTIVATING) return false;
+                published_entry->ever_active = true;
+                published_entry->state = ggml_backend_reg_state::ACTIVE;
+            }
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);
+#endif
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void register_device(ggml_backend_dev_t device) noexcept {
+        if (!device) {
             return;
         }
-
-        for (auto & entry : backends) {
-            if (entry.reg == reg) {
+        try {
+            const auto reg = device->reg;
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto owner = std::find_if(backends.begin(), backends.end(),
+                [reg](const ggml_backend_reg_entry_ptr & entry) {
+                    return entry->reg == reg && entry->state == ggml_backend_reg_state::ACTIVE;
+                });
+            if (owner == backends.end() || std::any_of(devices.begin(), devices.end(),
+                    [device](const ggml_backend_device_entry & entry) { return entry.dev == device; })) {
                 return;
             }
-        }
-
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n",
-            __func__, ggml_backend_reg_name(reg), ggml_backend_reg_dev_count(reg));
-#endif
-        backends.push_back({ reg, std::move(handle) });
-        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
-            register_device(ggml_backend_reg_dev_get(reg, i));
+            devices.push_back({ device, *owner, (*owner)->current_generation });
+        } catch (...) {
         }
     }
 
-    void register_device(ggml_backend_dev_t device) {
-        for (auto & dev : devices) {
-            if (dev == device) {
-                return;
+    ggml_backend_reg_t load_backend(const fs::path & path, bool silent) noexcept {
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
+            }
+        } drain_guard{ this };
+        std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
+        while (!operation_lock.try_lock()) {
+            if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) return nullptr;
+            std::this_thread::yield();
+        }
+        std::error_code canonical_error;
+        const fs::path canonical_path = fs::weakly_canonical(path, canonical_error);
+        const std::string module_path = path_str(canonical_error ? path : canonical_path);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto blocked = std::find_if(backends.begin(), backends.end(), [&](const auto & entry) {
+                return entry->dynamic && entry->module_path == module_path &&
+                       entry->state != ggml_backend_reg_state::REMOVED;
+            });
+            if (blocked != backends.end()) {
+                return nullptr;
             }
         }
-
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: registered device %s (%s)\n", __func__, ggml_backend_dev_name(device), ggml_backend_dev_description(device));
-#endif
-        devices.push_back(device);
-    }
-
-    ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
-        dl_handle_ptr handle { dl_load_library(path) };
+        dl_handle_ptr handle;
+        try {
+            handle.reset(dl_load_library(path));
+        } catch (...) {
+            if (!silent) {
+                GGML_LOG_ERROR("%s: backend loader callback threw for %s\n", __func__, path_str(path).c_str());
+            }
+            return nullptr;
+        }
         if (!handle) {
             if (!silent) {
                 GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(path).c_str(), dl_error());
             }
             return nullptr;
         }
-
-        auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
-        if (score_fn && score_fn() == 0) {
+        // Generic raw-handle policy: pin before score/init can publish any DSO
+        // pointer. Logical unload remains supported, physical unload does not.
+        if (!dl_pin_library(handle.get(), path)) {
             if (!silent) {
-                GGML_LOG_INFO("%s: backend %s is not supported on this system\n", __func__, path_str(path).c_str());
+                GGML_LOG_ERROR("%s: failed to process-pin backend %s\n", __func__, path_str(path).c_str());
             }
             return nullptr;
         }
-
-        auto backend_init_fn = (ggml_backend_init_t) dl_get_sym(handle.get(), "ggml_backend_init");
-        if (!backend_init_fn) {
+        try {
+            auto score_fn = reinterpret_cast<ggml_backend_score_t>(dl_get_sym(handle.get(), "ggml_backend_score"));
+            if (score_fn) {
+                external_hook_scope hook;
+                if (score_fn() == 0) return nullptr;
+            }
+            auto backend_init_fn = reinterpret_cast<ggml_backend_init_t>(dl_get_sym(handle.get(), "ggml_backend_init"));
+            if (!backend_init_fn) {
+                return nullptr;
+            }
+            external_hook_scope hook;
+            ggml_backend_reg_t reg = backend_init_fn();
+            if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
+                return nullptr;
+            }
+            if (!register_backend(reg, std::move(handle), module_path)) {
+                return nullptr;
+            }
+            GGML_LOG_INFO("%s: loaded %s backend from %s\n", __func__, ggml_backend_reg_name(reg), path_str(path).c_str());
+            return reg;
+        } catch (...) {
             if (!silent) {
-                GGML_LOG_ERROR("%s: failed to find ggml_backend_init in %s\n", __func__, path_str(path).c_str());
+                GGML_LOG_ERROR("%s: backend resolver/init threw for %s\n", __func__, path_str(path).c_str());
             }
             return nullptr;
         }
-
-        ggml_backend_reg_t reg = backend_init_fn();
-        if (!reg || reg->api_version != GGML_BACKEND_API_VERSION) {
-            if (!silent) {
-                if (!reg) {
-                    GGML_LOG_ERROR("%s: failed to initialize backend from %s: ggml_backend_init returned NULL\n",
-                        __func__, path_str(path).c_str());
-                } else {
-                    GGML_LOG_ERROR("%s: failed to initialize backend from %s: incompatible API version (backend: %d, current: %d)\n",
-                        __func__, path_str(path).c_str(), reg->api_version, GGML_BACKEND_API_VERSION);
-                }
-            }
-            return nullptr;
-        }
-
-        GGML_LOG_INFO("%s: loaded %s backend from %s\n", __func__, ggml_backend_reg_name(reg), path_str(path).c_str());
-
-        register_backend(reg, std::move(handle));
-
-        return reg;
     }
 
-    void unload_backend(ggml_backend_reg_t reg, bool silent) {
-        auto it = std::find_if(backends.begin(), backends.end(),
-                               [reg](const ggml_backend_reg_entry & entry) { return entry.reg == reg; });
-
-        if (it == backends.end()) {
-            if (!silent) {
-                GGML_LOG_ERROR("%s: backend not found\n", __func__);
+    ggml_backend_unload_result unload_backend(ggml_backend_reg_t reg, bool silent) noexcept {
+        g_test_unload_attempts.fetch_add(1, std::memory_order_release);
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
             }
-            return;
+        } drain_guard{ this };
+        std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
+        while (!operation_lock.try_lock()) {
+            if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) {
+                return GGML_BACKEND_UNLOAD_BUSY;
+            }
+            std::this_thread::yield();
+        }
+        ggml_backend_reg_entry_ptr unloading;
+        bool was_hidden_failed = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            const auto it = std::find_if(backends.begin(), backends.end(),
+                [reg](const ggml_backend_reg_entry_ptr & entry) {
+                    return entry->reg == reg && (entry->state == ggml_backend_reg_state::ACTIVE ||
+                                                 entry->state == ggml_backend_reg_state::HIDDEN_FAILED);
+                });
+            if (it == backends.end()) {
+                return GGML_BACKEND_UNLOAD_NOT_FOUND;
+            }
+            unloading = *it;
+            was_hidden_failed = unloading->state == ggml_backend_reg_state::HIDDEN_FAILED;
+            if (unloading->durable_owners != 0) {
+                return GGML_BACKEND_UNLOAD_BUSY;
+            }
+            // Tombstone first: enumeration, lookup, init and same-identity
+            // registration all reject this entry while callbacks run unlocked.
+            unloading->state = ggml_backend_reg_state::UNLOADING;
         }
 
+        {
+            // The deterministic barrier models a cross-thread dependency from
+            // plugin code while module serialization is held. Contending loads
+            // must fail closed rather than wait and deadlock the hook owner.
+            external_hook_scope hook;
+            ggml_backend_test_unload_barrier();
+        }
+        bool test_reentrant_registration = false;
+        {
+            std::lock_guard<std::mutex> test_lock(g_registry_test_mutex);
+            test_reentrant_registration = g_registry_test_reentrant_mutation;
+            g_registry_test_reentrant_mutation = false;
+        }
+        if (test_reentrant_registration) {
+            // Exercise the same public registration path a recursive plugin
+            // callback would use; the UNLOADING tombstone must reject it.
+            (void) register_backend(reg);
+        }
+        using can_unload_fn = bool (*)();
+        using shutdown_fn = void (*)();
+        can_unload_fn can_unload = nullptr;
+        shutdown_fn shutdown = nullptr;
+        shutdown_fn complete = nullptr;
+        shutdown_fn cancel = nullptr;
+        bool resolver_failed = false;
+        try {
+            // Resolver is plugin code too; the process pin guards every call.
+            const auto resolve = [&](const char * name) {
+                external_hook_scope hook;
+                return reg->iface.get_proc_address ? reg->iface.get_proc_address(reg, name) : nullptr;
+            };
+            can_unload = reinterpret_cast<can_unload_fn>(resolve("ggml_backend_can_unload"));
+            shutdown = reinterpret_cast<shutdown_fn>(resolve("ggml_backend_shutdown"));
+            complete = reinterpret_cast<shutdown_fn>(resolve("ggml_backend_complete_unload"));
+            cancel = reinterpret_cast<shutdown_fn>(resolve("ggml_backend_cancel_unload"));
+        } catch (...) {
+            resolver_failed = true;
+        }
+        bool reserved = false;
+        const auto cancel_noexcept = [&] {
+            if (reserved && cancel) {
+                try {
+                    external_hook_scope hook;
+                    cancel();
+                } catch (...) {
+                }
+            }
+            reserved = false;
+        };
+        dl_handle_ptr released_handle;
+        const auto settle_state = [&](ggml_backend_reg_state state) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (unloading->state == ggml_backend_reg_state::UNLOADING) {
+                if (state == ggml_backend_reg_state::REMOVED) {
+                    released_handle = std::move(unloading->handle);
+                }
+                unloading->state = state;
+            }
+        };
+        if (resolver_failed) {
+            settle_state(ggml_backend_reg_state::HIDDEN_FAILED);
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
+        // Never acquire a reservation unless every settlement path is already
+        // resolved. This avoids an un-cancellable reservation on malformed DSOs.
+        if (can_unload && (!shutdown || !complete || !cancel)) {
+            settle_state(was_hidden_failed ? ggml_backend_reg_state::HIDDEN_FAILED :
+                                               ggml_backend_reg_state::ACTIVE);
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
+
+        try {
+            if (can_unload) {
+                external_hook_scope hook;
+                reserved = can_unload();
+                if (!reserved) {
+                    settle_state(was_hidden_failed ? ggml_backend_reg_state::HIDDEN_FAILED :
+                                                       ggml_backend_reg_state::ACTIVE);
+                    return GGML_BACKEND_UNLOAD_BUSY;
+                }
+            }
+        } catch (...) {
+            // The hook may throw after reservation; conservatively cancel.
+            reserved = can_unload != nullptr;
+            cancel_noexcept();
+            settle_state(ggml_backend_reg_state::HIDDEN_FAILED);
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            constexpr auto active_call_drain_timeout = std::chrono::seconds(5);
+            if (!cv.wait_for(lock, active_call_drain_timeout, [&] { return unloading->active_calls == 0; })) {
+                const size_t stuck_calls = unloading->active_calls;
+                lock.unlock();
+                GGML_LOG_ERROR("%s: active callback drain timed out with %zu call(s)\n", __func__, stuck_calls);
+                cancel_noexcept();
+                settle_state(was_hidden_failed ? ggml_backend_reg_state::HIDDEN_FAILED :
+                                                 ggml_backend_reg_state::ACTIVE);
+                return GGML_BACKEND_UNLOAD_BUSY;
+            }
+        }
+
+        try {
+            if (shutdown) {
+                external_hook_scope hook;
+                shutdown();
+            }
+        } catch (...) {
+            cancel_noexcept();
+            // Shutdown may have destroyed arbitrary module state. Never make
+            // this identity discoverable again; retain a retryable tombstone.
+            settle_state(ggml_backend_reg_state::HIDDEN_FAILED);
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
+        try {
+            if (complete) {
+                external_hook_scope hook;
+                complete();
+                reserved = false;
+            }
+        } catch (...) {
+            cancel_noexcept();
+            settle_state(ggml_backend_reg_state::HIDDEN_FAILED);
+            return GGML_BACKEND_UNLOAD_BUSY;
+        }
+        settle_state(ggml_backend_reg_state::REMOVED);
+        // Drop only the ordinary dlopen reference outside the registry lock;
+        // the generic process pin preserves all previously returned raw handles.
+        released_handle.reset();
         if (!silent) {
-            GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
+            GGML_LOG_DEBUG("%s: logically unloaded backend\n", __func__);
         }
+        return GGML_BACKEND_UNLOAD_OK;
+    }
 
-        // remove devices
-        devices.erase(
-            std::remove_if(devices.begin(), devices.end(),
-                            [reg](ggml_backend_dev_t dev) { return ggml_backend_dev_backend_reg(dev) == reg; }),
-            devices.end());
+    bool begin_call(const ggml_backend_reg_entry_ptr & entry) const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (entry->state != ggml_backend_reg_state::ACTIVE || entry->active_calls == SIZE_MAX) {
+                return false;
+            }
+            ++entry->active_calls;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
 
-        // remove backend
-        backends.erase(it);
+    void end_call(const ggml_backend_reg_entry_ptr & entry) const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (entry->active_calls != 0) {
+                --entry->active_calls;
+                cv.notify_all();
+            }
+        } catch (...) {
+        }
+    }
+
+    size_t backend_count() const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            g_backend_reg_enumeration.clear();
+            for (const auto & entry : backends) {
+                if (entry->state == ggml_backend_reg_state::ACTIVE) {
+                    g_backend_reg_enumeration.push_back(entry);
+                }
+            }
+            return g_backend_reg_enumeration.size();
+        } catch (...) {
+            g_backend_reg_enumeration.clear();
+            return 0;
+        }
+    }
+
+    ggml_backend_reg_t backend_get(size_t index) const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (index >= g_backend_reg_enumeration.size() ||
+                g_backend_reg_enumeration[index]->state != ggml_backend_reg_state::ACTIVE) {
+                return nullptr;
+            }
+            return g_backend_reg_enumeration[index]->reg;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    ggml_backend_reg_t backend_by_name(const char * name) const noexcept {
+        try {
+            std::vector<ggml_backend_reg_entry_ptr> live;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const auto & entry : backends) {
+                    if (entry->state == ggml_backend_reg_state::ACTIVE) {
+                        live.push_back(entry);
+                    }
+                }
+            }
+            for (const auto & entry : live) {
+                if (!begin_call(entry)) {
+                    continue;
+                }
+                bool matches = false;
+                try {
+                    matches = striequals(ggml_backend_reg_name(entry->reg), name);
+                } catch (...) {
+                }
+                end_call(entry);
+                if (matches) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    return entry->state == ggml_backend_reg_state::ACTIVE ? entry->reg : nullptr;
+                }
+            }
+        } catch (...) {
+        }
+        return nullptr;
+    }
+
+    size_t device_count() const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            g_backend_dev_enumeration.clear();
+            for (const auto & entry : devices) {
+                if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                    entry.generation == entry.owner->current_generation) {
+                    g_backend_dev_enumeration.push_back(entry);
+                }
+            }
+            return g_backend_dev_enumeration.size();
+        } catch (...) {
+            g_backend_dev_enumeration.clear();
+            return 0;
+        }
+    }
+
+    ggml_backend_dev_t device_get(size_t index) const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (index >= g_backend_dev_enumeration.size() ||
+                g_backend_dev_enumeration[index].owner->state != ggml_backend_reg_state::ACTIVE ||
+                g_backend_dev_enumeration[index].generation !=
+                    g_backend_dev_enumeration[index].owner->current_generation) {
+                return nullptr;
+            }
+            return g_backend_dev_enumeration[index].dev;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    ggml_backend_dev_t device_by_name(const char * name) const noexcept {
+        try {
+            std::vector<ggml_backend_device_entry> live;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const auto & entry : devices) {
+                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                        entry.generation == entry.owner->current_generation) {
+                        live.push_back(entry);
+                    }
+                }
+            }
+            for (const auto & entry : live) {
+                if (!begin_call(entry.owner)) {
+                    continue;
+                }
+                bool matches = false;
+                try {
+                    matches = striequals(ggml_backend_dev_name(entry.dev), name);
+                } catch (...) {
+                }
+                end_call(entry.owner);
+                if (matches) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    return entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                           entry.generation == entry.owner->current_generation ? entry.dev : nullptr;
+                }
+            }
+        } catch (...) {
+        }
+        return nullptr;
+    }
+
+    ggml_backend_dev_t device_by_type(enum ggml_backend_dev_type type) const noexcept {
+        try {
+            std::vector<ggml_backend_device_entry> live;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const auto & entry : devices) {
+                    if (entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                        entry.generation == entry.owner->current_generation) {
+                        live.push_back(entry);
+                    }
+                }
+            }
+            for (const auto & entry : live) {
+                if (!begin_call(entry.owner)) {
+                    continue;
+                }
+                bool matches = false;
+                try {
+                    matches = ggml_backend_dev_type(entry.dev) == type;
+                } catch (...) {
+                }
+                end_call(entry.owner);
+                if (matches) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    return entry.owner->state == ggml_backend_reg_state::ACTIVE &&
+                           entry.generation == entry.owner->current_generation ? entry.dev : nullptr;
+                }
+            }
+        } catch (...) {
+        }
+        return nullptr;
     }
 };
 
+const char * ggml_backend_registry_cached_name(ggml_backend_reg_t reg) noexcept;
+bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept;
+void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
+bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
+void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
+bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept;
+bool ggml_backend_device_owner_adopt(ggml_backend_dev_t device) noexcept;
+void ggml_backend_device_owner_release(ggml_backend_dev_t device) noexcept;
+
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
+    static const ggml_backend_registry_lifecycle_i lifecycle_iface = {
+        ggml_backend_registry_cached_name,
+        ggml_backend_registry_begin_call,
+        ggml_backend_registry_end_call,
+        ggml_backend_device_begin_call,
+        ggml_backend_device_end_call,
+        ggml_backend_device_owner_acquire,
+        ggml_backend_device_owner_adopt,
+        ggml_backend_device_owner_release,
+    };
+    static const bool installed = [] {
+        ggml_backend_set_registry_lifecycle(&lifecycle_iface);
+        return true;
+    }();
+    (void) installed;
+
+    enum class builtin_init_state { UNINITIALIZED, INITIALIZING, COMPLETE };
+    static std::mutex builtin_mutex;
+    static std::condition_variable builtin_cv;
+    static builtin_init_state builtin_state = builtin_init_state::UNINITIALIZED;
+    static std::thread::id builtin_owner;
+    {
+        std::unique_lock<std::mutex> lock(builtin_mutex);
+        if (builtin_state == builtin_init_state::INITIALIZING && builtin_owner == std::this_thread::get_id()) {
+            // Constructor/callback reentry sees the fully constructed registry,
+            // but the currently initializing backend is not published yet.
+            return reg;
+        }
+        while (builtin_state == builtin_init_state::INITIALIZING) {
+            builtin_cv.wait(lock);
+        }
+        if (builtin_state == builtin_init_state::COMPLETE) {
+            return reg;
+        }
+        builtin_state = builtin_init_state::INITIALIZING;
+        builtin_owner = std::this_thread::get_id();
+    }
+    try {
+        reg.register_builtin_backends();
+        // Built-in devices are now published; transactionally backfill buffers
+        // that were created before lifecycle hooks/owners were available.
+        ggml_backend_set_registry_lifecycle(&lifecycle_iface);
+        ggml_backend_refresh_buffer_lifecycle();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(builtin_mutex);
+        builtin_state = builtin_init_state::UNINITIALIZED;
+        builtin_owner = {};
+        builtin_cv.notify_all();
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(builtin_mutex);
+        builtin_state = builtin_init_state::COMPLETE;
+        builtin_owner = {};
+        builtin_cv.notify_all();
+    }
     return reg;
 }
 
 // Internal API
 void ggml_backend_register(ggml_backend_reg_t reg) {
+    // Avoid first-use builtin_cv and module-operation waits from a thread
+    // spawned by an active plugin hook. Static registrations are losslessly
+    // deferred and drained by the outer operation after publication.
+    if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) {
+        defer_static_registration(reg);
+        return;
+    }
     get_reg().register_backend(reg);
 }
 
 void ggml_backend_device_register(ggml_backend_dev_t device) {
     get_reg().register_device(device);
+}
+
+const char * ggml_backend_registry_cached_name(ggml_backend_reg_t reg) noexcept {
+    if (!reg) return nullptr;
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        // Entry names are copied at staging and never mutated. Tombstones stay
+        // retained in the registry, so this pointer remains stable after unlock.
+        return found == registry.backends.end() ? nullptr : (*found)->cached_name.c_str();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool ggml_backend_registry_begin_call(ggml_backend_reg_t reg) noexcept {
+    if (!reg) {
+        return false;
+    }
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        if (found == registry.backends.end()) {
+            return true;
+        }
+        if ((*found)->state != ggml_backend_reg_state::ACTIVE || (*found)->active_calls == SIZE_MAX) {
+            return false;
+        }
+        ++(*found)->active_calls;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        if (found != registry.backends.end() && (*found)->active_calls != 0) {
+            --(*found)->active_calls;
+            registry.cv.notify_all();
+        }
+    } catch (...) {
+    }
+}
+
+extern "C" size_t ggml_backend_test_unload_attempts(void) {
+    return g_test_unload_attempts.load(std::memory_order_acquire);
+}
+
+extern "C" size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg) {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        return found == registry.backends.end() ? 0 : (*found)->durable_owners;
+    } catch (...) {
+        return SIZE_MAX;
+    }
+}
+
+extern "C" const char * ggml_backend_test_registry_state(ggml_backend_reg_t reg) {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        if (found == registry.backends.end()) return "NOT_FOUND";
+        switch ((*found)->state) {
+            case ggml_backend_reg_state::ACTIVE: return "ACTIVE";
+            case ggml_backend_reg_state::REACTIVATING: return "REACTIVATING";
+            case ggml_backend_reg_state::UNLOADING: return "UNLOADING";
+            case ggml_backend_reg_state::HIDDEN_FAILED: return "HIDDEN_FAILED";
+            case ggml_backend_reg_state::REMOVED: return "REMOVED";
+        }
+    } catch (...) {
+    }
+    return "ERROR";
+}
+
+extern "C" size_t ggml_backend_test_active_calls(ggml_backend_reg_t reg) {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        return found == registry.backends.end() ? 0 : (*found)->active_calls;
+    } catch (...) {
+        return SIZE_MAX;
+    }
+}
+
+bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept {
+    if (!device) {
+        return false;
+    }
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        // Standalone/custom devices are outside the registry lifecycle. Known
+        // registry devices acquire admission only while discoverable.
+        if (found == registry.devices.end()) {
+            return true;
+        }
+        if (found->owner->state != ggml_backend_reg_state::ACTIVE ||
+            found->generation != found->owner->current_generation || found->owner->active_calls == SIZE_MAX) {
+            return false;
+        }
+        ++found->owner->active_calls;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept {
+    if (!device) return false;
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        if (found == registry.devices.end()) return device->reg == nullptr;
+        if (found->owner->state != ggml_backend_reg_state::ACTIVE ||
+            found->generation != found->owner->current_generation || found->owner->durable_owners == SIZE_MAX) {
+            return false;
+        }
+        ++found->owner->durable_owners;
+        return true;
+    } catch (...) { return false; }
+}
+
+bool ggml_backend_device_owner_adopt(ggml_backend_dev_t device) noexcept {
+    if (!device) return false;
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        if (found == registry.devices.end() ||
+            (found->owner->state != ggml_backend_reg_state::ACTIVE &&
+             found->owner->state != ggml_backend_reg_state::REACTIVATING) ||
+            found->generation != found->owner->current_generation ||
+            found->owner->durable_owners == SIZE_MAX) return false;
+        ++found->owner->durable_owners;
+        return true;
+    } catch (...) { return false; }
+}
+
+void ggml_backend_device_owner_release(ggml_backend_dev_t device) noexcept {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        if (found != registry.devices.end() && found->owner->durable_owners != 0) {
+            --found->owner->durable_owners;
+            registry.cv.notify_all();
+        }
+    } catch (...) {}
+}
+
+void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        if (found != registry.devices.end() && found->owner->active_calls != 0) {
+            --found->owner->active_calls;
+            registry.cv.notify_all();
+        }
+    } catch (...) {
+    }
 }
 
 void ggml_backend_disable_device_backends(void) {
@@ -350,52 +1258,31 @@ static bool striequals(const char * a, const char * b) {
 }
 
 size_t ggml_backend_reg_count() {
-    return get_reg().backends.size();
+    return get_reg().backend_count();
 }
 
 ggml_backend_reg_t ggml_backend_reg_get(size_t index) {
-    GGML_ASSERT(index < ggml_backend_reg_count());
-    return get_reg().backends[index].reg;
+    return get_reg().backend_get(index);
 }
 
 ggml_backend_reg_t ggml_backend_reg_by_name(const char * name) {
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-        if (striequals(ggml_backend_reg_name(reg), name)) {
-            return reg;
-        }
-    }
-    return nullptr;
+    return get_reg().backend_by_name(name);
 }
 
-// Device enumeration
 size_t ggml_backend_dev_count() {
-    return get_reg().devices.size();
+    return get_reg().device_count();
 }
 
 ggml_backend_dev_t ggml_backend_dev_get(size_t index) {
-    GGML_ASSERT(index < ggml_backend_dev_count());
-    return get_reg().devices[index];
+    return get_reg().device_get(index);
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_name(const char * name) {
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (striequals(ggml_backend_dev_name(dev), name)) {
-            return dev;
-        }
-    }
-    return nullptr;
+    return get_reg().device_by_name(name);
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == type) {
-            return dev;
-        }
-    }
-    return nullptr;
+    return get_reg().device_by_type(type);
 }
 
 // Convenience functions
@@ -427,11 +1314,19 @@ ggml_backend_t ggml_backend_init_best(void) {
 
 // Dynamic loading
 ggml_backend_reg_t ggml_backend_load(const char * path) {
+    if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) return nullptr;
     return get_reg().load_backend(path, false);
 }
 
+ggml_backend_unload_result ggml_backend_unload_checked(ggml_backend_reg_t reg) {
+    if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) {
+        return GGML_BACKEND_UNLOAD_BUSY;
+    }
+    return get_reg().unload_backend(reg, true);
+}
+
 void ggml_backend_unload(ggml_backend_reg_t reg) {
-    get_reg().unload_backend(reg, true);
+    (void) ggml_backend_unload_checked(reg);
 }
 
 static fs::path get_executable_path() {
@@ -550,9 +1445,16 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 auto filename = entry.path().filename();
                 auto ext = entry.path().extension();
                 if (filename.native().find(file_prefix) == 0 && ext == file_extension) {
-                    dl_handle_ptr handle { dl_load_library(entry) };
+                    dl_handle_ptr handle{ dl_load_library(entry) };
                     if (!handle && !silent) {
                         GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(entry.path()).c_str(), dl_error());
+                    }
+                    if (handle && !dl_pin_library(handle.get(), entry.path())) {
+                        if (!silent) {
+                            GGML_LOG_ERROR("%s: failed to process-pin score candidate %s\n", __func__,
+                                           path_str(entry.path()).c_str());
+                        }
+                        continue;
                     }
                     if (handle) {
                         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");

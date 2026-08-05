@@ -366,6 +366,62 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
+option(LLAMA_SYCL_G1_STRICT "Make missing G1 acceptance prerequisites fail instead of skip" OFF)
+if (LLAMA_SYCL_G1_STRICT AND NOT GGML_SYCL)
+    message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires GGML_SYCL=ON")
+endif()
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (LLAMA_SYCL_G1_STRICT AND NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR "LLAMA_SYCL_G1_STRICT requires a Python 3 interpreter")
+endif()
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-backend-count-get-null-census
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
+    set_tests_properties(test-backend-count-get-null-census PROPERTIES
+        LABELS "backend;lifecycle;source;host" TIMEOUT 30)
+    add_test(NAME test-sycl-lifecycle-g1-harness
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
+    set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
+        LABELS "sycl;lifecycle;g1;python"
+        TIMEOUT 30)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-device-uuid-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-uuid-source.py
+        LABEL "sycl;api;source;host"
+        TIMEOUT 30)
+endif()
+
+if (GGML_SYCL)
+    set(LLAMA_SYCL_G1_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/sycl-lifecycle-fixtures.json" CACHE FILEPATH
+        "Canonical G1 fixture JSON (lead-populated external file is recommended)")
+    llama_build(test-sycl-lifecycle-gpu-sequential.cpp)
+    target_include_directories(test-sycl-lifecycle-gpu-sequential PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(NAME sycl-lifecycle-g1-parser
+        COMMAND test-sycl-lifecycle-gpu-sequential --self-test-parser)
+    set_tests_properties(sycl-lifecycle-g1-parser PROPERTIES LABELS "sycl;lifecycle;g1;host")
+
+    set(G1_LAUNCH_ARGS --fixture ${LLAMA_SYCL_G1_FIXTURE})
+    if (LLAMA_SYCL_G1_STRICT)
+        list(PREPEND G1_LAUNCH_ARGS --strict)
+    endif()
+    # Exact lab gate:
+    # cmake -S . -B build -DGGML_SYCL=ON -DLLAMA_SYCL_G1_STRICT=ON \
+    #   -DLLAMA_SYCL_G1_FIXTURE=/absolute/path/g1-canonical.json
+    # ctest --test-dir build -R '^sycl-lifecycle-gpu-sequential$' --output-on-failure
+    # The test name is intentionally identical in normal and strict modes.
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME sycl-lifecycle-gpu-sequential
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-aba.py
+                    ${G1_LAUNCH_ARGS} $<TARGET_FILE:test-sycl-lifecycle-gpu-sequential>)
+        set_tests_properties(sycl-lifecycle-gpu-sequential PROPERTIES
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK sycl-lifecycle-device
+            TIMEOUT 950
+            LABELS "sycl;lifecycle;g1;hash-pinned")
+    endif()
+endif()
+
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
@@ -1253,7 +1309,7 @@ if (NOT WIN32)
     # files in tests/ pass, and these are the 4 that do not.
 endif()
 
-if (GGML_SYCL)
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-kernel-profiler.cpp)
     target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-sycl-kernel-profiler PRIVATE ggml-sycl)
@@ -1431,7 +1487,10 @@ endif()
 # the sweep runs it, which is the entire point of restoring it.
 if(GGML_SYCL)
     add_executable(test-sycl-fattn-onednn-gates test-sycl-fattn-onednn-gates.cpp)
-    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml ggml-cpu)
+    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml)
+    if (NOT GGML_BACKEND_DL)
+        target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml-cpu)
+    endif()
     target_include_directories(test-sycl-fattn-onednn-gates PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/include
         ${PROJECT_SOURCE_DIR}/ggml/src)

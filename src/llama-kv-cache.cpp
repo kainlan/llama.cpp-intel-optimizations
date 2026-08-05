@@ -6,8 +6,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#ifdef GGML_USE_SYCL
-#include "ggml-sycl.h"
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+#    include "ggml-sycl.h"
 #endif
 
 #include <algorithm>
@@ -18,14 +18,30 @@
 #include <map>
 #include <stdexcept>
 
-#ifdef GGML_USE_SYCL
-static bool llama_kv_cache_sycl_hooks_enabled() {
-    return !ggml_backend_device_backends_disabled();
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+struct llama_kv_cache_sycl_hooks {
+    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)     kv_buft   = nullptr;
+    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev) push_mask = nullptr;
+};
+
+static llama_kv_cache_sycl_hooks llama_kv_cache_sycl_hooks_for(ggml_backend_dev_t dev) {
+    llama_kv_cache_sycl_hooks hooks;
+    if (ggml_backend_device_backends_disabled() || !dev) {
+        return hooks;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return hooks;
+    }
+    hooks.kv_buft = reinterpret_cast<decltype(hooks.kv_buft)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_buffer_type_from_dev"));
+    hooks.push_mask = reinterpret_cast<decltype(hooks.push_mask)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_push_kv_layer_mask_from_dev"));
+    return hooks;
 }
 
 static bool llama_kv_cache_dev_is_sycl(ggml_backend_dev_t dev) {
-    return llama_kv_cache_sycl_hooks_enabled() && dev != nullptr &&
-           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+    return llama_kv_cache_sycl_hooks_for(dev).kv_buft != nullptr;
 }
 #endif
 
@@ -122,7 +138,7 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     std::map<ggml_backend_buffer_type_t, std::vector<uint8_t>, ggml_backend_buft_comparator> sycl_kv_layer_masks;
 #endif
 
@@ -232,9 +248,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
             if (llama_kv_cache_dev_is_sycl(dev)) {
-                buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+                buft = llama_kv_cache_sycl_hooks_for(dev).kv_buft(dev);
             } else {
                 buft = ggml_backend_dev_buffer_type(dev);
             }
@@ -252,7 +268,7 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
         if (llama_kv_cache_dev_is_sycl(buft_dev)) {
             auto & mask = sycl_kv_layer_masks[buft];
@@ -320,13 +336,13 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-#ifdef GGML_USE_SYCL
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
             ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
             auto               mask_it  = sycl_kv_layer_masks.find(buft);
-            if (llama_kv_cache_dev_is_sycl(buft_dev) && mask_it != sycl_kv_layer_masks.end() &&
+            const auto         sycl_hooks = llama_kv_cache_sycl_hooks_for(buft_dev);
+            if (sycl_hooks.kv_buft && sycl_hooks.push_mask && mask_it != sycl_kv_layer_masks.end() &&
                 !mask_it->second.empty()) {
-                ggml_backend_sycl_push_kv_layer_mask_from_dev(buft_dev, mask_it->second.data(),
-                                                              static_cast<uint32_t>(mask_it->second.size()));
+                sycl_hooks.push_mask(buft_dev, mask_it->second.data(), static_cast<uint32_t>(mask_it->second.size()));
             }
 #endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer

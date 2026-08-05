@@ -252,6 +252,9 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     std::map<std::string, ggml_backend_buffer_type_t> buft_list;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
+        if (!dev) {
+            continue;
+        }
         auto * buft = ggml_backend_dev_buffer_type(dev);
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
@@ -2441,6 +2444,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             std::vector<ggml_backend_dev_t> devices;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
+                if (!dev) {
+                    continue;
+                }
                 if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                     devices.push_back(dev);
                 }

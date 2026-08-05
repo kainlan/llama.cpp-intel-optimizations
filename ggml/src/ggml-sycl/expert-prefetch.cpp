@@ -130,7 +130,7 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
         return true;
     }
 
-    if (cache->has_placement_plan()) {
+    if (!coherent_placement_plan_owner(cache)->entries.empty()) {
         return false;
     }
 
@@ -359,7 +359,8 @@ void * ExpertPrefetcher::demand_load(int layer_idx, int expert_idx) {
         return nullptr;
     }
 
-    if (unified_cache * cache = get_unified_cache_for_device(device_id_); cache && cache->has_placement_plan()) {
+    if (unified_cache * cache = get_unified_cache_for_device(device_id_);
+        !coherent_placement_plan_owner(cache)->entries.empty()) {
         return get_cached_ptr(layer_idx, expert_idx);
     }
 
@@ -462,6 +463,54 @@ ExpertPredictor::~ExpertPredictor() {
     scores_dev_   = nullptr;
     scores_dev_n_ = 0;
     scores_queue_ = nullptr;
+}
+
+void ExpertPredictor::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    initialized_ = false;
+    n_layers_ = n_experts_ = n_experts_used_ = 0;
+    last_experts_.clear();
+    freq_table_.clear();
+    last_prediction_.clear();
+    gate_weight_ptrs_.clear();
+    n_embd_ = 0;
+    scores_handle_ = {};
+    scores_dev_ = nullptr;
+    scores_dev_n_ = 0;
+    scores_queue_ = nullptr;
+    accuracy_ring_.clear();
+    accuracy_ring_pos_ = accuracy_hits_ = window_total_ = 0;
+    warmup_tokens_ = 0;
+    warmup_layer_max_ = -1;
+    prefetch_disabled_.store(false, std::memory_order_relaxed);
+}
+
+bool ExpertPredictor::test_allocate_scores(sycl::queue & queue, int count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (count <= 0) {
+        return false;
+    }
+    ggml_sycl::alloc_request req{};
+    req.queue                           = &queue;
+    req.device                          = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                            = static_cast<size_t>(count) * sizeof(float);
+    req.intent.role                     = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                 = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.constraints.must_device  = true;
+    ggml_sycl::alloc_handle owner{};
+    if (!ggml_sycl::unified_alloc(req, &owner) || !owner.ptr) {
+        return false;
+    }
+    scores_dev_    = static_cast<float *>(owner.ptr);
+    scores_dev_n_  = count;
+    scores_queue_  = &queue;
+    scores_handle_ = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    return scores_handle_.valid();
+}
+
+bool ExpertPredictor::test_scores_allocated() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return scores_handle_.valid();
 }
 
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {

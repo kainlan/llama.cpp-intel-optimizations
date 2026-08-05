@@ -20162,12 +20162,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
     const queue_ptr stream                = ctx.stream();
     auto *          route_cache           = ggml_sycl::get_unified_cache(*stream);
-    const bool      placement_plan_active = route_cache && route_cache->has_placement_plan();
+    const auto      plan_owner            = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);
+    const bool      placement_plan_active = !plan_owner->entries.empty();
     bool            plan_has_host_experts = false;
     if (placement_plan_active && src0->name && src0->name[0] != '\0') {
         const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        plan_has_host_experts =
-            route_cache->moe_tensor_has_host_experts(std::string(src0->name), n_experts, ctx.device);
+        plan_has_host_experts   = plan_owner->has_host_experts(std::string(src0->name), n_experts, ctx.device);
     }
     mmvq_moe_trace(src0, "candidate", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1, host_weights,
                    use_ptr_table, placement_plan_active, plan_has_host_experts);

@@ -193,8 +193,12 @@ class pinned_chunk_pool {
 
     bool zones_configured() const { return zones_configured_; }
 
-    // Check if a pointer belongs to this pool (falls within any chunk).
+    // Check if a pointer belongs to this pool (falls within any usable chunk).
     bool contains(const void * ptr) const;
+
+    // Check if a raw backing allocation range belongs to this pool, including
+    // the pre-base alignment/header bytes that usable chunk pointers skip.
+    bool contains_backing_allocation(const void * ptr, size_t size = 1) const;
 
     // Statistics
     size_t budget() const { return budget_; }

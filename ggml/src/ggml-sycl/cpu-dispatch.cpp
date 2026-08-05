@@ -23,6 +23,7 @@
 //
 
 #include "cpu-dispatch.hpp"
+#include "cpu-traits-support.hpp"
 
 #include "a7l5w-probe.hpp"
 #include "common.hpp"
@@ -505,14 +506,14 @@ void ggml_sycl_cpu_vec_dot_rows(ggml_type     type,
     // correctly sized -- resize() to an unchanged size is a no-op.
     ggml_sycl_cpu_dispatch_buffers_init();
 
-    const auto * cpu_traits = ggml_get_type_traits_cpu(type);
+    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
         GGML_LOG_WARN("[TENSOR-SPLIT] No vec_dot for type %d, skipping CPU rows\n", type);
         return;
     }
 
     const ggml_type   vec_dot_type  = cpu_traits->vec_dot_type;
-    const auto *      vdt_traits    = ggml_get_type_traits_cpu(vec_dot_type);
+    const auto *      vdt_traits    = ggml_sycl_get_type_traits_cpu(vec_dot_type);
     ggml_from_float_t from_float_fn = vdt_traits ? vdt_traits->from_float : nullptr;
     if (!from_float_fn) {
         GGML_LOG_WARN("[TENSOR-SPLIT] No from_float for vec_dot_type %d\n", vec_dot_type);
@@ -669,12 +670,12 @@ void ggml_sycl_cpu_vec_dot_batched(const cpu_vec_dot_batch_item * items, int n_i
             continue;  // Already quantized
         }
 
-        const auto * cpu_traits = ggml_get_type_traits_cpu(item.type);
+        const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(item.type);
         if (!cpu_traits || !cpu_traits->vec_dot) {
             continue;
         }
         const ggml_type   vdt        = cpu_traits->vec_dot_type;
-        const auto *      vdt_traits = ggml_get_type_traits_cpu(vdt);
+        const auto *      vdt_traits = ggml_sycl_get_type_traits_cpu(vdt);
         ggml_from_float_t from_float = vdt_traits ? vdt_traits->from_float : nullptr;
         if (!from_float) {
             continue;
@@ -722,7 +723,7 @@ void ggml_sycl_cpu_vec_dot_batched(const cpu_vec_dot_batch_item * items, int n_i
             meta[i].row_stride = 0;
             continue;
         }
-        meta[i].cpu_traits = ggml_get_type_traits_cpu(item.type);
+        meta[i].cpu_traits = ggml_sycl_get_type_traits_cpu(item.type);
         meta[i].row_stride = ggml_row_size(item.type, item.ne00);
         total_rows += item.n_rows;
     }
@@ -828,13 +829,13 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
         return;
     }
 
-    const auto * cpu_traits = ggml_get_type_traits_cpu(task.type);
+    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(task.type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
         return;
     }
 
     const ggml_type   vdt        = cpu_traits->vec_dot_type;
-    const auto *      vdt_traits = ggml_get_type_traits_cpu(vdt);
+    const auto *      vdt_traits = ggml_sycl_get_type_traits_cpu(vdt);
     ggml_from_float_t from_float = vdt_traits ? vdt_traits->from_float : nullptr;
     if (!from_float) {
         return;
@@ -890,12 +891,12 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             continue;
         }
 
-        const auto * cpu_traits = ggml_get_type_traits_cpu(t.type);
+        const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(t.type);
         if (!cpu_traits || !cpu_traits->vec_dot) {
             continue;
         }
         const ggml_type   vdt        = cpu_traits->vec_dot_type;
-        const auto *      vdt_traits = ggml_get_type_traits_cpu(vdt);
+        const auto *      vdt_traits = ggml_sycl_get_type_traits_cpu(vdt);
         ggml_from_float_t from_float = vdt_traits ? vdt_traits->from_float : nullptr;
         if (!from_float) {
             continue;
@@ -983,6 +984,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             const int    K          = t0.K;
             const size_t row_stride = ggml_row_size(t0.type, K);
             const int    nb         = K / QK_MXFP4;
+            const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_MXFP4);
 
             // Collect Q8_0 activation pointers for all tokens in this group
             std::vector<const uint8_t *> act_ptrs(M);
@@ -999,7 +1001,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             ggml_sycl_cpu_arena().execute([&] {
                 ggml_sycl_tbb::parallel_for(
                     ggml_sycl_tbb::blocked_range<int>(0, N, 4),
-                    [wptr, act_data, out_data, M, nb, row_stride, K](const ggml_sycl_tbb::blocked_range<int> & range) {
+                    [wptr, act_data, out_data, M, nb, row_stride, K, cpu_traits](const ggml_sycl_tbb::blocked_range<int> & range) {
                         constexpr int TILE_BLK = 16;
                         for (int r = range.begin(); r < range.end(); r++) {
                             const char * weight_row = (const char *) wptr + (size_t) r * row_stride;
@@ -1023,8 +1025,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
                             }
                             // Remainder: 1 activation at a time via vec_dot
                             for (; a < M; a++) {
-                                float        dot        = 0.0f;
-                                const auto * cpu_traits = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
+                                float dot = 0.0f;
                                 cpu_traits->vec_dot(K, &dot, sizeof(float), weight_row, 0, act_data[a], 0, 1);
                                 out_data[a][r] = dot;
                             }
@@ -1036,8 +1037,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             for (int r = 0; r < N; r++) {
                 const char * weight_row = (const char *) wptr + (size_t) r * row_stride;
                 for (int a = 0; a < M; a++) {
-                    float        dot        = 0.0f;
-                    const auto * cpu_traits = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
+                    float dot = 0.0f;
                     cpu_traits->vec_dot(K, &dot, sizeof(float), weight_row, 0, act_ptrs[a], 0, 1);
                     out_ptrs[a][r] = dot;
                 }
@@ -1072,7 +1072,7 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
             meta[i].row_stride = 0;
             continue;
         }
-        meta[i].cpu_traits = ggml_get_type_traits_cpu(t.type);
+        meta[i].cpu_traits = ggml_sycl_get_type_traits_cpu(t.type);
         meta[i].row_stride = ggml_row_size(t.type, t.K);
         total_rows += t.N;
     }
@@ -1431,9 +1431,9 @@ static void cpu_expert_mul_mat_int4(const cpu_expert_task & task) {
     const size_t row_stride = ggml_row_size(GGML_TYPE_Q4_0, K);
 
     // Quantize activation to Q8_0 using the standard from_float path
-    const auto *    cpu_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_0);
+    const auto *    cpu_traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_Q4_0);
     const ggml_type vdt        = cpu_traits->vec_dot_type;
-    const auto *    vdt_traits = ggml_get_type_traits_cpu(vdt);
+    const auto *    vdt_traits = ggml_sycl_get_type_traits_cpu(vdt);
     if (!vdt_traits || !vdt_traits->from_float) {
         ggml_sycl_cpu_expert_mul_mat(task);
         return;
@@ -1575,13 +1575,13 @@ void ggml_sycl_cpu_expert_fused_gate_up_silu(const cpu_expert_fused_task & task)
     // See ggml_sycl_cpu_vec_dot_rows -- same thread_local hazard, same fix.
     ggml_sycl_cpu_dispatch_buffers_init();
 
-    const auto * cpu_traits = ggml_get_type_traits_cpu(task.type);
+    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(task.type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
         return;
     }
 
     const ggml_type   vec_dot_type  = cpu_traits->vec_dot_type;
-    const auto *      vdt_traits    = ggml_get_type_traits_cpu(vec_dot_type);
+    const auto *      vdt_traits    = ggml_sycl_get_type_traits_cpu(vec_dot_type);
     ggml_from_float_t from_float_fn = vdt_traits ? vdt_traits->from_float : nullptr;
     if (!from_float_fn) {
         return;
@@ -1664,13 +1664,13 @@ void ggml_sycl_cpu_expert_fused_gate_up_silu_batched(const cpu_expert_fused_task
         return;
     }
 
-    const auto * cpu_traits = ggml_get_type_traits_cpu(tasks[0].type);
+    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(tasks[0].type);
     if (!cpu_traits || !cpu_traits->vec_dot) {
         return;
     }
 
     const ggml_type   vec_dot_type  = cpu_traits->vec_dot_type;
-    const auto *      vdt_traits    = ggml_get_type_traits_cpu(vec_dot_type);
+    const auto *      vdt_traits    = ggml_sycl_get_type_traits_cpu(vec_dot_type);
     ggml_from_float_t from_float_fn = vdt_traits ? vdt_traits->from_float : nullptr;
     if (!from_float_fn) {
         return;
@@ -1745,7 +1745,7 @@ void ggml_sycl_cpu_expert_fused_gate_up_silu_batched(const cpu_expert_fused_task
             meta[t].row_stride = 0;
             continue;
         }
-        meta[t].cpu_traits = ggml_get_type_traits_cpu(task.type);
+        meta[t].cpu_traits = ggml_sycl_get_type_traits_cpu(task.type);
         meta[t].row_stride = ggml_row_size(task.type, task.K);
         total_rows += task.N;
     }
@@ -2073,20 +2073,25 @@ void ggml_sycl_cpu_retained_init(int device, sycl::queue * gpu_q) {
     g_retained_device = device;
 }
 
-void ggml_sycl_cpu_retained_cleanup() {
+bool ggml_sycl_cpu_retained_cleanup() {
     retained_wait_flush_event();
     cpu_wait_chain_event();
-    if (g_retained_scratch && g_retained_gpu_q) {
-        (void) ggml_sycl::release_offload_buffer(g_retained_scratch_lease);
-        g_retained_scratch       = nullptr;
-        g_retained_scratch_cap   = 0;
-        g_retained_scratch_lease = {};
+    if (g_retained_scratch_lease.valid &&
+        !ggml_sycl::release_offload_buffer(g_retained_scratch_lease)) {
+        return false;
     }
+    // Reset every scratch identity after its pool lease is returned. Do not
+    // predicate this on the queue pointer: shutdown may already have detached
+    // a queue while the durable offload lease remains live.
+    g_retained_scratch       = nullptr;
+    g_retained_scratch_cap   = 0;
+    g_retained_scratch_lease = {};
     g_retained_map.clear();
     scratch_reset();
     g_retained_active = false;
     g_retained_gpu_q  = nullptr;
     g_retained_device = -1;
+    return true;
 }
 
 bool ggml_sycl_cpu_retained_active() {
@@ -2650,8 +2655,9 @@ static void * get_host_ptr(const ggml_tensor *     t,
                 if (cache) {
                     auto leased = cache->acquire_weight_lease(key);
                     if (leased && leased.ptr) {
-                        *out_lease = ggml_sycl::mem_handle::from_weight_lease(key, device, leased.ptr, leased.layout,
-                                                                              leased.on_device, leased.entry);
+                        *out_lease = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry,
+                            std::move(leased.storage_owner), leased.has_ready_event, leased.ready_event);
                         // Host-accessible: the lease holder's ptr is the correct
                         // pointer to hand to DNNL; it matches the resolved/
                         // t->data path when the data is cache-managed.
@@ -2695,8 +2701,9 @@ static void * get_host_ptr(const ggml_tensor *     t,
                         // directly via a named factory below.
                         // NOTE: the caller must keep out_lease alive until
                         // the downstream DNNL / host_task completes.
-                        *out_lease = ggml_sycl::mem_handle::from_weight_lease(
-                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry);
+                        *out_lease = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+                            key, device, leased.ptr, leased.layout, leased.on_device, leased.entry,
+                            std::move(leased.storage_owner), leased.has_ready_event, leased.ready_event);
                         // Return pointer regardless of location: HOST_PINNED
                         // is host-accessible (PCIe zero-copy), and device
                         // is NOT host-accessible so callers that need
@@ -4242,7 +4249,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     // dnnl_sgemm GEMV with direct quantized vec_dot (e.g., Q4_0 × Q8_0).
     // Benefits: ~5x less memory bandwidth (quantized reads), no BLAS overhead,
     // L1-friendly access pattern (one 2KB weight row + 4KB activation per dot).
-    const auto * cpu_traits  = src0_quantized ? ggml_get_type_traits_cpu(src0->type) : nullptr;
+    const auto * cpu_traits  = src0_quantized ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
     const bool   use_vec_dot = (M <= 4 && cpu_traits && cpu_traits->vec_dot);
 
     auto run_mul_mat = [=]() {
@@ -4283,7 +4290,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
         if (use_vec_dot) {
             const ggml_type vec_dot_type   = cpu_traits->vec_dot_type;
-            const auto *    vdt_cpu_traits = ggml_get_type_traits_cpu(vec_dot_type);
+            const auto *    vdt_cpu_traits = ggml_sycl_get_type_traits_cpu(vec_dot_type);
             from_float_fn                  = vdt_cpu_traits ? vdt_cpu_traits->from_float : nullptr;
             if (from_float_fn) {
                 q_row_size            = ggml_row_size(vec_dot_type, K);
@@ -6305,10 +6312,10 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
     // Primary path: quantized vec_dot (avoids dequantizing all N*K weights to F32).
     // Quantize M activation rows to vec_dot input type (e.g. Q8_0), then
     // compute C[m,n] = vec_dot(weight_row[n], src1_q[m]) for all m,n.
-    const auto * cpu_traits = ggml_get_type_traits_cpu(weight_type);
+    const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(weight_type);
     if (cpu_traits && cpu_traits->vec_dot) {
         const ggml_type   vec_dot_type   = cpu_traits->vec_dot_type;
-        const auto *      vdt_cpu_traits = ggml_get_type_traits_cpu(vec_dot_type);
+        const auto *      vdt_cpu_traits = ggml_sycl_get_type_traits_cpu(vec_dot_type);
         ggml_from_float_t from_float_fn  = vdt_cpu_traits ? vdt_cpu_traits->from_float : nullptr;
 
         if (from_float_fn) {

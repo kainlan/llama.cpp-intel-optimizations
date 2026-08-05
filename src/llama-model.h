@@ -18,6 +18,13 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+struct llama_sycl_model_token {
+    uint64_t model_id = 0;
+    uint64_t load_txn_id = 0;
+    uint32_t slot = 0xFFFFFFFFu;
+    uint64_t slot_generation = 0;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -682,7 +689,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
-protected:
+    const llama_sycl_model_token & get_sycl_model_token() const { return sycl_model_token; }
+
+  protected:
     llama_model_params params;
 
     struct impl;
@@ -693,7 +702,7 @@ protected:
     // not reclaim them, and this model's destruction must.  Assigned when
     // load_tensors() completes; the sentinel mirrors GGML_SYCL_MODEL_SLOT_NONE,
     // spelled literally so this header stays backend-agnostic.
-    uint32_t sycl_model_slot = 0xFFFFFFFFu;
+    llama_sycl_model_token sycl_model_token;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

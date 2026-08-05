@@ -164,18 +164,36 @@ class mem_handle {
     // whose dtor releases automatically (llama.cpp-vtf7f).
     //
     // `entry` may be nullptr for S1-PRELOAD direct entries (no refcount).
-    static mem_handle from_weight_lease(const ggml_sycl_cache_id & key_id,
-                                        int                        device,
-                                        void *                     ptr,
-                                        ggml_layout_mode           layout,
-                                        bool                       on_device,
-                                        unified_cache_entry *      entry);
-    static mem_handle from_weight_lease(const unified_cache_key & key,
-                                        int                       device,
-                                        void *                    ptr,
-                                        ggml_layout_mode          layout,
-                                        bool                      on_device,
-                                        unified_cache_entry *     entry);
+    static mem_handle from_weight_lease_locked(const ggml_sycl_cache_id & key_id,
+                                               int                        device,
+                                               void *                     ptr,
+                                               ggml_layout_mode           layout,
+                                               bool                       on_device,
+                                               unified_cache_entry *      entry);
+    static mem_handle from_weight_lease_snapshot(const ggml_sycl_cache_id & key_id,
+                                                 int                        device,
+                                                 void *                     ptr,
+                                                 ggml_layout_mode           layout,
+                                                 bool                       on_device,
+                                                 unified_cache_entry *      entry,
+                                                 std::shared_ptr<void>      storage_owner,
+                                                 bool                       has_ready_event,
+                                                 const sycl::event &        ready_event);
+    static mem_handle from_weight_lease_locked(const unified_cache_key & key,
+                                               int                       device,
+                                               void *                    ptr,
+                                               ggml_layout_mode          layout,
+                                               bool                      on_device,
+                                               unified_cache_entry *     entry);
+    static mem_handle from_weight_lease_snapshot(const unified_cache_key & key,
+                                                 int                       device,
+                                                 void *                    ptr,
+                                                 ggml_layout_mode          layout,
+                                                 bool                      on_device,
+                                                 unified_cache_entry *     entry,
+                                                 std::shared_ptr<void>     storage_owner,
+                                                 bool                      has_ready_event,
+                                                 const sycl::event &       ready_event);
 
     // Create a WEIGHT handle from a bare cache ID + device.
     // Convenience factory for callers that have ggml_sycl_cache_id (e.g.
@@ -342,6 +360,7 @@ class mem_handle {
         uint64_t              host_chunk_handle = UINT64_MAX;
         int32_t               vram_chunk_idx    = -1;
         int                   chunk_device      = -1;
+        std::shared_ptr<void> storage_owner;
     };
 
     // Detach this handle's lease state (caller holds lock_).  The handle no
@@ -402,6 +421,7 @@ class mem_handle {
     // MUST NOT erase entries with in_use_count > 0, which is the contract
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
     mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
+    mutable std::shared_ptr<void> leased_storage_owner_;    // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from
@@ -500,7 +520,7 @@ void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
 // retained event before dropping the retained mem_handle copies. This only runs
 // normal mem_handle destructors; backing memory is freed only when the last
 // refcounted owner is gone.
-void drain_retained_handles(bool wait_all = false);
+bool drain_retained_handles(bool wait_all = false, uint32_t timeout_ms = 10000);
 
 // Release handles retained for command-graph lifetime when the executable graph
 // is invalidated. These handles are not event-waitable, so drain_retained_handles()

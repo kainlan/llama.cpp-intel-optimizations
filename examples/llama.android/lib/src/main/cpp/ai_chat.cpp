@@ -126,6 +126,9 @@ static std::string get_backend() {
     std::vector<std::string> backends;
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         auto *reg = ggml_backend_reg_get(i);
+        if (!reg) {
+            continue;
+        }
         std::string name = ggml_backend_reg_name(reg);
         if (name != "CPU") {
             backends.push_back(ggml_backend_reg_name(reg));

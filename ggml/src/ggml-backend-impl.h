@@ -65,13 +65,29 @@ extern "C" {
         uint32_t     (*get_caps)     (ggml_backend_buffer_t buffer);
     };
 
+    typedef void (*ggml_backend_buffer_context_cleanup_t)(void * context);
+
     struct ggml_backend_buffer {
         struct ggml_backend_buffer_i  iface;
         ggml_backend_buffer_type_t    buft;
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        ggml_backend_dev_t owner_device;
+        bool owner_lease;
+        ggml_backend_buffer_context_cleanup_t context_cleanup;
     };
+
+    // Transfer a buffer produced through a proxy type to its true product
+    // owner, preserving durable registry ownership without double counting.
+    GGML_API void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer);
+    GGML_API bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
+            ggml_backend_buffer_type_t buft,
+            struct ggml_backend_buffer_i iface,
+            void * context,
+            size_t size,
+            ggml_backend_buffer_context_cleanup_t cleanup);
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
                    ggml_backend_buffer_type_t buft,
@@ -150,6 +166,7 @@ extern "C" {
         void * context;
     };
 
+    // ABI v2: event objects are plugin-allocated and must remain two fields.
     struct ggml_backend_event {
         struct ggml_backend_device * device;
         void * context;
@@ -232,6 +249,42 @@ extern "C" {
         struct ggml_backend_reg_i iface;
         void * context;
     };
+
+    // Optional registry lifecycle admission supplied by the higher-level ggml
+    // registry library. ggml-base defaults to admitting standalone/custom
+    // handles, avoiding a reverse link dependency on ggml-backend-reg.cpp.
+    struct ggml_backend_registry_lifecycle_i {
+        const char * (*registry_cached_name)(ggml_backend_reg_t reg);
+        bool (*registry_begin)(ggml_backend_reg_t reg);
+        void (*registry_end)(ggml_backend_reg_t reg);
+        bool (*device_begin)(ggml_backend_dev_t device);
+        void (*device_end)(ggml_backend_dev_t device);
+        bool (*device_owner_acquire)(ggml_backend_dev_t device);
+        bool (*device_owner_adopt)(ggml_backend_dev_t device);
+        void (*device_owner_release)(ggml_backend_dev_t device);
+    };
+
+    GGML_API void ggml_backend_refresh_buffer_lifecycle(void);
+    GGML_API void ggml_backend_test_block_owner_adoption(bool block);
+    GGML_API bool ggml_backend_test_owner_adoption_blocked(void);
+    GGML_API void ggml_backend_test_fail_next_owner_adoption(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_wrapper(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_emplace(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_refresh(void);
+    GGML_API void ggml_backend_test_fail_next_event_emplace(void);
+    GGML_API size_t ggml_backend_test_owner_close_attempts(void);
+    GGML_API size_t ggml_backend_test_owner_transfer_attempts(void);
+    GGML_API size_t ggml_backend_test_unload_attempts(void);
+    GGML_API size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg);
+    GGML_API void ggml_backend_set_registry_lifecycle(
+        const struct ggml_backend_registry_lifecycle_i * iface);
+
+    // Raw metadata access for registry publication/reactivation. These remain
+    // in ggml-base so the opaque registry/device layout is interpreted in one
+    // TU and lifecycle admission is intentionally bypassed only while staging.
+    GGML_API const char * ggml_backend_reg_name_unchecked(ggml_backend_reg_t reg);
+    GGML_API bool ggml_backend_reg_dev_count_unchecked(ggml_backend_reg_t reg, size_t * count);
+    GGML_API bool ggml_backend_reg_dev_get_unchecked(ggml_backend_reg_t reg, size_t index, ggml_backend_dev_t * device);
 
     // Add backend dynamic loading support to the backend
 
