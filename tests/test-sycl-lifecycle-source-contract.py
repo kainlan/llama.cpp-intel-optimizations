@@ -242,9 +242,11 @@ checks = {
     == {
         "ggml_sycl_cache_plan_owner": 127,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 8,
+        "ggml_sycl_global_plan_snapshot": 9,
         "ggml_sycl_has_global_plan": 26,
-    },
+    }
+    and "static std::vector<int> ggml_sycl_execution_aggregate_devices" in backend
+    and backend.count("const auto snapshot = ggml_sycl_global_plan_snapshot();") == 1,
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
     in backend
     and "authority.get() == cache.get()" in cache_hpp
