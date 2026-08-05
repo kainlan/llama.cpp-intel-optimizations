@@ -431,6 +431,46 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    auto sycl_exec_drain_close = [&](ggml_backend_dev_t dev) {
+        if (!dev || sycl_exec_context.value == 0) {
+            return;
+        }
+#    ifdef GGML_USE_SYCL
+        auto begin_drain = &ggml_backend_sycl_execution_context_begin_drain;
+        auto extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
+        auto finish_drain = &ggml_backend_sycl_execution_context_finish_drain;
+#    else
+        auto exec_hooks = llama_context_sycl_exec_procs(dev);
+        auto begin_drain = exec_hooks.begin_drain;
+        auto extract_allocs = exec_hooks.extract_control_host_allocs;
+        auto finish_drain = exec_hooks.finish_drain;
+#    endif
+        if (!begin_drain || !extract_allocs || !finish_drain) {
+            return;
+        }
+        ggml_sycl_exec_drain_ticket ticket{};
+        if (begin_drain(sycl_exec_context, &ticket) == GGML_SYCL_EXECUTION_OK) {
+            ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
+            (void) extract_allocs(&ticket, &batch);
+            (void) finish_drain(ticket, batch);
+        }
+        sycl_exec_context = {};
+    };
+
+    struct sycl_exec_context_scope {
+        decltype(sycl_exec_drain_close) & close_fn;
+        ggml_backend_dev_t               dev = nullptr;
+        bool                             armed = false;
+
+        ~sycl_exec_context_scope() {
+            if (armed) {
+                close_fn(dev);
+            }
+        }
+    } sycl_exec_scope{ sycl_exec_drain_close, nullptr, false };
+#endif
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
@@ -442,44 +482,6 @@ llama_context::llama_context(
         }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        auto sycl_exec_drain_close = [&](ggml_backend_dev_t dev) {
-            if (!dev || sycl_exec_context.value == 0) {
-                return;
-            }
-#    ifdef GGML_USE_SYCL
-            auto begin_drain = &ggml_backend_sycl_execution_context_begin_drain;
-            auto extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
-            auto finish_drain = &ggml_backend_sycl_execution_context_finish_drain;
-#    else
-            auto exec_hooks = llama_context_sycl_exec_procs(dev);
-            auto begin_drain = exec_hooks.begin_drain;
-            auto extract_allocs = exec_hooks.extract_control_host_allocs;
-            auto finish_drain = exec_hooks.finish_drain;
-#    endif
-            if (!begin_drain || !extract_allocs || !finish_drain) {
-                return;
-            }
-            ggml_sycl_exec_drain_ticket ticket{};
-            if (begin_drain(sycl_exec_context, &ticket) == GGML_SYCL_EXECUTION_OK) {
-                ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
-                (void) extract_allocs(&ticket, &batch);
-                (void) finish_drain(ticket, batch);
-            }
-            sycl_exec_context = {};
-        };
-
-        struct sycl_exec_context_scope {
-            decltype(sycl_exec_drain_close) & close_fn;
-            ggml_backend_dev_t               dev = nullptr;
-            bool                             armed = true;
-
-            ~sycl_exec_context_scope() {
-                if (armed) {
-                    close_fn(dev);
-                }
-            }
-        } sycl_exec_scope{ sycl_exec_drain_close, nullptr, true };
-
         bool sycl_exec_created = false;
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -510,6 +512,7 @@ llama_context::llama_context(
                     throw std::runtime_error(format("failed to allocate SYCL execution context: result=%d", (int) exec_rc));
                 }
                 sycl_exec_created = true;
+                sycl_exec_scope.armed = true;
             }
             const auto bind_rc = bind_exec(backend.get(), sycl_exec_context);
             if (bind_rc != GGML_SYCL_EXECUTION_OK) {
