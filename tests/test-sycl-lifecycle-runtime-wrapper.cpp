@@ -129,15 +129,20 @@ static ggml_backend_reg_t registry_fixture() {
     return &reg;
 }
 
+static void phase(const char * name);
+
 static bool run_registry_failure_fixture() {
+    phase("generic fixture: construct pre-registry owners");
     auto reg = registry_fixture();
     static ggml_backend_buffer_type pre_registry_buft{};
     pre_registry_buft.device = static_cast<ggml_backend_dev_t>(reg->context);
     auto pre_registry_buffer = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
     auto pre_registry_event = ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context));
     if (!pre_registry_buffer || !pre_registry_event) return false;
+    phase("generic fixture: overlap lifecycle adoption and buffer free");
     ggml_backend_test_block_owner_adoption(true);
     auto adopting_register = std::async(std::launch::async, [reg] { ggml_backend_register(reg); });
+    phase("generic fixture: await adoption barrier");
     for (int i = 0; i < 1000 && !ggml_backend_test_owner_adoption_blocked(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -154,6 +159,7 @@ static bool run_registry_failure_fixture() {
         overlapping_free.get();
         return false;
     }
+    phase("generic fixture: release adoption barrier");
     ggml_backend_test_block_owner_adoption(false);
     adopting_register.get();
     overlapping_free.get();

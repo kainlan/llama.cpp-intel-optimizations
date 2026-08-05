@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -93,14 +94,33 @@ struct live_owner_record {
     bool lease;
     live_owner_state state = live_owner_state::OPEN;
 };
-static std::mutex g_live_owner_mutex;
-static std::condition_variable g_live_owner_cv;
-static std::unordered_map<void *, live_owner_record> g_live_buffers;
-static std::unordered_map<void *, live_owner_record> g_live_events;
-static std::mutex g_owner_adoption_test_mutex;
-static std::condition_variable g_owner_adoption_test_cv;
-static bool g_owner_adoption_test_block = false;
-static bool g_owner_adoption_test_blocked = false;
+struct live_owner_store {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unordered_map<void *, live_owner_record> buffers;
+    std::unordered_map<void *, live_owner_record> events;
+    std::mutex test_mutex;
+    std::condition_variable test_cv;
+    bool test_block = false;
+    bool test_blocked = false;
+};
+
+// Lifecycle installation may be reached from another translation unit's static
+// initializer. A function-local, intentionally process-lived store avoids the
+// cross-TU initialization-order cycle and also remains valid during teardown.
+static live_owner_store & live_owners() {
+    static auto * store = new live_owner_store;
+    return *store;
+}
+
+#define g_live_owner_mutex         (live_owners().mutex)
+#define g_live_owner_cv            (live_owners().cv)
+#define g_live_buffers             (live_owners().buffers)
+#define g_live_events              (live_owners().events)
+#define g_owner_adoption_test_mutex (live_owners().test_mutex)
+#define g_owner_adoption_test_cv    (live_owners().test_cv)
+#define g_owner_adoption_test_block (live_owners().test_block)
+#define g_owner_adoption_test_blocked (live_owners().test_blocked)
 
 void ggml_backend_test_block_owner_adoption(bool block) {
     std::lock_guard<std::mutex> lock(g_owner_adoption_test_mutex);
@@ -148,7 +168,11 @@ void ggml_backend_refresh_buffer_lifecycle(void) {
         if (g_owner_adoption_test_block) {
             g_owner_adoption_test_blocked = true;
             g_owner_adoption_test_cv.notify_all();
-            g_owner_adoption_test_cv.wait(test_lock, [] { return !g_owner_adoption_test_block; });
+            if (!g_owner_adoption_test_cv.wait_for(test_lock, std::chrono::seconds(10),
+                                                    [] { return !g_owner_adoption_test_block; })) {
+                GGML_LOG_ERROR("owner-adoption test barrier timed out; cancelling block\n");
+                g_owner_adoption_test_block = false;
+            }
             g_owner_adoption_test_blocked = false;
         }
     }
@@ -345,10 +369,13 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     bool owner_lease = false;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
-        g_live_owner_cv.wait(lock, [&] {
-            auto found = g_live_buffers.find(buffer);
-            return found == g_live_buffers.end() || found->second.state != live_owner_state::ADOPTING;
-        });
+        if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+                auto found = g_live_buffers.find(buffer);
+                return found == g_live_buffers.end() || found->second.state != live_owner_state::ADOPTING;
+            })) {
+            GGML_LOG_ERROR("buffer free timed out waiting for lifecycle adoption\n");
+            return;
+        }
         auto found = g_live_buffers.find(buffer);
         if (found != g_live_buffers.end()) {
             owner_device = found->second.device;
@@ -868,10 +895,13 @@ void ggml_backend_event_free(ggml_backend_event_t event) {
     bool owner_lease = false;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
-        g_live_owner_cv.wait(lock, [&] {
-            auto found = g_live_events.find(event);
-            return found == g_live_events.end() || found->second.state != live_owner_state::ADOPTING;
-        });
+        if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+                auto found = g_live_events.find(event);
+                return found == g_live_events.end() || found->second.state != live_owner_state::ADOPTING;
+            })) {
+            GGML_LOG_ERROR("event free timed out waiting for lifecycle adoption\n");
+            return;
+        }
         auto found = g_live_events.find(event);
         if (found != g_live_events.end()) {
             owner_device = found->second.device;
