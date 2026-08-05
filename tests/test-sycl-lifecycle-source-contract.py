@@ -793,6 +793,8 @@ checks = {
     and "overlapping_free.wait_for" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "static auto * store = new live_owner_store" in backend_base
+    and "Do not adopt here: first installation occurs inside get_reg()" in backend_base
+    and "Built-in devices are now published; transactionally backfill buffers" in registry_backend
     and "buffer free timed out waiting for lifecycle adoption" in backend_base
     and "event free timed out waiting for lifecycle adoption" in backend_base
     and "generic fixture: await adoption barrier" in

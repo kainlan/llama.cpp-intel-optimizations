@@ -881,6 +881,7 @@ static ggml_backend_registry & get_reg() {
         // Built-in devices are now published; transactionally backfill buffers
         // that were created before lifecycle hooks/owners were available.
         ggml_backend_set_registry_lifecycle(&lifecycle_iface);
+        ggml_backend_refresh_buffer_lifecycle();
     } catch (...) {
         std::lock_guard<std::mutex> lock(builtin_mutex);
         builtin_state = builtin_init_state::UNINITIALIZED;

@@ -165,7 +165,9 @@ static bool run_registry_failure_fixture() {
     phase("generic fixture: release adoption barrier");
     ggml_backend_test_block_owner_adoption(false);
     adopting_register.get();
+    phase("generic fixture: adoption publication joined");
     overlapping_free.get();
+    phase("generic fixture: overlapping free joined");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
     ggml_backend_event_free(pre_registry_event);
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;

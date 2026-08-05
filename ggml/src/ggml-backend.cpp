@@ -141,7 +141,9 @@ void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i
     g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
     g_registry_begin.store(iface ? iface->registry_begin : nullptr, std::memory_order_release);
     g_registry_cached_name.store(iface ? iface->registry_cached_name : nullptr, std::memory_order_release);
-    ggml_backend_refresh_buffer_lifecycle();
+    // Do not adopt here: first installation occurs inside get_reg()'s guarded
+    // static initializer, and owner_acquire re-enters get_reg(). Backfill only
+    // after built-ins or a late backend have completed publication.
 }
 
 void ggml_backend_refresh_buffer_lifecycle(void) {
