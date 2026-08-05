@@ -1,5 +1,19 @@
 #include "execution-lifecycle.hpp"
 
+namespace {
+static bool canonicalize_unique_ids(const int * values, size_t count, std::vector<int> & out) {
+    out.assign(values, values + count);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out.size() == count;
+}
+
+static int participant_index(const std::vector<int> & participants, int participant) {
+    const auto it = std::lower_bound(participants.begin(), participants.end(), participant);
+    return it != participants.end() && *it == participant ? static_cast<int>(it - participants.begin()) : -1;
+}
+}
+
 namespace ggml_sycl::execution {
 
 Registry::Registry(test_mutation mutation) : mutation_(mutation) {}
@@ -131,12 +145,18 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
     auto & graph = entry.session.graph;
     if (!(graph.id == graph_epoch)) return error::STALE;
     if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
-    if (participant < 0 || participant >= static_cast<int>(max_devices) || entry.bound_device_refs[participant] == 0) return error::MISMATCH;
+    std::vector<int> canonical_devices;
+    std::vector<int> canonical_participants;
+    if (!canonicalize_unique_ids(devices, device_count, canonical_devices) ||
+        !canonicalize_unique_ids(participants, participant_count, canonical_participants)) {
+        return error::MISMATCH;
+    }
+    for (int device : canonical_devices) {
+        if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
+    }
     if (graph.invocation.value == 0) {
         if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) return error::MISMATCH;
-        for (size_t i = 0; i < device_count; ++i) {
-            const int device = devices[i];
-            if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
+        for (int device : canonical_devices) {
             if (device_owners_[device].invocation.value != 0) return error::DEVICE_BUSY;
         }
         uint64_t invocation_value = 0;
@@ -144,36 +164,23 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
                                 mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, invocation_value);
         if (rc != error::OK) return rc;
         graph.invocation = { invocation_value };
-        graph.devices.assign(devices, devices + device_count);
-        graph.participants.assign(participants, participants + participant_count);
-        graph.participant_complete.fill(false);
-        graph.pending_participant_count = static_cast<uint32_t>(participant_count);
-        for (size_t i = 0; i < participant_count; ++i) {
-            const int expected = participants[i];
-            if (expected < 0 || expected >= static_cast<int>(max_devices) || graph.participant_complete[expected]) {
-                return error::MISMATCH;
-            }
-            graph.participant_complete[expected] = false;
-        }
-        for (size_t i = 0; i < device_count; ++i) {
-            const int device = devices[i];
+        graph.devices = canonical_devices;
+        graph.participants = canonical_participants;
+        graph.participant_joined.assign(graph.participants.size(), false);
+        graph.participant_completed.assign(graph.participants.size(), false);
+        graph.pending_participant_count = static_cast<uint32_t>(graph.participants.size());
+        graph.any_quarantined = false;
+        for (int device : graph.devices) {
             device_owners_[device] = { context, session, reset_epoch, graph_epoch, graph.invocation, root };
         }
     } else {
-        if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED &&
-            graph.state != graph_phase::COMPLETE && graph.state != graph_phase::QUARANTINED) return error::MISMATCH;
-        if (device_count != graph.devices.size() || participant_count != graph.participants.size()) return error::MISMATCH;
-        for (size_t i = 0; i < device_count; ++i) {
-            if (devices[i] != graph.devices[i]) return error::MISMATCH;
-        }
-        for (size_t i = 0; i < participant_count; ++i) {
-            if (participants[i] != graph.participants[i]) return error::MISMATCH;
-        }
+        if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) return error::MISMATCH;
+        if (canonical_devices != graph.devices || canonical_participants != graph.participants) return error::MISMATCH;
     }
-    if (std::find(graph.participants.begin(), graph.participants.end(), participant) == graph.participants.end()) {
-        return error::MISMATCH;
-    }
-    if (graph.participant_complete[participant]) return error::STALE;
+    const int pidx = participant_index(graph.participants, participant);
+    if (pidx < 0) return error::MISMATCH;
+    if (graph.participant_completed[static_cast<size_t>(pidx)]) return error::STALE;
+    graph.participant_joined[static_cast<size_t>(pidx)] = true;
     *invocation = graph.invocation;
     return error::OK;
 }
@@ -206,31 +213,35 @@ error Registry::finish_invocation(ContextId context, SessionId session, SessionR
     auto & graph = entry.session.graph;
     if (!(graph.id == graph_epoch) || !(graph.invocation == invocation)) return graph.id == graph_epoch ? error::MISMATCH : error::STALE;
     if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
-    if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED && graph.state != terminal) return error::BUSY;
-    if (device < 0 || device >= static_cast<int>(max_devices)) return error::MISMATCH;
-    const auto & owner = device_owners_[device];
-    if (!(owner.context == context && owner.session == session && owner.reset_epoch == reset_epoch &&
-          owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
-        return error::MISMATCH;
+    if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) return error::BUSY;
+    const int pidx = participant_index(graph.participants, device);
+    if (pidx < 0) return error::MISMATCH;
+    if (!graph.participant_joined[static_cast<size_t>(pidx)]) return error::MISMATCH;
+    if (graph.participant_completed[static_cast<size_t>(pidx)]) return error::STALE;
+    for (int claimed_device : graph.devices) {
+        if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) return error::MISMATCH;
+        const auto & owner = device_owners_[claimed_device];
+        if (!(owner.context == context && owner.session == session && owner.reset_epoch == reset_epoch &&
+              owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
+            return error::MISMATCH;
+        }
     }
-    if (graph.participant_complete[device]) return error::STALE;
-    graph.state = terminal;
-    graph.token_root_state = token_terminal;
-    graph.participant_complete[device] = true;
+    graph.participant_completed[static_cast<size_t>(pidx)] = true;
+    graph.any_quarantined = graph.any_quarantined || terminal == graph_phase::QUARANTINED;
     if (graph.pending_participant_count == 0) return error::STALE;
     --graph.pending_participant_count;
     if (graph.pending_participant_count != 0) {
         return error::OK;
     }
-    for (int participating : graph.devices) {
-        if (participating >= 0 && participating < static_cast<int>(max_devices)) {
-            const auto & device_owner = device_owners_[participating];
-            if (device_owner.context == context && device_owner.session == session && device_owner.reset_epoch == reset_epoch &&
-                device_owner.graph_epoch == graph_epoch && device_owner.invocation == invocation && device_owner.token_root == root) {
-                device_owners_[participating] = {};
-            }
+    for (int claimed_device : graph.devices) {
+        const auto & device_owner = device_owners_[claimed_device];
+        if (device_owner.context == context && device_owner.session == session && device_owner.reset_epoch == reset_epoch &&
+            device_owner.graph_epoch == graph_epoch && device_owner.invocation == invocation && device_owner.token_root == root) {
+            device_owners_[claimed_device] = {};
         }
     }
+    graph.state = graph.any_quarantined ? graph_phase::QUARANTINED : graph_phase::COMPLETE;
+    graph.token_root_state = graph.any_quarantined ? token_root_phase::QUARANTINED : token_root_phase::COMPLETE;
     graph.invocation = {};
     return error::OK;
 }

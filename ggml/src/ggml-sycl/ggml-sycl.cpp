@@ -9428,6 +9428,10 @@ struct ggml_sycl_control_host_alloc_batch_storage {
         ggml_backend_sycl_context * backend = nullptr;
         std::vector<ggml_backend_sycl_context::control_host_alloc> allocs;
     };
+    uint64_t                 context_id = 0;
+    uint64_t                 serial = 0;
+    uint64_t                 session_id = 0;
+    uint64_t                 reset_epoch = 0;
     std::vector<moved_entry> entries;
     uint32_t                 count = 0;
 };
@@ -9517,6 +9521,8 @@ static std::vector<int> ggml_sycl_execution_expected_participants(uint64_t conte
             participants.push_back(binding.participant_id);
         }
     }
+    std::sort(participants.begin(), participants.end());
+    participants.erase(std::unique(participants.begin(), participants.end()), participants.end());
     return participants;
 }
 
@@ -11217,6 +11223,10 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
             return ggml_sycl_execution_c_result(validate_rc);
         }
         auto storage = std::make_unique<ggml_sycl_control_host_alloc_batch_storage>();
+        storage->context_id = ticket->context_id.value;
+        storage->serial = ticket->serial;
+        storage->session_id = ticket->session_id.value;
+        storage->reset_epoch = ticket->reset_epoch.value;
         const auto bound_backends = ggml_sycl_execution_bound_backends(ticket->context_id.value);
         storage->entries.reserve(bound_backends.size());
         for (auto * backend_ctx : bound_backends) {
@@ -11273,6 +11283,10 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(ggml
         if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
         ggml_sycl_execution_wrapper_failpoint_maybe_throw();
         auto * storage = static_cast<ggml_sycl_control_host_alloc_batch_storage *>(batch.opaque);
+        if (!storage || storage->context_id != ticket.context_id.value || storage->serial != ticket.serial ||
+            storage->session_id != ticket.session_id.value || storage->reset_epoch != ticket.reset_epoch.value) {
+            return GGML_SYCL_EXECUTION_STALE;
+        }
         const ggml_sycl::execution::DrainTicket cpp_ticket{ { ticket.context_id.value }, { ticket.session_id.value },
                                                              { ticket.reset_epoch.value }, ticket.serial,
                                                              ticket.extracted_control_host_allocs, true };
@@ -11501,10 +11515,10 @@ static std::vector<int> ggml_sycl_execution_aggregate_devices(const ggml_backend
     if (!ctx) {
         return {};
     }
-    if (!ctx->execution_aggregate_devices.empty()) {
-        return ctx->execution_aggregate_devices;
-    }
-    return { ctx->device };
+    std::vector<int> devices = !ctx->execution_aggregate_devices.empty() ? ctx->execution_aggregate_devices : std::vector<int>{ ctx->device };
+    std::sort(devices.begin(), devices.end());
+    devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
+    return devices;
 }
 
 static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context * ctx) {

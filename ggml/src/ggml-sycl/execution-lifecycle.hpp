@@ -136,10 +136,12 @@ class Registry {
         token_root_phase            token_root_state = token_root_phase::OPEN;
         lifecycle::ModelToken       token_root{};
         InvocationId                invocation{};
-        std::vector<int>              devices;
-        std::vector<int>              participants;
-        std::array<bool, max_devices> participant_complete{};
-        uint32_t                      pending_participant_count = 0;
+        std::vector<int> devices;
+        std::vector<int> participants;
+        std::vector<bool> participant_joined;
+        std::vector<bool> participant_completed;
+        uint32_t         pending_participant_count = 0;
+        bool             any_quarantined = false;
     };
 
     struct session_entry {
