@@ -118,20 +118,22 @@ error Registry::abort_graph_locked(ContextId context, SessionId session, Session
 }
 
 error Registry::begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                                 lifecycle::ModelToken root, const int * devices, size_t device_count, int participant,
+                                 lifecycle::ModelToken root, const int * devices, size_t device_count,
+                                 const int * participants, size_t participant_count, int participant,
                                  InvocationId * invocation) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = contexts_.find(context.value);
-    if (!devices || !invocation) return error::NULL_OUTPUT;
+    if (!devices || !participants || !invocation) return error::NULL_OUTPUT;
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     auto & entry = it->second;
     const auto session_rc = validate_session(entry, session, reset_epoch);
     if (session_rc != error::OK) return session_rc;
     auto & graph = entry.session.graph;
     if (!(graph.id == graph_epoch)) return error::STALE;
-    if ((graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) || validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
+    if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
     if (participant < 0 || participant >= static_cast<int>(max_devices) || entry.bound_device_refs[participant] == 0) return error::MISMATCH;
     if (graph.invocation.value == 0) {
+        if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) return error::MISMATCH;
         for (size_t i = 0; i < device_count; ++i) {
             const int device = devices[i];
             if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
@@ -143,24 +145,35 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
         if (rc != error::OK) return rc;
         graph.invocation = { invocation_value };
         graph.devices.assign(devices, devices + device_count);
-        graph.participants.clear();
+        graph.participants.assign(participants, participants + participant_count);
         graph.participant_complete.fill(false);
-        graph.pending_participant_count = 0;
+        graph.pending_participant_count = static_cast<uint32_t>(participant_count);
+        for (size_t i = 0; i < participant_count; ++i) {
+            const int expected = participants[i];
+            if (expected < 0 || expected >= static_cast<int>(max_devices) || graph.participant_complete[expected]) {
+                return error::MISMATCH;
+            }
+            graph.participant_complete[expected] = false;
+        }
         for (size_t i = 0; i < device_count; ++i) {
             const int device = devices[i];
             device_owners_[device] = { context, session, reset_epoch, graph_epoch, graph.invocation, root };
         }
     } else {
-        if (device_count != graph.devices.size()) return error::MISMATCH;
+        if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED &&
+            graph.state != graph_phase::COMPLETE && graph.state != graph_phase::QUARANTINED) return error::MISMATCH;
+        if (device_count != graph.devices.size() || participant_count != graph.participants.size()) return error::MISMATCH;
         for (size_t i = 0; i < device_count; ++i) {
             if (devices[i] != graph.devices[i]) return error::MISMATCH;
         }
+        for (size_t i = 0; i < participant_count; ++i) {
+            if (participants[i] != graph.participants[i]) return error::MISMATCH;
+        }
+    }
+    if (std::find(graph.participants.begin(), graph.participants.end(), participant) == graph.participants.end()) {
+        return error::MISMATCH;
     }
     if (graph.participant_complete[participant]) return error::STALE;
-    if (std::find(graph.participants.begin(), graph.participants.end(), participant) == graph.participants.end()) {
-        graph.participants.push_back(participant);
-        ++graph.pending_participant_count;
-    }
     *invocation = graph.invocation;
     return error::OK;
 }
@@ -315,6 +328,9 @@ error Registry::close_context_if_idle(ContextId context) noexcept {
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     auto & entry = it->second;
+    if (entry.state != context_phase::OPEN || entry.active_drain_serial != 0 || entry.session.active_reset_serial != 0) {
+        return error::BUSY;
+    }
     for (const auto & owner : device_owners_) {
         if (owner.context == context && owner.invocation.value != 0) return error::DEVICE_BUSY;
     }

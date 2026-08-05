@@ -4555,6 +4555,7 @@ struct ggml_backend_sycl_context {
     int                                  device;
     std::string                          name;
     uint64_t                             execution_context_id = 0;
+    int                                  execution_participant_id = -1;
     uint64_t                             execution_session_id = 0;
     uint64_t                             execution_reset_epoch = 0;
     uint64_t                             execution_graph_epoch = 0;

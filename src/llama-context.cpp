@@ -478,6 +478,9 @@ llama_context::llama_context(
             auto bind_exec   = &ggml_backend_sycl_execution_context_bind_backend;
 #    else
             auto exec_hooks  = llama_context_sycl_exec_procs(dev);
+            if (!exec_hooks.create || !exec_hooks.bind || !exec_hooks.close_if_idle) {
+                throw std::runtime_error(format("missing SYCL execution lifecycle procedures for %s backend", ggml_backend_dev_name(dev)));
+            }
             auto create_exec = exec_hooks.create;
             auto bind_exec   = exec_hooks.bind;
 #    endif

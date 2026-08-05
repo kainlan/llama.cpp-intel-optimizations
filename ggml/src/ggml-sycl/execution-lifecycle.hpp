@@ -102,7 +102,8 @@ class Registry {
     error begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                       lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept;
     error begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                           lifecycle::ModelToken root, const int * devices, size_t device_count, int participant,
+                           lifecycle::ModelToken root, const int * devices, size_t device_count,
+                           const int * participants, size_t participant_count, int participant,
                            InvocationId * invocation) noexcept;
     error seal_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                           InvocationId invocation, lifecycle::ModelToken root) noexcept;
