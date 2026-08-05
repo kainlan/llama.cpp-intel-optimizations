@@ -12890,39 +12890,52 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         if (!snapshot) {
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
-        if (backend_ctx && backend_ctx->execution_context_id != 0) {
-            ggml_sycl::execution::snapshot exec_snapshot{};
-            if (ggml_sycl::execution::global_registry().extract({ backend_ctx->execution_context_id }, &exec_snapshot) ==
-                    ggml_sycl::execution::error::OK &&
-                (exec_snapshot.invocation.value != 0 || exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::OPEN ||
-                 exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::SEALED)) {
-                return GGML_SYCL_LIFECYCLE_BUSY;
-            }
-            ggml_sycl::execution::SessionId session{};
-            ggml_sycl::execution::SessionResetEpoch reset_epoch{};
-            const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
-                { backend_ctx->execution_context_id }, token, &session, &reset_epoch);
-            if (attach_rc != ggml_sycl::execution::error::OK) {
-                return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
-                       GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
-            }
-            ggml_sycl_execution_record_root(backend_ctx, token, session, reset_epoch);
-            {
-                std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
-                backend_ctx->execution_aggregate_devices.clear();
+        if (backend_ctx) {
+            const auto exec_state = ggml_sycl_execution_state_snapshot(backend_ctx);
+            if (exec_state.context_id != 0) {
+                ggml_sycl::execution::snapshot exec_snapshot{};
+                if (ggml_sycl::execution::global_registry().extract({ exec_state.context_id }, &exec_snapshot) ==
+                        ggml_sycl::execution::error::OK &&
+                    (exec_snapshot.invocation.value != 0 || exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::OPEN ||
+                     exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::SEALED)) {
+                    return GGML_SYCL_LIFECYCLE_BUSY;
+                }
+                ggml_sycl::execution::SessionId session{};
+                ggml_sycl::execution::SessionResetEpoch reset_epoch{};
+                const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
+                    { exec_state.context_id }, token, &session, &reset_epoch);
+                if (attach_rc != ggml_sycl::execution::error::OK) {
+                    return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
+                           GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+                }
+                std::vector<int> aggregate_devices;
                 if (snapshot->plan) {
-                const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-                for (int device = 0; device < total; ++device) {
-                    if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
-                        backend_ctx->execution_aggregate_devices.push_back(device);
+                    const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+                    for (int device = 0; device < total; ++device) {
+                        if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
+                            aggregate_devices.push_back(device);
+                        }
                     }
                 }
+                if (aggregate_devices.empty()) {
+                    aggregate_devices.push_back(backend_ctx->device);
                 }
-                if (backend_ctx->execution_aggregate_devices.empty()) {
-                    backend_ctx->execution_aggregate_devices.push_back(backend_ctx->device);
+                {
+                    std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
+                    std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
+                    if (backend_ctx->execution_context_id != exec_state.context_id) {
+                        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+                    }
+                    backend_ctx->execution_session_id = session.value;
+                    backend_ctx->execution_reset_epoch = reset_epoch.value;
+                    backend_ctx->execution_root_model_id = token.model.value;
+                    backend_ctx->execution_root_load_txn_id = token.load.value;
+                    backend_ctx->execution_root_slot = token.owner.slot;
+                    backend_ctx->execution_root_slot_generation = token.owner.generation;
+                    backend_ctx->execution_aggregate_devices = aggregate_devices;
                 }
+                ggml_sycl_execution_sync_binding_devices(backend_ctx, aggregate_devices);
             }
-            ggml_sycl_execution_sync_binding_devices(backend_ctx, ggml_sycl_execution_aggregate_devices(backend_ctx));
         }
         ggml_sycl_publish_plan_locked(snapshot);
     } catch (...) {
