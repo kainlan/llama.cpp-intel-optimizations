@@ -12712,6 +12712,64 @@ static void shutdown_shared_context_queues() noexcept {
     g_shared_ctx_queues_initialized_for = 0;
 }
 
+static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & rec, int * owner_device = nullptr) noexcept {
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        auto owns_record = [&](const unified_cache & cache) {
+            if (cache.contains_pinned(rec.handle.ptr)) {
+                return true;
+            }
+            for (const auto & seg : rec.handle.all_segments) {
+                if (cache.contains_pinned(seg.ptr)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (const auto & item : g_device_caches) {
+            if (!item.second) {
+                continue;
+            }
+            if (owns_record(*item.second)) {
+                if (owner_device) {
+                    *owner_device = item.first;
+                }
+                return true;
+            }
+        }
+    } catch (...) {
+    }
+    if (owner_device) {
+        *owner_device = -1;
+    }
+    return false;
+}
+
+static bool release_cache_owned_runtime_allocations_for_final_shutdown() noexcept {
+    try {
+        std::vector<alloc_handle> deferred;
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            deferred.reserve(g_runtime_alloc_registry.size());
+            for (const auto & kv : g_runtime_alloc_registry) {
+                if (runtime_allocation_owned_by_live_cache(kv.second, nullptr)) {
+                    deferred.push_back(kv.second.handle);
+                }
+            }
+        }
+        for (const auto & handle : deferred) {
+            if (!unified_free(handle)) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] final shutdown failed to release retained cache-owned allocation ptr=%p\n",
+                               handle.ptr);
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
     try {
         if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
@@ -12720,9 +12778,11 @@ static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
         }
         {
             std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
-            if (!g_runtime_alloc_registry.empty()) {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
-                return false;
+            for (const auto & kv : g_runtime_alloc_registry) {
+                if (!runtime_allocation_owned_by_live_cache(kv.second, nullptr)) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
+                    return false;
+                }
             }
         }
         {
@@ -12785,11 +12845,11 @@ bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
     }
 }
 
-bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[5]) noexcept {
+bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept {
     if (!out) {
         return false;
     }
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
         out[i] = 0;
     }
     try {
@@ -12804,21 +12864,30 @@ bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[5]) noexc
                 if (rec.handle.tier == alloc_tier::HOST_PINNED) {
                     ++out[1];
                 }
-                if (rec.uses_pinned_pool) {
+                int owner_device = -1;
+                if (runtime_allocation_owned_by_live_cache(rec, &owner_device)) {
                     ++out[2];
-                }
-                if (rec.handle.host_zone != host_zone_id::COUNT) {
-                    ++out[3];
+                    if (out[4] == 0) {
+                        out[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rec.handle.ptr));
+                        out[5] = rec.handle.size;
+                        out[6] = owner_device >= 0 ? static_cast<uint64_t>(owner_device) : UINT64_MAX;
+                        out[7] = 1;
+                    }
+                } else if (out[4] == 0) {
+                    out[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rec.handle.ptr));
+                    out[5] = rec.handle.size;
+                    out[6] = UINT64_MAX;
+                    out[7] = 0;
                 }
             }
         }
         {
             std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
-            out[4] = g_offload_pool_slots.size();
+            out[3] = g_offload_pool_slots.size();
         }
         return true;
     } catch (...) {
-        for (size_t i = 0; i < 5; ++i) {
+        for (size_t i = 0; i < 8; ++i) {
             out[i] = 0;
         }
         return false;
@@ -12847,6 +12916,9 @@ bool shutdown_unified_cache() {
     // Any retryable dirty boundary must be detected before destroying the last
     // cache owners or shared queues, so a failed unload can retry exactly.
     if (!unified_cache_shutdown_retryable_postconditions_clean()) {
+        return false;
+    }
+    if (!release_cache_owned_runtime_allocations_for_final_shutdown()) {
         return false;
     }
     {

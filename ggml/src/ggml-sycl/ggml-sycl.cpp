@@ -74248,9 +74248,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // shutdown() is idempotent and a no-op for pools that were never started.
     // ExpertPrefetcher must be shut down first: cancel_all() waits for
     // in-flight BCS DMAs whose destinations are VRAM owned by the unified
-    // cache. Shutting these global pinned/runtime owners down here — while
-    // VRAM is still mapped — prevents later shutdown retries from inheriting
-    // stale runtime-allocation authority.
+    // cache.
     GGML_ASSERT(ggml_sycl_shutdown_global_runtime_pinned_owners());
     // Drain any pending merge events before teardown
     split_merge_drain();
@@ -96379,7 +96377,7 @@ static bool ggml_backend_sycl_test_shutdown_owner_census(uint64_t out[4]) {
     return ggml_sycl::unified_cache_shutdown_owner_census_for_test(out);
 }
 
-static bool ggml_backend_sycl_test_shutdown_runtime_alloc_census(uint64_t out[5]) {
+static bool ggml_backend_sycl_test_shutdown_runtime_alloc_census(uint64_t out[8]) {
     return ggml_sycl::unified_cache_shutdown_runtime_alloc_census_for_test(out);
 }
 
@@ -96450,8 +96448,8 @@ void ggml_backend_sycl_shutdown(void) {
     if (!ggml_sycl::drain_retained_handles(true, 10000)) {
         throw std::runtime_error("SYCL retained-handle drain timed out");
     }
-    if (!ggml_sycl_shutdown_global_runtime_pinned_owners() || !ggml_sycl_cpu_retained_cleanup() ||
-        !ggml_sycl::offload_buffer_pool_shutdown() || ggml_sycl_cpu_retained_active()) {
+    if (!ggml_sycl_cpu_retained_cleanup() || !ggml_sycl::offload_buffer_pool_shutdown() ||
+        ggml_sycl_cpu_retained_active()) {
         throw std::runtime_error("SYCL retained/offload state survived shutdown cleanup");
     }
     {

@@ -718,7 +718,7 @@ int main() {
     using shutdown_owner_census_fn = bool (*)(uint64_t out[4]);
     auto shutdown_owner_census = reinterpret_cast<shutdown_owner_census_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_owner_census"));
-    using shutdown_runtime_alloc_census_fn = bool (*)(uint64_t out[5]);
+    using shutdown_runtime_alloc_census_fn = bool (*)(uint64_t out[8]);
     auto shutdown_runtime_alloc_census = reinterpret_cast<shutdown_runtime_alloc_census_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_runtime_alloc_census"));
     auto block_next_kv_push = reinterpret_cast<void (*)()>(
@@ -777,19 +777,22 @@ int main() {
         std::fprintf(stderr, "shutdown owner census unavailable after dirty retry\n");
         return 1;
     }
-    uint64_t runtime_alloc_census_after_dirty[5]{};
+    uint64_t runtime_alloc_census_after_dirty[8]{};
     if (!shutdown_runtime_alloc_census(runtime_alloc_census_after_dirty)) {
         std::fprintf(stderr, "shutdown runtime allocation census unavailable after dirty retry\n");
         return 1;
     }
-    if (runtime_alloc_census_after_dirty[0] != 0 || runtime_alloc_census_after_dirty[4] != 0) {
+    if (runtime_alloc_census_after_dirty[0] != 0 || runtime_alloc_census_after_dirty[3] != 0) {
         std::fprintf(stderr,
-                     "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu pinned_pool=%llu host_zone=%llu offload=%llu\n",
+                     "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu cache_owned=%llu offload=%llu ptr=0x%llx size=%llu owner=%s device=%lld\n",
                      static_cast<unsigned long long>(runtime_alloc_census_after_dirty[0]),
                      static_cast<unsigned long long>(runtime_alloc_census_after_dirty[1]),
                      static_cast<unsigned long long>(runtime_alloc_census_after_dirty[2]),
                      static_cast<unsigned long long>(runtime_alloc_census_after_dirty[3]),
-                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[4]));
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[4]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[5]),
+                     runtime_alloc_census_after_dirty[7] ? "cache-pinned" : "external",
+                     static_cast<long long>(runtime_alloc_census_after_dirty[6] == UINT64_MAX ? -1 : runtime_alloc_census_after_dirty[6]));
         return 1;
     }
     if (owner_census_before_dirty[0] == 0 || owner_census_after_dirty[0] != owner_census_before_dirty[0]) {
