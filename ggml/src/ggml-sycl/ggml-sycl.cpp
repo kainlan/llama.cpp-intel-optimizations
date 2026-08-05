@@ -12891,8 +12891,29 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
         if (backend_ctx) {
-            const auto exec_state = ggml_sycl_execution_state_snapshot(backend_ctx);
-            if (exec_state.context_id != 0) {
+            std::vector<int> aggregate_devices;
+            if (snapshot->plan) {
+                const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+                for (int device = 0; device < total; ++device) {
+                    if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
+                        aggregate_devices.push_back(device);
+                    }
+                }
+            }
+            if (aggregate_devices.empty()) {
+                aggregate_devices.push_back(backend_ctx->device);
+            }
+            std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
+            auto binding_it = g_execution_backend_bindings.find(backend_ctx);
+            if (binding_it != g_execution_backend_bindings.end() && binding_it->second.context_id != 0) {
+                ggml_sycl_execution_state_snapshot exec_state{};
+                {
+                    std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
+                    exec_state = ggml_sycl_execution_snapshot_locked(backend_ctx);
+                    if (binding_it->second.context_id != exec_state.context_id) {
+                        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+                    }
+                }
                 ggml_sycl::execution::snapshot exec_snapshot{};
                 if (ggml_sycl::execution::global_registry().extract({ exec_state.context_id }, &exec_snapshot) ==
                         ggml_sycl::execution::error::OK &&
@@ -12908,22 +12929,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                     return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
                            GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
                 }
-                std::vector<int> aggregate_devices;
-                if (snapshot->plan) {
-                    const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-                    for (int device = 0; device < total; ++device) {
-                        if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
-                            aggregate_devices.push_back(device);
-                        }
-                    }
-                }
-                if (aggregate_devices.empty()) {
-                    aggregate_devices.push_back(backend_ctx->device);
-                }
                 {
-                    std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
                     std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
-                    if (backend_ctx->execution_context_id != exec_state.context_id) {
+                    if (binding_it == g_execution_backend_bindings.end() || binding_it->second.context_id != exec_state.context_id ||
+                        backend_ctx->execution_context_id != exec_state.context_id) {
                         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
                     }
                     backend_ctx->execution_session_id = session.value;
@@ -12933,8 +12942,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                     backend_ctx->execution_root_slot = token.owner.slot;
                     backend_ctx->execution_root_slot_generation = token.owner.generation;
                     backend_ctx->execution_aggregate_devices = aggregate_devices;
+                    binding_it->second.covered_devices = aggregate_devices;
                 }
-                ggml_sycl_execution_sync_binding_devices(backend_ctx, aggregate_devices);
             }
         }
         ggml_sycl_publish_plan_locked(snapshot);

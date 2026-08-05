@@ -617,9 +617,11 @@ checks = {
     and exact_runtime_body.index("return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND") <
         exact_runtime_body.index("registry.prepare_live_update(token)"),
     "runtime context snapshots and revalidates execution binding":
-    "const auto exec_state = ggml_sycl_execution_state_snapshot(backend_ctx);" in exact_runtime_body
-    and "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in exact_runtime_body
-    and "if (backend_ctx->execution_context_id != exec_state.context_id)" in exact_runtime_body,
+    "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in exact_runtime_body
+    and "auto binding_it = g_execution_backend_bindings.find(backend_ctx);" in exact_runtime_body
+    and "exec_state = ggml_sycl_execution_snapshot_locked(backend_ctx);" in exact_runtime_body
+    and "if (binding_it->second.context_id != exec_state.context_id)" in exact_runtime_body
+    and "backend_ctx->execution_context_id != exec_state.context_id" in exact_runtime_body,
     "weight usage ABI wrapper and status mutation hold exact load effect":
     "void ggml_backend_sycl_register_weight_usage" in backend
     and "bool ggml_backend_sycl_try_register_weight_usage" in backend
