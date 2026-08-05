@@ -9415,6 +9415,12 @@ static ggml_sycl_execution_token_root_state ggml_sycl_execution_c_token_state(gg
     return GGML_SYCL_EXECUTION_TOKEN_ROOT_OPEN;
 }
 
+struct ggml_sycl_control_host_alloc_batch_storage {
+    std::vector<ggml_backend_sycl_context::control_host_alloc> allocs;
+};
+
+static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
+
 static void ggml_sycl_execution_record_root(ggml_backend_sycl_context * backend_ctx,
                                              const ggml_sycl::lifecycle::ModelToken & token,
                                              const ggml_sycl::execution::SessionId & session,
@@ -9881,6 +9887,34 @@ extern "C" void ggml_backend_sycl_test_release_live_update() {
     if (!module_guard) return;
     std::lock_guard<std::mutex> lock(g_test_live_update_mutex);
     g_test_live_update_guard.reset();
+}
+
+extern "C" bool ggml_backend_sycl_test_seed_control_host_allocs(ggml_backend_t backend, uint32_t count) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || !backend || !backend->context) return false;
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    auto & q = *ctx->stream();
+    for (uint32_t i = 0; i < count; ++i) {
+        ggml_sycl::alloc_request req{};
+        req.queue = &q;
+        req.device = ctx->device;
+        req.size = 64;
+        req.intent.category = ggml_sycl::runtime_category::CONTROL;
+        req.intent.constraints.must_host_pinned = true;
+        req.intent.constraints.use_pinned_pool = true;
+        ggml_sycl::alloc_handle owner{};
+        if (!ggml_sycl::unified_alloc(req, &owner) || owner.ptr == nullptr) {
+            return false;
+        }
+        auto handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+        auto resolved = handle.resolve(ctx->device);
+        if (!resolved || !resolved.ptr || resolved.on_device) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(ctx->control_host_allocs_mutex);
+        ctx->control_host_allocs.push_back({ resolved.ptr, 64, std::move(handle) });
+    }
+    return true;
 }
 
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
@@ -10971,27 +11005,46 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_begin_drain(ggml_
 }
 
 ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs(
-    ggml_sycl_exec_drain_ticket * ticket, uint32_t * extracted_count) {
+    ggml_sycl_exec_drain_ticket * ticket, ggml_sycl_exec_control_host_alloc_batch * batch) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
-    if (!ticket || !extracted_count) {
+    if (!ticket || !batch) {
         return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+    }
+    auto storage = std::make_unique<ggml_sycl_control_host_alloc_batch_storage>();
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        auto * backend_ctx = ggml_sycl_get_backend_context_for_device(device);
+        if (!backend_ctx || backend_ctx->execution_context_id != ticket->context_id.value) {
+            continue;
+        }
+        std::vector<ggml_backend_sycl_context::control_host_alloc> moved;
+        {
+            std::lock_guard<std::mutex> lock(backend_ctx->control_host_allocs_mutex);
+            moved.swap(backend_ctx->control_host_allocs);
+        }
+        storage->allocs.insert(storage->allocs.end(), std::make_move_iterator(moved.begin()),
+                               std::make_move_iterator(moved.end()));
     }
     ggml_sycl::execution::DrainTicket cpp_ticket{ { ticket->context_id.value }, { ticket->session_id.value },
                                                    { ticket->reset_epoch.value }, ticket->serial,
                                                    ticket->extracted_control_host_allocs, true };
-    const auto rc = ggml_sycl::execution::global_registry().note_drain_extracted_control_host_allocs(&cpp_ticket, 0);
+    const auto rc = ggml_sycl::execution::global_registry().note_drain_extracted_control_host_allocs(
+        &cpp_ticket, static_cast<uint32_t>(storage->allocs.size()));
     if (rc != ggml_sycl::execution::error::OK) {
         return ggml_sycl_execution_c_result(rc);
     }
     ticket->extracted_control_host_allocs = cpp_ticket.extracted_control_host_allocs;
-    *extracted_count = ticket->extracted_control_host_allocs;
+    batch->count = ticket->extracted_control_host_allocs;
+    batch->opaque = storage.release();
     return GGML_SYCL_EXECUTION_OK;
 }
 
-ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(ggml_sycl_exec_drain_ticket ticket) {
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(ggml_sycl_exec_drain_ticket ticket,
+                                                                             ggml_sycl_exec_control_host_alloc_batch batch) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
+    std::unique_ptr<ggml_sycl_control_host_alloc_batch_storage> storage(
+        static_cast<ggml_sycl_control_host_alloc_batch_storage *>(batch.opaque));
     const ggml_sycl::execution::DrainTicket cpp_ticket{ { ticket.context_id.value }, { ticket.session_id.value },
                                                          { ticket.reset_epoch.value }, ticket.serial,
                                                          ticket.extracted_control_host_allocs, true };
@@ -11167,23 +11220,13 @@ static bool ggml_sycl_execution_current_owner(const ggml_backend_sycl_context * 
 }
 
 static std::vector<int> ggml_sycl_execution_aggregate_devices(const ggml_backend_sycl_context * ctx) {
-    std::vector<int> devices;
     if (!ctx) {
-        return devices;
+        return {};
     }
-    const auto snapshot = ggml_sycl_global_plan_snapshot();
-    if (snapshot && snapshot->plan) {
-        const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-        for (int device = 0; device < total; ++device) {
-            if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
-                devices.push_back(device);
-            }
-        }
+    if (!ctx->execution_aggregate_devices.empty()) {
+        return ctx->execution_aggregate_devices;
     }
-    if (devices.empty()) {
-        devices.push_back(ctx->device);
-    }
-    return devices;
+    return { ctx->device };
 }
 
 static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context * ctx) {
@@ -11231,6 +11274,20 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     }
     ctx->execution_session_id = session.value;
     ctx->execution_reset_epoch = reset_epoch.value;
+    ggml_sycl::execution::snapshot current{};
+    if (registry.extract({ ctx->execution_context_id }, &current) == ggml_sycl::execution::error::OK &&
+        current.token_root == owner && current.invocation.value != 0 &&
+        (current.graph_state == ggml_sycl::execution::graph_phase::OPEN ||
+         current.graph_state == ggml_sycl::execution::graph_phase::SEALED ||
+         current.graph_state == ggml_sycl::execution::graph_phase::COMPLETE ||
+         current.graph_state == ggml_sycl::execution::graph_phase::QUARANTINED)) {
+        ctx->execution_session_id = current.session.value;
+        ctx->execution_reset_epoch = current.reset_epoch.value;
+        ctx->execution_graph_epoch = current.graph_epoch.value;
+        ctx->execution_invocation_id = current.invocation.value;
+        ctx->execution_graph_sealed = current.graph_state != ggml_sycl::execution::graph_phase::OPEN;
+        return true;
+    }
     ggml_sycl::execution::GraphEpoch graph_epoch{};
     if (registry.begin_graph({ ctx->execution_context_id }, session, reset_epoch, owner, &graph_epoch) !=
         ggml_sycl::execution::error::OK) {
@@ -11240,7 +11297,7 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     ggml_sycl::execution::InvocationId invocation{};
     if (registry.begin_invocation({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner,
                                   devices.data(), devices.size(), &invocation) != ggml_sycl::execution::error::OK) {
-        (void) registry.retire_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
+        (void) registry.abort_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
         return false;
     }
     ctx->execution_graph_epoch = graph_epoch.value;
@@ -11279,10 +11336,14 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
     auto & registry = ggml_sycl::execution::global_registry();
     if (registry.quarantine_invocation({ ctx->execution_context_id }, { ctx->execution_session_id },
                                        { ctx->execution_reset_epoch }, { ctx->execution_graph_epoch },
-                                       { ctx->execution_invocation_id }, owner) == ggml_sycl::execution::error::OK) {
-        ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
-        ctx->execution_graph_quarantined = true;
-        ggml_sycl_execution_clear_graph_tracking(ctx);
+                                       { ctx->execution_invocation_id }, owner, ctx->device) == ggml_sycl::execution::error::OK) {
+        ggml_sycl::execution::snapshot snapshot{};
+        if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
+            snapshot.invocation.value == 0) {
+            ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
+            ctx->execution_graph_quarantined = true;
+            ggml_sycl_execution_clear_graph_tracking(ctx);
+        }
     }
 }
 
@@ -11298,11 +11359,15 @@ static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) 
     ggml_sycl_execution_seal_graph(ctx);
     if (registry.complete_invocation({ ctx->execution_context_id }, { ctx->execution_session_id },
                                      { ctx->execution_reset_epoch }, { ctx->execution_graph_epoch },
-                                     { ctx->execution_invocation_id }, owner) != ggml_sycl::execution::error::OK) {
+                                     { ctx->execution_invocation_id }, owner, ctx->device) != ggml_sycl::execution::error::OK) {
         return false;
     }
-    ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
-    ggml_sycl_execution_clear_graph_tracking(ctx);
+    ggml_sycl::execution::snapshot snapshot{};
+    if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
+        snapshot.invocation.value == 0) {
+        ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
+        ggml_sycl_execution_clear_graph_tracking(ctx);
+    }
     return true;
 }
 
@@ -12221,17 +12286,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         { model.slot, model.slot_generation }
     };
     auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
-    if (backend_ctx && backend_ctx->execution_context_id != 0) {
-        ggml_sycl::execution::SessionId session{};
-        ggml_sycl::execution::SessionResetEpoch reset_epoch{};
-        const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
-            { backend_ctx->execution_context_id }, token, &session, &reset_epoch);
-        if (attach_rc != ggml_sycl::execution::error::OK) {
-            return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
-                   GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
-        }
-        ggml_sycl_execution_record_root(backend_ctx, token, session, reset_epoch);
-    }
     auto & registry = ggml_sycl::lifecycle::global_registry();
     auto   ticket   = registry.prepare_live_update(token);
     if (!ticket.active) {
@@ -12254,6 +12308,29 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                          model.slot_generation);
         if (!snapshot) {
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        }
+        if (backend_ctx && backend_ctx->execution_context_id != 0) {
+            ggml_sycl::execution::SessionId session{};
+            ggml_sycl::execution::SessionResetEpoch reset_epoch{};
+            const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
+                { backend_ctx->execution_context_id }, token, &session, &reset_epoch);
+            if (attach_rc != ggml_sycl::execution::error::OK) {
+                return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
+                       GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+            }
+            ggml_sycl_execution_record_root(backend_ctx, token, session, reset_epoch);
+            backend_ctx->execution_aggregate_devices.clear();
+            if (snapshot->plan) {
+                const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+                for (int device = 0; device < total; ++device) {
+                    if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
+                        backend_ctx->execution_aggregate_devices.push_back(device);
+                    }
+                }
+            }
+            if (backend_ctx->execution_aggregate_devices.empty()) {
+                backend_ctx->execution_aggregate_devices.push_back(backend_ctx->device);
+            }
         }
         ggml_sycl_publish_plan_locked(snapshot);
     } catch (...) {
@@ -97276,6 +97353,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_release_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_release_live_update;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_seed_control_host_allocs") == 0) {
+        return (void *) ggml_backend_sycl_test_seed_control_host_allocs;
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_backend_publish") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_backend_publish;

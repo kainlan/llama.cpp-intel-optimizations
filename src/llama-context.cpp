@@ -461,9 +461,9 @@ llama_context::llama_context(
             }
             ggml_sycl_exec_drain_ticket ticket{};
             if (begin_drain(sycl_exec_context, &ticket) == GGML_SYCL_EXECUTION_OK) {
-                uint32_t extracted = 0;
-                (void) extract_allocs(&ticket, &extracted);
-                (void) finish_drain(ticket);
+                ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
+                (void) extract_allocs(&ticket, &batch);
+                (void) finish_drain(ticket, batch);
             }
             sycl_exec_context = {};
         };
@@ -518,8 +518,6 @@ llama_context::llama_context(
             }
             sycl_exec_context_bound = true;
         }
-        sycl_exec_scope.armed = false;
-
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
 #    ifdef GGML_USE_SYCL
@@ -757,6 +755,9 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        sycl_exec_scope.armed = false;
+#endif
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -789,6 +790,13 @@ llama_context::~llama_context() {
     }
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (sycl_exec_context_bound && sycl_exec_context.value != 0) {
+        try {
+            synchronize();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain: %s\n", __func__, e.what());
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain\n", __func__);
+        }
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             if (!llama_context_dev_is_sycl(dev)) {
@@ -806,10 +814,19 @@ llama_context::~llama_context() {
 #    endif
             if (begin_drain && extract_allocs && finish_drain) {
                 ggml_sycl_exec_drain_ticket ticket{};
-                if (begin_drain(sycl_exec_context, &ticket) == GGML_SYCL_EXECUTION_OK) {
-                    uint32_t extracted = 0;
-                    (void) extract_allocs(&ticket, &extracted);
-                    (void) finish_drain(ticket);
+                const auto begin_rc = begin_drain(sycl_exec_context, &ticket);
+                if (begin_rc != GGML_SYCL_EXECUTION_OK) {
+                    LLAMA_LOG_ERROR("%s: failed to begin SYCL execution drain: result=%d\n", __func__, (int) begin_rc);
+                } else {
+                    ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
+                    const auto extract_rc = extract_allocs(&ticket, &batch);
+                    if (extract_rc != GGML_SYCL_EXECUTION_OK) {
+                        LLAMA_LOG_ERROR("%s: failed to extract SYCL control host allocs: result=%d\n", __func__, (int) extract_rc);
+                    }
+                    const auto drain_rc = finish_drain(ticket, batch);
+                    if (drain_rc != GGML_SYCL_EXECUTION_OK) {
+                        LLAMA_LOG_ERROR("%s: failed to finish SYCL execution drain: result=%d\n", __func__, (int) drain_rc);
+                    }
                 }
             }
             break;

@@ -1,6 +1,7 @@
 #include "execution-lifecycle.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 using namespace ggml_sycl::execution;
@@ -20,196 +21,93 @@ static ModelToken root_token(uint64_t base) {
     return { ModelId{ base }, LoadTxnId{ base + 1000 }, SlotToken{ static_cast<uint32_t>(base % 11), base + 2000 } };
 }
 
-static void h6_device_busy_exact_ownership() {
+static void h6() {
     Registry reg;
     error err = error::OK;
-    const auto a = reg.create_context(err);
-    require(err == error::OK, "H6 create A failed");
-    const auto b = reg.create_context(err);
-    require(err == error::OK, "H6 create B failed");
-    require(reg.bind_backend(a, 0) == error::OK && reg.bind_backend(a, 1) == error::OK, "H6 bind A failed");
-    require(reg.bind_backend(b, 1) == error::OK, "H6 bind B failed");
-
-    SessionId sa{};
-    SessionResetEpoch ea{};
-    const auto root_a = root_token(1);
-    require(reg.attach_root(a, root_a, &sa, &ea) == error::OK, "H6 attach A failed");
-    GraphEpoch ga{};
-    require(reg.begin_graph(a, sa, ea, root_a, &ga) == error::OK, "H6 graph A failed");
-    InvocationId ia{};
-    const int devices_a[] = { 0, 1 };
-    require(reg.begin_invocation(a, sa, ea, ga, root_a, devices_a, 2, &ia) == error::OK, "H6 invoke A failed");
-
-    SessionId sb{};
-    SessionResetEpoch eb{};
-    const auto root_b = root_token(2);
-    require(reg.attach_root(b, root_b, &sb, &eb) == error::OK, "H6 attach B failed");
-    GraphEpoch gb{};
-    require(reg.begin_graph(b, sb, eb, root_b, &gb) == error::OK, "H6 graph B failed");
-    InvocationId ib{};
-    const int device_b[] = { 1 };
-    require(reg.begin_invocation(b, sb, eb, gb, root_b, device_b, 1, &ib) == error::DEVICE_BUSY,
-            "H6 missing DEVICE_BUSY");
-
-    require(reg.complete_invocation(a, sa, ea, ga, ia, root_a) == error::OK, "H6 complete A failed");
-    require(reg.begin_invocation(b, sb, eb, gb, root_b, device_b, 1, &ib) == error::OK,
-            "H6 exact owner release failed");
+    const auto a = reg.create_context(err), b = reg.create_context(err);
+    require(err == error::OK, "H6 create failed");
+    require(reg.bind_backend(a, 0) == error::OK && reg.bind_backend(a, 1) == error::OK && reg.bind_backend(b, 1) == error::OK, "H6 bind failed");
+    SessionId sa{}, sb{}; SessionResetEpoch ea{}, eb{};
+    auto ra = root_token(1), rb = root_token(2);
+    require(reg.attach_root(a, ra, &sa, &ea) == error::OK && reg.attach_root(b, rb, &sb, &eb) == error::OK, "H6 attach failed");
+    GraphEpoch ga{}, gb{}; InvocationId ia{}, ib{}; const int da[] = {0,1}; const int db[] = {1};
+    require(reg.begin_graph(a, sa, ea, ra, &ga) == error::OK && reg.begin_graph(b, sb, eb, rb, &gb) == error::OK, "H6 graph failed");
+    require(reg.begin_invocation(a, sa, ea, ga, ra, da, 2, &ia) == error::OK, "H6 invoke A failed");
+    require(reg.begin_invocation(b, sb, eb, gb, rb, db, 1, &ib) == error::DEVICE_BUSY, "H6 missing DEVICE_BUSY");
+    require(reg.complete_invocation(a, sa, ea, ga, ia, ra, 0) == error::OK, "H6 complete dev0 failed");
+    require(reg.begin_invocation(b, sb, eb, gb, rb, db, 1, &ib) == error::DEVICE_BUSY, "H6 released all devices too early");
+    require(reg.complete_invocation(a, sa, ea, ga, ia, ra, 1) == error::OK, "H6 complete dev1 failed");
+    require(reg.begin_invocation(b, sb, eb, gb, rb, db, 1, &ib) == error::OK, "H6 exact owner release failed");
 }
 
-static void h7_terminal_retire_and_stale_proof() {
-    Registry reg;
-    error err = error::OK;
-    const auto ctx = reg.create_context(err);
-    require(err == error::OK, "H7 create failed");
+static void h7() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H7 create failed");
     require(reg.bind_backend(ctx, 0) == error::OK, "H7 bind failed");
-    SessionId session{};
-    SessionResetEpoch reset{};
-    const auto root = root_token(10);
-    require(reg.attach_root(ctx, root, &session, &reset) == error::OK, "H7 attach failed");
-    GraphEpoch graph{};
-    require(reg.begin_graph(ctx, session, reset, root, &graph) == error::OK, "H7 graph failed");
-    InvocationId invocation{};
-    const int devices[] = { 0 };
-    require(reg.begin_invocation(ctx, session, reset, graph, root, devices, 1, &invocation) == error::OK,
-            "H7 invocation failed");
-    require(reg.quarantine_invocation(ctx, session, reset, graph, invocation, root) == error::OK,
-            "H7 quarantine failed");
-    DrainTicket drain{};
-    ResetTicket reset_ticket{};
-    require(reg.begin_drain(ctx, &drain) == error::BUSY, "H7 drain crossed terminal-unretired graph");
-    require(reg.begin_reset(ctx, session, reset, &reset_ticket) == error::BUSY,
-            "H7 reset crossed terminal-unretired graph");
-    require(reg.begin_graph(ctx, session, reset, root, &graph) == error::BUSY,
-            "H7 begin_graph overwrote terminal graph");
-    require(reg.retire_graph(ctx, session, reset, graph, root) == error::OK, "H7 retire failed");
-    require(reg.retire_graph(ctx, session, reset, graph, root) == error::STALE, "H7 stale retire proof failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(10); require(reg.attach_root(ctx, root, &s, &e) == error::OK, "H7 attach failed");
+    GraphEpoch g{}; InvocationId i{}; const int d[] = {0};
+    require(reg.begin_graph(ctx, s, e, root, &g) == error::OK && reg.begin_invocation(ctx, s, e, g, root, d, 1, &i) == error::OK, "H7 invoke failed");
+    require(reg.quarantine_invocation(ctx, s, e, g, i, root, 0) == error::OK, "H7 quarantine failed");
+    DrainTicket dt{}; ResetTicket rt{};
+    require(reg.begin_drain(ctx, &dt) == error::BUSY && reg.begin_reset(ctx, s, e, &rt) == error::BUSY, "H7 terminal graph not blocking");
+    require(reg.begin_graph(ctx, s, e, root, &g) == error::BUSY, "H7 terminal overwritten");
+    require(reg.retire_graph(ctx, s, e, g, root) == error::OK, "H7 retire failed");
+    require(reg.retire_graph(ctx, s, e, g, root) == error::STALE, "H7 stale retire proof failed");
 }
 
-static void h11_token_root_retention() {
-    Registry reg;
-    error err = error::OK;
-    const auto ctx = reg.create_context(err);
-    require(err == error::OK, "H11 create failed");
+static void h11() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H11 create failed");
     require(reg.bind_backend(ctx, 0) == error::OK, "H11 bind failed");
-    SessionId session{};
-    SessionResetEpoch reset{};
-    const auto root = root_token(20);
-    require(reg.attach_root(ctx, root, &session, &reset) == error::OK, "H11 attach failed");
-    GraphEpoch graph{};
-    require(reg.begin_graph(ctx, session, reset, root, &graph) == error::OK, "H11 graph failed");
-    InvocationId invocation{};
-    const int devices[] = { 0 };
-    require(reg.begin_invocation(ctx, session, reset, graph, root, devices, 1, &invocation) == error::OK,
-            "H11 invocation failed");
-    snapshot snap{};
-    require(reg.extract(ctx, &snap) == error::OK && snap.token_root == root &&
-                snap.token_root_state == token_root_phase::OPEN,
-            "H11 OPEN retention failed");
-    require(reg.seal_invocation(ctx, session, reset, graph, invocation, root) == error::OK, "H11 seal failed");
-    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::SEALED,
-            "H11 SEALED retention failed");
-    require(reg.complete_invocation(ctx, session, reset, graph, invocation, root) == error::OK, "H11 complete failed");
-    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::COMPLETE,
-            "H11 COMPLETE retention failed");
-    require(reg.retire_graph(ctx, session, reset, graph, root) == error::OK, "H11 retire complete failed");
-    GraphEpoch graph2{};
-    require(reg.begin_graph(ctx, session, reset, root, &graph2) == error::OK, "H11 graph2 failed");
-    InvocationId invocation2{};
-    require(reg.begin_invocation(ctx, session, reset, graph2, root, devices, 1, &invocation2) == error::OK,
-            "H11 invocation2 failed");
-    require(reg.quarantine_invocation(ctx, session, reset, graph2, invocation2, root) == error::OK,
-            "H11 quarantine failed");
-    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::QUARANTINED,
-            "H11 QUARANTINED retention failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(20); require(reg.attach_root(ctx, root, &s, &e) == error::OK, "H11 attach failed");
+    GraphEpoch g{}; InvocationId i{}; const int d[] = {0}; snapshot snap{};
+    require(reg.begin_graph(ctx, s, e, root, &g) == error::OK && reg.begin_invocation(ctx, s, e, g, root, d, 1, &i) == error::OK, "H11 invoke failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::OPEN, "H11 open failed");
+    require(reg.seal_invocation(ctx, s, e, g, i, root) == error::OK, "H11 seal failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::SEALED, "H11 sealed failed");
+    require(reg.complete_invocation(ctx, s, e, g, i, root, 0) == error::OK, "H11 complete failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::COMPLETE, "H11 complete state failed");
+    require(reg.retire_graph(ctx, s, e, g, root) == error::OK, "H11 retire complete failed");
+    require(reg.begin_graph(ctx, s, e, root, &g) == error::OK && reg.begin_invocation(ctx, s, e, g, root, d, 1, &i) == error::OK, "H11 invoke2 failed");
+    require(reg.quarantine_invocation(ctx, s, e, g, i, root, 0) == error::OK, "H11 quarantine failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::QUARANTINED, "H11 quarantine state failed");
 }
 
-static void h13_owner_reset_and_mutations() {
-    Registry reg;
-    error err = error::OK;
-    const auto ctx = reg.create_context(err);
-    require(err == error::OK, "H13 create failed");
+static void h13() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H13 create failed");
     require(reg.bind_backend(ctx, 3) == error::OK, "H13 bind failed");
-    SessionId session{};
-    SessionResetEpoch reset{};
-    const auto root = root_token(30);
-    require(reg.attach_root(ctx, root, &session, &reset) == error::OK, "H13 attach failed");
-    snapshot snap{};
-    require(reg.extract(ctx, &snap) == error::OK && snap.context == ctx && snap.session == session &&
-                snap.reset_epoch == reset && snap.bound_device_count == 1,
-            "H13 extract failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(30); require(reg.attach_root(ctx, root, &s, &e) == error::OK, "H13 attach failed");
+    snapshot snap{}; require(reg.extract(ctx, &snap) == error::OK && snap.bound_device_count == 1, "H13 extract failed");
+    ResetTicket rt{}; require(reg.begin_reset(ctx, s, e, &rt) == error::OK, "H13 begin reset failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.context_state == context_phase::RESETTING, "H13 resetting invisible");
+    SessionResetEpoch next{}; require(reg.finish_reset(rt, &next) == error::OK && next.value == e.value + 1, "H13 finish reset failed");
+    DrainTicket dt{}; require(reg.begin_drain(ctx, &dt) == error::OK, "H13 begin drain failed");
+    require(reg.extract(ctx, &snap) == error::OK && snap.context_state == context_phase::DRAINING, "H13 draining invisible");
+    require(reg.note_drain_extracted_control_host_allocs(&dt, 7) == error::OK && dt.extracted_control_host_allocs == 7, "H13 drain extract failed");
+    require(reg.finish_drain(dt) == error::OK, "H13 finish drain failed");
 
-    ResetTicket reset_ticket{};
-    require(reg.begin_reset(ctx, session, reset, &reset_ticket) == error::OK, "H13 begin reset failed");
-    require(reg.extract(ctx, &snap) == error::OK && snap.context_state == context_phase::RESETTING &&
-                snap.session_state == session_phase::RESETTING,
-            "H13 RESETTING not observable");
-    SessionResetEpoch next_reset{};
-    require(reg.finish_reset(reset_ticket, &next_reset) == error::OK && next_reset.value == reset.value + 1,
-            "H13 finish reset failed");
-
-    DrainTicket drain{};
-    require(reg.begin_drain(ctx, &drain) == error::OK, "H13 begin drain failed");
-    require(reg.extract(ctx, &snap) == error::OK && snap.context_state == context_phase::DRAINING,
-            "H13 DRAINING not observable");
-    require(reg.note_drain_extracted_control_host_allocs(&drain, 0) == error::OK,
-            "H13 extract control-host scaffolding failed");
-    require(reg.finish_drain(drain) == error::OK, "H13 finish drain failed");
-
-    Registry m4(test_mutation::M4_CONTEXT_ID_OVERFLOW);
-    m4.create_context(err);
-    require(err == error::OVERFLOW, "H13 M4 hook failed");
-    Registry m5(test_mutation::M5_SESSION_ID_OVERFLOW);
-    const auto ctx5 = m5.create_context(err);
-    require(err == error::OK && m5.bind_backend(ctx5, 0) == error::OK, "H13 M5 setup failed");
-    SessionId s5{};
-    SessionResetEpoch e5{};
-    require(m5.attach_root(ctx5, root, &s5, &e5) == error::OVERFLOW, "H13 M5 hook failed");
-    Registry m6a(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW);
-    const auto ctx6a = m6a.create_context(err);
-    require(err == error::OK && m6a.bind_backend(ctx6a, 0) == error::OK, "H13 M6a setup failed");
-    SessionId s6a{};
-    SessionResetEpoch e6a{};
-    require(m6a.attach_root(ctx6a, root, &s6a, &e6a) == error::OK, "H13 M6a attach failed");
-    GraphEpoch g6a{};
-    require(m6a.begin_graph(ctx6a, s6a, e6a, root, &g6a) == error::OVERFLOW, "H13 M6a hook failed");
-    Registry m6e(test_mutation::M6e_INVOCATION_ID_OVERFLOW);
-    const auto ctx6e = m6e.create_context(err);
-    require(err == error::OK && m6e.bind_backend(ctx6e, 0) == error::OK, "H13 M6e setup failed");
-    SessionId s6e{};
-    SessionResetEpoch e6e{};
-    require(m6e.attach_root(ctx6e, root, &s6e, &e6e) == error::OK, "H13 M6e attach failed");
-    GraphEpoch g6e{};
-    require(m6e.begin_graph(ctx6e, s6e, e6e, root, &g6e) == error::OK, "H13 M6e graph failed");
-    InvocationId i6e{};
-    const int device[] = { 0 };
-    require(m6e.begin_invocation(ctx6e, s6e, e6e, g6e, root, device, 1, &i6e) == error::OVERFLOW,
-            "H13 M6e hook failed");
+    Registry m4(test_mutation::M4_CONTEXT_ID_OVERFLOW); m4.create_context(err); require(err == error::OVERFLOW, "H13 M4 failed");
+    Registry m5(test_mutation::M5_SESSION_ID_OVERFLOW); const auto c5 = m5.create_context(err); require(err == error::OK && m5.bind_backend(c5,0)==error::OK, "H13 M5 setup failed"); SessionId s5{}; SessionResetEpoch e5{}; require(m5.attach_root(c5, root, &s5, &e5) == error::OVERFLOW, "H13 M5 failed");
+    Registry m6a(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW); const auto c6a = m6a.create_context(err); require(err == error::OK && m6a.bind_backend(c6a,0)==error::OK, "H13 M6a setup failed"); SessionId s6a{}; SessionResetEpoch e6a{}; GraphEpoch g6a{}; require(m6a.attach_root(c6a, root, &s6a, &e6a) == error::OK && m6a.begin_graph(c6a, s6a, e6a, root, &g6a) == error::OVERFLOW, "H13 M6a failed");
+    Registry m6b(test_mutation::M6b_DRAIN_SERIAL_OVERFLOW); const auto c6b = m6b.create_context(err); require(err == error::OK && m6b.bind_backend(c6b,0)==error::OK, "H13 M6b setup failed"); SessionId s6b{}; SessionResetEpoch e6b{}; require(m6b.attach_root(c6b, root, &s6b, &e6b) == error::OK, "H13 M6b attach failed"); DrainTicket d6b{}; require(m6b.begin_drain(c6b, &d6b) == error::OVERFLOW, "H13 M6b failed");
+    Registry m6c(test_mutation::M6c_RESET_SERIAL_OVERFLOW); const auto c6c = m6c.create_context(err); require(err == error::OK && m6c.bind_backend(c6c,0)==error::OK, "H13 M6c setup failed"); SessionId s6c{}; SessionResetEpoch e6c{}; require(m6c.attach_root(c6c, root, &s6c, &e6c) == error::OK, "H13 M6c attach failed"); ResetTicket r6c{}; require(m6c.begin_reset(c6c, s6c, e6c, &r6c) == error::OVERFLOW, "H13 M6c failed");
+    Registry m6e(test_mutation::M6e_INVOCATION_ID_OVERFLOW); const auto c6e = m6e.create_context(err); require(err == error::OK && m6e.bind_backend(c6e,0)==error::OK, "H13 M6e setup failed"); SessionId s6e{}; SessionResetEpoch e6e{}; GraphEpoch g6e{}; InvocationId i6e{}; const int d[] = {0}; require(m6e.attach_root(c6e, root, &s6e, &e6e) == error::OK && m6e.begin_graph(c6e, s6e, e6e, root, &g6e) == error::OK && m6e.begin_invocation(c6e, s6e, e6e, g6e, root, d, 1, &i6e) == error::OVERFLOW, "H13 M6e failed");
 }
 
-static void independent_same_device_contexts() {
-    Registry reg;
-    error err = error::OK;
-    const auto a = reg.create_context(err);
-    require(err == error::OK, "same-device A create failed");
-    const auto b = reg.create_context(err);
-    require(err == error::OK, "same-device B create failed");
-    require(reg.bind_backend(a, 0) == error::OK && reg.bind_backend(b, 0) == error::OK,
-            "same-device bind failed");
-    snapshot snap{};
-    require(reg.extract(a, &snap) == error::OK && snap.bound_device_count == 1, "same-device extract A failed");
-    require(reg.extract(b, &snap) == error::OK && snap.bound_device_count == 1, "same-device extract B failed");
-    DrainTicket drain{};
-    require(reg.begin_drain(a, &drain) == error::OK, "same-device begin drain A failed");
-    require(reg.finish_drain(drain) == error::OK, "same-device finish drain A failed");
-    require(reg.extract(b, &snap) == error::OK && snap.bound_device_count == 1,
-            "same-device close of A damaged B");
+static void g2_multi_live() {
+    Registry reg; error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "G2 create failed");
+    require(reg.bind_backend(a, 2) == error::OK && reg.bind_backend(b, 2) == error::OK, "G2 bind failed");
+    snapshot snap{}; require(reg.extract(a, &snap) == error::OK && snap.bound_device_count == 1, "G2 extract A failed");
+    require(reg.extract(b, &snap) == error::OK && snap.bound_device_count == 1, "G2 extract B failed");
+    DrainTicket dt{}; require(reg.begin_drain(a, &dt) == error::OK && reg.finish_drain(dt) == error::OK, "G2 drain A failed");
+    require(reg.extract(b, &snap) == error::OK && snap.bound_device_count == 1, "G2 B damaged by A close");
 }
 
-int main() {
-    h6_device_busy_exact_ownership();
-    h7_terminal_retire_and_stale_proof();
-    h11_token_root_retention();
-    h13_owner_reset_and_mutations();
-    independent_same_device_contexts();
+int main(int argc, char ** argv) {
+    const char * which = argc > 2 && std::strcmp(argv[1], "--case") == 0 ? argv[2] : "all";
+    if (std::strcmp(which, "H6") == 0) h6();
+    else if (std::strcmp(which, "H7") == 0) h7();
+    else if (std::strcmp(which, "H11") == 0) h11();
+    else if (std::strcmp(which, "H13") == 0) h13();
+    else if (std::strcmp(which, "G2") == 0) g2_multi_live();
+    else { h6(); h7(); h11(); h13(); g2_multi_live(); }
     return 0;
 }

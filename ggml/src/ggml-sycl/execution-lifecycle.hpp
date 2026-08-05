@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +47,8 @@ enum class test_mutation {
     M4_CONTEXT_ID_OVERFLOW,
     M5_SESSION_ID_OVERFLOW,
     M6a_GRAPH_EPOCH_OVERFLOW,
+    M6b_DRAIN_SERIAL_OVERFLOW,
+    M6c_RESET_SERIAL_OVERFLOW,
     M6e_INVOCATION_ID_OVERFLOW,
 };
 
@@ -62,6 +65,11 @@ struct snapshot {
     lifecycle::ModelToken token_root{};
     uint32_t             bound_device_count = 0;
     uint32_t             busy_device_count  = 0;
+};
+
+struct ControlAllocBatch {
+    void *   opaque = nullptr;
+    uint32_t count  = 0;
 };
 
 struct DrainTicket {
@@ -98,10 +106,10 @@ class Registry {
     error seal_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                           InvocationId invocation, lifecycle::ModelToken root) noexcept;
     error complete_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                              InvocationId invocation, lifecycle::ModelToken root) noexcept;
+                              InvocationId invocation, lifecycle::ModelToken root, int device) noexcept;
     error quarantine_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                 GraphEpoch graph_epoch, InvocationId invocation,
-                                lifecycle::ModelToken root) noexcept;
+                                lifecycle::ModelToken root, int device) noexcept;
     error retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                        GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
 
@@ -117,12 +125,14 @@ class Registry {
 
   private:
     struct graph_entry {
-        GraphEpoch            id{};
-        graph_phase           state = graph_phase::IDLE;
-        token_root_phase      token_root_state = token_root_phase::OPEN;
-        lifecycle::ModelToken token_root{};
-        InvocationId          invocation{};
-        std::vector<int>      devices;
+        GraphEpoch                  id{};
+        graph_phase                 state = graph_phase::IDLE;
+        token_root_phase            token_root_state = token_root_phase::OPEN;
+        lifecycle::ModelToken       token_root{};
+        InvocationId                invocation{};
+        std::vector<int>            devices;
+        std::array<bool, max_devices> device_complete{};
+        uint32_t                    pending_device_count = 0;
     };
 
     struct session_entry {
@@ -157,8 +167,10 @@ class Registry {
     error validate_root(const lifecycle::ModelToken & expected, const lifecycle::ModelToken & actual) const noexcept;
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
+    error abort_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
+                      lifecycle::ModelToken root) noexcept;
     error finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                            InvocationId invocation, lifecycle::ModelToken root, graph_phase terminal,
+                            InvocationId invocation, lifecycle::ModelToken root, int device, graph_phase terminal,
                             token_root_phase token_terminal) noexcept;
 
     mutable std::mutex                          mutex_;

@@ -1027,6 +1027,7 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_cancel_unload)
     LOAD_SYCL(ggml_backend_sycl_test_hold_live_update)
     LOAD_SYCL(ggml_backend_sycl_test_release_live_update)
+    LOAD_SYCL(ggml_backend_sycl_test_seed_control_host_allocs)
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_execution_context_create)
@@ -1139,10 +1140,11 @@ int main() {
     ggml_sycl_execution_snapshot exec_snapshot{};
     ggml_sycl_exec_drain_ticket drain_ticket{};
     ggml_sycl_exec_reset_ticket reset_ticket{};
+    ggml_sycl_exec_control_host_alloc_batch drain_batch{ nullptr, 0 };
     if (CALL_SYCL(ggml_backend_sycl_execution_context_extract)({}, &exec_snapshot) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_begin_drain)({}, &drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_ticket.extracted_control_host_allocs) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket, drain_batch) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_session_begin_reset)({}, {}, {}, &reset_ticket) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_session_finish_reset)(reset_ticket, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE) {
         std::fprintf(stderr, "execution lifecycle invalid-input contract mismatch\n");

@@ -780,6 +780,10 @@ struct ggml_sycl_exec_session_id { uint64_t value; };
 struct ggml_sycl_exec_session_reset_epoch { uint64_t value; };
 struct ggml_sycl_exec_graph_epoch { uint64_t value; };
 struct ggml_sycl_exec_invocation_id { uint64_t value; };
+struct ggml_sycl_exec_control_host_alloc_batch {
+    void *   opaque;
+    uint32_t count;
+};
 struct ggml_sycl_exec_drain_ticket {
     struct ggml_sycl_exec_context_id context_id;
     struct ggml_sycl_exec_session_id session_id;
@@ -918,9 +922,10 @@ GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_con
     struct ggml_sycl_exec_drain_ticket * ticket);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs(
     struct ggml_sycl_exec_drain_ticket * ticket,
-    uint32_t * extracted_count);
+    struct ggml_sycl_exec_control_host_alloc_batch * batch);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(
-    struct ggml_sycl_exec_drain_ticket ticket);
+    struct ggml_sycl_exec_drain_ticket ticket,
+    struct ggml_sycl_exec_control_host_alloc_batch batch);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_session_begin_reset(
     struct ggml_sycl_exec_context_id context,
     struct ggml_sycl_exec_session_id session,
