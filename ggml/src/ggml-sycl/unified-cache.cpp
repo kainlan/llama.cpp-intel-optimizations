@@ -12939,12 +12939,14 @@ bool shutdown_unified_cache() {
     // under its lock, then destroy caches without the registry lock held so
     // mem_handle release callbacks cannot deadlock on cache lookup.
     std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
+    runtime_allocation_owner_snapshot                      owner_snapshot;
     {
         // Module mutation admission is closed. Retain a stable owner snapshot,
         // then drop the map lock before callbacks/free paths that may re-enter
         // cache lookup or allocation bookkeeping.
         std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
         caches = g_device_caches;
+        owner_snapshot = capture_runtime_allocation_owner_snapshot();
     }
     for (auto & item : caches) {
         if (item.second && !item.second->shutdown_resources()) {
@@ -12955,7 +12957,7 @@ bool shutdown_unified_cache() {
     g_sycl_shutting_down.store(false, std::memory_order_release);
     // Any retryable dirty boundary must be detected before destroying the last
     // cache owners or shared queues, so a failed unload can retry exactly.
-    if (!unified_cache_shutdown_retryable_postconditions_clean()) {
+    if (!unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot)) {
         return false;
     }
     if (!release_cache_owned_runtime_allocations_for_final_shutdown()) {
