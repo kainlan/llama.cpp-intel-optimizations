@@ -96,8 +96,14 @@ error Registry::begin_graph(ContextId context, SessionId session, SessionResetEp
     return error::OK;
 }
 
-error Registry::abort_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                            lifecycle::ModelToken root) noexcept {
+error Registry::rollback_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                               GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return abort_graph_locked(context, session, reset_epoch, graph_epoch, root);
+}
+
+error Registry::abort_graph_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                   GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     auto & entry = it->second;

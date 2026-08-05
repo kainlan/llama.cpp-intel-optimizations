@@ -110,6 +110,8 @@ class Registry {
     error quarantine_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                 GraphEpoch graph_epoch, InvocationId invocation,
                                 lifecycle::ModelToken root, int device) noexcept;
+    error rollback_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                         GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
     error retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                        GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
 
@@ -167,8 +169,8 @@ class Registry {
     error validate_root(const lifecycle::ModelToken & expected, const lifecycle::ModelToken & actual) const noexcept;
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
-    error abort_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                      lifecycle::ModelToken root) noexcept;
+    error abort_graph_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
+                             lifecycle::ModelToken root) noexcept;
     error finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                             InvocationId invocation, lifecycle::ModelToken root, int device, graph_phase terminal,
                             token_root_phase token_terminal) noexcept;

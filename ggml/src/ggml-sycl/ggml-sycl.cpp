@@ -11297,7 +11297,7 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     ggml_sycl::execution::InvocationId invocation{};
     if (registry.begin_invocation({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner,
                                   devices.data(), devices.size(), &invocation) != ggml_sycl::execution::error::OK) {
-        (void) registry.abort_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
+        (void) registry.rollback_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
         return false;
     }
     ctx->execution_graph_epoch = graph_epoch.value;
