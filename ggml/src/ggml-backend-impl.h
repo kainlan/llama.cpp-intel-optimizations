@@ -65,6 +65,8 @@ extern "C" {
         uint32_t     (*get_caps)     (ggml_backend_buffer_t buffer);
     };
 
+    typedef void (*ggml_backend_buffer_context_cleanup_t)(void * context);
+
     struct ggml_backend_buffer {
         struct ggml_backend_buffer_i  iface;
         ggml_backend_buffer_type_t    buft;
@@ -73,14 +75,13 @@ extern "C" {
         enum ggml_backend_buffer_usage usage;
         ggml_backend_dev_t owner_device;
         bool owner_lease;
+        ggml_backend_buffer_context_cleanup_t context_cleanup;
     };
 
     // Transfer a buffer produced through a proxy type to its true product
     // owner, preserving durable registry ownership without double counting.
     GGML_API void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer);
     GGML_API bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft);
-
-    typedef void (*ggml_backend_buffer_context_cleanup_t)(void * context);
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
             ggml_backend_buffer_type_t buft,
             struct ggml_backend_buffer_i iface,
@@ -269,6 +270,7 @@ extern "C" {
     GGML_API void ggml_backend_test_fail_next_owner_adoption(void);
     GGML_API void ggml_backend_test_fail_next_buffer_wrapper(void);
     GGML_API void ggml_backend_test_fail_next_buffer_emplace(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_refresh(void);
     GGML_API void ggml_backend_test_fail_next_event_emplace(void);
     GGML_API size_t ggml_backend_test_owner_close_attempts(void);
     GGML_API size_t ggml_backend_test_owner_transfer_attempts(void);

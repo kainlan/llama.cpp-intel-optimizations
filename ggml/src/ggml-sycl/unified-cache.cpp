@@ -12712,6 +12712,32 @@ static void shutdown_shared_context_queues() noexcept {
     g_shared_ctx_queues_initialized_for = 0;
 }
 
+static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
+    try {
+        if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic dirty shutdown postcondition; retaining owners for retry\n");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            if (!g_runtime_alloc_registry.empty()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
+                return false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
+            if (!g_offload_pool_slots.empty() || !g_offload_pool_free.empty()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] offload pool still populated at shutdown boundary\n");
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool unified_cache_shutdown_state_clean() noexcept {
     try {
         std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
@@ -12721,15 +12747,7 @@ bool unified_cache_shutdown_state_clean() noexcept {
         for (const auto * queue : g_shared_ctx_queues) {
             if (queue != nullptr) return false;
         }
-        {
-            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
-            if (!g_runtime_alloc_registry.empty()) return false;
-        }
-        {
-            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
-            if (!g_offload_pool_slots.empty() || !g_offload_pool_free.empty()) return false;
-        }
-        return true;
+        return unified_cache_shutdown_retryable_postconditions_clean();
     } catch (...) {
         return false;
     }
@@ -12754,11 +12772,9 @@ bool shutdown_unified_cache() {
         }
     }
     g_sycl_shutting_down.store(false, std::memory_order_release);
-    // Keep the drained cache owners movable until every postcondition passes;
-    // a release-build failure restores them to the global map for retry.
-    // Preserve deterministic retry coverage before irreversible owner teardown.
-    if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic shutdown-clean failure; retaining owners for retry\n");
+    // Any retryable dirty boundary must be detected before destroying the last
+    // cache owners or shared queues, so a failed unload can retry exactly.
+    if (!unified_cache_shutdown_retryable_postconditions_clean()) {
         return false;
     }
     {
@@ -12775,7 +12791,7 @@ bool shutdown_unified_cache() {
     // owners are gone; otherwise a 2 GiB chunk can survive until DSO destruction.
     const bool clean = unified_cache_shutdown_state_clean();
     if (!clean) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown postcondition failed after owner teardown\n");
+        GGML_LOG_ERROR("[UNIFIED-CACHE] explicit shutdown invariant failed after owner teardown\n");
         return false;
     }
     // Any later static destructors must not re-enter SYCL after explicit DSO

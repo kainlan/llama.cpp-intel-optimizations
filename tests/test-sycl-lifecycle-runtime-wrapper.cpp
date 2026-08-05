@@ -39,6 +39,8 @@ static std::condition_variable g_device_callback_cv;
 static bool                    g_device_callback_block = false;
 static bool                    g_fixture_event_free_throw = false;
 static bool                    g_device_callback_entered = false;
+static int                     g_fixture_event_free_calls = 0;
+static int                     g_fixture_buffer_free_calls = 0;
 static std::mutex              g_commit_reactivate_mutex;
 static std::condition_variable g_commit_reactivate_cv;
 static bool                    g_commit_reactivate_block = false;
@@ -64,17 +66,29 @@ static ggml_backend_event_t registry_fixture_event_new(ggml_backend_dev_t device
     return reinterpret_cast<ggml_backend_event_t>(new legacy_v2_event_layout{ device, nullptr });
 }
 static void registry_fixture_event_free(ggml_backend_dev_t, ggml_backend_event_t event) {
+    ++g_fixture_event_free_calls;
     delete reinterpret_cast<legacy_v2_event_layout *>(event);
     if (g_fixture_event_free_throw) throw std::runtime_error("fixture event free failure");
 }
-struct fixture_owned_context { int * live; };
+struct fixture_owned_context {
+    int * live;
+    int * cleanup_calls = nullptr;
+};
 static void registry_fixture_context_cleanup(void * opaque) {
     auto * context = static_cast<fixture_owned_context *>(opaque);
+    if (context->cleanup_calls) {
+        ++*context->cleanup_calls;
+    }
     --*context->live;
     delete context;
 }
 static void registry_fixture_buffer_free_owned(ggml_backend_buffer_t buffer) {
+    ++g_fixture_buffer_free_calls;
     registry_fixture_context_cleanup(buffer->context);
+    buffer->context = nullptr;
+}
+static void registry_fixture_buffer_free_passthrough(ggml_backend_buffer_t) {
+    ++g_fixture_buffer_free_calls;
 }
 static void registry_fixture_buffer_free_throw(ggml_backend_buffer_t) {
     throw std::runtime_error("fixture buffer free failure");
@@ -202,11 +216,18 @@ static bool run_registry_failure_fixture() {
     static ggml_backend_device orphan_dev{};
     static ggml_backend_buffer_type orphan_buft{};
     orphan_dev.reg = &orphan_reg;
+    orphan_dev.iface.event_new = registry_fixture_event_new;
+    orphan_dev.iface.event_free = registry_fixture_event_free;
     orphan_buft.device = &orphan_dev;
-    auto orphan_buffer = ggml_backend_buffer_init(&orphan_buft, {}, nullptr, 0);
-    if (!pre_registry_buffer || !pre_registry_event || !orphan_buffer) return false;
+    ggml_backend_buffer_i orphan_iface{};
+    orphan_iface.free_buffer = registry_fixture_buffer_free_passthrough;
+    auto orphan_buffer = ggml_backend_buffer_init(&orphan_buft, orphan_iface, nullptr, 0);
+    auto orphan_event = ggml_backend_event_new(&orphan_dev);
+    if (!pre_registry_buffer || !pre_registry_event || !orphan_buffer || !orphan_event) return false;
     phase("generic fixture: initialize registry with owners still pending");
     (void) ggml_backend_reg_count();
+    g_fixture_event_free_calls = 0;
+    g_fixture_buffer_free_calls = 0;
     phase("generic fixture: overlap lifecycle adoption and buffer free");
     ggml_backend_test_block_owner_adoption(true);
     auto adopting_register = std::async(std::launch::async, [reg] { ggml_backend_register(reg); });
@@ -296,10 +317,18 @@ static bool run_registry_failure_fixture() {
     ggml_backend_test_fail_next_owner_adoption();
     ggml_backend_register(&orphan_reg);
     if (ggml_backend_test_durable_owners(&orphan_reg) != 0) return false;
+    phase("generic fixture: immediate free after failed first publication");
+    ggml_backend_buffer_free(orphan_buffer);
+    ggml_backend_event_free(orphan_event);
+    if (g_fixture_buffer_free_calls != 1 || g_fixture_event_free_calls != 1) return false;
+    orphan_buffer = ggml_backend_buffer_init(&orphan_buft, orphan_iface, nullptr, 0);
+    orphan_event = ggml_backend_event_new(&orphan_dev);
+    if (!orphan_buffer || !orphan_event) return false;
     ggml_backend_register(&orphan_reg);
-    if (ggml_backend_test_durable_owners(&orphan_reg) != 1 ||
+    if (ggml_backend_test_durable_owners(&orphan_reg) != 2 ||
         ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
     ggml_backend_buffer_free(orphan_buffer);
+    ggml_backend_event_free(orphan_event);
     if (ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_OK) return false;
     phase("generic fixture: free adopted legacy-v2 event");
     ggml_backend_event_free(pre_registry_event);
@@ -336,16 +365,34 @@ static bool run_registry_failure_fixture() {
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
     phase("generic fixture: owner-map allocation and throwing teardown recovery");
     int wrapper_owned_resources = 1;
+    int wrapper_cleanup_calls = 0;
     ggml_backend_buffer_i owned_iface{};
-    owned_iface.free_buffer = registry_fixture_buffer_free_owned;
+    owned_iface.free_buffer = registry_fixture_buffer_free_passthrough;
     ggml_backend_test_fail_next_buffer_wrapper();
     if (ggml_backend_buffer_init_with_cleanup(&pre_registry_buft, owned_iface,
-                                 new fixture_owned_context{ &wrapper_owned_resources }, 0,
+                                 new fixture_owned_context{ &wrapper_owned_resources, &wrapper_cleanup_calls }, 0,
                                  registry_fixture_context_cleanup) != nullptr ||
-        wrapper_owned_resources != 0 || ggml_backend_test_durable_owners(reg) != 0) return false;
+        wrapper_owned_resources != 0 || wrapper_cleanup_calls != 1 || ggml_backend_test_durable_owners(reg) != 0) return false;
+    int acquire_owned_resources = 1;
+    int acquire_cleanup_calls = 0;
+    if (ggml_backend_buffer_init_with_cleanup(&orphan_buft, owned_iface,
+                                 new fixture_owned_context{ &acquire_owned_resources, &acquire_cleanup_calls }, 0,
+                                 registry_fixture_context_cleanup) != nullptr ||
+        acquire_owned_resources != 0 || acquire_cleanup_calls != 1 || ggml_backend_test_durable_owners(reg) != 0) return false;
+    int emplace_owned_resources = 1;
+    int emplace_cleanup_calls = 0;
     ggml_backend_test_fail_next_buffer_emplace();
-    if (ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0) != nullptr ||
-        ggml_backend_test_durable_owners(reg) != 0) return false;
+    if (ggml_backend_buffer_init_with_cleanup(&pre_registry_buft, owned_iface,
+                                 new fixture_owned_context{ &emplace_owned_resources, &emplace_cleanup_calls }, 0,
+                                 registry_fixture_context_cleanup) != nullptr ||
+        emplace_owned_resources != 0 || emplace_cleanup_calls != 1 || ggml_backend_test_durable_owners(reg) != 0) return false;
+    int refresh_owned_resources = 1;
+    int refresh_cleanup_calls = 0;
+    ggml_backend_test_fail_next_buffer_refresh();
+    if (ggml_backend_buffer_init_with_cleanup(nullptr, owned_iface,
+                                 new fixture_owned_context{ &refresh_owned_resources, &refresh_cleanup_calls }, 0,
+                                 registry_fixture_context_cleanup) != nullptr ||
+        refresh_owned_resources != 0 || refresh_cleanup_calls != 1 || ggml_backend_test_durable_owners(reg) != 0) return false;
     ggml_backend_test_fail_next_event_emplace();
     if (ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context)) != nullptr ||
         ggml_backend_test_durable_owners(reg) != 0) return false;
@@ -638,6 +685,19 @@ int main() {
     phase("retry module unload detects shutdown-clean failure");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
         std::fprintf(stderr, "shutdown clean=false did not retain owners transactionally\n");
+        return 1;
+    }
+    size_t free_after_dirty_failure = 0;
+    size_t total_after_dirty_failure = 0;
+    initial_get_device_memory(0, &free_after_dirty_failure, &total_after_dirty_failure);
+    constexpr size_t dirty_failure_noise = 256ull * 1024ull * 1024ull;
+    const size_t dirty_failure_recovery = free_after_dirty_failure > free_with_cache ?
+                                              free_after_dirty_failure - free_with_cache : 0;
+    if (total_after_dirty_failure != total_before_cache ||
+        dirty_failure_recovery + dirty_failure_noise >= measured_cache_drop) {
+        std::fprintf(stderr,
+                     "dirty shutdown retry lost retained cache owners: before=%zu dirty=%zu cached=%zu\n",
+                     free_before_cache, free_after_dirty_failure, free_with_cache);
         return 1;
     }
     if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {

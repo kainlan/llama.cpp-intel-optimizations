@@ -117,6 +117,7 @@ static std::atomic<size_t> g_owner_transfer_attempts{ 0 };
 static std::atomic<uint64_t> g_live_owner_epoch{ 1 };
 static std::atomic<bool> g_fail_next_buffer_wrapper{ false };
 static std::atomic<bool> g_fail_next_buffer_emplace{ false };
+static std::atomic<bool> g_fail_next_buffer_refresh{ false };
 static std::atomic<bool> g_fail_next_event_emplace{ false };
 
 static live_owner_store & live_owners() {
@@ -154,6 +155,11 @@ void ggml_backend_test_fail_next_buffer_wrapper(void) {
 void ggml_backend_test_fail_next_buffer_emplace(void) {
     g_fail_next_buffer_emplace.store(true, std::memory_order_release);
 }
+
+void ggml_backend_test_fail_next_buffer_refresh(void) {
+    g_fail_next_buffer_refresh.store(true, std::memory_order_release);
+}
+
 void ggml_backend_test_fail_next_event_emplace(void) {
     g_fail_next_event_emplace.store(true, std::memory_order_release);
 }
@@ -341,6 +347,36 @@ bool ggml_backend_buft_has_cap(ggml_backend_buffer_type_t buft, enum ggml_backen
 
 // backend buffer
 
+static void ggml_backend_buffer_run_context_cleanup(ggml_backend_buffer_t buffer, const char * message) {
+    if (!buffer || !buffer->context_cleanup || !buffer->context) return;
+    void * context = buffer->context;
+    buffer->context = nullptr;
+    auto cleanup = buffer->context_cleanup;
+    buffer->context_cleanup = nullptr;
+    try { cleanup(context); }
+    catch (...) { GGML_LOG_ERROR("%s\n", message); }
+}
+
+static void ggml_backend_buffer_discard_failed_init(ggml_backend_buffer_t buffer, bool inserted, const char * callback_msg,
+                                                    const char * cleanup_msg) {
+    if (!buffer) return;
+    if (inserted) {
+        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
+        g_live_buffers.erase(buffer);
+    }
+    if (buffer->iface.free_buffer) {
+        try { buffer->iface.free_buffer(buffer); }
+        catch (...) { GGML_LOG_ERROR("%s\n", callback_msg); }
+    }
+    ggml_backend_buffer_run_context_cleanup(buffer, cleanup_msg);
+    if (buffer->owner_lease) {
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (release) release(buffer->owner_device);
+        buffer->owner_lease = false;
+    }
+    delete buffer;
+}
+
 void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer) {
     if (!buffer) return;
     ggml_backend_dev_t device = nullptr;
@@ -455,7 +491,8 @@ ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
         /* .size      = */ size,
         /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
         /* .owner_device = */ buft ? buft->device : nullptr,
-        /* .owner_lease  = */ false
+        /* .owner_lease  = */ false,
+        /* .context_cleanup = */ cleanup
     };
     if (!buffer) {
         if (cleanup) {
@@ -471,11 +508,8 @@ ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
     const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
     const bool consumed_production = consume_production_owner(buffer->owner_device);
     if (!consumed_production && buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
-        if (buffer->iface.free_buffer) {
-            try { buffer->iface.free_buffer(buffer); }
-            catch (...) { GGML_LOG_ERROR("buffer cleanup threw after owner acquisition failure\n"); }
-        }
-        delete buffer;
+        ggml_backend_buffer_discard_failed_init(buffer, false, "buffer cleanup threw after owner acquisition failure",
+                                                "buffer context cleanup threw after owner acquisition failure");
         return nullptr;
     }
     buffer->owner_lease = consumed_production || (buffer->owner_device && acquire_owner);
@@ -488,22 +522,23 @@ ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
             g_live_owner_epoch.fetch_add(1, std::memory_order_relaxed) });
         if (!inserted.second) throw std::bad_alloc();
     } catch (...) {
-        if (buffer->iface.free_buffer) {
-            try { buffer->iface.free_buffer(buffer); }
-            catch (...) { GGML_LOG_ERROR("buffer cleanup threw after owner-map insertion failure\n"); }
-        }
-        if (buffer->owner_lease) {
-            const auto release = g_device_owner_release.load(std::memory_order_acquire);
-            if (release) release(buffer->owner_device);
-        }
-        delete buffer;
+        ggml_backend_buffer_discard_failed_init(buffer, false, "buffer cleanup threw after owner-map insertion failure",
+                                                "buffer context cleanup threw after owner-map insertion failure");
+        return nullptr;
+    }
+    if (g_fail_next_buffer_refresh.exchange(false, std::memory_order_acq_rel)) {
+        ggml_backend_buffer_discard_failed_init(buffer, true, "buffer cleanup threw after post-insert refresh failure",
+                                                "buffer context cleanup threw after post-insert refresh failure");
+        g_live_owner_cv.notify_all();
         return nullptr;
     }
     if (buffer->owner_device && !buffer->owner_lease &&
         g_device_owner_acquire.load(std::memory_order_acquire)) {
         try { ggml_backend_refresh_buffer_lifecycle(); }
         catch (...) {
-            ggml_backend_buffer_free(buffer);
+            ggml_backend_buffer_discard_failed_init(buffer, true, "buffer cleanup threw after post-insert refresh failure",
+                                                    "buffer context cleanup threw after post-insert refresh failure");
+            g_live_owner_cv.notify_all();
             return nullptr;
         }
     }
@@ -552,10 +587,11 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         buffer->owner_lease = false;
     }
     g_live_owner_cv.notify_all();
-    device_call_guard callback_guard(owner_device);
-    if (callback_guard && buffer->iface.free_buffer != NULL) {
+    if (buffer->iface.free_buffer != NULL) {
         try { buffer->iface.free_buffer(buffer); }
         catch (...) { GGML_LOG_ERROR("backend buffer free callback threw\n"); }
+    } else {
+        ggml_backend_buffer_run_context_cleanup(buffer, "buffer context cleanup threw during buffer free");
     }
     if (owner_lease) {
         const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
@@ -1104,8 +1140,7 @@ void ggml_backend_event_free(ggml_backend_event_t event) {
         g_live_events.erase(found);
     }
     g_live_owner_cv.notify_all();
-    device_call_guard guard(owner_device);
-    if (guard) {
+    if (owner_device && owner_device->iface.event_free) {
         try { owner_device->iface.event_free(owner_device, event); }
         catch (...) { GGML_LOG_ERROR("backend event free callback threw\n"); }
     }

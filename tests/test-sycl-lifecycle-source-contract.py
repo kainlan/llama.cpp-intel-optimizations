@@ -71,13 +71,15 @@ buft_callback_inventory = [
 buft_callback_inventory_ok = all(function_has_guard(backend_base, name, "device_call_guard")
                                   for name in buft_callback_inventory)
 buffer_callback_inventory = [
-    "ggml_backend_buffer_free", "ggml_backend_buffer_get_base", "ggml_backend_buffer_init_tensor",
+    "ggml_backend_buffer_get_base", "ggml_backend_buffer_init_tensor",
     "ggml_backend_buffer_clear", "ggml_backend_buffer_reset", "ggml_backend_buffer_get_caps",
     "ggml_backend_buffer_copy_tensor", "ggml_backend_tensor_set", "ggml_backend_tensor_get",
     "ggml_backend_tensor_set_2d", "ggml_backend_tensor_get_2d", "ggml_backend_tensor_memset",
 ]
 buffer_callback_inventory_ok = all(function_has_guard(backend_base, name, "device_call_guard")
-                                    for name in buffer_callback_inventory)
+                                    for name in buffer_callback_inventory) \
+    and "backend buffer free callback threw" in backend_base \
+    and "backend event free callback threw" in backend_base
 placement_paths = sorted(
     [root / "ggml/include/ggml-sycl.h"]
     + list((root / "ggml/src/ggml-sycl").rglob("*.cpp"))
@@ -712,7 +714,7 @@ checks = {
     "explicit cache ownership drain": "shutdown_shared_context_queues();" in cache_cpp
     and "g_live_arena_chunks.fetch_sub" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in cache_cpp
-    and "explicit shutdown postcondition failed after owner teardown" in cache_cpp
+    and "explicit shutdown invariant failed after owner teardown" in cache_cpp
     and "arena chunk remained registered after unregister" in cache_cpp
     and "Destroyed %zu chunk(s), released %.1f MB" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in backend,
