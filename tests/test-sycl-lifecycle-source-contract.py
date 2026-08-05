@@ -133,6 +133,30 @@ abort_owner_effects_noexcept_body = re.search(
     r"static bool ggml_sycl_abort_owner_effects_noexcept\(.*?^}\n",
     backend, re.S | re.M
 ).group(0)
+extract_control_host_allocs_body = re.search(
+    r"ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_unbind_body = re.search(
+    r"static void ggml_sycl_execution_unbind_backend\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_seal_body = re.search(
+    r"static void ggml_sycl_execution_seal_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_quarantine_body = re.search(
+    r"static void ggml_sycl_execution_quarantine_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_complete_body = re.search(
+    r"static bool ggml_sycl_execution_complete_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+backend_destructor_body = re.search(
+    r"ggml_backend_sycl_context::~ggml_backend_sycl_context\(\) \{.*?^}\n",
+    backend, re.S | re.M
+).group(0)
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -362,8 +386,16 @@ checks = {
     and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
     "explicit abort propagates cleanup failure": "const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);" in backend
     and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
-    and "registry->is_quarantined(failed.token)" in backend
-    and "ggml_sycl_quarantine_enqueue(quarantined)" in backend,
+    and "ggml_sycl_enqueue_quarantined_result(*registry, failed, model);" in backend,
+    "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
+    and "storage->entries.resize(binding_count);" in extract_control_host_allocs_body
+    and "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in extract_control_host_allocs_body,
+    "execution unbind/seal/quarantine/complete snapshot under mutex": backend.count("ggml_sycl_execution_snapshot(ctx)") >= 4
+    and "ctx->execution_state_mutex" in backend,
+    "destructor waits before unbind": backend_destructor_body.index("qptrs[dev][s]->wait()")
+    < backend_destructor_body.index("ggml_sycl_execution_unbind_backend(this);"),
+    "centralized quarantine enqueue helper": "static void ggml_sycl_enqueue_quarantined_result" in backend
+    and backend.count("ggml_sycl_enqueue_quarantined_result(") >= 5,
     "finalize poison authority": "poisoned_after_prepare" in cpp
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"

@@ -9424,16 +9424,12 @@ static ggml_sycl_execution_token_root_state ggml_sycl_execution_c_token_state(gg
 }
 
 struct ggml_sycl_control_host_alloc_batch_storage {
-    struct moved_entry {
-        ggml_backend_sycl_context * backend = nullptr;
-        std::vector<ggml_backend_sycl_context::control_host_alloc> allocs;
-    };
-    uint64_t                 context_id = 0;
-    uint64_t                 serial = 0;
-    uint64_t                 session_id = 0;
-    uint64_t                 reset_epoch = 0;
-    std::vector<moved_entry> entries;
-    uint32_t                 count = 0;
+    uint64_t                                                                     context_id = 0;
+    uint64_t                                                                     serial = 0;
+    uint64_t                                                                     session_id = 0;
+    uint64_t                                                                     reset_epoch = 0;
+    std::vector<std::vector<ggml_backend_sycl_context::control_host_alloc>>      entries;
+    uint32_t                                                                     count = 0;
 };
 
 enum class ggml_sycl_execution_wrapper_failpoint {
@@ -9499,6 +9495,11 @@ static ggml_sycl_execution_state_snapshot ggml_sycl_execution_snapshot_locked(co
     s.root_slot = ctx->execution_root_slot;
     s.root_slot_generation = ctx->execution_root_slot_generation;
     return s;
+}
+
+static ggml_sycl_execution_state_snapshot ggml_sycl_execution_snapshot(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+    return ggml_sycl_execution_snapshot_locked(ctx);
 }
 
 static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx) {
@@ -9579,7 +9580,10 @@ static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) 
     if (!ctx) {
         return;
     }
-    GGML_ASSERT(ctx->execution_invocation_id == 0 && ctx->execution_graph_epoch == 0);
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        GGML_ASSERT(ctx->execution_invocation_id == 0 && ctx->execution_graph_epoch == 0);
+    }
     ggml_sycl_execution_backend_binding binding{};
     bool had_binding = false;
     {
@@ -9737,6 +9741,20 @@ class sycl_module_mutation_guard {
 
 static bool ggml_sycl_quarantine_enqueue(ggml_sycl_model_token token) noexcept {
     return g_sycl_quarantine_queue.enqueue(ggml_sycl_cpp_token(token));
+}
+
+static void ggml_sycl_enqueue_quarantined_result(const ggml_sycl::lifecycle::Registry & registry,
+                                                 const ggml_sycl::lifecycle::end_result & result,
+                                                 ggml_sycl_model_token *                  model) noexcept {
+    if (result.committed || !registry.is_quarantined(result.token)) {
+        return;
+    }
+    ggml_sycl_model_token quarantined{};
+    ggml_sycl_export_token(result.token, &quarantined);
+    if (model) {
+        *model = quarantined;
+    }
+    (void) ggml_sycl_quarantine_enqueue(quarantined);
 }
 
 void ggml_backend_sycl_model_unloaded(uint32_t slot) {
@@ -10114,11 +10132,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         if (ticket.finisher) {
             const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
-            if (!failed.committed && registry->is_quarantined(failed.token)) {
-                ggml_sycl_model_token quarantined{};
-                ggml_sycl_export_token(failed.token, &quarantined);
-                (void) ggml_sycl_quarantine_enqueue(quarantined);
-            }
+            ggml_sycl_enqueue_quarantined_result(*registry, failed, nullptr);
         }
         txn->id = 0;
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -10353,11 +10367,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         if (!ticket.commit) {
             const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
-            if (!failed.committed && registry->is_quarantined(failed.token)) {
-                ggml_sycl_model_token quarantined{};
-                ggml_sycl_export_token(failed.token, &quarantined);
-                (void) ggml_sycl_quarantine_enqueue(quarantined);
-            }
+            ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
             if (model && failed.token.model.value != 0) {
                 ggml_sycl_export_token(failed.token, model);
             }
@@ -10371,6 +10381,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
                 cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             }
             const auto failed = pending.cleanup_required ? registry->finalize_cleanup(ticket, cleanup_ok) : pending;
+            ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
             if (model) {
                 ggml_sycl_export_token(failed.token, model);
             }
@@ -10410,6 +10421,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
             const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(result.token);
             result = registry->finalize_cleanup(ticket, cleanup_ok);
+            ggml_sycl_enqueue_quarantined_result(*registry, result, model);
             (void) ggml_sycl_restore_latest_live_plan();
         }
         if (result.committed || (!result.committed && model)) {
@@ -10426,6 +10438,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         if (ticket.finisher) {
             (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             const auto failed = registry->finalize_end(ticket, false);
+            ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
             if (model && failed.token.model.value != 0) {
                 ggml_sycl_export_token(failed.token, model);
             }
@@ -11403,44 +11416,67 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         storage->serial = ticket->serial;
         storage->session_id = ticket->session_id.value;
         storage->reset_epoch = ticket->reset_epoch.value;
-        ggml_sycl_execution_for_each_bound_backend(ticket->context_id.value,
-            [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                storage->entries.push_back({ backend_ctx, {} });
-            });
-        struct restore_guard {
-            ggml_sycl_control_host_alloc_batch_storage * storage;
-            bool success = false;
-            ~restore_guard() {
-                if (success || !storage) return;
-                for (auto & entry : storage->entries) {
-                    if (!entry.backend) continue;
-                    std::lock_guard<std::mutex> lock(entry.backend->control_host_allocs_mutex);
-                    entry.backend->control_host_allocs.swap(entry.allocs);
-                }
-            }
-        } restore{ storage.get(), false };
         bool fail_after_first = g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
                                                                        std::memory_order_acq_rel) ==
                                 static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC);
-        for (size_t i = 0; i < storage->entries.size(); ++i) {
-            auto & entry = storage->entries[i];
-            {
-                std::lock_guard<std::mutex> lock(entry.backend->control_host_allocs_mutex);
-                entry.allocs.swap(entry.backend->control_host_allocs);
+        ggml_sycl::execution::error extract_rc = ggml_sycl::execution::error::OK;
+        {
+            std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
+            size_t binding_count = 0;
+            for (const auto & [backend_ctx, binding] : g_execution_backend_bindings) {
+                if (backend_ctx && binding.context_id == ticket->context_id.value) {
+                    ++binding_count;
+                }
             }
-            storage->count += static_cast<uint32_t>(entry.allocs.size());
-            if (fail_after_first && i == 0) {
-                throw std::bad_alloc();
+            storage->entries.resize(binding_count);
+            size_t index = 0;
+            bool swapped = false;
+            try {
+                for (const auto & [backend_ctx, binding] : g_execution_backend_bindings) {
+                    if (!backend_ctx || binding.context_id != ticket->context_id.value) {
+                        continue;
+                    }
+                    auto & moved_allocs = storage->entries[index];
+                    std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
+                    moved_allocs.swap(backend_ctx->control_host_allocs);
+                    swapped = true;
+                    storage->count += static_cast<uint32_t>(moved_allocs.size());
+                    if (fail_after_first && index == 0) {
+                        throw std::bad_alloc();
+                    }
+                    ++index;
+                }
+                extract_rc = ggml_sycl::execution::global_registry().note_drain_extracted_control_host_allocs(&cpp_ticket, storage->count);
+            } catch (...) {
+                size_t restore_index = 0;
+                for (const auto & [backend_ctx, binding] : g_execution_backend_bindings) {
+                    if (!backend_ctx || binding.context_id != ticket->context_id.value) {
+                        continue;
+                    }
+                    auto & moved_allocs = storage->entries[restore_index++];
+                    std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
+                    backend_ctx->control_host_allocs.swap(moved_allocs);
+                }
+                throw;
+            }
+            if (extract_rc != ggml_sycl::execution::error::OK && swapped) {
+                size_t restore_index = 0;
+                for (const auto & [backend_ctx, binding] : g_execution_backend_bindings) {
+                    if (!backend_ctx || binding.context_id != ticket->context_id.value) {
+                        continue;
+                    }
+                    auto & moved_allocs = storage->entries[restore_index++];
+                    std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
+                    backend_ctx->control_host_allocs.swap(moved_allocs);
+                }
             }
         }
-        const auto rc = ggml_sycl::execution::global_registry().note_drain_extracted_control_host_allocs(&cpp_ticket, storage->count);
-        if (rc != ggml_sycl::execution::error::OK) {
-            return ggml_sycl_execution_c_result(rc);
+        if (extract_rc != ggml_sycl::execution::error::OK) {
+            return ggml_sycl_execution_c_result(extract_rc);
         }
         ticket->extracted_control_host_allocs = cpp_ticket.extracted_control_host_allocs;
         batch->count = ticket->extracted_control_host_allocs;
         batch->opaque = storage.release();
-        restore.success = true;
         cancel_scope.released = true;
         return GGML_SYCL_EXECUTION_OK;
     } catch (const std::bad_alloc &) {
@@ -11721,7 +11757,11 @@ static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context *
 }
 
 static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * ctx) noexcept {
-    if (!ctx || ctx->execution_context_id == 0) {
+    if (!ctx) {
+        return;
+    }
+    const auto state = ggml_sycl_execution_snapshot(ctx);
+    if (state.context_id == 0) {
         return;
     }
     ggml_sycl::lifecycle::ModelToken owner{};
@@ -11730,16 +11770,16 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     }
     auto & registry = ggml_sycl::execution::global_registry();
     ggml_sycl::execution::snapshot snapshot{};
-    if (registry.extract({ ctx->execution_context_id }, &snapshot) != ggml_sycl::execution::error::OK ||
+    if (registry.extract({ state.context_id }, &snapshot) != ggml_sycl::execution::error::OK ||
         snapshot.invocation.value != 0 ||
         (snapshot.graph_state != ggml_sycl::execution::graph_phase::COMPLETE &&
          snapshot.graph_state != ggml_sycl::execution::graph_phase::QUARANTINED)) {
         return;
     }
-    const auto rc = registry.retire_graph({ ctx->execution_context_id }, snapshot.session, snapshot.reset_epoch,
+    const auto rc = registry.retire_graph({ state.context_id }, snapshot.session, snapshot.reset_epoch,
                                           snapshot.graph_epoch, owner);
     if (rc == ggml_sycl::execution::error::OK || rc == ggml_sycl::execution::error::STALE) {
-        ggml_sycl_execution_for_each_bound_backend(ctx->execution_context_id,
+        ggml_sycl_execution_for_each_bound_backend(state.context_id,
             [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
                 ggml_sycl_execution_clear_graph_tracking(backend_ctx);
             });
@@ -11814,8 +11854,11 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
 }
 
 static void ggml_sycl_execution_seal_graph(ggml_backend_sycl_context * ctx) noexcept {
-    if (!ctx || ctx->execution_graph_sealed || ctx->execution_context_id == 0 || ctx->execution_graph_epoch == 0 ||
-        ctx->execution_invocation_id == 0) {
+    if (!ctx) {
+        return;
+    }
+    const auto state = ggml_sycl_execution_snapshot(ctx);
+    if (state.graph_sealed || state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return;
     }
     ggml_sycl::lifecycle::ModelToken owner{};
@@ -11823,15 +11866,20 @@ static void ggml_sycl_execution_seal_graph(ggml_backend_sycl_context * ctx) noex
         return;
     }
     auto & registry = ggml_sycl::execution::global_registry();
-    if (registry.seal_invocation({ ctx->execution_context_id }, { ctx->execution_session_id },
-                                 { ctx->execution_reset_epoch }, { ctx->execution_graph_epoch },
-                                 { ctx->execution_invocation_id }, owner) == ggml_sycl::execution::error::OK) {
+    if (registry.seal_invocation({ state.context_id }, { state.session_id },
+                                 { state.reset_epoch }, { state.graph_epoch },
+                                 { state.invocation_id }, owner) == ggml_sycl::execution::error::OK) {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
         ctx->execution_graph_sealed = true;
     }
 }
 
 static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx) noexcept {
-    if (!ctx || ctx->execution_context_id == 0 || ctx->execution_graph_epoch == 0 || ctx->execution_invocation_id == 0) {
+    if (!ctx) {
+        return;
+    }
+    const auto state = ggml_sycl_execution_snapshot(ctx);
+    if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return;
     }
     ggml_sycl::lifecycle::ModelToken owner{};
@@ -11839,13 +11887,13 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
         return;
     }
     auto & registry = ggml_sycl::execution::global_registry();
-    if (registry.quarantine_invocation({ ctx->execution_context_id }, { ctx->execution_session_id },
-                                       { ctx->execution_reset_epoch }, { ctx->execution_graph_epoch },
-                                       { ctx->execution_invocation_id }, owner, ctx->execution_participant_id) == ggml_sycl::execution::error::OK) {
+    if (registry.quarantine_invocation({ state.context_id }, { state.session_id },
+                                       { state.reset_epoch }, { state.graph_epoch },
+                                       { state.invocation_id }, owner, state.participant_id) == ggml_sycl::execution::error::OK) {
         ggml_sycl::execution::snapshot snapshot{};
-        if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
+        if (registry.extract({ state.context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
             snapshot.invocation.value == 0) {
-            ggml_sycl_execution_for_each_bound_backend(ctx->execution_context_id,
+            ggml_sycl_execution_for_each_bound_backend(state.context_id,
                 [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
                     ggml_sycl_execution_clear_graph_tracking(backend_ctx);
                 });
@@ -11855,7 +11903,11 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
 }
 
 static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) noexcept {
-    if (!ctx || ctx->execution_context_id == 0 || ctx->execution_graph_epoch == 0 || ctx->execution_invocation_id == 0) {
+    if (!ctx) {
+        return false;
+    }
+    const auto state = ggml_sycl_execution_snapshot(ctx);
+    if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return false;
     }
     ggml_sycl::lifecycle::ModelToken owner{};
@@ -11864,15 +11916,15 @@ static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) 
     }
     auto & registry = ggml_sycl::execution::global_registry();
     ggml_sycl_execution_seal_graph(ctx);
-    if (registry.complete_invocation({ ctx->execution_context_id }, { ctx->execution_session_id },
-                                     { ctx->execution_reset_epoch }, { ctx->execution_graph_epoch },
-                                     { ctx->execution_invocation_id }, owner, ctx->execution_participant_id) != ggml_sycl::execution::error::OK) {
+    if (registry.complete_invocation({ state.context_id }, { state.session_id },
+                                     { state.reset_epoch }, { state.graph_epoch },
+                                     { state.invocation_id }, owner, state.participant_id) != ggml_sycl::execution::error::OK) {
         return false;
     }
     ggml_sycl::execution::snapshot snapshot{};
-    if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
+    if (registry.extract({ state.context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
         snapshot.invocation.value == 0) {
-        ggml_sycl_execution_for_each_bound_backend(ctx->execution_context_id,
+        ggml_sycl_execution_for_each_bound_backend(state.context_id,
             [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
                 ggml_sycl_execution_clear_graph_tracking(backend_ctx);
             });
@@ -35056,7 +35108,6 @@ static void graph_unpin_weights(ggml_backend_sycl_context * ctx);
 static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx);
 
 ggml_backend_sycl_context::~ggml_backend_sycl_context() {
-    ggml_sycl_execution_unbind_backend(this);
     // graph_compute may return with work still in flight when async exit is
     // enabled. Drain existing queues before releasing backend-owned USM.
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; ++dev) {
@@ -35072,6 +35123,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
             }
         }
     }
+    ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
         if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && g_backend_context_by_device[device] == this) {
