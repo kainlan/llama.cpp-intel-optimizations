@@ -20,6 +20,8 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
 extern "C" bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners();
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
@@ -1046,6 +1048,18 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_execution_session_begin_reset)
     LOAD_SYCL(ggml_backend_sycl_execution_session_finish_reset)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
+    using stage_inventory_failpoint_fn = void (*)();
+    auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device"));
+    auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
+    if (!ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn ||
+        !ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn) {
+        std::fprintf(stderr, "missing stage_inventory_plan failpoint procedures\n");
+        return 1;
+    }
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
     LOAD_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)
     LOAD_SYCL(ggml_backend_sycl_host_compute_buffer_type)
@@ -1066,6 +1080,22 @@ int main() {
 #    define CALL_SYCL(name) name##_fn
 #else
 #    define CALL_SYCL(name) name
+#endif
+
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    auto fail_stage_early_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn();
+    };
+    auto fail_stage_late_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn();
+    };
+#else
+    auto fail_stage_early_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
+    };
+    auto fail_stage_late_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
+    };
 #endif
 
 #if defined(GGML_SYCL_RUNTIME_MODULE)
@@ -1197,9 +1227,8 @@ int main() {
         return 1;
     }
 
-    phase("empty early and late planning commit");
-    ggml_sycl_load_txn    committed{};
-    ggml_sycl_model_token token{};
+    phase("stage_inventory_plan fail-closed after first device");
+    ggml_sycl_load_txn stage_fail{};
     ggml_sycl_tensor_inventory inventory{};
     inventory.n_ctx    = 32;
     inventory.n_ubatch = 8;
@@ -1208,6 +1237,38 @@ int main() {
     envelope.n_ubatch        = 8;
     envelope.n_seq_max       = 1;
     envelope.flash_attn_type = -1;
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&stage_fail) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "stage fail setup begin failed\n");
+        return 1;
+    }
+    fail_stage_early_after_first_device();
+    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+        std::fprintf(stderr, "early stage_inventory_plan did not fail closed\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        std::fprintf(stderr, "early stage failure left txn unrecoverable\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&stage_fail) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "late stage fail setup begin failed\n");
+        return 1;
+    }
+    fail_stage_late_after_first_device();
+    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+        std::fprintf(stderr, "late stage_inventory_plan did not fail closed\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        std::fprintf(stderr, "late stage failure left txn unrecoverable\n");
+        return 1;
+    }
+
+    phase("empty early and late planning commit");
+    ggml_sycl_load_txn    committed{};
+    ggml_sycl_model_token token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&committed) != GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||

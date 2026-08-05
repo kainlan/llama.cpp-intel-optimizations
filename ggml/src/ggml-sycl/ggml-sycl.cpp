@@ -12558,10 +12558,16 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             ~plan_effect_scope() { g_sycl_plan_load_effect_txn = previous; }
         } authority{ effect.owner.load.value };
         bool applied = false;
+        auto rollback_partial = [&]() {
+            if (applied) {
+                ggml_sycl_abort_owner_effects(effect.owner);
+            }
+        };
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {
-                continue;
+                rollback_partial();
+                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
             }
 
             struct backend_guard {
@@ -12577,9 +12583,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
                 ggml_backend_sycl_set_tensor_inventory(backend, inventory);
             }
             applied = true;
+            if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
+                (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {
+                rollback_partial();
+                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+            }
         }
         return applied ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_NOT_FOUND;
     } catch (...) {
+        try {
+            ggml_sycl_abort_owner_effects(effect.owner);
+        } catch (...) {
+        }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
 }
@@ -97570,10 +97585,22 @@ struct ggml_backend_sycl_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
 static std::atomic<bool> g_test_fail_next_registry_stage{ false };
+static std::atomic<bool> g_test_fail_next_stage_inventory_plan_early_after_first_device{ false };
+static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_device{ false };
 
 static void ggml_backend_sycl_test_fail_next_registry_stage() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) g_test_fail_next_registry_stage.store(true, std::memory_order_release);
+}
+
+static void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) g_test_fail_next_stage_inventory_plan_early_after_first_device.store(true, std::memory_order_release);
+}
+
+static void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) g_test_fail_next_stage_inventory_plan_late_after_first_device.store(true, std::memory_order_release);
 }
 
 static void ggml_backend_sycl_test_admission_snapshot(uint64_t out[8]) {
@@ -97651,6 +97678,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_registry_stage") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_registry_stage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device;
     }
     if (strcmp(name, "ggml_backend_sycl_test_admission_snapshot") == 0) {
         return (void *) ggml_backend_sycl_test_admission_snapshot;
