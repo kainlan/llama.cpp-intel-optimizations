@@ -118,7 +118,7 @@ error Registry::abort_graph_locked(ContextId context, SessionId session, Session
 }
 
 error Registry::begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                                 lifecycle::ModelToken root, const int * devices, size_t device_count,
+                                 lifecycle::ModelToken root, const int * devices, size_t device_count, int participant,
                                  InvocationId * invocation) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = contexts_.find(context.value);
@@ -129,24 +129,37 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
     if (session_rc != error::OK) return session_rc;
     auto & graph = entry.session.graph;
     if (!(graph.id == graph_epoch)) return error::STALE;
-    if (graph.state != graph_phase::OPEN || validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
-    if (graph.invocation.value != 0) return error::BUSY;
-    for (size_t i = 0; i < device_count; ++i) {
-        const int device = devices[i];
-        if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
-        if (device_owners_[device].invocation.value != 0) return error::DEVICE_BUSY;
+    if ((graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) || validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
+    if (participant < 0 || participant >= static_cast<int>(max_devices) || entry.bound_device_refs[participant] == 0) return error::MISMATCH;
+    if (graph.invocation.value == 0) {
+        for (size_t i = 0; i < device_count; ++i) {
+            const int device = devices[i];
+            if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
+            if (device_owners_[device].invocation.value != 0) return error::DEVICE_BUSY;
+        }
+        uint64_t invocation_value = 0;
+        const auto rc = next_id(next_invocation_id_, error::OVERFLOW,
+                                mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, invocation_value);
+        if (rc != error::OK) return rc;
+        graph.invocation = { invocation_value };
+        graph.devices.assign(devices, devices + device_count);
+        graph.participants.clear();
+        graph.participant_complete.fill(false);
+        graph.pending_participant_count = 0;
+        for (size_t i = 0; i < device_count; ++i) {
+            const int device = devices[i];
+            device_owners_[device] = { context, session, reset_epoch, graph_epoch, graph.invocation, root };
+        }
+    } else {
+        if (device_count != graph.devices.size()) return error::MISMATCH;
+        for (size_t i = 0; i < device_count; ++i) {
+            if (devices[i] != graph.devices[i]) return error::MISMATCH;
+        }
     }
-    uint64_t invocation_value = 0;
-    const auto rc = next_id(next_invocation_id_, error::OVERFLOW,
-                            mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, invocation_value);
-    if (rc != error::OK) return rc;
-    graph.invocation = { invocation_value };
-    graph.devices.assign(devices, devices + device_count);
-    graph.device_complete.fill(false);
-    graph.pending_device_count = static_cast<uint32_t>(device_count);
-    for (size_t i = 0; i < device_count; ++i) {
-        const int device = devices[i];
-        device_owners_[device] = { context, session, reset_epoch, graph_epoch, graph.invocation, root };
+    if (graph.participant_complete[participant]) return error::STALE;
+    if (std::find(graph.participants.begin(), graph.participants.end(), participant) == graph.participants.end()) {
+        graph.participants.push_back(participant);
+        ++graph.pending_participant_count;
     }
     *invocation = graph.invocation;
     return error::OK;
@@ -187,13 +200,13 @@ error Registry::finish_invocation(ContextId context, SessionId session, SessionR
           owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
         return error::MISMATCH;
     }
-    if (graph.device_complete[device]) return error::STALE;
+    if (graph.participant_complete[device]) return error::STALE;
     graph.state = terminal;
     graph.token_root_state = token_terminal;
-    graph.device_complete[device] = true;
-    if (graph.pending_device_count == 0) return error::STALE;
-    --graph.pending_device_count;
-    if (graph.pending_device_count != 0) {
+    graph.participant_complete[device] = true;
+    if (graph.pending_participant_count == 0) return error::STALE;
+    --graph.pending_participant_count;
+    if (graph.pending_participant_count != 0) {
         return error::OK;
     }
     for (int participating : graph.devices) {
@@ -236,7 +249,7 @@ error Registry::retire_graph(ContextId context, SessionId session, SessionResetE
     if (!(graph.id == graph_epoch)) return error::STALE;
     if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
     if (graph.state == graph_phase::RETIRED) return error::STALE;
-    if (!graph_terminal_unretired(graph) || graph.invocation.value != 0 || graph.pending_device_count != 0) return error::BUSY;
+    if (!graph_terminal_unretired(graph) || graph.invocation.value != 0 || graph.pending_participant_count != 0) return error::BUSY;
     graph = {};
     graph.state = graph_phase::RETIRED;
     graph.id = graph_epoch;
@@ -262,11 +275,20 @@ error Registry::begin_drain(ContextId context, DrainTicket * ticket) noexcept {
     return error::OK;
 }
 
-error Registry::note_drain_extracted_control_host_allocs(DrainTicket * ticket, uint32_t count) noexcept {
+error Registry::validate_drain_ticket(const DrainTicket & ticket) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!ticket || !ticket->active || ticket->context.value == 0 || ticket->serial == 0) return error::STALE;
-    auto it = contexts_.find(ticket->context.value);
-    if (it == contexts_.end() || it->second.active_drain_serial != ticket->serial || it->second.state != context_phase::DRAINING) return error::STALE;
+    auto it = contexts_.find(ticket.context.value);
+    if (!ticket.active || ticket.context.value == 0 || ticket.serial == 0 || it == contexts_.end()) return error::STALE;
+    const auto & entry = it->second;
+    if (entry.active_drain_serial != ticket.serial || entry.state != context_phase::DRAINING ||
+        !(entry.session.id == ticket.session) || !(entry.session.reset_epoch == ticket.reset_epoch)) return error::STALE;
+    return error::OK;
+}
+
+error Registry::note_drain_extracted_control_host_allocs(DrainTicket * ticket, uint32_t count) noexcept {
+    if (!ticket) return error::STALE;
+    const auto rc = validate_drain_ticket(*ticket);
+    if (rc != error::OK) return rc;
     ticket->extracted_control_host_allocs = count;
     return error::OK;
 }
@@ -284,6 +306,24 @@ error Registry::finish_drain(const DrainTicket & ticket) noexcept {
     entry.state = context_phase::CLOSED;
     entry.session.state = entry.session.id.value != 0 ? session_phase::CLOSED : session_phase::IDLE;
     for (auto & refs : entry.bound_device_refs) refs = 0;
+    contexts_.erase(it);
+    return error::OK;
+}
+
+error Registry::close_context_if_idle(ContextId context) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    auto & entry = it->second;
+    for (const auto & owner : device_owners_) {
+        if (owner.context == context && owner.invocation.value != 0) return error::DEVICE_BUSY;
+    }
+    auto & graph = entry.session.graph;
+    if (graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED) return error::BUSY;
+    if (graph_terminal_unretired(graph)) {
+        graph.state = graph_phase::RETIRED;
+        graph.invocation = {};
+    }
     contexts_.erase(it);
     return error::OK;
 }

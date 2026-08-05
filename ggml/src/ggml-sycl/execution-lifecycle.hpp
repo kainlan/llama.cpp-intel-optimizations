@@ -2,6 +2,7 @@
 
 #include "model-lifecycle.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -101,7 +102,7 @@ class Registry {
     error begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                       lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept;
     error begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                           lifecycle::ModelToken root, const int * devices, size_t device_count,
+                           lifecycle::ModelToken root, const int * devices, size_t device_count, int participant,
                            InvocationId * invocation) noexcept;
     error seal_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                           InvocationId invocation, lifecycle::ModelToken root) noexcept;
@@ -116,8 +117,10 @@ class Registry {
                        GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
 
     error begin_drain(ContextId context, DrainTicket * ticket) noexcept;
+    error validate_drain_ticket(const DrainTicket & ticket) const noexcept;
     error note_drain_extracted_control_host_allocs(DrainTicket * ticket, uint32_t count) noexcept;
     error finish_drain(const DrainTicket & ticket) noexcept;
+    error close_context_if_idle(ContextId context) noexcept;
 
     error begin_reset(ContextId context, SessionId session, SessionResetEpoch expected_epoch,
                       ResetTicket * ticket) noexcept;
@@ -132,9 +135,10 @@ class Registry {
         token_root_phase            token_root_state = token_root_phase::OPEN;
         lifecycle::ModelToken       token_root{};
         InvocationId                invocation{};
-        std::vector<int>            devices;
-        std::array<bool, max_devices> device_complete{};
-        uint32_t                    pending_device_count = 0;
+        std::vector<int>              devices;
+        std::vector<int>              participants;
+        std::array<bool, max_devices> participant_complete{};
+        uint32_t                      pending_participant_count = 0;
     };
 
     struct session_entry {

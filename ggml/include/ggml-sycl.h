@@ -808,6 +808,8 @@ enum ggml_sycl_execution_result {
     GGML_SYCL_EXECUTION_NULL_OUTPUT,
     GGML_SYCL_EXECUTION_FOREIGN_BACKEND,
     GGML_SYCL_EXECUTION_NOT_FOUND,
+    GGML_SYCL_EXECUTION_ALLOCATION_FAILURE,
+    GGML_SYCL_EXECUTION_INTERNAL_ERROR,
 };
 
 enum ggml_sycl_execution_context_state {
@@ -917,6 +919,8 @@ GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_con
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract(
     struct ggml_sycl_exec_context_id      context,
     struct ggml_sycl_execution_snapshot * out);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_close_if_idle(
+    struct ggml_sycl_exec_context_id context);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_begin_drain(
     struct ggml_sycl_exec_context_id context,
     struct ggml_sycl_exec_drain_ticket * ticket);

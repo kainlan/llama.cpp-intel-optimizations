@@ -124,11 +124,9 @@ struct llama_context_sycl_dl_compute_hooks {
 };
 
 struct llama_context_sycl_exec_hooks {
-    decltype(&ggml_backend_sycl_execution_context_create)                      create = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_bind_backend)                bind   = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_begin_drain)                 begin_drain = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_extract_control_host_allocs) extract_control_host_allocs = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_finish_drain)                finish_drain = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_create)               create = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_bind_backend)         bind   = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_close_if_idle)        close_if_idle = nullptr;
 };
 
 static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
@@ -173,12 +171,8 @@ static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_create"));
     hooks.bind = reinterpret_cast<decltype(hooks.bind)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_bind_backend"));
-    hooks.begin_drain = reinterpret_cast<decltype(hooks.begin_drain)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_begin_drain"));
-    hooks.extract_control_host_allocs = reinterpret_cast<decltype(hooks.extract_control_host_allocs)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_extract_control_host_allocs"));
-    hooks.finish_drain = reinterpret_cast<decltype(hooks.finish_drain)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_finish_drain"));
+    hooks.close_if_idle = reinterpret_cast<decltype(hooks.close_if_idle)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_close_if_idle"));
     return hooks;
 }
 
@@ -432,43 +426,33 @@ llama_context::llama_context(
     }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    auto sycl_exec_drain_close = [&](ggml_backend_dev_t dev) {
+    auto sycl_exec_close_if_idle = [&](ggml_backend_dev_t dev) {
         if (!dev || sycl_exec_context.value == 0) {
             return;
         }
 #    ifdef GGML_USE_SYCL
-        auto begin_drain = &ggml_backend_sycl_execution_context_begin_drain;
-        auto extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
-        auto finish_drain = &ggml_backend_sycl_execution_context_finish_drain;
+        auto close_if_idle = &ggml_backend_sycl_execution_context_close_if_idle;
 #    else
         auto exec_hooks = llama_context_sycl_exec_procs(dev);
-        auto begin_drain = exec_hooks.begin_drain;
-        auto extract_allocs = exec_hooks.extract_control_host_allocs;
-        auto finish_drain = exec_hooks.finish_drain;
+        auto close_if_idle = exec_hooks.close_if_idle;
 #    endif
-        if (!begin_drain || !extract_allocs || !finish_drain) {
-            return;
-        }
-        ggml_sycl_exec_drain_ticket ticket{};
-        if (begin_drain(sycl_exec_context, &ticket) == GGML_SYCL_EXECUTION_OK) {
-            ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
-            (void) extract_allocs(&ticket, &batch);
-            (void) finish_drain(ticket, batch);
+        if (close_if_idle) {
+            (void) close_if_idle(sycl_exec_context);
         }
         sycl_exec_context = {};
     };
 
     struct sycl_exec_context_scope {
-        decltype(sycl_exec_drain_close) & close_fn;
-        ggml_backend_dev_t               dev = nullptr;
-        bool                             armed = false;
+        decltype(sycl_exec_close_if_idle) & close_fn;
+        ggml_backend_dev_t                 dev = nullptr;
+        bool                               armed = false;
 
         ~sycl_exec_context_scope() {
             if (armed) {
                 close_fn(dev);
             }
         }
-    } sycl_exec_scope{ sycl_exec_drain_close, nullptr, false };
+    } sycl_exec_scope{ sycl_exec_close_if_idle, nullptr, false };
 #endif
 
     if (!hparams.vocab_only) {
@@ -492,18 +476,12 @@ llama_context::llama_context(
 #    ifdef GGML_USE_SYCL
             auto create_exec = &ggml_backend_sycl_execution_context_create;
             auto bind_exec   = &ggml_backend_sycl_execution_context_bind_backend;
-            auto begin_drain = &ggml_backend_sycl_execution_context_begin_drain;
-            auto extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
-            auto finish_drain = &ggml_backend_sycl_execution_context_finish_drain;
 #    else
             auto exec_hooks  = llama_context_sycl_exec_procs(dev);
             auto create_exec = exec_hooks.create;
             auto bind_exec   = exec_hooks.bind;
-            auto begin_drain = exec_hooks.begin_drain;
-            auto extract_allocs = exec_hooks.extract_control_host_allocs;
-            auto finish_drain = exec_hooks.finish_drain;
 #    endif
-            if (!create_exec || !bind_exec || !begin_drain || !extract_allocs || !finish_drain) {
+            if (!create_exec || !bind_exec) {
                 continue;
             }
             if (!sycl_exec_created) {
@@ -516,7 +494,7 @@ llama_context::llama_context(
             }
             const auto bind_rc = bind_exec(backend.get(), sycl_exec_context);
             if (bind_rc != GGML_SYCL_EXECUTION_OK) {
-                sycl_exec_drain_close(dev);
+                sycl_exec_close_if_idle(dev);
                 throw std::runtime_error(format("failed to bind SYCL execution context: result=%d", (int) bind_rc));
             }
             sycl_exec_context_bound = true;
@@ -758,9 +736,6 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        sycl_exec_scope.armed = false;
-#endif
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -772,6 +747,9 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    sycl_exec_scope.armed = false;
+#endif
 }
 
 llama_context::~llama_context() {
@@ -806,30 +784,15 @@ llama_context::~llama_context() {
                 continue;
             }
 #    ifdef GGML_USE_SYCL
-            auto begin_drain = &ggml_backend_sycl_execution_context_begin_drain;
-            auto extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
-            auto finish_drain = &ggml_backend_sycl_execution_context_finish_drain;
+            auto close_if_idle = &ggml_backend_sycl_execution_context_close_if_idle;
 #    else
             auto exec_hooks = llama_context_sycl_exec_procs(dev);
-            auto begin_drain = exec_hooks.begin_drain;
-            auto extract_allocs = exec_hooks.extract_control_host_allocs;
-            auto finish_drain = exec_hooks.finish_drain;
+            auto close_if_idle = exec_hooks.close_if_idle;
 #    endif
-            if (begin_drain && extract_allocs && finish_drain) {
-                ggml_sycl_exec_drain_ticket ticket{};
-                const auto begin_rc = begin_drain(sycl_exec_context, &ticket);
-                if (begin_rc != GGML_SYCL_EXECUTION_OK) {
-                    LLAMA_LOG_ERROR("%s: failed to begin SYCL execution drain: result=%d\n", __func__, (int) begin_rc);
-                } else {
-                    ggml_sycl_exec_control_host_alloc_batch batch{ nullptr, 0 };
-                    const auto extract_rc = extract_allocs(&ticket, &batch);
-                    if (extract_rc != GGML_SYCL_EXECUTION_OK) {
-                        LLAMA_LOG_ERROR("%s: failed to extract SYCL control host allocs: result=%d\n", __func__, (int) extract_rc);
-                    }
-                    const auto drain_rc = finish_drain(ticket, batch);
-                    if (drain_rc != GGML_SYCL_EXECUTION_OK) {
-                        LLAMA_LOG_ERROR("%s: failed to finish SYCL execution drain: result=%d\n", __func__, (int) drain_rc);
-                    }
+            if (close_if_idle) {
+                const auto close_rc = close_if_idle(sycl_exec_context);
+                if (close_rc != GGML_SYCL_EXECUTION_OK && close_rc != GGML_SYCL_EXECUTION_STALE) {
+                    LLAMA_LOG_ERROR("%s: failed to close SYCL execution context: result=%d\n", __func__, (int) close_rc);
                 }
             }
             break;

@@ -1039,6 +1039,7 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_execution_context_create)
     LOAD_SYCL(ggml_backend_sycl_execution_context_bind_backend)
     LOAD_SYCL(ggml_backend_sycl_execution_context_extract)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_close_if_idle)
     LOAD_SYCL(ggml_backend_sycl_execution_context_begin_drain)
     LOAD_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)
     LOAD_SYCL(ggml_backend_sycl_execution_context_finish_drain)
@@ -1148,6 +1149,7 @@ int main() {
     ggml_sycl_exec_reset_ticket reset_ticket{};
     ggml_sycl_exec_control_host_alloc_batch drain_batch{ nullptr, 0 };
     if (CALL_SYCL(ggml_backend_sycl_execution_context_extract)({}, &exec_snapshot) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_close_if_idle)({}) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_begin_drain)({}, &drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket, drain_batch) != GGML_SYCL_EXECUTION_STALE ||

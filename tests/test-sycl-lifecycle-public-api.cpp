@@ -10,6 +10,7 @@ using usage_status_fn = bool (*)(const char *, ggml_backend_sycl_tensor_usage);
 using exec_create_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id *);
 using exec_bind_fn = ggml_sycl_execution_result (*)(ggml_backend_t, ggml_sycl_exec_context_id);
 using exec_extract_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id, ggml_sycl_execution_snapshot *);
+using exec_close_if_idle_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id);
 using exec_begin_drain_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id, ggml_sycl_exec_drain_ticket *);
 using exec_extract_allocs_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_drain_ticket *, ggml_sycl_exec_control_host_alloc_batch *);
 using exec_finish_drain_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_drain_ticket, ggml_sycl_exec_control_host_alloc_batch);
@@ -25,6 +26,7 @@ static_assert(std::is_same_v<decltype(&ggml_backend_sycl_try_register_weight_usa
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_create), exec_create_fn>);
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_bind_backend), exec_bind_fn>);
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_extract), exec_extract_fn>);
+static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_close_if_idle), exec_close_if_idle_fn>);
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_begin_drain), exec_begin_drain_fn>);
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_extract_control_host_allocs), exec_extract_allocs_fn>);
 static_assert(std::is_same_v<decltype(&ggml_backend_sycl_execution_context_finish_drain), exec_finish_drain_fn>);
