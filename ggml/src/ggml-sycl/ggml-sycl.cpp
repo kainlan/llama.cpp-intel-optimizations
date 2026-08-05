@@ -12533,6 +12533,9 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
     g_placement_envelope_set = true;
 }
 
+static std::atomic<bool> g_test_fail_next_stage_inventory_plan_early_after_first_device{ false };
+static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_device{ false };
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
                                                                   bool                                 early) {
@@ -12541,6 +12544,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
     if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
+    std::vector<ggml_sycl::lifecycle::ModelToken> staged_effects;
     try {
         auto & registry = ggml_sycl::lifecycle::global_registry();
         auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
@@ -12557,11 +12561,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
 
             ~plan_effect_scope() { g_sycl_plan_load_effect_txn = previous; }
         } authority{ effect.owner.load.value };
-        bool applied = false;
         auto rollback_partial = [&]() {
-            if (applied) {
-                ggml_sycl_abort_owner_effects(effect.owner);
+            for (auto it = staged_effects.rbegin(); it != staged_effects.rend(); ++it) {
+                ggml_sycl_abort_owner_effects(*it);
             }
+            staged_effects.clear();
         };
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
@@ -12582,17 +12586,19 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             } else {
                 ggml_backend_sycl_set_tensor_inventory(backend, inventory);
             }
-            applied = true;
+            staged_effects.push_back(effect.owner);
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
                 (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {
                 rollback_partial();
                 return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
             }
         }
-        return applied ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_NOT_FOUND;
+        return staged_effects.empty() ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         try {
-            ggml_sycl_abort_owner_effects(effect.owner);
+            for (auto it = staged_effects.rbegin(); it != staged_effects.rend(); ++it) {
+                ggml_sycl_abort_owner_effects(*it);
+            }
         } catch (...) {
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -97585,8 +97591,6 @@ struct ggml_backend_sycl_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
 static std::atomic<bool> g_test_fail_next_registry_stage{ false };
-static std::atomic<bool> g_test_fail_next_stage_inventory_plan_early_after_first_device{ false };
-static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_device{ false };
 
 static void ggml_backend_sycl_test_fail_next_registry_stage() {
     sycl_module_mutation_guard module_guard;
