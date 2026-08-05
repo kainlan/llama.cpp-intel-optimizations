@@ -791,7 +791,11 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu cache_owned=%llu offload=%llu ptr=0x%llx size=%llu owner=%s device=%lld" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "runtime_alloc_census_after_dirty[0] != runtime_alloc_census_after_dirty[2]" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "retained owner retry did not clear owner census" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "retained owner retry did not clear runtime allocation census" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "saved buffer-type path allocated after completed unload" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()

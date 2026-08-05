@@ -782,7 +782,8 @@ int main() {
         std::fprintf(stderr, "shutdown runtime allocation census unavailable after dirty retry\n");
         return 1;
     }
-    if (runtime_alloc_census_after_dirty[0] != 0 || runtime_alloc_census_after_dirty[3] != 0) {
+    if (runtime_alloc_census_after_dirty[3] != 0 ||
+        runtime_alloc_census_after_dirty[0] != runtime_alloc_census_after_dirty[2]) {
         std::fprintf(stderr,
                      "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu cache_owned=%llu offload=%llu ptr=0x%llx size=%llu owner=%s device=%lld\n",
                      static_cast<unsigned long long>(runtime_alloc_census_after_dirty[0]),
@@ -826,6 +827,20 @@ int main() {
                      static_cast<unsigned long long>(owner_census_after_retry[1]),
                      static_cast<unsigned long long>(owner_census_after_retry[2]),
                      static_cast<unsigned long long>(owner_census_after_retry[3]));
+        return 1;
+    }
+    uint64_t runtime_alloc_census_after_retry[8]{};
+    if (!shutdown_runtime_alloc_census(runtime_alloc_census_after_retry)) {
+        std::fprintf(stderr, "shutdown runtime allocation census unavailable after retry success\n");
+        return 1;
+    }
+    if (runtime_alloc_census_after_retry[0] != 0 || runtime_alloc_census_after_retry[2] != 0 ||
+        runtime_alloc_census_after_retry[3] != 0) {
+        std::fprintf(stderr,
+                     "retained owner retry did not clear runtime allocation census: total=%llu cache_owned=%llu offload=%llu\n",
+                     static_cast<unsigned long long>(runtime_alloc_census_after_retry[0]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_retry[2]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_retry[3]));
         return 1;
     }
     reg = nullptr;
