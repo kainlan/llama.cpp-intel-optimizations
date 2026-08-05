@@ -30,6 +30,7 @@ static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
 static int                    g_registry_fixture_recursive_registrations = 0;
 static int                    g_registry_fixture_shutdowns = 0;
 static int                    g_registry_fixture_cancels = 0;
+static bool                   g_registry_fixture_reactivation_pending = false;
 static std::mutex              g_device_callback_mutex;
 static std::condition_variable g_device_callback_cv;
 static bool                    g_device_callback_block = false;
@@ -78,7 +79,11 @@ static void registry_fixture_shutdown() {
     }
 }
 static void registry_fixture_cancel() { ++g_registry_fixture_cancels; }
-static bool registry_fixture_prepare_reactivate() { return true; }
+static bool registry_fixture_prepare_reactivate() {
+    if (g_registry_fixture_reactivation_pending) return false;
+    g_registry_fixture_reactivation_pending = true;
+    return true;
+}
 static void registry_fixture_commit_reactivate() {
     {
         std::unique_lock<std::mutex> lock(g_commit_reactivate_mutex);
@@ -93,8 +98,12 @@ static void registry_fixture_commit_reactivate() {
         throw std::runtime_error("fixture reactivation commit failure");
     }
 }
+static void registry_fixture_finalize_reactivate() {
+    g_registry_fixture_reactivation_pending = false;
+}
 static void registry_fixture_rollback_reactivate() {
     ++g_registry_fixture_cancels;
+    g_registry_fixture_reactivation_pending = false;
     if (g_registry_fixture_mode == registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW) {
         throw std::runtime_error("fixture rollback failure");
     }
@@ -109,6 +118,7 @@ static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
         std::strcmp(name, "ggml_backend_cancel_unload") == 0) return (void *) registry_fixture_cancel;
     if (std::strcmp(name, "ggml_backend_prepare_reactivate") == 0) return (void *) registry_fixture_prepare_reactivate;
     if (std::strcmp(name, "ggml_backend_commit_reactivate") == 0) return (void *) registry_fixture_commit_reactivate;
+    if (std::strcmp(name, "ggml_backend_finalize_reactivate") == 0) return (void *) registry_fixture_finalize_reactivate;
     if (std::strcmp(name, "ggml_backend_rollback_reactivate") == 0) return (void *) registry_fixture_rollback_reactivate;
     return nullptr;
 }

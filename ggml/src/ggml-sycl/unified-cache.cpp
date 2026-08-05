@@ -12691,6 +12691,10 @@ void prepare_unified_cache_for_module_use() noexcept {
     g_sycl_shutting_down.store(false, std::memory_order_release);
 }
 
+void rollback_unified_cache_module_use() noexcept {
+    g_sycl_shutting_down.store(true, std::memory_order_release);
+}
+
 static void shutdown_shared_context_queues() noexcept {
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         sycl::queue * queue = g_shared_ctx_queues[d];

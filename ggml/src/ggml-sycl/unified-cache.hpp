@@ -4247,6 +4247,7 @@ bool unified_cache_shutdown_state_clean() noexcept;
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();
 void prepare_unified_cache_for_module_use() noexcept;
+void rollback_unified_cache_module_use() noexcept;
 
 // Returns true if SYCL runtime teardown has begun (atexit handler fired).
 // Used by ExpertCache/ExpertPrefetcher to skip sycl::free() during static destruction.

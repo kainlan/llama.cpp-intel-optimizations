@@ -96277,6 +96277,7 @@ void ggml_backend_sycl_complete_unload(void) {
 
 static sycl_module_admission_state g_sycl_reactivation_previous =
     sycl_module_admission_state::COMPLETE_CLOSED;
+static bool g_sycl_reactivation_pending_finalize = false;
 
 bool ggml_backend_sycl_prepare_reactivate(void) {
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -96285,6 +96286,7 @@ bool ggml_backend_sycl_prepare_reactivate(void) {
         return false;
     }
     g_sycl_reactivation_previous = g_sycl_module_admission;
+    g_sycl_reactivation_pending_finalize = true;
     g_sycl_module_admission = sycl_module_admission_state::PREPARING;
     return true;
 }
@@ -96297,10 +96299,25 @@ void ggml_backend_sycl_commit_reactivate(void) {
     g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
 }
 
-void ggml_backend_sycl_rollback_reactivate(void) {
+void ggml_backend_sycl_finalize_reactivate(void) {
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
-    if (g_sycl_module_admission == sycl_module_admission_state::PREPARING) {
-        g_sycl_module_admission = g_sycl_reactivation_previous;
+    g_sycl_reactivation_pending_finalize = false;
+}
+
+void ggml_backend_sycl_rollback_reactivate(void) {
+    bool restore_closed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
+        if (g_sycl_reactivation_pending_finalize) {
+            g_sycl_module_admission = g_sycl_reactivation_previous;
+            g_sycl_reactivation_pending_finalize = false;
+            g_sycl_module_shutdown_started = true;
+            restore_closed = true;
+        }
+    }
+    if (restore_closed) {
+        ggml_sycl::lifecycle::global_registry().complete_shutdown();
+        ggml_sycl::rollback_unified_cache_module_use();
     }
 }
 
@@ -96537,6 +96554,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_commit_reactivate") == 0) {
         return (void *) ggml_backend_sycl_commit_reactivate;
+    }
+    if (strcmp(name, "ggml_backend_finalize_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_finalize_reactivate;
     }
     if (strcmp(name, "ggml_backend_rollback_reactivate") == 0) {
         return (void *) ggml_backend_sycl_rollback_reactivate;

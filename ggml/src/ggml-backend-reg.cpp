@@ -334,6 +334,7 @@ struct ggml_backend_registry {
             using settle_reactivate_fn = void (*)();
             prepare_reactivate_fn prepare_reactivate = nullptr;
             settle_reactivate_fn commit_reactivate = nullptr;
+            settle_reactivate_fn finalize_reactivate = nullptr;
             settle_reactivate_fn rollback_reactivate = nullptr;
             bool reactivation_prepared = false;
             if (needs_reactivation && reg->iface.get_proc_address) {
@@ -341,10 +342,12 @@ struct ggml_backend_registry {
                     reg->iface.get_proc_address(reg, "ggml_backend_prepare_reactivate"));
                 commit_reactivate = reinterpret_cast<settle_reactivate_fn>(
                     reg->iface.get_proc_address(reg, "ggml_backend_commit_reactivate"));
+                finalize_reactivate = reinterpret_cast<settle_reactivate_fn>(
+                    reg->iface.get_proc_address(reg, "ggml_backend_finalize_reactivate"));
                 rollback_reactivate = reinterpret_cast<settle_reactivate_fn>(
                     reg->iface.get_proc_address(reg, "ggml_backend_rollback_reactivate"));
-                const bool any_hook = prepare_reactivate || commit_reactivate || rollback_reactivate;
-                if (any_hook && (!prepare_reactivate || !commit_reactivate || !rollback_reactivate ||
+                const bool any_hook = prepare_reactivate || commit_reactivate || finalize_reactivate || rollback_reactivate;
+                if (any_hook && (!prepare_reactivate || !commit_reactivate || !finalize_reactivate || !rollback_reactivate ||
                                  !prepare_reactivate())) {
                     return false;
                 }
@@ -421,7 +424,6 @@ struct ggml_backend_registry {
                     published_entry->state = ggml_backend_reg_state::REMOVED;
                     return false;
                 }
-                reactivation_prepared = false;
             }
             // module_operation_mutex remains held: unload cannot pass preflight,
             // and enumeration stays hidden until adoption has settled.
@@ -436,6 +438,16 @@ struct ggml_backend_registry {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (published_entry->state != ggml_backend_reg_state::REACTIVATING) return false;
                 published_entry->state = ggml_backend_reg_state::ACTIVE;
+            }
+            if (reactivation_prepared) {
+                try {
+                    finalize_reactivate();
+                    reactivation_prepared = false;
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    published_entry->state = ggml_backend_reg_state::REMOVED;
+                    return false;
+                }
             }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);

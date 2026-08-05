@@ -771,6 +771,7 @@ checks = {
         "saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY") == 4
     and "ggml_backend_prepare_reactivate" in backend
     and "ggml_backend_commit_reactivate" in backend
+    and "ggml_backend_finalize_reactivate" in backend
     and "ggml_backend_rollback_reactivate" in backend,
     "completion, callback, arena retry and renamed DSO coverage": "shutdown_completed_" in hpp
     and "complete_shutdown()" in backend
@@ -798,6 +799,9 @@ checks = {
         and "g_fail_next_owner_adoption" in backend_base
         and "published_entry->state = ggml_backend_reg_state::REMOVED" in registry_backend
         and "reactivation rollback threw; retaining tombstone" in registry_backend
+        and "ggml_backend_finalize_reactivate" in registry_backend
+        and "g_sycl_reactivation_pending_finalize" in backend
+        and "rollback_unified_cache_module_use" in backend
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "orphan_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
