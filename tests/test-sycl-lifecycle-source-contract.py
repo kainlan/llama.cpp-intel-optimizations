@@ -746,6 +746,8 @@ checks = {
         < backend_base.index("buft->iface.alloc_buffer(buft, size)")
     and "buffer_production_guard production(device)" in backend_base
     and "Underlying buffers already hold durable owners" in backend_base
+    and "ggml_backend_buffer_clear_owner(result)" in backend_base
+    and "live_owner_state::TRANSFERRING" in backend_base
     and "pre_registry_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "live backend event did not block checked unload" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -792,10 +794,18 @@ checks = {
             < registry_backend.index("published_entry->state = ggml_backend_reg_state::ACTIVE")
         and "device_owner_adopt" in backend_base
         and "Settle independently" in backend_base
+        and "candidates.reserve" in backend_base
+        and "g_fail_next_owner_adoption" in backend_base
+        and "published_entry->state = ggml_backend_reg_state::REMOVED" in registry_backend
+        and "reactivation rollback threw; retaining tombstone" in registry_backend
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "orphan_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "publication-raced unload completed early" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "overlapping ownership transfer reconciled" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "multi-buffer aggregate owns no duplicate lease" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "generation tombstones retained": "current_generation" in registry_backend
     and "find_device_identity" in registry_backend

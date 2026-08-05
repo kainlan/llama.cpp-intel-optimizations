@@ -95,6 +95,7 @@
 namespace fs = std::filesystem;
 
 static std::atomic<bool> g_disable_device_backends{false};
+static std::atomic<size_t> g_test_unload_attempts{0};
 
 // Deterministic host-test barrier: pauses one checked unload after publishing
 // its UNLOADING tombstone. Readers and recursive registration remain unlocked
@@ -352,7 +353,12 @@ struct ggml_backend_registry {
             struct reactivation_rollback_guard {
                 settle_reactivate_fn rollback;
                 bool * prepared;
-                ~reactivation_rollback_guard() { if (*prepared && rollback) rollback(); }
+                ~reactivation_rollback_guard() noexcept {
+                    if (*prepared && rollback) {
+                        try { rollback(); }
+                        catch (...) { GGML_LOG_ERROR("backend reactivation rollback threw; retaining tombstone\n"); }
+                    }
+                }
             } rollback_guard{ rollback_reactivate, &reactivation_prepared };
             // Stage all plugin-owned metadata while mutation admission remains closed.
             const char * name = ggml_backend_reg_name_unchecked(reg);
@@ -419,7 +425,13 @@ struct ggml_backend_registry {
             }
             // module_operation_mutex remains held: unload cannot pass preflight,
             // and enumeration stays hidden until adoption has settled.
-            ggml_backend_refresh_buffer_lifecycle();
+            try {
+                ggml_backend_refresh_buffer_lifecycle();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                published_entry->state = ggml_backend_reg_state::REMOVED;
+                return false;
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (published_entry->state != ggml_backend_reg_state::REACTIVATING) return false;
@@ -519,6 +531,7 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_unload_result unload_backend(ggml_backend_reg_t reg, bool silent) noexcept {
+        g_test_unload_attempts.fetch_add(1, std::memory_order_release);
         std::lock_guard<std::recursive_mutex> operation_lock(module_operation_mutex);
         ggml_backend_reg_entry_ptr unloading;
         bool was_hidden_failed = false;
@@ -978,6 +991,10 @@ void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept {
         }
     } catch (...) {
     }
+}
+
+extern "C" size_t ggml_backend_test_unload_attempts(void) {
+    return g_test_unload_attempts.load(std::memory_order_acquire);
 }
 
 extern "C" size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg) {

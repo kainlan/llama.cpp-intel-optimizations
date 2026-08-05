@@ -77,6 +77,7 @@ extern "C" {
 
     // Transfer a buffer produced through a proxy type to its true product
     // owner, preserving durable registry ownership without double counting.
+    GGML_API void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer);
     GGML_API bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft);
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
@@ -257,6 +258,10 @@ extern "C" {
     GGML_API void ggml_backend_refresh_buffer_lifecycle(void);
     GGML_API void ggml_backend_test_block_owner_adoption(bool block);
     GGML_API bool ggml_backend_test_owner_adoption_blocked(void);
+    GGML_API void ggml_backend_test_fail_next_owner_adoption(void);
+    GGML_API size_t ggml_backend_test_owner_close_attempts(void);
+    GGML_API size_t ggml_backend_test_owner_transfer_attempts(void);
+    GGML_API size_t ggml_backend_test_unload_attempts(void);
     GGML_API size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg);
     GGML_API void ggml_backend_set_registry_lifecycle(
         const struct ggml_backend_registry_lifecycle_i * iface);

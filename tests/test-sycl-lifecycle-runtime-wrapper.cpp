@@ -22,7 +22,9 @@ extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token mo
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
 namespace {
-enum class registry_fixture_mode { NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, COMMIT_REACTIVATE_THROW };
+enum class registry_fixture_mode {
+    NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW
+};
 static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
 static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
 static int                    g_registry_fixture_recursive_registrations = 0;
@@ -86,11 +88,17 @@ static void registry_fixture_commit_reactivate() {
             g_commit_reactivate_cv.wait(lock, [] { return !g_commit_reactivate_block; });
         }
     }
-    if (g_registry_fixture_mode == registry_fixture_mode::COMMIT_REACTIVATE_THROW) {
+    if (g_registry_fixture_mode == registry_fixture_mode::COMMIT_REACTIVATE_THROW ||
+        g_registry_fixture_mode == registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW) {
         throw std::runtime_error("fixture reactivation commit failure");
     }
 }
-static void registry_fixture_rollback_reactivate() { ++g_registry_fixture_cancels; }
+static void registry_fixture_rollback_reactivate() {
+    ++g_registry_fixture_cancels;
+    if (g_registry_fixture_mode == registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW) {
+        throw std::runtime_error("fixture rollback failure");
+    }
+}
 static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
     if (g_registry_fixture_mode == registry_fixture_mode::RESOLVER_THROW) {
         throw std::runtime_error("fixture resolver failure");
@@ -168,8 +176,18 @@ static bool run_registry_failure_fixture() {
         return false;
     }
     phase("generic fixture: concurrent unload blocked by hidden publication");
+    const size_t unload_attempts_before = ggml_backend_test_unload_attempts();
     auto publishing_unload = std::async(std::launch::async, [reg] { return ggml_backend_unload_checked(reg); });
-    if (publishing_unload.wait_for(std::chrono::milliseconds(50)) != std::future_status::timeout) {
+    for (int i = 0; i < 1000 && ggml_backend_test_unload_attempts() == unload_attempts_before; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (ggml_backend_test_unload_attempts() == unload_attempts_before) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        (void) publishing_unload.get();
+        return false;
+    }
+    if (publishing_unload.wait_for(std::chrono::milliseconds(0)) != std::future_status::timeout) {
         const auto early_result = publishing_unload.get();
         std::fprintf(stderr,
                      "publication-raced unload completed early: result=%d visible=%d durable=%zu shutdowns=%d\n",
@@ -179,18 +197,40 @@ static bool run_registry_failure_fixture() {
         adopting_register.get();
         return false;
     }
-    auto overlapping_free = std::async(std::launch::async,
-        [pre_registry_buffer] { ggml_backend_buffer_free(pre_registry_buffer); });
-    if (overlapping_free.wait_for(std::chrono::milliseconds(50)) != std::future_status::timeout) {
+    const size_t transfer_attempts_before = ggml_backend_test_owner_transfer_attempts();
+    auto overlapping_transfer = std::async(std::launch::async,
+        [pre_registry_buffer] { return ggml_backend_buffer_set_type(pre_registry_buffer, &orphan_buft); });
+    for (int i = 0; i < 1000 && ggml_backend_test_owner_transfer_attempts() == transfer_attempts_before; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (ggml_backend_test_owner_transfer_attempts() == transfer_attempts_before) {
         ggml_backend_test_block_owner_adoption(false);
         adopting_register.get();
+        (void) overlapping_transfer.get();
+        (void) publishing_unload.get();
+        return false;
+    }
+    const size_t close_attempts_before = ggml_backend_test_owner_close_attempts();
+    auto overlapping_free = std::async(std::launch::async,
+        [pre_registry_buffer] { ggml_backend_buffer_free(pre_registry_buffer); });
+    for (int i = 0; i < 1000 && ggml_backend_test_owner_close_attempts() == close_attempts_before; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (ggml_backend_test_owner_close_attempts() == close_attempts_before ||
+        overlapping_free.wait_for(std::chrono::milliseconds(0)) != std::future_status::timeout) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        (void) overlapping_transfer.get();
         overlapping_free.get();
+        (void) publishing_unload.get();
         return false;
     }
     phase("generic fixture: release adoption barrier");
     ggml_backend_test_block_owner_adoption(false);
     adopting_register.get();
     phase("generic fixture: adoption publication joined");
+    if (overlapping_transfer.get()) return false;
+    phase("generic fixture: overlapping ownership transfer reconciled");
     if (publishing_unload.get() != GGML_BACKEND_UNLOAD_BUSY) return false;
     phase("generic fixture: publication-raced unload rejected by live owner");
     overlapping_free.get();
@@ -204,8 +244,23 @@ static bool run_registry_failure_fixture() {
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
     phase("generic fixture: unload after all adopted owners freed");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: adoption allocation failure leaves retryable tombstone");
+    ggml_backend_test_fail_next_owner_adoption();
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
     phase("generic fixture: register after adopted-owner unload");
     ggml_backend_register(reg);
+    phase("generic fixture: multi-buffer aggregate owns no duplicate lease");
+    auto part_a = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
+    auto part_b = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
+    auto unrelated = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
+    ggml_backend_buffer_t parts[] = { part_a, part_b };
+    auto aggregate = part_a && part_b ? ggml_backend_multi_buffer_alloc_buffer(parts, 2) : nullptr;
+    if (!aggregate || !unrelated || ggml_backend_test_durable_owners(reg) != 3) return false;
+    ggml_backend_buffer_free(aggregate);
+    if (ggml_backend_test_durable_owners(reg) != 1) return false;
+    ggml_backend_buffer_free(unrelated);
+    if (ggml_backend_test_durable_owners(reg) != 0) return false;
     const size_t initial_reg_count = ggml_backend_reg_count();
 #if defined(GGML_SYCL_RUNTIME_MODULE)
     if (initial_reg_count < 1) return false;
@@ -342,7 +397,7 @@ static bool run_registry_failure_fixture() {
     if (!reactivation_hidden || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
 
     phase("generic fixture: throwing commit rollback and recovery");
-    g_registry_fixture_mode = registry_fixture_mode::COMMIT_REACTIVATE_THROW;
+    g_registry_fixture_mode = registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW;
     ggml_backend_register(reg);
     if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
     g_registry_fixture_mode = registry_fixture_mode::NORMAL;
