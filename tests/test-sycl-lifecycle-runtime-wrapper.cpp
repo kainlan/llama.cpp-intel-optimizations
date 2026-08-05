@@ -1032,9 +1032,11 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_execution_context_create)
     LOAD_SYCL(ggml_backend_sycl_execution_context_bind_backend)
     LOAD_SYCL(ggml_backend_sycl_execution_context_extract)
-    LOAD_SYCL(ggml_backend_sycl_execution_context_drain)
-    LOAD_SYCL(ggml_backend_sycl_execution_session_reset)
-    LOAD_SYCL(ggml_backend_sycl_execution_context_close)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_begin_drain)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_finish_drain)
+    LOAD_SYCL(ggml_backend_sycl_execution_session_begin_reset)
+    LOAD_SYCL(ggml_backend_sycl_execution_session_finish_reset)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
     LOAD_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)
@@ -1135,10 +1137,14 @@ int main() {
         return 1;
     }
     ggml_sycl_execution_snapshot exec_snapshot{};
+    ggml_sycl_exec_drain_ticket drain_ticket{};
+    ggml_sycl_exec_reset_ticket reset_ticket{};
     if (CALL_SYCL(ggml_backend_sycl_execution_context_extract)({}, &exec_snapshot) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_context_drain)({}) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_session_reset)({}, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_context_close)({}) != GGML_SYCL_EXECUTION_STALE) {
+        CALL_SYCL(ggml_backend_sycl_execution_context_begin_drain)({}, &drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_ticket.extracted_control_host_allocs) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_session_begin_reset)({}, {}, {}, &reset_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_session_finish_reset)(reset_ticket, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE) {
         std::fprintf(stderr, "execution lifecycle invalid-input contract mismatch\n");
         return 1;
     }

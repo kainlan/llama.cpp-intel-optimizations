@@ -4559,6 +4559,9 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_reset_epoch = 0;
     uint64_t                             execution_graph_epoch = 0;
     uint64_t                             execution_invocation_id = 0;
+    uint64_t                             execution_terminal_graph_epoch = 0;
+    bool                                 execution_graph_sealed = false;
+    bool                                 execution_graph_quarantined = false;
     uint64_t                             execution_root_model_id = 0;
     uint64_t                             execution_root_load_txn_id = 0;
     uint32_t                             execution_root_slot = GGML_SYCL_MODEL_SLOT_NONE;

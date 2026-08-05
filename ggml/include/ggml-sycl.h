@@ -780,6 +780,19 @@ struct ggml_sycl_exec_session_id { uint64_t value; };
 struct ggml_sycl_exec_session_reset_epoch { uint64_t value; };
 struct ggml_sycl_exec_graph_epoch { uint64_t value; };
 struct ggml_sycl_exec_invocation_id { uint64_t value; };
+struct ggml_sycl_exec_drain_ticket {
+    struct ggml_sycl_exec_context_id context_id;
+    struct ggml_sycl_exec_session_id session_id;
+    struct ggml_sycl_exec_session_reset_epoch reset_epoch;
+    uint64_t serial;
+    uint32_t extracted_control_host_allocs;
+};
+struct ggml_sycl_exec_reset_ticket {
+    struct ggml_sycl_exec_context_id context_id;
+    struct ggml_sycl_exec_session_id session_id;
+    struct ggml_sycl_exec_session_reset_epoch expected_reset_epoch;
+    uint64_t serial;
+};
 
 enum ggml_sycl_execution_result {
     GGML_SYCL_EXECUTION_OK = 0,
@@ -900,13 +913,22 @@ GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_con
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract(
     struct ggml_sycl_exec_context_id      context,
     struct ggml_sycl_execution_snapshot * out);
-GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_drain(
-    struct ggml_sycl_exec_context_id context);
-GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_session_reset(
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_begin_drain(
     struct ggml_sycl_exec_context_id context,
+    struct ggml_sycl_exec_drain_ticket * ticket);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs(
+    struct ggml_sycl_exec_drain_ticket * ticket,
+    uint32_t * extracted_count);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(
+    struct ggml_sycl_exec_drain_ticket ticket);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_session_begin_reset(
+    struct ggml_sycl_exec_context_id context,
+    struct ggml_sycl_exec_session_id session,
+    struct ggml_sycl_exec_session_reset_epoch expected_epoch,
+    struct ggml_sycl_exec_reset_ticket * ticket);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_session_finish_reset(
+    struct ggml_sycl_exec_reset_ticket ticket,
     struct ggml_sycl_exec_session_reset_epoch * next_reset_epoch);
-GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_close(
-    struct ggml_sycl_exec_context_id context);
 
 // Deprecated bool compatibility boundary. It is abort-default and cannot be
 // used to obtain ownership identity; migrated callers use the APIs above.
