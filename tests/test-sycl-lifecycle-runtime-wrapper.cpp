@@ -1027,7 +1027,13 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_cancel_unload)
     LOAD_SYCL(ggml_backend_sycl_test_hold_live_update)
     LOAD_SYCL(ggml_backend_sycl_test_release_live_update)
-    LOAD_SYCL(ggml_backend_sycl_test_seed_control_host_allocs)
+    using seed_control_host_allocs_fn = bool (*)(ggml_backend_t, uint32_t);
+    auto ggml_backend_sycl_test_seed_control_host_allocs_fn = reinterpret_cast<seed_control_host_allocs_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_control_host_allocs"));
+    if (!ggml_backend_sycl_test_seed_control_host_allocs_fn) {
+        std::fprintf(stderr, "missing registry procedure %s\n", "ggml_backend_sycl_test_seed_control_host_allocs");
+        return 1;
+    }
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
     LOAD_SYCL(ggml_backend_sycl_execution_context_create)
