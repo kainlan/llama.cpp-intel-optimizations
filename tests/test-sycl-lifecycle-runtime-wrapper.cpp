@@ -14,6 +14,7 @@ extern "C" void ggml_backend_test_wait_unload_blocked();
 extern "C" void ggml_backend_test_reentrant_mutation_on_next_unload();
 extern "C" void ggml_backend_test_release_unload();
 extern "C" size_t ggml_backend_test_active_calls(ggml_backend_reg_t reg);
+extern "C" const char * ggml_backend_test_registry_state(ggml_backend_reg_t reg);
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state();
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
@@ -205,6 +206,14 @@ static void phase(const char * name) {
     std::fflush(stderr);
 }
 
+static bool fixture_expect(bool condition, const char * detail) {
+    if (!condition) {
+        std::fprintf(stderr, "[sycl-runtime-wrapper] assert failed: %s\n", detail);
+        std::fflush(stderr);
+    }
+    return condition;
+}
+
 static bool run_registry_failure_fixture() {
     phase("generic fixture: construct pre-registry owners");
     auto reg = registry_fixture();
@@ -308,7 +317,7 @@ static bool run_registry_failure_fixture() {
     phase("generic fixture: verify adopted event durable owner");
     if (ggml_backend_test_durable_owners(reg) != 1) return false;
     // The unrelated owner remained pending. Its first publication failure must
-    // not run reactivation hooks; retry adopts its exact live buffer.
+    // not run reactivation hooks; retry adopts its exact live owners.
     orphan_reg.api_version = GGML_BACKEND_API_VERSION;
     orphan_reg.iface.get_name = registry_fixture_reg_name;
     orphan_reg.iface.get_device_count = registry_fixture_reg_count;
@@ -316,20 +325,74 @@ static bool run_registry_failure_fixture() {
     orphan_reg.context = &orphan_dev;
     ggml_backend_test_fail_next_owner_adoption();
     ggml_backend_register(&orphan_reg);
-    if (ggml_backend_test_durable_owners(&orphan_reg) != 0) return false;
-    phase("generic fixture: immediate free after failed first publication");
-    ggml_backend_buffer_free(orphan_buffer);
-    ggml_backend_event_free(orphan_event);
-    if (g_fixture_buffer_free_calls != 1 || g_fixture_event_free_calls != 1) return false;
-    orphan_buffer = ggml_backend_buffer_init(&orphan_buft, orphan_iface, nullptr, 0);
-    orphan_event = ggml_backend_event_new(&orphan_dev);
-    if (!orphan_buffer || !orphan_event) return false;
+    if (!fixture_expect(ggml_backend_test_durable_owners(&orphan_reg) == 0,
+                        "failed first publication durable owner count != 0")) return false;
+    if (!fixture_expect(std::strcmp(ggml_backend_test_registry_state(&orphan_reg), "REMOVED") == 0,
+                        "failed first publication registry tombstone state != REMOVED")) return false;
+    phase("generic fixture: retry failed first publication with exact live owners");
     ggml_backend_register(&orphan_reg);
-    if (ggml_backend_test_durable_owners(&orphan_reg) != 2 ||
-        ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
+    if (!fixture_expect(ggml_backend_test_durable_owners(&orphan_reg) == 2,
+                        "retry publication durable owner count != 2") ||
+        !fixture_expect(ggml_backend_unload_checked(&orphan_reg) == GGML_BACKEND_UNLOAD_BUSY,
+                        "retry publication unload did not report BUSY")) return false;
     ggml_backend_buffer_free(orphan_buffer);
     ggml_backend_event_free(orphan_event);
     if (ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_OK) return false;
+
+    g_fixture_buffer_free_calls = 0;
+    g_fixture_event_free_calls = 0;
+    phase("generic fixture: construct failed-publication owners for immediate free");
+    static ggml_backend_reg failed_free_reg{};
+    static ggml_backend_device failed_free_dev{};
+    static ggml_backend_buffer_type failed_free_buft{};
+    failed_free_dev.reg = &failed_free_reg;
+    failed_free_dev.iface.event_new = registry_fixture_event_new;
+    failed_free_dev.iface.event_free = registry_fixture_event_free;
+    failed_free_buft.device = &failed_free_dev;
+    auto failed_free_buffer = ggml_backend_buffer_init(&failed_free_buft, orphan_iface, nullptr, 0);
+    auto failed_free_event = ggml_backend_event_new(&failed_free_dev);
+    if (!failed_free_buffer || !failed_free_event) return false;
+    failed_free_reg.api_version = GGML_BACKEND_API_VERSION;
+    failed_free_reg.iface.get_name = registry_fixture_reg_name;
+    failed_free_reg.iface.get_device_count = registry_fixture_reg_count;
+    failed_free_reg.iface.get_device = registry_fixture_reg_get;
+    failed_free_reg.context = &failed_free_dev;
+    ggml_backend_test_fail_next_owner_adoption();
+    ggml_backend_register(&failed_free_reg);
+    if (!fixture_expect(ggml_backend_test_durable_owners(&failed_free_reg) == 0,
+                        "immediate-free failed publication durable owner count != 0")) return false;
+    phase("generic fixture: immediate free after failed first publication");
+    ggml_backend_buffer_free(failed_free_buffer);
+    if (!fixture_expect(g_fixture_buffer_free_calls == 1,
+                        "failed first publication buffer cleanup callback count != 1")) {
+        std::fprintf(stderr, "[sycl-runtime-wrapper] buffer cleanup diagnostics: calls=%d durable_owners=%zu registry_state=%s lookup_visible=%d\n",
+                     g_fixture_buffer_free_calls, ggml_backend_test_durable_owners(&failed_free_reg),
+                     ggml_backend_test_registry_state(&failed_free_reg), ggml_backend_reg_by_name("TEST-LIFECYCLE") == &failed_free_reg);
+        return false;
+    }
+    phase("generic fixture: immediate free after failed first publication / free legacy-v2 event owner");
+    ggml_backend_event_free(failed_free_event);
+    if (!fixture_expect(g_fixture_event_free_calls == 1,
+                        "failed first publication legacy-v2 event cleanup callback count != 1")) {
+        std::fprintf(stderr, "[sycl-runtime-wrapper] legacy-v2 event cleanup diagnostics: calls=%d durable_owners=%zu registry_state=%s lookup_visible=%d\n",
+                     g_fixture_event_free_calls, ggml_backend_test_durable_owners(&failed_free_reg),
+                     ggml_backend_test_registry_state(&failed_free_reg), ggml_backend_reg_by_name("TEST-LIFECYCLE") == &failed_free_reg);
+        return false;
+    }
+    if (!fixture_expect(ggml_backend_test_durable_owners(&failed_free_reg) == 0,
+                        "failed first publication durable owner count changed after immediate free")) {
+        std::fprintf(stderr, "[sycl-runtime-wrapper] durable owner diagnostics: count=%zu registry_state=%s lookup_visible=%d\n",
+                     ggml_backend_test_durable_owners(&failed_free_reg), ggml_backend_test_registry_state(&failed_free_reg),
+                     ggml_backend_reg_by_name("TEST-LIFECYCLE") == &failed_free_reg);
+        return false;
+    }
+    if (!fixture_expect(std::strcmp(ggml_backend_test_registry_state(&failed_free_reg), "REMOVED") == 0,
+                        "failed first publication registry tombstone state != REMOVED")) {
+        std::fprintf(stderr, "[sycl-runtime-wrapper] registry state diagnostics: state=%s durable_owners=%zu lookup_visible=%d\n",
+                     ggml_backend_test_registry_state(&failed_free_reg), ggml_backend_test_durable_owners(&failed_free_reg),
+                     ggml_backend_reg_by_name("TEST-LIFECYCLE") == &failed_free_reg);
+        return false;
+    }
     phase("generic fixture: free adopted legacy-v2 event");
     ggml_backend_event_free(pre_registry_event);
     if (ggml_backend_test_durable_owners(reg) != 0) return false;

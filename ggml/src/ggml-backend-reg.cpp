@@ -1091,6 +1091,25 @@ extern "C" size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg) {
     }
 }
 
+extern "C" const char * ggml_backend_test_registry_state(ggml_backend_reg_t reg) {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        if (found == registry.backends.end()) return "NOT_FOUND";
+        switch ((*found)->state) {
+            case ggml_backend_reg_state::ACTIVE: return "ACTIVE";
+            case ggml_backend_reg_state::REACTIVATING: return "REACTIVATING";
+            case ggml_backend_reg_state::UNLOADING: return "UNLOADING";
+            case ggml_backend_reg_state::HIDDEN_FAILED: return "HIDDEN_FAILED";
+            case ggml_backend_reg_state::REMOVED: return "REMOVED";
+        }
+    } catch (...) {
+    }
+    return "ERROR";
+}
+
 extern "C" size_t ggml_backend_test_active_calls(ggml_backend_reg_t reg) {
     try {
         auto & registry = get_reg();
