@@ -783,13 +783,20 @@ checks = {
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
     "hidden publication until independent owner adoption":
         "entry->state = ggml_backend_reg_state::REACTIVATING" in registry_backend
+        and "Serialize staging, hidden adoption, and ACTIVE publication" in registry_backend
+        and registry_backend.index("operation_lock(module_operation_mutex)",
+                                   registry_backend.index("bool register_backend"))
+            < registry_backend.index("ggml_backend_refresh_buffer_lifecycle();",
+                                     registry_backend.index("bool register_backend"))
         and registry_backend.index("ggml_backend_refresh_buffer_lifecycle();")
             < registry_backend.index("published_entry->state = ggml_backend_reg_state::ACTIVE")
         and "device_owner_adopt" in backend_base
         and "Settle independently" in backend_base
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
-        and "orphan_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+        and "orphan_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "publication-raced unload completed early" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "generation tombstones retained": "current_generation" in registry_backend
     and "find_device_identity" in registry_backend
     and "Prefer" in registry_backend and "current committed row" in registry_backend

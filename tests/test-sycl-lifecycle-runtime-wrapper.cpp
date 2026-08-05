@@ -170,9 +170,13 @@ static bool run_registry_failure_fixture() {
     phase("generic fixture: concurrent unload blocked by hidden publication");
     auto publishing_unload = std::async(std::launch::async, [reg] { return ggml_backend_unload_checked(reg); });
     if (publishing_unload.wait_for(std::chrono::milliseconds(50)) != std::future_status::timeout) {
+        const auto early_result = publishing_unload.get();
+        std::fprintf(stderr,
+                     "publication-raced unload completed early: result=%d visible=%d durable=%zu shutdowns=%d\n",
+                     static_cast<int>(early_result), ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr,
+                     ggml_backend_test_durable_owners(reg), g_registry_fixture_shutdowns);
         ggml_backend_test_block_owner_adoption(false);
         adopting_register.get();
-        (void) publishing_unload.get();
         return false;
     }
     auto overlapping_free = std::async(std::launch::async,

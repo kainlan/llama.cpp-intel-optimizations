@@ -315,6 +315,9 @@ struct ggml_backend_registry {
         if (!reg) {
             return false;
         }
+        // Serialize staging, hidden adoption, and ACTIVE publication with
+        // checked unload. Recursive plugin registration remains supported.
+        std::lock_guard<std::recursive_mutex> operation_lock(module_operation_mutex);
         try {
             bool needs_reactivation = false;
             {
