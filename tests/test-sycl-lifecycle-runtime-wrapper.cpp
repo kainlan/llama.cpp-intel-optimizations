@@ -1049,15 +1049,29 @@ int main() {
     ggml_backend_test_wait_unload_blocked();
     auto concurrent_load = std::async(std::launch::async, [&] { return ggml_backend_load(GGML_SYCL_RUNTIME_MODULE); });
     auto concurrent_enumeration = std::async(std::launch::async, [] { return ggml_backend_dev_count(); });
-    if (concurrent_load.wait_for(std::chrono::milliseconds(100)) != std::future_status::timeout ||
-        concurrent_enumeration.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
-        std::fprintf(stderr, "same-module load was not deferred or enumeration held the registry lock\n");
+    const bool load_failed_closed =
+        concurrent_load.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const bool enumeration_unlocked =
+        concurrent_enumeration.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (!load_failed_closed || !enumeration_unlocked) {
+        std::fprintf(stderr, "hook-contended load did not fail closed or enumeration blocked\n");
+        ggml_backend_test_release_unload();
+        (void) final_unload.get();
+        (void) concurrent_load.get();
+        (void) concurrent_enumeration.get();
         return 1;
     }
     (void) concurrent_enumeration.get();
+    if (concurrent_load.get() != nullptr || ggml_backend_reg_by_name("SYCL") != nullptr) {
+        std::fprintf(stderr, "hook-contended load published a backend instead of returning null\n");
+        ggml_backend_test_release_unload();
+        (void) final_unload.get();
+        return 1;
+    }
     ggml_backend_test_release_unload();
-    if (final_unload.get() != GGML_BACKEND_UNLOAD_OK || !(reg = concurrent_load.get())) {
-        std::fprintf(stderr, "deferred logical reload failed\n");
+    if (final_unload.get() != GGML_BACKEND_UNLOAD_OK ||
+        !(reg = ggml_backend_load(GGML_SYCL_RUNTIME_MODULE))) {
+        std::fprintf(stderr, "post-hook logical reload retry failed\n");
         return 1;
     }
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {

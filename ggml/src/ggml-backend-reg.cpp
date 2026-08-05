@@ -619,7 +619,13 @@ struct ggml_backend_registry {
             unloading->state = ggml_backend_reg_state::UNLOADING;
         }
 
-        ggml_backend_test_unload_barrier();
+        {
+            // The deterministic barrier models a cross-thread dependency from
+            // plugin code while module serialization is held. Contending loads
+            // must fail closed rather than wait and deadlock the hook owner.
+            external_hook_scope hook;
+            ggml_backend_test_unload_barrier();
+        }
         bool test_reentrant_registration = false;
         {
             std::lock_guard<std::mutex> test_lock(g_registry_test_mutex);

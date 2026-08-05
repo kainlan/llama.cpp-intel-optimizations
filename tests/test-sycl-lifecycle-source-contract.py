@@ -661,8 +661,11 @@ checks = {
     and "cv.wait_for(lock, active_call_drain_timeout" in registry_backend
     and "mutable std::recursive_mutex" not in registry_backend
     and "module_operation_mutex" in registry_backend
-    and "same-module load was not deferred or enumeration held the registry lock" in
-        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    and "hook-contended load did not fail closed or enumeration blocked" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "post-hook logical reload retry failed" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "barrier models a cross-thread dependency" in registry_backend,
     "NODELETE MoE state reset": "ggml_sycl_reset_moe_module_state()" in backend
     and "g_moe_hybrid_init_success[d].store(false" in backend
     and "g_moe_expert_meta.clear()" in backend
