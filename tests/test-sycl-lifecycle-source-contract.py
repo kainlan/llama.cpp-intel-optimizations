@@ -58,6 +58,7 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_test_fail_next_shutdown_clean": "ggml_backend_sycl_test_fail_next_shutdown_clean_guarded",
     "ggml_backend_sycl_test_fail_next_registry_stage": "ggml_backend_sycl_test_fail_next_registry_stage",
     "ggml_backend_sycl_test_block_next_kv_push": "ggml_backend_sycl_test_block_next_kv_push",
+    "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup": "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup",
 }
 module_proc_inventory_ok = all(
     ('strcmp(name, "' + proc + '")') in backend and function_has_module_guard(backend, function)
@@ -110,6 +111,50 @@ register_usage_body = re.search(
 ).group(0)
 exact_runtime_body = re.search(
     r"ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+begin_graph_body = re.search(
+    r"static bool ggml_sycl_execution_begin_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+expected_participants_locked_body = re.search(
+    r"static std::vector<int> ggml_sycl_execution_expected_participants_locked\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+for_each_bound_backend_body = re.search(
+    r"template<typename F>\nstatic void ggml_sycl_execution_for_each_bound_backend\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+owner_rollback_guard_body = re.search(
+    r"struct owner_rollback_guard \{.*?\} rollback\{ effect\.owner, false, false \};",
+    backend, re.S | re.M
+).group(0)
+abort_owner_effects_noexcept_body = re.search(
+    r"static bool ggml_sycl_abort_owner_effects_noexcept\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+extract_control_host_allocs_body = re.search(
+    r"ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_unbind_body = re.search(
+    r"static void ggml_sycl_execution_unbind_backend\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_seal_body = re.search(
+    r"static void ggml_sycl_execution_seal_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_quarantine_body = re.search(
+    r"static void ggml_sycl_execution_quarantine_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+execution_complete_body = re.search(
+    r"static bool ggml_sycl_execution_complete_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+backend_destructor_body = re.search(
+    r"ggml_backend_sycl_context::~ggml_backend_sycl_context\(\) \{.*?^}\n",
     backend, re.S | re.M
 ).group(0)
 checks = {
@@ -327,6 +372,30 @@ checks = {
     < cpp.index("model->second.phase = model_phase::TEARING_DOWN"),
     "rollback effect replay": "error::EFFECT_FAILED" in cpp
     and "poisoned_after_prepare" in cpp,
+    "begin_graph binding lock acquired once": begin_graph_body.count("g_execution_backend_binding_mutex") == 1
+    and "ggml_sycl_execution_expected_participants_locked" in begin_graph_body,
+    "expected participants follows covered device remaps": "binding.covered_devices.begin()" in expected_participants_locked_body
+    and "backend->device" not in expected_participants_locked_body,
+    "for_each backend callback holds no state lock": "execution_state_mutex" not in for_each_bound_backend_body,
+    "rollback guard is noexcept": "~owner_rollback_guard() noexcept" in owner_rollback_guard_body
+    and "ggml_sycl_abort_owner_effects_noexcept(owner)" in owner_rollback_guard_body,
+    "rollback cleanup failpoint is guarded and exported": "g_test_fail_next_abort_owner_effects_cleanup" in backend
+    and 'strcmp(name, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup")' in backend,
+    "rollback cleanup stays nonthrowing and preserves closed reset": "ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw()" in abort_owner_effects_noexcept_body
+    and abort_owner_effects_noexcept_body.count("catch (...)") >= 6
+    and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
+    "explicit abort propagates cleanup failure": "const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);" in backend
+    and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
+    and "ggml_sycl_enqueue_quarantined_result(*registry, failed, model);" in backend,
+    "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
+    and "storage->entries.resize(binding_count);" in extract_control_host_allocs_body
+    and "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in extract_control_host_allocs_body,
+    "execution unbind/seal/quarantine/complete snapshot under mutex": backend.count("ggml_sycl_take_execution_state_snapshot(ctx)") >= 4
+    and "ctx->execution_state_mutex" in backend,
+    "destructor waits before unbind": backend_destructor_body.index("qptrs[dev][s]->wait()")
+    < backend_destructor_body.index("ggml_sycl_execution_unbind_backend(this);"),
+    "centralized quarantine enqueue helper": "static void ggml_sycl_enqueue_quarantined_result" in backend
+    and backend.count("ggml_sycl_enqueue_quarantined_result(") >= 5,
     "finalize poison authority": "poisoned_after_prepare" in cpp
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
@@ -547,6 +616,12 @@ checks = {
     and "ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()" in exact_runtime_body
     and exact_runtime_body.index("return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND") <
         exact_runtime_body.index("registry.prepare_live_update(token)"),
+    "runtime context snapshots and revalidates execution binding":
+    "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in exact_runtime_body
+    and "auto binding_it = g_execution_backend_bindings.find(backend_ctx);" in exact_runtime_body
+    and "exec_state = ggml_sycl_execution_snapshot_locked(backend_ctx);" in exact_runtime_body
+    and "if (binding_it->second.context_id != exec_state.context_id)" in exact_runtime_body
+    and "backend_ctx->execution_context_id != exec_state.context_id" in exact_runtime_body,
     "weight usage ABI wrapper and status mutation hold exact load effect":
     "void ggml_backend_sycl_register_weight_usage" in backend
     and "bool ggml_backend_sycl_try_register_weight_usage" in backend

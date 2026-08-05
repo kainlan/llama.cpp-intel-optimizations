@@ -20,6 +20,9 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
 extern "C" bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners();
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
+extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
@@ -1027,9 +1030,41 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_cancel_unload)
     LOAD_SYCL(ggml_backend_sycl_test_hold_live_update)
     LOAD_SYCL(ggml_backend_sycl_test_release_live_update)
+    using seed_control_host_allocs_fn = bool (*)(ggml_backend_t, uint32_t);
+    auto ggml_backend_sycl_test_seed_control_host_allocs_fn = reinterpret_cast<seed_control_host_allocs_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_control_host_allocs"));
+    if (!ggml_backend_sycl_test_seed_control_host_allocs_fn) {
+        std::fprintf(stderr, "missing registry procedure %s\n", "ggml_backend_sycl_test_seed_control_host_allocs");
+        return 1;
+    }
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_create)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_bind_backend)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_extract)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_close_if_idle)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_begin_drain)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_finish_drain)
+    LOAD_SYCL(ggml_backend_sycl_execution_session_begin_reset)
+    LOAD_SYCL(ggml_backend_sycl_execution_session_finish_reset)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
+    using stage_inventory_failpoint_fn = void (*)();
+    auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device"));
+    auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
+    auto ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup"));
+    if (!ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn ||
+        !ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn ||
+        !ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn) {
+        std::fprintf(stderr, "missing lifecycle failpoint procedures\n");
+        return 1;
+    }
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
     LOAD_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)
     LOAD_SYCL(ggml_backend_sycl_host_compute_buffer_type)
@@ -1050,6 +1085,28 @@ int main() {
 #    define CALL_SYCL(name) name##_fn
 #else
 #    define CALL_SYCL(name) name
+#endif
+
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    auto fail_stage_early_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn();
+    };
+    auto fail_stage_late_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn();
+    };
+    auto fail_abort_owner_effects_cleanup = [&] {
+        ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn();
+    };
+#else
+    auto fail_stage_early_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
+    };
+    auto fail_stage_late_after_first_device = [&] {
+        ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
+    };
+    auto fail_abort_owner_effects_cleanup = [&] {
+        ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
+    };
 #endif
 
 #if defined(GGML_SYCL_RUNTIME_MODULE)
@@ -1128,6 +1185,20 @@ int main() {
         std::fprintf(stderr, "unknown quarantine token accepted\n");
         return 1;
     }
+    ggml_sycl_execution_snapshot exec_snapshot{};
+    ggml_sycl_exec_drain_ticket drain_ticket{};
+    ggml_sycl_exec_reset_ticket reset_ticket{};
+    ggml_sycl_exec_control_host_alloc_batch drain_batch{ nullptr, 0 };
+    if (CALL_SYCL(ggml_backend_sycl_execution_context_extract)({}, &exec_snapshot) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_close_if_idle)({}) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_begin_drain)({}, &drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_session_begin_reset)({}, {}, {}, &reset_ticket) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_session_finish_reset)(reset_ticket, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE) {
+        std::fprintf(stderr, "execution lifecycle invalid-input contract mismatch\n");
+        return 1;
+    }
 
     phase("lifecycle abort checks");
     ggml_sycl_load_txn aborted{};
@@ -1167,9 +1238,46 @@ int main() {
         return 1;
     }
 
-    phase("empty early and late planning commit");
-    ggml_sycl_load_txn    committed{};
-    ggml_sycl_model_token token{};
+    phase("abort cleanup failure quarantines and recovers");
+    ggml_sycl_load_txn poisoned_abort{};
+    ggml_sycl_tensor_inventory poisoned_inventory{};
+    poisoned_inventory.n_ctx    = 16;
+    poisoned_inventory.n_ubatch = 4;
+    ggml_sycl_placement_envelope poisoned_envelope{};
+    poisoned_envelope.n_ctx           = 16;
+    poisoned_envelope.n_ubatch        = 4;
+    poisoned_envelope.n_seq_max       = 1;
+    poisoned_envelope.flash_attn_type = -1;
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "poisoned abort setup failed\n");
+        return 1;
+    }
+    fail_abort_owner_effects_cleanup();
+    const auto poisoned_abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(poisoned_abort, false, nullptr);
+    if (poisoned_abort_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
+        std::fprintf(stderr, "poisoned abort did not quarantine/recover cleanly rc=%d authority=%d before=%d\n",
+                     (int) poisoned_abort_rc,
+                     CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() ? 1 : 0,
+                     authority_before_cpu_cancels ? 1 : 0);
+        return 1;
+    }
+    ggml_sycl_load_txn post_poisoned_abort{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&post_poisoned_abort) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "poisoned abort did not recover future transactions\n");
+        return 1;
+    }
+    const auto post_poisoned_abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(post_poisoned_abort, false, nullptr);
+    if (post_poisoned_abort_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
+        post_poisoned_abort_rc != GGML_SYCL_LIFECYCLE_POISONED) {
+        std::fprintf(stderr, "post-poisoned abort returned %d\n", (int) post_poisoned_abort_rc);
+        return 1;
+    }
+
+    phase("stage_inventory_plan fail-closed after first device");
+    ggml_sycl_load_txn stage_fail{};
     ggml_sycl_tensor_inventory inventory{};
     inventory.n_ctx    = 32;
     inventory.n_ubatch = 8;
@@ -1178,6 +1286,38 @@ int main() {
     envelope.n_ubatch        = 8;
     envelope.n_seq_max       = 1;
     envelope.flash_attn_type = -1;
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&stage_fail) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "stage fail setup begin failed\n");
+        return 1;
+    }
+    fail_stage_early_after_first_device();
+    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+        std::fprintf(stderr, "early stage_inventory_plan did not fail closed\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        std::fprintf(stderr, "early stage failure left txn unrecoverable\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&stage_fail) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "late stage fail setup begin failed\n");
+        return 1;
+    }
+    fail_stage_late_after_first_device();
+    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+        std::fprintf(stderr, "late stage_inventory_plan did not fail closed\n");
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        std::fprintf(stderr, "late stage failure left txn unrecoverable\n");
+        return 1;
+    }
+
+    phase("empty early and late planning commit");
+    ggml_sycl_load_txn    committed{};
+    ggml_sycl_model_token token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&committed) != GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||

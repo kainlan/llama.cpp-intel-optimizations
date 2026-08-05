@@ -135,6 +135,33 @@ if (BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-runtime-host COMMAND test-sycl-lifecycle-runtime-host)
     set_tests_properties(sycl-lifecycle-runtime-host PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
+    add_executable(test-sycl-lifecycle-owner-reset
+        tests/test-sycl-lifecycle-owner-reset.cpp
+        execution-lifecycle.cpp)
+    target_include_directories(test-sycl-lifecycle-owner-reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-lifecycle-owner-reset PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-lifecycle-owner-reset PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-lifecycle-owner-reset COMMAND test-sycl-lifecycle-owner-reset)
+    add_test(NAME sycl-lifecycle-h6 COMMAND test-sycl-lifecycle-owner-reset --case H6)
+    add_test(NAME sycl-lifecycle-h7 COMMAND test-sycl-lifecycle-owner-reset --case H7)
+    add_test(NAME sycl-lifecycle-h11 COMMAND test-sycl-lifecycle-owner-reset --case H11)
+    add_test(NAME sycl-lifecycle-h13 COMMAND test-sycl-lifecycle-owner-reset --case H13)
+    add_test(NAME sycl-lifecycle-g2 COMMAND test-sycl-lifecycle-owner-reset --case G2)
+    set_tests_properties(sycl-lifecycle-owner-reset sycl-lifecycle-h6 sycl-lifecycle-h7 sycl-lifecycle-h11 sycl-lifecycle-h13 sycl-lifecycle-g2 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    add_executable(test-sycl-lifecycle-event-lease
+        tests/test-sycl-lifecycle-event-lease.cpp
+        execution-lifecycle.cpp)
+    target_include_directories(test-sycl-lifecycle-event-lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-lifecycle-event-lease PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-lifecycle-event-lease PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-lifecycle-event-lease COMMAND test-sycl-lifecycle-event-lease)
+    add_test(NAME sycl-lifecycle-g5a COMMAND test-sycl-lifecycle-event-lease --case G5a)
+    add_test(NAME sycl-lifecycle-g6 COMMAND test-sycl-lifecycle-event-lease --case G6)
+    add_test(NAME sycl-lifecycle-g6b COMMAND test-sycl-lifecycle-event-lease --case G6b)
+    add_test(NAME sycl-lifecycle-g7 COMMAND test-sycl-lifecycle-event-lease --case G7)
+    set_tests_properties(sycl-lifecycle-event-lease sycl-lifecycle-g5a sycl-lifecycle-g6 sycl-lifecycle-g6b sycl-lifecycle-g7 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")

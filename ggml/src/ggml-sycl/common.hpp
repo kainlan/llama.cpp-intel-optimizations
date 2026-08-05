@@ -4554,6 +4554,19 @@ namespace sycl_ex = sycl::ext::oneapi::experimental;
 struct ggml_backend_sycl_context {
     int                                  device;
     std::string                          name;
+    mutable std::mutex                   execution_state_mutex;
+    uint64_t                             execution_context_id = 0;
+    int                                  execution_participant_id = -1;
+    uint64_t                             execution_session_id = 0;
+    uint64_t                             execution_reset_epoch = 0;
+    uint64_t                             execution_graph_epoch = 0;
+    uint64_t                             execution_invocation_id = 0;
+    bool                                 execution_graph_sealed = false;
+    std::vector<int>                     execution_aggregate_devices;
+    uint64_t                             execution_root_model_id = 0;
+    uint64_t                             execution_root_load_txn_id = 0;
+    uint32_t                             execution_root_slot = GGML_SYCL_MODEL_SLOT_NONE;
+    uint64_t                             execution_root_slot_generation = 0;
     // Device capability: does this device support SoA weight layout optimization?
     // This is NOT tensor state - it's a static capability of the GPU.
     // Tensor state is tracked per-tensor in ggml_tensor_extra_gpu::optimized_feature
