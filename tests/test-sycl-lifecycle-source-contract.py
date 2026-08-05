@@ -748,6 +748,8 @@ checks = {
     and "Underlying buffers already hold durable owners" in backend_base
     and "ggml_backend_buffer_clear_owner(result)" in backend_base
     and "live_owner_state::TRANSFERRING" in backend_base
+    and "uint64_t epoch" in backend_base
+    and "found->second.epoch != epoch" in backend_base
     and "pre_registry_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "live backend event did not block checked unload" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -787,7 +789,7 @@ checks = {
     "hidden publication until independent owner adoption":
         "entry->state = ggml_backend_reg_state::REACTIVATING" in registry_backend
         and "Serialize staging, hidden adoption, and ACTIVE publication" in registry_backend
-        and registry_backend.index("operation_lock(module_operation_mutex)",
+        and registry_backend.index("operation_lock(module_operation_mutex,",
                                    registry_backend.index("bool register_backend"))
             < registry_backend.index("ggml_backend_refresh_buffer_lifecycle();",
                                      registry_backend.index("bool register_backend"))
@@ -801,6 +803,12 @@ checks = {
         and "reactivation rollback threw; retaining tombstone" in registry_backend
         and "ggml_backend_finalize_reactivate" in registry_backend
         and "g_sycl_reactivation_pending_finalize" in backend
+        and "g_external_hook_active" in registry_backend
+        and "external_hook_scope" in registry_backend
+        and "PREPARE_CROSS_THREAD" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "PREPARE_REACTIVATE_THROW" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "rollback_unified_cache_module_use" in backend
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -810,7 +818,11 @@ checks = {
         and "overlapping ownership transfer reconciled" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "multi-buffer aggregate owns no duplicate lease" in
-            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "g_fail_next_buffer_emplace" in backend_base
+        and "g_fail_next_event_emplace" in backend_base
+        and "backend buffer free callback threw" in backend_base
+        and "backend event free callback threw" in backend_base,
     "generation tombstones retained": "current_generation" in registry_backend
     and "find_device_identity" in registry_backend
     and "Prefer" in registry_backend and "current committed row" in registry_backend

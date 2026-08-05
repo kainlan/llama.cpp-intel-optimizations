@@ -259,6 +259,8 @@ extern "C" {
     GGML_API void ggml_backend_test_block_owner_adoption(bool block);
     GGML_API bool ggml_backend_test_owner_adoption_blocked(void);
     GGML_API void ggml_backend_test_fail_next_owner_adoption(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_emplace(void);
+    GGML_API void ggml_backend_test_fail_next_event_emplace(void);
     GGML_API size_t ggml_backend_test_owner_close_attempts(void);
     GGML_API size_t ggml_backend_test_owner_transfer_attempts(void);
     GGML_API size_t ggml_backend_test_unload_attempts(void);

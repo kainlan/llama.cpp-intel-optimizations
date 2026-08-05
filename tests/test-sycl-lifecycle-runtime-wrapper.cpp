@@ -23,7 +23,9 @@ extern "C" void ggml_backend_sycl_test_release_live_update();
 
 namespace {
 enum class registry_fixture_mode {
-    NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW
+    NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, PREPARE_CROSS_THREAD,
+    PREPARE_REACTIVATE_THROW,
+    COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW
 };
 static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
 static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
@@ -34,6 +36,7 @@ static bool                   g_registry_fixture_reactivation_pending = false;
 static std::mutex              g_device_callback_mutex;
 static std::condition_variable g_device_callback_cv;
 static bool                    g_device_callback_block = false;
+static bool                    g_fixture_event_free_throw = false;
 static bool                    g_device_callback_entered = false;
 static std::mutex              g_commit_reactivate_mutex;
 static std::condition_variable g_commit_reactivate_cv;
@@ -61,6 +64,10 @@ static ggml_backend_event_t registry_fixture_event_new(ggml_backend_dev_t device
 }
 static void registry_fixture_event_free(ggml_backend_dev_t, ggml_backend_event_t event) {
     delete reinterpret_cast<legacy_v2_event_layout *>(event);
+    if (g_fixture_event_free_throw) throw std::runtime_error("fixture event free failure");
+}
+static void registry_fixture_buffer_free_throw(ggml_backend_buffer_t) {
+    throw std::runtime_error("fixture buffer free failure");
 }
 static const char * registry_fixture_reg_name(ggml_backend_reg_t) { return "TEST-LIFECYCLE"; }
 static size_t registry_fixture_reg_count(ggml_backend_reg_t) { return 1; }
@@ -82,6 +89,16 @@ static void registry_fixture_cancel() { ++g_registry_fixture_cancels; }
 static bool registry_fixture_prepare_reactivate() {
     if (g_registry_fixture_reactivation_pending) return false;
     g_registry_fixture_reactivation_pending = true;
+    if (g_registry_fixture_mode == registry_fixture_mode::PREPARE_CROSS_THREAD) {
+        auto nested = std::async(std::launch::async, [] { ggml_backend_register(g_registry_fixture_reg); });
+        if (nested.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            throw std::runtime_error("cross-thread prepare reentry deadlocked");
+        }
+        nested.get();
+    }
+    if (g_registry_fixture_mode == registry_fixture_mode::PREPARE_REACTIVATE_THROW) {
+        throw std::runtime_error("fixture partial prepare failure");
+    }
     return true;
 }
 static void registry_fixture_commit_reactivate() {
@@ -254,6 +271,16 @@ static bool run_registry_failure_fixture() {
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
     phase("generic fixture: unload after all adopted owners freed");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: cross-thread prepare reentry fails closed");
+    g_registry_fixture_mode = registry_fixture_mode::PREPARE_CROSS_THREAD;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg ||
+        ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: throwing partial prepare rolls back");
+    g_registry_fixture_mode = registry_fixture_mode::PREPARE_REACTIVATE_THROW;
+    ggml_backend_register(reg);
+    if (g_registry_fixture_reactivation_pending || ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
     phase("generic fixture: adoption allocation failure leaves retryable tombstone");
     ggml_backend_test_fail_next_owner_adoption();
     ggml_backend_register(reg);
@@ -270,6 +297,24 @@ static bool run_registry_failure_fixture() {
     ggml_backend_buffer_free(aggregate);
     if (ggml_backend_test_durable_owners(reg) != 1) return false;
     ggml_backend_buffer_free(unrelated);
+    if (ggml_backend_test_durable_owners(reg) != 0) return false;
+    phase("generic fixture: owner-map allocation and throwing teardown recovery");
+    ggml_backend_test_fail_next_buffer_emplace();
+    if (ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0) != nullptr ||
+        ggml_backend_test_durable_owners(reg) != 0) return false;
+    ggml_backend_test_fail_next_event_emplace();
+    if (ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context)) != nullptr ||
+        ggml_backend_test_durable_owners(reg) != 0) return false;
+    ggml_backend_buffer_i throwing_iface{};
+    throwing_iface.free_buffer = registry_fixture_buffer_free_throw;
+    auto throwing_buffer = ggml_backend_buffer_init(&pre_registry_buft, throwing_iface, nullptr, 0);
+    if (!throwing_buffer || ggml_backend_test_durable_owners(reg) != 1) return false;
+    ggml_backend_buffer_free(throwing_buffer);
+    g_fixture_event_free_throw = true;
+    auto throwing_event = ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context));
+    if (!throwing_event || ggml_backend_test_durable_owners(reg) != 1) return false;
+    ggml_backend_event_free(throwing_event);
+    g_fixture_event_free_throw = false;
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
     const size_t initial_reg_count = ggml_backend_reg_count();
 #if defined(GGML_SYCL_RUNTIME_MODULE)

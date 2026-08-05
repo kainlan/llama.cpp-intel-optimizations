@@ -95,6 +95,7 @@ struct live_owner_record {
     ggml_backend_dev_t device;
     bool lease;
     live_owner_state state = live_owner_state::OPEN;
+    uint64_t epoch = 0;
 };
 struct live_owner_store {
     std::mutex mutex;
@@ -113,6 +114,9 @@ struct live_owner_store {
 static std::atomic<bool> g_fail_next_owner_adoption{ false };
 static std::atomic<size_t> g_owner_close_attempts{ 0 };
 static std::atomic<size_t> g_owner_transfer_attempts{ 0 };
+static std::atomic<uint64_t> g_live_owner_epoch{ 1 };
+static std::atomic<bool> g_fail_next_buffer_emplace{ false };
+static std::atomic<bool> g_fail_next_event_emplace{ false };
 
 static live_owner_store & live_owners() {
     static auto * store = new live_owner_store;
@@ -140,6 +144,13 @@ size_t ggml_backend_test_owner_transfer_attempts(void) {
 
 size_t ggml_backend_test_owner_close_attempts(void) {
     return g_owner_close_attempts.load(std::memory_order_acquire);
+}
+
+void ggml_backend_test_fail_next_buffer_emplace(void) {
+    g_fail_next_buffer_emplace.store(true, std::memory_order_release);
+}
+void ggml_backend_test_fail_next_event_emplace(void) {
+    g_fail_next_event_emplace.store(true, std::memory_order_release);
 }
 
 void ggml_backend_test_fail_next_owner_adoption(void) {
@@ -331,16 +342,22 @@ void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer) {
     bool lease = false;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        auto initial = g_live_buffers.find(buffer);
+        if (initial == g_live_buffers.end()) return;
+        const uint64_t epoch = initial->second.epoch;
         if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
                 auto found = g_live_buffers.find(buffer);
-                return found == g_live_buffers.end() || found->second.state == live_owner_state::OPEN;
+                return found == g_live_buffers.end() || found->second.epoch != epoch ||
+                       found->second.state == live_owner_state::OPEN;
             })) return;
         auto found = g_live_buffers.find(buffer);
-        if (found == g_live_buffers.end()) return;
+        if (found == g_live_buffers.end() || found->second.epoch != epoch) return;
         found->second.state = live_owner_state::TRANSFERRING;
         device = found->second.device;
         lease = found->second.lease;
-        found->second = { nullptr, false, live_owner_state::OPEN };
+        found->second.device = nullptr;
+        found->second.lease = false;
+        found->second.state = live_owner_state::OPEN;
         buffer->owner_device = nullptr;
         buffer->owner_lease = false;
     }
@@ -356,14 +373,19 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
     g_owner_transfer_attempts.fetch_add(1, std::memory_order_release);
     ggml_backend_dev_t old_device = nullptr;
     bool old_lease = false;
+    uint64_t epoch = 0;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        auto initial = g_live_buffers.find(buffer);
+        if (initial == g_live_buffers.end()) return false;
+        epoch = initial->second.epoch;
         if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
                 auto found = g_live_buffers.find(buffer);
-                return found == g_live_buffers.end() || found->second.state == live_owner_state::OPEN;
+                return found == g_live_buffers.end() || found->second.epoch != epoch ||
+                       found->second.state == live_owner_state::OPEN;
             })) return false;
         auto found = g_live_buffers.find(buffer);
-        if (found == g_live_buffers.end()) return false;
+        if (found == g_live_buffers.end() || found->second.epoch != epoch) return false;
         old_device = found->second.device;
         old_lease = found->second.lease;
         found->second.state = live_owner_state::TRANSFERRING;
@@ -375,15 +397,18 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
     if (!consumed_production && new_lease && !acquire_owner(new_device)) {
         std::lock_guard<std::mutex> lock(g_live_owner_mutex);
         auto found = g_live_buffers.find(buffer);
-        if (found != g_live_buffers.end()) found->second.state = live_owner_state::OPEN;
+        if (found != g_live_buffers.end() && found->second.epoch == epoch &&
+            found->second.state == live_owner_state::TRANSFERRING) {
+            found->second.state = live_owner_state::OPEN;
+        }
         g_live_owner_cv.notify_all();
         return false;
     }
     {
         std::lock_guard<std::mutex> lock(g_live_owner_mutex);
         auto found = g_live_buffers.find(buffer);
-        if (found == g_live_buffers.end() || found->second.state != live_owner_state::TRANSFERRING ||
-            found->second.device != old_device || found->second.lease != old_lease) {
+        if (found == g_live_buffers.end() || found->second.epoch != epoch ||
+            found->second.state != live_owner_state::TRANSFERRING || found->second.device != old_device || found->second.lease != old_lease) {
             if (new_lease) {
                 const auto release = g_device_owner_release.load(std::memory_order_acquire);
                 if (release) release(new_device);
@@ -393,7 +418,9 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
         buffer->buft = buft;
         buffer->owner_device = new_device;
         buffer->owner_lease = new_lease;
-        found->second = { new_device, new_lease, live_owner_state::OPEN };
+        found->second.device = new_device;
+        found->second.lease = new_lease;
+        found->second.state = live_owner_state::OPEN;
     }
     g_live_owner_cv.notify_all();
     if (old_lease) {
@@ -408,7 +435,7 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         struct ggml_backend_buffer_i      iface,
                void *                     context,
                size_t                     size) {
-    ggml_backend_buffer_t buffer = new ggml_backend_buffer {
+    ggml_backend_buffer_t buffer = new (std::nothrow) ggml_backend_buffer {
         /* .interface = */ iface,
         /* .buft      = */ buft,
         /* .context   = */ context,
@@ -417,6 +444,7 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .owner_device = */ buft ? buft->device : nullptr,
         /* .owner_lease  = */ false
     };
+    if (!buffer) return nullptr;
     const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
     const bool consumed_production = consume_production_owner(buffer->owner_device);
     if (!consumed_production && buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
@@ -425,9 +453,24 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     }
     buffer->owner_lease = consumed_production || (buffer->owner_device && acquire_owner);
 
-    {
+    try {
         std::lock_guard<std::mutex> lock(g_live_owner_mutex);
-        g_live_buffers.emplace(buffer, live_owner_record{ buffer->owner_device, buffer->owner_lease });
+        if (g_fail_next_buffer_emplace.exchange(false, std::memory_order_acq_rel)) throw std::bad_alloc();
+        const auto inserted = g_live_buffers.emplace(buffer, live_owner_record{
+            buffer->owner_device, buffer->owner_lease, live_owner_state::OPEN,
+            g_live_owner_epoch.fetch_add(1, std::memory_order_relaxed) });
+        if (!inserted.second) throw std::bad_alloc();
+    } catch (...) {
+        if (buffer->iface.free_buffer) {
+            try { buffer->iface.free_buffer(buffer); }
+            catch (...) { GGML_LOG_ERROR("buffer cleanup threw after owner-map insertion failure\n"); }
+        }
+        if (buffer->owner_lease) {
+            const auto release = g_device_owner_release.load(std::memory_order_acquire);
+            if (release) release(buffer->owner_device);
+        }
+        delete buffer;
+        return nullptr;
     }
     if (buffer->owner_device && !buffer->owner_lease &&
         g_device_owner_acquire.load(std::memory_order_acquire)) {
@@ -447,27 +490,34 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     }
     g_owner_close_attempts.fetch_add(1, std::memory_order_release);
 
-    ggml_backend_dev_t owner_device = buffer->owner_device;
+    ggml_backend_dev_t owner_device = nullptr;
     bool owner_lease = false;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        auto initial = g_live_buffers.find(buffer);
+        if (initial == g_live_buffers.end()) return;
+        const uint64_t epoch = initial->second.epoch;
         if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
                 auto found = g_live_buffers.find(buffer);
-                return found == g_live_buffers.end() || found->second.state == live_owner_state::OPEN;
+                return found == g_live_buffers.end() || found->second.epoch != epoch ||
+                       found->second.state == live_owner_state::OPEN;
             })) {
             GGML_LOG_ERROR("buffer free timed out waiting for lifecycle adoption\n");
             return;
         }
         auto found = g_live_buffers.find(buffer);
-        if (found != g_live_buffers.end()) {
-            owner_device = found->second.device;
-            owner_lease = found->second.lease;
-            g_live_buffers.erase(found);
-        }
+        if (found == g_live_buffers.end() || found->second.epoch != epoch) return;
+        owner_device = found->second.device;
+        owner_lease = found->second.lease;
+        g_live_buffers.erase(found);
         buffer->owner_lease = false;
     }
+    g_live_owner_cv.notify_all();
     device_call_guard callback_guard(owner_device);
-    if (callback_guard && buffer->iface.free_buffer != NULL) buffer->iface.free_buffer(buffer);
+    if (callback_guard && buffer->iface.free_buffer != NULL) {
+        try { buffer->iface.free_buffer(buffer); }
+        catch (...) { GGML_LOG_ERROR("backend buffer free callback threw\n"); }
+    }
     if (owner_lease) {
         const auto release_owner = g_device_owner_release.load(std::memory_order_acquire);
         if (release_owner) release_owner(owner_device);
@@ -953,15 +1003,31 @@ ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
     if (!guard) return nullptr;
     const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
     if (acquire && !acquire(device)) return nullptr;
-    ggml_backend_event_t event = device->iface.event_new(device);
+    ggml_backend_event_t event = nullptr;
+    try { event = device->iface.event_new(device); }
+    catch (...) {
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (acquire && release) release(device);
+        return nullptr;
+    }
     if (!event) {
         const auto release = g_device_owner_release.load(std::memory_order_acquire);
         if (acquire && release) release(device);
         return nullptr;
     }
-    {
+    try {
         std::lock_guard<std::mutex> lock(g_live_owner_mutex);
-        g_live_events.emplace(event, live_owner_record{ device, acquire != nullptr });
+        if (g_fail_next_event_emplace.exchange(false, std::memory_order_acq_rel)) throw std::bad_alloc();
+        const auto inserted = g_live_events.emplace(event, live_owner_record{
+            device, acquire != nullptr, live_owner_state::OPEN,
+            g_live_owner_epoch.fetch_add(1, std::memory_order_relaxed) });
+        if (!inserted.second) throw std::bad_alloc();
+    } catch (...) {
+        try { device->iface.event_free(device, event); }
+        catch (...) { GGML_LOG_ERROR("event cleanup threw after owner-map insertion failure\n"); }
+        const auto release = g_device_owner_release.load(std::memory_order_acquire);
+        if (acquire && release) release(device);
+        return nullptr;
     }
     if (!acquire && g_device_owner_acquire.load(std::memory_order_acquire)) {
         ggml_backend_refresh_buffer_lifecycle();
@@ -973,26 +1039,33 @@ void ggml_backend_event_free(ggml_backend_event_t event) {
     if (event == NULL) {
         return;
     }
-    ggml_backend_dev_t owner_device = event->device;
+    ggml_backend_dev_t owner_device = nullptr;
     bool owner_lease = false;
     {
         std::unique_lock<std::mutex> lock(g_live_owner_mutex);
+        auto initial = g_live_events.find(event);
+        if (initial == g_live_events.end()) return;
+        const uint64_t epoch = initial->second.epoch;
         if (!g_live_owner_cv.wait_for(lock, std::chrono::seconds(10), [&] {
                 auto found = g_live_events.find(event);
-                return found == g_live_events.end() || found->second.state == live_owner_state::OPEN;
+                return found == g_live_events.end() || found->second.epoch != epoch ||
+                       found->second.state == live_owner_state::OPEN;
             })) {
             GGML_LOG_ERROR("event free timed out waiting for lifecycle adoption\n");
             return;
         }
         auto found = g_live_events.find(event);
-        if (found != g_live_events.end()) {
-            owner_device = found->second.device;
-            owner_lease = found->second.lease;
-            g_live_events.erase(found);
-        }
+        if (found == g_live_events.end() || found->second.epoch != epoch) return;
+        owner_device = found->second.device;
+        owner_lease = found->second.lease;
+        g_live_events.erase(found);
     }
+    g_live_owner_cv.notify_all();
     device_call_guard guard(owner_device);
-    if (guard) owner_device->iface.event_free(owner_device, event);
+    if (guard) {
+        try { owner_device->iface.event_free(owner_device, event); }
+        catch (...) { GGML_LOG_ERROR("backend event free callback threw\n"); }
+    }
     if (owner_lease) {
         const auto release = g_device_owner_release.load(std::memory_order_acquire);
         if (release) release(owner_device);
