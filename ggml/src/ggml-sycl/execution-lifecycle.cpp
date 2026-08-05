@@ -305,6 +305,16 @@ error Registry::begin_drain(ContextId context, DrainTicket * ticket) noexcept {
     return error::OK;
 }
 
+error Registry::unbind_backend(ContextId context, int device) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    if (device < 0 || device >= static_cast<int>(max_devices)) return error::MISMATCH;
+    if (it->second.bound_device_refs[device] == 0) return error::STALE;
+    --it->second.bound_device_refs[device];
+    return error::OK;
+}
+
 error Registry::validate_drain_ticket(const DrainTicket & ticket) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = contexts_.find(ticket.context.value);
@@ -313,6 +323,29 @@ error Registry::validate_drain_ticket(const DrainTicket & ticket) const noexcept
     if (entry.active_drain_serial != ticket.serial || entry.state != context_phase::DRAINING ||
         !(entry.session.id == ticket.session) || !(entry.session.reset_epoch == ticket.reset_epoch)) return error::STALE;
     return error::OK;
+}
+
+error Registry::begin_drain_extract(const DrainTicket & ticket) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = contexts_.find(ticket.context.value);
+    if (!ticket.active || ticket.context.value == 0 || ticket.serial == 0 || it == contexts_.end()) return error::STALE;
+    auto & entry = it->second;
+    if (entry.active_drain_serial != ticket.serial || entry.state != context_phase::DRAINING ||
+        !(entry.session.id == ticket.session) || !(entry.session.reset_epoch == ticket.reset_epoch)) return error::STALE;
+    if (entry.batch_outstanding) return error::BUSY;
+    entry.batch_outstanding = true;
+    return error::OK;
+}
+
+void Registry::cancel_drain_extract(const DrainTicket & ticket) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = contexts_.find(ticket.context.value);
+    if (!ticket.active || ticket.context.value == 0 || ticket.serial == 0 || it == contexts_.end()) return;
+    auto & entry = it->second;
+    if (entry.active_drain_serial == ticket.serial && entry.state == context_phase::DRAINING &&
+        entry.session.id == ticket.session && entry.session.reset_epoch == ticket.reset_epoch) {
+        entry.batch_outstanding = false;
+    }
 }
 
 error Registry::note_drain_extracted_control_host_allocs(DrainTicket * ticket, uint32_t count) noexcept {
@@ -333,6 +366,7 @@ error Registry::finish_drain(const DrainTicket & ticket) noexcept {
         if (owner.context == ticket.context && owner.invocation.value != 0) return error::DEVICE_BUSY;
     }
     entry.active_drain_serial = 0;
+    entry.batch_outstanding = false;
     entry.state = context_phase::CLOSED;
     entry.session.state = entry.session.id.value != 0 ? session_phase::CLOSED : session_phase::IDLE;
     for (auto & refs : entry.bound_device_refs) refs = 0;

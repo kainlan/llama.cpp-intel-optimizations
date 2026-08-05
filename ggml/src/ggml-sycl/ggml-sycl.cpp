@@ -9445,8 +9445,9 @@ enum class ggml_sycl_execution_wrapper_failpoint {
 
 static std::atomic<int> g_execution_wrapper_failpoint{ 0 };
 struct ggml_sycl_execution_backend_binding {
-    uint64_t context_id = 0;
-    int      participant_id = -1;
+    uint64_t         context_id = 0;
+    int              participant_id = -1;
+    std::vector<int> covered_devices;
 };
 static std::mutex g_execution_backend_binding_mutex;
 static std::unordered_map<ggml_backend_sycl_context *, ggml_sycl_execution_backend_binding> g_execution_backend_bindings;
@@ -9488,6 +9489,43 @@ static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_co
     ctx->execution_root_slot_generation = 0;
 }
 
+static void ggml_sycl_execution_sync_binding_devices(ggml_backend_sycl_context * backend, const std::vector<int> & devices) {
+    ggml_sycl_execution_backend_binding binding_copy{};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        auto it = g_execution_backend_bindings.find(backend);
+        if (it != g_execution_backend_bindings.end()) {
+            binding_copy = it->second;
+            found = true;
+        }
+    }
+    if (!found || binding_copy.context_id == 0) {
+        return;
+    }
+    std::vector<int> next = devices;
+    std::sort(next.begin(), next.end());
+    next.erase(std::unique(next.begin(), next.end()), next.end());
+    std::vector<int> prev = binding_copy.covered_devices;
+    std::sort(prev.begin(), prev.end());
+    prev.erase(std::unique(prev.begin(), prev.end()), prev.end());
+    for (int d : next) {
+        if (std::find(prev.begin(), prev.end(), d) == prev.end()) {
+            (void) ggml_sycl::execution::global_registry().bind_backend({ binding_copy.context_id }, d);
+        }
+    }
+    for (int d : prev) {
+        if (std::find(next.begin(), next.end(), d) == next.end()) {
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding_copy.context_id }, d);
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+    auto it = g_execution_backend_bindings.find(backend);
+    if (it != g_execution_backend_bindings.end()) {
+        it->second.covered_devices = next;
+    }
+}
+
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
     std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
@@ -9516,10 +9554,21 @@ static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) 
         return;
     }
     GGML_ASSERT(ctx->execution_invocation_id == 0 && ctx->execution_graph_epoch == 0);
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    auto it = g_execution_backend_bindings.find(ctx);
-    if (it != g_execution_backend_bindings.end()) {
-        g_execution_backend_bindings.erase(it);
+    ggml_sycl_execution_backend_binding binding{};
+    bool had_binding = false;
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        auto it = g_execution_backend_bindings.find(ctx);
+        if (it != g_execution_backend_bindings.end()) {
+            binding = it->second;
+            g_execution_backend_bindings.erase(it);
+            had_binding = true;
+        }
+    }
+    if (had_binding && binding.context_id != 0) {
+        for (int device : binding.covered_devices) {
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding.context_id }, device);
+        }
     }
     ggml_sycl_execution_reset_backend_binding_state(ctx);
 }
@@ -11113,9 +11162,17 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
                 if (it->second.context_id != context.value) {
                     return GGML_SYCL_EXECUTION_BUSY;
                 }
+                ggml_sycl::execution::snapshot snap{};
+                const auto xrc = ggml_sycl::execution::global_registry().extract({ context.value }, &snap);
+                if (xrc == ggml_sycl::execution::error::OK && snap.context_state != ggml_sycl::execution::context_phase::OPEN) {
+                    return GGML_SYCL_EXECUTION_BUSY;
+                }
+                if (xrc != ggml_sycl::execution::error::OK && xrc != ggml_sycl::execution::error::STALE) {
+                    return ggml_sycl_execution_c_result(xrc);
+                }
                 backend_ctx->execution_context_id = context.value;
                 backend_ctx->execution_participant_id = it->second.participant_id;
-                return GGML_SYCL_EXECUTION_OK;
+                return xrc == ggml_sycl::execution::error::STALE ? GGML_SYCL_EXECUTION_STALE : GGML_SYCL_EXECUTION_OK;
             } else {
                 std::array<bool, ggml_sycl::execution::max_devices> used{};
                 for (const auto & [_, binding] : g_execution_backend_bindings) {
@@ -11135,7 +11192,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
                 if (participant_id < 0) {
                     return GGML_SYCL_EXECUTION_OVERFLOW;
                 }
-                g_execution_backend_bindings[backend_ctx] = { context.value, participant_id };
+                g_execution_backend_bindings[backend_ctx] = { context.value, participant_id, { backend_ctx->device } };
             }
         }
         const auto rc = ggml_sycl::execution::global_registry().bind_backend({ context.value }, backend_ctx->device);
@@ -11236,6 +11293,10 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         if (validate_rc != ggml_sycl::execution::error::OK) {
             return ggml_sycl_execution_c_result(validate_rc);
         }
+        const auto mark_rc = ggml_sycl::execution::global_registry().begin_drain_extract(cpp_ticket);
+        if (mark_rc != ggml_sycl::execution::error::OK) {
+            return ggml_sycl_execution_c_result(mark_rc);
+        }
         auto storage = std::make_unique<ggml_sycl_control_host_alloc_batch_storage>();
         storage->context_id = ticket->context_id.value;
         storage->serial = ticket->serial;
@@ -11248,6 +11309,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         }
         struct restore_guard {
             ggml_sycl_control_host_alloc_batch_storage * storage;
+            ggml_sycl::execution::DrainTicket ticket;
             bool success = false;
             ~restore_guard() {
                 if (success || !storage) return;
@@ -11256,8 +11318,9 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
                     std::lock_guard<std::mutex> lock(entry.backend->control_host_allocs_mutex);
                     entry.backend->control_host_allocs.swap(entry.allocs);
                 }
+                ggml_sycl::execution::global_registry().cancel_drain_extract(ticket);
             }
-        } restore{ storage.get(), false };
+        } restore{ storage.get(), cpp_ticket, false };
         bool fail_after_first = g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
                                                                        std::memory_order_acq_rel) ==
                                 static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC);
@@ -11574,8 +11637,7 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
             if (!backend_ctx) {
                 continue;
             }
-            backend_ctx->execution_terminal_graph_epoch = 0;
-            backend_ctx->execution_graph_quarantined = false;
+            ggml_sycl_execution_clear_graph_tracking(backend_ctx);
         }
     }
 }
@@ -11672,8 +11734,13 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
         ggml_sycl::execution::snapshot snapshot{};
         if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
             snapshot.invocation.value == 0) {
+            for (auto * backend_ctx : ggml_sycl_execution_bound_backends(ctx->execution_context_id)) {
+                if (!backend_ctx) continue;
+                backend_ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
+                backend_ctx->execution_graph_quarantined = true;
+                ggml_sycl_execution_clear_graph_tracking(backend_ctx);
+            }
             ggml_sycl_execution_try_retire_terminal(ctx);
-            ggml_sycl_execution_clear_graph_tracking(ctx);
         }
     }
 }
@@ -11696,8 +11763,13 @@ static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) 
     ggml_sycl::execution::snapshot snapshot{};
     if (registry.extract({ ctx->execution_context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
         snapshot.invocation.value == 0) {
+        for (auto * backend_ctx : ggml_sycl_execution_bound_backends(ctx->execution_context_id)) {
+            if (!backend_ctx) continue;
+            backend_ctx->execution_terminal_graph_epoch = ctx->execution_graph_epoch;
+            backend_ctx->execution_graph_quarantined = false;
+            ggml_sycl_execution_clear_graph_tracking(backend_ctx);
+        }
         ggml_sycl_execution_try_retire_terminal(ctx);
-        ggml_sycl_execution_clear_graph_tracking(ctx);
     }
     return true;
 }
@@ -12662,6 +12734,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             if (backend_ctx->execution_aggregate_devices.empty()) {
                 backend_ctx->execution_aggregate_devices.push_back(backend_ctx->device);
             }
+            ggml_sycl_execution_sync_binding_devices(backend_ctx, backend_ctx->execution_aggregate_devices);
         }
         ggml_sycl_publish_plan_locked(snapshot);
     } catch (...) {

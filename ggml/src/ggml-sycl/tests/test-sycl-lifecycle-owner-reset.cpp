@@ -83,6 +83,10 @@ static void h13() {
     require(reg.close_context_if_idle(ctx) == error::BUSY, "H13 close drain should block");
     require(reg.bind_backend(ctx, 4) == error::BUSY, "H13 bind during drain should block");
     require(reg.extract(ctx, &snap) == error::OK && snap.context_state == context_phase::DRAINING, "H13 draining invisible");
+    require(reg.begin_drain_extract(dt) == error::OK, "H13 begin extract failed");
+    require(reg.begin_drain_extract(dt) == error::BUSY, "H13 duplicate extract allowed");
+    reg.cancel_drain_extract(dt);
+    require(reg.begin_drain_extract(dt) == error::OK, "H13 extract retry failed");
     require(reg.note_drain_extracted_control_host_allocs(&dt, 7) == error::OK && dt.extracted_control_host_allocs == 7, "H13 drain extract failed");
     require(reg.finish_drain(dt) == error::OK, "H13 finish drain failed");
 

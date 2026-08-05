@@ -119,9 +119,12 @@ class Registry {
 
     error begin_drain(ContextId context, DrainTicket * ticket) noexcept;
     error validate_drain_ticket(const DrainTicket & ticket) const noexcept;
+    error begin_drain_extract(const DrainTicket & ticket) noexcept;
+    void  cancel_drain_extract(const DrainTicket & ticket) noexcept;
     error note_drain_extracted_control_host_allocs(DrainTicket * ticket, uint32_t count) noexcept;
     error finish_drain(const DrainTicket & ticket) noexcept;
     error close_context_if_idle(ContextId context) noexcept;
+    error unbind_backend(ContextId context, int device) noexcept;
 
     error begin_reset(ContextId context, SessionId session, SessionResetEpoch expected_epoch,
                       ResetTicket * ticket) noexcept;
@@ -161,6 +164,7 @@ class Registry {
         std::array<uint32_t, max_devices> bound_device_refs{};
         uint64_t                          next_drain_serial = 1;
         uint64_t                          active_drain_serial = 0;
+        bool                              batch_outstanding = false;
     };
 
     struct device_owner {
