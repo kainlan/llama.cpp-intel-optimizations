@@ -24,7 +24,7 @@ extern "C" void ggml_backend_sycl_test_release_live_update();
 
 namespace {
 enum class registry_fixture_mode {
-    NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, PREPARE_CROSS_THREAD,
+    NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, DEFERRED_REGISTER_ON_SHUTDOWN, PREPARE_CROSS_THREAD,
     PREPARE_REACTIVATE_THROW,
     COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW, FINALIZE_REACTIVATE_THROW
 };
@@ -104,8 +104,12 @@ static bool registry_fixture_can_unload() {
     ggml_backend_register(g_registry_fixture_reg);
     return true;
 }
+static ggml_backend_reg_t deferred_hook_fixture();
 static void registry_fixture_shutdown() {
     ++g_registry_fixture_shutdowns;
+    if (g_registry_fixture_mode == registry_fixture_mode::DEFERRED_REGISTER_ON_SHUTDOWN) {
+        ggml_backend_register(deferred_hook_fixture());
+    }
     if (g_registry_fixture_mode == registry_fixture_mode::SHUTDOWN_THROW) {
         throw std::runtime_error("fixture partial shutdown");
     }
@@ -195,6 +199,28 @@ static ggml_backend_reg_t registry_fixture() {
         reg.iface.get_proc_address = registry_fixture_resolve;
         reg.context = &dev;
         g_registry_fixture_reg = &reg;
+        return true;
+    }();
+    (void) initialized;
+    return &reg;
+}
+
+static ggml_backend_reg_t deferred_hook_fixture() {
+    static ggml_backend_device dev{};
+    static ggml_backend_reg reg{};
+    static const bool initialized = [] {
+        dev.iface.get_name = registry_fixture_dev_name;
+        dev.iface.get_description = registry_fixture_dev_description;
+        dev.iface.get_type = registry_fixture_dev_type;
+        dev.iface.init_backend = registry_fixture_dev_init;
+        dev.iface.event_new = registry_fixture_event_new;
+        dev.iface.event_free = registry_fixture_event_free;
+        dev.reg = &reg;
+        reg.api_version = GGML_BACKEND_API_VERSION;
+        reg.iface.get_name = [](ggml_backend_reg_t) { return "TEST-DEFERRED-HOOK"; };
+        reg.iface.get_device_count = registry_fixture_reg_count;
+        reg.iface.get_device = registry_fixture_reg_get;
+        reg.context = &dev;
         return true;
     }();
     (void) initialized;
@@ -592,6 +618,15 @@ static bool run_registry_failure_fixture() {
     if (stalled_unload_result != GGML_BACKEND_UNLOAD_BUSY || !stalled_callback.get() ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     phase("generic fixture: stalled callback and retry unload joined");
+
+    phase("generic fixture: unload-hook deferred registration publishes eventually");
+    g_registry_fixture_mode = registry_fixture_mode::DEFERRED_REGISTER_ON_SHUTDOWN;
+    ggml_backend_register(reg);
+    auto * deferred_reg = deferred_hook_fixture();
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK ||
+        ggml_backend_reg_by_name("TEST-DEFERRED-HOOK") != deferred_reg ||
+        ggml_backend_unload_checked(deferred_reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
 
     phase("generic fixture: hidden blocked reactivation");
     {

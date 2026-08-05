@@ -106,6 +106,12 @@ static void defer_static_registration(ggml_backend_reg_t reg) {
     if (std::find(g_deferred_registrations.begin(), g_deferred_registrations.end(), reg) ==
         g_deferred_registrations.end()) g_deferred_registrations.push_back(reg);
 }
+static std::vector<ggml_backend_reg_t> take_deferred_registrations() {
+    std::vector<ggml_backend_reg_t> deferred;
+    std::lock_guard<std::mutex> lock(g_deferred_registration_mutex);
+    deferred.swap(g_deferred_registrations);
+    return deferred;
+}
 struct external_hook_scope {
     external_hook_scope() { ++g_external_hook_depth; g_external_hook_active.fetch_add(1, std::memory_order_acq_rel); }
     ~external_hook_scope() { g_external_hook_active.fetch_sub(1, std::memory_order_acq_rel); --g_external_hook_depth; }
@@ -326,6 +332,21 @@ struct ggml_backend_registry {
 
     ~ggml_backend_registry() = default;
 
+    void drain_deferred_registrations() noexcept {
+        try {
+            while (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) == 0) {
+                auto deferred = take_deferred_registrations();
+                if (deferred.empty()) {
+                    return;
+                }
+                for (auto * pending : deferred) {
+                    ggml_backend_register(pending);
+                }
+            }
+        } catch (...) {
+        }
+    }
+
     bool register_backend(ggml_backend_reg_t reg, dl_handle_ptr handle = nullptr,
                           std::string module_path = {}) noexcept {
         if (!reg) {
@@ -333,6 +354,14 @@ struct ggml_backend_registry {
         }
         // Serialize staging, hidden adoption, and ACTIVE publication with
         // checked unload. Recursive plugin registration remains supported.
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
+            }
+        } drain_guard{ this };
         std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
         while (!operation_lock.try_lock()) {
             if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) return false;
@@ -486,12 +515,6 @@ struct ggml_backend_registry {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);
 #endif
-            std::vector<ggml_backend_reg_t> deferred;
-            {
-                std::lock_guard<std::mutex> lock(g_deferred_registration_mutex);
-                deferred.swap(g_deferred_registrations);
-            }
-            for (auto * pending : deferred) (void) register_backend(pending);
             return true;
         } catch (...) {
             return false;
@@ -519,6 +542,14 @@ struct ggml_backend_registry {
     }
 
     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) noexcept {
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
+            }
+        } drain_guard{ this };
         std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
         while (!operation_lock.try_lock()) {
             if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) return nullptr;
@@ -590,6 +621,14 @@ struct ggml_backend_registry {
 
     ggml_backend_unload_result unload_backend(ggml_backend_reg_t reg, bool silent) noexcept {
         g_test_unload_attempts.fetch_add(1, std::memory_order_release);
+        struct deferred_registration_drain_guard {
+            ggml_backend_registry * registry;
+            ~deferred_registration_drain_guard() noexcept {
+                if (registry) {
+                    registry->drain_deferred_registrations();
+                }
+            }
+        } drain_guard{ this };
         std::unique_lock<std::recursive_mutex> operation_lock(module_operation_mutex, std::defer_lock);
         while (!operation_lock.try_lock()) {
             if (g_external_hook_depth == 0 && g_external_hook_active.load(std::memory_order_acquire) != 0) {

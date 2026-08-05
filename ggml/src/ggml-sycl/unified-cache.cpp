@@ -12712,9 +12712,12 @@ static void shutdown_shared_context_queues() noexcept {
     g_shared_ctx_queues_initialized_for = 0;
 }
 
-static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & rec, int * owner_device = nullptr) noexcept {
+using runtime_allocation_owner_snapshot = std::vector<std::pair<int, std::shared_ptr<unified_cache>>>;
+
+static bool runtime_allocation_owned_by_cache_snapshot(const runtime_alloc_record &                   rec,
+                                                       const runtime_allocation_owner_snapshot & snapshot,
+                                                       int *                                       owner_device = nullptr) noexcept {
     try {
-        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
         auto owns_record = [&](const unified_cache & cache) {
             if (cache.contains_pinned(rec.handle.ptr) ||
                 cache.contains_pinned_backing_allocation(rec.handle.ptr, rec.handle.size)) {
@@ -12728,7 +12731,7 @@ static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & 
             }
             return false;
         };
-        for (const auto & item : g_device_caches) {
+        for (const auto & item : snapshot) {
             if (!item.second) {
                 continue;
             }
@@ -12747,14 +12750,44 @@ static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & 
     return false;
 }
 
+static runtime_allocation_owner_snapshot capture_runtime_allocation_owner_snapshot() {
+    runtime_allocation_owner_snapshot snapshot;
+    snapshot.reserve(g_device_caches.size());
+    for (const auto & item : g_device_caches) {
+        if (item.second) {
+            snapshot.push_back(item);
+        }
+    }
+    return snapshot;
+}
+
+static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & rec, int * owner_device = nullptr) noexcept {
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        const auto snapshot = capture_runtime_allocation_owner_snapshot();
+        lock.unlock();
+        return runtime_allocation_owned_by_cache_snapshot(rec, snapshot, owner_device);
+    } catch (...) {
+    }
+    if (owner_device) {
+        *owner_device = -1;
+    }
+    return false;
+}
+
 static bool release_cache_owned_runtime_allocations_for_final_shutdown() noexcept {
     try {
+        runtime_allocation_owner_snapshot owner_snapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            owner_snapshot = capture_runtime_allocation_owner_snapshot();
+        }
         std::vector<alloc_handle> deferred;
         {
             std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
             deferred.reserve(g_runtime_alloc_registry.size());
             for (const auto & kv : g_runtime_alloc_registry) {
-                if (runtime_allocation_owned_by_live_cache(kv.second, nullptr)) {
+                if (runtime_allocation_owned_by_cache_snapshot(kv.second, owner_snapshot, nullptr)) {
                     deferred.push_back(kv.second.handle);
                 }
             }
@@ -12772,7 +12805,8 @@ static bool release_cache_owned_runtime_allocations_for_final_shutdown() noexcep
     }
 }
 
-static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
+static bool unified_cache_shutdown_retryable_postconditions_clean(
+    const runtime_allocation_owner_snapshot & owner_snapshot) noexcept {
     try {
         if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic dirty shutdown postcondition; retaining owners for retry\n");
@@ -12781,7 +12815,7 @@ static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
         {
             std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
             for (const auto & kv : g_runtime_alloc_registry) {
-                if (!runtime_allocation_owned_by_live_cache(kv.second, nullptr)) {
+                if (!runtime_allocation_owned_by_cache_snapshot(kv.second, owner_snapshot, nullptr)) {
                     GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
                     return false;
                 }
@@ -12802,14 +12836,18 @@ static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
 
 bool unified_cache_shutdown_state_clean() noexcept {
     try {
-        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        if (!g_device_caches.empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
-            return false;
+        runtime_allocation_owner_snapshot owner_snapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            if (!g_device_caches.empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
+                return false;
+            }
+            for (const auto * queue : g_shared_ctx_queues) {
+                if (queue != nullptr) return false;
+            }
+            owner_snapshot = capture_runtime_allocation_owner_snapshot();
         }
-        for (const auto * queue : g_shared_ctx_queues) {
-            if (queue != nullptr) return false;
-        }
-        return unified_cache_shutdown_retryable_postconditions_clean();
+        return unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot);
     } catch (...) {
         return false;
     }

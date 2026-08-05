@@ -718,6 +718,14 @@ checks = {
     and "arena chunk remained registered after unregister" in cache_cpp
     and "Destroyed %zu chunk(s), released %.1f MB" in cache_cpp
     and "unified_cache_shutdown_state_clean()" in backend,
+    "shutdown cleanup uses non-recursive cache snapshots": "runtime_allocation_owner_snapshot" in cache_cpp
+    and "capture_runtime_allocation_owner_snapshot()" in cache_cpp
+    and "runtime_allocation_owned_by_cache_snapshot" in cache_cpp
+    and cache_cpp.index("owner_snapshot = capture_runtime_allocation_owner_snapshot();",
+                         cache_cpp.index("bool unified_cache_shutdown_state_clean()"))
+        < cache_cpp.index("return unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot);",
+                          cache_cpp.index("bool unified_cache_shutdown_state_clean()"))
+    and "runtime allocation registry still populated at shutdown boundary" in cache_cpp,
     "backend construction publish rollback": "g_test_fail_next_backend_publish" in backend
     and "auto ctx = std::make_unique<ggml_backend_sycl_context>(device)" in backend
     and backend.index("auto sycl_backend = std::make_unique<ggml_backend>")
@@ -839,6 +847,11 @@ checks = {
         and "rollback_unified_cache_module_use" in backend
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "unload-hook deferred registration publishes eventually" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "TEST-DEFERRED-HOOK" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "drain_deferred_registrations" in registry_backend
+        and "take_deferred_registrations" in registry_backend
         and "orphan_buffer" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "publication-raced unload completed early" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
