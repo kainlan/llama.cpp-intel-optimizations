@@ -228,11 +228,29 @@ static bool run_registry_failure_fixture() {
     orphan_dev.iface.event_new = registry_fixture_event_new;
     orphan_dev.iface.event_free = registry_fixture_event_free;
     orphan_buft.device = &orphan_dev;
+    static ggml_backend_reg failed_free_reg{};
+    static ggml_backend_device failed_free_dev{};
+    static ggml_backend_buffer_type failed_free_buft{};
+    failed_free_dev.reg = &failed_free_reg;
+    failed_free_dev.iface.event_new = registry_fixture_event_new;
+    failed_free_dev.iface.event_free = registry_fixture_event_free;
+    failed_free_buft.device = &failed_free_dev;
     ggml_backend_buffer_i orphan_iface{};
     orphan_iface.free_buffer = registry_fixture_buffer_free_passthrough;
     auto orphan_buffer = ggml_backend_buffer_init(&orphan_buft, orphan_iface, nullptr, 0);
     auto orphan_event = ggml_backend_event_new(&orphan_dev);
-    if (!pre_registry_buffer || !pre_registry_event || !orphan_buffer || !orphan_event) return false;
+    auto failed_free_buffer = ggml_backend_buffer_init(&failed_free_buft, orphan_iface, nullptr, 0);
+    auto failed_free_event = ggml_backend_event_new(&failed_free_dev);
+    if (!pre_registry_buffer || !pre_registry_event || !orphan_buffer || !orphan_event || !failed_free_buffer || !failed_free_event) {
+        if (!pre_registry_buffer) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: pre_registry_buffer\n");
+        if (!pre_registry_event) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: pre_registry_event\n");
+        if (!orphan_buffer) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: orphan_buffer\n");
+        if (!orphan_event) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: orphan_event\n");
+        if (!failed_free_buffer) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: failed_free_buffer\n");
+        if (!failed_free_event) std::fprintf(stderr, "[sycl-runtime-wrapper] init returned null: failed_free_event\n");
+        std::fflush(stderr);
+        return false;
+    }
     phase("generic fixture: initialize registry with owners still pending");
     (void) ggml_backend_reg_count();
     g_fixture_event_free_calls = 0;
@@ -342,16 +360,6 @@ static bool run_registry_failure_fixture() {
     g_fixture_buffer_free_calls = 0;
     g_fixture_event_free_calls = 0;
     phase("generic fixture: construct failed-publication owners for immediate free");
-    static ggml_backend_reg failed_free_reg{};
-    static ggml_backend_device failed_free_dev{};
-    static ggml_backend_buffer_type failed_free_buft{};
-    failed_free_dev.reg = &failed_free_reg;
-    failed_free_dev.iface.event_new = registry_fixture_event_new;
-    failed_free_dev.iface.event_free = registry_fixture_event_free;
-    failed_free_buft.device = &failed_free_dev;
-    auto failed_free_buffer = ggml_backend_buffer_init(&failed_free_buft, orphan_iface, nullptr, 0);
-    auto failed_free_event = ggml_backend_event_new(&failed_free_dev);
-    if (!failed_free_buffer || !failed_free_event) return false;
     failed_free_reg.api_version = GGML_BACKEND_API_VERSION;
     failed_free_reg.iface.get_name = registry_fixture_reg_name;
     failed_free_reg.iface.get_device_count = registry_fixture_reg_count;
