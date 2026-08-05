@@ -9497,7 +9497,7 @@ static ggml_sycl_execution_state_snapshot ggml_sycl_execution_snapshot_locked(co
     return s;
 }
 
-static ggml_sycl_execution_state_snapshot ggml_sycl_execution_state_snapshot(const ggml_backend_sycl_context * ctx) {
+static ggml_sycl_execution_state_snapshot ggml_sycl_take_execution_state_snapshot(const ggml_backend_sycl_context * ctx) {
     std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
     return ggml_sycl_execution_snapshot_locked(ctx);
 }
@@ -11762,7 +11762,7 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     if (!ctx) {
         return;
     }
-    const auto state = ggml_sycl_execution_state_snapshot(ctx);
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
     if (state.context_id == 0) {
         return;
     }
@@ -11859,7 +11859,7 @@ static void ggml_sycl_execution_seal_graph(ggml_backend_sycl_context * ctx) noex
     if (!ctx) {
         return;
     }
-    const auto state = ggml_sycl_execution_state_snapshot(ctx);
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
     if (state.graph_sealed || state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return;
     }
@@ -11880,7 +11880,7 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
     if (!ctx) {
         return;
     }
-    const auto state = ggml_sycl_execution_state_snapshot(ctx);
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
     if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return;
     }
@@ -11908,7 +11908,7 @@ static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) 
     if (!ctx) {
         return false;
     }
-    const auto state = ggml_sycl_execution_state_snapshot(ctx);
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
     if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
         return false;
     }
