@@ -12618,7 +12618,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {
-                rollback_partial();
                 return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
             }
 
