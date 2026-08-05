@@ -54,6 +54,9 @@ error Registry::bind_backend(ContextId context, int device) noexcept {
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     if (device < 0 || device >= static_cast<int>(max_devices)) return error::MISMATCH;
+    if (it->second.state != context_phase::OPEN || it->second.active_drain_serial != 0 || it->second.session.active_reset_serial != 0) {
+        return error::BUSY;
+    }
     it->second.bound_device_refs[device] += 1;
     return error::OK;
 }
@@ -147,10 +150,13 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
     if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
     std::vector<int> canonical_devices;
     std::vector<int> canonical_participants;
-    if (!canonicalize_unique_ids(devices, device_count, canonical_devices) ||
+    if (device_count == 0 || participant_count == 0 ||
+        !canonicalize_unique_ids(devices, device_count, canonical_devices) ||
         !canonicalize_unique_ids(participants, participant_count, canonical_participants)) {
         return error::MISMATCH;
     }
+    const int pidx = participant_index(canonical_participants, participant);
+    if (pidx < 0) return error::MISMATCH;
     for (int device : canonical_devices) {
         if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) return error::MISMATCH;
     }
@@ -177,10 +183,10 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
         if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) return error::MISMATCH;
         if (canonical_devices != graph.devices || canonical_participants != graph.participants) return error::MISMATCH;
     }
-    const int pidx = participant_index(graph.participants, participant);
-    if (pidx < 0) return error::MISMATCH;
-    if (graph.participant_completed[static_cast<size_t>(pidx)]) return error::STALE;
-    graph.participant_joined[static_cast<size_t>(pidx)] = true;
+    const int gpidx = participant_index(graph.participants, participant);
+    if (gpidx < 0) return error::MISMATCH;
+    if (graph.participant_completed[static_cast<size_t>(gpidx)]) return error::STALE;
+    graph.participant_joined[static_cast<size_t>(gpidx)] = true;
     *invocation = graph.invocation;
     return error::OK;
 }

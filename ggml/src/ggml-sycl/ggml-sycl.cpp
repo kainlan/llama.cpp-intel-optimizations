@@ -9466,6 +9466,7 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 }
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
+static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 
 static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx) {
     if (!ctx) {
@@ -9508,6 +9509,19 @@ static std::vector<ggml_backend_sycl_context *> ggml_sycl_execution_bound_backen
         }
     }
     return backends;
+}
+
+static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx) {
+        return;
+    }
+    GGML_ASSERT(ctx->execution_invocation_id == 0 && ctx->execution_graph_epoch == 0);
+    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+    auto it = g_execution_backend_bindings.find(ctx);
+    if (it != g_execution_backend_bindings.end()) {
+        g_execution_backend_bindings.erase(it);
+    }
+    ggml_sycl_execution_reset_backend_binding_state(ctx);
 }
 
 static std::vector<int> ggml_sycl_execution_expected_participants(uint64_t context_id, const std::vector<int> & devices) {
@@ -11277,12 +11291,15 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
 }
 
 ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(ggml_sycl_exec_drain_ticket ticket,
-                                                                             ggml_sycl_exec_control_host_alloc_batch batch) {
+                                                                             ggml_sycl_exec_control_host_alloc_batch * batch) {
     try {
         sycl_module_mutation_guard module_guard;
         if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
         ggml_sycl_execution_wrapper_failpoint_maybe_throw();
-        auto * storage = static_cast<ggml_sycl_control_host_alloc_batch_storage *>(batch.opaque);
+        if (!batch) {
+            return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+        }
+        auto * storage = static_cast<ggml_sycl_control_host_alloc_batch_storage *>(batch->opaque);
         if (!storage || storage->context_id != ticket.context_id.value || storage->serial != ticket.serial ||
             storage->session_id != ticket.session_id.value || storage->reset_epoch != ticket.reset_epoch.value) {
             return GGML_SYCL_EXECUTION_STALE;
@@ -11296,6 +11313,8 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(ggml
         }
         ggml_sycl_execution_clear_bindings_for_context(ticket.context_id.value);
         std::unique_ptr<ggml_sycl_control_host_alloc_batch_storage> consume(storage);
+        batch->opaque = nullptr;
+        batch->count = 0;
         return GGML_SYCL_EXECUTION_OK;
     } catch (const std::bad_alloc &) {
         return ggml_sycl_execution_caught_bad_alloc();
@@ -34830,13 +34849,6 @@ static void graph_unpin_weights(ggml_backend_sycl_context * ctx);
 static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx);
 
 ggml_backend_sycl_context::~ggml_backend_sycl_context() {
-    {
-        std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && g_backend_context_by_device[device] == this) {
-            g_backend_context_by_device[device] = nullptr;
-        }
-    }
-
     // graph_compute may return with work still in flight when async exit is
     // enabled. Drain existing queues before releasing backend-owned USM.
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; ++dev) {
@@ -34850,6 +34862,13 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
                 // Destructors must not throw. Any async error has already made
                 // the backend unusable; continue cleanup as far as possible.
             }
+        }
+    }
+    ggml_sycl_execution_unbind_backend(this);
+    {
+        std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && g_backend_context_by_device[device] == this) {
+            g_backend_context_by_device[device] = nullptr;
         }
     }
     ggml_sycl::drain_retained_handles(true);

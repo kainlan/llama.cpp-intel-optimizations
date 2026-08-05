@@ -13,7 +13,7 @@ using exec_extract_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id
 using exec_close_if_idle_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id);
 using exec_begin_drain_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id, ggml_sycl_exec_drain_ticket *);
 using exec_extract_allocs_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_drain_ticket *, ggml_sycl_exec_control_host_alloc_batch *);
-using exec_finish_drain_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_drain_ticket, ggml_sycl_exec_control_host_alloc_batch);
+using exec_finish_drain_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_drain_ticket, ggml_sycl_exec_control_host_alloc_batch *);
 using exec_begin_reset_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_context_id, ggml_sycl_exec_session_id, ggml_sycl_exec_session_reset_epoch, ggml_sycl_exec_reset_ticket *);
 using exec_finish_reset_fn = ggml_sycl_execution_result (*)(ggml_sycl_exec_reset_ticket, ggml_sycl_exec_session_reset_epoch *);
 

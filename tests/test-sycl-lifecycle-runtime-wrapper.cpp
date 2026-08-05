@@ -1152,7 +1152,7 @@ int main() {
         CALL_SYCL(ggml_backend_sycl_execution_context_close_if_idle)({}) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_begin_drain)({}, &drain_ticket) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_context_extract_control_host_allocs)(&drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
-        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket, drain_batch) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_finish_drain)(drain_ticket, &drain_batch) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_session_begin_reset)({}, {}, {}, &reset_ticket) != GGML_SYCL_EXECUTION_STALE ||
         CALL_SYCL(ggml_backend_sycl_execution_session_finish_reset)(reset_ticket, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE) {
         std::fprintf(stderr, "execution lifecycle invalid-input contract mismatch\n");
