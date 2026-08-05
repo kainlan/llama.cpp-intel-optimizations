@@ -4554,6 +4554,7 @@ namespace sycl_ex = sycl::ext::oneapi::experimental;
 struct ggml_backend_sycl_context {
     int                                  device;
     std::string                          name;
+    mutable std::mutex                   execution_state_mutex;
     uint64_t                             execution_context_id = 0;
     int                                  execution_participant_id = -1;
     uint64_t                             execution_session_id = 0;

@@ -9469,10 +9469,47 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 
+struct ggml_sycl_execution_state_snapshot {
+    uint64_t         context_id = 0;
+    int              participant_id = -1;
+    uint64_t         session_id = 0;
+    uint64_t         reset_epoch = 0;
+    uint64_t         graph_epoch = 0;
+    uint64_t         invocation_id = 0;
+    uint64_t         terminal_graph_epoch = 0;
+    bool             graph_sealed = false;
+    bool             graph_quarantined = false;
+    std::vector<int> aggregate_devices;
+    uint64_t         root_model_id = 0;
+    uint64_t         root_load_txn_id = 0;
+    uint32_t         root_slot = GGML_SYCL_MODEL_SLOT_NONE;
+    uint64_t         root_slot_generation = 0;
+};
+
+static ggml_sycl_execution_state_snapshot ggml_sycl_execution_snapshot_locked(const ggml_backend_sycl_context * ctx) {
+    ggml_sycl_execution_state_snapshot s{};
+    s.context_id = ctx->execution_context_id;
+    s.participant_id = ctx->execution_participant_id;
+    s.session_id = ctx->execution_session_id;
+    s.reset_epoch = ctx->execution_reset_epoch;
+    s.graph_epoch = ctx->execution_graph_epoch;
+    s.invocation_id = ctx->execution_invocation_id;
+    s.terminal_graph_epoch = ctx->execution_terminal_graph_epoch;
+    s.graph_sealed = ctx->execution_graph_sealed;
+    s.graph_quarantined = ctx->execution_graph_quarantined;
+    s.aggregate_devices = ctx->execution_aggregate_devices;
+    s.root_model_id = ctx->execution_root_model_id;
+    s.root_load_txn_id = ctx->execution_root_load_txn_id;
+    s.root_slot = ctx->execution_root_slot;
+    s.root_slot_generation = ctx->execution_root_slot_generation;
+    return s;
+}
+
 static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx) {
     if (!ctx) {
         return;
     }
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
     ctx->execution_context_id = 0;
     ctx->execution_participant_id = -1;
     ctx->execution_session_id = 0;
@@ -9490,40 +9527,35 @@ static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_co
 }
 
 static void ggml_sycl_execution_sync_binding_devices(ggml_backend_sycl_context * backend, const std::vector<int> & devices) {
-    ggml_sycl_execution_backend_binding binding_copy{};
-    bool found = false;
-    {
-        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-        auto it = g_execution_backend_bindings.find(backend);
-        if (it != g_execution_backend_bindings.end()) {
-            binding_copy = it->second;
-            found = true;
-        }
+    if (!backend) {
+        return;
     }
-    if (!found || binding_copy.context_id == 0) {
+    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+    auto it = g_execution_backend_bindings.find(backend);
+    if (it == g_execution_backend_bindings.end() || it->second.context_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> state_lock(backend->execution_state_mutex);
+    if (backend->execution_context_id != it->second.context_id || backend->execution_participant_id != it->second.participant_id) {
         return;
     }
     std::vector<int> next = devices;
     std::sort(next.begin(), next.end());
     next.erase(std::unique(next.begin(), next.end()), next.end());
-    std::vector<int> prev = binding_copy.covered_devices;
+    std::vector<int> prev = it->second.covered_devices;
     std::sort(prev.begin(), prev.end());
     prev.erase(std::unique(prev.begin(), prev.end()), prev.end());
     for (int d : next) {
         if (std::find(prev.begin(), prev.end(), d) == prev.end()) {
-            (void) ggml_sycl::execution::global_registry().bind_backend({ binding_copy.context_id }, d);
+            (void) ggml_sycl::execution::global_registry().bind_backend({ it->second.context_id }, d);
         }
     }
     for (int d : prev) {
         if (std::find(next.begin(), next.end(), d) == next.end()) {
-            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding_copy.context_id }, d);
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ it->second.context_id }, d);
         }
     }
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    auto it = g_execution_backend_bindings.find(backend);
-    if (it != g_execution_backend_bindings.end()) {
-        it->second.covered_devices = next;
-    }
+    it->second.covered_devices = next;
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
@@ -9538,14 +9570,23 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
     }
 }
 
-static std::vector<ggml_backend_sycl_context *> ggml_sycl_execution_bound_backends(uint64_t context_id) {
-    std::vector<ggml_backend_sycl_context *> backends;
+template<typename F>
+static void ggml_sycl_execution_for_each_bound_backend(uint64_t context_id, F && fn) {
     std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     for (const auto & [backend, binding] : g_execution_backend_bindings) {
-        if (binding.context_id == context_id && backend) {
-            backends.push_back(backend);
+        if (binding.context_id != context_id || !backend) {
+            continue;
         }
+        std::lock_guard<std::mutex> state_lock(backend->execution_state_mutex);
+        fn(backend, binding);
     }
+}
+
+static std::vector<ggml_backend_sycl_context *> ggml_sycl_execution_bound_backends(uint64_t context_id) {
+    std::vector<ggml_backend_sycl_context *> backends;
+    ggml_sycl_execution_for_each_bound_backend(context_id, [&](ggml_backend_sycl_context * backend, const ggml_sycl_execution_backend_binding &) {
+        backends.push_back(backend);
+    });
     return backends;
 }
 
@@ -9596,6 +9637,7 @@ static void ggml_sycl_execution_record_root(ggml_backend_sycl_context * backend_
     if (!backend_ctx) {
         return;
     }
+    std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
     backend_ctx->execution_session_id = session.value;
     backend_ctx->execution_reset_epoch = reset_epoch.value;
     backend_ctx->execution_root_model_id = token.model.value;
@@ -11302,11 +11344,10 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         storage->serial = ticket->serial;
         storage->session_id = ticket->session_id.value;
         storage->reset_epoch = ticket->reset_epoch.value;
-        const auto bound_backends = ggml_sycl_execution_bound_backends(ticket->context_id.value);
-        storage->entries.reserve(bound_backends.size());
-        for (auto * backend_ctx : bound_backends) {
-            storage->entries.push_back({ backend_ctx, {} });
-        }
+        ggml_sycl_execution_for_each_bound_backend(ticket->context_id.value,
+            [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
+                storage->entries.push_back({ backend_ctx, {} });
+            });
         struct restore_guard {
             ggml_sycl_control_host_alloc_batch_storage * storage;
             ggml_sycl::execution::DrainTicket ticket;
@@ -11583,7 +11624,11 @@ static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl:
 
 static bool ggml_sycl_execution_current_owner(const ggml_backend_sycl_context * ctx,
                                               ggml_sycl::lifecycle::ModelToken & owner) {
-    if (!ctx || ctx->execution_context_id == 0 || ctx->execution_root_model_id == 0 ||
+    if (!ctx) {
+        return false;
+    }
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+    if (ctx->execution_context_id == 0 || ctx->execution_root_model_id == 0 ||
         ctx->execution_root_load_txn_id == 0 || ctx->execution_root_slot == GGML_SYCL_MODEL_SLOT_NONE) {
         return false;
     }
@@ -11597,7 +11642,11 @@ static std::vector<int> ggml_sycl_execution_aggregate_devices(const ggml_backend
     if (!ctx) {
         return {};
     }
-    std::vector<int> devices = !ctx->execution_aggregate_devices.empty() ? ctx->execution_aggregate_devices : std::vector<int>{ ctx->device };
+    std::vector<int> devices;
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        devices = !ctx->execution_aggregate_devices.empty() ? ctx->execution_aggregate_devices : std::vector<int>{ ctx->device };
+    }
     std::sort(devices.begin(), devices.end());
     devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
     return devices;
@@ -11607,6 +11656,7 @@ static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context *
     if (!ctx) {
         return;
     }
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
     ctx->execution_graph_epoch = 0;
     ctx->execution_invocation_id = 0;
     ctx->execution_terminal_graph_epoch = 0;
@@ -11643,7 +11693,15 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
 }
 
 static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noexcept {
-    if (!ctx || ctx->execution_context_id == 0) {
+    if (!ctx) {
+        return false;
+    }
+    ggml_sycl_execution_state_snapshot local{};
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        local = ggml_sycl_execution_snapshot_locked(ctx);
+    }
+    if (local.context_id == 0) {
         return false;
     }
     ggml_sycl_execution_try_retire_terminal(ctx);
@@ -11654,25 +11712,29 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     auto & registry = ggml_sycl::execution::global_registry();
     ggml_sycl::execution::SessionId session{};
     ggml_sycl::execution::SessionResetEpoch reset_epoch{};
-    if (registry.attach_root({ ctx->execution_context_id }, owner, &session, &reset_epoch) != ggml_sycl::execution::error::OK) {
+    if (registry.attach_root({ local.context_id }, owner, &session, &reset_epoch) != ggml_sycl::execution::error::OK) {
         return false;
     }
-    ctx->execution_session_id = session.value;
-    ctx->execution_reset_epoch = reset_epoch.value;
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        ctx->execution_session_id = session.value;
+        ctx->execution_reset_epoch = reset_epoch.value;
+    }
     ggml_sycl::execution::snapshot current{};
-    if (registry.extract({ ctx->execution_context_id }, &current) == ggml_sycl::execution::error::OK &&
+    if (registry.extract({ local.context_id }, &current) == ggml_sycl::execution::error::OK &&
         current.token_root == owner && current.invocation.value != 0 &&
         (current.graph_state == ggml_sycl::execution::graph_phase::OPEN ||
          current.graph_state == ggml_sycl::execution::graph_phase::SEALED ||
          current.graph_state == ggml_sycl::execution::graph_phase::COMPLETE ||
          current.graph_state == ggml_sycl::execution::graph_phase::QUARANTINED)) {
         const auto devices = ggml_sycl_execution_aggregate_devices(ctx);
-        const auto participants = ggml_sycl_execution_expected_participants(ctx->execution_context_id, devices);
-        if (registry.begin_invocation({ ctx->execution_context_id }, current.session, current.reset_epoch, current.graph_epoch,
+        const auto participants = ggml_sycl_execution_expected_participants(local.context_id, devices);
+        if (registry.begin_invocation({ local.context_id }, current.session, current.reset_epoch, current.graph_epoch,
                                       owner, devices.data(), devices.size(), participants.data(), participants.size(),
-                                      ctx->execution_participant_id, &current.invocation) != ggml_sycl::execution::error::OK) {
+                                      local.participant_id, &current.invocation) != ggml_sycl::execution::error::OK) {
             return false;
         }
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
         ctx->execution_session_id = current.session.value;
         ctx->execution_reset_epoch = current.reset_epoch.value;
         ctx->execution_graph_epoch = current.graph_epoch.value;
@@ -11686,14 +11748,15 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
         return false;
     }
     const auto devices = ggml_sycl_execution_aggregate_devices(ctx);
-    const auto participants = ggml_sycl_execution_expected_participants(ctx->execution_context_id, devices);
+    const auto participants = ggml_sycl_execution_expected_participants(local.context_id, devices);
     ggml_sycl::execution::InvocationId invocation{};
-    if (registry.begin_invocation({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner,
+    if (registry.begin_invocation({ local.context_id }, session, reset_epoch, graph_epoch, owner,
                                   devices.data(), devices.size(), participants.data(), participants.size(),
-                                  ctx->execution_participant_id, &invocation) != ggml_sycl::execution::error::OK) {
-        (void) registry.rollback_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
+                                  local.participant_id, &invocation) != ggml_sycl::execution::error::OK) {
+        (void) registry.rollback_graph({ local.context_id }, session, reset_epoch, graph_epoch, owner);
         return false;
     }
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
     ctx->execution_graph_epoch = graph_epoch.value;
     ctx->execution_invocation_id = invocation.value;
     ctx->execution_graph_sealed = false;
@@ -12734,6 +12797,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
         if (backend_ctx && backend_ctx->execution_context_id != 0) {
+            ggml_sycl::execution::snapshot exec_snapshot{};
+            if (ggml_sycl::execution::global_registry().extract({ backend_ctx->execution_context_id }, &exec_snapshot) ==
+                    ggml_sycl::execution::error::OK &&
+                (exec_snapshot.invocation.value != 0 || exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::OPEN ||
+                 exec_snapshot.graph_state == ggml_sycl::execution::graph_phase::SEALED)) {
+                return GGML_SYCL_LIFECYCLE_BUSY;
+            }
             ggml_sycl::execution::SessionId session{};
             ggml_sycl::execution::SessionResetEpoch reset_epoch{};
             const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
@@ -12743,19 +12813,22 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                        GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
             }
             ggml_sycl_execution_record_root(backend_ctx, token, session, reset_epoch);
-            backend_ctx->execution_aggregate_devices.clear();
-            if (snapshot->plan) {
+            {
+                std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
+                backend_ctx->execution_aggregate_devices.clear();
+                if (snapshot->plan) {
                 const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
                 for (int device = 0; device < total; ++device) {
                     if (ggml_sycl_placement_plan_uses_device(*snapshot->plan, device)) {
                         backend_ctx->execution_aggregate_devices.push_back(device);
                     }
                 }
+                }
+                if (backend_ctx->execution_aggregate_devices.empty()) {
+                    backend_ctx->execution_aggregate_devices.push_back(backend_ctx->device);
+                }
             }
-            if (backend_ctx->execution_aggregate_devices.empty()) {
-                backend_ctx->execution_aggregate_devices.push_back(backend_ctx->device);
-            }
-            ggml_sycl_execution_sync_binding_devices(backend_ctx, backend_ctx->execution_aggregate_devices);
+            ggml_sycl_execution_sync_binding_devices(backend_ctx, ggml_sycl_execution_aggregate_devices(backend_ctx));
         }
         ggml_sycl_publish_plan_locked(snapshot);
     } catch (...) {
@@ -81725,6 +81798,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     compute_impl_guard _reentry_guard(sycl_ctx->device);
     const bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx);
+    {
+        std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);
+        if (sycl_ctx->execution_context_id != 0 && sycl_ctx->execution_root_model_id != 0 && !execution_graph_active) {
+            throw std::runtime_error("failed to begin tracked SYCL execution graph");
+        }
+    }
     struct execution_graph_scope {
         ggml_backend_sycl_context * ctx;
         bool                        active;
