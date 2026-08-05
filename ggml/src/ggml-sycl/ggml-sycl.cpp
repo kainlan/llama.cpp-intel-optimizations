@@ -9376,20 +9376,6 @@ static ggml_sycl_execution_result ggml_sycl_execution_caught_internal() {
     return GGML_SYCL_EXECUTION_INTERNAL_ERROR;
 }
 
-static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
-    switch (static_cast<ggml_sycl_execution_wrapper_failpoint>(
-                g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
-                                                       std::memory_order_acq_rel))) {
-        case ggml_sycl_execution_wrapper_failpoint::NONE: return;
-        case ggml_sycl_execution_wrapper_failpoint::NEXT_BAD_ALLOC: throw std::bad_alloc();
-        case ggml_sycl_execution_wrapper_failpoint::NEXT_INTERNAL_ERROR: throw std::runtime_error("execution wrapper failpoint");
-        case ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC:
-            g_execution_wrapper_failpoint.store(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC),
-                                                std::memory_order_release);
-            return;
-    }
-}
-
 static ggml_sycl_execution_context_state ggml_sycl_execution_c_context_state(ggml_sycl::execution::context_phase state) {
     using P = ggml_sycl::execution::context_phase;
     switch (state) {
@@ -9456,6 +9442,20 @@ enum class ggml_sycl_execution_wrapper_failpoint {
 static std::atomic<int> g_execution_wrapper_failpoint{ 0 };
 static std::mutex g_execution_backend_binding_mutex;
 static std::unordered_map<ggml_backend_sycl_context *, uint64_t> g_execution_backend_bindings;
+
+static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
+    switch (static_cast<ggml_sycl_execution_wrapper_failpoint>(
+                g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
+                                                       std::memory_order_acq_rel))) {
+        case ggml_sycl_execution_wrapper_failpoint::NONE: return;
+        case ggml_sycl_execution_wrapper_failpoint::NEXT_BAD_ALLOC: throw std::bad_alloc();
+        case ggml_sycl_execution_wrapper_failpoint::NEXT_INTERNAL_ERROR: throw std::runtime_error("execution wrapper failpoint");
+        case ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC:
+            g_execution_wrapper_failpoint.store(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC),
+                                                std::memory_order_release);
+            return;
+    }
+}
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 
