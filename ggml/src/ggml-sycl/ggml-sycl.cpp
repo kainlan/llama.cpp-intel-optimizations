@@ -97597,12 +97597,12 @@ static void ggml_backend_sycl_test_fail_next_registry_stage() {
     if (module_guard) g_test_fail_next_registry_stage.store(true, std::memory_order_release);
 }
 
-static void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device() {
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) g_test_fail_next_stage_inventory_plan_early_after_first_device.store(true, std::memory_order_release);
 }
 
-static void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device() {
+extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) g_test_fail_next_stage_inventory_plan_late_after_first_device.store(true, std::memory_order_release);
 }
