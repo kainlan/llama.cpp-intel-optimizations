@@ -18,6 +18,7 @@ extern "C" const char * ggml_backend_test_registry_state(ggml_backend_reg_t reg)
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state();
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean();
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores();
+extern "C" bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners();
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
@@ -25,7 +26,7 @@ extern "C" void ggml_backend_sycl_test_release_live_update();
 namespace {
 enum class registry_fixture_mode {
     NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, DEFERRED_REGISTER_ON_SHUTDOWN, PREPARE_CROSS_THREAD,
-    PREPARE_REACTIVATE_THROW,
+    PREPARE_REACTIVATE_THROW, LEGACY_THREE_HOOK_REACTIVATE,
     COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW, FINALIZE_REACTIVATE_THROW
 };
 static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
@@ -152,6 +153,9 @@ static void registry_fixture_commit_reactivate() {
         g_registry_fixture_mode == registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW) {
         throw std::runtime_error("fixture reactivation commit failure");
     }
+    if (g_registry_fixture_mode == registry_fixture_mode::LEGACY_THREE_HOOK_REACTIVATE) {
+        g_registry_fixture_reactivation_pending = false;
+    }
 }
 static void registry_fixture_finalize_reactivate() {
     g_registry_fixture_reactivation_pending = false;
@@ -176,7 +180,10 @@ static void * registry_fixture_resolve(ggml_backend_reg_t, const char * name) {
         std::strcmp(name, "ggml_backend_cancel_unload") == 0) return (void *) registry_fixture_cancel;
     if (std::strcmp(name, "ggml_backend_prepare_reactivate") == 0) return (void *) registry_fixture_prepare_reactivate;
     if (std::strcmp(name, "ggml_backend_commit_reactivate") == 0) return (void *) registry_fixture_commit_reactivate;
-    if (std::strcmp(name, "ggml_backend_finalize_reactivate") == 0) return (void *) registry_fixture_finalize_reactivate;
+    if (std::strcmp(name, "ggml_backend_finalize_reactivate") == 0) {
+        return g_registry_fixture_mode == registry_fixture_mode::LEGACY_THREE_HOOK_REACTIVATE ? nullptr :
+                                                                                                 (void *) registry_fixture_finalize_reactivate;
+    }
     if (std::strcmp(name, "ggml_backend_rollback_reactivate") == 0) return (void *) registry_fixture_rollback_reactivate;
     return nullptr;
 }
@@ -648,6 +655,14 @@ static bool run_registry_failure_fixture() {
     blocked_reactivation.get();
     if (!reactivation_hidden || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
 
+    phase("generic fixture: legacy 3-hook reactivation ABI");
+    g_registry_fixture_mode = registry_fixture_mode::LEGACY_THREE_HOOK_REACTIVATE;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        return false;
+    }
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+
     phase("generic fixture: throwing commit rollback and recovery");
     g_registry_fixture_mode = registry_fixture_mode::COMMIT_AND_ROLLBACK_THROW;
     ggml_backend_register(reg);
@@ -703,6 +718,12 @@ int main() {
         std::fprintf(stderr, "missing CPU-retained reload fixture\n");
         return 1;
     }
+    auto seed_global_runtime_pinned_owners = reinterpret_cast<decltype(&ggml_backend_sycl_test_seed_global_runtime_pinned_owners)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_seed_global_runtime_pinned_owners"));
+    if (!seed_global_runtime_pinned_owners) {
+        std::fprintf(stderr, "missing global runtime/pinned owner seed procedure\n");
+        return 1;
+    }
     auto initial_get_device_memory = reinterpret_cast<decltype(&ggml_backend_sycl_get_device_memory)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_memory"));
     size_t free_before_cache = 0;
@@ -714,6 +735,10 @@ int main() {
     initial_get_device_memory(0, &free_before_cache, &total_before_cache);
     if (!seed_cpu_retained()) {
         std::fprintf(stderr, "failed to seed CPU-retained reload fixture\n");
+        return 1;
+    }
+    if (!seed_global_runtime_pinned_owners()) {
+        std::fprintf(stderr, "failed to seed global runtime/pinned owner fixture\n");
         return 1;
     }
     auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
@@ -942,6 +967,36 @@ int main() {
                  "device memory reclaim settled after %lld ms: allocated_free=%zu recovered_free=%zu delta=%zu\n",
                  static_cast<long long>(reclaim_elapsed_ms), free_with_cache, free_after_shutdown,
                  free_after_shutdown - free_with_cache);
+    auto block_finalize_reactivate = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_block_finalize_reactivate"));
+    auto wait_finalize_reactivate_blocked = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_wait_finalize_reactivate_blocked"));
+    auto release_finalize_reactivate = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_release_finalize_reactivate"));
+    if (!block_finalize_reactivate || !wait_finalize_reactivate_blocked || !release_finalize_reactivate) {
+        std::fprintf(stderr, "missing finalize reactivation control procedures\n");
+        return 1;
+    }
+    phase("module reload finalize window keeps saved procedures closed until publication");
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
+        std::fprintf(stderr, "failed to unload reloaded SYCL backend before finalize-window probe\n");
+        return 1;
+    }
+    block_finalize_reactivate();
+    auto blocked_reload = std::async(std::launch::async, [] { return ggml_backend_load(GGML_SYCL_RUNTIME_MODULE); });
+    wait_finalize_reactivate_blocked();
+    if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY || saved_host_compute(0) != nullptr ||
+        ggml_backend_reg_by_name("SYCL") != nullptr) {
+        std::fprintf(stderr, "reactivation commit/finalize window reopened saved procedures or published early\n");
+        release_finalize_reactivate();
+        return 1;
+    }
+    release_finalize_reactivate();
+    reg = blocked_reload.get();
+    if (!reg || saved_host_compute(0) == nullptr) {
+        std::fprintf(stderr, "saved procedures did not reopen after finalize publication\n");
+        return 1;
+    }
     auto moe_state_clean = reinterpret_cast<decltype(&ggml_backend_sycl_test_moe_module_state_clean)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_moe_module_state_clean"));
     if (!moe_state_clean || !moe_state_clean()) {

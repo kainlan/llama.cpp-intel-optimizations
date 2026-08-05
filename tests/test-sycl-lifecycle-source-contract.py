@@ -721,6 +721,7 @@ checks = {
     "shutdown cleanup uses non-recursive cache snapshots": "runtime_allocation_owner_snapshot" in cache_cpp
     and "capture_runtime_allocation_owner_snapshot()" in cache_cpp
     and "runtime_allocation_owned_by_cache_snapshot" in cache_cpp
+    and "canonical mem_handle destruction can" in cache_cpp
     and cache_cpp.index("owner_snapshot = capture_runtime_allocation_owner_snapshot();",
                          cache_cpp.index("bool unified_cache_shutdown_state_clean()"))
         < cache_cpp.index("return unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot);",
@@ -785,11 +786,12 @@ checks = {
     and "shutdown reservation check failed: reserved=%d begin_rc=%d" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
-        "saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY") == 4
+        "saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY") == 5
     and "ggml_backend_prepare_reactivate" in backend
     and "ggml_backend_commit_reactivate" in backend
     and "ggml_backend_finalize_reactivate" in backend
-    and "ggml_backend_rollback_reactivate" in backend,
+    and "ggml_backend_rollback_reactivate" in backend
+    and "ggml_backend_sycl_test_seed_global_runtime_pinned_owners" in backend,
     "completion, callback, arena retry and renamed DSO coverage": "shutdown_completed_" in hpp
     and "complete_shutdown()" in backend
     and "ggml_backend_commit_reactivate" in backend
@@ -828,7 +830,11 @@ checks = {
         and "published_entry->state = ggml_backend_reg_state::REMOVED" in registry_backend
         and "reactivation rollback threw; retaining tombstone" in registry_backend
         and "ggml_backend_finalize_reactivate" in registry_backend
+        and "COMMITTED_CLOSED" in backend
         and "g_sycl_reactivation_pending_finalize" in backend
+        and "g_sycl_reactivation_commit_completed" in backend
+        and "LEGACY_THREE_HOOK_REACTIVATE" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "g_external_hook_active" in registry_backend
         and "external_hook_scope" in registry_backend
         and "ever_active" in registry_backend
@@ -848,6 +854,10 @@ checks = {
         and "concurrent unload blocked by hidden publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "unload-hook deferred registration publishes eventually" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "legacy 3-hook reactivation ABI" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "module reload finalize window keeps saved procedures closed until publication" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "TEST-DEFERRED-HOOK" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "drain_deferred_registrations" in registry_backend
@@ -913,7 +923,7 @@ checks = {
             < backend.index("ggml_sycl_cpu_retained_cleanup()", backend.index("void ggml_backend_sycl_shutdown"))
         and "!ggml_sycl_cpu_retained_active()" in backend
         and "runtime_allocation_owned_by_live_cache" in cache_cpp
-        and "release_cache_owned_runtime_allocations_for_final_shutdown()" in cache_cpp
+        and "canonical mem_handle destruction can" in cache_cpp
         and "g_offload_pool_slots.empty()" in cache_cpp
         and "g_offload_pool_slots.clear()" in cache_cpp
         and cache_cpp.index("caches.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
@@ -924,6 +934,7 @@ checks = {
         and "ggml_backend_reg_state::REACTIVATING" in registry_backend
         and "COMMIT_REACTIVATE_THROW" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "g_commit_reactivate_block" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "ggml_backend_sycl_test_block_finalize_reactivate" in backend
         and registry_backend.index("dl_pin_library(handle.get(), entry.path())")
             < registry_backend.index('dl_get_sym(handle.get(), "ggml_backend_score")',
                                      registry_backend.index("dl_pin_library(handle.get(), entry.path())"))

@@ -406,8 +406,9 @@ struct ggml_backend_registry {
                 rollback_reactivate = reinterpret_cast<settle_reactivate_fn>(
                     reg->iface.get_proc_address(reg, "ggml_backend_rollback_reactivate"));
                 const bool any_hook = prepare_reactivate || commit_reactivate || finalize_reactivate || rollback_reactivate;
-                if (any_hook && (!prepare_reactivate || !commit_reactivate || !finalize_reactivate ||
-                                 !rollback_reactivate)) return false;
+                // Legacy reactivation ABI is a prepare/commit/rollback triplet;
+                // finalize is an optional containment hook for newer DSOs.
+                if (any_hook && (!prepare_reactivate || !commit_reactivate || !rollback_reactivate)) return false;
                 reactivation_prepared = any_hook;
                 if (any_hook) {
                     try {
@@ -494,7 +495,7 @@ struct ggml_backend_registry {
                 published_entry->state = ggml_backend_reg_state::REMOVED;
                 return false;
             }
-            if (reactivation_prepared) {
+            if (reactivation_prepared && finalize_reactivate) {
                 try {
                     external_hook_scope hook;
                     finalize_reactivate();
@@ -504,8 +505,8 @@ struct ggml_backend_registry {
                     // back into a plugin state that may already be active.
                     GGML_LOG_ERROR("backend reactivation finalize threw; publishing committed generation\n");
                 }
-                reactivation_prepared = false;
             }
+            reactivation_prepared = false;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (published_entry->state != ggml_backend_reg_state::REACTIVATING) return false;

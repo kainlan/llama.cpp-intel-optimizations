@@ -12775,36 +12775,6 @@ static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & 
     return false;
 }
 
-static bool release_cache_owned_runtime_allocations_for_final_shutdown() noexcept {
-    try {
-        runtime_allocation_owner_snapshot owner_snapshot;
-        {
-            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-            owner_snapshot = capture_runtime_allocation_owner_snapshot();
-        }
-        std::vector<alloc_handle> deferred;
-        {
-            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
-            deferred.reserve(g_runtime_alloc_registry.size());
-            for (const auto & kv : g_runtime_alloc_registry) {
-                if (runtime_allocation_owned_by_cache_snapshot(kv.second, owner_snapshot, nullptr)) {
-                    deferred.push_back(kv.second.handle);
-                }
-            }
-        }
-        for (const auto & handle : deferred) {
-            if (!unified_free(handle)) {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] final shutdown failed to release retained cache-owned allocation ptr=%p\n",
-                               handle.ptr);
-                return false;
-            }
-        }
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 static bool unified_cache_shutdown_retryable_postconditions_clean(
     const runtime_allocation_owner_snapshot & owner_snapshot) noexcept {
     try {
@@ -12960,11 +12930,11 @@ bool shutdown_unified_cache() {
     if (!unified_cache_shutdown_retryable_postconditions_clean(owner_snapshot)) {
         return false;
     }
-    if (!release_cache_owned_runtime_allocations_for_final_shutdown()) {
-        return false;
-    }
     {
         std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        // Detach cache owners atomically, then destroy the last shared_ptr
+        // snapshots outside the lock so canonical mem_handle destruction can
+        // unregister/free pinned backing exactly once.
         g_device_caches.clear();
         g_cache_mode_locked.store(false, std::memory_order_release);
     }

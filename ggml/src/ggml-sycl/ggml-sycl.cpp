@@ -5890,6 +5890,7 @@ static bool ggml_sycl_shutdown_global_runtime_pinned_owners() noexcept {
         if (!ggml_sycl_staging_pool().release_all_idle("module-shutdown")) {
             return false;
         }
+        ggml_sycl_cpu_staging_cache_clear();
         reset_managed_host_pinned_buffers_before_host_zone_reset();
         return true;
     } catch (...) {
@@ -9381,7 +9382,9 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
 // Non-interposable module admission for every saveable mutating/allocating
 // procedure. RETRY_CLOSED permits only the generic loader's hidden-failure retry.
-enum class sycl_module_admission_state { ACTIVE, RETRY_CLOSED, COMPLETE_CLOSED, PREPARING };
+// COMMITTED_CLOSED means reactivation commit succeeded internally, but hidden
+// owner adoption/finalize/publication have not reopened saved-proc admission yet.
+enum class sycl_module_admission_state { ACTIVE, RETRY_CLOSED, COMPLETE_CLOSED, PREPARING, COMMITTED_CLOSED };
 static std::mutex                    g_sycl_module_admission_mutex;
 static std::condition_variable       g_sycl_module_admission_cv;
 static sycl_module_admission_state   g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
@@ -96285,7 +96288,12 @@ void ggml_backend_sycl_complete_unload(void) {
 
 static sycl_module_admission_state g_sycl_reactivation_previous =
     sycl_module_admission_state::COMPLETE_CLOSED;
-static bool g_sycl_reactivation_pending_finalize = false;
+static bool g_sycl_reactivation_pending_finalize  = false;
+static bool g_sycl_reactivation_commit_completed  = false;
+static std::mutex              g_sycl_finalize_reactivate_mutex;
+static std::condition_variable g_sycl_finalize_reactivate_cv;
+static bool                    g_sycl_finalize_reactivate_block   = false;
+static bool                    g_sycl_finalize_reactivate_entered = false;
 
 bool ggml_backend_sycl_prepare_reactivate(void) {
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -96293,9 +96301,10 @@ bool ggml_backend_sycl_prepare_reactivate(void) {
         g_sycl_module_admission != sycl_module_admission_state::COMPLETE_CLOSED) {
         return false;
     }
-    g_sycl_reactivation_previous = g_sycl_module_admission;
+    g_sycl_reactivation_previous         = g_sycl_module_admission;
     g_sycl_reactivation_pending_finalize = true;
-    g_sycl_module_admission = sycl_module_admission_state::PREPARING;
+    g_sycl_reactivation_commit_completed = false;
+    g_sycl_module_admission              = sycl_module_admission_state::PREPARING;
     return true;
 }
 
@@ -96303,27 +96312,39 @@ void ggml_backend_sycl_commit_reactivate(void) {
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
-    g_sycl_module_shutdown_started = false;
-    g_sycl_module_admission = sycl_module_admission_state::ACTIVE;
+    g_sycl_reactivation_commit_completed = true;
+    g_sycl_module_admission              = sycl_module_admission_state::COMMITTED_CLOSED;
 }
 
 void ggml_backend_sycl_finalize_reactivate(void) {
+    {
+        std::unique_lock<std::mutex> lock(g_sycl_finalize_reactivate_mutex);
+        if (g_sycl_finalize_reactivate_block) {
+            g_sycl_finalize_reactivate_entered = true;
+            g_sycl_finalize_reactivate_cv.notify_all();
+            g_sycl_finalize_reactivate_cv.wait(lock, [] { return !g_sycl_finalize_reactivate_block; });
+        }
+    }
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
     g_sycl_reactivation_pending_finalize = false;
+    g_sycl_reactivation_commit_completed = false;
+    g_sycl_module_shutdown_started       = false;
+    g_sycl_module_admission              = sycl_module_admission_state::ACTIVE;
 }
 
 void ggml_backend_sycl_rollback_reactivate(void) {
-    bool restore_closed = false;
+    bool rollback_committed = false;
     {
         std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
         if (g_sycl_reactivation_pending_finalize) {
-            g_sycl_module_admission = g_sycl_reactivation_previous;
+            rollback_committed                  = g_sycl_reactivation_commit_completed;
+            g_sycl_module_admission             = g_sycl_reactivation_previous;
             g_sycl_reactivation_pending_finalize = false;
-            g_sycl_module_shutdown_started = true;
-            restore_closed = true;
+            g_sycl_reactivation_commit_completed = false;
+            g_sycl_module_shutdown_started      = true;
         }
     }
-    if (restore_closed) {
+    if (rollback_committed) {
         ggml_sycl::lifecycle::global_registry().complete_shutdown();
         ggml_sycl::rollback_unified_cache_module_use();
     }
@@ -96368,6 +96389,23 @@ static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_arena_free();
 }
 
+static void ggml_backend_sycl_test_block_finalize_reactivate() {
+    std::lock_guard<std::mutex> lock(g_sycl_finalize_reactivate_mutex);
+    g_sycl_finalize_reactivate_block   = true;
+    g_sycl_finalize_reactivate_entered = false;
+}
+
+static void ggml_backend_sycl_test_wait_finalize_reactivate_blocked() {
+    std::unique_lock<std::mutex> lock(g_sycl_finalize_reactivate_mutex);
+    g_sycl_finalize_reactivate_cv.wait(lock, [] { return g_sycl_finalize_reactivate_entered; });
+}
+
+static void ggml_backend_sycl_test_release_finalize_reactivate() {
+    std::lock_guard<std::mutex> lock(g_sycl_finalize_reactivate_mutex);
+    g_sycl_finalize_reactivate_block = false;
+    g_sycl_finalize_reactivate_cv.notify_all();
+}
+
 static void ggml_backend_sycl_test_fail_next_shutdown_clean_guarded() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_shutdown_clean();
@@ -96386,6 +96424,22 @@ static bool ggml_backend_sycl_test_seed_cpu_retained() {
     if (!module_guard || ggml_sycl_info().device_count <= 0) return false;
     ggml_sycl_cpu_retained_init(0, &ggml_sycl_get_device(0).default_queue());
     return ggml_sycl_cpu_retained_active();
+}
+
+static bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || ggml_sycl_info().device_count <= 0) return false;
+    auto & q = ggml_sycl_get_device(0).default_queue();
+    g_expert_prefetchers[0].init(q);
+    g_pinned_buffer_pools[0].init(q, 0, 2, 4, 4);
+    g_cpu_expert_pools[0].init(1, 2, 4, 4, q);
+    void * staging = ggml_sycl_staging_pool().acquire(256, q);
+    if (!staging) {
+        return false;
+    }
+    ggml_sycl_staging_pool().release(staging);
+    return g_expert_prefetchers[0].is_initialized() && g_pinned_buffer_pools[0].is_initialized() &&
+           g_cpu_expert_pools[0].is_active();
 }
 
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
@@ -96419,8 +96473,9 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
            g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
-           !g_expert_predictors[0].test_scores_allocated() && !ggml_sycl_cpu_retained_active() &&
-           ggml_sycl::unified_cache_shutdown_state_clean() &&
+           !g_expert_prefetchers[0].is_initialized() && !g_pinned_buffer_pools[0].is_initialized() &&
+           !g_cpu_expert_pools[0].is_active() && !g_expert_predictors[0].test_scores_allocated() &&
+           !ggml_sycl_cpu_retained_active() && ggml_sycl::unified_cache_shutdown_state_clean() &&
            ggml_sycl::unified_alloc_validate_registry(-1, "module-reload-clean");
 }
 
@@ -96441,6 +96496,9 @@ void ggml_backend_sycl_shutdown(void) {
     split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();
+    if (!ggml_sycl_shutdown_global_runtime_pinned_owners()) {
+        throw std::runtime_error("SYCL global runtime/pinned owner shutdown failed");
+    }
     // Event-retained mem_handles and retained CPU outputs both own cache/pinned
     // allocations. Drain events synchronously, return the scratch lease, then
     // erase/free every offload-pool owner before queue or cache destruction.
@@ -96549,6 +96607,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_shutdown_clean") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_shutdown_clean_guarded;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_block_finalize_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_test_block_finalize_reactivate;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_wait_finalize_reactivate_blocked") == 0) {
+        return (void *) ggml_backend_sycl_test_wait_finalize_reactivate_blocked;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_release_finalize_reactivate") == 0) {
+        return (void *) ggml_backend_sycl_test_release_finalize_reactivate;
+    }
     if (strcmp(name, "ggml_backend_sycl_test_shutdown_owner_census") == 0) {
         return (void *) ggml_backend_sycl_test_shutdown_owner_census;
     }
@@ -96648,6 +96715,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_seed_cpu_retained") == 0) {
         return (void *) ggml_backend_sycl_test_seed_cpu_retained;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_seed_global_runtime_pinned_owners") == 0) {
+        return (void *) ggml_backend_sycl_test_seed_global_runtime_pinned_owners;
     }
     if (strcmp(name, "ggml_backend_sycl_test_seed_moe_module_state") == 0) {
         return (void *) ggml_backend_sycl_test_seed_moe_module_state;
