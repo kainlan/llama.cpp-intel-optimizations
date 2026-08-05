@@ -715,14 +715,17 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_shutdown_clean"));
     auto fail_next_registry_stage = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_registry_stage"));
+    using shutdown_owner_census_fn = void (*)(uint64_t out[4]);
+    auto shutdown_owner_census = reinterpret_cast<shutdown_owner_census_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_owner_census"));
     auto block_next_kv_push = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_block_next_kv_push"));
     auto wait_kv_push_blocked = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_wait_kv_push_blocked"));
     auto release_kv_push = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_release_kv_push"));
-    if (!fail_next_arena_free || !fail_next_shutdown_clean || !fail_next_registry_stage || !block_next_kv_push ||
-        !wait_kv_push_blocked || !release_kv_push) {
+    if (!fail_next_arena_free || !fail_next_shutdown_clean || !fail_next_registry_stage || !shutdown_owner_census ||
+        !block_next_kv_push || !wait_kv_push_blocked || !release_kv_push) {
         std::fprintf(stderr, "missing deterministic unload/admission procedures\n");
         return 1;
     }
@@ -753,22 +756,27 @@ int main() {
         std::fprintf(stderr, "failure-window saved model-load procedure reopened admission\n");
         return 1;
     }
+    // shutdown_resources() may legitimately free arena bytes before the later
+    // retryable dirty postcondition runs. Assert retained owner authority, not
+    // transient free-VRAM deltas.
+    uint64_t owner_census_before_dirty[4]{};
+    shutdown_owner_census(owner_census_before_dirty);
     phase("retry module unload detects shutdown-clean failure");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
         std::fprintf(stderr, "shutdown clean=false did not retain owners transactionally\n");
         return 1;
     }
-    size_t free_after_dirty_failure = 0;
-    size_t total_after_dirty_failure = 0;
-    initial_get_device_memory(0, &free_after_dirty_failure, &total_after_dirty_failure);
-    constexpr size_t dirty_failure_noise = 256ull * 1024ull * 1024ull;
-    const size_t dirty_failure_recovery = free_after_dirty_failure > free_with_cache ?
-                                              free_after_dirty_failure - free_with_cache : 0;
-    if (total_after_dirty_failure != total_before_cache ||
-        dirty_failure_recovery + dirty_failure_noise >= measured_cache_drop) {
+    uint64_t owner_census_after_dirty[4]{};
+    shutdown_owner_census(owner_census_after_dirty);
+    if (owner_census_before_dirty[0] == 0 || owner_census_after_dirty[0] != owner_census_before_dirty[0]) {
         std::fprintf(stderr,
-                     "dirty shutdown retry lost retained cache owners: before=%zu dirty=%zu cached=%zu\n",
-                     free_before_cache, free_after_dirty_failure, free_with_cache);
+                     "dirty shutdown retry lost retained cache owners: before=%llu dirty=%llu active_before=%llu active_dirty=%llu chunks_before=%llu chunks_dirty=%llu\n",
+                     static_cast<unsigned long long>(owner_census_before_dirty[0]),
+                     static_cast<unsigned long long>(owner_census_after_dirty[0]),
+                     static_cast<unsigned long long>(owner_census_before_dirty[1]),
+                     static_cast<unsigned long long>(owner_census_after_dirty[1]),
+                     static_cast<unsigned long long>(owner_census_before_dirty[2]),
+                     static_cast<unsigned long long>(owner_census_after_dirty[2]));
         return 1;
     }
     if (saved_model_load_begin(&stale_txn) != GGML_SYCL_LIFECYCLE_LOAD_BUSY) {
@@ -778,6 +786,16 @@ int main() {
     phase("final retry module unload after retained owners");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) {
         std::fprintf(stderr, "retained owner retry did not complete unload\n");
+        return 1;
+    }
+    uint64_t owner_census_after_retry[4]{};
+    shutdown_owner_census(owner_census_after_retry);
+    if (owner_census_after_retry[0] != 0) {
+        std::fprintf(stderr, "retained owner retry did not clear owner census: owners=%llu active=%llu chunks=%llu queues=%llu\n",
+                     static_cast<unsigned long long>(owner_census_after_retry[0]),
+                     static_cast<unsigned long long>(owner_census_after_retry[1]),
+                     static_cast<unsigned long long>(owner_census_after_retry[2]),
+                     static_cast<unsigned long long>(owner_census_after_retry[3]));
         return 1;
     }
     reg = nullptr;

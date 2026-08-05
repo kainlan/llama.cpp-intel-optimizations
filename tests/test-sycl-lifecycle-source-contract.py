@@ -771,6 +771,7 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "if (!module_guard) return GGML_SYCL_LIFECYCLE_LOAD_BUSY" in backend
     and "ggml_backend_sycl_test_admission_snapshot" in backend
+    and "ggml_backend_sycl_test_shutdown_owner_census" in backend
     and "ggml_backend_test_active_calls" in registry_backend
     and "shutdown reservation check failed: reserved=%d begin_rc=%d" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -785,6 +786,10 @@ checks = {
     and "ggml_backend_commit_reactivate" in backend
     and "device_call_guard" in (root / "ggml/src/ggml-backend.cpp").read_text()
     and "failure-window saved model-load procedure" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "dirty shutdown retry lost retained cache owners: before=%llu dirty=%llu active_before=%llu active_dirty=%llu chunks_before=%llu chunks_dirty=%llu" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "retained owner retry did not clear owner census" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "saved buffer-type path allocated after completed unload" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "reactivation staging failure published or reopened module" in

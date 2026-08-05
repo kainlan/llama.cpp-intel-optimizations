@@ -12753,6 +12753,36 @@ bool unified_cache_shutdown_state_clean() noexcept {
     }
 }
 
+void unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
+    if (!out) {
+        return;
+    }
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    try {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        out[0] = g_device_caches.size();
+        for (const auto & item : g_device_caches) {
+            if (item.second && item.second->arena_active()) {
+                ++out[1];
+            }
+        }
+        out[2] = g_live_arena_chunks.load(std::memory_order_acquire);
+        for (const auto * queue : g_shared_ctx_queues) {
+            if (queue != nullptr) {
+                ++out[3];
+            }
+        }
+    } catch (...) {
+        out[0] = 0;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+    }
+}
+
 bool shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
