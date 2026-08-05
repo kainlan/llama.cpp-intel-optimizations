@@ -22,6 +22,7 @@ extern "C" bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners();
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
 extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
 extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
+extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
@@ -1055,9 +1056,13 @@ int main() {
     auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn =
         reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
+    auto ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn =
+        reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup"));
     if (!ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn ||
-        !ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn) {
-        std::fprintf(stderr, "missing stage_inventory_plan failpoint procedures\n");
+        !ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn ||
+        !ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn) {
+        std::fprintf(stderr, "missing lifecycle failpoint procedures\n");
         return 1;
     }
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
@@ -1089,12 +1094,18 @@ int main() {
     auto fail_stage_late_after_first_device = [&] {
         ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device_fn();
     };
+    auto fail_abort_owner_effects_cleanup = [&] {
+        ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup_fn();
+    };
 #else
     auto fail_stage_early_after_first_device = [&] {
         ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device();
     };
     auto fail_stage_late_after_first_device = [&] {
         ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device();
+    };
+    auto fail_abort_owner_effects_cleanup = [&] {
+        ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
     };
 #endif
 
@@ -1224,6 +1235,30 @@ int main() {
     }
     if (CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
         std::fprintf(stderr, "speculative CPU lifecycle changed placement authority\n");
+        return 1;
+    }
+
+    phase("abort cleanup failure quarantines and recovers");
+    ggml_sycl_load_txn poisoned_abort{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "poisoned abort begin failed\n");
+        return 1;
+    }
+    fail_abort_owner_effects_cleanup();
+    const auto poisoned_abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(poisoned_abort, false, nullptr);
+    if (poisoned_abort_rc != GGML_SYCL_LIFECYCLE_POISONED ||
+        CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
+        std::fprintf(stderr, "poisoned abort did not quarantine/recover cleanly rc=%d authority=%d before=%d\n",
+                     (int) poisoned_abort_rc,
+                     CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() ? 1 : 0,
+                     authority_before_cpu_cancels ? 1 : 0);
+        return 1;
+    }
+    ggml_sycl_load_txn post_poisoned_abort{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&post_poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_model_load_end)(post_poisoned_abort, false, nullptr) ==
+            GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        std::fprintf(stderr, "poisoned abort did not recover future transactions\n");
         return 1;
     }
 

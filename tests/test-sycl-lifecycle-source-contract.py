@@ -117,6 +117,10 @@ begin_graph_body = re.search(
     r"static bool ggml_sycl_execution_begin_graph\(.*?^}\n",
     backend, re.S | re.M
 ).group(0)
+expected_participants_locked_body = re.search(
+    r"static std::vector<int> ggml_sycl_execution_expected_participants_locked\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
 for_each_bound_backend_body = re.search(
     r"template<typename F>\nstatic void ggml_sycl_execution_for_each_bound_backend\(.*?^}\n",
     backend, re.S | re.M
@@ -346,6 +350,8 @@ checks = {
     and "poisoned_after_prepare" in cpp,
     "begin_graph binding lock acquired once": begin_graph_body.count("g_execution_backend_binding_mutex") == 1
     and "ggml_sycl_execution_expected_participants_locked" in begin_graph_body,
+    "expected participants follows covered device remaps": "binding.covered_devices.begin()" in expected_participants_locked_body
+    and "backend->device" not in expected_participants_locked_body,
     "for_each backend callback holds no state lock": "execution_state_mutex" not in for_each_bound_backend_body,
     "rollback guard is noexcept": "~owner_rollback_guard() noexcept" in owner_rollback_guard_body
     and "ggml_sycl_abort_owner_effects_noexcept(owner)" in owner_rollback_guard_body,
@@ -354,6 +360,8 @@ checks = {
     "rollback cleanup stays nonthrowing and preserves closed reset": "ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw()" in abort_owner_effects_noexcept_body
     and abort_owner_effects_noexcept_body.count("catch (...)") >= 6
     and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
+    "explicit abort propagates cleanup failure": "const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);" in backend
+    and "registry->finalize_end(ticket, cleanup_ok).code" in backend,
     "finalize poison authority": "poisoned_after_prepare" in cpp
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"

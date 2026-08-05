@@ -9606,7 +9606,11 @@ static std::vector<int> ggml_sycl_execution_expected_participants_locked(uint64_
         if (!backend || binding.context_id != context_id) {
             continue;
         }
-        if (std::find(devices.begin(), devices.end(), backend->device) != devices.end()) {
+        const bool intersects = std::any_of(binding.covered_devices.begin(), binding.covered_devices.end(),
+                                            [&](int covered_device) {
+                                                return std::find(devices.begin(), devices.end(), covered_device) != devices.end();
+                                            });
+        if (intersects) {
             participants.push_back(binding.participant_id);
         }
     }
@@ -10347,8 +10351,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         g_sycl_abort_load_exit = false;
         finisher_effect        = {};
         if (!ticket.commit) {
-            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token);
-            return ggml_sycl_lifecycle_c_result(registry->finalize_end(ticket, true).code);
+            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
+            return ggml_sycl_lifecycle_c_result(registry->finalize_end(ticket, cleanup_ok).code);
         }
         const auto validation = registry->validate_end(ticket);
         if (validation != ggml_sycl::lifecycle::error::OK) {
