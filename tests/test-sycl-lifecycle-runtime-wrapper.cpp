@@ -141,7 +141,15 @@ static bool run_registry_failure_fixture() {
     pre_registry_buft.device = static_cast<ggml_backend_dev_t>(reg->context);
     auto pre_registry_buffer = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
     auto pre_registry_event = ggml_backend_event_new(static_cast<ggml_backend_dev_t>(reg->context));
-    if (!pre_registry_buffer || !pre_registry_event) return false;
+    static ggml_backend_reg orphan_reg{};
+    static ggml_backend_device orphan_dev{};
+    static ggml_backend_buffer_type orphan_buft{};
+    orphan_dev.reg = &orphan_reg;
+    orphan_buft.device = &orphan_dev;
+    auto orphan_buffer = ggml_backend_buffer_init(&orphan_buft, {}, nullptr, 0);
+    if (!pre_registry_buffer || !pre_registry_event || !orphan_buffer) return false;
+    phase("generic fixture: initialize registry with owners still pending");
+    (void) ggml_backend_reg_count();
     phase("generic fixture: overlap lifecycle adoption and buffer free");
     ggml_backend_test_block_owner_adoption(true);
     auto adopting_register = std::async(std::launch::async, [reg] { ggml_backend_register(reg); });
@@ -152,6 +160,19 @@ static bool run_registry_failure_fixture() {
     if (!ggml_backend_test_owner_adoption_blocked()) {
         ggml_backend_test_block_owner_adoption(false);
         adopting_register.get();
+        return false;
+    }
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        return false;
+    }
+    phase("generic fixture: concurrent unload blocked by hidden publication");
+    auto publishing_unload = std::async(std::launch::async, [reg] { return ggml_backend_unload_checked(reg); });
+    if (publishing_unload.wait_for(std::chrono::milliseconds(50)) != std::future_status::timeout) {
+        ggml_backend_test_block_owner_adoption(false);
+        adopting_register.get();
+        (void) publishing_unload.get();
         return false;
     }
     auto overlapping_free = std::async(std::launch::async,
@@ -166,10 +187,14 @@ static bool run_registry_failure_fixture() {
     ggml_backend_test_block_owner_adoption(false);
     adopting_register.get();
     phase("generic fixture: adoption publication joined");
+    if (publishing_unload.get() != GGML_BACKEND_UNLOAD_BUSY) return false;
+    phase("generic fixture: publication-raced unload rejected by live owner");
     overlapping_free.get();
     phase("generic fixture: overlapping free joined");
     phase("generic fixture: verify adopted event durable owner");
     if (ggml_backend_test_durable_owners(reg) != 1) return false;
+    // The unrelated, never-registered owner must not roll back A's adoption.
+    ggml_backend_buffer_free(orphan_buffer);
     phase("generic fixture: free adopted legacy-v2 event");
     ggml_backend_event_free(pre_registry_event);
     if (ggml_backend_test_durable_owners(reg) != 0) return false;

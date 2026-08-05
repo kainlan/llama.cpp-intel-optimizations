@@ -250,6 +250,7 @@ extern "C" {
         bool (*device_begin)(ggml_backend_dev_t device);
         void (*device_end)(ggml_backend_dev_t device);
         bool (*device_owner_acquire)(ggml_backend_dev_t device);
+        bool (*device_owner_adopt)(ggml_backend_dev_t device);
         void (*device_owner_release)(ggml_backend_dev_t device);
     };
 

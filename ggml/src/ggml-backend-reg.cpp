@@ -393,11 +393,12 @@ struct ggml_backend_registry {
                     entry->handle = std::move(candidate->handle);
                     entry->dynamic = candidate->dynamic;
                     entry->module_path = std::move(candidate->module_path);
-                    entry->state = reactivation_prepared ? ggml_backend_reg_state::REACTIVATING :
-                                                           ggml_backend_reg_state::ACTIVE;
                 }
+                // Keep all new/current device identities hidden while live
+                // pre-registry owners are adopted under module serialization.
+                entry->state = ggml_backend_reg_state::REACTIVATING;
                 for (auto dev : staged_devices) devices.push_back({ dev, entry, staged_generation });
-                if (!reactivation_prepared) entry->current_generation = staged_generation;
+                entry->current_generation = staged_generation;
                 published_entry = entry;
             }
             if (reactivation_prepared) {
@@ -411,12 +412,16 @@ struct ggml_backend_registry {
                     published_entry->state = ggml_backend_reg_state::REMOVED;
                     return false;
                 }
-                std::lock_guard<std::mutex> lock(mutex);
-                published_entry->current_generation = staged_generation;
-                published_entry->state = ggml_backend_reg_state::ACTIVE;
                 reactivation_prepared = false;
             }
+            // module_operation_mutex remains held: unload cannot pass preflight,
+            // and enumeration stays hidden until adoption has settled.
             ggml_backend_refresh_buffer_lifecycle();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (published_entry->state != ggml_backend_reg_state::REACTIVATING) return false;
+                published_entry->state = ggml_backend_reg_state::ACTIVE;
+            }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n", __func__, name, count);
 #endif
@@ -848,6 +853,7 @@ void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept;
 bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept;
 void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept;
 bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept;
+bool ggml_backend_device_owner_adopt(ggml_backend_dev_t device) noexcept;
 void ggml_backend_device_owner_release(ggml_backend_dev_t device) noexcept;
 
 static ggml_backend_registry & get_reg() {
@@ -859,6 +865,7 @@ static ggml_backend_registry & get_reg() {
         ggml_backend_device_begin_call,
         ggml_backend_device_end_call,
         ggml_backend_device_owner_acquire,
+        ggml_backend_device_owner_adopt,
         ggml_backend_device_owner_release,
     };
     static const bool installed = [] {
@@ -1029,6 +1036,22 @@ bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept {
             found->generation != found->owner->current_generation || found->owner->durable_owners == SIZE_MAX) {
             return false;
         }
+        ++found->owner->durable_owners;
+        return true;
+    } catch (...) { return false; }
+}
+
+bool ggml_backend_device_owner_adopt(ggml_backend_dev_t device) noexcept {
+    if (!device) return false;
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = find_device_identity(registry.devices, device);
+        if (found == registry.devices.end() ||
+            (found->owner->state != ggml_backend_reg_state::ACTIVE &&
+             found->owner->state != ggml_backend_reg_state::REACTIVATING) ||
+            found->generation != found->owner->current_generation ||
+            found->owner->durable_owners == SIZE_MAX) return false;
         ++found->owner->durable_owners;
         return true;
     } catch (...) { return false; }

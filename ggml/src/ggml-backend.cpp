@@ -42,6 +42,7 @@ std::atomic<registry_end_fn>   g_registry_end{ nullptr };
 std::atomic<device_begin_fn>   g_device_begin{ nullptr };
 std::atomic<device_end_fn>     g_device_end{ nullptr };
 std::atomic<device_owner_acquire_fn> g_device_owner_acquire{ nullptr };
+std::atomic<device_owner_acquire_fn> g_device_owner_adopt{ nullptr };
 std::atomic<device_owner_release_fn> g_device_owner_release{ nullptr };
 
 struct production_frame { ggml_backend_dev_t device; bool transferred = false; };
@@ -136,6 +137,7 @@ bool ggml_backend_test_owner_adoption_blocked(void) {
 void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i * iface) {
     g_device_owner_release.store(iface ? iface->device_owner_release : nullptr, std::memory_order_release);
     g_device_owner_acquire.store(iface ? iface->device_owner_acquire : nullptr, std::memory_order_release);
+    g_device_owner_adopt.store(iface ? iface->device_owner_adopt : nullptr, std::memory_order_release);
     g_registry_end.store(iface ? iface->registry_end : nullptr, std::memory_order_release);
     g_device_end.store(iface ? iface->device_end : nullptr, std::memory_order_release);
     g_device_begin.store(iface ? iface->device_begin : nullptr, std::memory_order_release);
@@ -147,7 +149,7 @@ void ggml_backend_set_registry_lifecycle(const ggml_backend_registry_lifecycle_i
 }
 
 void ggml_backend_refresh_buffer_lifecycle(void) {
-    const auto acquire = g_device_owner_acquire.load(std::memory_order_acquire);
+    const auto acquire = g_device_owner_adopt.load(std::memory_order_acquire);
     const auto release = g_device_owner_release.load(std::memory_order_acquire);
     if (!acquire) return;
     struct adoption_candidate { void * object; ggml_backend_dev_t device; bool event; };
@@ -178,28 +180,27 @@ void ggml_backend_refresh_buffer_lifecycle(void) {
             g_owner_adoption_test_blocked = false;
         }
     }
-    size_t acquired = 0;
-    for (; acquired < candidates.size(); ++acquired) {
-        if (!acquire(candidates[acquired].device)) break;
-    }
-    if (acquired != candidates.size()) {
-        for (size_t i = 0; i < acquired; ++i) if (release) release(candidates[i].device);
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_live_owner_mutex);
-        for (const auto & candidate : candidates) {
+    for (const auto & candidate : candidates) {
+        const bool adopted = acquire(candidate.device);
+        bool release_adopted = adopted;
+        {
+            std::lock_guard<std::mutex> lock(g_live_owner_mutex);
             auto & objects = candidate.event ? g_live_events : g_live_buffers;
             auto found = objects.find(candidate.object);
             if (found != objects.end() && found->second.state == live_owner_state::ADOPTING) {
-                found->second.lease = acquired == candidates.size();
+                found->second.lease = adopted;
                 found->second.state = live_owner_state::OPEN;
                 if (!candidate.event) {
-                    static_cast<ggml_backend_buffer_t>(candidate.object)->owner_lease = found->second.lease;
+                    static_cast<ggml_backend_buffer_t>(candidate.object)->owner_lease = adopted;
                 }
+                release_adopted = false;
             }
         }
+        if (release_adopted && release) release(candidate.device);
+        // Settle independently: an unrelated unregistered candidate remains
+        // pending without rolling back owners already adopted for this module.
+        g_live_owner_cv.notify_all();
     }
-    g_live_owner_cv.notify_all();
 }
 
 #ifdef __APPLE__
