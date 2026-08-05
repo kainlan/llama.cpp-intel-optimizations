@@ -361,7 +361,9 @@ checks = {
     and abort_owner_effects_noexcept_body.count("catch (...)") >= 6
     and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
     "explicit abort propagates cleanup failure": "const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);" in backend
-    and "registry->finalize_end(ticket, cleanup_ok).code" in backend,
+    and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
+    and "registry->is_quarantined(failed.token)" in backend
+    and "ggml_sycl_quarantine_enqueue(quarantined)" in backend,
     "finalize poison authority": "poisoned_after_prepare" in cpp
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"

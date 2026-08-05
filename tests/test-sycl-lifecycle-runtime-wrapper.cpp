@@ -1240,13 +1240,23 @@ int main() {
 
     phase("abort cleanup failure quarantines and recovers");
     ggml_sycl_load_txn poisoned_abort{};
-    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK) {
-        std::fprintf(stderr, "poisoned abort begin failed\n");
+    ggml_sycl_tensor_inventory poisoned_inventory{};
+    poisoned_inventory.n_ctx    = 16;
+    poisoned_inventory.n_ubatch = 4;
+    ggml_sycl_placement_envelope poisoned_envelope{};
+    poisoned_envelope.n_ctx           = 16;
+    poisoned_envelope.n_ubatch        = 4;
+    poisoned_envelope.n_seq_max       = 1;
+    poisoned_envelope.flash_attn_type = -1;
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK) {
+        std::fprintf(stderr, "poisoned abort setup failed\n");
         return 1;
     }
     fail_abort_owner_effects_cleanup();
     const auto poisoned_abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(poisoned_abort, false, nullptr);
-    if (poisoned_abort_rc != GGML_SYCL_LIFECYCLE_POISONED ||
+    if (poisoned_abort_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED ||
         CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
         std::fprintf(stderr, "poisoned abort did not quarantine/recover cleanly rc=%d authority=%d before=%d\n",
                      (int) poisoned_abort_rc,
@@ -1255,10 +1265,14 @@ int main() {
         return 1;
     }
     ggml_sycl_load_txn post_poisoned_abort{};
-    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&post_poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_model_load_end)(post_poisoned_abort, false, nullptr) ==
-            GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&post_poisoned_abort) != GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "poisoned abort did not recover future transactions\n");
+        return 1;
+    }
+    const auto post_poisoned_abort_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(post_poisoned_abort, false, nullptr);
+    if (post_poisoned_abort_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS &&
+        post_poisoned_abort_rc != GGML_SYCL_LIFECYCLE_POISONED) {
+        std::fprintf(stderr, "post-poisoned abort returned %d\n", (int) post_poisoned_abort_rc);
         return 1;
     }
 

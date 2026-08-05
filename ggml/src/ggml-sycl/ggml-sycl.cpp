@@ -10352,7 +10352,16 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         finisher_effect        = {};
         if (!ticket.commit) {
             const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
-            return ggml_sycl_lifecycle_c_result(registry->finalize_end(ticket, cleanup_ok).code);
+            const auto failed = registry->finalize_end(ticket, cleanup_ok);
+            if (!failed.committed && registry->is_quarantined(failed.token)) {
+                ggml_sycl_model_token quarantined{};
+                ggml_sycl_export_token(failed.token, &quarantined);
+                (void) ggml_sycl_quarantine_enqueue(quarantined);
+            }
+            if (model && failed.token.model.value != 0) {
+                ggml_sycl_export_token(failed.token, model);
+            }
+            return ggml_sycl_lifecycle_c_result(failed.code);
         }
         const auto validation = registry->validate_end(ticket);
         if (validation != ggml_sycl::lifecycle::error::OK) {
