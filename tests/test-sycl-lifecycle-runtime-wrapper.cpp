@@ -67,6 +67,15 @@ static void registry_fixture_event_free(ggml_backend_dev_t, ggml_backend_event_t
     delete reinterpret_cast<legacy_v2_event_layout *>(event);
     if (g_fixture_event_free_throw) throw std::runtime_error("fixture event free failure");
 }
+struct fixture_owned_context { int * live; };
+static void registry_fixture_context_cleanup(void * opaque) {
+    auto * context = static_cast<fixture_owned_context *>(opaque);
+    --*context->live;
+    delete context;
+}
+static void registry_fixture_buffer_free_owned(ggml_backend_buffer_t buffer) {
+    registry_fixture_context_cleanup(buffer->context);
+}
 static void registry_fixture_buffer_free_throw(ggml_backend_buffer_t) {
     throw std::runtime_error("fixture buffer free failure");
 }
@@ -326,6 +335,14 @@ static bool run_registry_failure_fixture() {
     ggml_backend_buffer_free(unrelated);
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
     phase("generic fixture: owner-map allocation and throwing teardown recovery");
+    int wrapper_owned_resources = 1;
+    ggml_backend_buffer_i owned_iface{};
+    owned_iface.free_buffer = registry_fixture_buffer_free_owned;
+    ggml_backend_test_fail_next_buffer_wrapper();
+    if (ggml_backend_buffer_init_with_cleanup(&pre_registry_buft, owned_iface,
+                                 new fixture_owned_context{ &wrapper_owned_resources }, 0,
+                                 registry_fixture_context_cleanup) != nullptr ||
+        wrapper_owned_resources != 0 || ggml_backend_test_durable_owners(reg) != 0) return false;
     ggml_backend_test_fail_next_buffer_emplace();
     if (ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0) != nullptr ||
         ggml_backend_test_durable_owners(reg) != 0) return false;

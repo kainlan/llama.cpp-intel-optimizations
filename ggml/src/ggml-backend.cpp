@@ -115,6 +115,7 @@ static std::atomic<bool> g_fail_next_owner_adoption{ false };
 static std::atomic<size_t> g_owner_close_attempts{ 0 };
 static std::atomic<size_t> g_owner_transfer_attempts{ 0 };
 static std::atomic<uint64_t> g_live_owner_epoch{ 1 };
+static std::atomic<bool> g_fail_next_buffer_wrapper{ false };
 static std::atomic<bool> g_fail_next_buffer_emplace{ false };
 static std::atomic<bool> g_fail_next_event_emplace{ false };
 
@@ -144,6 +145,10 @@ size_t ggml_backend_test_owner_transfer_attempts(void) {
 
 size_t ggml_backend_test_owner_close_attempts(void) {
     return g_owner_close_attempts.load(std::memory_order_acquire);
+}
+
+void ggml_backend_test_fail_next_buffer_wrapper(void) {
+    g_fail_next_buffer_wrapper.store(true, std::memory_order_release);
 }
 
 void ggml_backend_test_fail_next_buffer_emplace(void) {
@@ -430,11 +435,19 @@ bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buf
     return true;
 }
 
-ggml_backend_buffer_t ggml_backend_buffer_init(
+ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
                void *                     context,
-               size_t                     size) {
+               size_t                     size,
+               ggml_backend_buffer_context_cleanup_t cleanup) {
+    if (g_fail_next_buffer_wrapper.exchange(false, std::memory_order_acq_rel)) {
+        if (cleanup) {
+            try { cleanup(context); }
+            catch (...) { GGML_LOG_ERROR("buffer context cleanup threw after wrapper allocation failure\n"); }
+        }
+        return nullptr;
+    }
     ggml_backend_buffer_t buffer = new (std::nothrow) ggml_backend_buffer {
         /* .interface = */ iface,
         /* .buft      = */ buft,
@@ -444,10 +457,24 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .owner_device = */ buft ? buft->device : nullptr,
         /* .owner_lease  = */ false
     };
-    if (!buffer) return nullptr;
+    if (!buffer) {
+        if (cleanup) {
+            try { cleanup(context); }
+            catch (...) { GGML_LOG_ERROR("buffer context cleanup threw after wrapper allocation failure\n"); }
+            return nullptr;
+        }
+        // Legacy callers without an explicit context cleanup fail closed;
+        // returning would leak an ownership contract the core cannot infer.
+        GGML_ABORT("backend buffer wrapper allocation failed");
+        return nullptr;
+    }
     const auto acquire_owner = g_device_owner_acquire.load(std::memory_order_acquire);
     const bool consumed_production = consume_production_owner(buffer->owner_device);
     if (!consumed_production && buffer->owner_device && acquire_owner && !acquire_owner(buffer->owner_device)) {
+        if (buffer->iface.free_buffer) {
+            try { buffer->iface.free_buffer(buffer); }
+            catch (...) { GGML_LOG_ERROR("buffer cleanup threw after owner acquisition failure\n"); }
+        }
         delete buffer;
         return nullptr;
     }
@@ -482,6 +509,14 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     }
 
     return buffer;
+}
+
+ggml_backend_buffer_t ggml_backend_buffer_init(
+               ggml_backend_buffer_type_t buft,
+        struct ggml_backend_buffer_i      iface,
+               void *                     context,
+               size_t                     size) {
+    return ggml_backend_buffer_init_with_cleanup(buft, iface, context, size, nullptr);
 }
 
 const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {

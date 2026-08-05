@@ -80,6 +80,14 @@ extern "C" {
     GGML_API void ggml_backend_buffer_clear_owner(ggml_backend_buffer_t buffer);
     GGML_API bool ggml_backend_buffer_set_type(ggml_backend_buffer_t buffer, ggml_backend_buffer_type_t buft);
 
+    typedef void (*ggml_backend_buffer_context_cleanup_t)(void * context);
+    GGML_API ggml_backend_buffer_t ggml_backend_buffer_init_with_cleanup(
+            ggml_backend_buffer_type_t buft,
+            struct ggml_backend_buffer_i iface,
+            void * context,
+            size_t size,
+            ggml_backend_buffer_context_cleanup_t cleanup);
+
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(
                    ggml_backend_buffer_type_t buft,
             struct ggml_backend_buffer_i      iface,
@@ -259,6 +267,7 @@ extern "C" {
     GGML_API void ggml_backend_test_block_owner_adoption(bool block);
     GGML_API bool ggml_backend_test_owner_adoption_blocked(void);
     GGML_API void ggml_backend_test_fail_next_owner_adoption(void);
+    GGML_API void ggml_backend_test_fail_next_buffer_wrapper(void);
     GGML_API void ggml_backend_test_fail_next_buffer_emplace(void);
     GGML_API void ggml_backend_test_fail_next_event_emplace(void);
     GGML_API size_t ggml_backend_test_owner_close_attempts(void);

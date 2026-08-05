@@ -829,6 +829,14 @@ checks = {
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "multi-buffer aggregate owns no duplicate lease" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "g_fail_next_buffer_wrapper" in backend_base
+        and "ggml_backend_buffer_init_with_cleanup" in backend_base
+        and "registry_fixture_context_cleanup" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "backend buffer wrapper allocation failed" in backend_base
+        and "buffer cleanup threw after owner acquisition failure" in backend_base
+        and "wrapper_owned_resources != 0" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "g_fail_next_buffer_emplace" in backend_base
         and "g_fail_next_event_emplace" in backend_base
         and "backend buffer free callback threw" in backend_base
