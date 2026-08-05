@@ -129,7 +129,10 @@ static ggml_backend_reg_t registry_fixture() {
     return &reg;
 }
 
-static void phase(const char * name);
+static void phase(const char * name) {
+    std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
+    std::fflush(stderr);
+}
 
 static bool run_registry_failure_fixture() {
     phase("generic fixture: construct pre-registry owners");
@@ -280,11 +283,6 @@ static bool run_registry_failure_fixture() {
            g_registry_fixture_cancels >= 2;
 }
 } // namespace
-
-static void phase(const char * name) {
-    std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
-    std::fflush(stderr);
-}
 
 int main() {
     phase("generic registry tombstone/failure fixture");
