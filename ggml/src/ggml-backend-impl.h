@@ -256,6 +256,7 @@ extern "C" {
     GGML_API void ggml_backend_refresh_buffer_lifecycle(void);
     GGML_API void ggml_backend_test_block_owner_adoption(bool block);
     GGML_API bool ggml_backend_test_owner_adoption_blocked(void);
+    GGML_API size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg);
     GGML_API void ggml_backend_set_registry_lifecycle(
         const struct ggml_backend_registry_lifecycle_i * iface);
 

@@ -798,6 +798,10 @@ checks = {
     and "buffer free timed out waiting for lifecycle adoption" in backend_base
     and "event free timed out waiting for lifecycle adoption" in backend_base
     and "generic fixture: await adoption barrier" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "verify adopted event durable owner" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "ggml_backend_test_durable_owners(reg) != 0" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "cache shutdown owner snapshot avoids rw-lock callbacks":
         "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp

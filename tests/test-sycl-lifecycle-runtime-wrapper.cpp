@@ -168,9 +168,14 @@ static bool run_registry_failure_fixture() {
     phase("generic fixture: adoption publication joined");
     overlapping_free.get();
     phase("generic fixture: overlapping free joined");
-    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
+    phase("generic fixture: verify adopted event durable owner");
+    if (ggml_backend_test_durable_owners(reg) != 1) return false;
+    phase("generic fixture: free adopted legacy-v2 event");
     ggml_backend_event_free(pre_registry_event);
+    if (ggml_backend_test_durable_owners(reg) != 0) return false;
+    phase("generic fixture: unload after all adopted owners freed");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: register after adopted-owner unload");
     ggml_backend_register(reg);
     const size_t initial_reg_count = ggml_backend_reg_count();
 #if defined(GGML_SYCL_RUNTIME_MODULE)
@@ -181,15 +186,18 @@ static bool run_registry_failure_fixture() {
     if (initial_reg_count < 2 || ggml_backend_reg_by_name("SYCL") == nullptr) return false;
 #endif
 
+    phase("generic fixture: resolver failure tombstone");
     g_registry_fixture_mode = registry_fixture_mode::RESOLVER_THROW;
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
         ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
     for (int i = 0; i < 1000; ++i) {
         if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
     }
+    phase("generic fixture: retry resolver-failure unload");
     g_registry_fixture_mode = registry_fixture_mode::NORMAL;
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
 
+    phase("generic fixture: enumerate reactivated generation");
     const size_t before_reg_count = ggml_backend_reg_count();
     const size_t before_dev_count = ggml_backend_dev_count();
     ggml_backend_register(reg);
@@ -201,13 +209,16 @@ static bool run_registry_failure_fixture() {
     for (size_t i = 0; i < reg_count; ++i) if (ggml_backend_reg_get(i) == reg) reg_index = i;
     for (size_t i = 0; i < dev_count; ++i) if (ggml_backend_dev_get(i) == reg->context) dev_index = i;
 
+    phase("generic fixture: shutdown failure tombstone");
     g_registry_fixture_mode = registry_fixture_mode::SHUTDOWN_THROW;
     if (reg_index == reg_count || dev_index == dev_count ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY ||
         ggml_backend_reg_get(reg_index) != nullptr || ggml_backend_dev_get(dev_index) != nullptr ||
         ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;
+    phase("generic fixture: retry shutdown-failure unload");
     g_registry_fixture_mode = registry_fixture_mode::NORMAL;
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: active callback drain");
     ggml_backend_register(reg);
     if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg) return false;
     {
@@ -233,6 +244,7 @@ static bool run_registry_failure_fixture() {
     if (!unload_waited_for_callback || !callback.get() ||
         blocked_unload.get() != GGML_BACKEND_UNLOAD_OK) return false;
 
+    phase("generic fixture: bounded stalled callback cancellation");
     ggml_backend_register(reg);
     {
         std::lock_guard<std::mutex> lock(g_device_callback_mutex);
@@ -255,6 +267,7 @@ static bool run_registry_failure_fixture() {
     if (stalled_unload_result != GGML_BACKEND_UNLOAD_BUSY || !stalled_callback.get() ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
 
+    phase("generic fixture: hidden blocked reactivation");
     {
         std::lock_guard<std::mutex> lock(g_commit_reactivate_mutex);
         g_commit_reactivate_block = true;
@@ -274,6 +287,7 @@ static bool run_registry_failure_fixture() {
     blocked_reactivation.get();
     if (!reactivation_hidden || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
 
+    phase("generic fixture: throwing commit rollback and recovery");
     g_registry_fixture_mode = registry_fixture_mode::COMMIT_REACTIVATE_THROW;
     ggml_backend_register(reg);
     if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != nullptr) return false;

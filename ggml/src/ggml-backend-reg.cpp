@@ -958,6 +958,18 @@ void ggml_backend_registry_end_call(ggml_backend_reg_t reg) noexcept {
     }
 }
 
+extern "C" size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg) {
+    try {
+        auto & registry = get_reg();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = std::find_if(registry.backends.begin(), registry.backends.end(),
+            [reg](const ggml_backend_reg_entry_ptr & entry) { return entry->reg == reg; });
+        return found == registry.backends.end() ? 0 : (*found)->durable_owners;
+    } catch (...) {
+        return SIZE_MAX;
+    }
+}
+
 extern "C" size_t ggml_backend_test_active_calls(ggml_backend_reg_t reg) {
     try {
         auto & registry = get_reg();
