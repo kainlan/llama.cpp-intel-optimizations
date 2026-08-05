@@ -12716,11 +12716,13 @@ static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & 
     try {
         std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
         auto owns_record = [&](const unified_cache & cache) {
-            if (cache.contains_pinned(rec.handle.ptr)) {
+            if (cache.contains_pinned(rec.handle.ptr) ||
+                cache.contains_pinned_backing_allocation(rec.handle.ptr, rec.handle.size)) {
                 return true;
             }
             for (const auto & seg : rec.handle.all_segments) {
-                if (cache.contains_pinned(seg.ptr)) {
+                if (cache.contains_pinned(seg.ptr) ||
+                    cache.contains_pinned_backing_allocation(seg.ptr, seg.size)) {
                     return true;
                 }
             }
@@ -13392,6 +13394,13 @@ bool unified_cache::contains_pinned(const void * ptr) const {
         return false;
     }
     return host_arena_->contains(ptr);
+}
+
+bool unified_cache::contains_pinned_backing_allocation(const void * ptr, size_t size) const {
+    if (!host_arena_ || !ptr || size == 0) {
+        return false;
+    }
+    return host_arena_->contains_backing_allocation(ptr, size);
 }
 
 size_t unified_cache::pre_allocate_host_pool(size_t total_bytes) {

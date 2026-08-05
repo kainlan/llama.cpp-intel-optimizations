@@ -2735,6 +2735,7 @@ class unified_cache {
     size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
     bool   contains_pinned(const void * ptr) const;
+    bool   contains_pinned_backing_allocation(const void * ptr, size_t size) const;
     size_t pre_allocate_host_pool(size_t total_bytes);
 
     // Deprecated shim — tests written against the old API. Migrate callers to unified_alloc().
