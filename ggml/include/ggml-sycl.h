@@ -775,6 +775,70 @@ struct ggml_sycl_model_token {
 
 struct ggml_sycl_load_txn { uint64_t id; };
 
+struct ggml_sycl_exec_context_id { uint64_t value; };
+struct ggml_sycl_exec_session_id { uint64_t value; };
+struct ggml_sycl_exec_session_reset_epoch { uint64_t value; };
+struct ggml_sycl_exec_graph_epoch { uint64_t value; };
+struct ggml_sycl_exec_invocation_id { uint64_t value; };
+
+enum ggml_sycl_execution_result {
+    GGML_SYCL_EXECUTION_OK = 0,
+    GGML_SYCL_EXECUTION_STALE,
+    GGML_SYCL_EXECUTION_MISMATCH,
+    GGML_SYCL_EXECUTION_OVERFLOW,
+    GGML_SYCL_EXECUTION_DEVICE_BUSY,
+    GGML_SYCL_EXECUTION_BUSY,
+    GGML_SYCL_EXECUTION_NULL_OUTPUT,
+    GGML_SYCL_EXECUTION_FOREIGN_BACKEND,
+    GGML_SYCL_EXECUTION_NOT_FOUND,
+};
+
+enum ggml_sycl_execution_context_state {
+    GGML_SYCL_EXECUTION_CONTEXT_OPEN = 0,
+    GGML_SYCL_EXECUTION_CONTEXT_DRAINING,
+    GGML_SYCL_EXECUTION_CONTEXT_RESETTING,
+    GGML_SYCL_EXECUTION_CONTEXT_CLOSED,
+};
+
+enum ggml_sycl_execution_session_state {
+    GGML_SYCL_EXECUTION_SESSION_IDLE = 0,
+    GGML_SYCL_EXECUTION_SESSION_OPEN,
+    GGML_SYCL_EXECUTION_SESSION_RESETTING,
+    GGML_SYCL_EXECUTION_SESSION_DRAINING,
+    GGML_SYCL_EXECUTION_SESSION_CLOSED,
+};
+
+enum ggml_sycl_execution_graph_state {
+    GGML_SYCL_EXECUTION_GRAPH_IDLE = 0,
+    GGML_SYCL_EXECUTION_GRAPH_OPEN,
+    GGML_SYCL_EXECUTION_GRAPH_SEALED,
+    GGML_SYCL_EXECUTION_GRAPH_COMPLETE,
+    GGML_SYCL_EXECUTION_GRAPH_QUARANTINED,
+    GGML_SYCL_EXECUTION_GRAPH_RETIRED,
+};
+
+enum ggml_sycl_execution_token_root_state {
+    GGML_SYCL_EXECUTION_TOKEN_ROOT_OPEN = 0,
+    GGML_SYCL_EXECUTION_TOKEN_ROOT_SEALED,
+    GGML_SYCL_EXECUTION_TOKEN_ROOT_COMPLETE,
+    GGML_SYCL_EXECUTION_TOKEN_ROOT_QUARANTINED,
+};
+
+struct ggml_sycl_execution_snapshot {
+    struct ggml_sycl_exec_context_id         context_id;
+    struct ggml_sycl_exec_session_id         session_id;
+    struct ggml_sycl_exec_session_reset_epoch reset_epoch;
+    struct ggml_sycl_exec_graph_epoch        graph_epoch;
+    struct ggml_sycl_exec_invocation_id      invocation_id;
+    struct ggml_sycl_model_token             token_root;
+    enum ggml_sycl_execution_context_state   context_state;
+    enum ggml_sycl_execution_session_state   session_state;
+    enum ggml_sycl_execution_graph_state     graph_state;
+    enum ggml_sycl_execution_token_root_state token_root_state;
+    uint32_t                                 bound_device_count;
+    uint32_t                                 busy_device_count;
+};
+
 enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_OK = 0,
     GGML_SYCL_LIFECYCLE_NESTED,
@@ -824,6 +888,25 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max);
+
+// Execution-lifecycle context identity is separate from the model lifecycle.
+// One ContextId is allocated per llama_context and then bound to each SYCL
+// backend created for it.
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_create(
+    struct ggml_sycl_exec_context_id * context);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(
+    ggml_backend_t backend,
+    struct ggml_sycl_exec_context_id context);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract(
+    struct ggml_sycl_exec_context_id      context,
+    struct ggml_sycl_execution_snapshot * out);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_drain(
+    struct ggml_sycl_exec_context_id context);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_session_reset(
+    struct ggml_sycl_exec_context_id context,
+    struct ggml_sycl_exec_session_reset_epoch * next_reset_epoch);
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_close(
+    struct ggml_sycl_exec_context_id context);
 
 // Deprecated bool compatibility boundary. It is abort-default and cannot be
 // used to obtain ownership identity; migrated callers use the APIs above.

@@ -109,6 +109,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "model-lifecycle.hpp"
+#include "execution-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
 
@@ -9342,6 +9343,93 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
     };
 }
 
+static ggml_sycl_execution_result ggml_sycl_execution_c_result(ggml_sycl::execution::error e) {
+    using E = ggml_sycl::execution::error;
+    switch (e) {
+        case E::OK:
+            return GGML_SYCL_EXECUTION_OK;
+        case E::STALE:
+            return GGML_SYCL_EXECUTION_STALE;
+        case E::MISMATCH:
+            return GGML_SYCL_EXECUTION_MISMATCH;
+        case E::OVERFLOW:
+            return GGML_SYCL_EXECUTION_OVERFLOW;
+        case E::DEVICE_BUSY:
+            return GGML_SYCL_EXECUTION_DEVICE_BUSY;
+        case E::BUSY:
+            return GGML_SYCL_EXECUTION_BUSY;
+        case E::NULL_OUTPUT:
+            return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+        case E::FOREIGN_BACKEND:
+            return GGML_SYCL_EXECUTION_FOREIGN_BACKEND;
+        case E::NOT_FOUND:
+            return GGML_SYCL_EXECUTION_NOT_FOUND;
+    }
+    return GGML_SYCL_EXECUTION_BUSY;
+}
+
+static ggml_sycl_execution_context_state ggml_sycl_execution_c_context_state(ggml_sycl::execution::context_phase state) {
+    using P = ggml_sycl::execution::context_phase;
+    switch (state) {
+        case P::OPEN: return GGML_SYCL_EXECUTION_CONTEXT_OPEN;
+        case P::DRAINING: return GGML_SYCL_EXECUTION_CONTEXT_DRAINING;
+        case P::RESETTING: return GGML_SYCL_EXECUTION_CONTEXT_RESETTING;
+        case P::CLOSED: return GGML_SYCL_EXECUTION_CONTEXT_CLOSED;
+    }
+    return GGML_SYCL_EXECUTION_CONTEXT_CLOSED;
+}
+
+static ggml_sycl_execution_session_state ggml_sycl_execution_c_session_state(ggml_sycl::execution::session_phase state) {
+    using P = ggml_sycl::execution::session_phase;
+    switch (state) {
+        case P::IDLE: return GGML_SYCL_EXECUTION_SESSION_IDLE;
+        case P::OPEN: return GGML_SYCL_EXECUTION_SESSION_OPEN;
+        case P::RESETTING: return GGML_SYCL_EXECUTION_SESSION_RESETTING;
+        case P::DRAINING: return GGML_SYCL_EXECUTION_SESSION_DRAINING;
+        case P::CLOSED: return GGML_SYCL_EXECUTION_SESSION_CLOSED;
+    }
+    return GGML_SYCL_EXECUTION_SESSION_CLOSED;
+}
+
+static ggml_sycl_execution_graph_state ggml_sycl_execution_c_graph_state(ggml_sycl::execution::graph_phase state) {
+    using P = ggml_sycl::execution::graph_phase;
+    switch (state) {
+        case P::IDLE: return GGML_SYCL_EXECUTION_GRAPH_IDLE;
+        case P::OPEN: return GGML_SYCL_EXECUTION_GRAPH_OPEN;
+        case P::SEALED: return GGML_SYCL_EXECUTION_GRAPH_SEALED;
+        case P::COMPLETE: return GGML_SYCL_EXECUTION_GRAPH_COMPLETE;
+        case P::QUARANTINED: return GGML_SYCL_EXECUTION_GRAPH_QUARANTINED;
+        case P::RETIRED: return GGML_SYCL_EXECUTION_GRAPH_RETIRED;
+    }
+    return GGML_SYCL_EXECUTION_GRAPH_IDLE;
+}
+
+static ggml_sycl_execution_token_root_state ggml_sycl_execution_c_token_state(ggml_sycl::execution::token_root_phase state) {
+    using P = ggml_sycl::execution::token_root_phase;
+    switch (state) {
+        case P::OPEN: return GGML_SYCL_EXECUTION_TOKEN_ROOT_OPEN;
+        case P::SEALED: return GGML_SYCL_EXECUTION_TOKEN_ROOT_SEALED;
+        case P::COMPLETE: return GGML_SYCL_EXECUTION_TOKEN_ROOT_COMPLETE;
+        case P::QUARANTINED: return GGML_SYCL_EXECUTION_TOKEN_ROOT_QUARANTINED;
+    }
+    return GGML_SYCL_EXECUTION_TOKEN_ROOT_OPEN;
+}
+
+static void ggml_sycl_execution_record_root(ggml_backend_sycl_context * backend_ctx,
+                                             const ggml_sycl::lifecycle::ModelToken & token,
+                                             const ggml_sycl::execution::SessionId & session,
+                                             const ggml_sycl::execution::SessionResetEpoch & reset_epoch) {
+    if (!backend_ctx) {
+        return;
+    }
+    backend_ctx->execution_session_id = session.value;
+    backend_ctx->execution_reset_epoch = reset_epoch.value;
+    backend_ctx->execution_root_model_id = token.model.value;
+    backend_ctx->execution_root_load_txn_id = token.load.value;
+    backend_ctx->execution_root_slot = token.owner.slot;
+    backend_ctx->execution_root_slot_generation = token.owner.generation;
+}
+
 static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
     const std::string prefix = std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
                                std::to_string(owner.owner.slot) + ":" +
@@ -10807,6 +10895,87 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
     return ggml_sycl_has_global_plan();
 }
 
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_create(ggml_sycl_exec_context_id * context) {
+    if (!context) {
+        return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+    }
+    ggml_sycl::execution::error err = ggml_sycl::execution::error::OK;
+    const auto id = ggml_sycl::execution::global_registry().create_context(err);
+    if (err == ggml_sycl::execution::error::OK) {
+        context->value = id.value;
+    }
+    return ggml_sycl_execution_c_result(err);
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml_backend_t backend,
+                                                                             ggml_sycl_exec_context_id context) {
+    if (!backend || !backend->context) {
+        return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device || ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_EXECUTION_FOREIGN_BACKEND;
+    }
+    auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    const auto rc = ggml_sycl::execution::global_registry().bind_backend({ context.value }, backend_ctx->device);
+    if (rc == ggml_sycl::execution::error::OK) {
+        backend_ctx->execution_context_id = context.value;
+    }
+    return ggml_sycl_execution_c_result(rc);
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract(ggml_sycl_exec_context_id context,
+                                                                        ggml_sycl_execution_snapshot * out) {
+    if (!out) {
+        return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+    }
+    ggml_sycl::execution::snapshot snapshot{};
+    const auto rc = ggml_sycl::execution::global_registry().extract({ context.value }, &snapshot);
+    if (rc != ggml_sycl::execution::error::OK) {
+        return ggml_sycl_execution_c_result(rc);
+    }
+    out->context_id = { snapshot.context.value };
+    out->session_id = { snapshot.session.value };
+    out->reset_epoch = { snapshot.reset_epoch.value };
+    out->graph_epoch = { snapshot.graph_epoch.value };
+    out->invocation_id = { snapshot.invocation.value };
+    out->token_root = { snapshot.token_root.model.value, snapshot.token_root.load.value, snapshot.token_root.owner.slot,
+                        snapshot.token_root.owner.generation };
+    out->context_state = ggml_sycl_execution_c_context_state(snapshot.context_state);
+    out->session_state = ggml_sycl_execution_c_session_state(snapshot.session_state);
+    out->graph_state = ggml_sycl_execution_c_graph_state(snapshot.graph_state);
+    out->token_root_state = ggml_sycl_execution_c_token_state(snapshot.token_root_state);
+    out->bound_device_count = snapshot.bound_device_count;
+    out->busy_device_count = snapshot.busy_device_count;
+    return GGML_SYCL_EXECUTION_OK;
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_drain(ggml_sycl_exec_context_id context) {
+    return ggml_sycl_execution_c_result(ggml_sycl::execution::global_registry().drain_context({ context.value }));
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_session_reset(ggml_sycl_exec_context_id context,
+                                                                     ggml_sycl_exec_session_reset_epoch * next_reset_epoch) {
+    if (!next_reset_epoch) {
+        return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+    }
+    ggml_sycl::execution::snapshot snapshot{};
+    const auto extract_rc = ggml_sycl::execution::global_registry().extract({ context.value }, &snapshot);
+    if (extract_rc != ggml_sycl::execution::error::OK) {
+        return ggml_sycl_execution_c_result(extract_rc);
+    }
+    ggml_sycl::execution::SessionResetEpoch next{};
+    const auto rc = ggml_sycl::execution::global_registry().reset_session(snapshot.context, snapshot.session,
+                                                                          snapshot.reset_epoch, &next);
+    if (rc == ggml_sycl::execution::error::OK) {
+        next_reset_epoch->value = next.value;
+    }
+    return ggml_sycl_execution_c_result(rc);
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_close(ggml_sycl_exec_context_id context) {
+    return ggml_sycl_execution_c_result(ggml_sycl::execution::global_registry().close_context({ context.value }));
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
@@ -11841,6 +12010,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         { model.load_txn_id },
         { model.slot, model.slot_generation }
     };
+    auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (backend_ctx && backend_ctx->execution_context_id != 0) {
+        ggml_sycl::execution::SessionId session{};
+        ggml_sycl::execution::SessionResetEpoch reset_epoch{};
+        const auto attach_rc = ggml_sycl::execution::global_registry().attach_root(
+            { backend_ctx->execution_context_id }, token, &session, &reset_epoch);
+        if (attach_rc != ggml_sycl::execution::error::OK) {
+            return ggml_sycl_execution_c_result(attach_rc) == GGML_SYCL_EXECUTION_BUSY ? GGML_SYCL_LIFECYCLE_BUSY :
+                   GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        }
+        ggml_sycl_execution_record_root(backend_ctx, token, session, reset_epoch);
+    }
     auto & registry = ggml_sycl::lifecycle::global_registry();
     auto   ticket   = registry.prepare_live_update(token);
     if (!ticket.active) {
@@ -96892,6 +97073,24 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_create;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_bind_backend") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_bind_backend;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_extract") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_extract;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_drain") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_drain;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_session_reset") == 0) {
+        return (void *) ggml_backend_sycl_execution_session_reset;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_close") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_close;
     }
     if (strcmp(name, "ggml_backend_sycl_model_unloaded_token") == 0) {
         return (void *) ggml_backend_sycl_model_unloaded_token;

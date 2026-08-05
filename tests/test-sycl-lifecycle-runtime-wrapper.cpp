@@ -1029,6 +1029,12 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_test_release_live_update)
     LOAD_SYCL(ggml_backend_sycl_activate_model_plan)
     LOAD_SYCL(ggml_backend_sycl_set_runtime_context_for_model)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_create)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_bind_backend)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_extract)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_drain)
+    LOAD_SYCL(ggml_backend_sycl_execution_session_reset)
+    LOAD_SYCL(ggml_backend_sycl_execution_context_close)
     LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
     LOAD_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)
@@ -1126,6 +1132,14 @@ int main() {
     ggml_sycl_model_token unknown{ 0x1234, 0x5678, 0, 1 };
     if (CALL_SYCL(ggml_backend_sycl_model_quarantine_token)(unknown) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
         std::fprintf(stderr, "unknown quarantine token accepted\n");
+        return 1;
+    }
+    ggml_sycl_execution_snapshot exec_snapshot{};
+    if (CALL_SYCL(ggml_backend_sycl_execution_context_extract)({}, &exec_snapshot) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_drain)({}) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_session_reset)({}, &exec_snapshot.reset_epoch) != GGML_SYCL_EXECUTION_STALE ||
+        CALL_SYCL(ggml_backend_sycl_execution_context_close)({}) != GGML_SYCL_EXECUTION_STALE) {
+        std::fprintf(stderr, "execution lifecycle invalid-input contract mismatch\n");
         return 1;
     }
 

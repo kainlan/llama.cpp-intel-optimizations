@@ -135,6 +135,15 @@ if (BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-runtime-host COMMAND test-sycl-lifecycle-runtime-host)
     set_tests_properties(sycl-lifecycle-runtime-host PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
+    add_executable(test-sycl-execution-lifecycle-host
+        tests/test-execution-lifecycle-runtime.cpp
+        execution-lifecycle.cpp)
+    target_include_directories(test-sycl-execution-lifecycle-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-execution-lifecycle-host PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-execution-lifecycle-host PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-execution-lifecycle-host COMMAND test-sycl-execution-lifecycle-host)
+    set_tests_properties(sycl-execution-lifecycle-host PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")

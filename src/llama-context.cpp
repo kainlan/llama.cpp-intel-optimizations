@@ -107,11 +107,17 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
 
 #if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
 struct llama_context_sycl_dl_compute_hooks {
-    decltype(&ggml_backend_sycl_host_compute_buffer_type)        host_compute  = nullptr;
-    decltype(&ggml_backend_sycl_cpu_offload_compute_buffer_type) cpu_compute   = nullptr;
-    decltype(&ggml_backend_sycl_cpu_offload_available)           cpu_available   = nullptr;
-    decltype(&ggml_backend_sycl_has_active_placement_plan)       has_active_plan = nullptr;
-    int                                                          device_index    = -1;
+    decltype(&ggml_backend_sycl_host_compute_buffer_type)         host_compute    = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_compute_buffer_type)  cpu_compute     = nullptr;
+    decltype(&ggml_backend_sycl_cpu_offload_available)            cpu_available   = nullptr;
+    decltype(&ggml_backend_sycl_has_active_placement_plan)        has_active_plan = nullptr;
+    int                                                           device_index    = -1;
+};
+
+struct llama_context_sycl_exec_hooks {
+    decltype(&ggml_backend_sycl_execution_context_create)        create = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_bind_backend)  bind   = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_close)         close  = nullptr;
 };
 
 static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
@@ -140,6 +146,24 @@ static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cpu_offload_available"));
     hooks.has_active_plan = reinterpret_cast<decltype(hooks.has_active_plan)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
+    return hooks;
+}
+
+static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_dev_t dev) {
+    llama_context_sycl_exec_hooks hooks;
+    if (!dev) {
+        return hooks;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
+        return hooks;
+    }
+    hooks.create = reinterpret_cast<decltype(hooks.create)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_create"));
+    hooks.bind = reinterpret_cast<decltype(hooks.bind)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_bind_backend"));
+    hooks.close = reinterpret_cast<decltype(hooks.close)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_close"));
     return hooks;
 }
 
@@ -403,6 +427,43 @@ llama_context::llama_context(
         }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        bool sycl_exec_created = false;
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (!llama_context_dev_is_sycl(dev)) {
+                continue;
+            }
+#    ifdef GGML_USE_SYCL
+            auto create_exec = &ggml_backend_sycl_execution_context_create;
+            auto bind_exec   = &ggml_backend_sycl_execution_context_bind_backend;
+            auto close_exec  = &ggml_backend_sycl_execution_context_close;
+#    else
+            auto exec_hooks  = llama_context_sycl_exec_procs(dev);
+            auto create_exec = exec_hooks.create;
+            auto bind_exec   = exec_hooks.bind;
+            auto close_exec  = exec_hooks.close;
+#    endif
+            if (!create_exec || !bind_exec || !close_exec) {
+                continue;
+            }
+            if (!sycl_exec_created) {
+                const auto exec_rc = create_exec(&sycl_exec_context);
+                if (exec_rc != GGML_SYCL_EXECUTION_OK) {
+                    throw std::runtime_error(format("failed to allocate SYCL execution context: result=%d", (int) exec_rc));
+                }
+                sycl_exec_created = true;
+            }
+            const auto bind_rc = bind_exec(backend.get(), sycl_exec_context);
+            if (bind_rc != GGML_SYCL_EXECUTION_OK) {
+                if (sycl_exec_created && sycl_exec_context.value != 0) {
+                    (void) close_exec(sycl_exec_context);
+                    sycl_exec_context = {};
+                }
+                throw std::runtime_error(format("failed to bind SYCL execution context: result=%d", (int) bind_rc));
+            }
+            sycl_exec_context_bound = true;
+        }
+
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
 #    ifdef GGML_USE_SYCL
@@ -670,6 +731,25 @@ llama_context::~llama_context() {
             }
         }
     }
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (sycl_exec_context_bound && sycl_exec_context.value != 0) {
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (!llama_context_dev_is_sycl(dev)) {
+                continue;
+            }
+#    ifdef GGML_USE_SYCL
+            auto close_exec = &ggml_backend_sycl_execution_context_close;
+#    else
+            auto close_exec = llama_context_sycl_exec_procs(dev).close;
+#    endif
+            if (close_exec) {
+                (void) close_exec(sycl_exec_context);
+            }
+            break;
+        }
+    }
+#endif
     ggml_opt_free(opt_ctx);
 }
 

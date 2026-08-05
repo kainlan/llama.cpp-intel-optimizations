@@ -10,6 +10,7 @@
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "ggml-sycl.h"
 
 #include <map>
 #include <vector>
@@ -362,6 +363,8 @@ private:
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
+    ggml_sycl_exec_context_id               sycl_exec_context{};
+    bool                                    sycl_exec_context_bound = false;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
