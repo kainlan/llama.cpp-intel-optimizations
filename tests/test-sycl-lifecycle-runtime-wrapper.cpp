@@ -229,20 +229,34 @@ static bool run_registry_failure_fixture() {
     auto callback = std::async(std::launch::async, [&] {
         return ggml_backend_dev_description(static_cast<ggml_backend_dev_t>(reg->context));
     });
+    phase("generic fixture: await active callback entry");
     {
         std::unique_lock<std::mutex> lock(g_device_callback_mutex);
-        g_device_callback_cv.wait(lock, [] { return g_device_callback_entered; });
+        if (!g_device_callback_cv.wait_for(lock, std::chrono::seconds(10),
+                                           [] { return g_device_callback_entered; })) {
+            g_device_callback_block = false;
+            g_device_callback_cv.notify_all();
+            lock.unlock();
+            callback.get();
+            return false;
+        }
     }
+    phase("generic fixture: launch unload into bounded callback drain");
     auto blocked_unload = std::async(std::launch::async, [&] { return ggml_backend_unload_checked(reg); });
     const bool unload_waited_for_callback =
         blocked_unload.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    phase("generic fixture: release active callback");
     {
         std::lock_guard<std::mutex> lock(g_device_callback_mutex);
         g_device_callback_block = false;
         g_device_callback_cv.notify_all();
     }
-    if (!unload_waited_for_callback || !callback.get() ||
-        blocked_unload.get() != GGML_BACKEND_UNLOAD_OK) return false;
+    const char * callback_result = callback.get();
+    phase("generic fixture: active callback joined");
+    const auto blocked_unload_result = blocked_unload.get();
+    phase("generic fixture: callback-drain unload joined");
+    if (!unload_waited_for_callback || !callback_result ||
+        blocked_unload_result != GGML_BACKEND_UNLOAD_OK) return false;
 
     phase("generic fixture: bounded stalled callback cancellation");
     ggml_backend_register(reg);
@@ -254,18 +268,29 @@ static bool run_registry_failure_fixture() {
     auto stalled_callback = std::async(std::launch::async, [&] {
         return ggml_backend_dev_description(static_cast<ggml_backend_dev_t>(reg->context));
     });
+    phase("generic fixture: await deliberately stalled callback entry");
     {
         std::unique_lock<std::mutex> lock(g_device_callback_mutex);
-        g_device_callback_cv.wait(lock, [] { return g_device_callback_entered; });
+        if (!g_device_callback_cv.wait_for(lock, std::chrono::seconds(10),
+                                           [] { return g_device_callback_entered; })) {
+            g_device_callback_block = false;
+            g_device_callback_cv.notify_all();
+            lock.unlock();
+            stalled_callback.get();
+            return false;
+        }
     }
+    phase("generic fixture: run bounded stalled-callback unload");
     const auto stalled_unload_result = ggml_backend_unload_checked(reg);
     {
         std::lock_guard<std::mutex> lock(g_device_callback_mutex);
         g_device_callback_block = false;
         g_device_callback_cv.notify_all();
     }
+    phase("generic fixture: released stalled callback");
     if (stalled_unload_result != GGML_BACKEND_UNLOAD_BUSY || !stalled_callback.get() ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: stalled callback and retry unload joined");
 
     phase("generic fixture: hidden blocked reactivation");
     {

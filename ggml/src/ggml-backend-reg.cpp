@@ -197,6 +197,18 @@ struct ggml_backend_device_entry {
     uint64_t                   generation;
 };
 
+template <typename Entries>
+static auto find_device_identity(Entries & entries, ggml_backend_dev_t device) {
+    // A backend may reuse the same static device object on reactivation. Prefer
+    // its current committed row; retain an older matching row only as a
+    // rejectable tombstone when no current generation exists.
+    auto current = std::find_if(entries.begin(), entries.end(), [device](const auto & entry) {
+        return entry.dev == device && entry.generation == entry.owner->current_generation;
+    });
+    return current != entries.end() ? current :
+        std::find_if(entries.begin(), entries.end(), [device](const auto & entry) { return entry.dev == device; });
+}
+
 // count()/get() use one bounded per-thread snapshot. It is enumeration state,
 // never a DSO lifetime mechanism: every dynamic module is process-pinned before
 // score/init/publication because raw C handles have no transferable release API.
@@ -989,8 +1001,7 @@ bool ggml_backend_device_begin_call(ggml_backend_dev_t device) noexcept {
     try {
         auto & registry = get_reg();
         std::lock_guard<std::mutex> lock(registry.mutex);
-        const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
-            [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
+        const auto found = find_device_identity(registry.devices, device);
         // Standalone/custom devices are outside the registry lifecycle. Known
         // registry devices acquire admission only while discoverable.
         if (found == registry.devices.end()) {
@@ -1012,8 +1023,7 @@ bool ggml_backend_device_owner_acquire(ggml_backend_dev_t device) noexcept {
     try {
         auto & registry = get_reg();
         std::lock_guard<std::mutex> lock(registry.mutex);
-        const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
-            [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
+        const auto found = find_device_identity(registry.devices, device);
         if (found == registry.devices.end()) return device->reg == nullptr;
         if (found->owner->state != ggml_backend_reg_state::ACTIVE ||
             found->generation != found->owner->current_generation || found->owner->durable_owners == SIZE_MAX) {
@@ -1028,8 +1038,7 @@ void ggml_backend_device_owner_release(ggml_backend_dev_t device) noexcept {
     try {
         auto & registry = get_reg();
         std::lock_guard<std::mutex> lock(registry.mutex);
-        const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
-            [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
+        const auto found = find_device_identity(registry.devices, device);
         if (found != registry.devices.end() && found->owner->durable_owners != 0) {
             --found->owner->durable_owners;
             registry.cv.notify_all();
@@ -1041,8 +1050,7 @@ void ggml_backend_device_end_call(ggml_backend_dev_t device) noexcept {
     try {
         auto & registry = get_reg();
         std::lock_guard<std::mutex> lock(registry.mutex);
-        const auto found = std::find_if(registry.devices.begin(), registry.devices.end(),
-            [device](const ggml_backend_device_entry & entry) { return entry.dev == device; });
+        const auto found = find_device_identity(registry.devices, device);
         if (found != registry.devices.end() && found->owner->active_calls != 0) {
             --found->owner->active_calls;
             registry.cv.notify_all();

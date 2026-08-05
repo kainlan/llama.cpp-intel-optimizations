@@ -782,6 +782,8 @@ checks = {
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
     "generation tombstones retained": "current_generation" in registry_backend
+    and "find_device_identity" in registry_backend
+    and "Prefer" in registry_backend and "current committed row" in registry_backend
     and "Retain every prior generation row forever" in registry_backend
     and "devices.erase(std::remove_if" not in registry_backend,
     "synchronized buffer/event adoption": "live_owner_state::ADOPTING" in backend_base
@@ -802,6 +804,10 @@ checks = {
     and "verify adopted event durable owner" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_test_durable_owners(reg) != 0" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "await active callback entry" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "callback-drain unload joined" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "cache shutdown owner snapshot avoids rw-lock callbacks":
         "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp
