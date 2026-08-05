@@ -25,7 +25,7 @@ namespace {
 enum class registry_fixture_mode {
     NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, PREPARE_CROSS_THREAD,
     PREPARE_REACTIVATE_THROW,
-    COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW
+    COMMIT_REACTIVATE_THROW, COMMIT_AND_ROLLBACK_THROW, FINALIZE_REACTIVATE_THROW
 };
 static registry_fixture_mode g_registry_fixture_mode = registry_fixture_mode::NORMAL;
 static ggml_backend_reg_t     g_registry_fixture_reg = nullptr;
@@ -33,6 +33,7 @@ static int                    g_registry_fixture_recursive_registrations = 0;
 static int                    g_registry_fixture_shutdowns = 0;
 static int                    g_registry_fixture_cancels = 0;
 static bool                   g_registry_fixture_reactivation_pending = false;
+static ggml_backend_reg_t     g_cross_thread_fixture_reg = nullptr;
 static std::mutex              g_device_callback_mutex;
 static std::condition_variable g_device_callback_cv;
 static bool                    g_device_callback_block = false;
@@ -90,7 +91,16 @@ static bool registry_fixture_prepare_reactivate() {
     if (g_registry_fixture_reactivation_pending) return false;
     g_registry_fixture_reactivation_pending = true;
     if (g_registry_fixture_mode == registry_fixture_mode::PREPARE_CROSS_THREAD) {
-        auto nested = std::async(std::launch::async, [] { ggml_backend_register(g_registry_fixture_reg); });
+        static ggml_backend_device nested_dev{};
+        static ggml_backend_reg nested_reg{};
+        nested_dev.reg = &nested_reg;
+        nested_reg.api_version = GGML_BACKEND_API_VERSION;
+        nested_reg.iface.get_name = registry_fixture_reg_name;
+        nested_reg.iface.get_device_count = registry_fixture_reg_count;
+        nested_reg.iface.get_device = registry_fixture_reg_get;
+        nested_reg.context = &nested_dev;
+        g_cross_thread_fixture_reg = &nested_reg;
+        auto nested = std::async(std::launch::async, [] { ggml_backend_register(g_cross_thread_fixture_reg); });
         if (nested.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
             throw std::runtime_error("cross-thread prepare reentry deadlocked");
         }
@@ -117,6 +127,9 @@ static void registry_fixture_commit_reactivate() {
 }
 static void registry_fixture_finalize_reactivate() {
     g_registry_fixture_reactivation_pending = false;
+    if (g_registry_fixture_mode == registry_fixture_mode::FINALIZE_REACTIVATE_THROW) {
+        throw std::runtime_error("fixture finalize failure");
+    }
 }
 static void registry_fixture_rollback_reactivate() {
     ++g_registry_fixture_cancels;
@@ -264,8 +277,21 @@ static bool run_registry_failure_fixture() {
     phase("generic fixture: overlapping free joined");
     phase("generic fixture: verify adopted event durable owner");
     if (ggml_backend_test_durable_owners(reg) != 1) return false;
-    // The unrelated, never-registered owner must not roll back A's adoption.
+    // The unrelated owner remained pending. Its first publication failure must
+    // not run reactivation hooks; retry adopts its exact live buffer.
+    orphan_reg.api_version = GGML_BACKEND_API_VERSION;
+    orphan_reg.iface.get_name = registry_fixture_reg_name;
+    orphan_reg.iface.get_device_count = registry_fixture_reg_count;
+    orphan_reg.iface.get_device = registry_fixture_reg_get;
+    orphan_reg.context = &orphan_dev;
+    ggml_backend_test_fail_next_owner_adoption();
+    ggml_backend_register(&orphan_reg);
+    if (ggml_backend_test_durable_owners(&orphan_reg) != 0) return false;
+    ggml_backend_register(&orphan_reg);
+    if (ggml_backend_test_durable_owners(&orphan_reg) != 1 ||
+        ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
     ggml_backend_buffer_free(orphan_buffer);
+    if (ggml_backend_unload_checked(&orphan_reg) != GGML_BACKEND_UNLOAD_OK) return false;
     phase("generic fixture: free adopted legacy-v2 event");
     ggml_backend_event_free(pre_registry_event);
     if (ggml_backend_test_durable_owners(reg) != 0) return false;
@@ -275,6 +301,7 @@ static bool run_registry_failure_fixture() {
     g_registry_fixture_mode = registry_fixture_mode::PREPARE_CROSS_THREAD;
     ggml_backend_register(reg);
     if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg ||
+        ggml_backend_unload_checked(g_cross_thread_fixture_reg) != GGML_BACKEND_UNLOAD_OK ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     phase("generic fixture: throwing partial prepare rolls back");
     g_registry_fixture_mode = registry_fixture_mode::PREPARE_REACTIVATE_THROW;
@@ -459,6 +486,15 @@ static bool run_registry_failure_fixture() {
     ggml_backend_register(reg);
     if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg ||
         ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
+    phase("generic fixture: throwing finalize rolls committed state forward");
+    g_registry_fixture_mode = registry_fixture_mode::FINALIZE_REACTIVATE_THROW;
+    ggml_backend_register(reg);
+    if (ggml_backend_reg_by_name("TEST-LIFECYCLE") != reg) return false;
+    auto finalize_owner = ggml_backend_buffer_init(&pre_registry_buft, {}, nullptr, 0);
+    if (!finalize_owner || ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) return false;
+    ggml_backend_buffer_free(finalize_owner);
+    g_registry_fixture_mode = registry_fixture_mode::NORMAL;
+    if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_OK) return false;
     return g_registry_fixture_recursive_registrations >= 2 && g_registry_fixture_shutdowns >= 2 &&
            g_registry_fixture_cancels >= 2;
 }

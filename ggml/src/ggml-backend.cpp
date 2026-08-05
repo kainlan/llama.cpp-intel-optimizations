@@ -474,7 +474,11 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     }
     if (buffer->owner_device && !buffer->owner_lease &&
         g_device_owner_acquire.load(std::memory_order_acquire)) {
-        ggml_backend_refresh_buffer_lifecycle();
+        try { ggml_backend_refresh_buffer_lifecycle(); }
+        catch (...) {
+            ggml_backend_buffer_free(buffer);
+            return nullptr;
+        }
     }
 
     return buffer;
@@ -1030,7 +1034,11 @@ ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
         return nullptr;
     }
     if (!acquire && g_device_owner_acquire.load(std::memory_order_acquire)) {
-        ggml_backend_refresh_buffer_lifecycle();
+        try { ggml_backend_refresh_buffer_lifecycle(); }
+        catch (...) {
+            ggml_backend_event_free(event);
+            return nullptr;
+        }
     }
     return event;
 }

@@ -794,6 +794,7 @@ checks = {
             < registry_backend.index("ggml_backend_refresh_buffer_lifecycle();",
                                      registry_backend.index("bool register_backend"))
         and registry_backend.index("ggml_backend_refresh_buffer_lifecycle();")
+            < registry_backend.index("finalize_reactivate();")
             < registry_backend.index("published_entry->state = ggml_backend_reg_state::ACTIVE")
         and "device_owner_adopt" in backend_base
         and "Settle independently" in backend_base
@@ -805,6 +806,15 @@ checks = {
         and "g_sycl_reactivation_pending_finalize" in backend
         and "g_external_hook_active" in registry_backend
         and "external_hook_scope" in registry_backend
+        and "ever_active" in registry_backend
+        and "first publication failure must" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "publishing committed generation" in registry_backend
+        and "g_deferred_registrations" in registry_backend
+        and "ggml_backend_unload_checked(g_cross_thread_fixture_reg)" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "FINALIZE_REACTIVATE_THROW" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "PREPARE_CROSS_THREAD" in
             (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
         and "PREPARE_REACTIVATE_THROW" in
