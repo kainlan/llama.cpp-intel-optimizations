@@ -12712,36 +12712,6 @@ static void shutdown_shared_context_queues() noexcept {
     g_shared_ctx_queues_initialized_for = 0;
 }
 
-static bool runtime_alloc_defers_to_cache_owner_teardown(const runtime_alloc_record & rec) noexcept {
-    return rec.handle.tier == alloc_tier::HOST_PINNED &&
-           (rec.uses_pinned_pool || rec.handle.host_zone != host_zone_id::COUNT);
-}
-
-static bool release_cache_owned_runtime_allocations_for_final_shutdown() noexcept {
-    try {
-        std::vector<alloc_handle> deferred;
-        {
-            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
-            deferred.reserve(g_runtime_alloc_registry.size());
-            for (const auto & kv : g_runtime_alloc_registry) {
-                if (runtime_alloc_defers_to_cache_owner_teardown(kv.second)) {
-                    deferred.push_back(kv.second.handle);
-                }
-            }
-        }
-        for (const auto & handle : deferred) {
-            if (!unified_free(handle)) {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] final shutdown failed to release retained host allocation ptr=%p\n",
-                               handle.ptr);
-                return false;
-            }
-        }
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
     try {
         if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
@@ -12750,11 +12720,9 @@ static bool unified_cache_shutdown_retryable_postconditions_clean() noexcept {
         }
         {
             std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
-            for (const auto & kv : g_runtime_alloc_registry) {
-                if (!runtime_alloc_defers_to_cache_owner_teardown(kv.second)) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
-                    return false;
-                }
+            if (!g_runtime_alloc_registry.empty()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] runtime allocation registry still populated at shutdown boundary\n");
+                return false;
             }
         }
         {
@@ -12817,6 +12785,46 @@ bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
     }
 }
 
+bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[5]) noexcept {
+    if (!out) {
+        return false;
+    }
+    for (size_t i = 0; i < 5; ++i) {
+        out[i] = 0;
+    }
+    try {
+        {
+            std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
+            for (const auto & kv : g_runtime_alloc_registry) {
+                const runtime_alloc_record & rec = kv.second;
+                if (!rec.handle.ptr || rec.handle.size == 0) {
+                    continue;
+                }
+                ++out[0];
+                if (rec.handle.tier == alloc_tier::HOST_PINNED) {
+                    ++out[1];
+                }
+                if (rec.uses_pinned_pool) {
+                    ++out[2];
+                }
+                if (rec.handle.host_zone != host_zone_id::COUNT) {
+                    ++out[3];
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> offload_lock(g_offload_pool_mutex);
+            out[4] = g_offload_pool_slots.size();
+        }
+        return true;
+    } catch (...) {
+        for (size_t i = 0; i < 5; ++i) {
+            out[i] = 0;
+        }
+        return false;
+    }
+}
+
 bool shutdown_unified_cache() {
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
@@ -12839,12 +12847,6 @@ bool shutdown_unified_cache() {
     // Any retryable dirty boundary must be detected before destroying the last
     // cache owners or shared queues, so a failed unload can retry exactly.
     if (!unified_cache_shutdown_retryable_postconditions_clean()) {
-        return false;
-    }
-    // Cache-owned pinned/host-zone runtime allocations survive until their
-    // owning host_arena_ is torn down. They are retry-safe to retain across a
-    // dirty boundary, but must be drained before the final clean invariant.
-    if (!release_cache_owned_runtime_allocations_for_final_shutdown()) {
         return false;
     }
     {

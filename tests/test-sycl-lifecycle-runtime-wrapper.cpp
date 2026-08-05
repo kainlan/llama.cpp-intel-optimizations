@@ -718,6 +718,9 @@ int main() {
     using shutdown_owner_census_fn = bool (*)(uint64_t out[4]);
     auto shutdown_owner_census = reinterpret_cast<shutdown_owner_census_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_owner_census"));
+    using shutdown_runtime_alloc_census_fn = bool (*)(uint64_t out[5]);
+    auto shutdown_runtime_alloc_census = reinterpret_cast<shutdown_runtime_alloc_census_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_runtime_alloc_census"));
     auto block_next_kv_push = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_block_next_kv_push"));
     auto wait_kv_push_blocked = reinterpret_cast<void (*)()>(
@@ -725,7 +728,7 @@ int main() {
     auto release_kv_push = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_release_kv_push"));
     if (!fail_next_arena_free || !fail_next_shutdown_clean || !fail_next_registry_stage || !shutdown_owner_census ||
-        !block_next_kv_push || !wait_kv_push_blocked || !release_kv_push) {
+        !shutdown_runtime_alloc_census || !block_next_kv_push || !wait_kv_push_blocked || !release_kv_push) {
         std::fprintf(stderr, "missing deterministic unload/admission procedures\n");
         return 1;
     }
@@ -772,6 +775,21 @@ int main() {
     uint64_t owner_census_after_dirty[4]{};
     if (!shutdown_owner_census(owner_census_after_dirty)) {
         std::fprintf(stderr, "shutdown owner census unavailable after dirty retry\n");
+        return 1;
+    }
+    uint64_t runtime_alloc_census_after_dirty[5]{};
+    if (!shutdown_runtime_alloc_census(runtime_alloc_census_after_dirty)) {
+        std::fprintf(stderr, "shutdown runtime allocation census unavailable after dirty retry\n");
+        return 1;
+    }
+    if (runtime_alloc_census_after_dirty[0] != 0 || runtime_alloc_census_after_dirty[4] != 0) {
+        std::fprintf(stderr,
+                     "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu pinned_pool=%llu host_zone=%llu offload=%llu\n",
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[0]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[1]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[2]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[3]),
+                     static_cast<unsigned long long>(runtime_alloc_census_after_dirty[4]));
         return 1;
     }
     if (owner_census_before_dirty[0] == 0 || owner_census_after_dirty[0] != owner_census_before_dirty[0]) {

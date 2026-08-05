@@ -5880,6 +5880,23 @@ static void reset_managed_host_pinned_buffers_before_host_zone_reset() {
     }
 }
 
+static bool ggml_sycl_shutdown_global_runtime_pinned_owners() noexcept {
+    try {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
+            g_expert_prefetchers[d].shutdown();
+            g_cpu_expert_pools[d].shutdown();
+            g_pinned_buffer_pools[d].shutdown();
+        }
+        if (!ggml_sycl_staging_pool().release_all_idle("module-shutdown")) {
+            return false;
+        }
+        reset_managed_host_pinned_buffers_before_host_zone_reset();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static bool allocate_managed_host_pinned(sycl::queue &               q,
                                          int                         device,
                                          size_t                      bytes,
@@ -74229,19 +74246,12 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // destructor, the unified cache statics may already be destroyed → SIGSEGV
     // or BCS CAT error (in-flight DMA targeting freed VRAM).
     // shutdown() is idempotent and a no-op for pools that were never started.
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
-        // ExpertPrefetcher must be shut down first: cancel_all() waits for
-        // in-flight BCS DMAs whose destinations are VRAM owned by the unified
-        // cache.  Shutting down here — while VRAM is still mapped — prevents
-        // BCS CAT errors and OpenMP worker crashes in the static destructor.
-        g_expert_prefetchers[d].shutdown();
-        g_cpu_expert_pools[d].shutdown();
-        g_pinned_buffer_pools[d].shutdown();
-    }
-    // Free staging buffer pool while SYCL context is still alive.
-    // shutdown() is idempotent — safe if pool was never used.
-    ggml_sycl_staging_pool().shutdown(*sycl_ctx->stream(sycl_ctx->device, 0));
-    reset_managed_host_pinned_buffers_before_host_zone_reset();
+    // ExpertPrefetcher must be shut down first: cancel_all() waits for
+    // in-flight BCS DMAs whose destinations are VRAM owned by the unified
+    // cache. Shutting these global pinned/runtime owners down here — while
+    // VRAM is still mapped — prevents later shutdown retries from inheriting
+    // stale runtime-allocation authority.
+    GGML_ASSERT(ggml_sycl_shutdown_global_runtime_pinned_owners());
     // Drain any pending merge events before teardown
     split_merge_drain();
     // Free ring buffer staging entries
@@ -96369,6 +96379,10 @@ static bool ggml_backend_sycl_test_shutdown_owner_census(uint64_t out[4]) {
     return ggml_sycl::unified_cache_shutdown_owner_census_for_test(out);
 }
 
+static bool ggml_backend_sycl_test_shutdown_runtime_alloc_census(uint64_t out[5]) {
+    return ggml_sycl::unified_cache_shutdown_runtime_alloc_census_for_test(out);
+}
+
 static bool ggml_backend_sycl_test_seed_cpu_retained() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard || ggml_sycl_info().device_count <= 0) return false;
@@ -96436,8 +96450,8 @@ void ggml_backend_sycl_shutdown(void) {
     if (!ggml_sycl::drain_retained_handles(true, 10000)) {
         throw std::runtime_error("SYCL retained-handle drain timed out");
     }
-    if (!ggml_sycl_cpu_retained_cleanup() || !ggml_sycl::offload_buffer_pool_shutdown() ||
-        ggml_sycl_cpu_retained_active()) {
+    if (!ggml_sycl_shutdown_global_runtime_pinned_owners() || !ggml_sycl_cpu_retained_cleanup() ||
+        !ggml_sycl::offload_buffer_pool_shutdown() || ggml_sycl_cpu_retained_active()) {
         throw std::runtime_error("SYCL retained/offload state survived shutdown cleanup");
     }
     {
@@ -96539,6 +96553,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_shutdown_owner_census") == 0) {
         return (void *) ggml_backend_sycl_test_shutdown_owner_census;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_shutdown_runtime_alloc_census") == 0) {
+        return (void *) ggml_backend_sycl_test_shutdown_runtime_alloc_census;
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_registry_stage") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_registry_stage;

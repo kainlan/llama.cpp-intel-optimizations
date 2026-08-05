@@ -713,9 +713,6 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "explicit cache ownership drain": "shutdown_shared_context_queues();" in cache_cpp
     and "g_live_arena_chunks.fetch_sub" in cache_cpp
-    and "release_cache_owned_runtime_allocations_for_final_shutdown()" in cache_cpp
-    and cache_cpp.index("release_cache_owned_runtime_allocations_for_final_shutdown()")
-        < cache_cpp.index("g_device_caches.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
     and "unified_cache_shutdown_state_clean()" in cache_cpp
     and "explicit shutdown invariant failed after owner teardown" in cache_cpp
     and "arena chunk remained registered after unregister" in cache_cpp
@@ -775,6 +772,7 @@ checks = {
     and "if (!module_guard) return GGML_SYCL_LIFECYCLE_LOAD_BUSY" in backend
     and "ggml_backend_sycl_test_admission_snapshot" in backend
     and "ggml_backend_sycl_test_shutdown_owner_census" in backend
+    and "ggml_backend_sycl_test_shutdown_runtime_alloc_census" in backend
     and "ggml_backend_test_active_calls" in registry_backend
     and "shutdown reservation check failed: reserved=%d begin_rc=%d" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -790,6 +788,8 @@ checks = {
     and "device_call_guard" in (root / "ggml/src/ggml-backend.cpp").read_text()
     and "failure-window saved model-load procedure" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "dirty shutdown retry lost retained cache owners: before=%llu dirty=%llu active_before=%llu active_dirty=%llu chunks_before=%llu chunks_dirty=%llu" in
+        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+    and "dirty shutdown retry retained runtime allocation owners: total=%llu host=%llu pinned_pool=%llu host_zone=%llu offload=%llu" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "retained owner retry did not clear owner census" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
@@ -889,14 +889,16 @@ checks = {
     "bounded retained handle drain": "wait_for(lock, std::chrono::milliseconds(timeout_ms)" in
         (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
         and "SYCL retained-handle drain timed out" in backend,
-    "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_cpu_retained_cleanup()")
+    "retained cleanup precedes cache shutdown": backend.index("ggml_sycl_shutdown_global_runtime_pinned_owners()")
         < backend.index("ggml_sycl::shutdown_unified_cache()")
+        and backend.index("ggml_sycl_cpu_retained_cleanup()")
+            < backend.index("ggml_sycl::shutdown_unified_cache()")
         and "offload_buffer_pool_shutdown()" in backend
         and backend.index("drain_retained_handles(true, 10000)", backend.index("void ggml_backend_sycl_shutdown"))
-            < backend.index("ggml_sycl_cpu_retained_cleanup()", backend.index("void ggml_backend_sycl_shutdown"))
+            < backend.index("ggml_sycl_shutdown_global_runtime_pinned_owners()", backend.index("void ggml_backend_sycl_shutdown"))
+        and "release_all_idle(\"module-shutdown\")" in backend
         and "!ggml_sycl_cpu_retained_active()" in backend
-        and "runtime_alloc_defers_to_cache_owner_teardown" in cache_cpp
-        and "release_cache_owned_runtime_allocations_for_final_shutdown()" in cache_cpp
+        and "g_runtime_alloc_registry.empty()" in cache_cpp
         and "g_offload_pool_slots.empty()" in cache_cpp
         and "g_offload_pool_slots.clear()" in cache_cpp
         and cache_cpp.index("caches.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
