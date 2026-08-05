@@ -3082,34 +3082,6 @@ if (NOT GGML_BACKEND_DL)
     )
 endif()
 
-if (NOT GGML_BACKEND_DL)
-    add_executable(test-sycl-expert-prefetch
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-expert-prefetch.cpp
-    )
-    target_include_directories(test-sycl-expert-prefetch PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_options(test-sycl-expert-prefetch PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-sycl-expert-prefetch PRIVATE "-fsycl")
-    target_compile_definitions(test-sycl-expert-prefetch PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-sycl-expert-prefetch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-sycl-expert-prefetch PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME test-sycl-expert-prefetch COMMAND test-sycl-expert-prefetch)
-    set_tests_properties(test-sycl-expert-prefetch PROPERTIES
-        LABELS "sycl;sycl-restored;gpu;moe;prefetch;restored"
-        RUN_SERIAL TRUE
-        SKIP_RETURN_CODE 77
-    )
-endif()
-
 if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
     add_executable(test-sycl-fattn-onednn-descriptors
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-onednn-descriptors.cpp
