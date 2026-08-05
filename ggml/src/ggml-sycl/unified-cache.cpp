@@ -12942,6 +12942,7 @@ bool shutdown_unified_cache() {
     // SYCL queues and single-device contexts are still valid. Only after every
     // cache destructor has released its chunks may those queues be destroyed.
     caches.clear();
+    owner_snapshot.clear();
     shutdown_shared_context_queues();
     // The clean postcondition is meaningful only after these final allocation
     // owners are gone; otherwise a 2 GiB chunk can survive until DSO destruction.

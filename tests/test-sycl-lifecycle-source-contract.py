@@ -927,6 +927,7 @@ checks = {
         and "g_offload_pool_slots.empty()" in cache_cpp
         and "g_offload_pool_slots.clear()" in cache_cpp
         and cache_cpp.index("caches.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
+            < cache_cpp.index("owner_snapshot.clear();", cache_cpp.index("bool shutdown_unified_cache()"))
             < cache_cpp.index("shutdown_shared_context_queues();", cache_cpp.index("bool shutdown_unified_cache()"))
             < cache_cpp.index("unified_cache_shutdown_state_clean();", cache_cpp.index("bool shutdown_unified_cache()")),
     "preflight, bounded generic drain, hidden reactivation and score pin":
