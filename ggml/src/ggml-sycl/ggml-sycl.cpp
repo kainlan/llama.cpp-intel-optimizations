@@ -9571,7 +9571,6 @@ static void ggml_sycl_execution_for_each_bound_backend(uint64_t context_id, F &&
         if (binding.context_id != context_id || !backend) {
             continue;
         }
-        std::lock_guard<std::mutex> state_lock(backend->execution_state_mutex);
         fn(backend, binding);
     }
 }
@@ -9600,9 +9599,9 @@ static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) 
     ggml_sycl_execution_reset_backend_binding_state(ctx);
 }
 
-static std::vector<int> ggml_sycl_execution_expected_participants(uint64_t context_id, const std::vector<int> & devices) {
+static std::vector<int> ggml_sycl_execution_expected_participants_locked(uint64_t context_id,
+                                                                           const std::vector<int> & devices) {
     std::vector<int> participants;
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     for (const auto & [backend, binding] : g_execution_backend_bindings) {
         if (!backend || binding.context_id != context_id) {
             continue;
@@ -9614,6 +9613,11 @@ static std::vector<int> ggml_sycl_execution_expected_participants(uint64_t conte
     std::sort(participants.begin(), participants.end());
     participants.erase(std::unique(participants.begin(), participants.end()), participants.end());
     return participants;
+}
+
+static std::vector<int> ggml_sycl_execution_expected_participants(uint64_t context_id, const std::vector<int> & devices) {
+    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+    return ggml_sycl_execution_expected_participants_locked(context_id, devices);
 }
 
 static void ggml_sycl_execution_record_root(ggml_backend_sycl_context * backend_ctx,
@@ -9632,10 +9636,33 @@ static void ggml_sycl_execution_record_root(ggml_backend_sycl_context * backend_
     backend_ctx->execution_root_slot_generation = token.owner.generation;
 }
 
+static bool ggml_sycl_owner_name_key_matches(const std::string & key, ggml_sycl::lifecycle::ModelToken owner) noexcept {
+    size_t pos = 0;
+    auto consume_uint = [&](uint64_t expected) noexcept -> bool {
+        size_t end = pos;
+        while (end < key.size() && key[end] >= '0' && key[end] <= '9') {
+            ++end;
+        }
+        if (end == pos) {
+            return false;
+        }
+        uint64_t parsed = 0;
+        for (size_t i = pos; i < end; ++i) {
+            parsed = parsed * 10 + static_cast<uint64_t>(key[i] - '0');
+        }
+        if (parsed != expected) {
+            return false;
+        }
+        pos = end;
+        return true;
+    };
+    return consume_uint(owner.model.value) && pos < key.size() && key[pos++] == ':' &&
+           consume_uint(owner.load.value) && pos < key.size() && key[pos++] == ':' &&
+           consume_uint(owner.owner.slot) && pos < key.size() && key[pos++] == ':' &&
+           consume_uint(owner.owner.generation) && pos < key.size() && key[pos++] == ':';
+}
+
 static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
-    const std::string prefix = std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
-                               std::to_string(owner.owner.slot) + ":" +
-                               std::to_string(owner.owner.generation) + ":";
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
         for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
@@ -9651,7 +9678,7 @@ static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::Mo
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
         for (auto it = g_sycl_weight_usages.begin(); it != g_sycl_weight_usages.end();) {
-            it = it->first.rfind(prefix, 0) == 0 ? g_sycl_weight_usages.erase(it) : std::next(it);
+            it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_weight_usages.erase(it) : std::next(it);
         }
     }
 }
@@ -10001,15 +10028,54 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
     }
 }
 
-static void ggml_sycl_abort_owner_effects(ggml_sycl::lifecycle::ModelToken owner) {
-    ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
-    ggml_sycl::unified_cache_note_model_load_abort(owner.load.value);
-    (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
-    ggml_sycl_erase_weight_identities_for_owner(owner);
-    (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
-    // Abort discards only loader-thread candidate state. The previously active
-    // LIVE execution authority remains continuously published.
-    ggml_sycl_reset_model_load_scratch_state(true);
+static std::atomic<bool> g_test_fail_next_abort_owner_effects_cleanup{ false };
+
+static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
+    if (g_test_fail_next_abort_owner_effects_cleanup.exchange(false, std::memory_order_acq_rel)) {
+        throw std::runtime_error("deterministic abort_owner_effects cleanup failure");
+    }
+}
+
+static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner) noexcept {
+    bool clean = true;
+    try {
+        ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        ggml_sycl::unified_cache_note_model_load_abort(owner.load.value);
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw();
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        (void) ggml_sycl_release_host_weight_extras_for_owner(owner);
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        ggml_sycl_erase_weight_identities_for_owner(owner);
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        (void) ggml_sycl::unified_cache_release_model_slot(owner.owner.slot);
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        // Abort discards only loader-thread candidate state. The previously active
+        // LIVE execution authority remains continuously published.
+        ggml_sycl_reset_model_load_scratch_state(true);
+    } catch (...) {
+        clean = false;
+    }
+    return clean;
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
@@ -10042,12 +10108,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         g_sycl_abort_load_exit = false;
         const auto ticket = registry ? registry->prepare_end(result.txn, false) : ggml_sycl::lifecycle::finish_ticket{};
         if (ticket.finisher) {
-            bool cleanup_ok = true;
-            try {
-                ggml_sycl_abort_owner_effects(ticket.token);
-            } catch (...) {
-                cleanup_ok = false;
-            }
+            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
             if (!failed.committed && registry->is_quarantined(failed.token)) {
                 ggml_sycl_model_token quarantined{};
@@ -10216,7 +10277,7 @@ static void ggml_sycl_finalize_binding_failure_abort(ggml_sycl::lifecycle::Regis
         g_sycl_abort_load_exit = true;
         ggml_sycl_model_loading_effects(false, recovery.outer);
         g_sycl_abort_load_exit = false;
-        ggml_sycl_abort_owner_effects(recovery.token);
+        effects_ok = ggml_sycl_abort_owner_effects_noexcept(recovery.token) && effects_ok;
     } catch (...) {
         g_sycl_abort_load_exit = false;
         effects_ok             = false;
@@ -10286,7 +10347,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         g_sycl_abort_load_exit = false;
         finisher_effect        = {};
         if (!ticket.commit) {
-            ggml_sycl_abort_owner_effects(ticket.token);
+            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             return ggml_sycl_lifecycle_c_result(registry->finalize_end(ticket, true).code);
         }
         const auto validation = registry->validate_end(ticket);
@@ -10294,11 +10355,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             const auto pending    = registry->finalize_end(ticket, true);
             bool       cleanup_ok = false;
             if (pending.cleanup_required) {
-                try {
-                    ggml_sycl_abort_owner_effects(ticket.token);
-                    cleanup_ok = true;
-                } catch (...) {
-                }
+                cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             }
             const auto failed = pending.cleanup_required ? registry->finalize_cleanup(ticket, cleanup_ok) : pending;
             if (model) {
@@ -10338,12 +10395,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         auto result = registry->finalize_end(ticket, true, publication, std::move(state));
         if (result.cleanup_required) {
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
-            bool cleanup_ok = false;
-            try {
-                ggml_sycl_abort_owner_effects(result.token);
-                cleanup_ok = true;
-            } catch (...) {
-            }
+            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(result.token);
             result = registry->finalize_cleanup(ticket, cleanup_ok);
             (void) ggml_sycl_restore_latest_live_plan();
         }
@@ -10359,10 +10411,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
         }
         if (ticket.finisher) {
-            try {
-                ggml_sycl_abort_owner_effects(ticket.token);
-            } catch (...) {
-            }
+            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token);
             const auto failed = registry->finalize_end(ticket, false);
             if (model && failed.token.model.value != 0) {
                 ggml_sycl_export_token(failed.token, model);
@@ -11716,7 +11765,7 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
         std::vector<int> devices = !ctx->execution_aggregate_devices.empty() ? ctx->execution_aggregate_devices : std::vector<int>{ ctx->device };
         std::sort(devices.begin(), devices.end());
         devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
-        const auto participants = ggml_sycl_execution_expected_participants(ctx->execution_context_id, devices);
+        const auto participants = ggml_sycl_execution_expected_participants_locked(ctx->execution_context_id, devices);
         if (registry.begin_invocation({ ctx->execution_context_id }, current.session, current.reset_epoch, current.graph_epoch,
                                       owner, devices.data(), devices.size(), participants.data(), participants.size(),
                                       ctx->execution_participant_id, &current.invocation) != ggml_sycl::execution::error::OK) {
@@ -11732,7 +11781,7 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     std::vector<int> devices = !ctx->execution_aggregate_devices.empty() ? ctx->execution_aggregate_devices : std::vector<int>{ ctx->device };
     std::sort(devices.begin(), devices.end());
     devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
-    const auto participants = ggml_sycl_execution_expected_participants(ctx->execution_context_id, devices);
+    const auto participants = ggml_sycl_execution_expected_participants_locked(ctx->execution_context_id, devices);
     ggml_sycl::execution::GraphEpoch graph_epoch{};
     if (registry.begin_graph({ ctx->execution_context_id }, session, reset_epoch, owner, &graph_epoch) !=
         ggml_sycl::execution::error::OK) {
@@ -12609,9 +12658,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             ggml_sycl::lifecycle::ModelToken owner{};
             bool started = false;
             bool released = false;
-            ~owner_rollback_guard() {
+            ~owner_rollback_guard() noexcept {
                 if (started && !released) {
-                    ggml_sycl_abort_owner_effects(owner);
+                    (void) ggml_sycl_abort_owner_effects_noexcept(owner);
                 }
             }
         } rollback{ effect.owner, false, false };
@@ -97664,6 +97713,11 @@ extern "C" void ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after
     if (module_guard) g_test_fail_next_stage_inventory_plan_late_after_first_device.store(true, std::memory_order_release);
 }
 
+extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup() {
+    sycl_module_mutation_guard module_guard;
+    if (module_guard) g_test_fail_next_abort_owner_effects_cleanup.store(true, std::memory_order_release);
+}
+
 static void ggml_backend_sycl_test_admission_snapshot(uint64_t out[8]) {
     if (!out) return;
     {
@@ -97745,6 +97799,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup;
     }
     if (strcmp(name, "ggml_backend_sycl_test_admission_snapshot") == 0) {
         return (void *) ggml_backend_sycl_test_admission_snapshot;

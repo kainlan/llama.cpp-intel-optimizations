@@ -58,6 +58,7 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_test_fail_next_shutdown_clean": "ggml_backend_sycl_test_fail_next_shutdown_clean_guarded",
     "ggml_backend_sycl_test_fail_next_registry_stage": "ggml_backend_sycl_test_fail_next_registry_stage",
     "ggml_backend_sycl_test_block_next_kv_push": "ggml_backend_sycl_test_block_next_kv_push",
+    "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup": "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup",
 }
 module_proc_inventory_ok = all(
     ('strcmp(name, "' + proc + '")') in backend and function_has_module_guard(backend, function)
@@ -110,6 +111,22 @@ register_usage_body = re.search(
 ).group(0)
 exact_runtime_body = re.search(
     r"ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+begin_graph_body = re.search(
+    r"static bool ggml_sycl_execution_begin_graph\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+for_each_bound_backend_body = re.search(
+    r"template<typename F>\nstatic void ggml_sycl_execution_for_each_bound_backend\(.*?^}\n",
+    backend, re.S | re.M
+).group(0)
+owner_rollback_guard_body = re.search(
+    r"struct owner_rollback_guard \{.*?\} rollback\{ effect\.owner, false, false \};",
+    backend, re.S | re.M
+).group(0)
+abort_owner_effects_noexcept_body = re.search(
+    r"static bool ggml_sycl_abort_owner_effects_noexcept\(.*?^}\n",
     backend, re.S | re.M
 ).group(0)
 checks = {
@@ -327,6 +344,16 @@ checks = {
     < cpp.index("model->second.phase = model_phase::TEARING_DOWN"),
     "rollback effect replay": "error::EFFECT_FAILED" in cpp
     and "poisoned_after_prepare" in cpp,
+    "begin_graph binding lock acquired once": begin_graph_body.count("g_execution_backend_binding_mutex") == 1
+    and "ggml_sycl_execution_expected_participants_locked" in begin_graph_body,
+    "for_each backend callback holds no state lock": "execution_state_mutex" not in for_each_bound_backend_body,
+    "rollback guard is noexcept": "~owner_rollback_guard() noexcept" in owner_rollback_guard_body
+    and "ggml_sycl_abort_owner_effects_noexcept(owner)" in owner_rollback_guard_body,
+    "rollback cleanup failpoint is guarded and exported": "g_test_fail_next_abort_owner_effects_cleanup" in backend
+    and 'strcmp(name, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup")' in backend,
+    "rollback cleanup stays nonthrowing and preserves closed reset": "ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw()" in abort_owner_effects_noexcept_body
+    and abort_owner_effects_noexcept_body.count("catch (...)") >= 6
+    and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
     "finalize poison authority": "poisoned_after_prepare" in cpp
     and "validate_end" in hpp,
     "serialized concurrent teardown": "item.second.phase == model_phase::TEARING_DOWN"
