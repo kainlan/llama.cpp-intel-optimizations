@@ -96365,18 +96365,8 @@ static void ggml_backend_sycl_test_fail_next_shutdown_clean_guarded() {
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_shutdown_clean();
 }
 
-static void ggml_backend_sycl_test_shutdown_owner_census(uint64_t out[4]) {
-    sycl_module_mutation_guard module_guard;
-    if (!module_guard) {
-        if (out) {
-            out[0] = 0;
-            out[1] = 0;
-            out[2] = 0;
-            out[3] = 0;
-        }
-        return;
-    }
-    ggml_sycl::unified_cache_shutdown_owner_census_for_test(out);
+static bool ggml_backend_sycl_test_shutdown_owner_census(uint64_t out[4]) {
+    return ggml_sycl::unified_cache_shutdown_owner_census_for_test(out);
 }
 
 static bool ggml_backend_sycl_test_seed_cpu_retained() {

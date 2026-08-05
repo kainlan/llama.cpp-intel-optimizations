@@ -12753,9 +12753,9 @@ bool unified_cache_shutdown_state_clean() noexcept {
     }
 }
 
-void unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
+bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
     if (!out) {
-        return;
+        return false;
     }
     out[0] = 0;
     out[1] = 0;
@@ -12775,11 +12775,13 @@ void unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
                 ++out[3];
             }
         }
+        return true;
     } catch (...) {
         out[0] = 0;
         out[1] = 0;
         out[2] = 0;
         out[3] = 0;
+        return false;
     }
 }
 

@@ -715,7 +715,7 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_shutdown_clean"));
     auto fail_next_registry_stage = reinterpret_cast<void (*)()>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_fail_next_registry_stage"));
-    using shutdown_owner_census_fn = void (*)(uint64_t out[4]);
+    using shutdown_owner_census_fn = bool (*)(uint64_t out[4]);
     auto shutdown_owner_census = reinterpret_cast<shutdown_owner_census_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_shutdown_owner_census"));
     auto block_next_kv_push = reinterpret_cast<void (*)()>(
@@ -760,14 +760,20 @@ int main() {
     // retryable dirty postcondition runs. Assert retained owner authority, not
     // transient free-VRAM deltas.
     uint64_t owner_census_before_dirty[4]{};
-    shutdown_owner_census(owner_census_before_dirty);
+    if (!shutdown_owner_census(owner_census_before_dirty)) {
+        std::fprintf(stderr, "shutdown owner census unavailable before dirty retry\n");
+        return 1;
+    }
     phase("retry module unload detects shutdown-clean failure");
     if (ggml_backend_unload_checked(reg) != GGML_BACKEND_UNLOAD_BUSY) {
         std::fprintf(stderr, "shutdown clean=false did not retain owners transactionally\n");
         return 1;
     }
     uint64_t owner_census_after_dirty[4]{};
-    shutdown_owner_census(owner_census_after_dirty);
+    if (!shutdown_owner_census(owner_census_after_dirty)) {
+        std::fprintf(stderr, "shutdown owner census unavailable after dirty retry\n");
+        return 1;
+    }
     if (owner_census_before_dirty[0] == 0 || owner_census_after_dirty[0] != owner_census_before_dirty[0]) {
         std::fprintf(stderr,
                      "dirty shutdown retry lost retained cache owners: before=%llu dirty=%llu active_before=%llu active_dirty=%llu chunks_before=%llu chunks_dirty=%llu\n",
@@ -789,7 +795,10 @@ int main() {
         return 1;
     }
     uint64_t owner_census_after_retry[4]{};
-    shutdown_owner_census(owner_census_after_retry);
+    if (!shutdown_owner_census(owner_census_after_retry)) {
+        std::fprintf(stderr, "shutdown owner census unavailable after retry success\n");
+        return 1;
+    }
     if (owner_census_after_retry[0] != 0) {
         std::fprintf(stderr, "retained owner retry did not clear owner census: owners=%llu active=%llu chunks=%llu queues=%llu\n",
                      static_cast<unsigned long long>(owner_census_after_retry[0]),

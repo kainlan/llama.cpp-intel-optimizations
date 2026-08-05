@@ -4244,7 +4244,7 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 // After calling this, the cache destructors will skip sycl::free() calls
 bool shutdown_unified_cache();
 bool unified_cache_shutdown_state_clean() noexcept;
-void unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
+bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();
 void prepare_unified_cache_for_module_use() noexcept;
