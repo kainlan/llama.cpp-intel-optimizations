@@ -390,7 +390,7 @@ checks = {
     "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
     and "storage->entries.resize(binding_count);" in extract_control_host_allocs_body
     and "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in extract_control_host_allocs_body,
-    "execution unbind/seal/quarantine/complete snapshot under mutex": backend.count("ggml_sycl_execution_snapshot(ctx)") >= 4
+    "execution unbind/seal/quarantine/complete snapshot under mutex": backend.count("ggml_sycl_execution_state_snapshot(ctx)") >= 4
     and "ctx->execution_state_mutex" in backend,
     "destructor waits before unbind": backend_destructor_body.index("qptrs[dev][s]->wait()")
     < backend_destructor_body.index("ggml_sycl_execution_unbind_backend(this);"),
