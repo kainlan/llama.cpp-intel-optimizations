@@ -304,6 +304,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-discovery-owner-contract.py
             --self-test)
     set_tests_properties(sycl-moe-discovery-owner-contract PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
+    # --self-test likewise: six of this gate's checks are absence-based, and
+    # without a poisoned control they pass on any tree that never had the
+    # construct they forbid -- which is every tree written after the migration.
+    add_test(NAME sycl-moe-bias-owner-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bias-owner-contract.py
+            --self-test)
+    set_tests_properties(sycl-moe-bias-owner-contract PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
@@ -3858,6 +3865,28 @@ set_target_properties(test-moe-discovery-owner-state PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-moe-discovery-owner-state COMMAND test-moe-discovery-owner-state)
 set_tests_properties(sycl-moe-discovery-owner-state PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# Owner-keyed MoE expert-bias and fused-activation state (llama.cpp-nlww). Pure
+# host C++ for the same reason as the discovery test above: it drives the real
+# state type through the real registry against a stand-in live state, so it
+# links no backend library, takes no -fsycl options and never touches a device.
+add_executable(test-moe-bias-owner-state
+    tests/test-moe-bias-owner-state.cpp
+)
+target_include_directories(test-moe-bias-owner-state PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-moe-bias-owner-state PRIVATE Threads::Threads)
+set_target_properties(test-moe-bias-owner-state PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bias-owner-state COMMAND test-moe-bias-owner-state)
+set_tests_properties(sycl-moe-bias-owner-state PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
     # submits to a device. Labels also avoid the throttled sweep's cache denylist.
     LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
