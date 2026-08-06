@@ -133,22 +133,22 @@ static void h12b() {
     require(reg.begin_graph(ctx,s,e,root,&g)==error::OK, "H12b next graph blocked after release");
 }
 
-static void h13() {
-    Registry reg; error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "H13 create failed");
-    require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "H13 bind failed");
+static void h13b() {
+    Registry reg; error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "H13b create failed");
+    require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "H13b bind failed");
     SessionId sa{}, sb{}; SessionResetEpoch ea{}, eb{}; auto ra = root_token(130), rb = root_token(131);
-    require(reg.attach_root(a,ra,&sa,&ea)==error::OK && reg.attach_root(b,rb,&sb,&eb)==error::OK, "H13 attach failed");
+    require(reg.attach_root(a,ra,&sa,&ea)==error::OK && reg.attach_root(b,rb,&sb,&eb)==error::OK, "H13b attach failed");
     GraphEpoch ga{}, gb{}; InvocationId ia{}, ib{}; const int d[] = {2}; const int p[] = {49}; snapshot snap{};
-    require(reg.begin_graph(a,sa,ea,ra,&ga)==error::OK && reg.begin_invocation(a,sa,ea,ga,ra,d,1,p,1,49,&ia)==error::OK, "H13 invoke A failed");
-    require(reg.begin_graph(b,sb,eb,rb,&gb)==error::OK, "H13 graph B failed");
-    require(reg.submit_invocation(a,sa,ea,ga,ia,ra,49)==error::OK, "H13 submit failed");
-    require(reg.release_invocation(a,sa,ea,ga,ia,rb)==error::MISMATCH, "H13 release accepted wrong root");
+    require(reg.begin_graph(a,sa,ea,ra,&ga)==error::OK && reg.begin_invocation(a,sa,ea,ga,ra,d,1,p,1,49,&ia)==error::OK, "H13b invoke A failed");
+    require(reg.begin_graph(b,sb,eb,rb,&gb)==error::OK, "H13b graph B failed");
+    require(reg.submit_invocation(a,sa,ea,ga,ia,ra,49)==error::OK, "H13b submit failed");
+    require(reg.release_invocation(a,sa,ea,ga,ia,rb)==error::MISMATCH, "H13b release accepted wrong root");
     require(reg.extract(a,&snap)==error::OK && snap.busy_device_count==1 && snap.invocation.value==ia.value,
-            "H13 wrong-root release damaged retained execution ownership");
-    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::DEVICE_BUSY, "H13 wrong-root release freed competing context");
-    require(reg.release_invocation(a,sa,ea,ga,ia,ra)==error::OK, "H13 exact owner release failed");
-    require(reg.retire_graph(a,sa,ea,ga,ra)==error::OK, "H13 retire failed");
-    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::OK, "H13 competing context did not recover after exact release");
+            "H13b wrong-root release damaged retained execution ownership");
+    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::DEVICE_BUSY, "H13b wrong-root release freed competing context");
+    require(reg.release_invocation(a,sa,ea,ga,ia,ra)==error::OK, "H13b exact owner release failed");
+    require(reg.retire_graph(a,sa,ea,ga,ra)==error::OK, "H13b retire failed");
+    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::OK, "H13b competing context did not recover after exact release");
 }
 
 static void m7() {
@@ -188,9 +188,9 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "H8") == 0) h8();
     else if (std::strcmp(which, "H12") == 0) h12();
     else if (std::strcmp(which, "H12b") == 0) h12b();
-    else if (std::strcmp(which, "H13") == 0) h13();
+    else if (std::strcmp(which, "H13b") == 0) h13b();
     else if (std::strcmp(which, "M7") == 0) m7();
     else if (std::strcmp(which, "M7b") == 0) m7b();
-    else { g5a(); g6(); g6b(); g7(); h8(); h12(); h12b(); h13(); m7(); m7b(); }
+    else { g5a(); g6(); g6b(); g7(); h8(); h12(); h12b(); h13b(); m7(); m7b(); }
     return 0;
 }

@@ -1035,14 +1035,14 @@ checks = {
     and "sycl-lifecycle-h8" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "sycl-lifecycle-h12" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "sycl-lifecycle-h12b" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
-    and "sycl-lifecycle-h13" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "sycl-lifecycle-h13b" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "sycl-lifecycle-m6" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "sycl-lifecycle-m7" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "sycl-lifecycle-m7b" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
     and "H8" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
     and "H12" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
     and "H12b" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
-    and "H13" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
+    and "H13b" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
     and "M7b" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
     and "submit_quarantined_invocation(" in execution
     and "M7_SUBMIT_RELEASES_DEVICES_EARLY" in execution,
