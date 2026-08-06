@@ -14,6 +14,7 @@ public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+execution = (root / "ggml/src/ggml-sycl/execution-lifecycle.cpp").read_text()
 sycl_cmake = (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
 sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
 
@@ -150,7 +151,7 @@ execution_quarantine_body = re.search(
     backend, re.S | re.M
 ).group(0)
 execution_complete_body = re.search(
-    r"static bool ggml_sycl_execution_complete_graph\(.*?^}\n",
+    r"static bool ggml_sycl_execution_release_graph\(.*?^}\n",
     backend, re.S | re.M
 ).group(0)
 backend_destructor_body = re.search(
@@ -1029,6 +1030,15 @@ checks = {
     in (root / "tests/test-sycl-lifecycle-gpu-sequential.cpp").read_text()
     and "GGML_SYCL_G1_MODEL_A"
     not in (root / "tests/test-sycl-lifecycle-g1-aba.sh").read_text(),
+    "execution submission/release split covered": "submit_invocation(" in execution
+    and "release_invocation(" in execution
+    and "sycl-lifecycle-h8" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "sycl-lifecycle-h12" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "sycl-lifecycle-m6" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "sycl-lifecycle-m7" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
+    and "H8" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
+    and "H12" in (root / "ggml/src/ggml-sycl/tests/test-sycl-lifecycle-event-lease.cpp").read_text()
+    and "M7_SUBMIT_RELEASES_DEVICES_EARLY" in execution,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

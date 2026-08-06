@@ -208,9 +208,10 @@ error Registry::seal_invocation(ContextId context, SessionId session, SessionRes
     return error::OK;
 }
 
-error Registry::finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                                  InvocationId invocation, lifecycle::ModelToken root, int device, graph_phase terminal,
-                                  token_root_phase token_terminal) noexcept {
+error Registry::submit_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                         GraphEpoch graph_epoch, InvocationId invocation,
+                                         lifecycle::ModelToken root, int device, graph_phase terminal,
+                                         token_root_phase token_terminal) noexcept {
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     auto & entry = it->second;
@@ -239,32 +240,94 @@ error Registry::finish_invocation(ContextId context, SessionId session, SessionR
     if (graph.pending_participant_count != 0) {
         return error::OK;
     }
-    for (int claimed_device : graph.devices) {
-        const auto & device_owner = device_owners_[claimed_device];
-        if (device_owner.context == context && device_owner.session == session && device_owner.reset_epoch == reset_epoch &&
-            device_owner.graph_epoch == graph_epoch && device_owner.invocation == invocation && device_owner.token_root == root) {
-            device_owners_[claimed_device] = {};
-        }
-    }
     graph.state = graph.any_quarantined ? graph_phase::QUARANTINED : graph_phase::COMPLETE;
     graph.token_root_state = graph.any_quarantined ? token_root_phase::QUARANTINED : token_root_phase::COMPLETE;
+    if (mutation_ == test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY) {
+        for (int claimed_device : graph.devices) {
+            const auto & device_owner = device_owners_[claimed_device];
+            if (device_owner.context == context && device_owner.session == session &&
+                device_owner.reset_epoch == reset_epoch && device_owner.graph_epoch == graph_epoch &&
+                device_owner.invocation == invocation && device_owner.token_root == root) {
+                device_owners_[claimed_device] = {};
+            }
+        }
+        graph.invocation = {};
+    }
+    return error::OK;
+}
+
+error Registry::release_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                          GraphEpoch graph_epoch, InvocationId invocation,
+                                          lifecycle::ModelToken root) noexcept {
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    auto & entry = it->second;
+    const auto session_rc = validate_session(entry, session, reset_epoch);
+    if (session_rc != error::OK) return session_rc;
+    auto & graph = entry.session.graph;
+    if (!(graph.id == graph_epoch)) return error::STALE;
+    if (!(graph.invocation == invocation)) return error::MISMATCH;
+    if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
+    if (!graph_terminal_unretired(graph) || graph.pending_participant_count != 0) return error::BUSY;
+    for (int claimed_device : graph.devices) {
+        if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) return error::MISMATCH;
+        const auto & owner = device_owners_[claimed_device];
+        if (!(owner.context == context && owner.session == session && owner.reset_epoch == reset_epoch &&
+              owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
+            return error::MISMATCH;
+        }
+    }
+    for (int claimed_device : graph.devices) {
+        device_owners_[claimed_device] = {};
+    }
     graph.invocation = {};
     return error::OK;
+}
+
+error Registry::submit_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                  GraphEpoch graph_epoch, InvocationId invocation,
+                                  lifecycle::ModelToken root, int device) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return submit_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root, device,
+                                    graph_phase::COMPLETE, token_root_phase::COMPLETE);
+}
+
+error Registry::submit_quarantined_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                              GraphEpoch graph_epoch, InvocationId invocation,
+                                              lifecycle::ModelToken root, int device) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return submit_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root, device,
+                                    graph_phase::QUARANTINED, token_root_phase::QUARANTINED);
+}
+
+error Registry::release_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                   GraphEpoch graph_epoch, InvocationId invocation,
+                                   lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
 
 error Registry::complete_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                                     InvocationId invocation, lifecycle::ModelToken root, int device) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return finish_invocation(context, session, reset_epoch, graph_epoch, invocation, root, device,
-                             graph_phase::COMPLETE, token_root_phase::COMPLETE);
+    const auto submit_rc = submit_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root, device,
+                                                    graph_phase::COMPLETE, token_root_phase::COMPLETE);
+    if (submit_rc != error::OK) {
+        return submit_rc;
+    }
+    return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
 
 error Registry::quarantine_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                       GraphEpoch graph_epoch, InvocationId invocation,
                                       lifecycle::ModelToken root, int device) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return finish_invocation(context, session, reset_epoch, graph_epoch, invocation, root, device,
-                             graph_phase::QUARANTINED, token_root_phase::QUARANTINED);
+    const auto submit_rc = submit_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root, device,
+                                                    graph_phase::QUARANTINED, token_root_phase::QUARANTINED);
+    if (submit_rc != error::OK) {
+        return submit_rc;
+    }
+    return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
 
 error Registry::retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,

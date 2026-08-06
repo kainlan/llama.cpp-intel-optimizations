@@ -11904,7 +11904,7 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
     }
 }
 
-static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) noexcept {
+static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx) {
         return false;
     }
@@ -11918,9 +11918,29 @@ static bool ggml_sycl_execution_complete_graph(ggml_backend_sycl_context * ctx) 
     }
     auto & registry = ggml_sycl::execution::global_registry();
     ggml_sycl_execution_seal_graph(ctx);
-    if (registry.complete_invocation({ state.context_id }, { state.session_id },
-                                     { state.reset_epoch }, { state.graph_epoch },
-                                     { state.invocation_id }, owner, state.participant_id) != ggml_sycl::execution::error::OK) {
+    const auto rc = registry.submit_invocation({ state.context_id }, { state.session_id },
+                                               { state.reset_epoch }, { state.graph_epoch },
+                                               { state.invocation_id }, owner, state.participant_id);
+    return rc == ggml_sycl::execution::error::OK || rc == ggml_sycl::execution::error::STALE;
+}
+
+static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx) {
+        return false;
+    }
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
+    if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
+        return false;
+    }
+    ggml_sycl::lifecycle::ModelToken owner{};
+    if (!ggml_sycl_execution_current_owner(ctx, owner)) {
+        return false;
+    }
+    auto & registry = ggml_sycl::execution::global_registry();
+    const auto rc   = registry.release_invocation({ state.context_id }, { state.session_id },
+                                                { state.reset_epoch }, { state.graph_epoch },
+                                                { state.invocation_id }, owner);
+    if (rc != ggml_sycl::execution::error::OK && rc != ggml_sycl::execution::error::STALE) {
         return false;
     }
     ggml_sycl::execution::snapshot snapshot{};
@@ -75788,7 +75808,7 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
             total_mem / (1024.0 * 1024.0));
     }
     SYCL_CHECK(err);
-    (void) ggml_sycl_execution_complete_graph(sycl_ctx);
+    (void) ggml_sycl_execution_release_graph(sycl_ctx);
     sycl_ctx->last_graph_event.reset();
     sycl_ctx->last_graph_event_deferred_decode = false;
     sycl_ctx->has_pending_barrier              = false;
@@ -96085,6 +96105,10 @@ normal_dispatch:
     }
     ggml_sycl_watchdog_heartbeat();
 
+    if (graph_executed || !g_ggml_sycl_graph_recording) {
+        (void) ggml_sycl_execution_submit_graph(sycl_ctx);
+    }
+
     // (W1) Drain the SYCL queue before returning control to the ggml backend
     // scheduler when another backend may consume these outputs. Pure GPU-only
     // decode on an in-order queue can defer the host wait: subsequent token work
@@ -96124,6 +96148,9 @@ normal_dispatch:
             GGML_LOG_ERROR("[SYCL] graph_compute exit wait failed: %s\n", exc.what());
         }
         graph_unpin_transient_leases_after_direct_execution(sycl_ctx);
+    }
+    if (!sycl_ctx->last_graph_event_deferred_decode) {
+        (void) ggml_sycl_execution_release_graph(sycl_ctx);
     }
 #ifdef GGML_SYCL_GRAPH
     if (g_moe_direct_graphlet_pending_replays > 0 || g_moe_block_graphlet_pending_replays > 0 ||
