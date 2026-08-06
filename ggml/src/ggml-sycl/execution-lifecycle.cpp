@@ -315,6 +315,13 @@ error Registry::complete_invocation(ContextId context, SessionId session, Sessio
     if (submit_rc != error::OK) {
         return submit_rc;
     }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    const auto & graph = it->second.session.graph;
+    if (graph.id == graph_epoch && graph.invocation == invocation &&
+        (graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED)) {
+        return error::OK;
+    }
     return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
 
@@ -326,6 +333,13 @@ error Registry::quarantine_invocation(ContextId context, SessionId session, Sess
                                                     graph_phase::QUARANTINED, token_root_phase::QUARANTINED);
     if (submit_rc != error::OK) {
         return submit_rc;
+    }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    const auto & graph = it->second.session.graph;
+    if (graph.id == graph_epoch && graph.invocation == invocation &&
+        (graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED)) {
+        return error::OK;
     }
     return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
