@@ -97723,8 +97723,37 @@ static bool ggml_sycl_moe_tensor_all_experts_on_host(const ggml_tensor * tensor,
     return true;
 }
 
+// llama.cpp-zviv: true when this backend can actually observe where a weight
+// lives.  Both the placement planner and the resolved-pointer inference below
+// answer a question about SYCL-managed storage; neither has jurisdiction over a
+// buffer type the unified cache does not own.  A foreign buffer may even hand
+// out a synthetic base -- the tensor-parallel Meta buffer returns
+// 0x1000000000000000 from get_base() -- which is non-null and is not a device
+// allocation, so the inference reads "I do not recognise this as device memory"
+// as "this weight lives on the host".  (The SYCL split and TP buffers return a
+// null base, so they never reached that inference; they are named here to keep
+// their behaviour explicit rather than incidental.)
+static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) {
+        return false;
+    }
+    return ggml_backend_buffer_is_host(tensor->buffer) || ggml_backend_buffer_has_sycl_context(tensor->buffer) ||
+           ggml_backend_buffer_is_sycl_split(tensor->buffer) || ggml_backend_buffer_is_sycl_tp(tensor->buffer);
+}
+
 static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device) {
     if (!tensor || device < 0 || !ggml_sycl_tensor_is_weight(tensor)) {
+        return false;
+    }
+
+    // Absence of evidence is not evidence of host residency.  Every claim below
+    // is scoped to storage this backend manages; for anything else the honest
+    // answer is "I do not know", and the caller (supports_op) must not turn a
+    // non-answer into a refusal.
+    if (!ggml_sycl_weight_residency_is_observable(tensor)) {
+        GGML_SYCL_DEBUG("[SYCL-SUPPORT] weight %s is in foreign buffer %s; residency unobservable, not claiming host\n",
+                        tensor->name[0] != '\0' ? tensor->name : "(unnamed)",
+                        ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer)));
         return false;
     }
 

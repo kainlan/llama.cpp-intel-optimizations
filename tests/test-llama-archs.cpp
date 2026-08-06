@@ -901,10 +901,10 @@ static int test_backends(const llm_arch                target_arch,
                 // The Meta backend is NOT the faulty subsystem. That assertion is correct, and relaxing it would
                 // be worse than this skip: handle_set_rows returns src_ss[0] and its result aliases the KV cache,
                 // so accepting MIRRORED would record the cache itself as MIRRORED and silently mis-plan every
-                // later attention read. The boundary exists because of our supports_op gate. That gate is the
-                // real fix and is tracked as llama.cpp-zviv; remove this skip when zviv lands.
+                // later attention read. llama.cpp-zviv fixed the original supports_op misclassification;
+                // llama.cpp-dy1r owns removal of this skip and the newly exposed weight-metadata boundary.
                 //
-                // Upstream ships this test disabled too -- ci/run.sh and three .github/workflows entries carry
+                // Upstream ships this test disabled too -- ci/run.sh and four .github/workflows entries carry
                 // -E "test-llama-archs" with "# TODO: fix and re-enable" -- so skipping the TP row matches
                 // upstream rather than concealing a local regression. The per-device and CPU rows still run and
                 // still gate; only the TP row is skipped.
