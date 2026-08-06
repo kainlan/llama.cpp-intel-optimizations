@@ -132,10 +132,14 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     host_key.aux_id             = 0x70005;
 
     ggml_sycl::mem_handle host_handle;
-    cache->register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle);
-    TEST_ASSERT(host_handle.device() == ggml_sycl::mem_handle::HOST_DEVICE,
-                "register_host_expert should preserve HOST_DEVICE owner identity");
-    TEST_ASSERT(host_handle.resolve().ptr == pinned, "register_host_expert should return allocation-time handle");
+    {
+        ggml_sycl::scoped_planned_materialization planned_materialization(cache, "test/MoE host expert registration");
+        TEST_ASSERT(cache->register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle),
+                    "register_host_expert should succeed for pinned host expert");
+    }
+    TEST_ASSERT(host_handle.device() == 0,
+                "register_host_expert should return a logical-device cache lease handle");
+    TEST_ASSERT(host_handle.resolve(0).ptr == pinned, "register_host_expert should return allocation-time handle");
 
     auto host_res = cache->resolve_expert(make_request(host_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(host_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "host expert should resolve");
@@ -159,7 +163,11 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     std::vector<uint8_t> plain_host(64, 0x54);
     ggml_sycl_cache_id   mmap_key = ggml_sycl::test_make_cache_id(plain_host.data());
     mmap_key.aux_id               = 0x70007;
-    cache->register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS);
+    {
+        ggml_sycl::scoped_planned_materialization planned_materialization(cache, "test/MoE mmap expert registration");
+        TEST_ASSERT(cache->register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS),
+                    "register_host_expert should succeed for mmap host expert");
+    }
 
     auto mmap_res = cache->resolve_expert(make_request(mmap_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(mmap_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "plain host expert should resolve");
