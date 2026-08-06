@@ -2365,6 +2365,52 @@ bool launch_fattn_xmx_v2_decode_gqa_split_tk(ggml_backend_sycl_context & ctx,
     }
 }
 
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false, typename PackedK>
+static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl(ggml_backend_sycl_context & ctx,
+                                                             const fattn_params &        params,
+                                                             dpct::queue_ptr             stream,
+                                                             PackedK *                   packed_k,
+                                                             float *                     partial_max,
+                                                             float *                     partial_sum,
+                                                             float *                     partial_out,
+                                                             int                         n_partitions) {
+    if (packed_k == nullptr || packed_k->device != ctx.device || packed_k->D != D || packed_k->n_kv < params.ne11 ||
+        packed_k->H_kv != params.ne12 || packed_k->batch != params.ne03 || packed_k->n_blocks < n_partitions) {
+        return false;
+    }
+
+    const size_t block_stride = GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK;
+    if (packed_k->n_blocks <= 0 || packed_k->H_kv <= 0 || packed_k->batch <= 0) {
+        return false;
+    }
+    if ((size_t) packed_k->n_blocks > std::numeric_limits<size_t>::max() / block_stride) {
+        return false;
+    }
+    const size_t head_stride = (size_t) packed_k->n_blocks * block_stride;
+    if ((size_t) packed_k->H_kv > std::numeric_limits<size_t>::max() / head_stride) {
+        return false;
+    }
+    const size_t batch_stride = (size_t) packed_k->H_kv * head_stride;
+    if ((size_t) packed_k->batch > std::numeric_limits<size_t>::max() / batch_stride) {
+        return false;
+    }
+    const size_t required_bytes = (size_t) packed_k->batch * batch_stride;
+    if (packed_k->total_bytes < required_bytes) {
+        return false;
+    }
+
+    const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device);
+    if (!resolved || !resolved.on_device) {
+        return false;
+    }
+
+    sycl::event merge_event = launch_fattn_xmx_v2_decode_gqa_split_leaf<D, use_logit_softcap, Q_type, TK, DIRECT_PV, true>(
+        params, stream, partial_max, partial_sum, partial_out, n_partitions, static_cast<const sycl::half *>(resolved.ptr),
+        (int64_t) batch_stride, (int64_t) head_stride, (int64_t) block_stride, &packed_k->ready_event);
+    packed_k->ready_event = merge_event;
+    return true;
+}
+
 template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
 bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &    ctx,
                                                     const fattn_params &           params,
@@ -2381,44 +2427,29 @@ bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context & 
                                                             n_partitions)) {
             return false;
         }
-        if (packed_k == nullptr || packed_k->device != ctx.device || packed_k->D != D ||
-            packed_k->n_kv < params.ne11 || packed_k->H_kv != params.ne12 || packed_k->batch != params.ne03 ||
-            packed_k->n_blocks < n_partitions) {
-            return false;
-        }
+        return launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(
+            ctx, params, stream, packed_k, partial_max, partial_sum, partial_out, n_partitions);
+    }
+}
 
-        const size_t block_stride = GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK;
-        if (packed_k->n_blocks <= 0 || packed_k->H_kv <= 0 || packed_k->batch <= 0) {
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
+bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &             ctx,
+                                                    const fattn_params &                    params,
+                                                    dpct::queue_ptr                         stream,
+                                                    ggml_sycl_fattn_xmx_packed_k_snapshot * packed_k,
+                                                    float *                                 partial_max,
+                                                    float *                                 partial_sum,
+                                                    float *                                 partial_out,
+                                                    int                                     n_partitions) {
+    if constexpr (D != 64) {
+        return false;
+    } else {
+        if (!fattn_xmx_v2_decode_gqa_split_supported<D, TK>(params, stream, partial_max, partial_sum, partial_out,
+                                                            n_partitions)) {
             return false;
         }
-        if ((size_t) packed_k->n_blocks > std::numeric_limits<size_t>::max() / block_stride) {
-            return false;
-        }
-        const size_t head_stride = (size_t) packed_k->n_blocks * block_stride;
-        if ((size_t) packed_k->H_kv > std::numeric_limits<size_t>::max() / head_stride) {
-            return false;
-        }
-        const size_t batch_stride = (size_t) packed_k->H_kv * head_stride;
-        if ((size_t) packed_k->batch > std::numeric_limits<size_t>::max() / batch_stride) {
-            return false;
-        }
-        const size_t required_bytes = (size_t) packed_k->batch * batch_stride;
-        if (packed_k->total_bytes < required_bytes) {
-            return false;
-        }
-
-        const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device);
-        if (!resolved || !resolved.on_device) {
-            return false;
-        }
-
-        sycl::event merge_event =
-            launch_fattn_xmx_v2_decode_gqa_split_leaf<D, use_logit_softcap, Q_type, TK, DIRECT_PV, true>(
-                params, stream, partial_max, partial_sum, partial_out, n_partitions,
-                static_cast<const sycl::half *>(resolved.ptr), (int64_t) batch_stride, (int64_t) head_stride,
-                (int64_t) block_stride, &packed_k->ready_event);
-        packed_k->ready_event = merge_event;
-        return true;
+        return launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(
+            ctx, params, stream, packed_k, partial_max, partial_sum, partial_out, n_partitions);
     }
 }
 

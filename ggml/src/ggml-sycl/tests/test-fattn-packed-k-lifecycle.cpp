@@ -663,6 +663,48 @@ void run_materializer_checkpoint(const std::string & checkpoint,
     packed.reset();
 }
 
+void run_sidecar_unregister_overlap(ggml_backend_sycl_context & ctx,
+                                    sycl::queue &                q,
+                                    sycl::queue &                dependency_q,
+                                    int                          device) {
+    enable_sidecar();
+    sidecar_fixture fixture(q, device);
+    device_buffer<sycl::half> qbuf(q, D, device);
+    device_buffer<sycl::half> vbuf(q, D * N_KV, device);
+    device_buffer<float>      out(q, D, device);
+    device_buffer<float>      partial_max(q, 1, device);
+    device_buffer<float>      partial_sum(q, 1, device);
+    device_buffer<float>      partial_out(q, D, device);
+    controlled_gate           gate;
+    controlled_gate_release_guard gate_guard(gate, dependency_q, q);
+
+    q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
+    std::vector<sycl::half> ones(D * N_KV, sycl::half(1.0f));
+    q.memcpy(vbuf.ptr, ones.data(), ones.size() * sizeof(sycl::half)).wait_and_throw();
+    require(fixture.update(q, device), "sidecar overlap setup failed");
+
+    ggml_sycl_fattn_xmx_packed_k_snapshot snapshot{};
+    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(fixture.lookup, device, &snapshot) && snapshot.valid(),
+            "sidecar snapshot capture failed");
+
+    const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
+    snapshot.ready_event         = gate_event;
+
+    fattn_params params = tiny_params(qbuf.ptr, fixture.k.ptr, vbuf.ptr, out.ptr);
+    require(launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
+                ctx, params, &q, &snapshot, partial_max.ptr, partial_sum.ptr, partial_out.ptr, 1),
+            "sidecar snapshot consumer launch failed");
+    ggml_sycl::retain_handles_until_event({ snapshot.handle }, snapshot.ready_event);
+
+    ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));
+    require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
+            "unregister retained sidecar registry entry during overlap");
+
+    const float payload = copy_after(q, snapshot.ready_event, out.ptr);
+    require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
+            "sidecar unregister overlap lost copied owner before final decode event");
+}
+
 void run_consumer_checkpoint(const std::string & checkpoint,
                              ggml_backend_sycl_context & ctx,
                              sycl::queue & q,
@@ -806,7 +848,7 @@ int main(int argc, char ** argv) {
     const std::string checkpoint = argv[2];
     const std::vector<std::string> allowed = {
         "sidecar-before-initial-fill", "sidecar-zero-to-update",
-        "materializer-zero-to-pack", "packed-first-to-merge",
+        "sidecar-unregister-overlap", "materializer-zero-to-pack", "packed-first-to-merge",
     };
     bool known = false;
     for (const auto & value : allowed) {
@@ -865,7 +907,9 @@ int main(int argc, char ** argv) {
         const size_t bytes_baseline = ggml_sycl::alloc_registry::instance().total_device_bytes(device);
         const size_t arena_baseline = ggml_sycl::unified_cache_arena_non_weight_used(device);
 
-        if (checkpoint.rfind("sidecar-", 0) == 0) {
+        if (checkpoint == "sidecar-unregister-overlap") {
+            run_sidecar_unregister_overlap(ctx, work_queue, dependency_queue, device);
+        } else if (checkpoint.rfind("sidecar-", 0) == 0) {
             run_sidecar_checkpoint(checkpoint, work_queue, dependency_queue, device);
         } else if (checkpoint == "materializer-zero-to-pack") {
             run_materializer_checkpoint(checkpoint, work_queue, dependency_queue, device);

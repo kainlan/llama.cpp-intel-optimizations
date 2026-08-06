@@ -1335,6 +1335,7 @@ endif()
 foreach(_packed_k_checkpoint IN ITEMS
         sidecar-before-initial-fill
         sidecar-zero-to-update
+        sidecar-unregister-overlap
         materializer-zero-to-pack
         packed-first-to-merge)
     add_test(NAME fattn-packed-k-lifecycle-${_packed_k_checkpoint}

@@ -386,8 +386,6 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
 
 }  // namespace
 
-// Borrowed-lifetime precondition: the returned sidecar is consumed immediately by the single active context, with no
-// concurrent unregister/teardown. Same-device concurrent find/use is unsupported until a lease or per-entry lock exists.
 ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const fattn_params & params,
                                                                          int                  target_device) {
     if (params.K == nullptr || target_device < 0 || params.ne10 != GGML_SYCL_FATTN_XMX_PACKED_K_D || params.ne11 <= 0 ||
@@ -406,6 +404,41 @@ ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const f
         }
     }
     return nullptr;
+}
+
+bool ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(const fattn_params &                       params,
+                                                        int                                        target_device,
+                                                        ggml_sycl_fattn_xmx_packed_k_snapshot * out) {
+    if (out != nullptr) {
+        *out = {};
+    }
+    if (out == nullptr || params.K == nullptr || target_device < 0 || params.ne10 != GGML_SYCL_FATTN_XMX_PACKED_K_D ||
+        params.ne11 <= 0 || params.ne12 <= 0 || params.ne13 <= 0 || !params.K_handle_valid || params.K_view_offs != 0) {
+        return false;
+    }
+    const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);
+
+    std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
+    for (const auto & entry : g_packed_k_sidecars) {
+        const auto & packed = entry->packed;
+        if (entry->k_handle.valid() && entry->k_handle_hash == params.K_handle_hash && packed.device == target_device &&
+            packed.D == params.ne10 && packed.n_kv >= params.ne11 && packed.H_kv == params.ne12 &&
+            packed.batch == params.ne13 && packed.n_blocks >= n_partitions && packed.handle.valid() &&
+            packed.ptr != nullptr) {
+            out->handle      = packed.handle;
+            out->ready_event = packed.ready_event;
+            out->ptr         = packed.ptr;
+            out->device      = packed.device;
+            out->D           = packed.D;
+            out->n_kv        = packed.n_kv;
+            out->H_kv        = packed.H_kv;
+            out->batch       = packed.batch;
+            out->n_blocks    = packed.n_blocks;
+            out->total_bytes = packed.total_bytes;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
@@ -2556,19 +2589,18 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                             float *   partial_max = nullptr;
                             float *   partial_sum = nullptr;
                             float *   partial_out = nullptr;
-                            // Immediate borrowed use under the sidecar's single-active-context/no-concurrent-teardown
-                            // precondition; concurrent same-device consumers require a future lease or per-entry lock.
-                            ggml_sycl_fattn_xmx_packed_k * packed_k =
-                                ggml_sycl_fattn_xmx_find_packed_k_sidecar(params, ctx.device);
-                            if (packed_k == nullptr &&
+                            ggml_sycl_fattn_xmx_packed_k_snapshot sidecar_snapshot{};
+                            const bool used_sidecar =
+                                ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(params, ctx.device, &sidecar_snapshot);
+                            ggml_sycl_fattn_xmx_packed_k * packed_k = nullptr;
+                            if (!used_sidecar &&
                                 ggml_sycl_fattn_xmx_materialize_packed_k(params, plan, ctx.device, stream,
                                                                          &cache->forced_split_packed_k)) {
                                 packed_k = &cache->forced_split_packed_k;
                             }
-                            if (packed_k != nullptr &&
+                            if ((used_sidecar || packed_k != nullptr) &&
                                 ggml_sycl_fattn_xmx_v2_ensure_split_workspace(
                                     ctx, params, D, n_partitions, stream, &partial_max, &partial_sum, &partial_out)) {
-                                const bool used_sidecar = packed_k != &cache->forced_split_packed_k;
                                 if (dispatch_debug_enabled) {
                                     fprintf(stderr,
                                             "[SYCL] fattn packed-K force path: tk=%d sidecar=%d k_view_offs=%zu "
@@ -2579,23 +2611,41 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                                                  " D=%d ne01=%d tk=%d sidecar=%d", D, ne01, selected_tk,
                                                  used_sidecar ? 1 : 0);
                                 if (logit_softcap == 0.0f) {
-                                    decode_sent =
-                                        selected_tk == 16 ?
-                                            launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 16>(
-                                                ctx, params, stream, packed_k, partial_max, partial_sum, partial_out,
-                                                n_partitions) :
-                                            launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 32>(
-                                                ctx, params, stream, packed_k, partial_max, partial_sum, partial_out,
-                                                n_partitions);
+                                    decode_sent = selected_tk == 16 ?
+                                                      (used_sidecar ?
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 16>(
+                                                               ctx, params, stream, &sidecar_snapshot, partial_max,
+                                                               partial_sum, partial_out, n_partitions) :
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 16>(
+                                                               ctx, params, stream, packed_k, partial_max, partial_sum,
+                                                               partial_out, n_partitions)) :
+                                                      (used_sidecar ?
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 32>(
+                                                               ctx, params, stream, &sidecar_snapshot, partial_max,
+                                                               partial_sum, partial_out, n_partitions) :
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 32>(
+                                                               ctx, params, stream, packed_k, partial_max, partial_sum,
+                                                               partial_out, n_partitions));
                                 } else {
-                                    decode_sent =
-                                        selected_tk == 16 ?
-                                            launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 16>(
-                                                ctx, params, stream, packed_k, partial_max, partial_sum, partial_out,
-                                                n_partitions) :
-                                            launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 32>(
-                                                ctx, params, stream, packed_k, partial_max, partial_sum, partial_out,
-                                                n_partitions);
+                                    decode_sent = selected_tk == 16 ?
+                                                      (used_sidecar ?
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 16>(
+                                                               ctx, params, stream, &sidecar_snapshot, partial_max,
+                                                               partial_sum, partial_out, n_partitions) :
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 16>(
+                                                               ctx, params, stream, packed_k, partial_max, partial_sum,
+                                                               partial_out, n_partitions)) :
+                                                      (used_sidecar ?
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 32>(
+                                                               ctx, params, stream, &sidecar_snapshot, partial_max,
+                                                               partial_sum, partial_out, n_partitions) :
+                                                           launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, Q_type, 32>(
+                                                               ctx, params, stream, packed_k, partial_max, partial_sum,
+                                                               partial_out, n_partitions));
+                                }
+                                if (decode_sent && used_sidecar && sidecar_snapshot.handle.valid()) {
+                                    ggml_sycl::retain_handles_until_event({ sidecar_snapshot.handle },
+                                                                          sidecar_snapshot.ready_event);
                                 }
                             }
                         } else if (dispatch_debug_enabled) {

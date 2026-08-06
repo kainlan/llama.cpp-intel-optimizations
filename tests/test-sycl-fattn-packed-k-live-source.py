@@ -25,6 +25,7 @@ MEM_OPS = MEM_OPS_PATH.read_text(encoding="utf-8")
 CHECKPOINTS = (
     "sidecar-before-initial-fill",
     "sidecar-zero-to-update",
+    "sidecar-unregister-overlap",
     "materializer-zero-to-pack",
     "packed-first-to-merge",
 )
@@ -54,6 +55,9 @@ def production_contract(
         "throw std::bad_alloc{}",
         "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
         "                            const int selected_tk",
+        "ggml_sycl_fattn_xmx_packed_k_snapshot sidecar_snapshot{};",
+        "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(params, ctx.device, &sidecar_snapshot)",
+        "ggml_sycl::retain_handles_until_event({ sidecar_snapshot.handle },",
         "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
         "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
