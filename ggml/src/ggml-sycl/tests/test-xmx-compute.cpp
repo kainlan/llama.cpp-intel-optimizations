@@ -28,6 +28,8 @@
 // Include the unified kernel header
 #include "../unified-kernel.hpp"
 
+#include "sycl-test-skip.hpp"
+
 // =============================================================================
 // Q4_0 Block Definition (match ggml-common.h)
 // =============================================================================
@@ -577,17 +579,24 @@ int main(int argc, char ** argv) {
     all_passed &= test_batch_strategy_selection();
     all_passed &= test_q4_to_half_conversion();
 
-    // GPU tests
-    sycl::device dev;
-    try {
-        dev = sycl::device(sycl::gpu_selector_v);
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU device found: %s\n", e.what());
+    // GPU tests. Enumeration comes FIRST: the bare `sycl::device dev;` this
+    // replaced default-constructs through the default selector and THROWS on a
+    // device-less host, from outside the try -- so the process aborted (exit 134)
+    // without ever reaching the check below, and the CPU-only results above were
+    // lost with it. See sycl-test-skip.hpp.
+    std::optional<sycl::device> dev_opt = sycl_test_require_gpu("the XMX dpas compute path");
+    if (!dev_opt) {
         fprintf(stderr, "-------------------------------------------\n");
         fprintf(stderr, "Tests: %d run, %d passed, %d skipped (GPU tests skipped)\n",
                 g_tests_run, g_tests_passed, g_tests_skipped);
-        return all_passed ? 0 : 1;
+        // The CPU-only tests above really did run, so a FAILURE among them is a
+        // real result and stays exit 1. But passing them is not a pass of THIS
+        // binary -- the XMX compute path is what it exists to test, and none of it
+        // executed. Returning 0 here was the vacuous pass this family is named for
+        // (llama.cpp-k208): green, and proving nothing about the thing under test.
+        return all_passed ? SYCL_TEST_SKIP : 1;
     }
+    sycl::device & dev = *dev_opt;
 
     fprintf(stderr, "Device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
     fprintf(stderr, "XMX support: %s\n", dev.has(sycl::aspect::ext_intel_matrix) ? "YES" : "NO");

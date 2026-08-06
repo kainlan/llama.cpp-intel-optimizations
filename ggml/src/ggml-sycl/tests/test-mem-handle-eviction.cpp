@@ -49,6 +49,8 @@
 #include "../unified-cache.hpp"
 #include "../mem-handle.hpp"
 
+#include "sycl-test-skip.hpp"
+
 // =============================================================================
 // Test harness (mirrors test-unified-cache-fast-path.cpp)
 // =============================================================================
@@ -450,13 +452,15 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "mem_handle / eviction lifecycle tests\n");
     fprintf(stderr, "===========================================\n");
 
-    sycl::device dev;
-    try {
-        dev = sycl::device(sycl::gpu_selector_v);
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU device found: %s\n", e.what());
-        return 1;
+    // Enumeration comes FIRST: the bare `sycl::device dev;` this replaced
+    // default-constructs through the default selector and THROWS on a device-less
+    // host, from outside the try -- so the process aborted (exit 134) without ever
+    // reaching the check below. See sycl-test-skip.hpp.
+    std::optional<sycl::device> dev_opt = sycl_test_require_gpu("mem_handle / eviction lifecycle");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
     fprintf(stderr, "Device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
     fprintf(stderr, "-------------------------------------------\n");
 

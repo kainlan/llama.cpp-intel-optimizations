@@ -28,6 +28,8 @@
 // stub implementations for common.cpp symbols needed by unified-kernel.cpp
 #include "../unified-kernel.hpp"
 
+#include "sycl-test-skip.hpp"
+
 // =============================================================================
 // Q4_0 Block Definition (match ggml-common.h)
 // =============================================================================
@@ -945,14 +947,15 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "ESIMD SLM Prefetch Optimization Tests\n");
     fprintf(stderr, "===========================================\n");
 
-    // Select GPU device
-    sycl::device dev;
-    try {
-        dev = sycl::device(sycl::gpu_selector_v);
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU device found: %s\n", e.what());
-        return 1;
+    // Select GPU device. Enumeration comes FIRST: the bare `sycl::device dev;`
+    // this replaced default-constructs through the default selector and THROWS on
+    // a device-less host, from outside the try -- so the process aborted (exit
+    // 134) without ever reaching the check below. See sycl-test-skip.hpp.
+    std::optional<sycl::device> dev_opt = sycl_test_require_gpu("ESIMD SLM prefetch");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
 
     fprintf(stderr, "Device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
     fprintf(stderr, "-------------------------------------------\n");

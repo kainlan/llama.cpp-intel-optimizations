@@ -25,6 +25,8 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "sycl-test-skip.hpp"
+
 // Enable standalone mode
 #define XMX_TEST_STANDALONE 1
 
@@ -959,18 +961,19 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "WARNING: ESIMD header not available, tests will be skipped.\n\n");
 #endif
 
-    // Create SYCL queue
-    sycl::queue  q;
-    sycl::device dev;
-    try {
-        dev = sycl::device(sycl::gpu_selector_v);
-        q   = sycl::queue(dev);
-        fprintf(stderr, "Using GPU: %s\n\n", dev.get_info<sycl::info::device::name>().c_str());
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU found, using default device\n");
-        dev = sycl::device(sycl::default_selector_v);
-        q   = sycl::queue(dev);
+    // Select a device BEFORE constructing anything. The bare `sycl::queue q;` /
+    // `sycl::device dev;` this replaced default-construct through the default
+    // selector and THROW on a device-less host, from outside the try -- and the
+    // default_selector fallback in the catch handler threw again, so the process
+    // aborted (exit 134) instead of falling back. See sycl-test-skip.hpp. The
+    // GPU-preferred / any-device-accepted intent is unchanged.
+    std::optional<sycl::device> dev_opt = sycl_test_prefer_gpu("ESIMD vectorized dequantization");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
+    fprintf(stderr, "Using device: %s\n\n", dev.get_info<sycl::info::device::name>().c_str());
+    sycl::queue q(dev);
 
     // Run all 8 tests
     bool all_passed = true;

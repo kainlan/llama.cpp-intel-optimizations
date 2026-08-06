@@ -22,6 +22,8 @@
 #include "quantize.hpp"
 #include "unified-cache.hpp"
 
+#include "sycl-test-skip.hpp"
+
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -1784,18 +1786,20 @@ int main(int argc, char ** argv) {
         return all_passed ? 0 : 1;
     }
 
-    // Create SYCL queue
-    sycl::queue  q;
-    sycl::device dev;
-    try {
-        dev = sycl::device(sycl::gpu_selector_v);
-        q   = sycl::queue(dev);
-        fprintf(stderr, "Using GPU: %s\n", dev.get_info<sycl::info::device::name>().c_str());
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "No GPU found, using default device: %s\n", e.what());
-        dev = sycl::device(sycl::default_selector_v);
-        q   = sycl::queue(dev);
+    // Select a device BEFORE constructing anything. The bare `sycl::queue q;` /
+    // `sycl::device dev;` this replaced default-construct through the default
+    // selector and THROW on a device-less host, from outside the try -- and the
+    // default_selector fallback in the catch handler threw again, so the process
+    // aborted (exit 134) instead of falling back, losing the CPU-only results
+    // above with it. See sycl-test-skip.hpp. The GPU-preferred /
+    // any-device-accepted intent is unchanged.
+    std::optional<sycl::device> dev_opt = sycl_test_prefer_gpu("the MXFP4 MoE XMX fused kernel");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
+    fprintf(stderr, "Using device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
+    sycl::queue q(dev);
     fprintf(stderr, "\n");
 
     // Run all required tests

@@ -863,6 +863,15 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
+    # These four exit 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).  Listed
+    # separately from the block above rather than folded into it because
+    # mxfp4-vector-dequant is host-only -- it never returns 77, so claiming it can
+    # would be documenting a path that does not exist.
+    set_tests_properties(xmx-hardware-detect xmx-esimd-basic xmx-moe-mxfp4 moe-mxfp4-dp4a PROPERTIES
+        SKIP_RETURN_CODE 77
+    )
+
     # MoE MXFP4 tests need longer timeout for large matrix tests
     set_tests_properties(xmx-moe-mxfp4 PROPERTIES
         TIMEOUT 300
@@ -898,6 +907,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(unified-kernel PROPERTIES
         LABELS "sycl;unified;matmul"
         TIMEOUT 180
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # Test 9: XMX Compute Path Tests
@@ -925,6 +937,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(xmx-compute PROPERTIES
         LABELS "sycl;xmx;unified;matmul"
         TIMEOUT 300
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # Test 10: XMX Default Enable Tests
@@ -952,6 +967,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(xmx-default-enable PROPERTIES
         LABELS "sycl;xmx;unified;default"
         TIMEOUT 120
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # Test 11: XMX Optimization Tests (TDD)
@@ -979,6 +997,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(xmx-optimization PROPERTIES
         LABELS "sycl;xmx;unified;optimization;tdd"
         TIMEOUT 300
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # Test 12: XMXConfig struct unit tests
@@ -1032,6 +1053,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(esimd-vectorized-dequant PROPERTIES
         LABELS "sycl;xmx;esimd;dequant"
         TIMEOUT 120
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # NOTE: Test 14 (kernel-dispatch) and Test 15 (sycl-dispatch-tuning) used to
@@ -1067,6 +1091,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(esimd-prefetch PROPERTIES
         LABELS "sycl;xmx;esimd;prefetch;lsc"
         TIMEOUT 180
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77
     )
 
     # NOTE: the unified-cache / mem_handle / allocator suite used to be
@@ -1425,6 +1452,9 @@ set_tests_properties(unified-cache-fast-path PROPERTIES
     LABELS "sycl;unified;fast-path;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+    SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
 
@@ -1524,6 +1554,9 @@ set_tests_properties(mem-handle-eviction PROPERTIES
     LABELS "sycl;handle;eviction;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+    SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
 
@@ -1634,6 +1667,9 @@ set_tests_properties(sycl-runtime-alloc PROPERTIES
     LABELS "sycl;allocator;runtime;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
+    # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+    # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+    SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
 

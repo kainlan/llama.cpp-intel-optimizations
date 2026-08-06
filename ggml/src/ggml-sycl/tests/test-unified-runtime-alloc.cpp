@@ -9,6 +9,8 @@
 #include "../unified-cache.hpp"
 #include "../ggml-sycl-test.hpp"
 
+#include "sycl-test-skip.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -677,17 +679,19 @@ int main() {
         set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
     }
 
-    sycl::queue q;
-    try {
-        q = sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order{});
-    } catch (const sycl::exception &) {
-        try {
-            q = sycl::queue(sycl::default_selector_v, sycl::property::queue::in_order{});
-        } catch (const sycl::exception & e) {
-            fprintf(stderr, "No SYCL device available: %s\n", e.what());
-            return 1;
-        }
+    // Select a device BEFORE constructing the queue. The bare `sycl::queue q;`
+    // this replaced default-constructs through the default selector, which THROWS
+    // on a device-less host -- from outside the try, so the process aborted (exit
+    // 134) without ever reaching either fallback. See sycl-test-skip.hpp. The
+    // GPU-preferred / any-device-accepted intent is unchanged; only the exit code
+    // for "no device at all" moves from 1 to 77, so a CPU-only runner reports a
+    // skip rather than a hard failure.
+    std::optional<sycl::device> dev_opt = sycl_test_prefer_gpu("the unified runtime allocator");
+    if (!dev_opt) {
+        return SYCL_TEST_SKIP;
     }
+    sycl::device & dev = *dev_opt;
+    sycl::queue q(dev, sycl::property::queue::in_order{});
 
     bool ok = true;
     enable_strict_mode_env();
