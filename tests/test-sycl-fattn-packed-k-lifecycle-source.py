@@ -169,17 +169,34 @@ def test_packed_consumer_propagates_prior_event_then_replaces_first_and_merge() 
         "return merge_event",
     )
 
-    caller = section(
+    impl = section(
         XMX,
-        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
-        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(",
+        "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
     )
     ordered(
-        caller,
+        impl,
+        "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
+        "if (!resolved || !resolved.on_device)",
         "launch_fattn_xmx_v2_decode_gqa_split_leaf",
         "packed_k->ready_event = merge_event",
         "return true",
     )
+
+    raw_wrapper = section(
+        XMX,
+        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &    ctx,",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &             ctx,",
+    )
+    assert "launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(" in raw_wrapper
+
+    snapshot_wrapper = section(
+        XMX,
+        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &             ctx,",
+        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(ggml_backend_sycl_context &    ctx,",
+    )
+    assert "ggml_sycl_fattn_xmx_packed_k_snapshot * packed_k" in snapshot_wrapper
+    assert "launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(" in snapshot_wrapper
 
 
 def test_device_guards_cover_submission_queue_packed_identity_and_resolution() -> None:
@@ -190,15 +207,15 @@ def test_device_guards_cover_submission_queue_packed_identity_and_resolution() -
     )
     assert "stream_device >= 0 && stream_device != target_device" in materializer
 
-    caller = section(
+    impl = section(
         XMX,
-        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
-        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(",
+        "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
     )
     ordered(
-        caller,
-        "packed_k->device != ctx.device",
-        "packed_k->handle.resolve(ctx.device)",
+        impl,
+        "packed_k == nullptr || packed_k->device != ctx.device",
+        "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
         "if (!resolved || !resolved.on_device)",
         "launch_fattn_xmx_v2_decode_gqa_split_leaf",
     )
