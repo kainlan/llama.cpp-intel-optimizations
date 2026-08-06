@@ -201,6 +201,14 @@ static void llama_context_sycl_exec_drain_and_close(const char *                
     ggml_sycl_exec_control_host_alloc_batch batch      = {};
     const auto                              extract_rc = hooks.extract_allocs(&ticket, &batch);
     if (extract_rc != GGML_SYCL_EXECUTION_OK) {
+        // Deliberate: returning here strands the registry entry in DRAINING for
+        // the process lifetime, because finish_drain is its only exit and also
+        // the only path that erases it. Accepted rather than papered over -- the
+        // terminal drain above has already cleared this context's device owners
+        // (quarantining when the terminal is unprovable), so nothing device-side
+        // is held, and every mem_handle is released independently of registry
+        // state. A rollback counterpart is registry work owned by 1q72:
+        // llama.cpp-34hr.
         LLAMA_LOG_ERROR("%s: failed to extract SYCL control-host allocations: result=%d\n", func, (int) extract_rc);
         return;
     }
@@ -213,6 +221,11 @@ static void llama_context_sycl_exec_drain_and_close(const char *                
 
     const auto finish_rc = hooks.finish_drain(ticket, &batch);
     if (finish_rc != GGML_SYCL_EXECUTION_OK) {
+        // Same deliberate tradeoff as the extract failure above, and the reason
+        // this one should be unreachable: finish_drain's only non-identity
+        // refusal is DEVICE_BUSY, which requires a live invocation on one of
+        // this context's devices -- exactly what the two terminal drains have
+        // already released. Recovery needs a registry rollback (llama.cpp-34hr).
         LLAMA_LOG_ERROR("%s: failed to finish SYCL execution drain: result=%d\n", func, (int) finish_rc);
     }
 }
