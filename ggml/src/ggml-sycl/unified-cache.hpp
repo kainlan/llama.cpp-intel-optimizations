@@ -11,6 +11,7 @@
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
 #include "mem-handle.hpp"
+#include "moe-control-plan.hpp"
 #include "pinned-pool.hpp"
 #include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
@@ -546,8 +547,16 @@ struct placement_plan {
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
     size_t   moe_routing_ids_bytes               = 0;  // Zone: HOST_CONTROL (shared-context host pinned)
-    // MoE expert pointer tables: void* per expert per MoE layer (MAX_EXPERTS * n_moe_layers * sizeof(void*)).
+    // MoE expert pointer tables: one void* per expert per EXPERT TENSOR, summed
+    // over the tensors the descriptors actually name -- not MAX_EXPERTS per
+    // layer. Derived from base_context_control_layout.tables_bytes below, which
+    // is the single place that geometry is computed.
     size_t   moe_expert_ptrs_bytes               = 0;  // Zone: RUNTIME (device VRAM)
+    // base_context_control_layout.total_bytes when that layout is valid (see the
+    // declaration below the size_t run): the whole per-context CONTROL pool,
+    // which the RUNTIME zone must hold. 0 for a dense model or when the layout
+    // could not be computed.
+    size_t   moe_control_pool_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // Combined VRAM RUNTIME reservation for MoE device routing buffers (expert_ptrs only;
     // routing IDs are HOST_CONTROL and are accounted in host pinned planning).
     // 0 when model has no MoE layers.
@@ -591,6 +600,14 @@ struct placement_plan {
     // Folded into host_zone_scratch_bytes for zone budgeting; also available to
     // secondary-device planners as a sizing reference. 0 when TP is disabled.
     size_t tp_vram_runtime_bytes   = 0;  // Zone: RUNTIME (device VRAM)
+
+    // Exact CONTROL pool geometry for this plan: the expert pointer tables plus
+    // the routing ids, compaction table and missing-expert counter, at their
+    // real offsets. `valid == false` means the geometry could not be computed
+    // and the coarse fallback is in force for moe_expert_ptrs_bytes; see
+    // populate_host_zone_sizing. Declared outside the size_t block above so its
+    // longer type does not widen that block's alignment column.
+    moe_context_control_layout base_context_control_layout;
 
     // Per-device VRAM usage (multi-device only, indexed by position in devices vector)
     std::vector<int>    devices;          // Device IDs participating in this plan
@@ -1175,6 +1192,21 @@ size_t   unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(int devic
 size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id);
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
+
+// Per-device planned MoE CONTROL pool requirement. Unlike the scratch figures
+// above -- which ggml-sycl.cpp publishes from the tensor inventory -- this one
+// is published by populate_host_zone_sizing, so the geometry is computed in
+// exactly one place. A second computation site is the failure mode the oneDNN
+// scratchpad comment in ggml-sycl.cpp warns about: two sites sizing one zone
+// that disagree silently when only one is changed.
+void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement);
+moe_control_requirement unified_cache_get_planned_moe_control_requirement(int device_id);
+
+// pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
+// checked. Returns false without writing *out when the device's CONTROL
+// requirement could not be computed, which is what stops an unsizable plan from
+// silently becoming a smaller RUNTIME zone.
+bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
 
 // Parse GGML_SYCL_MULTI_GPU_MODE env var.
 // Returns HYBRID for MoE models, LAYER for dense-only, unless overridden.

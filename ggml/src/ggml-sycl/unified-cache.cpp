@@ -44,6 +44,31 @@
 
 namespace ggml_sycl {
 
+// moe-control-plan.hpp duplicates expert_tensor_role so it can stay free of
+// this header. That duplication is only safe while the two agree value for
+// value, and the failure mode of a silent divergence is a descriptor sized
+// under the wrong role. These are the compile error that replaces it -- if a
+// role is added, renamed or reordered in either enum, this file stops building
+// and names the pair that drifted.
+static_assert(static_cast<int>(expert_tensor_role::UNKNOWN) == static_cast<int>(moe_expert_role::UNKNOWN),
+              "expert_tensor_role::UNKNOWN and moe_expert_role::UNKNOWN must agree");
+static_assert(static_cast<int>(expert_tensor_role::GATE) == static_cast<int>(moe_expert_role::GATE),
+              "expert_tensor_role::GATE and moe_expert_role::GATE must agree");
+static_assert(static_cast<int>(expert_tensor_role::UP) == static_cast<int>(moe_expert_role::UP),
+              "expert_tensor_role::UP and moe_expert_role::UP must agree");
+static_assert(static_cast<int>(expert_tensor_role::DOWN) == static_cast<int>(moe_expert_role::DOWN),
+              "expert_tensor_role::DOWN and moe_expert_role::DOWN must agree");
+static_assert(static_cast<int>(expert_tensor_role::GATE_UP) == static_cast<int>(moe_expert_role::GATE_UP),
+              "expert_tensor_role::GATE_UP and moe_expert_role::GATE_UP must agree");
+static_assert(static_cast<int>(expert_tensor_role::CHUNK_GATE) == static_cast<int>(moe_expert_role::CHUNK_GATE),
+              "expert_tensor_role::CHUNK_GATE and moe_expert_role::CHUNK_GATE must agree");
+static_assert(static_cast<int>(expert_tensor_role::CHUNK_UP) == static_cast<int>(moe_expert_role::CHUNK_UP),
+              "expert_tensor_role::CHUNK_UP and moe_expert_role::CHUNK_UP must agree");
+static_assert(static_cast<int>(expert_tensor_role::CHUNK_DOWN) == static_cast<int>(moe_expert_role::CHUNK_DOWN),
+              "expert_tensor_role::CHUNK_DOWN and moe_expert_role::CHUNK_DOWN must agree");
+static_assert(static_cast<int>(expert_tensor_role::COUNT) == static_cast<int>(moe_expert_role::COUNT),
+              "a role added to one enum must be added to the other");
+
 namespace {
 enum class load_effect_state { NONE, ACQUIRED, FAILED };
 
@@ -736,6 +761,43 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id) {
         return 0;
     }
     return g_planned_pp_pipeline_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
+// The two halves are stored separately rather than as a struct so the pair
+// stays lock-free. They are only ever written together, by one planner, before
+// any consumer reads them.
+//
+// The flag records INVALID rather than valid so that its zero-initialized state
+// -- a device nobody has planned for yet, which is every device on a dense
+// model -- reads as a valid zero requirement. Storing validity the other way
+// round would make an unplanned device poison its own RUNTIME zone sizing.
+static std::atomic<size_t> g_planned_moe_control_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<bool>   g_planned_moe_control_invalid[GGML_SYCL_MAX_DEVICES]{};
+
+void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    // Bytes first, then the flag: a reader that sees a valid requirement must
+    // see the bytes that go with it.
+    g_planned_moe_control_bytes[device_id].store(requirement.valid ? requirement.bytes : 0, std::memory_order_relaxed);
+    g_planned_moe_control_invalid[device_id].store(!requirement.valid, std::memory_order_release);
+}
+
+moe_control_requirement unified_cache_get_planned_moe_control_requirement(int device_id) {
+    moe_control_requirement requirement;
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return requirement;
+    }
+    requirement.valid = !g_planned_moe_control_invalid[device_id].load(std::memory_order_acquire);
+    requirement.bytes = g_planned_moe_control_bytes[device_id].load(std::memory_order_relaxed);
+    return requirement;
+}
+
+bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
+    return moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
+                                                unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id),
+                                                unified_cache_get_planned_moe_control_requirement(device_id), out);
 }
 
 void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
@@ -2011,16 +2073,30 @@ bool unified_cache::ensure_planned_arena_zones() {
     if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
         runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
     }
-    const size_t planned_pp_pipeline     = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
-    const size_t planned_pp_moe_onednn   = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
-    const size_t planned_runtime_scratch = planned_pp_pipeline + planned_pp_moe_onednn;
+    const size_t                  planned_pp_pipeline   = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
+    const size_t                  planned_pp_moe_onednn = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
+    const moe_control_requirement planned_moe_control   = unified_cache_get_planned_moe_control_requirement(dev_id);
+
+    // The MoE CONTROL pool lives in this zone too and was never counted here.
+    // The addition is checked because a plan whose CONTROL sizing failed must
+    // not quietly become a SMALLER runtime zone than one that succeeded --
+    // which is exactly what an unchecked `a + b + c` on a poisoned term does.
+    size_t planned_runtime_scratch = 0;
+    if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {
+        planned_runtime_scratch = 0;
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] Runtime zone requirement for device %d is unanswerable "
+            "(pipeline=%zu moe_onednn=%zu control_valid=%d); keeping the %.1f MB default\n",
+            dev_id, planned_pp_pipeline, planned_pp_moe_onednn, static_cast<int>(planned_moe_control.valid),
+            runtime_zone / (1024.0 * 1024.0));
+    }
     if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
         runtime_zone = planned_runtime_scratch;
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-            planned_pp_moe_onednn / (1024.0 * 1024.0));
+            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0));
     }
 
     auto bind_compute_arena = [&]() {
@@ -19042,12 +19118,63 @@ static void populate_host_zone_sizing(placement_plan &                          
         const size_t max_batch_tokens = static_cast<size_t>(std::max<uint32_t>(plan.planner_n_ctx, 1));
         plan.moe_routing_ids_bytes    = static_cast<size_t>(n_experts) * sizeof(int32_t) * max_batch_tokens;
 
-        // 3c. MoE expert pointer tables: one void* per expert per MoE layer, pre-allocated
-        //     for graph recording (fixed addresses required).
-        //     MAX_EXPERTS (256) is used for the pre-allocation size regardless of n_experts.
-        constexpr int k_max_experts_prealloc = 256;  // moe_tile_mapping_state::MAX_EXPERTS
-        plan.moe_expert_ptrs_bytes =
-            static_cast<size_t>(k_max_experts_prealloc) * sizeof(void *) * static_cast<size_t>(n_moe_layers);
+        // 3c. MoE expert pointer tables: one void* per expert per EXPERT TENSOR,
+        //     pre-allocated for graph recording (fixed addresses required).
+        //
+        //     This used to be MAX_EXPERTS (256) * n_moe_layers, which is wrong in
+        //     both directions and not conservatively so. It over-counts a model
+        //     with fewer than 256 experts (4x on GPT-OSS's 32), and it UNDER-counts
+        //     any model whose layers carry more than one expert tensor -- a split
+        //     gate/up/down layer needs three tables, not one, so a 256-expert split
+        //     model was budgeted a third of what it needs. Deriving both terms from
+        //     the descriptors removes both errors (llama.cpp-dimc).
+        //
+        //     The layout is computed once, here, and stored on the plan. Anything
+        //     that needs the geometry reads plan.base_context_control_layout rather
+        //     than recomputing it -- see the oneDNN scratchpad note in ggml-sycl.cpp
+        //     for what two independent sizing sites cost.
+        std::vector<moe_control_tensor_desc> moe_descs;
+        moe_descs.reserve(tensor_inventory.size());
+        for (const auto & item : tensor_inventory) {
+            moe_control_tensor_desc entry;
+            entry.name = item.name;
+            entry.size = item.size;
+            entry.type = static_cast<int>(item.type);
+            for (int d = 0; d < GGML_MAX_DIMS && d < 4; ++d) {
+                entry.ne[d] = item.ne[d];
+            }
+            moe_descs.push_back(std::move(entry));
+        }
+
+        // n_ubatch is not known at plan time, so the layout is built at the
+        // GPU ceiling: it is the largest micro-batch the routing path can be
+        // admitted for, so a pool sized here fits every smaller one.
+        const moe_ptr_table_plan ptr_tables = moe_build_ptr_table_plan(moe_descs, n_experts);
+        plan.base_context_control_layout =
+            moe_build_context_control_layout(ptr_tables, n_expert_used, MOE_GPU_UBATCH_MAX);
+
+        const moe_context_control_layout & control_layout = plan.base_context_control_layout;
+        if (control_layout.valid) {
+            plan.moe_expert_ptrs_bytes  = control_layout.tables_bytes;
+            plan.moe_control_pool_bytes = control_layout.total_bytes;
+        } else {
+            // The descriptors could not be sized -- a malformed expert name, a
+            // layer missing a role, a conflicting duplicate. Fall back to the
+            // coarse budget rather than to zero: this figure only widens a
+            // conservative zone estimate, so the safe failure is the old
+            // over-count, never an under-count. The requirement published below
+            // still reports invalid, so nothing that must be exact proceeds.
+            constexpr int k_max_experts_prealloc = 256;  // moe_tile_mapping_state::MAX_EXPERTS
+            plan.moe_expert_ptrs_bytes =
+                static_cast<size_t>(k_max_experts_prealloc) * sizeof(void *) * static_cast<size_t>(n_moe_layers);
+            plan.moe_control_pool_bytes = 0;
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE CONTROL layout could not be computed (malformed=%zu conflicting=%zu overflow=%d "
+                "mismatch=%d); falling back to the coarse %zu-byte expert pointer budget\n",
+                ptr_tables.malformed_expert_candidate_count, ptr_tables.conflicting_duplicate_count,
+                static_cast<int>(control_layout.arithmetic_overflow),
+                static_cast<int>(control_layout.metadata_mismatch), plan.moe_expert_ptrs_bytes);
+        }
 
         // 3d. PP CPU expert act/out staging. These are scoped EXPERT_STAGING
         //     HOST_COMPUTE allocations routed to host SCRATCH, so the zone only
@@ -19063,15 +19190,39 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.moe_cpu_expert_staging_bytes = max_moe_tensor_bytes;
 
         GGML_LOG_INFO(
-            "[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_moe_layers=%d "
-            "max_batch=%zu control_ids=%.2f MB host-pinned, expert_ptrs=%.2f MB VRAM, cpu_staging=%.2f MB\n",
-            n_experts, n_moe_layers, max_batch_tokens, plan.moe_routing_ids_bytes / (1024.0 * 1024.0),
-            plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0), plan.moe_cpu_expert_staging_bytes / (1024.0 * 1024.0));
+            "[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_expert_used=%d n_moe_layers=%d "
+            "max_batch=%zu control_ids=%.2f MB host-pinned, expert_ptrs=%.2f MB VRAM (%zu tables x %zu B, exact=%d), "
+            "control_pool=%.2f MB VRAM, cpu_staging=%.2f MB\n",
+            n_experts, n_expert_used, n_moe_layers, max_batch_tokens, plan.moe_routing_ids_bytes / (1024.0 * 1024.0),
+            plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0), control_layout.table_count, control_layout.table_stride,
+            static_cast<int>(control_layout.valid), plan.moe_control_pool_bytes / (1024.0 * 1024.0),
+            plan.moe_cpu_expert_staging_bytes / (1024.0 * 1024.0));
     } else {
         plan.expert_bias_bytes            = 0;
         plan.moe_routing_ids_bytes        = 0;
         plan.moe_expert_ptrs_bytes        = 0;
+        plan.moe_control_pool_bytes       = 0;
         plan.moe_cpu_expert_staging_bytes = 0;
+
+        // A dense model is a VALID zero requirement, not an unknown one: it has
+        // no expert tensors to route, so its RUNTIME zone owes nothing.
+        plan.base_context_control_layout       = moe_context_control_layout{};
+        plan.base_context_control_layout.valid = true;
+    }
+
+    // Publish the per-device CONTROL requirement the RUNTIME zone must hold.
+    // Every device in the plan needs its own pool, so each gets the same
+    // requirement; a single-device plan publishes only for its own device.
+    {
+        const moe_control_requirement control_requirement =
+            moe_control_requirement_from_layout(plan.base_context_control_layout, n_experts > 0);
+        if (plan.devices.empty()) {
+            unified_cache_set_planned_moe_control_requirement(plan.device_id, control_requirement);
+        } else {
+            for (int device : plan.devices) {
+                unified_cache_set_planned_moe_control_requirement(device, control_requirement);
+            }
+        }
     }
 
     // 4. CPU quantization temp buffers: 3 pre-allocated slots (cpu_dispatch_buffers) each
@@ -19152,7 +19303,11 @@ static void populate_host_zone_sizing(placement_plan &                          
     // Aggregate MoE device-side routing buffers into a single VRAM RUNTIME
     // reservation field. CPU-produced routing IDs are host-pinned CONTROL data
     // and are accounted in host staging, not VRAM.
-    plan.moe_vram_runtime_bytes = plan.moe_expert_ptrs_bytes;
+    //
+    // The CONTROL pool total already contains the pointer tables, so the max
+    // picks the pool when the exact layout was computed and the coarse table
+    // figure when it was not -- never the sum, which would double-count.
+    plan.moe_vram_runtime_bytes = std::max(plan.moe_expert_ptrs_bytes, plan.moe_control_pool_bytes);
 
     // 7. DMA staging pool: device-resident double-buffer for host→device weight streaming.
     //    Two slices, each sized to the largest tensor the weight stream can actually carry.
