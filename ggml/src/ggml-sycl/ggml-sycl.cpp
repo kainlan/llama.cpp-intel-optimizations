@@ -2154,6 +2154,8 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 #include "ggml-sycl/expert-prefetch.hpp"
 // Owner-keyed ownership for the MoE discovery/popularity state cluster
 #include "ggml-sycl/moe-discovery-state.hpp"
+// Owner-keyed ownership for the MoE expert-bias and fused-activation cluster
+#include "ggml-sycl/moe-bias-state.hpp"
 // Persistent CPU expert thread pool with ring-buffered staging
 #include "ggml-sycl/cpu-expert-pool.hpp"
 
@@ -2888,6 +2890,92 @@ static std::atomic<bool> g_prestage_completed{ false };
 static std::array<size_t, GGML_SYCL_MAX_DEVICES> g_moe_expert_vram_reserve = {};
 
 // ---------------------------------------------------------------------------
+// Owner-keyed MoE expert-bias and fused-activation state (llama.cpp-nlww).
+//
+// The live half of the cluster whose rules moe-bias-state.hpp states. It rides
+// the nn6z discovery registry rather than a registry of its own: both clusters
+// are discovered by the same model's first MoE graph, both must transfer at the
+// same instant, and two registries would be two transition points that can
+// disagree about who the owner is.
+//
+// It is declared here, ahead of the discovery registry below, because the
+// parked discovery state holds an owner's bias working set as a member.
+//
+// `g_moe_bias_state_mutex` is L3 strictly-leaf (canonical §12.5): every helper
+// below takes it alone, holds it across no allocation and no device work, and
+// releases it before returning. The graph scan that fills the state runs
+// entirely outside it and installs its result in one move.
+// ---------------------------------------------------------------------------
+static ggml_sycl::moe_bias_activation_state g_moe_bias_state;
+static std::shared_mutex                    g_moe_bias_state_mutex;
+
+// Readers copy the triple out from under the lock. The host buffers it points
+// into are stable while their owner is active, but the map entry is not: an
+// owner switch replaces the whole cluster, so nothing may hold a reference into
+// it across the lock.
+static bool ggml_sycl_moe_bias_lookup(int layer, ggml_sycl::layer_expert_biases * out) {
+    std::shared_lock<std::shared_mutex>    lock(g_moe_bias_state_mutex);
+    const ggml_sycl::layer_expert_biases * entry = g_moe_bias_state.find_layer(layer);
+    if (!entry) {
+        return false;
+    }
+    *out = *entry;
+    return true;
+}
+
+static bool ggml_sycl_moe_bias_scanned() {
+    std::shared_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    return g_moe_bias_state.biases_scanned;
+}
+
+// The scan itself allocates and waits on a device-to-host copy, so it runs
+// unlocked and installs its result here. The re-check is what makes two
+// concurrent scans safe: the loser discards its own duplicate rather than
+// replacing pointers a consumer may already have read out.
+static void ggml_sycl_moe_bias_publish(ggml_sycl::moe_bias_activation_state && scanned) {
+    std::unique_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    if (g_moe_bias_state.biases_scanned) {
+        return;
+    }
+    g_moe_bias_state.adopt_biases(std::move(scanned));
+}
+
+static bool ggml_sycl_moe_act_detected() {
+    std::shared_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    return g_moe_bias_state.act_detected();
+}
+
+static void ggml_sycl_moe_act_publish(int variant, float alpha, float limit) {
+    std::unique_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    if (g_moe_bias_state.act_detected()) {
+        return;
+    }
+    g_moe_bias_state.act_variant = variant;
+    g_moe_bias_state.act_alpha   = alpha;
+    g_moe_bias_state.act_limit   = limit;
+}
+
+// Move the working set out for parking. The caller owns what comes back, and
+// the destructor that frees the host bias copies therefore runs on the caller's
+// thread with no registry lock held.
+static ggml_sycl::moe_bias_activation_state ggml_sycl_moe_bias_state_take() {
+    std::unique_lock<std::shared_mutex>  lock(g_moe_bias_state_mutex);
+    ggml_sycl::moe_bias_activation_state taken = std::move(g_moe_bias_state);
+    g_moe_bias_state.clear();
+    return taken;
+}
+
+static void ggml_sycl_moe_bias_state_install(ggml_sycl::moe_bias_activation_state && restored) {
+    std::unique_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    g_moe_bias_state = std::move(restored);
+}
+
+static void ggml_sycl_moe_bias_state_clear() {
+    std::unique_lock<std::shared_mutex> lock(g_moe_bias_state_mutex);
+    g_moe_bias_state.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Owner-keyed MoE discovery state (llama.cpp-nn6z).
 //
 // Everything the two classes below touch is host metadata that exactly one
@@ -2920,6 +3008,12 @@ struct ggml_sycl_moe_parked_discovery : public ggml_sycl::moe_discovery_parked_s
     // Sequential-layer major, warmup_n_layers * warmup_n_experts entries. Epoch
     // counters are not carried: enable_reranking() zeroes them by design.
     std::vector<uint32_t>            warmup_counts;
+    // The owner's expert-bias and fused-activation working set (llama.cpp-nlww).
+    // Unlike every other member here it is MOVED out of the live state rather
+    // than copied out of it, because the map's pointers address the host buffers
+    // stored alongside it: a copy would point into the live state that
+    // install_fresh() is about to destroy.
+    ggml_sycl::moe_bias_activation_state bias;
 };
 
 class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_state {
@@ -2949,6 +3043,11 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                     }
                 }
             }
+            // Last, so that a throw above leaves the live bias state where
+            // install_fresh() will clear it rather than half-detached. Either
+            // way the outgoing owner's biases stop being reachable by the
+            // incoming one, which is what fail-closed means here.
+            parked->bias = ggml_sycl_moe_bias_state_take();
             return parked;
         } catch (...) {
             // Fail closed: the registry drops the outgoing owner's state rather
@@ -2961,13 +3060,16 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
         // The device-bound half is never restored, only re-discovered.
         install_fresh();
         // The registry hands back exactly what park() produced; this class is
-        // the only producer of a parked state, so the downcast is total.
-        const ggml_sycl_moe_parked_discovery * state =
-            static_cast<const ggml_sycl_moe_parked_discovery *>(parked.get());
+        // the only producer of a parked state, so the downcast is total. It is
+        // non-const because the owner's bias working set is moved back in, not
+        // copied: only the buffers park() detached can carry its recorded
+        // pointers.
+        ggml_sycl_moe_parked_discovery * state = static_cast<ggml_sycl_moe_parked_discovery *>(parked.get());
         if (!state) {
             return;
         }
         try {
+            ggml_sycl_moe_bias_state_install(std::move(state->bias));
             for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
                 g_moe_layer_seq[d] = state->layer_seq[d];
             }
@@ -3030,6 +3132,12 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                 std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
                 g_expert_groups.clear();
             }
+            // The expert-bias and fused-activation cluster (llama.cpp-nlww).
+            // Clearing it here is what retires the once-semantics: the next
+            // owner finds biases_scanned false and act_variant undetected, so
+            // it scans its own graph instead of reading the previous owner's
+            // per-layer bias pointers or activation alpha/limit.
+            ggml_sycl_moe_bias_state_clear();
         } catch (...) {
         }
     }
@@ -17196,26 +17304,11 @@ static void moe_profile_ids_done_at(const char * site) {
     g_moe_profile.moe_ids_done();
 }
 
-// MoE activation variant detected from graph structure.
-// Set once during first graph_compute, used by fusion to select correct activation.
-static std::atomic<int> g_moe_fused_act_variant{ -1 };  // -1 = not yet detected
-static float            g_moe_fused_act_alpha = 0.0f;
-static float            g_moe_fused_act_limit = 0.0f;
-
-// Per-layer expert bias pointers captured during graph scan.
-// Maps layer_id -> {gate_bias, up_bias, down_bias} HOST data pointers + stride.
-// Bias tensors in the graph have device pointers; we copy to host-owned buffers
-// so the CPU fused kernel can access them safely.
-struct layer_expert_biases {
-    const float * gate_bias = nullptr;  // HOST copy of ffn_gate_exps bias base
-    const float * up_bias   = nullptr;  // HOST copy of ffn_up_exps bias base
-    const float * down_bias = nullptr;  // HOST copy of ffn_down_exps bias base
-    size_t        nb        = 0;        // Expert stride in bytes (nb11)
-};
-
-static std::unordered_map<int, layer_expert_biases> g_moe_expert_biases;
-// Host-side copies of bias data (owned memory, freed at static destruction).
-static std::vector<std::vector<float>>              g_moe_bias_host_copies;
+// The MoE activation variant and the per-layer expert bias pointers used to be
+// declared here as file-scope state that nothing but module shutdown ever
+// cleared. Both now live in the owner-keyed g_moe_bias_state above
+// (llama.cpp-nlww); see moe-bias-state.hpp for why once-semantics could not
+// simply be reset in place.
 
 // MoE fusion env var: GGML_SYCL_MOE_FUSE (default: 1 = enabled)
 static bool ggml_sycl_moe_fusion_enabled() {
@@ -60742,12 +60835,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         fusion.down_bias_data = nullptr;
                         fusion.bias_nb        = 0;
                         if (cur_layer_fast >= 0) {
-                            auto it = g_moe_expert_biases.find(cur_layer_fast);
-                            if (it != g_moe_expert_biases.end()) {
-                                fusion.gate_bias_data = it->second.gate_bias;
-                                fusion.up_bias_data   = it->second.up_bias;
-                                fusion.down_bias_data = it->second.down_bias;
-                                fusion.bias_nb        = it->second.nb;
+                            // Copied out rather than referenced: the entry
+                            // belongs to whichever model owns MoE discovery, and
+                            // an owner switch replaces the map wholesale.
+                            ggml_sycl::layer_expert_biases layer_bias;
+                            if (ggml_sycl_moe_bias_lookup(cur_layer_fast, &layer_bias)) {
+                                fusion.gate_bias_data = layer_bias.gate_bias;
+                                fusion.up_bias_data   = layer_bias.up_bias;
+                                fusion.down_bias_data = layer_bias.down_bias;
+                                fusion.bias_nb        = layer_bias.nb;
                             }
                         }
 
@@ -82978,115 +83074,121 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     //
     // IMPORTANT: bias_tensor->data is a DEVICE pointer (GPU memory).  The CPU fused
     // kernel needs host-accessible data.  We copy each bias tensor to a host buffer
-    // during this one-time scan.  Bias tensors are small (N_expert * N_ff * 4 bytes,
+    // during this scan.  Bias tensors are small (N_expert * N_ff * 4 bytes,
     // typically a few hundred KB per layer), so the total host copy is negligible.
-    {
-        static std::once_flag bias_detect_flag;
-        std::call_once(bias_detect_flag, [&]() {
-            // Temporary collection of bias info before D2H copy
-            struct bias_capture {
-                int          layer;
-                const char * category;  // "gate", "up", or "down"
-                const void * device_ptr;
-                size_t       total_bytes;
-                size_t       nb;  // expert stride
-            };
-            std::vector<bias_capture> captures;
+    //
+    // Once per OWNER, not once per process (llama.cpp-nlww). This was a
+    // std::call_once, which cannot be reset, so the first MoE model in the
+    // process owned these per-layer pointers until module shutdown and a later
+    // model's layer 3 read the earlier model's layer 3 biases. The guard is now
+    // a bit in the owner-keyed state that an owner switch clears.
+    if (!ggml_sycl_moe_bias_scanned()) {
+        // Scanned into a local, then installed in one move. The D2H copies below
+        // allocate and wait on the queue, which must not happen under the state
+        // lock, and a scan that aborts partway must not have published anything.
+        ggml_sycl::moe_bias_activation_state scanned;
 
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                const ggml_tensor * node = cgraph->nodes[i];
-                if (node->op != GGML_OP_ADD_ID || !node->src[0] || node->src[0]->op != GGML_OP_MUL_MAT_ID) {
-                    continue;
-                }
-                // src[0] = MUL_MAT_ID result, src[1] = bias tensor, src[2] = expert IDs
-                const ggml_tensor * bias_tensor = node->src[1];
-                if (!bias_tensor || bias_tensor->type != GGML_TYPE_F32) {
-                    continue;
-                }
-                // The MUL_MAT_ID's src[0] is the weight tensor — its name tells us gate/up/down
-                const char * weight_name = node->src[0]->src[0] ? node->src[0]->src[0]->name : nullptr;
-                if (!weight_name) {
-                    continue;
-                }
-                const int layer = parse_layer_id_from_name(weight_name);
-                if (layer < 0) {
-                    continue;
-                }
+        // Temporary collection of bias info before D2H copy
+        struct bias_capture {
+            int                      layer;
+            ggml_sycl::moe_bias_slot slot;
+            const void *             device_ptr;
+            size_t                   total_bytes;
+            size_t                   nb;  // expert stride
+        };
 
-                const char * cat = nullptr;
-                if (strstr(weight_name, "ffn_gate")) {
-                    cat = "gate";
-                } else if (strstr(weight_name, "ffn_up")) {
-                    cat = "up";
-                } else if (strstr(weight_name, "ffn_down")) {
-                    cat = "down";
-                }
-                if (!cat) {
-                    continue;
-                }
+        std::vector<bias_capture> captures;
 
-                // Total bias bytes = n_expert * expert_bias_size
-                const size_t total_bytes = ggml_nbytes(bias_tensor);
-                captures.push_back({ layer, cat, bias_tensor->data, total_bytes, bias_tensor->nb[1] });
-
-                // Initialize layer entry with stride
-                auto & lb = g_moe_expert_biases[layer];
-                lb.nb     = bias_tensor->nb[1];
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_ADD_ID || !node->src[0] || node->src[0]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            // src[0] = MUL_MAT_ID result, src[1] = bias tensor, src[2] = expert IDs
+            const ggml_tensor * bias_tensor = node->src[1];
+            if (!bias_tensor || bias_tensor->type != GGML_TYPE_F32) {
+                continue;
+            }
+            // The MUL_MAT_ID's src[0] is the weight tensor — its name tells us gate/up/down
+            const char * weight_name = node->src[0]->src[0] ? node->src[0]->src[0]->name : nullptr;
+            if (!weight_name) {
+                continue;
+            }
+            const int layer = parse_layer_id_from_name(weight_name);
+            if (layer < 0) {
+                continue;
             }
 
-            // Copy all bias data from device to host
-            if (!captures.empty()) {
-                const queue_ptr stream       = sycl_ctx->stream();
-                const int       queue_device = ggml_sycl_get_device_id_from_queue(*stream);
-                g_moe_bias_host_copies.reserve(captures.size());
+            ggml_sycl::moe_bias_slot slot;
+            if (strstr(weight_name, "ffn_gate")) {
+                slot = ggml_sycl::MOE_BIAS_SLOT_GATE;
+            } else if (strstr(weight_name, "ffn_up")) {
+                slot = ggml_sycl::MOE_BIAS_SLOT_UP;
+            } else if (strstr(weight_name, "ffn_down")) {
+                slot = ggml_sycl::MOE_BIAS_SLOT_DOWN;
+            } else {
+                continue;
+            }
 
-                for (auto & cap : captures) {
-                    const size_t n_floats = cap.total_bytes / sizeof(float);
-                    g_moe_bias_host_copies.emplace_back(n_floats);
-                    auto & host_buf = g_moe_bias_host_copies.back();
+            // Total bias bytes = n_expert * expert_bias_size
+            const size_t total_bytes = ggml_nbytes(bias_tensor);
+            captures.push_back({ layer, slot, bias_tensor->data, total_bytes, bias_tensor->nb[1] });
+            scanned.set_layer_stride(layer, bias_tensor->nb[1]);
+        }
 
-                    // Check if source is already host-accessible
-                    const sycl::usm::alloc pt = ggml_sycl_get_alloc_type(cap.device_ptr);
-                    if (pt == sycl::usm::alloc::host || pt == sycl::usm::alloc::shared) {
-                        // Direct copy from host memory
-                        std::memcpy(host_buf.data(), cap.device_ptr, cap.total_bytes);
-                    } else if (cap.total_bytes > 0) {
-                        // D2H copy through host-pinned USM. Some Level Zero paths reject
-                        // pageable std::vector storage as a memcpy destination.
-                        ggml_sycl::mem_handle host_handle;
-                        if (!allocate_managed_host_pinned(
-                                *stream, queue_device, cap.total_bytes, ggml_sycl::alloc_role::STAGING,
-                                ggml_sycl::runtime_category::STAGING, "moe_bias_d2h", &host_handle)) {
-                            GGML_LOG_ERROR("[SYCL] Failed to allocate host-pinned expert bias staging (%zu bytes)\n",
-                                           cap.total_bytes);
-                            GGML_ABORT("expert bias host staging allocation failed");
-                        }
-                        ggml_sycl::mem_handle device_handle = ggml_sycl_copy_handle_for_raw_ptr(
-                            const_cast<void *>(cap.device_ptr), GGML_LAYOUT_AOS, queue_device);
-                        ggml_sycl::mem_copy(host_handle, device_handle, cap.total_bytes, *stream);
-                        stream->wait();
-                        void * staged_bias = host_handle.resolve().ptr;
-                        GGML_ASSERT(staged_bias != nullptr);
-                        std::memcpy(host_buf.data(), staged_bias, cap.total_bytes);
+        // Copy all bias data from device to host
+        if (!captures.empty()) {
+            const queue_ptr stream       = sycl_ctx->stream();
+            const int       queue_device = ggml_sycl_get_device_id_from_queue(*stream);
+            scanned.reserve_host_copies(captures.size());
+
+            for (auto & cap : captures) {
+                const size_t n_floats = cap.total_bytes / sizeof(float);
+                // A pointer, not a reference to the vector: the buffer survives
+                // the list growing, the vector object does not.
+                float *      host_buf = scanned.add_host_copy(n_floats);
+
+                // Check if source is already host-accessible
+                const sycl::usm::alloc pt = ggml_sycl_get_alloc_type(cap.device_ptr);
+                if (pt == sycl::usm::alloc::host || pt == sycl::usm::alloc::shared) {
+                    // Direct copy from host memory
+                    std::memcpy(host_buf, cap.device_ptr, cap.total_bytes);
+                } else if (cap.total_bytes > 0) {
+                    // D2H copy through host-pinned USM. Some Level Zero paths reject
+                    // pageable std::vector storage as a memcpy destination.
+                    ggml_sycl::mem_handle host_handle;
+                    if (!allocate_managed_host_pinned(
+                            *stream, queue_device, cap.total_bytes, ggml_sycl::alloc_role::STAGING,
+                            ggml_sycl::runtime_category::STAGING, "moe_bias_d2h", &host_handle)) {
+                        GGML_LOG_ERROR("[SYCL] Failed to allocate host-pinned expert bias staging (%zu bytes)\n",
+                                       cap.total_bytes);
+                        GGML_ABORT("expert bias host staging allocation failed");
                     }
-
-                    const float * host_ptr = host_buf.data();
-                    auto &        lb       = g_moe_expert_biases[cap.layer];
-                    if (strcmp(cap.category, "gate") == 0) {
-                        lb.gate_bias = host_ptr;
-                    } else if (strcmp(cap.category, "up") == 0) {
-                        lb.up_bias = host_ptr;
-                    } else {
-                        lb.down_bias = host_ptr;
-                    }
+                    ggml_sycl::mem_handle device_handle = ggml_sycl_copy_handle_for_raw_ptr(
+                        const_cast<void *>(cap.device_ptr), GGML_LAYOUT_AOS, queue_device);
+                    ggml_sycl::mem_copy(host_handle, device_handle, cap.total_bytes, *stream);
+                    stream->wait();
+                    void * staged_bias = host_handle.resolve().ptr;
+                    GGML_ASSERT(staged_bias != nullptr);
+                    std::memcpy(host_buf, staged_bias, cap.total_bytes);
+                    // host_handle's lease ends with this iteration; the owned
+                    // copy in `scanned` is what outlives it.
                 }
 
-                GGML_LOG_INFO(
-                    "[SYCL] Captured expert biases for %zu layers (%zu tensors, D2H copied) "
-                    "— fusion will apply biases inline\n",
-                    g_moe_expert_biases.size(), captures.size());
+                scanned.set_layer_bias(cap.layer, cap.slot, host_buf);
             }
-        });
+
+            GGML_LOG_INFO(
+                "[SYCL] Captured expert biases for %zu layers (%zu tensors, D2H copied) "
+                "— fusion will apply biases inline\n",
+                scanned.layer_count(), captures.size());
+        }
+
+        // Recorded even when the graph carried no bias tensors at all: an
+        // unbiased owner must remember that it looked, or every graph rescans.
+        // It is recorded under THIS owner, so the next one still scans its own.
+        scanned.biases_scanned = true;
+        ggml_sycl_moe_bias_publish(std::move(scanned));
     }
 
     // Pre-scan graph for MoE routing weights tensors.
@@ -88276,26 +88378,35 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         // Continue - graph_preload_moe_experts() will update pointer tables per ids
     }
 
-    // Detect MoE activation variant for fusion (only once).
-    // Scans for GLU ops in the graph and extracts swiglu_oai parameters.
-    if (g_moe_fused_act_variant.load(std::memory_order_acquire) < 0) {
+    // Detect MoE activation variant for fusion, once per OWNER (llama.cpp-nlww).
+    // Scans for GLU ops in the graph and extracts swiglu_oai parameters. The
+    // sentinel used to sit in a process-global that nothing reset, so a SILU
+    // model loaded after a SWIGLU_OAI model kept the earlier model's variant and
+    // its alpha/limit; it now lives in owner-keyed state that a switch clears.
+    if (!ggml_sycl_moe_act_detected()) {
+        // Scanned into locals, so a second thread's concurrent scan never sees
+        // a half-written variant/alpha/limit triple.
+        int   variant = ggml_sycl::moe_fused_act_undetected;
+        float alpha   = 0.0f;
+        float limit   = 0.0f;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             if (cgraph->nodes[i]->op == GGML_OP_GLU) {
                 const int glu_op = ggml_get_op_params_i32(cgraph->nodes[i], 0);
                 if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
-                    g_moe_fused_act_alpha = ggml_get_op_params_f32(cgraph->nodes[i], 2);
-                    g_moe_fused_act_limit = ggml_get_op_params_f32(cgraph->nodes[i], 3);
-                    g_moe_fused_act_variant.store(CPU_EXPERT_FUSED_ACT_SWIGLU_OAI, std::memory_order_release);
+                    alpha   = ggml_get_op_params_f32(cgraph->nodes[i], 2);
+                    limit   = ggml_get_op_params_f32(cgraph->nodes[i], 3);
+                    variant = CPU_EXPERT_FUSED_ACT_SWIGLU_OAI;
                 } else {
-                    g_moe_fused_act_variant.store(CPU_EXPERT_FUSED_ACT_SILU, std::memory_order_release);
+                    variant = CPU_EXPERT_FUSED_ACT_SILU;
                 }
                 break;
             }
         }
         // No GLU found — default to SiLU
-        if (g_moe_fused_act_variant.load(std::memory_order_acquire) < 0) {
-            g_moe_fused_act_variant.store(CPU_EXPERT_FUSED_ACT_SILU, std::memory_order_release);
+        if (variant == ggml_sycl::moe_fused_act_undetected) {
+            variant = CPU_EXPERT_FUSED_ACT_SILU;
         }
+        ggml_sycl_moe_act_publish(variant, alpha, limit);
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -98567,7 +98678,10 @@ static void ggml_sycl_reset_moe_module_state() {
     // drift out of step with it. What remains below is exactly what
     // install_fresh() deliberately does not own: the background prestage
     // thread, the device-resident predictors, the inventory-time VRAM reserve,
-    // the routing flags, and the bias registries.
+    // and the routing flags. The bias and fused-activation registries are no
+    // longer on that list -- install_fresh() owns them as of llama.cpp-nlww, so
+    // repeating their clear here would be the second copy this comment warns
+    // about.
     g_moe_live_discovery.install_fresh();
     g_adaptive_prestage.reset_after_stop();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
@@ -98577,8 +98691,6 @@ static void ggml_sycl_reset_moe_module_state() {
     g_moe_multi_gpu_active.store(false, std::memory_order_relaxed);
     g_moe_expert_split_active.store(false, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);
-    g_moe_expert_biases.clear();
-    g_moe_bias_host_copies.clear();
 }
 
 static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
@@ -98674,6 +98786,18 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
         std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
         g_moe_expert_meta.push_back({});
     }
+    // A biased owner with a non-default activation, so the clean gate below
+    // distinguishes "the bias cluster was torn down" from "nothing was ever
+    // there". Seeded through the same helpers the real scan uses.
+    {
+        ggml_sycl::moe_bias_activation_state seeded_bias;
+        float *                              seeded_copy = seeded_bias.add_host_copy(4);
+        seeded_bias.set_layer_stride(0, sizeof(float) * 4);
+        seeded_bias.set_layer_bias(0, ggml_sycl::MOE_BIAS_SLOT_GATE, seeded_copy);
+        seeded_bias.biases_scanned = true;
+        ggml_sycl_moe_bias_publish(std::move(seeded_bias));
+        ggml_sycl_moe_act_publish(CPU_EXPERT_FUSED_ACT_SWIGLU_OAI, 1.702f, 7.0f);
+    }
 }
 
 extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
@@ -98686,8 +98810,15 @@ extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
 }
 
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
+    // Taken before the meta lock and released immediately: g_moe_bias_state_mutex
+    // is strictly leaf (canonical §12.5), so it is never held across another.
+    bool bias_clean = false;
+    {
+        std::shared_lock<std::shared_mutex> bias_lock(g_moe_bias_state_mutex);
+        bias_clean = g_moe_bias_state.clean();
+    }
     std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-    return !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
+    return bias_clean && !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
            !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_moe_discovery_registry.has_active_owner() && g_moe_discovery_registry.parked_owner_count() == 0 &&
