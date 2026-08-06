@@ -10495,6 +10495,17 @@ static ggml_sycl::moe_owner_key ggml_sycl_moe_owner_key(const ggml_sycl::lifecyc
     return key;
 }
 
+// WARN, not INFO: upstream 67b2b7f2f maps GGML_LOG_LEVEL_INFO below the default
+// verbosity threshold, so an INFO line here would never reach a normal run --
+// and an unobservable report of a violated assumption is no report at all.
+static void ggml_sycl_moe_discovery_report(const char *                    op,
+                                           ggml_sycl::moe_owner_key        key,
+                                           ggml_sycl::moe_discovery_result result) {
+    GGML_LOG_WARN("[MOE-OWNER] %s did not take effect: result=%d model=%llu txn=%llu slot=%u generation=%llu\n", op,
+                  (int) result, (unsigned long long) key.model_id, (unsigned long long) key.load_txn_id, key.slot,
+                  (unsigned long long) key.slot_generation);
+}
+
 static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken owner) noexcept {
     try {
         ggml_sycl_plan_restoration_bundle restoration;
@@ -10518,7 +10529,22 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
         // active, so unloading A cannot disturb a live B. It runs before the
         // slot's resources go, because the live half holds observer pointers
         // into this model's tensors.
-        (void) g_moe_discovery_registry.release(ggml_sycl_moe_owner_key(owner));
+        const ggml_sycl::moe_owner_key moe_owner = ggml_sycl_moe_owner_key(owner);
+        const auto moe_result = ggml_sycl::moe_discovery_release_retrying(g_moe_discovery_registry, moe_owner);
+        // NOT_FOUND is the post-condition this call exists to establish, and the
+        // quarantine reaper legitimately retries a teardown that failed later,
+        // so it is a success here rather than something to warn about.
+        if (moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_OK &&
+            moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_NOT_FOUND) {
+            ggml_sycl_moe_discovery_report("model teardown MoE discovery release", moe_owner, moe_result);
+            // Fail closed. The live half still holds observer pointers into this
+            // model's tensors, so releasing its slot resources now would leave
+            // them dangling -- the exact property the comment above asserts.
+            // Returning false makes model_unloaded_token report EFFECT_FAILED,
+            // which routes the token to the existing quarantine reaper to be
+            // retried, rather than completing a teardown that did not happen.
+            return false;
+        }
         ggml_sycl_release_model_slot_resources(owner);
         return true;
     } catch (...) {
@@ -10913,7 +10939,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             // The committed model owns MoE discovery from here. Outside the
             // inventory lock: the outgoing owner's snapshot allocates, which
             // canonical §12 forbids under the publication locks.
-            (void) g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(result.token));
+            const ggml_sycl::moe_owner_key moe_owner = ggml_sycl_moe_owner_key(result.token);
+            const auto moe_result = ggml_sycl::moe_discovery_activate_retrying(g_moe_discovery_registry, moe_owner);
+            if (moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_OK &&
+                moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_UNCHANGED) {
+                // The load itself committed, so failing it here would be worse
+                // than reporting. But this model then has no discovery
+                // ownership, which means the previous owner's per-device guards
+                // stay set and this model will not re-run moe_hybrid_init_once
+                // -- the cross-model contamination this owner path exists to
+                // prevent. It must be visible when it happens.
+                ggml_sycl_moe_discovery_report("committed model MoE discovery activation", moe_owner, moe_result);
+            }
         }
         if (result.committed || (!result.committed && model)) {
             ggml_sycl_export_token(result.token, model);
@@ -12185,7 +12222,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model
         // Explicit A/B/A routing: hand this exact owner back its own discovery
         // rather than whatever the previously active model left behind. Outside
         // the inventory lock because parking the outgoing owner allocates.
-        (void) g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(token));
+        const ggml_sycl::moe_owner_key moe_owner = ggml_sycl_moe_owner_key(token);
+        const auto moe_result = ggml_sycl::moe_discovery_activate_retrying(g_moe_discovery_registry, moe_owner);
+        if (moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_OK &&
+            moe_result != ggml_sycl::MOE_DISCOVERY_RESULT_UNCHANGED) {
+            ggml_sycl_moe_discovery_report("explicit model activation MoE discovery", moe_owner, moe_result);
+            // Unlike the load-commit path this one has a caller-visible failure
+            // channel, and activation that did not transfer discovery ownership
+            // has not selected this model's authority. Report it rather than
+            // returning OK for a routing switch that half happened.
+            return GGML_SYCL_LIFECYCLE_BUSY;
+        }
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -98510,36 +98557,26 @@ static void ggml_sycl_reset_moe_module_state() {
     // Shutdown reservation proves graph/model quiescence. Clear every
     // module/model-bound MoE pointer registry and initialization authority so
     // RTLD_NODELETE reload rebuilds exclusively from the next model.
-    // Bookkeeping only. Module shutdown is the one point with no owner left for
-    // whom the live half could be preserved, so the process-global clear below
-    // is this function's job rather than the registry's.
+    //
+    // This drops the registry's bookkeeping only: module shutdown is the one
+    // point with no owner left for whom the live half could be preserved, so
+    // clearing that half is this function's job rather than the registry's.
     g_moe_discovery_registry.release_all_for_module_shutdown();
+    // The owner path already encodes what a pristine MoE working set is, so
+    // reuse it instead of maintaining a second copy of the same list that can
+    // drift out of step with it. What remains below is exactly what
+    // install_fresh() deliberately does not own: the background prestage
+    // thread, the device-resident predictors, the inventory-time VRAM reserve,
+    // the routing flags, and the bias registries.
+    g_moe_live_discovery.install_fresh();
     g_adaptive_prestage.reset_after_stop();
-    g_moe_warmup.reset();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        g_moe_hybrid_init_success[d].store(false, std::memory_order_relaxed);
         g_expert_predictors[d].reset();
-        g_moe_layer_seq[d].clear();
         g_moe_expert_vram_reserve[d] = 0;
     }
-    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);
     g_moe_multi_gpu_active.store(false, std::memory_order_relaxed);
     g_moe_expert_split_active.store(false, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);
-    g_prestage_completed.store(false, std::memory_order_relaxed);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        g_moe_expert_meta.clear();
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
-        g_expert_groups.clear();
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
-        g_expert_popularity.clear();
-        g_expert_popularity_initialized = false;
-    }
     g_moe_expert_biases.clear();
     g_moe_bias_host_copies.clear();
 }
@@ -98602,6 +98639,15 @@ static bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners() {
            g_cpu_expert_pools[0].is_active();
 }
 
+// Seeding that silently did nothing would make the module-reload clean gate pass
+// without ever having had state to clean, so a failed seed is reported.
+static void ggml_sycl_moe_discovery_seed_owner(const ggml_sycl::moe_owner_key & seeded) {
+    const auto result = ggml_sycl::moe_discovery_activate_retrying(g_moe_discovery_registry, seeded);
+    if (result != ggml_sycl::MOE_DISCOVERY_RESULT_OK) {
+        ggml_sycl_moe_discovery_report("module-reload seed", seeded, result);
+    }
+}
+
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return;
@@ -98613,11 +98659,11 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     seeded.load_txn_id     = 0x5eed0002u;
     seeded.slot            = 0;
     seeded.slot_generation = 1;
-    (void) g_moe_discovery_registry.activate(seeded);
+    ggml_sycl_moe_discovery_seed_owner(seeded);
     seeded.model_id    = 0x5eed0003u;
     seeded.load_txn_id = 0x5eed0004u;
     seeded.slot        = 1;
-    (void) g_moe_discovery_registry.activate(seeded);
+    ggml_sycl_moe_discovery_seed_owner(seeded);
     g_moe_hybrid_init_success[0].store(true, std::memory_order_relaxed);
     g_moe_hybrid_init_done.store(true, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(true, std::memory_order_relaxed);

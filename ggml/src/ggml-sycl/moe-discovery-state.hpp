@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace ggml_sycl {
@@ -317,6 +318,47 @@ class moe_discovery_registry {
     bool                       active_valid_ = false;
     bool                       transition_   = false;
 };
+
+// BUSY is reachable, not defensive dead code. Nothing above this registry
+// serializes owner transitions: sycl_module_mutation_guard is an admission
+// REFCOUNT rather than mutual exclusion, and two different owners' load and
+// teardown tickets are independent, so a load commit can overlap another
+// model's teardown. A transition only ever holds `transition_` across map
+// copies, so the window is microseconds; a bound this generous is exhausted
+// only by a genuinely stuck transition, which the caller must then treat as a
+// failure rather than as success.
+static constexpr int moe_discovery_transition_attempts = 4096;
+
+// Retry a BUSY transition, yielding between attempts. Every other result is
+// returned immediately -- INVALID_OWNER and NOT_FOUND are verdicts, not
+// contention.
+inline moe_discovery_result moe_discovery_activate_retrying(moe_discovery_registry & registry,
+                                                            const moe_owner_key &    owner,
+                                                            int attempts = moe_discovery_transition_attempts) noexcept {
+    moe_discovery_result result = MOE_DISCOVERY_RESULT_BUSY;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        result = registry.activate(owner);
+        if (result != MOE_DISCOVERY_RESULT_BUSY) {
+            return result;
+        }
+        std::this_thread::yield();
+    }
+    return result;
+}
+
+inline moe_discovery_result moe_discovery_release_retrying(moe_discovery_registry & registry,
+                                                           const moe_owner_key &    owner,
+                                                           int attempts = moe_discovery_transition_attempts) noexcept {
+    moe_discovery_result result = MOE_DISCOVERY_RESULT_BUSY;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        result = registry.release(owner);
+        if (result != MOE_DISCOVERY_RESULT_BUSY) {
+            return result;
+        }
+        std::this_thread::yield();
+    }
+    return result;
+}
 
 }  // namespace ggml_sycl
 

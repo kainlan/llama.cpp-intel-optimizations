@@ -3864,7 +3864,6 @@ set_tests_properties(sycl-moe-discovery-owner-state PROPERTIES
     TIMEOUT 30
 )
 
-
 # AST/control-flow contract plus executable mutation matrix. tree-sitter parses
 # active C++ nodes, so comments and literals cannot spoof reset/TLS/order checks.
 # Python is test-only: its absence must not break a clean SYCL configuration.

@@ -11,9 +11,12 @@
 
 #include "moe-discovery-state.hpp"
 
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using ggml_sycl::moe_discovery_parked_state;
@@ -330,6 +333,121 @@ static void case_reentrant_transition_is_refused() {
     check(registry.is_active_owner(a), "a refused re-entrant call displaced the owner being installed");
 }
 
+// A live state that blocks inside install_fresh until it is released, so a
+// transition can be held genuinely mid-flight while another thread tries one.
+struct blocking_live_state : public fake_live_state {
+    void install_fresh() noexcept override {
+        fake_live_state::install_fresh();
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        entered_cv.notify_all();
+        release_cv.wait(lock, [this] { return released; });
+    }
+
+    void wait_until_entered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered_cv.wait(lock, [this] { return entered; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            released = true;
+        }
+        release_cv.notify_all();
+    }
+
+    std::mutex              mutex;
+    std::condition_variable entered_cv;
+    std::condition_variable release_cv;
+    bool                    entered  = false;
+    bool                    released = false;
+};
+
+// Owns the blocked transition for the duration of a case. On scope exit it
+// RELEASES BEFORE JOINING, in that order: a failing check unwinds through here
+// while the transition thread is still parked inside install_fresh, so a plain
+// join would deadlock and a plain destructor would terminate on a joinable
+// thread. Both turn a legible FAIL into a timeout or an abort.
+struct held_transition {
+    held_transition(blocking_live_state & live, std::thread thread) : live_(live), thread_(std::move(thread)) {}
+
+    ~held_transition() { finish(); }
+
+    // Idempotent: release() only sets a flag and notifies.
+    void finish() {
+        live_.release();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    blocking_live_state & live_;
+    std::thread           thread_;
+};
+
+static void case_retry_helper_gives_up_on_a_stuck_transition() {
+    blocking_live_state    live;
+    moe_discovery_registry registry(live);
+
+    const moe_owner_key a = owner_of(1, 0, 1);
+    const moe_owner_key b = owner_of(2, 1, 1);
+
+    held_transition holder(live, std::thread([&] { (void) registry.activate(a); }));
+    live.wait_until_entered();
+
+    // The transition never completes within the bound, so the helper must
+    // report BUSY rather than report a transition that did not happen.
+    check(ggml_sycl::moe_discovery_activate_retrying(registry, b, 4) == ggml_sycl::MOE_DISCOVERY_RESULT_BUSY,
+          "a stuck transition did not make the activation retry helper give up");
+    check(ggml_sycl::moe_discovery_release_retrying(registry, b, 4) == ggml_sycl::MOE_DISCOVERY_RESULT_BUSY,
+          "a stuck transition did not make the release retry helper give up");
+    check(!registry.is_active_owner(b), "a helper that reported BUSY still transferred ownership");
+    check(registry.parked_owner_count() == 0, "a helper that reported BUSY still parked state");
+
+    holder.finish();
+    check(registry.is_active_owner(a), "the held transition did not complete after being released");
+}
+
+static void case_retry_helper_succeeds_once_the_transition_clears() {
+    blocking_live_state    live;
+    moe_discovery_registry registry(live);
+
+    const moe_owner_key a = owner_of(1, 0, 1);
+    const moe_owner_key b = owner_of(2, 1, 1);
+
+    held_transition holder(live, std::thread([&] { (void) registry.activate(a); }));
+    live.wait_until_entered();
+
+    // Deliberately sequenced rather than racing a releaser thread against the
+    // retry bound: spawning that thread can itself take longer than the bound,
+    // which made this case fail ~25% of runs. Held-then-cleared is the property
+    // worth asserting, and it is the one that can be asserted deterministically.
+    check(ggml_sycl::moe_discovery_activate_retrying(registry, b, 4) == ggml_sycl::MOE_DISCOVERY_RESULT_BUSY,
+          "the transition under test was not actually in flight");
+    holder.finish();
+
+    check(ggml_sycl::moe_discovery_activate_retrying(registry, b) == ggml_sycl::MOE_DISCOVERY_RESULT_OK,
+          "the retry helper did not recover once the in-flight transition cleared");
+    check(registry.is_active_owner(b), "the recovered transition did not transfer ownership");
+    check(registry.has_parked_owner(a), "the recovered transition did not park the previous owner");
+}
+
+static void case_retry_helper_returns_verdicts_immediately() {
+    fake_live_state        live;
+    moe_discovery_registry registry(live);
+
+    // INVALID_OWNER and NOT_FOUND are answers, not contention: retrying them
+    // would spin the full bound on every unattributed or already-retired token.
+    const moe_owner_key unattributed;
+    check(ggml_sycl::moe_discovery_activate_retrying(registry, unattributed, 1) ==
+              ggml_sycl::MOE_DISCOVERY_RESULT_INVALID_OWNER,
+          "the retry helper did not pass an invalid owner straight through");
+    check(ggml_sycl::moe_discovery_release_retrying(registry, owner_of(3, 2, 1), 1) ==
+              ggml_sycl::MOE_DISCOVERY_RESULT_NOT_FOUND,
+          "the retry helper did not pass NOT_FOUND straight through");
+}
+
 int main() {
     struct test_case {
         const char * name;
@@ -349,6 +467,9 @@ int main() {
         { "owner-slot-exhaustion",          case_owner_slots_exhaust_without_leaking_state              },
         { "module-shutdown",                case_module_shutdown_drops_bookkeeping_only                 },
         { "reentrant-transition-refused",   case_reentrant_transition_is_refused                        },
+        { "retry-gives-up-on-stuck",        case_retry_helper_gives_up_on_a_stuck_transition            },
+        { "retry-recovers-when-cleared",    case_retry_helper_succeeds_once_the_transition_clears       },
+        { "retry-passes-verdicts-through",  case_retry_helper_returns_verdicts_immediately              },
     };
 
     for (const test_case & entry : cases) {

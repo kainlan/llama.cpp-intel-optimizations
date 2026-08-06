@@ -87,6 +87,9 @@ def evaluate(backend, registry):
     live_restore    = member_body_of(backend, "    void restore(std::unique_ptr<ggml_sycl::moe_discovery_parked_state> parked)")
     live_fresh      = member_body_of(backend, "    void install_fresh(")
     owner_key_impl  = body_of(backend, "static ggml_sycl::moe_owner_key ggml_sycl_moe_owner_key(")
+    report_impl     = body_of(backend, "static void ggml_sycl_moe_discovery_report(")
+    seed_impl       = body_of(backend, 'extern "C" void ggml_backend_sycl_test_seed_moe_module_state(')
+    seed_helper     = body_of(backend, "static void ggml_sycl_moe_discovery_seed_owner(")
     teardown_impl   = body_of(backend, "static bool ggml_sycl_teardown_owner_effects(")
     load_end_impl   = body_of(backend, "ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(")
     activate_impl   = body_of(backend, "ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(")
@@ -106,6 +109,9 @@ def evaluate(backend, registry):
         "live discovery restore() body": live_restore,
         "live discovery install_fresh() body": live_fresh,
         "ggml_sycl_moe_owner_key body": owner_key_impl,
+        "ggml_sycl_moe_discovery_report body": report_impl,
+        "ggml_backend_sycl_test_seed_moe_module_state body": seed_impl,
+        "ggml_sycl_moe_discovery_seed_owner body": seed_helper,
         "ggml_sycl_teardown_owner_effects body": teardown_impl,
         "ggml_backend_sycl_model_load_end body": load_end_impl,
         "ggml_backend_sycl_activate_model_plan body": activate_impl,
@@ -149,18 +155,21 @@ def evaluate(backend, registry):
         # The three lifecycle hooks, and where they sit relative to the locks.
         "a committed load takes MoE discovery ownership":
             ordered(load_end_impl, "if (result.committed) {",
-                    "g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(result.token));"),
+                    "ggml_sycl_moe_owner_key(result.token)",
+                    "moe_discovery_activate_retrying(g_moe_discovery_registry, moe_owner)"),
         "explicit activation hands the owner back its own discovery":
-            "g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(token));" in activate_impl,
+            "ggml_sycl_moe_owner_key(token)" in activate_impl
+            and "moe_discovery_activate_retrying(g_moe_discovery_registry, moe_owner)" in activate_impl,
         "explicit activation transitions outside the publication lock":
             ordered(activate_impl, "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);",
                     "ggml_sycl_publish_plan_locked(snapshot);", "}",
-                    "g_moe_discovery_registry.activate("),
+                    "moe_discovery_activate_retrying("),
         "model teardown releases exactly one owner, before its slot resources go":
-            ordered(teardown_impl, "g_moe_discovery_registry.release(ggml_sycl_moe_owner_key(owner));",
+            ordered(teardown_impl, "ggml_sycl_moe_owner_key(owner)",
+                    "moe_discovery_release_retrying(g_moe_discovery_registry, moe_owner)",
                     "ggml_sycl_release_model_slot_resources(owner);"),
         "teardown releases by owner rather than clearing the cluster":
-            "g_moe_discovery_registry.release(" in teardown_impl
+            "moe_discovery_release_retrying(g_moe_discovery_registry" in teardown_impl
             and "ggml_sycl_reset_moe_module_state" not in teardown_impl,
 
         # No isolated global clears on the load boundary (the k7b0 ruling).
@@ -183,6 +192,38 @@ def evaluate(backend, registry):
         "releasing a token that owns nothing is reported, not silently swept":
             "MOE_DISCOVERY_RESULT_NOT_FOUND" in registry_release,
 
+        # A transition that did not take effect must be actionable, not discarded.
+        "no integration site discards the transition result":
+            all("(void) g_moe_discovery_registry." not in body
+                for body in (teardown_impl, load_end_impl, activate_impl)),
+        "the module-reload seed drives the registry through the same helper":
+            "ggml_sycl_moe_discovery_seed_owner(" in seed_impl
+            and "moe_discovery_activate_retrying(" in seed_helper
+            and "ggml_sycl_moe_discovery_report(" in seed_helper,
+        "every integration site retries a BUSY transition before giving up":
+            "moe_discovery_release_retrying(" in teardown_impl
+            and "moe_discovery_activate_retrying(" in load_end_impl
+            and "moe_discovery_activate_retrying(" in activate_impl,
+        "failed transitions are reported at WARN, which survives default verbosity":
+            "GGML_LOG_WARN(" in report_impl and "GGML_LOG_INFO(" not in report_impl,
+        "every integration site reports a transition that did not take effect":
+            all("ggml_sycl_moe_discovery_report(" in body
+                for body in (teardown_impl, load_end_impl, activate_impl)),
+        "model teardown fails closed instead of releasing slot resources anyway":
+            ordered(teardown_impl, "moe_discovery_release_retrying(",
+                    "ggml_sycl_moe_discovery_report(", "return false;",
+                    "ggml_sycl_release_model_slot_resources(owner);"),
+        "teardown treats NOT_FOUND as the post-condition, not a failure":
+            "MOE_DISCOVERY_RESULT_NOT_FOUND" in teardown_impl,
+        "explicit activation reports BUSY rather than OK for a half-done switch":
+            "return GGML_SYCL_LIFECYCLE_BUSY;" in activate_impl,
+
+        # The clear list lives in one place.
+        "module shutdown reuses the owner path's clear list":
+            "g_moe_live_discovery.install_fresh();" in module_reset
+            and "g_moe_hybrid_init_done.store(false" not in module_reset
+            and "g_expert_popularity.clear();" not in module_reset,
+
         # The existing module-reload gate covers the new state too.
         "the module-reload clean gate checks the registry is empty":
             "g_moe_discovery_registry.parked_owner_count() == 0" in backend
@@ -203,6 +244,12 @@ ABSENCE_MUTANTS = {
     "the all-owner sweep exists only in module shutdown": (
         "    g_adaptive_prestage.reset_after_stop();",
         "    g_moe_discovery_registry.release_all_for_module_shutdown();\n    g_adaptive_prestage.reset_after_stop();"),
+    "no integration site discards the transition result": (
+        "        ggml_sycl_release_model_slot_resources(owner);",
+        "        (void) g_moe_discovery_registry.activate(moe_owner);\n        ggml_sycl_release_model_slot_resources(owner);"),
+    "module shutdown reuses the owner path's clear list": (
+        "    g_adaptive_prestage.reset_after_stop();",
+        "    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);\n    g_adaptive_prestage.reset_after_stop();"),
 }
 
 
