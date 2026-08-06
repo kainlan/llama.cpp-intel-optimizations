@@ -398,9 +398,11 @@ int main() {
     bool ok = true;
     ok &= test_normal_cache_expert_resolution(q);
     ok &= test_direct_staged_device_resolution(q);
-    ok &= test_direct_host_and_miss_resolution(q);
-    ok &= test_expert_staging_host_compute_zone_ownership(q);
-    ok &= test_planner_role_specific_expert_placement();
+    // Keep the global-cache / ready-event chaining coverage ahead of the
+    // temporary tiny-budget cache test below. That local cache intentionally
+    // forces fallback/no-arena paths and tears down a separate cache owner,
+    // which is useful coverage on its own but should not perturb the later
+    // global-cache MoE staging chain assertions.
     ok &= test_moe_route_preserves_ready_event_for_chaining();
     ok &= test_moe_ptr_table_retains_route_lease_until_event();
     ok &= test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
@@ -408,6 +410,9 @@ int main() {
     ok &= test_moe_ptr_table_does_not_persist_pointer_cache();
     ok &= test_moe_ptr_table_lease_covers_populated_slots();
     ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
+    ok &= test_direct_host_and_miss_resolution(q);
+    ok &= test_expert_staging_host_compute_zone_ownership(q);
+    ok &= test_planner_role_specific_expert_placement();
 
     printf("\nSYCL MoE handle resolution tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

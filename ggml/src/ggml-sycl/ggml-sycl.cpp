@@ -96536,7 +96536,34 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
     } catch (const ggml_sycl_fallback_error & error) {
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
-        ggml_backend_sycl_graph_boundary_exception_cleanup(cleanup_ctx, "recoverable runtime fallback", error.what());
+        try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
+        if (cleanup_ctx) {
+            try { ggml_sycl_execution_quarantine_graph(cleanup_ctx); } catch (...) {}
+            try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
+            try {
+                if (cleanup_ctx->last_graph_event) {
+                    cleanup_ctx->last_graph_event->wait_and_throw();
+                }
+            } catch (...) {
+            }
+            try {
+                if (cleanup_ctx->stream()) {
+                    cleanup_ctx->stream()->wait_and_throw();
+                }
+            } catch (...) {
+            }
+            try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
+            try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
+            try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
+            cleanup_ctx->last_graph_event.reset();
+            cleanup_ctx->last_graph_event_deferred_decode = false;
+        }
+        g_ggml_sycl_graph_recording = false;
+        g_recording_graph_ptr       = nullptr;
+        g_recording_queue_ptr       = nullptr;
+        ggml_sycl::set_graph_retained_handle_sink(nullptr);
+        ggml_sycl::unified_cache_set_graph_compute_active(false);
+        GGML_LOG_ERROR("[SYCL] recoverable runtime fallback failed: %s\n", error.what());
         return GGML_STATUS_FAILED;
     } catch (const std::exception & exc) {
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
