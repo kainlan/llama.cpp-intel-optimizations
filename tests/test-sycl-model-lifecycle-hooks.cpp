@@ -29,8 +29,9 @@
 //
 //   llama_model_free
 //     -> ~llama_model                              (llama-model.cpp)
-//        -> ggml_backend_sycl_model_unloaded(slot)
-//           -> ggml_sycl::unified_cache_release_model_slot(slot)
+//        -> hooks.unload(token)
+//           -> ggml_backend_sycl_model_unloaded_token(token)
+//              -> ggml_sycl::unified_cache_release_model_slot(token.slot)
 //
 // Each link has its own way of silently disappearing: the #ifdef GGML_USE_SYCL
 // around the destructor hook, llama_model_sycl_hooks_enabled(), the
