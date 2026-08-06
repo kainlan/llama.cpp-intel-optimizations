@@ -342,14 +342,16 @@ moe_ptr_table_plan moe_build_ptr_table_plan(const std::vector<moe_control_tensor
                   return a.tensor_name < b.tensor_name;
               });
 
+    // The alignment goes through checked_align rather than being open-coded:
+    // moe_build_context_control_layout re-derives these same three values with
+    // these same helpers and REFUSES the plan when they disagree, so a second
+    // spelling of the rounding here would show up as a metadata mismatch on a
+    // plan that is actually fine. Short-circuit leaves the later fields at 0,
+    // which is what the overflow flag already means.
     if (!moe_checked_pool_bytes(static_cast<size_t>(plan.n_expert), sizeof(void *), &plan.table_bytes) ||
-        plan.table_bytes > std::numeric_limits<size_t>::max() - (k_control_alignment - 1)) {
+        !checked_align(plan.table_bytes, &plan.table_stride_bytes) ||
+        !moe_checked_pool_bytes(plan.entries.size(), plan.table_stride_bytes, &plan.total_bytes)) {
         plan.arithmetic_overflow = true;
-    } else {
-        plan.table_stride_bytes = (plan.table_bytes + k_control_alignment - 1) & ~(k_control_alignment - 1);
-        if (!moe_checked_pool_bytes(plan.entries.size(), plan.table_stride_bytes, &plan.total_bytes)) {
-            plan.arithmetic_overflow = true;
-        }
     }
 
     plan.index_by_name.reserve(plan.entries.size());
@@ -358,6 +360,13 @@ moe_ptr_table_plan moe_build_ptr_table_plan(const std::vector<moe_control_tensor
         entry.table_index                = i;
         entry.byte_size                  = plan.table_bytes;
         if (!plan.arithmetic_overflow) {
+            // Bare multiply on purpose: entries.size() * table_stride_bytes was
+            // just checked into total_bytes, and i < entries.size(), so this
+            // product is strictly below a value already proven not to overflow.
+            // Routing it through moe_checked_pool_bytes would add a branch that
+            // provably cannot be taken. If the guard above is ever loosened,
+            // this line stops being safe -- it depends on that check, not on
+            // its own bounds.
             entry.byte_offset = i * plan.table_stride_bytes;
         }
         plan.index_by_name.emplace(entry.tensor_name, i);
@@ -390,10 +399,13 @@ moe_context_control_layout moe_build_context_control_layout(const moe_ptr_table_
         layout.metadata_mismatch = true;
         return layout;
     }
-    if (!plan.entries.empty() && (plan.n_expert <= 0 || n_expert_used == 0 || n_expert_used > plan.n_expert ||
-                                  n_ubatch == 0 || !plan.structurally_complete ||
-                                  plan.malformed_expert_candidate_count != 0 || plan.conflicting_duplicate_count != 0 ||
-                                  plan.missing_role_count != 0 || plan.index_by_name.size() != plan.entries.size())) {
+    // Role COMPLETENESS is not checked here -- it is enforced per layer by the
+    // layer_role_masks pass below, which is the only place that can see which
+    // roles a layer actually accumulated.
+    if (!plan.entries.empty() &&
+        (plan.n_expert <= 0 || n_expert_used == 0 || n_expert_used > plan.n_expert || n_ubatch == 0 ||
+         !plan.structurally_complete || plan.malformed_expert_candidate_count != 0 ||
+         plan.conflicting_duplicate_count != 0 || plan.index_by_name.size() != plan.entries.size())) {
         layout.metadata_mismatch = true;
         return layout;
     }

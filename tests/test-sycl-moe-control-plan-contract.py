@@ -21,7 +21,7 @@ Every check below fails against the pre-dimc tree. Run it that way to confirm:
 
 The `anchors` section proves every string the checks key off exists, so a
 renamed symbol reports a missing anchor instead of passing vacuously. Run with
---self-test to prove the four absence-based checks fire against mutants.
+--self-test to prove the five absence-based checks fire against mutants.
 """
 import argparse
 import re
@@ -243,6 +243,14 @@ ABSENCE_MUTANTS = {
         "module",
         '#include "moe-control-plan.hpp"',
         '#include "moe-control-plan.hpp"\n#include <sycl/sycl.hpp>'),
+    # The regression this guards actually happened during development: gating on
+    # gpu_eligible makes a dense model -- valid layout, nothing to route -- come
+    # back as UNSIZABLE, which refuses the RUNTIME zone on every non-MoE model.
+    # The mutant is that exact mistake.
+    "the requirement keys on layout validity, not GPU eligibility": (
+        "module",
+        "    requirement.valid = layout.valid;",
+        "    requirement.valid = layout.valid && layout.gpu_eligible;"),
 }
 
 

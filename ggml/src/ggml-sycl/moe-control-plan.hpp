@@ -125,7 +125,6 @@ struct moe_ptr_table_plan {
     size_t                                  conflicting_duplicate_count      = 0;
     size_t                                  malformed_expert_candidate_count = 0;
     size_t                                  non_moe_ignored_count            = 0;
-    size_t                                  missing_role_count               = 0;
     bool                                    arithmetic_overflow              = false;
     bool                                    structurally_complete            = false;
 
@@ -223,6 +222,29 @@ struct moe_context_control_device_plan {
     bool               admitted        = false;
     moe_control_reason reason          = moe_control_reason::RUNTIME_CAPACITY;
 };
+
+// ---------------------------------------------------------------------------
+// Per-plan reservation and conversion ledger.
+//
+// STAGED ATTACHMENT SEAM -- LIVE BUT UNCALLED BY DESIGN. DO NOT DELETE AS DEAD
+// CODE. Everything from here to moe_control_reservation_state_for() has no
+// production caller yet, and that is the intended state, not an oversight.
+//
+// The sizing half of this module IS reached on every model load: the planner
+// calls moe_build_ptr_table_plan / moe_build_context_control_layout and the
+// RUNTIME zone sums the result. What is missing is the CONSUMER of a reserved
+// pool -- moe_context_control_pool_registry and the pointer-table publication
+// it feeds. Those were excluded from the llama.cpp-dimc port on purpose (the
+// c-4up7 reconciliation ruling) and are tracked as llama.cpp-0ywi, which
+// attaches to exactly these entry points.
+//
+// The ledger landed with that follow-up rather than inside it because the
+// admission arithmetic and the rollback protocol are the parts worth proving in
+// isolation, and they are: tests/test-moe-control-plan.cpp drives every state
+// transition below, including the ones a consumer would reach only under a
+// failed allocation. Deleting this block would discard that and force the
+// follow-up to re-derive it against a live allocator instead.
+// ---------------------------------------------------------------------------
 
 // Pure admission arithmetic: no ledger, no lock, same answer for the same
 // arguments. moe_reserve_context_control is the one that records.
