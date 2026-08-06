@@ -137,7 +137,8 @@ if (BUILD_TESTING)
     set_tests_properties(sycl-lifecycle-runtime-host PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
     add_executable(test-sycl-lifecycle-owner-reset
         tests/test-sycl-lifecycle-owner-reset.cpp
-        execution-lifecycle.cpp)
+        execution-lifecycle.cpp
+        model-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-owner-reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test-sycl-lifecycle-owner-reset PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-owner-reset PROPERTIES
@@ -149,7 +150,13 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-h13 COMMAND test-sycl-lifecycle-owner-reset --case H13)
     add_test(NAME sycl-lifecycle-m6 COMMAND test-sycl-lifecycle-owner-reset --case M6)
     add_test(NAME sycl-lifecycle-g2 COMMAND test-sycl-lifecycle-owner-reset --case G2)
-    set_tests_properties(sycl-lifecycle-owner-reset sycl-lifecycle-h6 sycl-lifecycle-h7 sycl-lifecycle-h11 sycl-lifecycle-h13 sycl-lifecycle-m6 sycl-lifecycle-g2 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    add_test(NAME sycl-lifecycle-h5 COMMAND test-sycl-lifecycle-owner-reset --case H5)
+    add_test(NAME sycl-lifecycle-h14 COMMAND test-sycl-lifecycle-owner-reset
+        --case teardown-repeat --case teardown-unknown-model --case teardown-stale-slot-generation
+        --case teardown-unknown-context --case teardown-never-issued-session
+        --case teardown-never-issued-graph-epoch --case teardown-stale-context
+        --case teardown-stale-session --case teardown-stale-graph-epoch)
+    set_tests_properties(sycl-lifecycle-owner-reset sycl-lifecycle-h5 sycl-lifecycle-h6 sycl-lifecycle-h7 sycl-lifecycle-h11 sycl-lifecycle-h13 sycl-lifecycle-h14 sycl-lifecycle-m6 sycl-lifecycle-g2 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
     add_executable(test-sycl-lifecycle-event-lease
         tests/test-sycl-lifecycle-event-lease.cpp
         execution-lifecycle.cpp)
@@ -287,6 +294,9 @@ if (BUILD_TESTING)
 
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
+    add_test(NAME sycl-teardown-sequence-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-teardown-sequence-contract.py)
+    set_tests_properties(sycl-teardown-sequence-contract PROPERTIES LABELS "sycl;execution;lifecycle;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation

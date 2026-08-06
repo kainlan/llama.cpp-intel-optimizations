@@ -9715,6 +9715,8 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
+static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
+static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
                                                                const char *                what) noexcept;
@@ -9828,6 +9830,39 @@ static void ggml_sycl_execution_for_each_bound_backend(uint64_t context_id, F &&
     for (auto & pin : snapshot) {
         if (pin.backend && pin.binding) {
             fn(pin.backend, *pin.binding);
+        }
+        ggml_sycl_execution_release_backend_pin(pin);
+    }
+}
+
+// Model teardown must reach exactly the backends whose execution root is the
+// dying owner. A device-indexed or all-binding sweep would drop another live
+// model's graph leases, which canonical §12.4 forbids. The owner comparison is
+// the full ModelToken, so a reused slot with a newer generation does not match.
+template<typename F>
+static void ggml_sycl_execution_for_each_backend_owned_by(const ggml_sycl::lifecycle::ModelToken & owner, F && fn) {
+    if (owner.model.value == 0 || owner.load.value == 0) {
+        return;
+    }
+    std::vector<ggml_sycl_execution_bound_backend_pin> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        snapshot.reserve(g_execution_backend_bindings.size());
+        for (const auto & [backend, binding] : g_execution_backend_bindings) {
+            if (!backend || !binding || binding->draining) {
+                continue;
+            }
+            ++binding->pin_count;
+            snapshot.push_back({ backend, binding });
+        }
+    }
+    for (auto & pin : snapshot) {
+        if (pin.backend) {
+            const auto state = ggml_sycl_take_execution_state_snapshot(pin.backend);
+            if (state.root_model_id == owner.model.value && state.root_load_txn_id == owner.load.value &&
+                state.root_slot == owner.owner.slot && state.root_slot_generation == owner.owner.generation) {
+                fn(pin.backend);
+            }
         }
         ggml_sycl_execution_release_backend_pin(pin);
     }
@@ -9949,11 +9984,18 @@ static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::Mo
     }
 }
 
+// Defined next to sycl_exec_graph_clear_active(), whose cleanup it mirrors for
+// one owner instead of every device.
+static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept;
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
-    // Graph replay teardown is deliberately not swept across all devices here;
-    // slot-scoped graph ownership belongs to downstream 1q72/o6jx.
+    // Graph replay leases pin this owner's weight/MoE cache entries, so they
+    // must be dropped before the slot is reclaimed or reclaim_weight_entries()
+    // reports them as leaked. The release is owner-targeted (canonical §12.4):
+    // a backend still rooted on another live model keeps its graph.
+    ggml_sycl_release_graph_leases_for_owner(owner);
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
@@ -11658,6 +11700,69 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_begin_drain(ggml_
     }
 }
 
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_drain_terminal_events(
+    ggml_sycl_exec_context_id context) {
+    try {
+        sycl_module_mutation_guard module_guard;
+        if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
+        ggml_sycl_execution_wrapper_failpoint_maybe_throw();
+        if (context.value == 0) {
+            return GGML_SYCL_EXECUTION_STALE;
+        }
+        // An unknown or already-closed context is a typed no-op, never a sweep.
+        // Repeating the wait on a live context is idempotent.
+        ggml_sycl::execution::snapshot snapshot{};
+        const auto rc = ggml_sycl::execution::global_registry().extract({ context.value }, &snapshot);
+        if (rc != ggml_sycl::execution::error::OK) {
+            return ggml_sycl_execution_c_result(rc);
+        }
+        ggml_sycl_execution_drain_context_terminal_events(context.value);
+        return GGML_SYCL_EXECUTION_OK;
+    } catch (const std::bad_alloc &) {
+        return ggml_sycl_execution_caught_bad_alloc();
+    } catch (const std::exception &) {
+        return ggml_sycl_execution_caught_internal();
+    } catch (...) {
+        return ggml_sycl_execution_caught_internal();
+    }
+}
+
+ggml_sycl_execution_result ggml_backend_sycl_execution_context_release_control_host_allocs(
+    ggml_sycl_exec_drain_ticket ticket, ggml_sycl_exec_control_host_alloc_batch * batch) {
+    try {
+        sycl_module_mutation_guard module_guard;
+        if (!module_guard) return GGML_SYCL_EXECUTION_BUSY;
+        ggml_sycl_execution_wrapper_failpoint_maybe_throw();
+        if (!batch) {
+            return GGML_SYCL_EXECUTION_NULL_OUTPUT;
+        }
+        auto * storage = static_cast<ggml_sycl_control_host_alloc_batch_storage *>(batch->opaque);
+        if (!storage || storage->context_id != ticket.context_id.value || storage->serial != ticket.serial ||
+            storage->session_id != ticket.session_id.value || storage->reset_epoch != ticket.reset_epoch.value) {
+            return GGML_SYCL_EXECUTION_STALE;
+        }
+        // The extracted batch is already detached from every backend, so the
+        // final mem_handle destructors below run with no control-host, cache or
+        // registry lock held. finish_drain() still consumes the emptied shell
+        // and re-checks the same ticket identity.
+        decltype(storage->entries) retired;
+        retired.swap(storage->entries);
+        for (auto & backend_entries : retired) {
+            for (auto & alloc : backend_entries) {
+                alloc.owner = {};
+                alloc.ptr   = nullptr;
+            }
+        }
+        return GGML_SYCL_EXECUTION_OK;
+    } catch (const std::bad_alloc &) {
+        return ggml_sycl_execution_caught_bad_alloc();
+    } catch (const std::exception &) {
+        return ggml_sycl_execution_caught_internal();
+    } catch (...) {
+        return ggml_sycl_execution_caught_internal();
+    }
+}
+
 ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs(
     ggml_sycl_exec_drain_ticket * ticket, ggml_sycl_exec_control_host_alloc_batch * batch) {
     try {
@@ -12221,6 +12326,49 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
     ggml_sycl_execution_quarantine_graph(ctx);
     (void) ggml_sycl_execution_release_graph(ctx);
     ggml_sycl_execution_clear_graph_tracking(ctx);
+}
+
+// The unlocked terminal wait of the teardown sequence, scoped to one context.
+//
+// A context that ran graphs still owns its per-device execution token when the
+// caller reaches teardown: the deferred-decode exit path leaves the invocation
+// live until a synchronize, and a recording pass that never submitted leaves it
+// live outright. close_if_idle()/finish_drain() then report DEVICE_BUSY. Waiting
+// here and releasing the exact invocation is what makes the drain legal, and it
+// is confined to backends bound to this context -- other contexts and other
+// devices are untouched (canonical §12.4).
+//
+// ggml_sycl_execution_for_each_bound_backend() pins its snapshot under the
+// binding lock and releases the lock before the callback, so every queue wait
+// and every final handle destruction below happens outside all ranked locks.
+static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {
+    if (context_id == 0) {
+        return;
+    }
+    ggml_sycl_execution_for_each_bound_backend(
+        context_id, [](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
+            try {
+                if (backend_ctx->last_graph_event.has_value() && backend_ctx->last_graph_event_deferred_decode) {
+                    backend_ctx->last_graph_event->wait_and_throw();
+                } else if (const queue_ptr stream = backend_ctx->stream(backend_ctx->device, 0)) {
+                    stream->wait_and_throw();
+                }
+            } catch (...) {
+                // Enqueue status is now uncertain for this device. Fall through
+                // to the quarantine path, which retains every root/backing lease
+                // instead of releasing on an unproven terminal.
+            }
+            backend_ctx->last_graph_event.reset();
+            backend_ctx->last_graph_event_deferred_decode = false;
+            if (!ggml_sycl_execution_release_graph(backend_ctx)) {
+                ggml_sycl_execution_abort_and_release_graph(backend_ctx);
+            }
+            ggml_sycl_execution_try_retire_terminal(backend_ctx);
+            // The recorded executable graph bakes USM pointers, including the
+            // control-host allocations the drain is about to retire. It must be
+            // destroyed before them, exactly as ~ggml_backend_sycl_context does.
+            sycl_exec_graph_clear_active(backend_ctx, "context-drain");
+        });
 }
 
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan) {
@@ -88834,6 +88982,24 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     ctx->invalidate_moe_block_graphs();
 }
 
+// Owner-targeted replacement for the historical all-device graph-lease sweep at
+// model teardown (llama.cpp-2wv5). Only backends whose execution root is this
+// exact ModelToken are cleared, so a concurrently live model keeps its recorded
+// graph and its weight leases. Runs with no registry, cache or binding lock
+// held: ggml_sycl_execution_for_each_backend_owned_by() releases the binding
+// lock before invoking the callback, and every final mem_handle destruction
+// happens inside the callback.
+static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {
+    try {
+        ggml_sycl_execution_for_each_backend_owned_by(owner, [](ggml_backend_sycl_context * backend_ctx) {
+            sycl_exec_graph_clear_active(backend_ctx, "model-teardown");
+        });
+    } catch (...) {
+        // Teardown effects report failure through their caller's result; a
+        // throwing lease release must not escape into a noexcept unload path.
+    }
+}
+
 // =============================================================================
 // Persistent Kernel Graph Extraction
 // =============================================================================
@@ -98619,8 +98785,14 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_execution_context_begin_drain") == 0) {
         return (void *) ggml_backend_sycl_execution_context_begin_drain;
     }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_drain_terminal_events") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_drain_terminal_events;
+    }
     if (strcmp(name, "ggml_backend_sycl_execution_context_extract_control_host_allocs") == 0) {
         return (void *) ggml_backend_sycl_execution_context_extract_control_host_allocs;
+    }
+    if (strcmp(name, "ggml_backend_sycl_execution_context_release_control_host_allocs") == 0) {
+        return (void *) ggml_backend_sycl_execution_context_release_control_host_allocs;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_finish_drain") == 0) {
         return (void *) ggml_backend_sycl_execution_context_finish_drain;
