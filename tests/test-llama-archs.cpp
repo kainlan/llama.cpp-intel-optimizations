@@ -908,7 +908,7 @@ static int test_backends(const llm_arch                target_arch,
                 // -E "test-llama-archs" with "# TODO: fix and re-enable" -- so skipping the TP row matches
                 // upstream rather than concealing a local regression. The per-device and CPU rows still run and
                 // still gate; only the TP row is skipped.
-                skip = skip || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && getenv("ZVIV_RUN_TP") == nullptr); // ZVIV TEMP: local RED/GREEN harness, do not commit
+                skip = skip || dc.split_mode == LLAMA_SPLIT_MODE_TENSOR;
 #endif  // GGML_USE_SYCL
                 if (!skip) {
                     if (logits_cpu.empty()) {
