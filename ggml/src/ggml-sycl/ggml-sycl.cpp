@@ -1100,6 +1100,13 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
 struct pp_moe_onednn_scratch_release_marker;
 struct pp_moe_prompt_down_dispatch_done_marker;
 
+enum class pp_moe_onednn_claim_failpoint {
+    NONE = 0,
+    FAIL_AFTER_LOCAL_RESERVATION,
+};
+
+static std::atomic<int> g_pp_moe_onednn_claim_failpoint{ static_cast<int>(pp_moe_onednn_claim_failpoint::NONE) };
+
 struct pp_moe_onednn_scratch_slot_state {
     std::mutex                                  mutex;
     uint32_t                                    ring_depth = 0;
@@ -1143,6 +1150,30 @@ static void pp_moe_onednn_reset_slot_state_locked(pp_moe_onednn_scratch_slot_sta
     state.retained_owners.assign(ring_depth, {});
 }
 
+static bool pp_moe_onednn_claim_fail_after_local_reservation() {
+    return g_pp_moe_onednn_claim_failpoint.exchange(static_cast<int>(pp_moe_onednn_claim_failpoint::NONE),
+                                                    std::memory_order_acq_rel) ==
+           static_cast<int>(pp_moe_onednn_claim_failpoint::FAIL_AFTER_LOCAL_RESERVATION);
+}
+
+static void pp_moe_onednn_rollback_unbound_scratch_slot(int device, uint32_t ring_depth, uint32_t slot) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
+        return;
+    }
+    pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
+    std::lock_guard<std::mutex>        lock(state.mutex);
+    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
+        state.generations.size() != ring_depth) {
+        return;
+    }
+    if (!state.busy[slot] || state.generations[slot] != 0) {
+        return;
+    }
+    state.done_events[slot] = sycl::event{};
+    state.busy[slot]        = 0;
+    state.retained_owners[slot].clear();
+}
+
 static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, uint32_t & slot_out) {
     slot_out = std::numeric_limits<uint32_t>::max();
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0) {
@@ -1169,6 +1200,12 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
                 state.next_slot  = (slot + 1) % ring_depth;
                 slot_out         = slot;
                 return true;
+            }
+            if (state.generations[slot] == 0) {
+                state.done_events[slot] = sycl::event{};
+                state.busy[slot]        = 0;
+                state.retained_owners[slot].clear();
+                continue;
             }
             if (pp_moe_onednn_event_complete(state.done_events[slot])) {
                 const uint64_t completed_generation = state.generations[slot];
@@ -10383,6 +10420,13 @@ extern "C" void ggml_backend_sycl_test_fail_next_execution_extract_after_first_s
     if (!module_guard) return;
     g_execution_wrapper_failpoint.store(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC),
                                         std::memory_order_release);
+}
+
+extern "C" void ggml_backend_sycl_test_fail_next_pp_moe_claim_after_local_reservation() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
+    g_pp_moe_onednn_claim_failpoint.store(static_cast<int>(pp_moe_onednn_claim_failpoint::FAIL_AFTER_LOCAL_RESERVATION),
+                                          std::memory_order_release);
 }
 
 extern "C" bool ggml_backend_sycl_test_seed_control_host_allocs(ggml_backend_t backend, uint32_t count) {
@@ -72380,10 +72424,16 @@ cpu_tg_fallthrough:
                                                          std::max(planned_out, out_bytes), planned_ring_depth)) {
                     uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
                     ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot slot;
-                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot) &&
-                        cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, slot)) {
-                        batched_scratch_claim.activate(ctx.device, planned_ring_depth, scratch_slot, slot.generation,
-                                                       ctx.stream());
+                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
+                        const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
+                        const bool cache_claimed = !fail_after_local_reservation &&
+                                                   cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, slot);
+                        if (cache_claimed) {
+                            batched_scratch_claim.activate(ctx.device, planned_ring_depth, scratch_slot, slot.generation,
+                                                           ctx.stream());
+                        } else {
+                            pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, planned_ring_depth, scratch_slot);
+                        }
                     }
                     if (batched_scratch_claim.claimed() && slot.weight_size >= weight_bytes &&
                         slot.activation_size >= act_bytes && slot.output_size >= out_bytes) {
@@ -72704,10 +72754,16 @@ cpu_tg_fallthrough:
                     std::max(planned_output_slot, dst_contiguous_bytes), planned_ring_depth);
                 ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
                 uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
-                if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot) &&
-                    cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
-                    pp_moe_onednn_scratch_claim_state.activate(ctx.device, planned_ring_depth, scratch_slot,
-                                                               reserved.generation, ctx.stream());
+                if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
+                    const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
+                    const bool cache_claimed = !fail_after_local_reservation &&
+                                               cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved);
+                    if (cache_claimed) {
+                        pp_moe_onednn_scratch_claim_state.activate(ctx.device, planned_ring_depth, scratch_slot,
+                                                                   reserved.generation, ctx.stream());
+                    } else {
+                        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, planned_ring_depth, scratch_slot);
+                    }
                 }
                 if (pp_moe_onednn_scratch_claim_state.claimed()) {
                     pp_moe_onednn_scratch.slot             = reserved.slot;
@@ -98460,6 +98516,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_execution_extract_after_first_swap_alloc") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_execution_extract_after_first_swap_alloc;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_fail_next_pp_moe_claim_after_local_reservation") == 0) {
+        return (void *) ggml_backend_sycl_test_fail_next_pp_moe_claim_after_local_reservation;
     }
     if (strcmp(name, "ggml_backend_sycl_test_seed_control_host_allocs") == 0) {
         return (void *) ggml_backend_sycl_test_seed_control_host_allocs;

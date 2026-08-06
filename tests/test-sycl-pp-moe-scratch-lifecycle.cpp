@@ -17,15 +17,23 @@ struct slot_backing {
     bool retired = false;
 };
 
+struct local_slot_state {
+    bool busy = false;
+    uint64_t generation = 0;
+};
+
 struct model {
     std::mutex m;
     std::condition_variable cv;
     uint64_t next_generation = 1;
     std::vector<slot_backing> current;
     std::vector<slot_backing> retired;
+    std::vector<local_slot_state> local;
+    uint32_t next_slot = 0;
 
     explicit model(uint32_t ring_depth) {
         current.resize(ring_depth);
+        local.resize(ring_depth);
         for (uint32_t i = 0; i < ring_depth; ++i) {
             current[i].slot = i;
             current[i].generation = next_generation++;
@@ -74,6 +82,65 @@ struct model {
             current[i].slot = i;
             current[i].generation = next_generation++;
         }
+    }
+
+    bool reserve_local(uint32_t & slot) {
+        std::lock_guard<std::mutex> lock(m);
+        const uint32_t ring_depth = static_cast<uint32_t>(local.size());
+        const uint32_t start = next_slot % ring_depth;
+        for (uint32_t attempt = 0; attempt < ring_depth; ++attempt) {
+            const uint32_t candidate = (start + attempt) % ring_depth;
+            if (!local[candidate].busy) {
+                local[candidate].busy = true;
+                local[candidate].generation = 0;
+                next_slot = (candidate + 1) % ring_depth;
+                slot = candidate;
+                return true;
+            }
+            if (local[candidate].generation == 0) {
+                local[candidate].busy = false;
+                continue;
+            }
+        }
+        return false;
+    }
+
+    bool claim_transactional(bool fail_after_local_reservation, uint32_t & slot, uint64_t & generation) {
+        if (!reserve_local(slot)) {
+            return false;
+        }
+        if (fail_after_local_reservation) {
+            rollback_local(slot);
+            return false;
+        }
+        auto claimed = claim(slot);
+        generation = claimed.generation;
+        bind_local(slot, generation);
+        return true;
+    }
+
+    void bind_local(uint32_t slot, uint64_t generation) {
+        std::lock_guard<std::mutex> lock(m);
+        local.at(slot).busy = true;
+        local.at(slot).generation = generation;
+    }
+
+    void rollback_local(uint32_t slot) {
+        std::lock_guard<std::mutex> lock(m);
+        if (slot < local.size() && local[slot].busy && local[slot].generation == 0) {
+            local[slot].busy = false;
+        }
+    }
+
+    size_t local_busy_generation0_count() {
+        std::lock_guard<std::mutex> lock(m);
+        size_t count = 0;
+        for (const auto & s : local) {
+            if (s.busy && s.generation == 0) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     uint64_t current_generation(uint32_t slot) {
@@ -131,6 +198,30 @@ void test_arena_reset_destroy_generation_bump() {
     require(stale != generation, "arena destroy failed to preserve stale invalidation");
 }
 
+void test_fail_after_local_reservation_rolls_back_busy_generation0() {
+    model m(1);
+    uint32_t slot = 99;
+    uint64_t generation = 0;
+    require(!m.claim_transactional(true, slot, generation), "failpoint should fail transactional claim");
+    require(m.local_busy_generation0_count() == 0, "failed transactional claim leaked busy generation0 slot");
+    require(m.claim_transactional(false, slot, generation), "rollback should leave slot claimable");
+    require(generation != 0, "successful transactional claim must bind nonzero generation");
+    m.release(slot, generation);
+}
+
+void test_ring_depth_plus_one_pressure_does_not_deadlock_generation0_slots() {
+    constexpr uint32_t ring_depth = 2;
+    model m(ring_depth);
+    std::vector<uint32_t> slots(ring_depth + 1, 99);
+    std::vector<uint64_t> generations(ring_depth + 1, 0);
+    require(!m.claim_transactional(true, slots[0], generations[0]), "pressure failpoint claim should fail");
+    require(m.claim_transactional(false, slots[1], generations[1]), "first live claim failed after rollback");
+    require(m.claim_transactional(false, slots[2], generations[2]), "second live claim failed after rollback");
+    require(m.local_busy_generation0_count() == 0, "pressure path left busy generation0 slot behind");
+    m.release(slots[1], generations[1]);
+    m.release(slots[2], generations[2]);
+}
+
 void mutation_stale_release_clears_new_generation() {
     model m(1);
     auto old = m.claim(0);
@@ -150,12 +241,16 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "resize-in-flight") == 0) test_resize_in_flight_retires_old_backing_until_release();
     else if (std::strcmp(which, "stale-release") == 0) test_stale_release_does_not_clear_new_generation();
     else if (std::strcmp(which, "arena-reset-destroy") == 0) test_arena_reset_destroy_generation_bump();
+    else if (std::strcmp(which, "rollback-after-local-reservation") == 0) test_fail_after_local_reservation_rolls_back_busy_generation0();
+    else if (std::strcmp(which, "ring-depth-plus-one-pressure") == 0) test_ring_depth_plus_one_pressure_does_not_deadlock_generation0_slots();
     else if (std::strcmp(which, "M1") == 0) mutation_stale_release_clears_new_generation();
     else {
         test_cross_thread_completion_releases_exact_generation();
         test_resize_in_flight_retires_old_backing_until_release();
         test_stale_release_does_not_clear_new_generation();
         test_arena_reset_destroy_generation_bump();
+        test_fail_after_local_reservation_rolls_back_busy_generation0();
+        test_ring_depth_plus_one_pressure_does_not_deadlock_generation0_slots();
         mutation_stale_release_clears_new_generation();
     }
     return 0;
