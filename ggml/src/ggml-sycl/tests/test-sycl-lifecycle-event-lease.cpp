@@ -112,6 +112,45 @@ static void h12() {
     require(reg.begin_graph(ctx,s,e,root,&g)==error::OK, "H12 next graph blocked after release");
 }
 
+static void h12b() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H12b create failed");
+    require(reg.bind_backend(ctx,0)==error::OK && reg.bind_backend(ctx,1)==error::OK, "H12b bind failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(121); require(reg.attach_root(ctx, root, &s, &e)==error::OK, "H12b attach failed");
+    GraphEpoch g{}; InvocationId i{}; const int devices[] = {0,1}; const int participants[] = {45,47}; snapshot snap{}; ResetTicket rt{}; DrainTicket dt{};
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::OK && reg.begin_invocation(ctx,s,e,g,root,devices,2,participants,2,45,&i)==error::OK, "H12b invoke A failed");
+    InvocationId j{}; require(reg.begin_invocation(ctx,s,e,g,root,devices,2,participants,2,47,&j)==error::OK && j.value == i.value, "H12b invoke B failed");
+    require(reg.submit_invocation(ctx,s,e,g,i,root,47)==error::OK, "H12b first submit failed");
+    require(reg.submit_quarantined_invocation(ctx,s,e,g,i,root,45)==error::OK, "H12b terminal quarantine failed");
+    require(reg.extract(ctx,&snap)==error::OK && snap.graph_state==graph_phase::QUARANTINED &&
+                snap.token_root_state==token_root_phase::QUARANTINED && snap.busy_device_count==2 &&
+                snap.invocation.value==i.value && snap.token_root==root,
+            "H12b terminal quarantine did not retain aggregate graph root");
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::BUSY, "H12b quarantined graph reopened before release");
+    require(reg.begin_reset(ctx,s,e,&rt)==error::BUSY, "H12b reset ignored quarantined event token");
+    require(reg.begin_drain(ctx,&dt)==error::BUSY, "H12b drain ignored quarantined event token");
+    require(reg.release_invocation(ctx,s,e,g,i,root)==error::OK, "H12b release failed");
+    require(reg.retire_graph(ctx,s,e,g,root)==error::OK, "H12b retire failed");
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::OK, "H12b next graph blocked after release");
+}
+
+static void h13() {
+    Registry reg; error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "H13 create failed");
+    require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "H13 bind failed");
+    SessionId sa{}, sb{}; SessionResetEpoch ea{}, eb{}; auto ra = root_token(130), rb = root_token(131);
+    require(reg.attach_root(a,ra,&sa,&ea)==error::OK && reg.attach_root(b,rb,&sb,&eb)==error::OK, "H13 attach failed");
+    GraphEpoch ga{}, gb{}; InvocationId ia{}, ib{}; const int d[] = {2}; const int p[] = {49}; snapshot snap{};
+    require(reg.begin_graph(a,sa,ea,ra,&ga)==error::OK && reg.begin_invocation(a,sa,ea,ga,ra,d,1,p,1,49,&ia)==error::OK, "H13 invoke A failed");
+    require(reg.begin_graph(b,sb,eb,rb,&gb)==error::OK, "H13 graph B failed");
+    require(reg.submit_invocation(a,sa,ea,ga,ia,ra,49)==error::OK, "H13 submit failed");
+    require(reg.release_invocation(a,sa,ea,ga,ia,rb)==error::MISMATCH, "H13 release accepted wrong root");
+    require(reg.extract(a,&snap)==error::OK && snap.busy_device_count==1 && snap.invocation.value==ia.value,
+            "H13 wrong-root release damaged retained execution ownership");
+    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::DEVICE_BUSY, "H13 wrong-root release freed competing context");
+    require(reg.release_invocation(a,sa,ea,ga,ia,ra)==error::OK, "H13 exact owner release failed");
+    require(reg.retire_graph(a,sa,ea,ga,ra)==error::OK, "H13 retire failed");
+    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,49,&ib)==error::OK, "H13 competing context did not recover after exact release");
+}
+
 static void m7() {
     Registry reg(test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY); error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "M7 create failed");
     require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "M7 bind failed");
@@ -126,6 +165,20 @@ static void m7() {
     require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,53,&ib)==error::OK, "M7 mutation did not release competing context early");
 }
 
+static void m7b() {
+    Registry reg(test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY); error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "M7b create failed");
+    require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "M7b bind failed");
+    SessionId sa{}, sb{}; SessionResetEpoch ea{}, eb{}; auto ra = root_token(92), rb = root_token(93);
+    require(reg.attach_root(a,ra,&sa,&ea)==error::OK && reg.attach_root(b,rb,&sb,&eb)==error::OK, "M7b attach failed");
+    GraphEpoch ga{}, gb{}; InvocationId ia{}, ib{}; const int d[] = {2}; const int p[] = {55}; snapshot snap{};
+    require(reg.begin_graph(a,sa,ea,ra,&ga)==error::OK && reg.begin_invocation(a,sa,ea,ga,ra,d,1,p,1,55,&ia)==error::OK, "M7b invoke A failed");
+    require(reg.begin_graph(b,sb,eb,rb,&gb)==error::OK, "M7b graph B failed");
+    require(reg.submit_quarantined_invocation(a,sa,ea,ga,ia,ra,55)==error::OK, "M7b quarantine failed");
+    require(reg.extract(a,&snap)==error::OK && snap.graph_state==graph_phase::QUARANTINED && snap.busy_device_count==0 && snap.invocation.value==0,
+            "M7b mutation did not expose early-release quarantine shape");
+    require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,55,&ib)==error::OK, "M7b mutation did not release competing context early after quarantine");
+}
+
 int main(int argc, char ** argv) {
     const char * which = argc > 2 && std::strcmp(argv[1], "--case") == 0 ? argv[2] : "all";
     if (std::strcmp(which, "G5a") == 0) g5a();
@@ -134,7 +187,10 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "G7") == 0) g7();
     else if (std::strcmp(which, "H8") == 0) h8();
     else if (std::strcmp(which, "H12") == 0) h12();
+    else if (std::strcmp(which, "H12b") == 0) h12b();
+    else if (std::strcmp(which, "H13") == 0) h13();
     else if (std::strcmp(which, "M7") == 0) m7();
-    else { g5a(); g6(); g6b(); g7(); h8(); h12(); m7(); }
+    else if (std::strcmp(which, "M7b") == 0) m7b();
+    else { g5a(); g6(); g6b(); g7(); h8(); h12(); h12b(); h13(); m7(); m7b(); }
     return 0;
 }
