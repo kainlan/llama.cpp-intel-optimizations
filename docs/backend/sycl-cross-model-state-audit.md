@@ -277,7 +277,7 @@ H8/M7 must cover every operation/rank and each named lock alias.
 | `y36c` | focused pending KV-mask consumer only |
 | `x3ou` | focused diagnostics/reporting consumer of `viu2`/`1q72`/`32dg8.15.12`/`o6jx` only |
 | `h5m4` | closed TLS-worker-reset gate revalidated by `1q72`/`o6jx`; no implementation ownership |
-| `t5nq` | OPEN with merged reviewed packed-K-sidecar-event-teardown code; no foundation prerequisites; may close after its live GPU failpoint/retry/teardown gate; `otry` revalidates after foundations |
+| `t5nq` | closed merged packed-K-sidecar event-teardown gate; live failpoint/retry/teardown matrix completed by `udpi` and strengthened by `32dg8.15.12`; `otry` revalidates after foundations |
 | `otry` | exact direct deps: `nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, `o6jx`; foundation/organizational edges are transitive |
 | `hcyp` | closed merged prerequisite: self-test line-drift repair only; no census ownership |
 | `jwy4` | after `otry` and `hcyp`, owns final audit script/fixtures, CSV, source hashes/count prose refresh together |
@@ -290,10 +290,9 @@ Focused consumers retain only their subsystem scopes. The lifecycle
 transitive-closure projection includes all foundations/focused children before
 `otry`; it is not the live direct-edge list. Exact direct convergence edge:
 `{nlww, h5m4, nn6z, y36c, vbeb, x3ou, t5nq, o6jx} → otry`; foundation and
-organizational edges are transitive. Closed `h5m4` and OPEN `t5nq` are focused
-proof gates, not foundation
-implementers. `t5nq` has no foundation prerequisite and may close after its live
-GPU gate; `otry` revalidates packed-K guarantees after foundations. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
+organizational edges are transitive. Closed `h5m4` and closed `t5nq` are focused
+proof gates, not foundation implementers. `t5nq`/`udpi` completed the live packed-K
+matrix; `otry` revalidates those guarantees after foundations. Historical `.15.10` is superseded by `1q72`/`o6jx`; `.15.12/.13`,
 `0qlw` and `2wv5` map to foundations without dual editing or cycles. Exact live
 tail edges are `{otry, hcyp (closed)} → jwy4` and `{jwy4, awcp (closed)} →
 k7b0`; final `k7b0` closure is blocked by `jwy4`. The exact H1-H14/G1-G4/G5a/G5b/G6-G7 commands, distinct B plus

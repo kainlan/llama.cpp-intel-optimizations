@@ -929,7 +929,7 @@ viu2 ─────────────────────────
 {viu2, 1q72, 32dg8.15.12, o6jx} ───────────────────> x3ou (diagnostics)
 
 {1q72, o6jx} --preserve/revalidate--> h5m4 (merged TLS-worker-reset gate)
-t5nq (OPEN merged reviewed packed-K-sidecar live GPU gate; no prerequisites)
+t5nq (closed merged packed-K-sidecar gate; live matrix completed by udpi)
 
 Exact live direct convergence/tail edges:
 {nlww, h5m4, nn6z, y36c, vbeb, x3ou, t5nq, o6jx} ──> otry
@@ -937,11 +937,11 @@ Exact live direct convergence/tail edges:
 {jwy4, awcp (closed)} ──> k7b0
 ```
 
-This graph is acyclic. Closed `h5m4` supplies merged proof evidence. OPEN
-`t5nq` has merged reviewed packed-K-sidecar code but still awaits its independent
-live GPU failpoint/retry/teardown gate; it has no foundation prerequisites and
-may close now. Both retain focused regression-gate scope only. After foundations
-land, `otry`—not `t5nq`—revalidates packed-K guarantees. The broad
+This graph is acyclic. Closed `h5m4` supplies merged proof evidence. Closed
+`t5nq` supplies the packed-K-sidecar teardown gate; closed `udpi` completed its
+live GPU failpoint/retry/teardown matrix, and `32dg8.15.12` later strengthened
+consumer lifetime. Both retain focused regression-gate scope only. After
+foundations land, `otry`—not `t5nq`—revalidates packed-K guarantees. The broad
 “foundations/focused children → otry” statement is a lifecycle transitive-closure
 projection: the exact live direct dependencies of `otry` are `nlww`, `h5m4`,
 `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, and `o6jx`; foundation/organizational
@@ -960,7 +960,7 @@ edges are transitive. `jwy4` directly depends on `otry` and closed `hcyp`. Final
 | `y36c` | pending KV-mask only; consumes `1q72` context/session keys and `o6jx` cleanup hooks | keyed queue/reset tests; no general teardown ownership |
 | `x3ou` | diagnostics/reporting only; consumes immutable snapshots from `viu2`/`1q72`/`32dg8.15.12`/`o6jx` | H9/M8 and identity-reporting audit; no lifecycle mutation |
 | `h5m4` | **closed merged gate:** TLS worker reset proof/fix | `1q72`/`o6jx` preserve and revalidate it; no new implementation ownership |
-| `t5nq` | **OPEN merged reviewed scope:** packed-K sidecar event teardown proof/fix | no foundation prerequisites; may close when its live GPU failpoint/retry/teardown gate passes; `otry` later revalidates packed-K after foundations |
+| `t5nq` | **closed merged scope:** packed-K sidecar event teardown proof/fix | `udpi` completed the live matrix; `32dg8.15.12` strengthened leased-snapshot lifetime; `otry` later revalidates after foundations |
 | `otry` | direct deps: `nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, `o6jx`; foundation/organizational dependencies are transitive | integrated payload/lock/teardown convergence corrections |
 | `hcyp` | **closed merged prerequisite:** self-test line-drift repair only | existing parser self-test is green; no final-census ownership |
 | `jwy4` | final audit script/fixtures, generated CSV, source-hash/count prose | consumes `otry` and `hcyp`; refreshes all artifacts atomically at final HEAD |
@@ -993,7 +993,7 @@ new exclusive owner:
 | current bare-slot ownership/reclaim (`0qlw` history) | `viu2` owns generated identity; `o6jx` consumes it |
 | current all-device graph cleanup (`2wv5` history) | `1q72` owns epoch attribution; `o6jx` removes the sweep |
 | current load scratch reset history | mitigation until `viu2` transaction rollback supersedes it; downstream `k7b0` does not own this foundation |
-| merged `h5m4` / `t5nq` | `h5m4` remains a closed TLS-reset gate; `t5nq` is OPEN with merged reviewed packed-K-sidecar code pending its live GPU failpoint/retry/teardown gate; neither owns a lifecycle foundation |
+| merged `h5m4` / `t5nq` | both are closed focused gates; `udpi` completed the packed-K live matrix and `32dg8.15.12` strengthened leased-snapshot lifetime; neither owns a lifecycle foundation |
 
 Cross-child changes require an explicit handoff commit from the exclusive owner;
 no duplicate “temporary” token, epoch, reset, or event-lease implementation is

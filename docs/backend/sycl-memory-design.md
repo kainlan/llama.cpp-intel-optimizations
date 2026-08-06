@@ -193,10 +193,10 @@ edges are `viu2 → 1q72` and `{1q72, 32dg8.15.13} → 32dg8.15.12 → o6jx`;
 their actual scopes: `nn6z` MoE discovery/popularity, `nlww` MoE bias/activation,
 `vbeb` layer streaming, `y36c` pending KV masks, and `x3ou` diagnostics;
 `x3ou` consumes `viu2`/`1q72`/`32dg8.15.12`/`o6jx`. Closed `h5m4` remains the
-TLS-reset proof gate. `t5nq` is OPEN with merged
-reviewed packed-K-sidecar code awaiting its live GPU failpoint/retry/teardown
-gate; that gate has no foundation prerequisites and may close now. `otry`, not
-`t5nq`, revalidates packed-K guarantees after foundations. “All
+TLS-reset proof gate. `t5nq` is a closed merged packed-K-sidecar gate; `udpi`
+completed its live GPU failpoint/retry/teardown matrix, and `32dg8.15.12`
+strengthened consumer lifetime with leased snapshots. `otry`, not `t5nq`,
+revalidates packed-K guarantees after foundations. “All
 foundations/focused children → otry” is the lifecycle transitive-closure
 projection, not the exact live edge list. Exact direct `otry` dependencies are
 `nlww`, `h5m4`, `nn6z`, `y36c`, `vbeb`, `x3ou`, `t5nq`, and `o6jx`;
