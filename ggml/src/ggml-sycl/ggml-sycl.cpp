@@ -2152,6 +2152,8 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 #include "ggml-sycl/pinned-buffer-pool.hpp"
 // MoE expert prefetch DMA engine + prediction
 #include "ggml-sycl/expert-prefetch.hpp"
+// Owner-keyed ownership for the MoE discovery/popularity state cluster
+#include "ggml-sycl/moe-discovery-state.hpp"
 // Persistent CPU expert thread pool with ring-buffered staging
 #include "ggml-sycl/cpu-expert-pool.hpp"
 
@@ -2884,6 +2886,157 @@ static std::atomic<bool> g_prestage_completed{ false };
 // Upfront VRAM budget reserved for MoE experts at inventory time (Phase 1).
 // Released after prestage completes and actual usage is tracked in cache (Phase 2).
 static std::array<size_t, GGML_SYCL_MAX_DEVICES> g_moe_expert_vram_reserve = {};
+
+// ---------------------------------------------------------------------------
+// Owner-keyed MoE discovery state (llama.cpp-nn6z).
+//
+// Everything the two classes below touch is host metadata that exactly one
+// model's graph produces: the hash -> sequential layer map, the hybrid-init
+// guards, the warmup counters, the popularity ranks, the expert metadata and
+// group registries, and the prestage flags. None of it owns a mem_handle, a
+// device allocation or an event, which is why it can be parked for a model that
+// is still loaded and handed back when that model is activated again.
+//
+// It was previously written once, by whichever model reached
+// moe_hybrid_init_once() first, and cleared only at module shutdown:
+// g_moe_hybrid_init_success[] gates that function, so the SECOND MoE model in a
+// process never re-discovered anything and ran on the first model's expert
+// metadata, layer numbering and popularity ranks.
+//
+// The device-bound half is deliberately not parked. Predictor arrays are sized
+// by the owning model's layer count and belong to whichever model last
+// initialised the device, so every owner switch clears the per-device guards
+// and lets the activating model re-run moe_hybrid_init_once() -- which is also
+// what rebuilds g_moe_expert_meta and g_expert_groups from that model's own
+// graph.
+// ---------------------------------------------------------------------------
+struct ggml_sycl_moe_parked_discovery : public ggml_sycl::moe_discovery_parked_state {
+    std::unordered_map<int, int>     layer_seq[GGML_SYCL_MAX_DEVICES];
+    std::unordered_map<int64_t, int> popularity;
+    bool                             popularity_initialized = false;
+    int                              warmup_n_layers        = 0;
+    int                              warmup_n_experts       = 0;
+    bool                             warmup_done            = false;
+    // Sequential-layer major, warmup_n_layers * warmup_n_experts entries. Epoch
+    // counters are not carried: enable_reranking() zeroes them by design.
+    std::vector<uint32_t>            warmup_counts;
+};
+
+class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_state {
+  public:
+    std::unique_ptr<ggml_sycl::moe_discovery_parked_state> park() noexcept override {
+        try {
+            auto parked = std::unique_ptr<ggml_sycl_moe_parked_discovery>(new ggml_sycl_moe_parked_discovery());
+            for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+                parked->layer_seq[d] = g_moe_layer_seq[d];
+            }
+            {
+                std::shared_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
+                parked->popularity             = g_expert_popularity;
+                parked->popularity_initialized = g_expert_popularity_initialized;
+            }
+            const int nl             = g_moe_warmup.n_layers;
+            const int ne             = g_moe_warmup.n_experts;
+            parked->warmup_n_layers  = nl;
+            parked->warmup_n_experts = ne;
+            parked->warmup_done      = g_moe_warmup.warmup_done.load(std::memory_order_acquire);
+            if (nl > 0 && ne > 0) {
+                parked->warmup_counts.resize(static_cast<size_t>(nl) * static_cast<size_t>(ne));
+                for (int l = 0; l < nl; ++l) {
+                    for (int e = 0; e < ne; ++e) {
+                        parked->warmup_counts[static_cast<size_t>(l) * static_cast<size_t>(ne) + e] =
+                            g_moe_warmup.counts[l][e].load(std::memory_order_relaxed);
+                    }
+                }
+            }
+            return parked;
+        } catch (...) {
+            // Fail closed: the registry drops the outgoing owner's state rather
+            // than leaving it where the incoming owner would read it.
+            return nullptr;
+        }
+    }
+
+    void restore(std::unique_ptr<ggml_sycl::moe_discovery_parked_state> parked) noexcept override {
+        // The device-bound half is never restored, only re-discovered.
+        install_fresh();
+        // The registry hands back exactly what park() produced; this class is
+        // the only producer of a parked state, so the downcast is total.
+        const ggml_sycl_moe_parked_discovery * state =
+            static_cast<const ggml_sycl_moe_parked_discovery *>(parked.get());
+        if (!state) {
+            return;
+        }
+        try {
+            for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+                g_moe_layer_seq[d] = state->layer_seq[d];
+            }
+            {
+                std::unique_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
+                g_expert_popularity             = state->popularity;
+                g_expert_popularity_initialized = state->popularity_initialized;
+            }
+            const int nl = std::min(state->warmup_n_layers, MOE_MAX_LAYERS);
+            const int ne = std::min(state->warmup_n_experts, MOE_MAX_EXPERTS);
+            if (nl > 0 && ne > 0 &&
+                state->warmup_counts.size() ==
+                    static_cast<size_t>(state->warmup_n_layers) * static_cast<size_t>(state->warmup_n_experts)) {
+                for (int l = 0; l < nl; ++l) {
+                    for (int e = 0; e < ne; ++e) {
+                        g_moe_warmup.counts[l][e].store(
+                            state->warmup_counts[static_cast<size_t>(l) * static_cast<size_t>(state->warmup_n_experts) +
+                                                 e],
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
+            g_moe_warmup.n_layers  = nl;
+            g_moe_warmup.n_experts = ne;
+            g_moe_warmup.warmup_done.store(state->warmup_done, std::memory_order_release);
+        } catch (...) {
+            // A partially restored set is indistinguishable from another
+            // model's, so discard it entirely and let the owner rediscover.
+            install_fresh();
+        }
+    }
+
+    void install_fresh() noexcept override {
+        try {
+            // g_moe_expert_vram_reserve is deliberately NOT touched here. Every
+            // other member of this cluster is written by moe_hybrid_init_once()
+            // at graph time, but the reserve is computed during inventory --
+            // before the load commits -- so clearing it on the commit that makes
+            // this model the owner would erase the budget it just computed. The
+            // existing load-boundary fill(0) already scopes it to one load.
+            for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+                g_moe_hybrid_init_success[d].store(false, std::memory_order_release);
+                g_moe_layer_seq[d].clear();
+            }
+            g_moe_hybrid_init_done.store(false, std::memory_order_release);
+            g_prestage_completed.store(false, std::memory_order_release);
+            g_moe_warmup.reset();
+            {
+                std::unique_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
+                g_expert_popularity.clear();
+                g_expert_popularity_initialized = false;
+            }
+            {
+                // The dying owner's tensor observers must not outlive it; the
+                // activating owner rebuilds both registries in init_once().
+                std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+                g_moe_expert_meta.clear();
+            }
+            {
+                std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
+                g_expert_groups.clear();
+            }
+        } catch (...) {
+        }
+    }
+};
+
+static ggml_sycl_moe_live_discovery      g_moe_live_discovery;
+static ggml_sycl::moe_discovery_registry g_moe_discovery_registry(g_moe_live_discovery);
 
 // Check if an expert's weights are fully resident in VRAM on a given device.
 // Checks the unified cache for ALL 3 tensors (gate, up, down) across multiple
@@ -10331,6 +10484,17 @@ static bool ggml_sycl_restore_latest_live_plan() noexcept {
     }
 }
 
+// The MoE discovery owner is the full model token, so a reused slot carrying a
+// newer generation never resolves to the dead model's parked discovery.
+static ggml_sycl::moe_owner_key ggml_sycl_moe_owner_key(const ggml_sycl::lifecycle::ModelToken & token) {
+    ggml_sycl::moe_owner_key key;
+    key.model_id        = token.model.value;
+    key.load_txn_id     = token.load.value;
+    key.slot            = token.owner.slot;
+    key.slot_generation = token.owner.generation;
+    return key;
+}
+
 static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken owner) noexcept {
     try {
         ggml_sycl_plan_restoration_bundle restoration;
@@ -10348,6 +10512,13 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
                 ggml_sycl_publish_plan_locked(restoration.snapshot);
             }
         }
+        // Exact-owner MoE teardown, outside the publication lock because parking
+        // allocates. A model that is not the active discovery owner loses only
+        // its parked snapshot: the live working set belongs to whoever is
+        // active, so unloading A cannot disturb a live B. It runs before the
+        // slot's resources go, because the live half holds observer pointers
+        // into this model's tensors.
+        (void) g_moe_discovery_registry.release(ggml_sycl_moe_owner_key(owner));
         ggml_sycl_release_model_slot_resources(owner);
         return true;
     } catch (...) {
@@ -10737,6 +10908,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             result = registry->finalize_cleanup(ticket, cleanup_ok);
             ggml_sycl_enqueue_quarantined_result(*registry, result, model);
             (void) ggml_sycl_restore_latest_live_plan();
+        }
+        if (result.committed) {
+            // The committed model owns MoE discovery from here. Outside the
+            // inventory lock: the outgoing owner's snapshot allocates, which
+            // canonical §12 forbids under the publication locks.
+            (void) g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(result.token));
         }
         if (result.committed || (!result.committed && model)) {
             ggml_sycl_export_token(result.token, model);
@@ -11994,15 +12171,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model
             ~activation_lease() { (void) registry.finalize_live_update(ticket); }
         } lease{ registry, std::move(ticket) };
 
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-        const auto                  state = registry.find(token.model);
-        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
-                                                                         model.slot_generation);
-        if (!state || state->phase != ggml_sycl::lifecycle::model_phase::LIVE || !(state->token == token) ||
-            !snapshot) {
-            return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            const auto                  state = registry.find(token.model);
+            const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id,
+                                                                             model.slot, model.slot_generation);
+            if (!state || state->phase != ggml_sycl::lifecycle::model_phase::LIVE || !(state->token == token) ||
+                !snapshot) {
+                return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+            }
+            ggml_sycl_publish_plan_locked(snapshot);
         }
-        ggml_sycl_publish_plan_locked(snapshot);
+        // Explicit A/B/A routing: hand this exact owner back its own discovery
+        // rather than whatever the previously active model left behind. Outside
+        // the inventory lock because parking the outgoing owner allocates.
+        (void) g_moe_discovery_registry.activate(ggml_sycl_moe_owner_key(token));
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -98327,6 +98510,10 @@ static void ggml_sycl_reset_moe_module_state() {
     // Shutdown reservation proves graph/model quiescence. Clear every
     // module/model-bound MoE pointer registry and initialization authority so
     // RTLD_NODELETE reload rebuilds exclusively from the next model.
+    // Bookkeeping only. Module shutdown is the one point with no owner left for
+    // whom the live half could be preserved, so the process-global clear below
+    // is this function's job rather than the registry's.
+    g_moe_discovery_registry.release_all_for_module_shutdown();
     g_adaptive_prestage.reset_after_stop();
     g_moe_warmup.reset();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
@@ -98418,6 +98605,19 @@ static bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners() {
 extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return;
+    // Two owners, so the reload gate sees both an active owner and a parked
+    // one. Activation installs a fresh working set, so it must precede the
+    // flags below or it would wipe them.
+    ggml_sycl::moe_owner_key seeded;
+    seeded.model_id        = 0x5eed0001u;
+    seeded.load_txn_id     = 0x5eed0002u;
+    seeded.slot            = 0;
+    seeded.slot_generation = 1;
+    (void) g_moe_discovery_registry.activate(seeded);
+    seeded.model_id    = 0x5eed0003u;
+    seeded.load_txn_id = 0x5eed0004u;
+    seeded.slot        = 1;
+    (void) g_moe_discovery_registry.activate(seeded);
     g_moe_hybrid_init_success[0].store(true, std::memory_order_relaxed);
     g_moe_hybrid_init_done.store(true, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(true, std::memory_order_relaxed);
@@ -98444,6 +98644,7 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     return !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
            !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
+           !g_moe_discovery_registry.has_active_owner() && g_moe_discovery_registry.parked_owner_count() == 0 &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
            g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
            !g_expert_prefetchers[0].is_initialized() && !g_pinned_buffer_pools[0].is_initialized() &&
