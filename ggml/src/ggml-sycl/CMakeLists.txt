@@ -311,6 +311,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bias-owner-contract.py
             --self-test)
     set_tests_properties(sycl-moe-bias-owner-contract PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
+    # --self-test likewise: four of this gate's checks are absence-based. It is
+    # the only thing that can see whether the PRODUCTION planner calls the exact
+    # sizing at all -- test-moe-control-plan proves the arithmetic, not that
+    # populate_host_zone_sizing uses it instead of MAX_EXPERTS * n_moe_layers.
+    add_test(NAME sycl-moe-control-plan-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-control-plan-contract.py
+            --self-test)
+    set_tests_properties(sycl-moe-control-plan-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
@@ -3890,6 +3898,33 @@ set_tests_properties(sycl-moe-bias-owner-state PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
     # submits to a device. Labels also avoid the throttled sweep's cache denylist.
     LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# Exact MoE pointer-table descriptor planning, CONTROL sizing and the strict
+# reservation ledger (llama.cpp-dimc). moe-control-plan.cpp is dependency-free
+# by design -- it includes no SYCL header and links no backend library -- so
+# this target compiles the production source directly and takes no -fsycl.
+# That is the same arrangement as test-zone-sizing above, and for the same
+# reason: the arithmetic is the whole point and it must be testable without a
+# GPU. The capacity snapshots the reservation cases use are built by the test,
+# so no arena is created or queried.
+add_executable(test-moe-control-plan
+    tests/test-moe-control-plan.cpp
+    moe-control-plan.cpp
+)
+target_include_directories(test-moe-control-plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-moe-control-plan PRIVATE Threads::Threads)
+set_target_properties(test-moe-control-plan PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-control-plan COMMAND test-moe-control-plan)
+set_tests_properties(sycl-moe-control-plan PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;host-only;tsan-capable"
     TIMEOUT 30
 )
 

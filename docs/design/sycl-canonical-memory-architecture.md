@@ -799,7 +799,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `g_onednn_scratch_lock_mutex`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `g_onednn_scratch_lock_mutex`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -833,6 +833,28 @@ two L3 locks are never co-held. The source contract
 `tests/test-sycl-moe-bias-owner-contract.py` gates both halves of the leaf
 property: that every accessor takes the lock, and that none takes another while
 holding it.
+
+The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
+guards the per-(device, plan) reservation table, the conversion generations, and
+the per-device planned-bytes publication. It sits at L5 with the allocation
+bookkeeping it admits against, and it is **strictly leaf: it is never held while
+any other lock is acquired, and no allocation, device work or logging happens
+under it.**
+
+That is a property of the API shape, not a rule to remember. The branch this was
+salvaged from queried the live cache for its RUNTIME capacity *while holding this
+lock*, which forced a documented acquire-cache-then-ledger ordering and a
+lock-order probe to police it. Here `moe_reserve_context_control` and
+`moe_authorize_control_allocation` take the capacity snapshot as a PARAMETER, so
+the caller resolves the cache first and the ledger lock cannot nest under an L4
+cache lock -- there is no call site at which it could. The transactional half
+follows from the same shape: `moe_begin_control_conversion`,
+`moe_commit_control_conversion` and `moe_rollback_control_conversion` each take
+the lock alone and release it before returning, and rollback is `noexcept`
+because it runs from `moe_control_conversion_guard`'s destructor on the failure
+path. `tests/test-sycl-moe-control-plan-contract.py` gates the noexcept rollback
+and the generation stamping; `test-moe-control-plan` proves the commit/rollback
+state machine.
 
 Code may skip ranks but never acquire a lower-numbered rank while holding a
 higher one. Two keyed same-rank locks require the stable key order; pointer
