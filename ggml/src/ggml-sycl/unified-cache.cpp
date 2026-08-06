@@ -2098,6 +2098,7 @@ bool unified_cache::ensure_planned_arena_zones() {
         compute_arena_size_  = 0;
         compute_arena_owner_ = {};
         compute_arena_off_.store(0, std::memory_order_relaxed);
+        arena_generation_bump();
         arena_destroy();
     }
 
@@ -11716,6 +11717,39 @@ bool unified_cache::get_onednn_scratch(size_t weights_needed, size_t activations
     return true;
 }
 
+bool unified_cache::acquire_onednn_scratch_reservation(size_t                 weights_needed,
+                                                       size_t                 activations_needed,
+                                                       onednn_scratch_buffers & out,
+                                                       onednn_scratch_token * token) {
+    if (!token) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(onednn_scratch_mutex_);
+    onednn_scratch_cv_.wait(lock, [&] { return onednn_scratch_refcount_ == 0; });
+    if (!get_onednn_scratch(weights_needed, activations_needed, out)) {
+        return false;
+    }
+    token->generation      = ++onednn_scratch_generation_;
+    token->active          = true;
+    onednn_scratch_refcount_ = 1;
+    return true;
+}
+
+void unified_cache::release_onednn_scratch_reservation(onednn_scratch_token token) {
+    if (!token.active) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
+        if (onednn_scratch_refcount_ == 0 || onednn_scratch_generation_ != token.generation) {
+            return;
+        }
+        onednn_scratch_refcount_ = 0;
+    }
+    onednn_scratch_cv_.notify_one();
+}
+
 bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
                                                   size_t   activation_slot_bytes,
                                                   size_t   output_slot_bytes,
@@ -11727,34 +11761,23 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
-    if (pp_moe_onednn_ring_depth_ >= ring_depth && pp_moe_onednn_weight_slot_size_ >= weight_slot_bytes &&
-        pp_moe_onednn_activation_slot_size_ >= activation_slot_bytes &&
-        pp_moe_onednn_output_slot_size_ >= output_slot_bytes && pp_moe_onednn_scratch_slots_.size() >= ring_depth) {
-        return true;
-    }
-
     auto release_slots = [&](std::vector<pp_moe_onednn_scratch_slot> & slots) {
         size_t released_direct = 0;
-        auto   release_buffer  = [&](void *& ptr, size_t & size, mem_handle & owner) {
-            if (!ptr) {
-                owner = {};
-                size  = 0;
-                return;
-            }
-            if (arena_active() && vram_owns(ptr)) {
-                zone_free(vram_zone_id::RUNTIME, ptr);
-            } else {
-                owner = {};
-                released_direct += size;
-            }
-            ptr  = nullptr;
-            size = 0;
-        };
         for (auto & slot : slots) {
-            release_buffer(slot.weight, slot.weight_size, slot.weight_owner);
-            release_buffer(slot.activation, slot.activation_size, slot.activation_owner);
-            release_buffer(slot.output, slot.output_size, slot.output_owner);
+            if (!slot.weight && !slot.activation && !slot.output) {
+                slot.weight_owner     = {};
+                slot.activation_owner = {};
+                slot.output_owner     = {};
+                continue;
+            }
+            slot.weight_owner     = {};
+            slot.activation_owner = {};
+            slot.output_owner     = {};
+            if (!arena_active()) {
+                released_direct += slot.weight_size + slot.activation_size + slot.output_size;
+            }
+            slot.weight = slot.activation = slot.output = nullptr;
+            slot.weight_size = slot.activation_size = slot.output_size = 0;
         }
         slots.clear();
         if (released_direct > 0) {
@@ -11763,23 +11786,6 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
     };
 
     auto allocate_buffer = [&](size_t size, const char * label, mem_handle & owner) -> void * {
-        if (arena_active()) {
-            void * ptr = zone_alloc(vram_zone_id::RUNTIME, size, 256);
-            if (!ptr) {
-                return nullptr;
-            }
-            const size_t offset = ptr_to_offset(ptr);
-            owner               = mem_handle::from_arena_zone(static_cast<int>(vram_zone_id::RUNTIME), offset, size,
-                                                              ggml_sycl_get_device_id_from_queue(queue_), arena_generation());
-            auto resolved       = owner.resolve(ggml_sycl_get_device_id_from_queue(queue_));
-            if (!resolved || resolved.ptr != ptr || !resolved.on_device) {
-                zone_free(vram_zone_id::RUNTIME, ptr);
-                owner = {};
-                return nullptr;
-            }
-            return ptr;
-        }
-
         alloc_request req{};
         req.queue                               = &queue_;
         req.device                              = ggml_sycl_get_device_id_from_queue(queue_);
@@ -11804,10 +11810,13 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
     };
 
     std::vector<pp_moe_onednn_scratch_slot> new_slots;
+    std::vector<pp_moe_onednn_scratch_slot> retired_to_release;
     new_slots.reserve(ring_depth);
     bool ok = true;
     for (uint32_t i = 0; i < ring_depth; ++i) {
         pp_moe_onednn_scratch_slot slot;
+        slot.slot            = i;
+        slot.generation      = pp_moe_onednn_next_generation_++;
         slot.weight_size     = weight_slot_bytes;
         slot.activation_size = activation_slot_bytes;
         slot.output_size     = output_slot_bytes;
@@ -11835,12 +11844,30 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         return false;
     }
 
-    release_slots(pp_moe_onednn_scratch_slots_);
-    pp_moe_onednn_scratch_slots_        = std::move(new_slots);
-    pp_moe_onednn_weight_slot_size_     = weight_slot_bytes;
-    pp_moe_onednn_activation_slot_size_ = activation_slot_bytes;
-    pp_moe_onednn_output_slot_size_     = output_slot_bytes;
-    pp_moe_onednn_ring_depth_           = ring_depth;
+    {
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        if (pp_moe_onednn_ring_depth_ >= ring_depth && pp_moe_onednn_weight_slot_size_ >= weight_slot_bytes &&
+            pp_moe_onednn_activation_slot_size_ >= activation_slot_bytes &&
+            pp_moe_onednn_output_slot_size_ >= output_slot_bytes && pp_moe_onednn_scratch_slots_.size() >= ring_depth) {
+            retired_to_release = std::move(new_slots);
+        } else {
+            for (auto & slot : pp_moe_onednn_scratch_slots_) {
+                if (slot.refcount == 0) {
+                    retired_to_release.push_back(std::move(slot));
+                } else {
+                    pp_moe_onednn_retired_slots_.push_back(std::move(slot));
+                }
+            }
+            pp_moe_onednn_scratch_slots_        = std::move(new_slots);
+            pp_moe_onednn_weight_slot_size_     = weight_slot_bytes;
+            pp_moe_onednn_activation_slot_size_ = activation_slot_bytes;
+            pp_moe_onednn_output_slot_size_     = output_slot_bytes;
+            pp_moe_onednn_ring_depth_           = ring_depth;
+        }
+    }
+
+    release_slots(retired_to_release);
+
     const size_t total =
         static_cast<size_t>(ring_depth) * (weight_slot_bytes + activation_slot_bytes + output_slot_bytes);
     if (!arena_active()) {
@@ -11853,6 +11880,67 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         weight_slot_bytes / (1024.0 * 1024.0), activation_slot_bytes / (1024.0 * 1024.0),
         output_slot_bytes / (1024.0 * 1024.0));
     return true;
+}
+
+bool unified_cache::claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out) {
+    std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+    if (slot >= pp_moe_onednn_scratch_slots_.size()) {
+        return false;
+    }
+    pp_moe_onednn_scratch_slot & reserved = pp_moe_onednn_scratch_slots_[slot];
+    if (!reserved.weight || !reserved.activation || !reserved.output) {
+        return false;
+    }
+    reserved.refcount++;
+    out = reserved;
+    return true;
+}
+
+void unified_cache::release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation) {
+    auto release_releasable = [&](std::vector<pp_moe_onednn_scratch_slot> & slots) {
+        size_t released_direct = 0;
+        for (auto & retired : slots) {
+            retired.weight_owner     = {};
+            retired.activation_owner = {};
+            retired.output_owner     = {};
+            if (!arena_active()) {
+                released_direct += retired.weight_size + retired.activation_size + retired.output_size;
+            }
+            retired.weight = retired.activation = retired.output = nullptr;
+            retired.weight_size = retired.activation_size = retired.output_size = 0;
+        }
+        slots.clear();
+        if (released_direct > 0) {
+            saturating_sub_used(released_direct);
+        }
+    };
+
+    std::vector<pp_moe_onednn_scratch_slot> releasable;
+    {
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        auto release_match = [&](std::vector<pp_moe_onednn_scratch_slot> & slots, bool erase_when_zero) {
+            for (size_t i = 0; i < slots.size(); ++i) {
+                auto & candidate = slots[i];
+                if (candidate.slot != slot || candidate.generation != generation) {
+                    continue;
+                }
+                if (candidate.refcount == 0) {
+                    return true;
+                }
+                candidate.refcount--;
+                if (erase_when_zero && candidate.refcount == 0) {
+                    releasable.push_back(std::move(candidate));
+                    slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(i));
+                }
+                return true;
+            }
+            return false;
+        };
+        if (!release_match(pp_moe_onednn_scratch_slots_, false)) {
+            (void) release_match(pp_moe_onednn_retired_slots_, true);
+        }
+    }
+    release_releasable(releasable);
 }
 
 bool unified_cache::get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out) {
@@ -11932,10 +12020,6 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
     return false;
 }
 
-// Global scratch buffer state for lock management
-static std::mutex                                            g_onednn_scratch_lock_mutex;
-static std::unordered_map<int, std::unique_lock<std::mutex>> g_onednn_scratch_locks;
-
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size) {
     unified_cache * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
@@ -11964,19 +12048,21 @@ pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int de
         return result;
     }
     unified_cache::pp_moe_onednn_scratch_slot reserved;
-    if (!cache->get_pp_moe_onednn_scratch_slot(slot, reserved)) {
+    if (!cache->claim_pp_moe_onednn_scratch_slot(slot, reserved)) {
         return result;
     }
-    result.weight           = reserved.weight;
-    result.activation       = reserved.activation;
-    result.output           = reserved.output;
-    result.weight_size      = reserved.weight_size;
-    result.activation_size  = reserved.activation_size;
-    result.output_size      = reserved.output_size;
+    result.slot            = reserved.slot;
+    result.generation      = reserved.generation;
+    result.weight          = reserved.weight;
+    result.activation      = reserved.activation;
+    result.output          = reserved.output;
+    result.weight_size     = reserved.weight_size;
+    result.activation_size = reserved.activation_size;
+    result.output_size     = reserved.output_size;
     result.weight_owner     = reserved.weight_owner;
     result.activation_owner = reserved.activation_owner;
     result.output_owner     = reserved.output_owner;
-    result.ok               = true;
+    result.ok              = true;
     return result;
 }
 
@@ -11994,21 +12080,13 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
         return result;
     }
 
-    // Acquire lock and store it for later release
-    auto lock = cache->lock_onednn_scratch();
-
     unified_cache::onednn_scratch_buffers buffers;
-    if (!cache->get_onednn_scratch(weights_needed, activations_needed, buffers)) {
+    if (!cache->acquire_onednn_scratch_reservation(weights_needed, activations_needed, buffers, &result.token)) {
         if (profile_active) {
-            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false, arena_profile_elapsed_us(t0));
+            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false,
+                                             arena_profile_elapsed_us(t0));
         }
         return result;
-    }
-
-    // Store lock for release
-    {
-        std::lock_guard<std::mutex> guard(g_onednn_scratch_lock_mutex);
-        g_onednn_scratch_locks[device_id] = std::move(lock);
     }
 
     result.weights     = buffers.weights;
@@ -12020,13 +12098,16 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
     return result;
 }
 
-void unified_cache_release_onednn_scratch(int device_id) {
-    std::lock_guard<std::mutex> guard(g_onednn_scratch_lock_mutex);
-    auto                        it = g_onednn_scratch_locks.find(device_id);
-    if (it != g_onednn_scratch_locks.end()) {
-        // Unlock by destroying the unique_lock
-        g_onednn_scratch_locks.erase(it);
+void unified_cache_release_onednn_scratch(int device_id, onednn_scratch_token token) {
+    if (!token.active) {
+        return;
     }
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache) {
+        return;
+    }
+
+    cache->release_onednn_scratch_reservation(token);
 }
 
 bool unified_cache_has_onednn_scratch(int device_id) {
@@ -15680,6 +15761,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
         z.allocator->reset();
     }
     z.used.store(0, std::memory_order_relaxed);
+    arena_generation_bump();
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_reset_calls[idx]++;
@@ -16093,6 +16175,7 @@ bool unified_cache::arena_destroy() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
+    arena_generation_bump();
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto &                      z = arena_zones_[i];

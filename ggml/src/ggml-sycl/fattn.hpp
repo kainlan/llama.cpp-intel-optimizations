@@ -195,6 +195,22 @@ struct ggml_sycl_fattn_xmx_packed_k {
     void reset();
 };
 
+struct ggml_sycl_fattn_xmx_packed_k_snapshot {
+    ggml_sycl::mem_handle handle{};
+    sycl::event           ready_event{};
+
+    void * ptr         = nullptr;
+    int    device      = -1;
+    int    D           = 0;
+    int    n_kv        = 0;
+    int    H_kv        = 0;
+    int    batch       = 0;
+    int    n_blocks    = 0;
+    size_t total_bytes = 0;
+
+    bool valid() const { return handle.valid() && ptr != nullptr; }
+};
+
 // Plan the future XMX decode KV layout using descriptor and device capability
 // facts only.  PACKED_K_MEM_HANDLE means the planner must materialize a packed
 // K allocation owned by a smart mem_handle before dispatch/graph recording;
@@ -230,6 +246,10 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
 
 ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const fattn_params & params,
                                                                          int                  target_device);
+
+bool ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(const fattn_params &                       params,
+                                                        int                                        target_device,
+                                                        ggml_sycl_fattn_xmx_packed_k_snapshot * out);
 
 bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                                                        const ggml_tensor * src0,

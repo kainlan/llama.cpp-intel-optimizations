@@ -51,7 +51,8 @@ struct retained_handle_state {
     std::condition_variable            cv;
     std::deque<retained_handle_record> queue;
     std::vector<mem_handle>            graph_unwaitable;
-    size_t                             active = 0;
+    size_t                             active     = 0;
+    size_t                             publishers = 0;
 };
 
 // The detached drain worker can still be waiting while process shutdown tears down
@@ -1195,6 +1196,43 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
     return true;
 }
 
+retained_handle_publish_ticket begin_retained_handle_publish() {
+    auto &                      state = *g_retained_handles_state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    ++state.publishers;
+    return retained_handle_publish_ticket(true);
+}
+
+retained_handle_publish_ticket::retained_handle_publish_ticket(retained_handle_publish_ticket && other) noexcept :
+    active_(std::exchange(other.active_, false)) {}
+
+retained_handle_publish_ticket & retained_handle_publish_ticket::operator=(retained_handle_publish_ticket && other) noexcept {
+    if (this != &other) {
+        reset();
+        active_ = std::exchange(other.active_, false);
+    }
+    return *this;
+}
+
+retained_handle_publish_ticket::~retained_handle_publish_ticket() {
+    reset();
+}
+
+void retained_handle_publish_ticket::reset() noexcept {
+    if (!active_) {
+        return;
+    }
+
+    active_ = false;
+    auto & state = *g_retained_handles_state;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        GGML_ASSERT(state.publishers > 0);
+        --state.publishers;
+    }
+    state.cv.notify_all();
+}
+
 bool drain_retained_handles(bool wait_all, uint32_t timeout_ms) {
     if (!wait_all) {
         // Retained handles are released by the background drain worker.  Avoid
@@ -1205,8 +1243,9 @@ bool drain_retained_handles(bool wait_all, uint32_t timeout_ms) {
 
     auto &                       state = *g_retained_handles_state;
     std::unique_lock<std::mutex> lock(state.mutex);
-    return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                             [&state] { return state.queue.empty() && state.active == 0; });
+    return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&state] {
+        return state.queue.empty() && state.active == 0 && state.publishers == 0;
+    });
 }
 
 size_t graph_retained_handle_count() {
@@ -1216,14 +1255,23 @@ size_t graph_retained_handle_count() {
 }
 
 void release_graph_retained_handles() {
-    auto &                      state = *g_retained_handles_state;
-    std::lock_guard<std::mutex> lock(state.mutex);
-    const size_t                n = state.graph_unwaitable.size();
-    state.graph_unwaitable.clear();
+    std::vector<mem_handle> released;
+    size_t                  n = 0;
+    {
+        auto &                      state = *g_retained_handles_state;
+        std::lock_guard<std::mutex> lock(state.mutex);
+        n = state.graph_unwaitable.size();
+        released.swap(state.graph_unwaitable);
+    }
     GGML_SYCL_DEBUG("[MEM-HANDLE] released %zu command-graph retained leases\n", n);
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
+    retain_handles_until_event(std::move(handles), std::move(event), retained_handle_publish_ticket{});
+}
+
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
+                                retained_handle_publish_ticket ticket) {
     if (handles.empty()) {
         return;
     }
@@ -1240,6 +1288,7 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
         std::lock_guard<std::mutex> lock(state.mutex);
         state.queue.push_back({ std::move(handles), std::move(event) });
     }
+    GGML_UNUSED(ticket);
     g_retained_handles_state->cv.notify_one();
 }
 

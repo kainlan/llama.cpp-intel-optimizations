@@ -33,23 +33,17 @@ def test_failpoints_are_exact_match_and_reserved_for_gpu_lifecycle_run() -> None
     assert "throw sycl::exception" in helper
 
 
-def test_borrowed_sidecar_precondition_is_documented_at_find_and_use() -> None:
-    lookup_comment = section(
-        FATTN,
-        "// Borrowed-lifetime precondition:",
-        "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
-    )
-    assert "single active context" in lookup_comment
-    assert "no\n// concurrent unregister/teardown" in lookup_comment
-    assert "Same-device concurrent find/use is unsupported until a lease or per-entry lock exists" in lookup_comment
+def test_sidecar_snapshot_replaces_borrowed_lookup_at_force_path() -> None:
+    assert "Borrowed-lifetime precondition" not in FATTN
+    assert "Immediate borrowed use under the sidecar's single-active-context/no-concurrent-teardown" not in FATTN
 
     use = section(
         FATTN,
-        "// Immediate borrowed use under the sidecar's single-active-context/no-concurrent-teardown",
-        "if (packed_k == nullptr &&",
+        "ggml_sycl_fattn_xmx_packed_k_snapshot sidecar_snapshot{};",
+        "if (logit_softcap == 0.0f)",
     )
-    assert "concurrent same-device consumers require a future lease or per-entry lock" in use
-    assert "ggml_sycl_fattn_xmx_find_packed_k_sidecar(params, ctx.device)" in use
+    assert "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(params, ctx.device, &sidecar_snapshot)" in use
+    assert "used_sidecar" in use
 
 
 def test_initial_fill_throw_erases_owner_before_retry() -> None:
@@ -175,17 +169,34 @@ def test_packed_consumer_propagates_prior_event_then_replaces_first_and_merge() 
         "return merge_event",
     )
 
-    caller = section(
+    impl = section(
         XMX,
-        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
-        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(",
+        "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
     )
     ordered(
-        caller,
+        impl,
+        "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
+        "if (!resolved || !resolved.on_device)",
         "launch_fattn_xmx_v2_decode_gqa_split_leaf",
         "packed_k->ready_event = merge_event",
         "return true",
     )
+
+    raw_wrapper = section(
+        XMX,
+        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &    ctx,",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &             ctx,",
+    )
+    assert "launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(" in raw_wrapper
+
+    snapshot_wrapper = section(
+        XMX,
+        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &             ctx,",
+        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(ggml_backend_sycl_context &    ctx,",
+    )
+    assert "ggml_sycl_fattn_xmx_packed_k_snapshot * packed_k" in snapshot_wrapper
+    assert "launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(" in snapshot_wrapper
 
 
 def test_device_guards_cover_submission_queue_packed_identity_and_resolution() -> None:
@@ -196,15 +207,15 @@ def test_device_guards_cover_submission_queue_packed_identity_and_resolution() -
     )
     assert "stream_device >= 0 && stream_device != target_device" in materializer
 
-    caller = section(
+    impl = section(
         XMX,
-        "bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
-        "template <int D, bool use_logit_softcap, typename Q_type>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed(",
+        "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
+        "template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>\nbool launch_fattn_xmx_v2_decode_gqa_split_packed_tk",
     )
     ordered(
-        caller,
-        "packed_k->device != ctx.device",
-        "packed_k->handle.resolve(ctx.device)",
+        impl,
+        "packed_k == nullptr || packed_k->device != ctx.device",
+        "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
         "if (!resolved || !resolved.on_device)",
         "launch_fattn_xmx_v2_decode_gqa_split_leaf",
     )
@@ -213,7 +224,7 @@ def test_device_guards_cover_submission_queue_packed_identity_and_resolution() -
 def test_sidecar_identity_is_handle_hash_plus_device_not_raw_address() -> None:
     lookup = section(
         FATTN,
-        "ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar",
+        "bool ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot",
         "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows",
     )
     assert "entry->k_handle.valid() && entry->k_handle_hash == params.K_handle_hash" in lookup
@@ -228,6 +239,34 @@ def test_sidecar_identity_is_handle_hash_plus_device_not_raw_address() -> None:
     assert "const size_t root_handle_hash = root_handle.stable_identity_hash()" in update
     assert "candidate->k_handle_hash == root_handle_hash" in update
     assert "candidate->packed.device == target_device" in update
+
+
+def test_snapshot_consumer_retains_copied_owner_through_unregister_overlap() -> None:
+    use = section(
+        FATTN,
+        "ggml_sycl_fattn_xmx_packed_k_snapshot sidecar_snapshot{};",
+        "} else if (dispatch_debug_enabled) {",
+    )
+    ordered(
+        use,
+        "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(params, ctx.device, &sidecar_snapshot)",
+        "launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, Q_type, 16>",
+        "ggml_sycl::retain_handles_until_event({ sidecar_snapshot.handle },",
+    )
+
+    live = section(
+        (ROOT / "ggml/src/ggml-sycl/tests/test-fattn-packed-k-lifecycle.cpp").read_text(encoding="utf-8"),
+        "void run_sidecar_unregister_overlap",
+        "void run_consumer_checkpoint",
+    )
+    ordered(
+        live,
+        "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(fixture.lookup, device, &snapshot)",
+        "launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>",
+        "ggml_sycl::retain_handles_until_event({ snapshot.handle }, snapshot.ready_event);",
+        "ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));",
+    )
+    assert "sidecar unregister overlap lost copied owner before final decode event" in live
 
 
 def test_unregister_is_half_open_range_isolated_and_waits_via_destructor() -> None:

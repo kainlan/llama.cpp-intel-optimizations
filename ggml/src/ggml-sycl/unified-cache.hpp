@@ -42,6 +42,8 @@
 
 namespace ggml_sycl {
 
+struct onednn_scratch_token;
+
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
 
@@ -2524,6 +2526,11 @@ class unified_cache {
     // Get scratch buffers. Returns false if not reserved or sizes exceed reserved.
     // Caller must hold onednn_scratch_mutex_ via lock_onednn_scratch().
     bool get_onednn_scratch(size_t weights_needed, size_t activations_needed, onednn_scratch_buffers & out);
+    bool acquire_onednn_scratch_reservation(size_t                 weights_needed,
+                                            size_t                 activations_needed,
+                                            onednn_scratch_buffers & out,
+                                            onednn_scratch_token * token);
+    void release_onednn_scratch_reservation(onednn_scratch_token token);
 
     // Lock/unlock for scratch buffer access (RAII recommended)
     std::unique_lock<std::mutex> lock_onednn_scratch() { return std::unique_lock<std::mutex>(onednn_scratch_mutex_); }
@@ -2549,6 +2556,9 @@ class unified_cache {
     size_t onednn_activations_scratch_size() const { return onednn_activations_scratch_size_; }
 
     struct pp_moe_onednn_scratch_slot {
+        uint32_t   slot            = std::numeric_limits<uint32_t>::max();
+        uint64_t   generation      = 0;
+        uint32_t   refcount        = 0;
         void *     weight          = nullptr;
         void *     activation      = nullptr;
         void *     output          = nullptr;
@@ -2564,6 +2574,8 @@ class unified_cache {
                                        size_t   activation_slot_bytes,
                                        size_t   output_slot_bytes,
                                        uint32_t ring_depth);
+    bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
+    void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
 
     // === GPU Reorder Temp Buffer ===
@@ -2979,13 +2991,18 @@ class unified_cache {
     size_t     onednn_activations_scratch_size_ = 0;
     mem_handle onednn_weights_scratch_owner_;
     mem_handle onednn_activations_scratch_owner_;
-    std::mutex onednn_scratch_mutex_;
+    std::mutex              onednn_scratch_mutex_;
+    std::condition_variable onednn_scratch_cv_;
+    uint64_t                onednn_scratch_generation_ = 0;
+    uint32_t                onednn_scratch_refcount_   = 0;
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
+    std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_retired_slots_;
     size_t                                  pp_moe_onednn_weight_slot_size_     = 0;
     size_t                                  pp_moe_onednn_activation_slot_size_ = 0;
     size_t                                  pp_moe_onednn_output_slot_size_     = 0;
     uint32_t                                pp_moe_onednn_ring_depth_           = 0;
+    uint64_t                                pp_moe_onednn_next_generation_      = 1;
     std::mutex                              pp_moe_onednn_scratch_mutex_;
 
     // Persistent scratch buffers for TG optimization (persistent kernels).
@@ -3772,6 +3789,8 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
 struct pp_moe_onednn_scratch_result {
+    uint32_t   slot            = std::numeric_limits<uint32_t>::max();
+    uint64_t   generation      = 0;
     void *     weight          = nullptr;
     void *     activation      = nullptr;
     void *     output          = nullptr;
@@ -3791,19 +3810,25 @@ bool                         unified_cache_reserve_pp_moe_onednn_scratch(int    
                                                                          uint32_t ring_depth);
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
 
-// Get scratch buffers for oneDNN FP16 path. Returns pointers and acquires lock.
-// Caller must call unified_cache_release_onednn_scratch() when done.
+// Get scratch buffers for oneDNN FP16 path. Returns pointers plus a logical
+// reservation token. Caller must release that token when done.
 // Returns false if scratch not reserved or sizes exceed reserved.
+struct onednn_scratch_token {
+    uint64_t generation = 0;
+    bool     active     = false;
+};
+
 struct onednn_scratch_result {
-    void * weights     = nullptr;
-    void * activations = nullptr;
-    bool   ok          = false;
+    void *               weights     = nullptr;
+    void *               activations = nullptr;
+    onednn_scratch_token token{};
+    bool                 ok = false;
 };
 
 onednn_scratch_result unified_cache_get_onednn_scratch(int device_id, size_t weights_needed, size_t activations_needed);
 
-// Release scratch buffers (unlocks mutex for other threads)
-void unified_cache_release_onednn_scratch(int device_id);
+// Release a logical scratch reservation for other threads.
+void unified_cache_release_onednn_scratch(int device_id, onednn_scratch_token token);
 
 // Check if scratch buffers are reserved
 bool unified_cache_has_onednn_scratch(int device_id);

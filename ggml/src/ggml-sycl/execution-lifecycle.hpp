@@ -51,6 +51,7 @@ enum class test_mutation {
     M6b_DRAIN_SERIAL_OVERFLOW,
     M6c_RESET_SERIAL_OVERFLOW,
     M6e_INVOCATION_ID_OVERFLOW,
+    M7_SUBMIT_RELEASES_DEVICES_EARLY,
 };
 
 struct snapshot {
@@ -107,11 +108,21 @@ class Registry {
                            InvocationId * invocation) noexcept;
     error seal_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                           InvocationId invocation, lifecycle::ModelToken root) noexcept;
+    error submit_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
+                            InvocationId invocation, lifecycle::ModelToken root, int device) noexcept;
+    error submit_quarantined_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                        GraphEpoch graph_epoch, InvocationId invocation,
+                                        lifecycle::ModelToken root, int device) noexcept;
+    error release_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
+                             InvocationId invocation, lifecycle::ModelToken root) noexcept;
     error complete_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                               InvocationId invocation, lifecycle::ModelToken root, int device) noexcept;
     error quarantine_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                 GraphEpoch graph_epoch, InvocationId invocation,
                                 lifecycle::ModelToken root, int device) noexcept;
+    error abort_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                           GraphEpoch graph_epoch, InvocationId invocation,
+                           lifecycle::ModelToken root) noexcept;
     error rollback_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                          GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
     error retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
@@ -182,9 +193,12 @@ class Registry {
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
     error abort_graph_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                              lifecycle::ModelToken root) noexcept;
-    error finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                            InvocationId invocation, lifecycle::ModelToken root, int device, graph_phase terminal,
-                            token_root_phase token_terminal) noexcept;
+    error submit_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                   GraphEpoch graph_epoch, InvocationId invocation, lifecycle::ModelToken root,
+                                   int device, graph_phase terminal, token_root_phase token_terminal) noexcept;
+    error release_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                    GraphEpoch graph_epoch, InvocationId invocation,
+                                    lifecycle::ModelToken root) noexcept;
 
     mutable std::mutex                          mutex_;
     test_mutation                               mutation_ = test_mutation::NONE;

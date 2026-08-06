@@ -147,8 +147,9 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-h7 COMMAND test-sycl-lifecycle-owner-reset --case H7)
     add_test(NAME sycl-lifecycle-h11 COMMAND test-sycl-lifecycle-owner-reset --case H11)
     add_test(NAME sycl-lifecycle-h13 COMMAND test-sycl-lifecycle-owner-reset --case H13)
+    add_test(NAME sycl-lifecycle-m6 COMMAND test-sycl-lifecycle-owner-reset --case M6)
     add_test(NAME sycl-lifecycle-g2 COMMAND test-sycl-lifecycle-owner-reset --case G2)
-    set_tests_properties(sycl-lifecycle-owner-reset sycl-lifecycle-h6 sycl-lifecycle-h7 sycl-lifecycle-h11 sycl-lifecycle-h13 sycl-lifecycle-g2 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    set_tests_properties(sycl-lifecycle-owner-reset sycl-lifecycle-h6 sycl-lifecycle-h7 sycl-lifecycle-h11 sycl-lifecycle-h13 sycl-lifecycle-m6 sycl-lifecycle-g2 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
     add_executable(test-sycl-lifecycle-event-lease
         tests/test-sycl-lifecycle-event-lease.cpp
         execution-lifecycle.cpp)
@@ -161,7 +162,13 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-g6 COMMAND test-sycl-lifecycle-event-lease --case G6)
     add_test(NAME sycl-lifecycle-g6b COMMAND test-sycl-lifecycle-event-lease --case G6b)
     add_test(NAME sycl-lifecycle-g7 COMMAND test-sycl-lifecycle-event-lease --case G7)
-    set_tests_properties(sycl-lifecycle-event-lease sycl-lifecycle-g5a sycl-lifecycle-g6 sycl-lifecycle-g6b sycl-lifecycle-g7 PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    add_test(NAME sycl-lifecycle-h8 COMMAND test-sycl-lifecycle-event-lease --case H8)
+    add_test(NAME sycl-lifecycle-h12 COMMAND test-sycl-lifecycle-event-lease --case H12)
+    add_test(NAME sycl-lifecycle-h12b COMMAND test-sycl-lifecycle-event-lease --case H12b)
+    add_test(NAME sycl-lifecycle-h13b COMMAND test-sycl-lifecycle-event-lease --case H13b)
+    add_test(NAME sycl-lifecycle-m7 COMMAND test-sycl-lifecycle-event-lease --case M7)
+    add_test(NAME sycl-lifecycle-m7b COMMAND test-sycl-lifecycle-event-lease --case M7b)
+    set_tests_properties(sycl-lifecycle-event-lease sycl-lifecycle-g5a sycl-lifecycle-g6 sycl-lifecycle-g6b sycl-lifecycle-g7 sycl-lifecycle-h8 sycl-lifecycle-h12 sycl-lifecycle-h12b sycl-lifecycle-h13b sycl-lifecycle-m7 sycl-lifecycle-m7b PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
@@ -1328,6 +1335,7 @@ endif()
 foreach(_packed_k_checkpoint IN ITEMS
         sidecar-before-initial-fill
         sidecar-zero-to-update
+        sidecar-unregister-overlap
         materializer-zero-to-pack
         packed-first-to-merge)
     add_test(NAME fattn-packed-k-lifecycle-${_packed_k_checkpoint}
@@ -1773,6 +1781,32 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-graph-retention-scope COMMAND test-sycl-graph-retention-scope)
 set_tests_properties(test-sycl-graph-retention-scope PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-retained-handoff-barrier
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-retained-handoff-barrier.cpp
+)
+target_include_directories(test-sycl-retained-handoff-barrier PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-retained-handoff-barrier PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-retained-handoff-barrier PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-retained-handoff-barrier PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-retained-handoff-barrier PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-retained-handoff-barrier PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-retained-handoff-barrier COMMAND test-sycl-retained-handoff-barrier)
+set_tests_properties(test-sycl-retained-handoff-barrier PROPERTIES
     LABELS "sycl;handle;concurrency;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120

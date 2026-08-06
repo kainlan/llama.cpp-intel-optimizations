@@ -273,7 +273,8 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
                                    sycl::queue &                    queue,
                                    const std::vector<sycl::event> & deps,
                                    bool                             retain_until_event) {
-    resolved_ptr d = dst.resolve();
+    auto         publish_ticket = retain_until_event ? begin_retained_handle_publish() : retained_handle_publish_ticket{};
+    resolved_ptr d              = dst.resolve();
     resolved_ptr s = src.resolve();
     GGML_ASSERT(d && s && "mem_copy_async on unresolved handle");
 
@@ -307,7 +308,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, src_stage, 0, size, dst_queue, h2d_deps,
                                                      "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
             if (retain_until_event) {
-                retain_handles_until_event({ dst, src, src_stage }, h2d);
+                retain_handles_until_event({ dst, src, src_stage }, h2d, std::move(publish_ticket));
             } else {
                 h2d.wait_and_throw();
             }
@@ -333,7 +334,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, dst_stage, 0, size, dst_queue, {},
                                                  "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
         if (retain_until_event) {
-            retain_handles_until_event({ dst, src, src_stage, dst_stage }, h2d);
+            retain_handles_until_event({ dst, src, src_stage, dst_stage }, h2d, std::move(publish_ticket));
         } else {
             h2d.wait_and_throw();
         }
@@ -374,7 +375,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             copied += cur;
         }
         if (retain_until_event) {
-            retain_handles_until_event({ dst, src, stage }, event);
+            retain_handles_until_event({ dst, src, stage }, event, std::move(publish_ticket));
         } else {
             event.wait_and_throw();
         }
@@ -407,7 +408,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
 
     sycl::event event = mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps);
     if (retain_until_event) {
-        retain_handles_until_event({ dst, src }, event);
+        retain_handles_until_event({ dst, src }, event, std::move(publish_ticket));
     }
     return event;
 }
@@ -480,7 +481,8 @@ static sycl::event mem_fill_submit(const mem_handle &               h,
                                    sycl::queue &                    queue,
                                    const std::vector<sycl::event> & deps,
                                    bool                             retain_until_event) {
-    resolved_ptr r = h.resolve();
+    auto         publish_ticket = retain_until_event ? begin_retained_handle_publish() : retained_handle_publish_ticket{};
+    resolved_ptr r              = h.resolve();
     GGML_ASSERT(r && "mem_fill_async on unresolved handle");
 
     sycl::queue * fill_queue = &queue;
@@ -492,7 +494,7 @@ static sycl::event mem_fill_submit(const mem_handle &               h,
     sycl::event event = mem_fill_direct_submit(h, offset, value, size, *fill_queue, deps);
 
     if (retain_until_event) {
-        retain_handles_until_event({ h }, event);
+        retain_handles_until_event({ h }, event, std::move(publish_ticket));
     }
     return event;
 }

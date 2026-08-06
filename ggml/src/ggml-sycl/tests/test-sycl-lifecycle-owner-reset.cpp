@@ -69,6 +69,15 @@ static void h11() {
     require(reg.extract(ctx, &snap) == error::OK && snap.token_root_state == token_root_phase::QUARANTINED, "H11 quarantine state failed");
 }
 
+static void m6() {
+    error err = error::OK;
+    auto  root = root_token(30);
+    Registry m6a(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW); const auto c6a = m6a.create_context(err); require(err == error::OK && m6a.bind_backend(c6a,0)==error::OK, "M6a setup failed"); SessionId s6a{}; SessionResetEpoch e6a{}; GraphEpoch g6a{}; require(m6a.attach_root(c6a, root, &s6a, &e6a) == error::OK && m6a.begin_graph(c6a, s6a, e6a, root, &g6a) == error::OVERFLOW, "M6a failed");
+    Registry m6b(test_mutation::M6b_DRAIN_SERIAL_OVERFLOW); const auto c6b = m6b.create_context(err); require(err == error::OK && m6b.bind_backend(c6b,0)==error::OK, "M6b setup failed"); SessionId s6b{}; SessionResetEpoch e6b{}; require(m6b.attach_root(c6b, root, &s6b, &e6b) == error::OK, "M6b attach failed"); DrainTicket d6b{}; require(m6b.begin_drain(c6b, &d6b) == error::OVERFLOW, "M6b failed");
+    Registry m6c(test_mutation::M6c_RESET_SERIAL_OVERFLOW); const auto c6c = m6c.create_context(err); require(err == error::OK && m6c.bind_backend(c6c,0)==error::OK, "M6c setup failed"); SessionId s6c{}; SessionResetEpoch e6c{}; require(m6c.attach_root(c6c, root, &s6c, &e6c) == error::OK, "M6c attach failed"); ResetTicket r6c{}; require(m6c.begin_reset(c6c, s6c, e6c, &r6c) == error::OVERFLOW, "M6c failed");
+    Registry m6e(test_mutation::M6e_INVOCATION_ID_OVERFLOW); const auto c6e = m6e.create_context(err); require(err == error::OK && m6e.bind_backend(c6e,0)==error::OK, "M6e setup failed"); SessionId s6e{}; SessionResetEpoch e6e{}; GraphEpoch g6e{}; InvocationId i6e{}; const int d[] = {0}; const int p6e[] = {29}; require(m6e.attach_root(c6e, root, &s6e, &e6e) == error::OK && m6e.begin_graph(c6e, s6e, e6e, root, &g6e) == error::OK && m6e.begin_invocation(c6e, s6e, e6e, g6e, root, d, 1, p6e, 1, 29, &i6e) == error::OVERFLOW, "M6e failed");
+}
+
 static void h13() {
     Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H13 create failed");
     require(reg.bind_backend(ctx, 3) == error::OK, "H13 bind failed");
@@ -92,11 +101,8 @@ static void h13() {
 
     Registry m4(test_mutation::M4_CONTEXT_ID_OVERFLOW); m4.create_context(err); require(err == error::OVERFLOW, "H13 M4 failed");
     Registry m5(test_mutation::M5_SESSION_ID_OVERFLOW); const auto c5 = m5.create_context(err); require(err == error::OK && m5.bind_backend(c5,0)==error::OK, "H13 M5 setup failed"); SessionId s5{}; SessionResetEpoch e5{}; require(m5.attach_root(c5, root, &s5, &e5) == error::OVERFLOW, "H13 M5 failed");
-    Registry m6a(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW); const auto c6a = m6a.create_context(err); require(err == error::OK && m6a.bind_backend(c6a,0)==error::OK, "H13 M6a setup failed"); SessionId s6a{}; SessionResetEpoch e6a{}; GraphEpoch g6a{}; require(m6a.attach_root(c6a, root, &s6a, &e6a) == error::OK && m6a.begin_graph(c6a, s6a, e6a, root, &g6a) == error::OVERFLOW, "H13 M6a failed");
-    Registry m6b(test_mutation::M6b_DRAIN_SERIAL_OVERFLOW); const auto c6b = m6b.create_context(err); require(err == error::OK && m6b.bind_backend(c6b,0)==error::OK, "H13 M6b setup failed"); SessionId s6b{}; SessionResetEpoch e6b{}; require(m6b.attach_root(c6b, root, &s6b, &e6b) == error::OK, "H13 M6b attach failed"); DrainTicket d6b{}; require(m6b.begin_drain(c6b, &d6b) == error::OVERFLOW, "H13 M6b failed");
-    Registry m6c(test_mutation::M6c_RESET_SERIAL_OVERFLOW); const auto c6c = m6c.create_context(err); require(err == error::OK && m6c.bind_backend(c6c,0)==error::OK, "H13 M6c setup failed"); SessionId s6c{}; SessionResetEpoch e6c{}; require(m6c.attach_root(c6c, root, &s6c, &e6c) == error::OK, "H13 M6c attach failed"); ResetTicket r6c{}; require(m6c.begin_reset(c6c, s6c, e6c, &r6c) == error::OVERFLOW, "H13 M6c failed");
-    Registry m6e(test_mutation::M6e_INVOCATION_ID_OVERFLOW); const auto c6e = m6e.create_context(err); require(err == error::OK && m6e.bind_backend(c6e,0)==error::OK, "H13 M6e setup failed"); SessionId s6e{}; SessionResetEpoch e6e{}; GraphEpoch g6e{}; InvocationId i6e{}; const int d[] = {0}; const int p6e[] = {29}; require(m6e.attach_root(c6e, root, &s6e, &e6e) == error::OK && m6e.begin_graph(c6e, s6e, e6e, root, &g6e) == error::OK && m6e.begin_invocation(c6e, s6e, e6e, g6e, root, d, 1, p6e, 1, 29, &i6e) == error::OVERFLOW, "H13 M6e failed");
-    Registry dupreg; error dup_err = error::OK; const auto dupctx = dupreg.create_context(dup_err); require(dup_err == error::OK && dupreg.bind_backend(dupctx,0)==error::OK, "H13 dup setup create failed"); SessionId ds{}; SessionResetEpoch de{}; GraphEpoch gd{}; InvocationId id{}; const int dup_d[] = {0,0}; const int dup_p[] = {3,3}; const int dummy[] = {0}; require(dupreg.attach_root(dupctx, root, &ds, &de) == error::OK && dupreg.begin_graph(dupctx, ds, de, root, &gd) == error::OK, "H13 dup setup failed"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, dup_d, 2, p6e, 1, 29, &id) == error::MISMATCH, "H13 duplicate devices accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, dup_p, 2, 3, &id) == error::MISMATCH, "H13 duplicate participants accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, dummy, 0, p6e, 1, 29, &id) == error::MISMATCH, "H13 empty devices accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, dummy, 0, 29, &id) == error::MISMATCH, "H13 empty participants accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, p6e, 1, 7, &id) == error::MISMATCH, "H13 missing caller participant accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, p6e, 1, 29, &id) == error::OK, "H13 valid begin after failed validation did not recover");
+    m6();
+    Registry dupreg; error dup_err = error::OK; const auto dupctx = dupreg.create_context(dup_err); require(dup_err == error::OK && dupreg.bind_backend(dupctx,0)==error::OK, "H13 dup setup create failed"); SessionId ds{}; SessionResetEpoch de{}; GraphEpoch gd{}; InvocationId id{}; const int d[] = {0,0}; const int dup_p[] = {3,3}; const int dummy[] = {0}; const int p6e[] = {29}; require(dupreg.attach_root(dupctx, root, &ds, &de) == error::OK && dupreg.begin_graph(dupctx, ds, de, root, &gd) == error::OK, "H13 dup setup failed"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 2, p6e, 1, 29, &id) == error::MISMATCH, "H13 duplicate devices accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, dup_p, 2, 3, &id) == error::MISMATCH, "H13 duplicate participants accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, dummy, 0, p6e, 1, 29, &id) == error::MISMATCH, "H13 empty devices accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, dummy, 0, 29, &id) == error::MISMATCH, "H13 empty participants accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, p6e, 1, 7, &id) == error::MISMATCH, "H13 missing caller participant accepted"); require(dupreg.begin_invocation(dupctx, ds, de, gd, root, d, 1, p6e, 1, 29, &id) == error::OK, "H13 valid begin after failed validation did not recover");
 }
 
 static void g2_multi_live() {
@@ -114,7 +120,8 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "H7") == 0) h7();
     else if (std::strcmp(which, "H11") == 0) h11();
     else if (std::strcmp(which, "H13") == 0) h13();
+    else if (std::strcmp(which, "M6") == 0) m6();
     else if (std::strcmp(which, "G2") == 0) g2_multi_live();
-    else { h6(); h7(); h11(); h13(); g2_multi_live(); }
+    else { h6(); h7(); h11(); h13(); m6(); g2_multi_live(); }
     return 0;
 }

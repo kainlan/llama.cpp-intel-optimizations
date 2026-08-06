@@ -198,10 +198,11 @@ static bool ggml_sycl_get_rows_alloc_host_stage(size_t                  bytes,
 }
 
 template <typename T> struct ggml_sycl_get_rows_device_temp {
-    ggml_sycl::mem_handle handle{};
-    T *                   ptr    = nullptr;
-    sycl::queue *         queue  = nullptr;
-    int                   device = -1;
+    ggml_sycl::mem_handle                     handle{};
+    ggml_sycl::retained_handle_publish_ticket publish_ticket{};
+    T *                                       ptr    = nullptr;
+    sycl::queue *                             queue  = nullptr;
+    int                                       device = -1;
 
     ~ggml_sycl_get_rows_device_temp() { release(); }
 
@@ -240,9 +241,10 @@ template <typename T> struct ggml_sycl_get_rows_device_temp {
             return nullptr;
         }
 
-        ptr    = static_cast<T *>(resolved.ptr);
-        queue  = &q;
-        device = target;
+        publish_ticket = ggml_sycl::begin_retained_handle_publish();
+        ptr            = static_cast<T *>(resolved.ptr);
+        queue          = &q;
+        device         = target;
         return ptr;
     }
 
@@ -254,12 +256,13 @@ template <typename T> struct ggml_sycl_get_rows_device_temp {
             return;
         }
 
+        auto ticket = std::move(publish_ticket);
         if (queue) {
             try {
                 sycl::event done = ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(*queue);
                 std::vector<ggml_sycl::mem_handle> retained;
                 retained.push_back(std::move(handle));
-                ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+                ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done), std::move(ticket));
             } catch (...) {
                 try {
                     queue->wait_and_throw();
@@ -483,12 +486,14 @@ static size_t ggml_sycl_get_rows_index_span_bytes(const ggml_tensor * src1) {
     return max_offset + sizeof(int32_t);
 }
 
-static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context & ctx,
-                                             const ggml_tensor *         src1,
-                                             const int32_t *             src,
-                                             ggml_sycl::mem_handle &     out_handle,
-                                             const int32_t *&            out_device_ptr) {
+static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &              ctx,
+                                             const ggml_tensor *                      src1,
+                                             const int32_t *                          src,
+                                             ggml_sycl::mem_handle &                  out_handle,
+                                             ggml_sycl::retained_handle_publish_ticket & out_publish_ticket,
+                                             const int32_t *&                         out_device_ptr) {
     out_handle         = {};
+    out_publish_ticket = {};
     out_device_ptr     = src;
     const size_t bytes = ggml_sycl_get_rows_index_span_bytes(src1);
     if (!src || bytes == 0 || !ctx.stream()) {
@@ -506,7 +511,8 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context & ctx,
     if (ggml_sycl_graph_recording_active() && src1 && src1->name && src1->name[0] != '\0') {
         void * staged_ptr = nullptr;
         if (ctx.graph_input_stage_lookup(src1->name, bytes, ctx.device, &out_handle, &staged_ptr) && staged_ptr) {
-            out_device_ptr = static_cast<const int32_t *>(staged_ptr);
+            out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+            out_device_ptr     = static_cast<const int32_t *>(staged_ptr);
             if (ggml_sycl_get_rows_trace_enabled()) {
                 GGML_LOG_INFO("[GET_ROWS] using pre-staged graph input indices: tensor=%s bytes=%zu dst=%p\n",
                               src1->name, bytes, staged_ptr);
@@ -535,8 +541,9 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context & ctx,
             return false;
         }
         std::memcpy(host_resolved.ptr, src, bytes);
-        out_device_ptr = static_cast<const int32_t *>(host_resolved.ptr);
-        out_handle     = std::move(host_handle);
+        out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+        out_device_ptr     = static_cast<const int32_t *>(host_resolved.ptr);
+        out_handle         = std::move(host_handle);
         if (ggml_sycl_get_rows_trace_enabled()) {
             GGML_LOG_INFO("[GET_ROWS] staged small CPU indices to host USM: tensor=%s bytes=%zu src_alloc=%d dst=%p\n",
                           src1 && src1->name ? src1->name : "?", bytes, (int) src_alloc, host_resolved.ptr);
@@ -588,8 +595,9 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context & ctx,
     sycl::event copy_event = ggml_sycl::mem_copy_async(handle, host_stage_handle, bytes, *ctx.stream());
     copy_event.wait_and_throw();
 
-    out_device_ptr = static_cast<const int32_t *>(r.ptr);
-    out_handle     = std::move(handle);
+    out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+    out_device_ptr     = static_cast<const int32_t *>(r.ptr);
+    out_handle         = std::move(handle);
     if (ggml_sycl_get_rows_trace_enabled()) {
         GGML_LOG_INFO(
             "[GET_ROWS] staged host indices to device: tensor=%s bytes=%zu src_alloc=%d dst=%p "
@@ -2780,13 +2788,14 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
         }
     }
 
-    ggml_sycl::mem_handle  staged_indices_handle;
-    const int32_t *        staged_src1_i32 = src1_i32;
+    ggml_sycl::mem_handle                     staged_indices_handle;
+    ggml_sycl::retained_handle_publish_ticket staged_indices_publish_ticket;
+    const int32_t *                           staged_src1_i32 = src1_i32;
     const sycl::usm::alloc index_alloc =
         src1_i32 ? ggml_sycl_get_alloc_type(const_cast<int32_t *>(src1_i32)) : sycl::usm::alloc::unknown;
     const bool indices_need_device_stage = src1_i32 && n_rows_total > 0 && index_alloc != sycl::usm::alloc::device;
-    const bool indices_ready =
-        ggml_sycl_stage_get_rows_indices(ctx, dst->src[1], src1_i32, staged_indices_handle, staged_src1_i32);
+    const bool indices_ready = ggml_sycl_stage_get_rows_indices(ctx, dst->src[1], src1_i32, staged_indices_handle,
+                                                                staged_indices_publish_ticket, staged_src1_i32);
     ggml_sycl_get_rows_tracef("indices staged: ready=%d handle=%d ptr=%p", indices_ready ? 1 : 0,
                               staged_indices_handle.valid() ? 1 : 0, (const void *) staged_src1_i32);
     if (indices_ready && staged_src1_i32) {
@@ -2906,7 +2915,8 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
             *ctx.stream(), {}, "sycl.get_rows.marker", "role=get_rows;kind=marker;path=indices_release");
         std::vector<ggml_sycl::mem_handle> retained;
         retained.push_back(std::move(staged_indices_handle));
-        ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+        ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done),
+                                              std::move(staged_indices_publish_ticket));
     }
 
     // DEBUG: Check output after kernel for token embedding batch=1

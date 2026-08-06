@@ -96,6 +96,9 @@ struct mem_handle_debug_info;
 // deallocate a control block.  It is a handful of instructions in the common
 // case and touches no cache lock, so it is safe here — but do not add work to a
 // critical section on the belief that nothing under this lock can allocate.
+// H8 lock class: MEM_HANDLE. This per-handle lock must stay leaf-only: no
+// unified_cache mutex, execution_state_mutex, binding mutex, or retained-handle
+// drain state may be acquired while it is held.
 class mem_handle_spin_lock {
   public:
     mem_handle_spin_lock() = default;
@@ -505,11 +508,38 @@ struct layer_weight_handles {
 // been prefetched.
 bool build_layer_handles(int device, int layer_id, layer_weight_handles & out);
 
+class retained_handle_publish_ticket {
+  public:
+    retained_handle_publish_ticket() = default;
+    retained_handle_publish_ticket(retained_handle_publish_ticket && other) noexcept;
+    retained_handle_publish_ticket & operator=(retained_handle_publish_ticket && other) noexcept;
+    retained_handle_publish_ticket(const retained_handle_publish_ticket &)             = delete;
+    retained_handle_publish_ticket & operator=(const retained_handle_publish_ticket &) = delete;
+    ~retained_handle_publish_ticket();
+
+    explicit operator bool() const { return active_; }
+
+  private:
+    friend retained_handle_publish_ticket begin_retained_handle_publish();
+    explicit retained_handle_publish_ticket(bool active) : active_(active) {}
+
+    void reset() noexcept;
+
+    bool active_ = false;
+};
+
+// Acquire a scoped publisher ticket before a handle enters the submit→retain
+// handoff. graph-boundary drains do not report clear until every active ticket
+// either publishes into retain_handles_until_event() or unwinds.
+retained_handle_publish_ticket begin_retained_handle_publish();
+
 // Keep handle leases alive until submitted SYCL work completes.  This bridges
 // the gap between C++ handle lifetime and asynchronous queue lifetime: callers
 // may pass temporary handles to a queue operation, then release their local
 // copies while the submitted event still depends on the backing pointer.
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
+                                retained_handle_publish_ticket ticket);
 
 // During SYCL command-graph recording, events produced by recorded commands are
 // not waitable. The active backend context installs a per-thread sink so those

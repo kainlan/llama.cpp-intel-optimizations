@@ -25,6 +25,7 @@ MEM_OPS = MEM_OPS_PATH.read_text(encoding="utf-8")
 CHECKPOINTS = (
     "sidecar-before-initial-fill",
     "sidecar-zero-to-update",
+    "sidecar-unregister-overlap",
     "materializer-zero-to-pack",
     "packed-first-to-merge",
 )
@@ -54,6 +55,9 @@ def production_contract(
         "throw std::bad_alloc{}",
         "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
         "                            const int selected_tk",
+        "ggml_sycl_fattn_xmx_packed_k_snapshot sidecar_snapshot{};",
+        "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(params, ctx.device, &sidecar_snapshot)",
+        "ggml_sycl::retain_handles_until_event({ sidecar_snapshot.handle },",
         "packed-K profiler bookkeeping failed after accepted pack submit",
         "if (!reuse_alloc && !zero_published)",
         "ggml_sycl_fattn_xmx_range_contains_address(begin, size, k)",
@@ -70,7 +74,14 @@ def production_contract(
         "sycl::event merge_event = stream->submit",
         "*packed_k_ready_event = merge_event",
         'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge")',
+        "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
+        "packed_k == nullptr || packed_k->device != ctx.device",
+        "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
+        "if (!resolved || !resolved.on_device)",
+        "launch_fattn_xmx_v2_decode_gqa_split_leaf",
         "packed_k->ready_event = merge_event",
+        "ggml_sycl_fattn_xmx_packed_k_snapshot * packed_k",
+        "launch_fattn_xmx_v2_decode_gqa_split_packed_impl<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(",
         "first_submit_begin_us",
         "first_submit_end_us",
         "merge_submit_begin_us",
@@ -93,7 +104,8 @@ def production_contract(
         "mem_fill_test_profile_error_after_submit();",
         "ggml_sycl_kernel_profile_record_event(",
         "mem_fill profiler bookkeeping failed after accepted submit",
-        "retain_handles_until_event({ h }, event)",
+        "begin_retained_handle_publish()",
+        "retain_handles_until_event({ h }, event, std::move(publish_ticket))",
     )
     return (all(needle in fattn for needle in fattn_needles) and
             all(needle in xmx for needle in xmx_needles) and
@@ -115,7 +127,7 @@ def mem_fill_attribution_contract(mem_ops: str) -> bool:
             direct.index("mem_fill_test_profile_error_after_submit();") <
             direct.index("return event;") and
             submit.index("mem_fill_direct_submit") <
-            submit.index("retain_handles_until_event({ h }, event)") <
+            submit.index("retain_handles_until_event({ h }, event, std::move(publish_ticket))") <
             submit.index("return event;"))
     except ValueError:
         return False
@@ -308,6 +320,41 @@ def final_retention_drain_contract(source: str) -> bool:
         return False
 
 
+def exact_guard_construction_contract(source: str) -> bool:
+    expected = {
+        "void run_sidecar_checkpoint": "controlled_gate_release_guard gate_guard(gate, dependency_q, q);",
+        "void run_materializer_checkpoint": "level_zero_host_gate gate(dependency_q, q);",
+        "void run_sidecar_unregister_overlap": "controlled_gate_release_guard gate_guard(gate, dependency_q, q);",
+        "void run_consumer_checkpoint": "controlled_gate_release_guard gate_guard(gate, dependency_q, q);",
+    }
+    starts = tuple(expected)
+    try:
+        for index, start_name in enumerate(starts):
+            begin = source.index(start_name)
+            end = source.index(starts[index + 1], begin) if index + 1 < len(starts) else source.index(
+                "void initialize_production_baseline", begin)
+            body = source[begin:end]
+            if expected[start_name] not in body:
+                return False
+        return True
+    except ValueError:
+        return False
+
+
+def replace_nth(source: str, old: str, new: str, occurrence: int) -> str:
+    start = -1
+    for _ in range(occurrence):
+        start = source.index(old, start + 1)
+    return source[:start] + new + source[start + len(old):]
+
+
+def replace_in_section(source: str, begin: str, end: str, old: str, new: str, occurrence: int = 1) -> str:
+    start = source.index(begin)
+    stop = source.index(end, start)
+    body = source[start:stop]
+    return source[:start] + body.replace(old, new, occurrence) + source[stop:]
+
+
 def live_contract(source: str) -> bool:
     required = (
         "SKIP_UNSUPPORTED = 77",
@@ -390,7 +437,8 @@ def live_contract(source: str) -> bool:
     guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
     return (all(needle in source for needle in required) and
             all(cp in source for cp in CHECKPOINTS) and
-            source.count(guard_construction) == 2 and
+            source.count(guard_construction) == 3 and
+            exact_guard_construction_contract(source) and
             lifecycle_teardown_contract(source) and
             backend_owner_contract(source) and
             baseline_accounting_contract(source) and
@@ -445,16 +493,19 @@ def test_checkpoint_mutations_are_killed() -> None:
     for checkpoint in CHECKPOINTS:
         if checkpoint == "packed-first-to-merge":
             assert not production_contract(FATTN, XMX.replace(checkpoint, "mutated-checkpoint", 1))
+        elif checkpoint == "sidecar-unregister-overlap":
+            assert not live_contract(LIVE.replace(checkpoint, "mutated-checkpoint"))
         else:
             assert not production_contract(FATTN.replace(checkpoint, "mutated-checkpoint", 1), XMX)
         assert not live_contract(LIVE.replace(checkpoint, "mutated-checkpoint"))
         assert not cmake_contract(CMAKE.replace(checkpoint, "mutated-checkpoint"))
 
     guard_construction = "controlled_gate_release_guard gate_guard(gate, dependency_q, q);"
-    assert not live_contract(LIVE.replace(guard_construction, "/* missing teardown guard */", 1))
-    assert not live_contract(
-        LIVE.replace(guard_construction,
-                     "controlled_gate_release_guard gate_guard(gate, q, dependency_q);", 1))
+    for occurrence in (1, 2, 3):
+        assert not live_contract(replace_nth(LIVE, guard_construction, "/* missing teardown guard */", occurrence))
+        assert not live_contract(replace_nth(
+            LIVE, guard_construction,
+            "controlled_gate_release_guard gate_guard(gate, q, dependency_q);", occurrence))
     assert not live_contract(
         LIVE.replace("dependency_queue_.wait();", "work_queue_.wait();", 1))
     assert not live_contract(
@@ -544,15 +595,36 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         XMX.replace(
             "first_profile_label, first_event, first_callsite,",
             "first_profile_label, first_event, merge_callsite,", 1))
+    assert not production_contract(
+        FATTN, XMX,
+        mem_ops=MEM_OPS.replace('std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
+                                "/* mutation removed fill seam */", 1))
     for needle in (
-        'std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
         "sycl::event event = queue.submit",
         "mem_fill_test_profile_error_after_submit();",
         "mem_fill profiler bookkeeping failed after accepted submit",
-        "retain_handles_until_event({ h }, event)",
     ):
-        assert not production_contract(
-            FATTN, XMX, mem_ops=MEM_OPS.replace(needle, "/* mutation removed fill seam */", 1))
+        mutated_mem_ops = replace_in_section(
+            MEM_OPS,
+            "static sycl::event mem_fill_direct_submit",
+            "static sycl::event mem_fill_submit",
+            needle,
+            "/* mutation removed fill seam */",
+            1,
+        )
+        assert not production_contract(FATTN, XMX, mem_ops=mutated_mem_ops)
+    assert not production_contract(
+        FATTN, XMX,
+        mem_ops=MEM_OPS.replace("begin_retained_handle_publish()", "/* mutation removed fill seam */"))
+    mutated_mem_ops = replace_in_section(
+        MEM_OPS,
+        "static sycl::event mem_fill_submit",
+        "sycl::event mem_copy_async",
+        "retain_handles_until_event({ h }, event, std::move(publish_ticket))",
+        "/* mutation removed fill seam */",
+        1,
+    )
+    assert not production_contract(FATTN, XMX, mem_ops=mutated_mem_ops)
     for needle in (
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
