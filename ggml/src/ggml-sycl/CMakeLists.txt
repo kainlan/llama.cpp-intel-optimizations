@@ -297,6 +297,13 @@ if (BUILD_TESTING)
     add_test(NAME sycl-teardown-sequence-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-teardown-sequence-contract.py)
     set_tests_properties(sycl-teardown-sequence-contract PROPERTIES LABELS "sycl;execution;lifecycle;host;source-contract")
+    # --self-test re-runs the two absence-based checks against a backend that
+    # deliberately contains the construct they forbid; without it those two pass
+    # on any tree that never had it.
+    add_test(NAME sycl-moe-discovery-owner-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-discovery-owner-contract.py
+            --self-test)
+    set_tests_properties(sycl-moe-discovery-owner-contract PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
@@ -3834,6 +3841,26 @@ set_tests_properties(sycl-moe-worker-reset PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
     # submits to a device. Labels also avoid the throttled sweep's cache denylist.
     LABELS "sycl;moe;host-only;tls"
+    TIMEOUT 30
+)
+# Owner-keyed MoE discovery state (llama.cpp-nn6z). Pure host C++: it drives the
+# registry against a recording stand-in, so it links no backend library, takes no
+# -fsycl options and never enumerates or submits to a device.
+add_executable(test-moe-discovery-owner-state
+    tests/test-moe-discovery-owner-state.cpp
+)
+target_include_directories(test-moe-discovery-owner-state PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-moe-discovery-owner-state PRIVATE Threads::Threads)
+set_target_properties(test-moe-discovery-owner-state PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-discovery-owner-state COMMAND test-moe-discovery-owner-state)
+set_tests_properties(sycl-moe-discovery-owner-state PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
     TIMEOUT 30
 )
 

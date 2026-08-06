@@ -797,7 +797,7 @@ The target lock inventory and mandatory order is concrete:
 |---|---|---|
 | L1 | planned `lifecycle_registry_mutex`; current `g_sycl_model_slot_mutex`, `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
-| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
+| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`) | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
 | L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `g_onednn_scratch_lock_mutex`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
@@ -807,6 +807,18 @@ This table is exhaustive for locks touched by the lifecycle, graph, cache,
 staging, pool, and event-retention paths in scope. Foundation owner `32dg8.15.12` must update it in the
 same commit when migration introduces or discovers another such lock; an
 unclassified lock is a failing census item, not implicitly L5.
+
+`moe_discovery_registry::mutex_` is the MoE discovery owner registry's lock
+(`nn6z`). It sits at L3 with the MoE metadata locks it coordinates, and it is
+**strictly leaf: it is never held while any other lock is acquired.** The
+registry claims or completes a transition under it without allocating, and every
+`moe_discovery_live_state` callback -- which takes the L3
+`g_moe_expert_meta_mutex`, `g_expert_groups_mutex` and
+`g_expert_popularity_mutex`, and which allocates -- runs with it released. That
+is also what keeps it clear of the L1 `g_tensor_inventory_mutex`: its three
+integration points (model load commit, explicit activation, owner teardown) all
+run after the publication block has closed, so the registry lock and the
+inventory lock are never co-held in either order.
 
 Code may skip ranks but never acquire a lower-numbered rank while holding a
 higher one. Two keyed same-rank locks require the stable key order; pointer
