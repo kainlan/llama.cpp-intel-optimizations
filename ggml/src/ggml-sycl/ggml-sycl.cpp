@@ -88406,6 +88406,9 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         if (variant == ggml_sycl::moe_fused_act_undetected) {
             variant = CPU_EXPERT_FUSED_ACT_SILU;
         }
+        // Nothing reads what this publishes yet -- see the WRITE-ONLY note on
+        // act_variant in moe-bias-state.hpp before concluding this scan is dead
+        // and removing it.
         ggml_sycl_moe_act_publish(variant, alpha, limit);
     }
 

@@ -83,11 +83,29 @@ struct moe_bias_activation_state {
     // that the next owner still scans its own graph.
     bool biases_scanned = false;
 
+    // WRITE-ONLY TODAY -- do not delete as dead code. Nothing reads these three:
+    // the graph scan in ggml-sycl.cpp fills them and no consumer exists, because
+    // the fused task's own act_variant is set independently inside
+    // cpu-dispatch.cpp and was never connected to this scan.
+    //
+    // They are kept, and kept owner-keyed, because the moment a real consumer is
+    // wired up it would otherwise inherit exactly the cross-model contamination
+    // this cluster exists to prevent: before llama.cpp-nlww the sentinel lived in
+    // a process-global that nothing reset, so a SiLU model loaded after a
+    // SWIGLU_OAI model kept the earlier model's variant, alpha and limit. Deleting
+    // them now would silently drop that protection and it would have to be
+    // rediscovered by whoever hits the bug. Whether they should exist at all is a
+    // separate call, tracked as a handoff on llama.cpp-nlww.
     int   act_variant = moe_fused_act_undetected;
     float act_alpha   = 0.0f;
     float act_limit   = 0.0f;
 
     moe_bias_activation_state()                                         = default;
+    // Defaulted, so self-move-assignment leaves the members valid but
+    // unspecified rather than freeing anything. No call site self-moves: the two
+    // that move at all -- park() into the parked state, restore() back out --
+    // always move between distinct objects, and the registry never hands an
+    // owner its own live state.
     moe_bias_activation_state(moe_bias_activation_state &&)             = default;
     moe_bias_activation_state & operator=(moe_bias_activation_state &&) = default;
 
