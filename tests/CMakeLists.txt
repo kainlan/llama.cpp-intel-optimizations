@@ -1445,6 +1445,70 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
         TIMEOUT 300
     )
+
+    # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
+    # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
+    #
+    # test-sycl-reset-model-weight-lease-preserve proves what those hooks DECIDE,
+    # by driving unified_cache directly -- which is exactly what makes it cheap
+    # and what makes it blind to whether the backend ever calls them. This is the
+    # other half. It is the only affordable test that walks the real path:
+    # test-thread-safety also does, but peaks at 156-180 GB of Shmem and its exit
+    # status is already consumed by two unrelated crashes (llama.cpp-oze0,
+    # llama.cpp-09ep), so a verdict read from it is absorbed noise.
+    #
+    # Links ggml-sycl for the probe symbol but is NOT compiled with -fsycl: the
+    # probe header deliberately pulls in no SYCL headers, so this stays a plain
+    # C++ TU and adds no icpx device link to the build.
+    #
+    # SKIP_RETURN_CODE 77 is load-bearing, not boilerplate. This test's whole
+    # value is proving a call happened; the failure mode to design against is a
+    # run that reports green having loaded nothing. No device, no model file, or
+    # no -m argument all exit 77, so ctest says "skipped" and a bare shell run
+    # gets a non-zero status. The device check in particular is not cosmetic:
+    # with no SYCL device there is no unified cache, yet the backend entry points
+    # still run and would still advance the counters.
+    #
+    # Labels deliberately exclude `residency|mem-handle|cache` -- the CLAUDE.md
+    # throttled-sweep denylist, which is about MEMORY-EXHAUSTION HAZARD, not
+    # subject matter. This test DOES load a model onto a GPU, which is the
+    # never-loop family's defining property, so the exclusion needs a number
+    # rather than an assumption.
+    #
+    # EVIDENCE, with its date and conditions, because a threshold outlives the
+    # hardware it was measured on and this file has been wrong that way before.
+    # Measured on THIS binary, under the selector this registration pins:
+    #
+    #   2026-08-01, ONEAPI_DEVICE_SELECTOR=level_zero:1 (the pin below):
+    #     Shmem   2.3 GB before load -> 2.3 GB after load -> 2.3 GB after free
+    #     peak RSS 564.5 MB
+    #   Shmem delta: ZERO. Not "small" -- nothing measurable.
+    #
+    # An earlier draft of this comment justified the label by inference from
+    # llama.cpp-403s (~2.2 GB, measured under level_zero:0,1 on a different
+    # binary). That figure was for a DUAL-GPU load and did not describe this
+    # test; the number above replaces it. Retained only for the direction it
+    # establishes: before llama.cpp-403s the same load cost ~127.8 GB, which
+    # WOULD have belonged in the denylist -- so this label is a consequence of
+    # that commit, not an intrinsic property of loading a model here.
+    #
+    # The test prints its own Shmem/MemAvailable before load, after load and
+    # after free, so every run re-checks this rather than trusting the comment.
+    # If a run shows a real delta, move it into the denylist and record the new
+    # number, date and selector here. Note this holds for ONE load: the test
+    # loads once and never loops, which is the never-loop rule, not an
+    # exception to it.
+    llama_build(test-sycl-model-lifecycle-hooks.cpp)
+    target_include_directories(test-sycl-model-lifecycle-hooks PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-model-lifecycle-hooks PRIVATE ggml-sycl)
+    llama_test(test-sycl-model-lifecycle-hooks LABEL "main" ARGS -m "${MODEL_DEST}")
+    set_tests_properties(test-sycl-model-lifecycle-hooks PROPERTIES
+        LABELS "sycl;lease;lifecycle;bugfix"
+        FIXTURES_REQUIRED test-download-model
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 # test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.

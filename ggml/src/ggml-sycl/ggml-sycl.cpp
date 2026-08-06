@@ -97,6 +97,7 @@
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
+#include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -9463,9 +9464,31 @@ static size_t ggml_sycl_release_host_weight_extras_for_owner(ggml_sycl::lifecycl
     return released;
 }
 
+// Cheap, test-visible proof that the real lifecycle integration points ran.
+// This probe is single-run test instrumentation, not a concurrent snapshot API.
+static std::atomic<uint64_t> g_sycl_lifecycle_load_end_calls{ 0 };
+static std::atomic<uint64_t> g_sycl_lifecycle_release_slot_calls{ 0 };
+static std::atomic<uint32_t> g_sycl_lifecycle_load_end_last_slot{ GGML_SYCL_MODEL_SLOT_NONE };
+static std::atomic<uint32_t> g_sycl_lifecycle_release_slot_last_slot{ GGML_SYCL_MODEL_SLOT_NONE };
+static std::atomic<uint64_t> g_sycl_lifecycle_release_slot_last_reclaimed{ 0 };
+
+void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model_lifecycle_probe * out) {
+    if (!out) {
+        return;
+    }
+    // NOT thread-safe, and deliberately not pretending otherwise. Five separate
+    // relaxed loads cannot produce one coherent snapshot. The sole consumer is
+    // a single-threaded integration test after each lifecycle boundary.
+    out->load_end_calls              = g_sycl_lifecycle_load_end_calls.load(std::memory_order_relaxed);
+    out->release_slot_calls          = g_sycl_lifecycle_release_slot_calls.load(std::memory_order_relaxed);
+    out->load_end_last_slot          = g_sycl_lifecycle_load_end_last_slot.load(std::memory_order_relaxed);
+    out->release_slot_last_slot      = g_sycl_lifecycle_release_slot_last_slot.load(std::memory_order_relaxed);
+    out->release_slot_last_reclaimed = g_sycl_lifecycle_release_slot_last_reclaimed.load(std::memory_order_relaxed);
+}
+
 uint32_t ggml_backend_sycl_model_slot_current(void) {
     try {
-        const auto state = ggml_sycl::lifecycle::global_registry().last_success();
+        const auto state = ggml_sycl::lifecycle::global_registry().latest_live();
         return state ? state->token.owner.slot : GGML_SYCL_MODEL_SLOT_NONE;
     } catch (...) {
         return GGML_SYCL_MODEL_SLOT_NONE;
@@ -9935,6 +9958,9 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
     const size_t   reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
+    g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
+    g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
+    g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
                   reclaimed);
 }
@@ -10633,6 +10659,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
 
         ggml_sycl::unified_cache_note_model_load_end(ticket.token.owner.slot, ticket.token.load.value);
+        g_sycl_lifecycle_load_end_last_slot.store(ticket.token.owner.slot, std::memory_order_relaxed);
+        g_sycl_lifecycle_load_end_calls.fetch_add(1, std::memory_order_relaxed);
         const auto                                                actual = ggml_sycl_lifecycle_actual_snapshot();
         std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> plan_snapshot;
         if (!ggml_sycl::lifecycle_publish_placement_plan(ticket.token.model.value, ticket.token.load.value,
