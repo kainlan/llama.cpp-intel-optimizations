@@ -123,18 +123,19 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
 static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     printf("\n=== Test: direct host and miss expert resolution ===\n");
 
-    ggml_sycl::unified_cache cache(q, 16 * 1024);
-    uint8_t *                pinned = static_cast<uint8_t *>(sycl::malloc_host(64, q));
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(0);
+    TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
+    uint8_t * pinned = static_cast<uint8_t *>(sycl::malloc_host(64, q));
     TEST_ASSERT(pinned != nullptr, "sycl::malloc_host failed");
     std::fill(pinned, pinned + 64, 0x53);
     ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(pinned);
     host_key.aux_id             = 0x70005;
 
     ggml_sycl::mem_handle host_handle;
-    cache.register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle);
+    cache->register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle);
     TEST_ASSERT(host_handle.resolve(0).ptr == pinned, "register_host_expert should return allocation-time handle");
 
-    auto host_res = cache.resolve_expert(make_request(host_key, GGML_LAYOUT_AOS));
+    auto host_res = cache->resolve_expert(make_request(host_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(host_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "host expert should resolve");
     TEST_ASSERT(host_res.ptr == pinned, "host expert pointer mismatch");
     TEST_ASSERT(host_res.tier == ggml_sycl::expert_resolve_tier::HOST_PINNED, "host expert tier mismatch");
@@ -145,20 +146,20 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
 
     auto host_blocked_req       = make_request(host_key, GGML_LAYOUT_AOS);
     host_blocked_req.allow_host = false;
-    auto host_blocked           = cache.resolve_expert(host_blocked_req);
+    auto host_blocked           = cache->resolve_expert(host_blocked_req);
     TEST_ASSERT(host_blocked.reason == ggml_sycl::expert_resolve_reason::HOST_DISALLOWED,
                 "host-pinned expert should honor allow_host=false for device-planned routes");
 
-    auto layout_miss = cache.resolve_expert(make_request(host_key, GGML_LAYOUT_SOA));
+    auto layout_miss = cache->resolve_expert(make_request(host_key, GGML_LAYOUT_SOA));
     TEST_ASSERT(layout_miss.reason == ggml_sycl::expert_resolve_reason::LAYOUT_MISMATCH,
                 "wrong layout should report layout mismatch");
 
     std::vector<uint8_t> plain_host(64, 0x54);
     ggml_sycl_cache_id   mmap_key = ggml_sycl::test_make_cache_id(plain_host.data());
     mmap_key.aux_id               = 0x70007;
-    cache.register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS);
+    cache->register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS);
 
-    auto mmap_res = cache.resolve_expert(make_request(mmap_key, GGML_LAYOUT_AOS));
+    auto mmap_res = cache->resolve_expert(make_request(mmap_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(mmap_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "plain host expert should resolve");
     TEST_ASSERT(mmap_res.tier == ggml_sycl::expert_resolve_tier::HOST_MMAP, "plain host expert tier mismatch");
     TEST_ASSERT(mmap_res.location == ggml_sycl::cache_location::HOST_MMAP, "plain host expert location mismatch");
@@ -166,13 +167,13 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
 
     auto mmap_blocked_req            = make_request(mmap_key, GGML_LAYOUT_AOS);
     mmap_blocked_req.allow_mmap_host = false;
-    auto mmap_blocked                = cache.resolve_expert(mmap_blocked_req);
+    auto mmap_blocked                = cache->resolve_expert(mmap_blocked_req);
     TEST_ASSERT(mmap_blocked.reason == ggml_sycl::expert_resolve_reason::MMAP_HOST_DISALLOWED,
                 "plain host expert should honor allow_mmap_host=false");
 
     ggml_sycl_cache_id missing_key = ggml_sycl::test_make_cache_id(reinterpret_cast<void *>(0x12345));
     missing_key.aux_id             = 0x70006;
-    auto missing                   = cache.resolve_expert(make_request(missing_key, GGML_LAYOUT_AOS));
+    auto missing                   = cache->resolve_expert(make_request(missing_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(missing.reason == ggml_sycl::expert_resolve_reason::NOT_FOUND, "missing expert reason mismatch");
     TEST_ASSERT(missing.tier == ggml_sycl::expert_resolve_tier::UNAVAILABLE, "missing expert tier mismatch");
     TEST_ASSERT(missing.ptr == nullptr, "missing expert pointer should be null");
