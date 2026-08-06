@@ -9488,7 +9488,7 @@ void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model
 
 uint32_t ggml_backend_sycl_model_slot_current(void) {
     try {
-        const auto state = ggml_sycl::lifecycle::global_registry().last_success();
+        const auto state = ggml_sycl::lifecycle::global_registry().latest_live();
         return state ? state->token.owner.slot : GGML_SYCL_MODEL_SLOT_NONE;
     } catch (...) {
         return GGML_SYCL_MODEL_SLOT_NONE;
