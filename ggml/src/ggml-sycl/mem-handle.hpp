@@ -96,6 +96,9 @@ struct mem_handle_debug_info;
 // deallocate a control block.  It is a handful of instructions in the common
 // case and touches no cache lock, so it is safe here — but do not add work to a
 // critical section on the belief that nothing under this lock can allocate.
+// H8 lock class: MEM_HANDLE. This per-handle lock must stay leaf-only: no
+// unified_cache mutex, execution_state_mutex, binding mutex, or retained-handle
+// drain state may be acquired while it is held.
 class mem_handle_spin_lock {
   public:
     mem_handle_spin_lock() = default;
