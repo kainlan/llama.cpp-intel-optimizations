@@ -13615,6 +13615,135 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
     sycl::event::wait(stage_events);
     return normal_covered;
 }
+
+bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (!cache) {
+        return false;
+    }
+
+    sycl::queue & q = ggml_sycl_get_device(0).default_queue();
+
+    ggml_tensor tensor{};
+    tensor.type  = GGML_TYPE_Q8_0;
+    tensor.ne[0] = QK8_0;
+    tensor.ne[1] = 4;
+    tensor.ne[2] = 16;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
+    tensor.nb[1] = sizeof(block_q8_0);
+    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
+    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
+    ggml_set_name(&tensor, "blk.23.ffn_gate_exps.weight");
+
+    ggml_tensor_extra_gpu extra{};
+    extra.model_id = 0x5a23;
+    tensor.extra   = &extra;
+
+    std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x67);
+    tensor.data = data.data();
+
+    ggml_sycl::placement_plan plan{};
+    for (int e = 0; e < tensor.ne[2]; ++e) {
+        plan.entries.push_back({ "blk.23.ffn_gate_exps.weight", data.size(), data.size(), 0,
+                                 ggml_sycl::placement_priority::MOE_GATE_PROJ, 23, e,
+                                 ggml_sycl::expert_tensor_role::GATE, true, 0 });
+        plan.expert_device[23][e] = 0;
+    }
+    plan.build_index();
+    ggml_sycl_publish_test_plan(std::move(plan));
+
+    std::vector<sycl::event> stage_events;
+    {
+        scoped_planned_materialization planned_materialization(cache, "test/MoE ptr-table dispatch bundle setup");
+        for (int e = 0; e < tensor.ne[2]; ++e) {
+            ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(&tensor, &extra, e);
+            if (!key.valid) {
+                return false;
+            }
+            key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
+            if (!test_stage_soa_expert_handle(cache, q, extra, key, e, data.data(), data.size(), nullptr,
+                                              &stage_events)) {
+                sycl::event::wait(stage_events);
+                return false;
+            }
+        }
+    }
+
+    ggml_backend_sycl_context ctx(0);
+    sycl::event               table_event;
+    std::vector<int32_t>      ids_host = { 0, 1, 2, 3 };
+    ggml_tensor               ids_tensor{};
+    const bool table_ok = ggml_sycl_update_moe_ptr_table(ctx, &tensor, &ids_tensor, GGML_LAYOUT_SOA, &table_event,
+                                                         moe_ptr_table_coverage::SELECTED_IDS, &ids_host,
+                                                         /*skip_device_copy=*/false,
+                                                         /*force_cache_aos=*/false,
+                                                         /*skip_cpu_routed_experts=*/false,
+                                                         /*exact_layout_required=*/false);
+    if (!table_ok || !ggml_sycl_moe_prepare_compact_list(ctx, &tensor, /*total_batches=*/4, true)) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+    table_event.wait();
+
+    void * table_ptr   = extra.moe_ptrs_ptr(0);
+    void * compact_ptr = extra.moe_compact_ptr(0);
+    int *  missing_ptr = extra.moe_compact_missing_ptr(0);
+    if (!table_ptr || !compact_ptr || !missing_ptr) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+
+    std::vector<ggml_sycl::mem_handle> dispatch_bundle =
+        ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(&extra, 0, true, true);
+    if (dispatch_bundle.empty()) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+
+    auto bundle_covers = [&](void * ptr) {
+        for (const auto & handle : dispatch_bundle) {
+            auto resolved = handle.resolve(0);
+            if (resolved.ptr == ptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!bundle_covers(table_ptr) || !bundle_covers(compact_ptr) || !bundle_covers(missing_ptr)) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+
+    std::mutex              gate_mutex;
+    std::condition_variable gate_cv;
+    bool                    gate_open = false;
+    sycl::event delayed_event = q.submit([&](sycl::handler & cgh) {
+        cgh.host_task([&]() {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            gate_cv.wait(lock, [&]() { return gate_open; });
+        });
+    });
+
+    ggml_sycl::retain_handles_until_event(dispatch_bundle, delayed_event);
+    extra.moe_expert_ptrs_handle[0]         = {};
+    extra.moe_expert_ptrs_compact_handle[0] = {};
+    extra.moe_expert_ptrs_missing_handle[0] = {};
+    extra.moe_expert_ptrs_leases[0].clear();
+
+    const bool retained_after_clear = bundle_covers(table_ptr) && bundle_covers(compact_ptr) && bundle_covers(missing_ptr);
+    const bool drain_blocked        = !ggml_sycl::drain_retained_handles(true, 20);
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_cv.notify_all();
+    delayed_event.wait_and_throw();
+    const bool drain_cleared = ggml_sycl::drain_retained_handles(true, 1000);
+
+    sycl::event::wait(stage_events);
+    return retained_after_clear && drain_blocked && drain_cleared;
+}
 }  // namespace ggml_sycl
 
 static void ggml_sycl_moe_ids_cache_new_graph() {
@@ -45956,6 +46085,41 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
                                            sycl::queue &           queue,
                                            int                     table_index = -1);
 
+static void ggml_sycl_append_moe_dispatch_handle(std::vector<ggml_sycl::mem_handle> & bundle,
+                                                 const ggml_sycl::mem_handle &          handle) {
+    if (!ggml_sycl_mem_handle_has_identity(handle)) {
+        return;
+    }
+    for (const auto & existing : bundle) {
+        if (existing.stable_identity_equal(handle)) {
+            return;
+        }
+    }
+    bundle.push_back(handle);
+}
+
+std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
+    const ggml_tensor_extra_gpu * extra, int device, bool include_compact, bool include_missing) {
+    std::vector<ggml_sycl::mem_handle> bundle;
+    if (!extra || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return bundle;
+    }
+
+    const auto & active_leases = extra->moe_expert_ptrs_leases[device];
+    bundle.reserve(active_leases.size() + 3);
+    for (const auto & lease : active_leases) {
+        ggml_sycl_append_moe_dispatch_handle(bundle, lease);
+    }
+    ggml_sycl_append_moe_dispatch_handle(bundle, extra->moe_expert_ptrs_handle[device]);
+    if (include_compact) {
+        ggml_sycl_append_moe_dispatch_handle(bundle, extra->moe_expert_ptrs_compact_handle[device]);
+    }
+    if (include_missing) {
+        ggml_sycl_append_moe_dispatch_handle(bundle, extra->moe_expert_ptrs_missing_handle[device]);
+    }
+    return bundle;
+}
+
 static void ggml_sycl_set_moe_ptr_table_leases(ggml_tensor_extra_gpu *            extra,
                                                int                                device,
                                                std::vector<ggml_sycl::mem_handle> leases,
@@ -45964,6 +46128,7 @@ static void ggml_sycl_set_moe_ptr_table_leases(ggml_tensor_extra_gpu *          
         return;
     }
 
+    ggml_sycl_append_moe_dispatch_handle(leases, extra->moe_expert_ptrs_handle[device]);
     auto & active_leases = extra->moe_expert_ptrs_leases[device];
     if (g_ggml_sycl_graph_recording) {
         if (!leases.empty()) {
@@ -71438,6 +71603,8 @@ cpu_tg_fallthrough:
                 return false;
             }
 
+            std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
+                ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
             bool                     completion_event_set = false;
             sycl::event              completion_event;
             std::vector<sycl::event> dispatch_deps;
@@ -71458,11 +71625,10 @@ cpu_tg_fallthrough:
                 return false;
             }
 
-            if (completion_event_set && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                ggml_sycl_retain_moe_ptr_table_leases_until_event(src0_extra, ctx.device, completion_event);
-            } else if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                ggml_sycl_retain_moe_ptr_table_leases_until_event(src0_extra, ctx.device,
-                                                                  stream->ext_oneapi_submit_barrier());
+            if (!ptr_table_dispatch_bundle.empty()) {
+                ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
+                                                      completion_event_set ? completion_event :
+                                                                             stream->ext_oneapi_submit_barrier());
             }
 
             const std::vector<expert_dispatch_entry>              no_entries;
@@ -73434,9 +73600,13 @@ cpu_tg_fallthrough:
                                                                                 stream->ext_oneapi_submit_barrier());
         }
         if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-            ggml_sycl_retain_moe_ptr_table_leases_until_event(
-                src0_extra, ctx.device,
-                prompt_down_dispatch_done_set ? prompt_down_dispatch_done : stream->ext_oneapi_submit_barrier());
+            std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
+                ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
+            if (!ptr_table_dispatch_bundle.empty()) {
+                ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
+                                                      prompt_down_dispatch_done_set ? prompt_down_dispatch_done :
+                                                                                     stream->ext_oneapi_submit_barrier());
+            }
         }
         if (release_prompt_down_soa_after_dispatch) {
             (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);

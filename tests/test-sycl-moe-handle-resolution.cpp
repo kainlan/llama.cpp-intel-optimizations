@@ -373,6 +373,15 @@ static bool test_moe_ptr_table_lease_covers_populated_slots() {
     return true;
 }
 
+static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
+    printf("\n=== Test: MoE dispatch bundle retains table/compact/missing backing until delayed event ===\n");
+
+    TEST_ASSERT(ggml_sycl::test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing(),
+                "MoE dispatch bundle must retain table, compact list, and missing flag backing independently of extra slots");
+
+    return true;
+}
+
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
@@ -398,6 +407,7 @@ int main() {
     ok &= test_moe_ptr_table_cached_reuse_is_tensor_specific();
     ok &= test_moe_ptr_table_does_not_persist_pointer_cache();
     ok &= test_moe_ptr_table_lease_covers_populated_slots();
+    ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
 
     printf("\nSYCL MoE handle resolution tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

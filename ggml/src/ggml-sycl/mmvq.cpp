@@ -20456,6 +20456,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     const int32_t *      dispatch_ids  = ids_d;
     sycl::event          compact_build_event;
     bool                 has_compact_build_event = false;
+    bool                 used_compact_dispatch   = false;
+    bool                 used_compact_missing    = false;
 
     if (compact_ready && expert_ptrs) {
         auto *  extra_mut    = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -20499,8 +20501,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     return false;
                 }
             }
-            dispatch_ptrs = compact_ptrs;
-            dispatch_ids  = nullptr;
+            dispatch_ptrs         = compact_ptrs;
+            dispatch_ids          = nullptr;
+            used_compact_dispatch = true;
+            used_compact_missing  = missing_device != nullptr;
         } else if (g_ggml_sycl_graph_recording) {
             GGML_SYCL_DEBUG("[MMVQ] Missing compact list buffer during graph recording for %s\n", src0->name);
             ctx.moe_graphs_disabled_once = true;
@@ -20938,8 +20942,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     }
 
     if (use_ptr_table && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-        ggml_sycl_retain_moe_ptr_table_leases_until_event(const_cast<ggml_tensor_extra_gpu *>(src0_extra), ctx.device,
-                                                          stream->ext_oneapi_submit_barrier());
+        std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
+            ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(const_cast<ggml_tensor_extra_gpu *>(src0_extra), ctx.device,
+                                                             used_compact_dispatch, used_compact_missing);
+        if (!ptr_table_dispatch_bundle.empty()) {
+            ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
+                                                  stream->ext_oneapi_submit_barrier());
+        }
     }
 
     return true;

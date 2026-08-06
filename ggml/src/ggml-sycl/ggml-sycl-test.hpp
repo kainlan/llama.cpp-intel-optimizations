@@ -32,6 +32,7 @@ bool               test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event
 bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();
 bool               test_moe_ptr_table_does_not_persist_pointer_cache();
 bool               test_moe_ptr_table_lease_covers_populated_slots();
+bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
 constexpr uint32_t TEST_GRAPH_BOUNDARY_DRAIN_RETAINED = 1u << 0;
 constexpr uint32_t TEST_GRAPH_BOUNDARY_CLEAR_ACTIVE   = 1u << 1;
 constexpr uint32_t TEST_GRAPH_BOUNDARY_RESET_ARENAS   = 1u << 2;

@@ -1575,6 +1575,8 @@ bool ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
                                         const ggml_tensor *         src0,
                                         int64_t                     total_batches,
                                         bool                        allow_alloc);
+std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
+    const ggml_tensor_extra_gpu * extra, int device, bool include_compact = false, bool include_missing = false);
 void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event);
 const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
                                                  const ggml_tensor *         ids,
