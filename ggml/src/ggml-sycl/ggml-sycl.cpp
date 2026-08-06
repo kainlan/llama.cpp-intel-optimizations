@@ -9569,6 +9569,9 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
+static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
+                                                               const char *                stage,
+                                                               const char *                what) noexcept;
 
 struct ggml_sycl_execution_state_snapshot {
     uint64_t         context_id = 0;
@@ -35448,7 +35451,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     graph_unpin_moe_experts(this);
     graph_unpin_weights(this);
 
-    std::vector<ggml_sycl_control_host_alloc> retired_control_host_allocs;
+    decltype(control_host_allocs) retired_control_host_allocs;
     {
         std::lock_guard<std::mutex> lock(control_host_allocs_mutex);
         retired_control_host_allocs.swap(control_host_allocs);
@@ -72286,12 +72289,13 @@ cpu_tg_fallthrough:
                                                          std::max(planned_out, out_bytes), planned_ring_depth)) {
                     uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
                     ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot slot;
-                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
-                        batched_scratch_claim.activate(ctx.device, planned_ring_depth, scratch_slot, ctx.stream());
+                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot) &&
+                        cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, slot)) {
+                        batched_scratch_claim.activate(ctx.device, planned_ring_depth, scratch_slot, slot.generation,
+                                                       ctx.stream());
                     }
-                    if (batched_scratch_claim.claimed() && cache->get_pp_moe_onednn_scratch_slot(scratch_slot, slot) &&
-                        slot.weight_size >= weight_bytes && slot.activation_size >= act_bytes &&
-                        slot.output_size >= out_bytes) {
+                    if (batched_scratch_claim.claimed() && slot.weight_size >= weight_bytes &&
+                        slot.activation_size >= act_bytes && slot.output_size >= out_bytes) {
                         batched_weights            = static_cast<sycl::half *>(slot.weight);
                         batched_acts               = static_cast<sycl::half *>(slot.activation);
                         batched_out                = static_cast<float *>(slot.output);
