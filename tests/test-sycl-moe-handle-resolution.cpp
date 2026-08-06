@@ -387,17 +387,33 @@ int main() {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
-    sycl::queue q;
+    ggml_sycl::unified_cache * cache = nullptr;
+    sycl::queue *              q     = nullptr;
     try {
-        printf("Using device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+        cache = ggml_sycl::get_unified_cache_for_device(0);
+        if (!cache) {
+            fprintf(stderr, "global unified cache unavailable for logical device 0\n");
+            return 1;
+        }
+        q = &cache->get_queue();
+        const sycl::device queue_device = q->get_device();
+        const sycl::device cache_device = cache->get_queue().get_device();
+        if (queue_device != cache_device) {
+            fprintf(stderr,
+                    "queue-device identity mismatch: logical0 cache queue device (%s) != selected queue device (%s)\n",
+                    cache_device.get_info<sycl::info::device::name>().c_str(),
+                    queue_device.get_info<sycl::info::device::name>().c_str());
+            return 1;
+        }
+        printf("Using logical device 0 queue: %s\n", queue_device.get_info<sycl::info::device::name>().c_str());
     } catch (const sycl::exception & e) {
         fprintf(stderr, "SYCL error: %s\n", e.what());
         return 1;
     }
 
     bool ok = true;
-    ok &= test_normal_cache_expert_resolution(q);
-    ok &= test_direct_staged_device_resolution(q);
+    ok &= test_normal_cache_expert_resolution(*q);
+    ok &= test_direct_staged_device_resolution(*q);
     // Keep the global-cache / ready-event chaining coverage ahead of the
     // temporary tiny-budget cache test below. That local cache intentionally
     // forces fallback/no-arena paths and tears down a separate cache owner,
@@ -410,8 +426,8 @@ int main() {
     ok &= test_moe_ptr_table_does_not_persist_pointer_cache();
     ok &= test_moe_ptr_table_lease_covers_populated_slots();
     ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
-    ok &= test_direct_host_and_miss_resolution(q);
-    ok &= test_expert_staging_host_compute_zone_ownership(q);
+    ok &= test_direct_host_and_miss_resolution(*q);
+    ok &= test_expert_staging_host_compute_zone_ownership(*q);
     ok &= test_planner_role_specific_expert_placement();
 
     printf("\nSYCL MoE handle resolution tests: %s\n", ok ? "PASS" : "FAIL");
