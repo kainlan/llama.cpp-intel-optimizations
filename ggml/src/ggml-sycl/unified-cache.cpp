@@ -11716,6 +11716,39 @@ bool unified_cache::get_onednn_scratch(size_t weights_needed, size_t activations
     return true;
 }
 
+bool unified_cache::acquire_onednn_scratch_reservation(size_t                 weights_needed,
+                                                       size_t                 activations_needed,
+                                                       onednn_scratch_buffers & out,
+                                                       onednn_scratch_token * token) {
+    if (!token) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(onednn_scratch_mutex_);
+    onednn_scratch_cv_.wait(lock, [&] { return onednn_scratch_refcount_ == 0; });
+    if (!get_onednn_scratch(weights_needed, activations_needed, out)) {
+        return false;
+    }
+    token->generation      = ++onednn_scratch_generation_;
+    token->active          = true;
+    onednn_scratch_refcount_ = 1;
+    return true;
+}
+
+void unified_cache::release_onednn_scratch_reservation(onednn_scratch_token token) {
+    if (!token.active) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
+        if (onednn_scratch_refcount_ == 0 || onednn_scratch_generation_ != token.generation) {
+            return;
+        }
+        onednn_scratch_refcount_ = 0;
+    }
+    onednn_scratch_cv_.notify_one();
+}
+
 bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
                                                   size_t   activation_slot_bytes,
                                                   size_t   output_slot_bytes,
@@ -11932,10 +11965,6 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
     return false;
 }
 
-// Global scratch buffer state for lock management
-static std::mutex                                            g_onednn_scratch_lock_mutex;
-static std::unordered_map<int, std::unique_lock<std::mutex>> g_onednn_scratch_locks;
-
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size) {
     unified_cache * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
@@ -11994,21 +12023,13 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
         return result;
     }
 
-    // Acquire lock and store it for later release
-    auto lock = cache->lock_onednn_scratch();
-
     unified_cache::onednn_scratch_buffers buffers;
-    if (!cache->get_onednn_scratch(weights_needed, activations_needed, buffers)) {
+    if (!cache->acquire_onednn_scratch_reservation(weights_needed, activations_needed, buffers, &result.token)) {
         if (profile_active) {
-            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false, arena_profile_elapsed_us(t0));
+            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false,
+                                             arena_profile_elapsed_us(t0));
         }
         return result;
-    }
-
-    // Store lock for release
-    {
-        std::lock_guard<std::mutex> guard(g_onednn_scratch_lock_mutex);
-        g_onednn_scratch_locks[device_id] = std::move(lock);
     }
 
     result.weights     = buffers.weights;
@@ -12020,13 +12041,16 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
     return result;
 }
 
-void unified_cache_release_onednn_scratch(int device_id) {
-    std::lock_guard<std::mutex> guard(g_onednn_scratch_lock_mutex);
-    auto                        it = g_onednn_scratch_locks.find(device_id);
-    if (it != g_onednn_scratch_locks.end()) {
-        // Unlock by destroying the unique_lock
-        g_onednn_scratch_locks.erase(it);
+void unified_cache_release_onednn_scratch(int device_id, onednn_scratch_token token) {
+    if (!token.active) {
+        return;
     }
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache) {
+        return;
+    }
+
+    cache->release_onednn_scratch_reservation(token);
 }
 
 bool unified_cache_has_onednn_scratch(int device_id) {

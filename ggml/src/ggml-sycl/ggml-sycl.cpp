@@ -1054,18 +1054,18 @@ static bool onednn_pp_unified_scratch_enabled(ggml_type type) {
 }
 
 struct onednn_pp_scratch_guard {
-    int  device = -1;
-    bool active = false;
+    int                            device = -1;
+    ggml_sycl::onednn_scratch_token token{};
 
     ~onednn_pp_scratch_guard() {
-        if (active) {
-            ggml_sycl::unified_cache_release_onednn_scratch(device);
+        if (token.active) {
+            ggml_sycl::unified_cache_release_onednn_scratch(device, token);
         }
     }
 
-    void arm(int device_id) {
+    void arm(int device_id, ggml_sycl::onednn_scratch_token reservation_token) {
         device = device_id;
-        active = true;
+        token  = reservation_token;
     }
 
     onednn_pp_scratch_guard()                                            = default;
@@ -1093,7 +1093,7 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
     }
     *weights_scratch     = static_cast<sycl::half *>(scratch.weights);
     *activations_scratch = static_cast<sycl::half *>(scratch.activations);
-    scratch_guard.arm(device_id);
+    scratch_guard.arm(device_id, scratch.token);
     return true;
 }
 
