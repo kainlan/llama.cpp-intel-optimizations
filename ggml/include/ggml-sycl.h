@@ -924,8 +924,21 @@ GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_con
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_begin_drain(
     struct ggml_sycl_exec_context_id context,
     struct ggml_sycl_exec_drain_ticket * ticket);
+// Owner-targeted terminal wait for exactly one context: drains the queues of
+// the backends bound to it, releases that context's invocation and retires its
+// terminal graph epoch. Every wait runs with no binding, execution-state or
+// registry lock held. An unknown or already-closed context returns STALE and
+// touches nothing; teardown never sweeps other contexts or devices.
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_drain_terminal_events(
+    struct ggml_sycl_exec_context_id context);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_host_allocs(
     struct ggml_sycl_exec_drain_ticket * ticket,
+    struct ggml_sycl_exec_control_host_alloc_batch * batch);
+// Destroys the extracted batch's mem_handles outside every lock. It must run
+// between extract_control_host_allocs and finish_drain; the emptied batch shell
+// stays valid so finish_drain still checks the ticket identity that produced it.
+GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_release_control_host_allocs(
+    struct ggml_sycl_exec_drain_ticket ticket,
     struct ggml_sycl_exec_control_host_alloc_batch * batch);
 GGML_BACKEND_API enum ggml_sycl_execution_result ggml_backend_sycl_execution_context_finish_drain(
     struct ggml_sycl_exec_drain_ticket ticket,

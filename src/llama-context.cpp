@@ -112,6 +112,123 @@ static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched,
     }
 }
 #    endif
+
+struct llama_context_sycl_exec_hooks {
+    decltype(&ggml_backend_sycl_execution_context_create)               create        = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_bind_backend)         bind          = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_close_if_idle)        close_if_idle = nullptr;
+    // Owner-targeted teardown sequence. A SYCL DSO older than llama.cpp-o6jx
+    // exports none of these, and teardown then falls back to close_if_idle.
+    decltype(&ggml_backend_sycl_execution_context_drain_terminal_events)       drain_terminal = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_begin_drain)                 begin_drain    = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_extract_control_host_allocs) extract_allocs = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_release_control_host_allocs) release_allocs = nullptr;
+    decltype(&ggml_backend_sycl_execution_context_finish_drain)                finish_drain   = nullptr;
+
+    bool has_drain_sequence() const {
+        return drain_terminal && begin_drain && extract_allocs && release_allocs && finish_drain;
+    }
+};
+
+#    ifdef GGML_USE_SYCL
+static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_dev_t /*dev*/) {
+    llama_context_sycl_exec_hooks hooks;
+    hooks.create         = &ggml_backend_sycl_execution_context_create;
+    hooks.bind           = &ggml_backend_sycl_execution_context_bind_backend;
+    hooks.close_if_idle  = &ggml_backend_sycl_execution_context_close_if_idle;
+    hooks.drain_terminal = &ggml_backend_sycl_execution_context_drain_terminal_events;
+    hooks.begin_drain    = &ggml_backend_sycl_execution_context_begin_drain;
+    hooks.extract_allocs = &ggml_backend_sycl_execution_context_extract_control_host_allocs;
+    hooks.release_allocs = &ggml_backend_sycl_execution_context_release_control_host_allocs;
+    hooks.finish_drain   = &ggml_backend_sycl_execution_context_finish_drain;
+    return hooks;
+}
+#    endif
+
+// Owner-targeted context teardown (canonical §12.4/§12.8, llama.cpp-o6jx).
+//
+// The call order is mandatory: quiesce this exact context, take its drain
+// ticket, wait again for its terminal events with the ticket held, extract the
+// control-host batch, destroy that batch with no lock held, then finish the
+// drain. Calling close_if_idle() on a context that ran graphs reports
+// GGML_SYCL_EXECUTION_DEVICE_BUSY (result=4) because its per-device execution
+// token is still owned; that path stays only as the fallback for a SYCL DSO too
+// old to export the sequence.
+static void llama_context_sycl_exec_drain_and_close(const char *                          func,
+                                                    const llama_context_sycl_exec_hooks & hooks,
+                                                    ggml_sycl_exec_context_id             context) {
+    if (context.value == 0) {
+        return;
+    }
+
+    if (!hooks.has_drain_sequence()) {
+        if (hooks.close_if_idle) {
+            const auto close_rc = hooks.close_if_idle(context);
+            if (close_rc != GGML_SYCL_EXECUTION_OK && close_rc != GGML_SYCL_EXECUTION_STALE) {
+                LLAMA_LOG_ERROR("%s: failed to close SYCL execution context: result=%d\n", func, (int) close_rc);
+            }
+        }
+        return;
+    }
+
+    // A context nobody else knows about is already gone: STALE here is the
+    // idempotent repeat, not a failure, and it must not fall back to a sweep.
+    const auto quiesce_rc = hooks.drain_terminal(context);
+    if (quiesce_rc != GGML_SYCL_EXECUTION_OK) {
+        if (quiesce_rc != GGML_SYCL_EXECUTION_STALE) {
+            LLAMA_LOG_ERROR("%s: failed to quiesce SYCL execution context: result=%d\n", func, (int) quiesce_rc);
+        }
+        return;
+    }
+
+    ggml_sycl_exec_drain_ticket ticket   = {};
+    const auto                  begin_rc = hooks.begin_drain(context, &ticket);
+    if (begin_rc != GGML_SYCL_EXECUTION_OK) {
+        if (begin_rc != GGML_SYCL_EXECUTION_STALE) {
+            LLAMA_LOG_ERROR("%s: failed to begin SYCL execution drain: result=%d\n", func, (int) begin_rc);
+        }
+        return;
+    }
+
+    // With the ticket held no new session or graph epoch can start, so this is
+    // the wait that actually proves quiescence. It runs outside every backend
+    // lock.
+    const auto wait_rc = hooks.drain_terminal(context);
+    if (wait_rc != GGML_SYCL_EXECUTION_OK) {
+        LLAMA_LOG_ERROR("%s: failed to drain SYCL execution context: result=%d\n", func, (int) wait_rc);
+    }
+
+    ggml_sycl_exec_control_host_alloc_batch batch      = {};
+    const auto                              extract_rc = hooks.extract_allocs(&ticket, &batch);
+    if (extract_rc != GGML_SYCL_EXECUTION_OK) {
+        // Deliberate: returning here strands the registry entry in DRAINING for
+        // the process lifetime, because finish_drain is its only exit and also
+        // the only path that erases it. Accepted rather than papered over -- the
+        // terminal drain above has already cleared this context's device owners
+        // (quarantining when the terminal is unprovable), so nothing device-side
+        // is held, and every mem_handle is released independently of registry
+        // state. A rollback counterpart is registry work owned by 1q72:
+        // llama.cpp-34hr.
+        LLAMA_LOG_ERROR("%s: failed to extract SYCL control-host allocations: result=%d\n", func, (int) extract_rc);
+        return;
+    }
+
+    // Final mem_handle destruction, outside every lock, before the drain ends.
+    const auto release_rc = hooks.release_allocs(ticket, &batch);
+    if (release_rc != GGML_SYCL_EXECUTION_OK) {
+        LLAMA_LOG_ERROR("%s: failed to release SYCL control-host allocations: result=%d\n", func, (int) release_rc);
+    }
+
+    const auto finish_rc = hooks.finish_drain(ticket, &batch);
+    if (finish_rc != GGML_SYCL_EXECUTION_OK) {
+        // Same deliberate tradeoff as the extract failure above, and the reason
+        // this one should be unreachable: finish_drain's only non-identity
+        // refusal is DEVICE_BUSY, which requires a live invocation on one of
+        // this context's devices -- exactly what the two terminal drains have
+        // already released. Recovery needs a registry rollback (llama.cpp-34hr).
+        LLAMA_LOG_ERROR("%s: failed to finish SYCL execution drain: result=%d\n", func, (int) finish_rc);
+    }
+}
 #endif
 
 #if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
@@ -121,12 +238,6 @@ struct llama_context_sycl_dl_compute_hooks {
     decltype(&ggml_backend_sycl_cpu_offload_available)            cpu_available   = nullptr;
     decltype(&ggml_backend_sycl_has_active_placement_plan)        has_active_plan = nullptr;
     int                                                           device_index    = -1;
-};
-
-struct llama_context_sycl_exec_hooks {
-    decltype(&ggml_backend_sycl_execution_context_create)               create = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_bind_backend)         bind   = nullptr;
-    decltype(&ggml_backend_sycl_execution_context_close_if_idle)        close_if_idle = nullptr;
 };
 
 static llama_context_sycl_dl_compute_hooks llama_context_sycl_compute_procs(ggml_backend_dev_t dev) {
@@ -173,6 +284,16 @@ static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_bind_backend"));
     hooks.close_if_idle = reinterpret_cast<decltype(hooks.close_if_idle)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_close_if_idle"));
+    hooks.drain_terminal = reinterpret_cast<decltype(hooks.drain_terminal)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_drain_terminal_events"));
+    hooks.begin_drain = reinterpret_cast<decltype(hooks.begin_drain)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_begin_drain"));
+    hooks.extract_allocs = reinterpret_cast<decltype(hooks.extract_allocs)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_extract_control_host_allocs"));
+    hooks.release_allocs = reinterpret_cast<decltype(hooks.release_allocs)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_release_control_host_allocs"));
+    hooks.finish_drain = reinterpret_cast<decltype(hooks.finish_drain)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_execution_context_finish_drain"));
     return hooks;
 }
 
@@ -430,14 +551,12 @@ llama_context::llama_context(
         if (!dev || sycl_exec_context.value == 0) {
             return;
         }
-#    ifdef GGML_USE_SYCL
-        auto close_if_idle = &ggml_backend_sycl_execution_context_close_if_idle;
-#    else
+        // Construction unwind: no graph has run, so the context is genuinely
+        // idle and close_if_idle is the exact operation. Teardown of a context
+        // that ran graphs uses llama_context_sycl_exec_drain_and_close instead.
         auto exec_hooks = llama_context_sycl_exec_procs(dev);
-        auto close_if_idle = exec_hooks.close_if_idle;
-#    endif
-        if (close_if_idle) {
-            (void) close_if_idle(sycl_exec_context);
+        if (exec_hooks.close_if_idle) {
+            (void) exec_hooks.close_if_idle(sycl_exec_context);
         }
         sycl_exec_context = {};
     };
@@ -473,17 +592,12 @@ llama_context::llama_context(
                 continue;
             }
             sycl_exec_scope.dev = dev;
-#    ifdef GGML_USE_SYCL
-            auto create_exec = &ggml_backend_sycl_execution_context_create;
-            auto bind_exec   = &ggml_backend_sycl_execution_context_bind_backend;
-#    else
-            auto exec_hooks  = llama_context_sycl_exec_procs(dev);
+            auto exec_hooks = llama_context_sycl_exec_procs(dev);
             if (!exec_hooks.create || !exec_hooks.bind || !exec_hooks.close_if_idle) {
                 throw std::runtime_error(format("missing SYCL execution lifecycle procedures for %s backend", ggml_backend_dev_name(dev)));
             }
             auto create_exec = exec_hooks.create;
             auto bind_exec   = exec_hooks.bind;
-#    endif
             if (!create_exec || !bind_exec) {
                 continue;
             }
@@ -786,18 +900,7 @@ llama_context::~llama_context() {
             if (!llama_context_dev_is_sycl(dev)) {
                 continue;
             }
-#    ifdef GGML_USE_SYCL
-            auto close_if_idle = &ggml_backend_sycl_execution_context_close_if_idle;
-#    else
-            auto exec_hooks = llama_context_sycl_exec_procs(dev);
-            auto close_if_idle = exec_hooks.close_if_idle;
-#    endif
-            if (close_if_idle) {
-                const auto close_rc = close_if_idle(sycl_exec_context);
-                if (close_rc != GGML_SYCL_EXECUTION_OK && close_rc != GGML_SYCL_EXECUTION_STALE) {
-                    LLAMA_LOG_ERROR("%s: failed to close SYCL execution context: result=%d\n", __func__, (int) close_rc);
-                }
-            }
+            llama_context_sycl_exec_drain_and_close(__func__, llama_context_sycl_exec_procs(dev), sycl_exec_context);
             break;
         }
     }

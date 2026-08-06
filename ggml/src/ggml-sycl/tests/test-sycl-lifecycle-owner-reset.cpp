@@ -1,14 +1,20 @@
 #include "execution-lifecycle.hpp"
+#include "model-lifecycle.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 
 using namespace ggml_sycl::execution;
 using ggml_sycl::lifecycle::LoadTxnId;
 using ggml_sycl::lifecycle::ModelId;
 using ggml_sycl::lifecycle::ModelToken;
 using ggml_sycl::lifecycle::SlotToken;
+
+namespace model = ggml_sycl::lifecycle;
 
 static void require(bool value, const char * message) {
     if (!value) {
@@ -114,14 +120,312 @@ static void g2_multi_live() {
     require(reg.extract(b, &snap) == error::OK && snap.bound_device_count == 1, "G2 B damaged by A close");
 }
 
+// A published model owner, for the model half of the H14 identity matrix.
+static ModelToken commit_model(model::Registry & reg) {
+    auto begin = reg.begin_outer();
+    require(begin.code == model::error::OK, "H14 model load begin failed");
+    auto end = reg.end(begin.txn, true);
+    require(end.committed, "H14 model load did not commit");
+    return end.token;
+}
+
+// A context's whole observable owner state. Teardown of a different owner must
+// leave every field of this untouched.
+struct owner_state {
+    uint64_t context = 0, session = 0, reset_epoch = 0, graph_epoch = 0, invocation = 0;
+    context_phase context_state = context_phase::CLOSED;
+    session_phase session_state = session_phase::IDLE;
+    graph_phase   graph_state   = graph_phase::IDLE;
+    ModelToken    token_root{};
+    uint32_t      bound_device_count = 0;
+};
+
+static owner_state read_owner(Registry & reg, ContextId context, const char * message) {
+    snapshot snap{};
+    require(reg.extract(context, &snap) == error::OK, message);
+    return { snap.context.value,  snap.session.value,     snap.reset_epoch.value,
+             snap.graph_epoch.value, snap.invocation.value, snap.context_state,
+             snap.session_state,  snap.graph_state,       snap.token_root,
+             snap.bound_device_count };
+}
+
+static bool same_owner(const owner_state & a, const owner_state & b) {
+    return a.context == b.context && a.session == b.session && a.reset_epoch == b.reset_epoch &&
+           a.graph_epoch == b.graph_epoch && a.invocation == b.invocation &&
+           a.context_state == b.context_state && a.session_state == b.session_state &&
+           a.graph_state == b.graph_state && a.token_root == b.token_root &&
+           a.bound_device_count == b.bound_device_count;
+}
+
+// H5: reset and teardown touch only the target model/context/session/epoch.
+// The wrong-owner assertions are the host form of M4 (wildcard context owner)
+// and M5 (all-epoch graph clear): with either mutation applied the mismatched
+// call below would succeed and B's snapshot would move.
+static void h5_owner_targeted_reset() {
+    Registry reg;
+    error    err = error::OK;
+    const auto a = reg.create_context(err), b = reg.create_context(err);
+    require(err == error::OK, "H5 create failed");
+    // Same device for both contexts: a device-scoped teardown cannot pass this.
+    require(reg.bind_backend(a, 5) == error::OK && reg.bind_backend(b, 5) == error::OK, "H5 bind failed");
+
+    SessionId sa{}, sb{};
+    SessionResetEpoch ea{}, eb{};
+    auto ra = root_token(40), rb = root_token(41);
+    require(reg.attach_root(a, ra, &sa, &ea) == error::OK && reg.attach_root(b, rb, &sb, &eb) == error::OK,
+            "H5 attach failed");
+
+    GraphEpoch gb{};
+    InvocationId ib{};
+    const int devices[] = { 5 };
+    const int participants[] = { 2 };
+    require(reg.begin_graph(b, sb, eb, rb, &gb) == error::OK, "H5 B graph failed");
+    require(reg.begin_invocation(b, sb, eb, gb, rb, devices, 1, participants, 1, 2, &ib) == error::OK,
+            "H5 B invoke failed");
+    require(reg.complete_invocation(b, sb, eb, gb, ib, rb, 2) == error::OK, "H5 B complete failed");
+    require(reg.retire_graph(b, sb, eb, gb, rb) == error::OK, "H5 B retire failed");
+
+    const owner_state before = read_owner(reg, b, "H5 B extract failed");
+
+    // M4 shape: A's reset ticket presented with B's session must be refused.
+    ResetTicket wrong{};
+    require(reg.begin_reset(a, sb, eb, &wrong) == error::STALE, "H5 cross-context session reset accepted");
+    // M5 shape: retiring B's epoch through A must be refused.
+    require(reg.retire_graph(a, sa, ea, gb, rb) == error::STALE, "H5 cross-context graph retire accepted");
+    require(same_owner(read_owner(reg, b, "H5 B extract after refusals failed"), before),
+            "H5 refused cross-owner call still changed B");
+
+    // A's own reset, then A's own full drain, must both leave B alone.
+    ResetTicket mine{};
+    SessionResetEpoch next{};
+    require(reg.begin_reset(a, sa, ea, &mine) == error::OK, "H5 A begin reset failed");
+    require(reg.finish_reset(mine, &next) == error::OK && next.value == ea.value + 1, "H5 A finish reset failed");
+    require(same_owner(read_owner(reg, b, "H5 B extract after A reset failed"), before), "H5 A reset changed B");
+
+    DrainTicket drain{};
+    require(reg.begin_drain(a, &drain) == error::OK, "H5 A begin drain failed");
+    require(reg.finish_drain(drain) == error::OK, "H5 A finish drain failed");
+    require(same_owner(read_owner(reg, b, "H5 B extract after A drain failed"), before), "H5 A drain changed B");
+
+    // B is not merely intact in the snapshot -- it is still usable on the very
+    // device A was torn down on.
+    GraphEpoch gb2{};
+    InvocationId ib2{};
+    require(reg.begin_graph(b, sb, eb, rb, &gb2) == error::OK, "H5 B unusable after A teardown");
+    require(reg.begin_invocation(b, sb, eb, gb2, rb, devices, 1, participants, 1, 2, &ib2) == error::OK,
+            "H5 B device claim lost to A teardown");
+}
+
+// Shared H14 fixtures. Each --case below asserts only its own named scenario;
+// the fixtures exist so that nine focused cases do not become nine copies of
+// the same setup.
+
+// Two published models. `survivor` must be untouched by whatever a case does
+// to `doomed`.
+struct model_fixture {
+    model::Registry reg;
+    ModelToken      doomed{};
+    ModelToken      survivor{};
+    std::shared_ptr<const model::ModelState> survivor_state;
+
+    model_fixture() {
+        doomed         = commit_model(reg);
+        survivor       = commit_model(reg);
+        survivor_state = reg.find(survivor.model);
+        require(survivor_state != nullptr, "H14 survivor model not live");
+    }
+
+    void require_survivor_unchanged(const char * message) {
+        require(reg.find(survivor.model) == survivor_state, message);
+    }
+};
+
+// Two contexts on one device. A device-scoped teardown cannot pass these:
+// `live` must be untouched by whatever a case does to `doomed`.
+struct context_fixture {
+    Registry          reg;
+    ContextId         live{}, doomed{};
+    SessionId         s_live{}, s_doomed{};
+    SessionResetEpoch e_live{}, e_doomed{};
+    ModelToken        r_live    = root_token(50);
+    ModelToken        r_doomed  = root_token(51);
+    GraphEpoch        g_live{};
+    owner_state       before{};
+
+    context_fixture() {
+        error err = error::OK;
+        live   = reg.create_context(err);
+        doomed = reg.create_context(err);
+        require(err == error::OK, "H14 context create failed");
+        require(reg.bind_backend(live, 6) == error::OK && reg.bind_backend(doomed, 6) == error::OK,
+                "H14 bind failed");
+        require(reg.attach_root(live, r_live, &s_live, &e_live) == error::OK, "H14 live attach failed");
+        require(reg.attach_root(doomed, r_doomed, &s_doomed, &e_doomed) == error::OK, "H14 doomed attach failed");
+        require(reg.begin_graph(live, s_live, e_live, r_live, &g_live) == error::OK, "H14 live graph failed");
+        before = read_owner(reg, live, "H14 live extract failed");
+    }
+
+    void require_live_unchanged(const char * message) {
+        require(same_owner(read_owner(reg, live, "H14 live re-extract failed"), before), message);
+    }
+
+    // Drives `doomed` all the way to CLOSED so the stale-identity cases have a
+    // previously-issued identity to present, as distinct from a never-issued one.
+    DrainTicket close_doomed() {
+        DrainTicket ticket{};
+        require(reg.begin_drain(doomed, &ticket) == error::OK, "H14 doomed begin drain failed");
+        require(reg.finish_drain(ticket) == error::OK, "H14 doomed finish drain failed");
+        return ticket;
+    }
+};
+
+// Repeat teardown of the same DEAD identity is an idempotent typed no-op.
+static void h14_teardown_repeat() {
+    model_fixture f;
+    require(f.reg.teardown(f.doomed) == model::error::OK, "H14 first teardown failed");
+    require(f.reg.teardown(f.doomed) == model::error::OK_ALREADY_DEAD, "H14 repeat teardown is not OK_ALREADY_DEAD");
+    require(f.reg.teardown(f.doomed) == model::error::OK_ALREADY_DEAD, "H14 repeat teardown is not idempotent");
+    f.require_survivor_unchanged("H14 repeat teardown changed the surviving model");
+}
+
+// A model identity this registry never issued is NOT_FOUND, not a sweep.
+static void h14_teardown_unknown_model() {
+    model_fixture    f;
+    const ModelToken unknown{ ModelId{ f.doomed.model.value + 9999 }, LoadTxnId{ f.doomed.load.value + 9999 },
+                              SlotToken{ 0, 1 } };
+    require(f.reg.teardown(unknown) == model::error::NOT_FOUND, "H14 unknown model is not NOT_FOUND");
+    f.require_survivor_unchanged("H14 unknown-model teardown changed the surviving model");
+    require(f.reg.teardown(f.doomed) == model::error::OK, "H14 real teardown blocked by the unknown attempt");
+}
+
+// A live model's slot with the wrong generation is STALE_IDENTITY, and the
+// model stays live and tearable through its real token.
+//
+// prepare_teardown() guards this input twice -- the slot generation check and
+// the token-equality check below it -- so deleting either one alone is a null
+// mutation that no test can catch. Deleting both does fail this case, and only
+// this case. Assert the observable result, not one of the two source lines.
+static void h14_teardown_stale_slot_generation() {
+    model_fixture f;
+    ModelToken    stale = f.survivor;
+    stale.owner.generation = f.survivor.owner.generation + 1;
+    require(f.reg.teardown(stale) == model::error::STALE_IDENTITY, "H14 stale slot generation is not STALE_IDENTITY");
+    f.require_survivor_unchanged("H14 stale-generation teardown changed the surviving model");
+    require(f.reg.teardown(f.survivor) == model::error::OK, "H14 exact token rejected after a stale attempt");
+}
+
+// A ContextId beyond anything issued cannot start or close a drain.
+static void h14_teardown_unknown_context() {
+    context_fixture f;
+    const ContextId never_issued{ f.doomed.value + 4096 };
+    DrainTicket     ticket{};
+    require(f.reg.begin_drain(never_issued, &ticket) == error::STALE, "H14 never-issued context drain accepted");
+    require(f.reg.close_context_if_idle(never_issued) == error::STALE, "H14 never-issued context close accepted");
+    f.require_live_unchanged("H14 unknown context still mutated the live context");
+}
+
+// A SessionId this registry never issued cannot open a reset on a real context.
+static void h14_teardown_never_issued_session() {
+    context_fixture f;
+    ResetTicket     ticket{};
+    require(f.reg.begin_reset(f.live, SessionId{ f.s_live.value + 4096 }, f.e_live, &ticket) == error::STALE,
+            "H14 never-issued session accepted");
+    f.require_live_unchanged("H14 never-issued session still mutated the live context");
+}
+
+// A GraphEpoch this registry never issued cannot retire the current graph.
+static void h14_teardown_never_issued_graph_epoch() {
+    context_fixture f;
+    require(f.reg.retire_graph(f.live, f.s_live, f.e_live, GraphEpoch{ f.g_live.value + 4096 }, f.r_live) ==
+                error::STALE,
+            "H14 never-issued graph epoch accepted");
+    f.require_live_unchanged("H14 never-issued graph epoch still mutated the live context");
+}
+
+// A previously-issued ContextId that has already been drained to CLOSED, plus a
+// replay of its own spent drain ticket.
+static void h14_teardown_stale_context() {
+    context_fixture   f;
+    const DrainTicket spent = f.close_doomed();
+    DrainTicket       ticket{};
+    require(f.reg.begin_drain(f.doomed, &ticket) == error::STALE, "H14 stale context drain accepted");
+    require(f.reg.finish_drain(spent) == error::STALE, "H14 spent drain ticket replayed");
+    require(f.reg.close_context_if_idle(f.doomed) == error::STALE, "H14 stale context close accepted");
+    f.require_live_unchanged("H14 draining the doomed context swept the live one");
+}
+
+// A previously-issued SessionId belonging to a different context, presented to
+// this one. Distinct from the never-issued case above: this value really was
+// handed out, just not for this owner.
+static void h14_teardown_stale_session() {
+    context_fixture f;
+    ResetTicket     ticket{};
+    require(f.reg.begin_reset(f.live, f.s_doomed, f.e_doomed, &ticket) == error::STALE,
+            "H14 another context's session accepted");
+    f.close_doomed();
+    require(f.reg.begin_reset(f.live, f.s_doomed, f.e_doomed, &ticket) == error::STALE,
+            "H14 closed context's session accepted");
+    f.require_live_unchanged("H14 stale session still mutated the live context");
+}
+
+// A superseded reset epoch, and a graph epoch that has already been retired --
+// both previously issued, both stale.
+static void h14_teardown_stale_graph_epoch() {
+    context_fixture f;
+    ResetTicket     ticket{};
+    require(f.reg.begin_reset(f.live, f.s_live, SessionResetEpoch{ f.e_live.value - 1 }, &ticket) == error::STALE,
+            "H14 superseded reset epoch accepted");
+
+    require(f.reg.rollback_graph(f.live, f.s_live, f.e_live, f.g_live, f.r_live) == error::OK,
+            "H14 live graph rollback failed");
+    GraphEpoch next{};
+    require(f.reg.begin_graph(f.live, f.s_live, f.e_live, f.r_live, &next) == error::OK, "H14 live re-record failed");
+    require(next.value != f.g_live.value, "H14 re-record reused the retired epoch");
+    require(f.reg.retire_graph(f.live, f.s_live, f.e_live, f.g_live, f.r_live) == error::STALE,
+            "H14 superseded graph epoch accepted");
+
+    snapshot after{};
+    require(f.reg.extract(f.live, &after) == error::OK && after.graph_epoch.value == next.value,
+            "H14 stale epoch retire clobbered the current epoch");
+}
+
 int main(int argc, char ** argv) {
-    const char * which = argc > 2 && std::strcmp(argv[1], "--case") == 0 ? argv[2] : "all";
-    if (std::strcmp(which, "H6") == 0) h6();
-    else if (std::strcmp(which, "H7") == 0) h7();
-    else if (std::strcmp(which, "H11") == 0) h11();
-    else if (std::strcmp(which, "H13") == 0) h13();
-    else if (std::strcmp(which, "M6") == 0) m6();
-    else if (std::strcmp(which, "G2") == 0) g2_multi_live();
-    else { h6(); h7(); h11(); h13(); m6(); g2_multi_live(); }
+    std::vector<std::string> cases;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--case") == 0 && i + 1 < argc) {
+            cases.emplace_back(argv[++i]);
+        }
+    }
+    if (cases.empty()) {
+        cases = { "all" };
+    }
+    for (const auto & which : cases) {
+        if (which == "H6") h6();
+        else if (which == "H7") h7();
+        else if (which == "H11") h11();
+        else if (which == "H13") h13();
+        else if (which == "M6") m6();
+        else if (which == "G2") g2_multi_live();
+        else if (which == "H5" || which == "owner-targeted-reset") h5_owner_targeted_reset();
+        else if (which == "teardown-repeat") h14_teardown_repeat();
+        else if (which == "teardown-unknown-model") h14_teardown_unknown_model();
+        else if (which == "teardown-stale-slot-generation") h14_teardown_stale_slot_generation();
+        else if (which == "teardown-unknown-context") h14_teardown_unknown_context();
+        else if (which == "teardown-never-issued-session") h14_teardown_never_issued_session();
+        else if (which == "teardown-never-issued-graph-epoch") h14_teardown_never_issued_graph_epoch();
+        else if (which == "teardown-stale-context") h14_teardown_stale_context();
+        else if (which == "teardown-stale-session") h14_teardown_stale_session();
+        else if (which == "teardown-stale-graph-epoch") h14_teardown_stale_graph_epoch();
+        else if (which == "all") {
+            h6(); h7(); h11(); h13(); m6(); g2_multi_live(); h5_owner_targeted_reset();
+            h14_teardown_repeat(); h14_teardown_unknown_model(); h14_teardown_stale_slot_generation();
+            h14_teardown_unknown_context(); h14_teardown_never_issued_session();
+            h14_teardown_never_issued_graph_epoch(); h14_teardown_stale_context();
+            h14_teardown_stale_session(); h14_teardown_stale_graph_epoch();
+        } else {
+            std::cerr << "unknown case: " << which << '\n';
+            return 2;
+        }
+    }
     return 0;
 }
