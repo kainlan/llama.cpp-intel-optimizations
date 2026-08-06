@@ -133,7 +133,9 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
 
     ggml_sycl::mem_handle host_handle;
     cache->register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle);
-    TEST_ASSERT(host_handle.resolve(0).ptr == pinned, "register_host_expert should return allocation-time handle");
+    TEST_ASSERT(host_handle.device() == ggml_sycl::mem_handle::HOST_DEVICE,
+                "register_host_expert should preserve HOST_DEVICE owner identity");
+    TEST_ASSERT(host_handle.resolve().ptr == pinned, "register_host_expert should return allocation-time handle");
 
     auto host_res = cache->resolve_expert(make_request(host_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(host_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "host expert should resolve");
