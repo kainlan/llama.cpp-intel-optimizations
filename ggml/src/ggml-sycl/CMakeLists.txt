@@ -1785,6 +1785,32 @@ set_tests_properties(test-sycl-graph-retention-scope PROPERTIES
     TIMEOUT 120
 )
 
+add_executable(test-sycl-retained-handoff-barrier
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-retained-handoff-barrier.cpp
+)
+target_include_directories(test-sycl-retained-handoff-barrier PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-retained-handoff-barrier PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-retained-handoff-barrier PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-retained-handoff-barrier PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-retained-handoff-barrier PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-retained-handoff-barrier PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-retained-handoff-barrier COMMAND test-sycl-retained-handoff-barrier)
+set_tests_properties(test-sycl-retained-handoff-barrier PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: the scoped transient allocators must decide allocation SHAPE -- role, category, arena
 # zone, allocator path -- from THIS thread's recording state (llama.cpp-f9tg).  The three
 # scoped_unified_*_temp templates in ggml-sycl.cpp took it from
