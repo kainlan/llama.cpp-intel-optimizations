@@ -555,13 +555,20 @@ Task 17c's explicit soft-skip/non-vacuity audit and repair where necessary.
 | `tests/test-mmvq-q8-0-streaming-bench.cpp` | `test-mmvq-q8-0-streaming-bench` | `CMD(test-mmvq-q8-0-streaming-bench)`; `CMD(test-mmvq-q8-0-streaming-smoke)`; `CMD(test-mmq-q8-0-streaming-smoke)`; `CMD(test-mmq-q8-0-streaming-forced)` | manual (opt-in CTest modes) | NV-77; 77-ready by Task 14a; all four historical modes required | `lead` / `CHAIN` |
 | `tests/test-mxfp4-xmx-tiled.cpp` | `test-mxfp4-xmx-tiled` | `CMD(test-mxfp4-xmx-tiled)` | GPU serial | NV-77; 77-ready by Task 14b | `lead` / `CHAIN` |
 | `tests/test-q6k-reorder-dispatch.cpp` | `test-q6k-reorder-dispatch` | `CMD(test-q6k-reorder-dispatch)` | GPU serial | NV-77; Task 15b source-ready; mutation deferred to `8u22`, runtime to `8kyi` | `lead` / `CHAIN` |
-| `tests/test-sycl-expert-prefetch.cpp` | `test-sycl-expert-prefetch` | `CMD(test-sycl-expert-prefetch)` | GPU serial | NV-77; current no-GPU path exits 77 | `lead` / `CHAIN` |
 | `tests/test-sycl-fattn-onednn-descriptors.cpp` | `test-sycl-fattn-onednn-descriptors` | `CMD(test-sycl-fattn-onednn-descriptors)` | GPU serial | NV-77; 77-ready by Task 14c | `lead` / `CHAIN` |
 | `tests/test-sycl-set-rows-owner-routing.cpp` | `test-sycl-set-rows-owner-routing` | `CMD(test-sycl-set-rows-owner-routing)` | GPU serial | NV-77; repair success-on-unavailable | `lead` / `CHAIN` |
 | `tests/test-unified-dispatch-integration.cpp` | `test-unified-dispatch-integration` | `CMD(test-unified-dispatch-integration)` | GPU serial | NV-77; 77-ready by Task 14d | `lead` / `CHAIN` |
 
-Accepted reconciliation: **40 live + 8 inactive = 48**; hazards are **9
-host-only + 38 GPU serial + 1 manual opt-in = 48**. The source-ready review set
+Accepted reconciliation (amended 2026-08-06): **40 live + 7 inactive = 47**;
+hazards are **9 host-only + 37 GPU serial + 1 manual opt-in = 47**. The count
+was 48 when Task 16 was decided; `tests/test-sycl-expert-prefetch.cpp` was
+subsequently RE-DECLINED and its registration dropped by `a4791b7a9`
+(2026-08-05): the source includes `expert-cache.hpp`, which no longer exists —
+the same obsolete-header class as the declined `test-expert-cache.cpp` row. It
+now sits in the declined table below. The Task 19 gate (`llama.cpp-8kyi`,
+comment c-jx40) reconciled `ctest -N` against this amended set: 50 exact CTest
+names, all registered, all executed at `772798e91`. A future rewrite against
+the current prefetch API needs a new Task 16 acceptance decision. The source-ready review set
 is exactly Task 14a–d plus Task 15a–b: streaming, MXFP4, oneDNN descriptors,
 unified dispatch, CPU/GPU SoA, and Q6K reorder. Their required lead mutation
 proofs remain conditions on `llama.cpp-8u22`; the final clean build and
@@ -581,9 +588,13 @@ source needs a new acceptance decision.
 | `tests/test-q6k-56block-debug.cpp`; `tests/test-q6k-layout-debug.cpp`; `tests/test-q6k-variable-reorder.cpp`; `tests/test-tile-decomposition.cpp` | 4 | never-test local reimplementations; vacuous against production | `lead` via `llama.cpp-0igs`: delete current sources, preserving the Task 4b per-file reasons |
 | `tests/test-sycl-prestage-routed-experts.cpp` | 1 | D-LOCAL: current source locally mimics routed-expert prestaging, includes no production header/path, and its bare `assert()` checks compile away under NDEBUG | `llama.cpp-3ygx`: delete the current source. Then `llama.cpp-m2ke` removes its active target, `add_test`, and properties; `llama.cpp-kdfh` verifies that no declined row remains registered. To seek reacceptance, rewrite against the production path with NDEBUG-proof checks and request a new Task 16 decision |
 | `tests/test-expert-cache.cpp` | 1 | never-test obsolete include of removed `expert-cache.hpp` | `lead` via `llama.cpp-0igs`: delete current source, preserving the obsolete-header reason |
+| `tests/test-sycl-expert-prefetch.cpp` | 1 | RE-DECLINED 2026-08-06 (was Task 16 accepted): includes removed `expert-cache.hpp`; registration dropped by `a4791b7a9` | `lead` via `llama.cpp-0igs`: delete or rewrite against the current prefetch API; a rewrite needs a new Task 16 acceptance decision |
 | `tests/test-pinned-chunk-pool.cpp` | 1 | current source is unsafe/stale pending canonical pinned-pool API work | `lead` via `llama.cpp-32dg8.20`: preserve allocation/reuse/capacity/failure checks in a rewrite, perform its build/GPU proof, then request a new Task 16 acceptance decision |
 
-Final reconciliation: **48 accepted + 16 declined = 64/64 unique rows**. The
+Final reconciliation: **48 accepted + 16 declined = 64/64 unique rows** at the
+Task 16 decision point; **47 accepted + 17 declined** after the 2026-08-06
+`test-sycl-expert-prefetch` amendment above (registration dropped by
+`a4791b7a9`; Task 19 ran the amended 50-name set at `772798e91`). The
 five model-loading hazards are exactly the five declined model rows above; none
 is accepted into ordinary CTest. The 38 accepted GPU rows remain lead-only and
 serial, gated on Task 17 metadata, the `llama.cpp-8u22` mutation-proof gate,
