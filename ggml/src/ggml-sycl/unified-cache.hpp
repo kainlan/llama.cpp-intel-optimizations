@@ -2556,6 +2556,9 @@ class unified_cache {
     size_t onednn_activations_scratch_size() const { return onednn_activations_scratch_size_; }
 
     struct pp_moe_onednn_scratch_slot {
+        uint32_t   slot            = std::numeric_limits<uint32_t>::max();
+        uint64_t   generation      = 0;
+        uint32_t   refcount        = 0;
         void *     weight          = nullptr;
         void *     activation      = nullptr;
         void *     output          = nullptr;
@@ -2571,6 +2574,8 @@ class unified_cache {
                                        size_t   activation_slot_bytes,
                                        size_t   output_slot_bytes,
                                        uint32_t ring_depth);
+    bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
+    void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
 
     // === GPU Reorder Temp Buffer ===
@@ -2992,10 +2997,12 @@ class unified_cache {
     uint32_t                onednn_scratch_refcount_   = 0;
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
+    std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_retired_slots_;
     size_t                                  pp_moe_onednn_weight_slot_size_     = 0;
     size_t                                  pp_moe_onednn_activation_slot_size_ = 0;
     size_t                                  pp_moe_onednn_output_slot_size_     = 0;
     uint32_t                                pp_moe_onednn_ring_depth_           = 0;
+    uint64_t                                pp_moe_onednn_next_generation_      = 1;
     std::mutex                              pp_moe_onednn_scratch_mutex_;
 
     // Persistent scratch buffers for TG optimization (persistent kernels).
@@ -3782,6 +3789,8 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
 struct pp_moe_onednn_scratch_result {
+    uint32_t   slot            = std::numeric_limits<uint32_t>::max();
+    uint64_t   generation      = 0;
     void *     weight          = nullptr;
     void *     activation      = nullptr;
     void *     output          = nullptr;

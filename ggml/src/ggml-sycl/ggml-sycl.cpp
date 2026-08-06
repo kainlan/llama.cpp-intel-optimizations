@@ -1105,6 +1105,7 @@ struct pp_moe_onednn_scratch_slot_state {
     uint32_t                 ring_depth = 0;
     uint32_t                 next_slot  = 0;
     std::vector<sycl::event> done_events;
+    std::vector<uint64_t>    generations;
     std::vector<uint8_t>     busy;
 };
 
@@ -1136,6 +1137,7 @@ static void pp_moe_onednn_reset_slot_state_locked(pp_moe_onednn_scratch_slot_sta
     state.next_slot  = 0;
     state.done_events.clear();
     state.done_events.resize(ring_depth);
+    state.generations.assign(ring_depth, 0);
     state.busy.assign(ring_depth, 0);
 }
 
@@ -1147,17 +1149,33 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
 
     pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
     std::unique_lock<std::mutex>       lock(state.mutex);
-    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth) {
+    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
+        state.generations.size() != ring_depth) {
         pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
     }
 
     const uint32_t start = state.next_slot % ring_depth;
     for (uint32_t attempt = 0; attempt < ring_depth; ++attempt) {
         const uint32_t slot = (start + attempt) % ring_depth;
-        if (!state.busy[slot] || pp_moe_onednn_event_complete(state.done_events[slot])) {
+        if (!state.busy[slot]) {
             state.busy[slot] = 1;
             state.next_slot  = (slot + 1) % ring_depth;
             slot_out         = slot;
+            return true;
+        }
+        if (pp_moe_onednn_event_complete(state.done_events[slot])) {
+            const uint64_t completed_generation = state.generations[slot];
+            state.done_events[slot]             = sycl::event{};
+            state.generations[slot]             = 0;
+            state.busy[slot]                    = 1;
+            state.next_slot                     = (slot + 1) % ring_depth;
+            slot_out                            = slot;
+            lock.unlock();
+            if (completed_generation != 0) {
+                if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+                    cache->release_pp_moe_onednn_scratch_slot(slot, completed_generation);
+                }
+            }
             return true;
         }
     }
@@ -1169,49 +1187,110 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
         GGML_LOG_WARN("[MOE-PP-ONEDNN-SCRATCH] wait failed for device=%d slot=%u/%u: %s\n", device, slot, ring_depth,
                       e.what());
         state.busy[slot] = 0;
+        state.generations[slot] = 0;
         return false;
     } catch (...) {
         GGML_LOG_WARN("[MOE-PP-ONEDNN-SCRATCH] wait failed for device=%d slot=%u/%u\n", device, slot, ring_depth);
         state.busy[slot] = 0;
+        state.generations[slot] = 0;
         return false;
     }
 
-    state.busy[slot] = 1;
-    state.next_slot  = (slot + 1) % ring_depth;
-    slot_out         = slot;
+    const uint64_t completed_generation = state.generations[slot];
+    state.done_events[slot]             = sycl::event{};
+    state.generations[slot]             = 0;
+    state.busy[slot]                    = 1;
+    state.next_slot                     = (slot + 1) % ring_depth;
+    slot_out                            = slot;
+    lock.unlock();
+    if (completed_generation != 0) {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+            cache->release_pp_moe_onednn_scratch_slot(slot, completed_generation);
+        }
+    }
     return true;
 }
 
-static void pp_moe_onednn_record_scratch_slot_event(int device, uint32_t ring_depth, uint32_t slot, sycl::event done) {
+static void pp_moe_onednn_bind_scratch_slot_generation(int device,
+                                                        uint32_t ring_depth,
+                                                        uint32_t slot,
+                                                        uint64_t generation) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
         return;
     }
     pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
     std::lock_guard<std::mutex>        lock(state.mutex);
-    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth) {
-        pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
-    }
-    state.done_events[slot] = std::move(done);
-    state.busy[slot]        = 1;
-}
-
-static void pp_moe_onednn_release_scratch_slot(int device, uint32_t ring_depth, uint32_t slot) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
-        return;
-    }
-    pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
-    std::lock_guard<std::mutex>        lock(state.mutex);
-    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth) {
+    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
+        state.generations.size() != ring_depth) {
         pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
     }
     state.done_events[slot] = sycl::event{};
+    state.generations[slot] = generation;
+    state.busy[slot]        = 1;
+}
+
+static void pp_moe_onednn_record_scratch_slot_event(int device,
+                                                     uint32_t ring_depth,
+                                                     uint32_t slot,
+                                                     uint64_t generation,
+                                                     sycl::event done) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
+        return;
+    }
+    pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
+    std::lock_guard<std::mutex>        lock(state.mutex);
+    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
+        state.generations.size() != ring_depth) {
+        pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
+    }
+    if (state.generations[slot] != generation) {
+        return;
+    }
+    state.done_events[slot]  = std::move(done);
+    state.generations[slot]  = generation;
+    state.busy[slot]         = 1;
+}
+
+static void pp_moe_onednn_release_scratch_slot(int device, uint32_t ring_depth, uint32_t slot, uint64_t generation) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
+        return;
+    }
+    pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
+    std::lock_guard<std::mutex>        lock(state.mutex);
+    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
+        state.generations.size() != ring_depth) {
+        pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
+    }
+    if (state.generations[slot] != generation) {
+        return;
+    }
+    state.done_events[slot] = sycl::event{};
+    state.generations[slot] = 0;
     state.busy[slot]        = 0;
+}
+
+static void pp_moe_onednn_release_scratch_slot_after_event(int         device,
+                                                            uint32_t    ring_depth,
+                                                            uint32_t    slot,
+                                                            uint64_t    generation,
+                                                            sycl::event done) {
+    std::thread([device, ring_depth, slot, generation, done = std::move(done)]() mutable {
+        try {
+            done.wait_and_throw();
+        } catch (...) {
+        }
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+            cache->release_pp_moe_onednn_scratch_slot(slot, generation);
+        }
+        pp_moe_onednn_release_scratch_slot(device, ring_depth, slot, generation);
+    }).detach();
 }
 
 struct pp_moe_onednn_scratch_claim {
     int           device     = -1;
     uint32_t      ring_depth = 0;
     uint32_t      slot       = std::numeric_limits<uint32_t>::max();
+    uint64_t      generation = 0;
     sycl::queue * queue      = nullptr;
     bool          active     = false;
     bool          used       = false;
@@ -1222,13 +1301,16 @@ struct pp_moe_onednn_scratch_claim {
 
     ~pp_moe_onednn_scratch_claim() { finish_or_release(); }
 
-    void activate(int device_id, uint32_t ring_depth_value, uint32_t slot_value, sycl::queue * stream) {
+    void activate(int device_id, uint32_t ring_depth_value, uint32_t slot_value, uint64_t slot_generation,
+                  sycl::queue * stream) {
         device     = device_id;
         ring_depth = ring_depth_value;
         slot       = slot_value;
+        generation = slot_generation;
         queue      = stream;
         active     = true;
         used       = false;
+        pp_moe_onednn_bind_scratch_slot_generation(device, ring_depth, slot, generation);
     }
 
     bool claimed() const { return active; }
@@ -1243,7 +1325,9 @@ struct pp_moe_onednn_scratch_claim {
         if (!active) {
             return;
         }
-        pp_moe_onednn_record_scratch_slot_event(device, ring_depth, slot, std::move(done));
+        sycl::event retained_done = done;
+        pp_moe_onednn_record_scratch_slot_event(device, ring_depth, slot, generation, std::move(done));
+        pp_moe_onednn_release_scratch_slot_after_event(device, ring_depth, slot, generation, std::move(retained_done));
         active = false;
     }
 
@@ -1251,7 +1335,10 @@ struct pp_moe_onednn_scratch_claim {
         if (!active) {
             return;
         }
-        pp_moe_onednn_release_scratch_slot(device, ring_depth, slot);
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+            cache->release_pp_moe_onednn_scratch_slot(slot, generation);
+        }
+        pp_moe_onednn_release_scratch_slot(device, ring_depth, slot, generation);
         active = false;
     }
 
@@ -72501,12 +72588,14 @@ cpu_tg_fallthrough:
                     std::max(planned_output_slot, dst_contiguous_bytes), planned_ring_depth);
                 ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
                 uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
-                if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
+                if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot) &&
+                    cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
                     pp_moe_onednn_scratch_claim_state.activate(ctx.device, planned_ring_depth, scratch_slot,
-                                                               ctx.stream());
+                                                               reserved.generation, ctx.stream());
                 }
-                if (pp_moe_onednn_scratch_claim_state.claimed() &&
-                    cache->get_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
+                if (pp_moe_onednn_scratch_claim_state.claimed()) {
+                    pp_moe_onednn_scratch.slot             = reserved.slot;
+                    pp_moe_onednn_scratch.generation       = reserved.generation;
                     pp_moe_onednn_scratch.weight           = reserved.weight;
                     pp_moe_onednn_scratch.activation       = reserved.activation;
                     pp_moe_onednn_scratch.output           = reserved.output;
@@ -73592,6 +73681,19 @@ cpu_tg_fallthrough:
             prompt_down_dispatch_done_set = true;
         }
         if (pp_moe_onednn_scratch_claim_state.claimed()) {
+            std::vector<ggml_sycl::mem_handle> pp_moe_slot_owners;
+            if (pp_moe_onednn_scratch.weight_owner.valid()) {
+                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.weight_owner));
+            }
+            if (pp_moe_onednn_scratch.activation_owner.valid()) {
+                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.activation_owner));
+            }
+            if (pp_moe_onednn_scratch.output_owner.valid()) {
+                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
+            }
+            if (!pp_moe_slot_owners.empty()) {
+                ggml_sycl::retain_handles_until_event(std::move(pp_moe_slot_owners), prompt_down_dispatch_done);
+            }
             pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
         }
         if (!pp_gpu_leases.empty()) {
