@@ -120,6 +120,9 @@ class Registry {
     error quarantine_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                 GraphEpoch graph_epoch, InvocationId invocation,
                                 lifecycle::ModelToken root, int device) noexcept;
+    error abort_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                           GraphEpoch graph_epoch, InvocationId invocation,
+                           lifecycle::ModelToken root) noexcept;
     error rollback_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                          GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
     error retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,

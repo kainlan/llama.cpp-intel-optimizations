@@ -375,7 +375,7 @@ checks = {
     and "poisoned_after_prepare" in cpp,
     "begin_graph binding lock acquired once": begin_graph_body.count("g_execution_backend_binding_mutex") == 1
     and "ggml_sycl_execution_expected_participants_locked" in begin_graph_body,
-    "expected participants follows covered device remaps": "binding.covered_devices.begin()" in expected_participants_locked_body
+    "expected participants follows covered device remaps": "binding->covered_devices.begin()" in expected_participants_locked_body
     and "backend->device" not in expected_participants_locked_body,
     "for_each backend callback holds no state lock": "execution_state_mutex" not in for_each_bound_backend_body,
     "rollback guard is noexcept": "~owner_rollback_guard() noexcept" in owner_rollback_guard_body
@@ -389,11 +389,13 @@ checks = {
     and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
     and "ggml_sycl_enqueue_quarantined_result(*registry, failed, model);" in backend,
     "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
-    and "storage->entries.resize(binding_count);" in extract_control_host_allocs_body
+    and "std::vector<ggml_sycl_execution_bound_backend_pin> bound_backends;" in extract_control_host_allocs_body
+    and "ggml_sycl_execution_pin_bound_backends_locked(ticket->context_id.value)" in extract_control_host_allocs_body
     and "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in extract_control_host_allocs_body,
     "execution unbind/seal/quarantine/complete snapshot under mutex": backend.count("ggml_sycl_take_execution_state_snapshot(ctx)") >= 4
     and "ctx->execution_state_mutex" in backend,
     "destructor waits before unbind": backend_destructor_body.index("qptrs[dev][s]->wait()")
+    < backend_destructor_body.index("ggml_sycl_execution_abort_and_release_graph(this);")
     < backend_destructor_body.index("ggml_sycl_execution_unbind_backend(this);"),
     "centralized quarantine enqueue helper": "static void ggml_sycl_enqueue_quarantined_result" in backend
     and backend.count("ggml_sycl_enqueue_quarantined_result(") >= 5,
@@ -621,7 +623,7 @@ checks = {
     "std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);" in exact_runtime_body
     and "auto binding_it = g_execution_backend_bindings.find(backend_ctx);" in exact_runtime_body
     and "exec_state = ggml_sycl_execution_snapshot_locked(backend_ctx);" in exact_runtime_body
-    and "if (binding_it->second.context_id != exec_state.context_id)" in exact_runtime_body
+    and "if (binding_it->second->context_id != exec_state.context_id)" in exact_runtime_body
     and "backend_ctx->execution_context_id != exec_state.context_id" in exact_runtime_body,
     "weight usage ABI wrapper and status mutation hold exact load effect":
     "void ggml_backend_sycl_register_weight_usage" in backend

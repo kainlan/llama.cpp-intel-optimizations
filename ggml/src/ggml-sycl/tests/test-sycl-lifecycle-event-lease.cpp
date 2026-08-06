@@ -62,6 +62,20 @@ static void g6b() {
     require(reg.extract(ctx,&snap)==error::OK && snap.invocation.value==0 && snap.graph_state==graph_phase::QUARANTINED, "G6b final release failed");
 }
 
+static void g6c() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "G6c create failed");
+    require(reg.bind_backend(ctx,0)==error::OK && reg.bind_backend(ctx,1)==error::OK, "G6c bind failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(62); require(reg.attach_root(ctx, root, &s, &e)==error::OK, "G6c attach failed");
+    GraphEpoch g{}; InvocationId i{}; const int devices[] = {0,1}; const int participants[] = {19,23}; snapshot snap{};
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::OK && reg.begin_invocation(ctx,s,e,g,root,devices,2,participants,2,19,&i)==error::OK, "G6c invoke failed");
+    require(reg.abort_invocation(ctx,s,e,g,i,root)==error::OK, "G6c abort failed");
+    require(reg.extract(ctx,&snap)==error::OK && snap.graph_state==graph_phase::QUARANTINED && snap.invocation.value==i.value && snap.busy_device_count==2,
+            "G6c abort did not retain quarantined invocation");
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::BUSY, "G6c aborted graph reopened before explicit release");
+    require(reg.release_invocation(ctx,s,e,g,i,root)==error::OK, "G6c release failed");
+    require(reg.retire_graph(ctx,s,e,g,root)==error::OK, "G6c retire failed");
+}
+
 static void g7() {
     Registry reg; error err = error::OK; const auto a = reg.create_context(err), b = reg.create_context(err); require(err == error::OK, "G7 create failed");
     require(reg.bind_backend(a,2)==error::OK && reg.bind_backend(b,2)==error::OK, "G7 bind failed");
@@ -184,6 +198,7 @@ int main(int argc, char ** argv) {
     if (std::strcmp(which, "G5a") == 0) g5a();
     else if (std::strcmp(which, "G6") == 0) g6();
     else if (std::strcmp(which, "G6b") == 0) g6b();
+    else if (std::strcmp(which, "G6c") == 0) g6c();
     else if (std::strcmp(which, "G7") == 0) g7();
     else if (std::strcmp(which, "H8") == 0) h8();
     else if (std::strcmp(which, "H12") == 0) h12();
@@ -191,6 +206,6 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "H13b") == 0) h13b();
     else if (std::strcmp(which, "M7") == 0) m7();
     else if (std::strcmp(which, "M7b") == 0) m7b();
-    else { g5a(); g6(); g6b(); g7(); h8(); h12(); h12b(); h13b(); m7(); m7b(); }
+    else { g5a(); g6(); g6b(); g6c(); g7(); h8(); h12(); h12b(); h13b(); m7(); m7b(); }
     return 0;
 }

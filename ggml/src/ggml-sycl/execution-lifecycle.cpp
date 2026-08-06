@@ -344,6 +344,42 @@ error Registry::quarantine_invocation(ContextId context, SessionId session, Sess
     return release_invocation_locked(context, session, reset_epoch, graph_epoch, invocation, root);
 }
 
+error Registry::abort_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                 GraphEpoch graph_epoch, InvocationId invocation,
+                                 lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    auto & entry = it->second;
+    const auto session_rc = validate_session(entry, session, reset_epoch);
+    if (session_rc != error::OK) return session_rc;
+    auto & graph = entry.session.graph;
+    if (!(graph.id == graph_epoch)) return error::STALE;
+    if (!(graph.invocation == invocation)) return error::MISMATCH;
+    if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
+    if (graph_terminal_unretired(graph)) {
+        return error::OK;
+    }
+    if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) {
+        return error::BUSY;
+    }
+    for (int claimed_device : graph.devices) {
+        if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) return error::MISMATCH;
+        const auto & owner = device_owners_[claimed_device];
+        if (!(owner.context == context && owner.session == session && owner.reset_epoch == reset_epoch &&
+              owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
+            return error::MISMATCH;
+        }
+    }
+    graph.any_quarantined = true;
+    graph.state = graph_phase::QUARANTINED;
+    graph.token_root_state = token_root_phase::QUARANTINED;
+    graph.pending_participant_count = 0;
+    std::fill(graph.participant_joined.begin(), graph.participant_joined.end(), true);
+    std::fill(graph.participant_completed.begin(), graph.participant_completed.end(), true);
+    return error::OK;
+}
+
 error Registry::retire_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                              GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);

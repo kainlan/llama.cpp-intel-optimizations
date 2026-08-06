@@ -1101,12 +1101,13 @@ struct pp_moe_onednn_scratch_release_marker;
 struct pp_moe_prompt_down_dispatch_done_marker;
 
 struct pp_moe_onednn_scratch_slot_state {
-    std::mutex               mutex;
-    uint32_t                 ring_depth = 0;
-    uint32_t                 next_slot  = 0;
-    std::vector<sycl::event> done_events;
-    std::vector<uint64_t>    generations;
-    std::vector<uint8_t>     busy;
+    std::mutex                                  mutex;
+    uint32_t                                    ring_depth = 0;
+    uint32_t                                    next_slot  = 0;
+    std::vector<sycl::event>                    done_events;
+    std::vector<uint64_t>                       generations;
+    std::vector<uint8_t>                        busy;
+    std::vector<std::vector<ggml_sycl::mem_handle>> retained_owners;
 };
 
 static std::array<pp_moe_onednn_scratch_slot_state, GGML_SYCL_MAX_DEVICES> g_pp_moe_onednn_scratch_slot_state;
@@ -1139,6 +1140,7 @@ static void pp_moe_onednn_reset_slot_state_locked(pp_moe_onednn_scratch_slot_sta
     state.done_events.resize(ring_depth);
     state.generations.assign(ring_depth, 0);
     state.busy.assign(ring_depth, 0);
+    state.retained_owners.assign(ring_depth, {});
 }
 
 static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, uint32_t & slot_out) {
@@ -1151,6 +1153,7 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
     sycl::event                        wait_event;
     uint32_t                           wait_slot       = std::numeric_limits<uint32_t>::max();
     uint64_t                           wait_generation = 0;
+    std::vector<ggml_sycl::mem_handle> completed_owners;
     {
         std::unique_lock<std::mutex> lock(state.mutex);
         if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
@@ -1169,12 +1172,14 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
             }
             if (pp_moe_onednn_event_complete(state.done_events[slot])) {
                 const uint64_t completed_generation = state.generations[slot];
-                state.done_events[slot]             = sycl::event{};
-                state.generations[slot]             = 0;
-                state.busy[slot]                    = 1;
-                state.next_slot                     = (slot + 1) % ring_depth;
-                slot_out                            = slot;
+                completed_owners.swap(state.retained_owners[slot]);
+                state.done_events[slot]  = sycl::event{};
+                state.generations[slot]  = 0;
+                state.busy[slot]         = 1;
+                state.next_slot          = (slot + 1) % ring_depth;
+                slot_out                 = slot;
                 lock.unlock();
+                completed_owners.clear();
                 if (completed_generation != 0) {
                     if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
                         cache->release_pp_moe_onednn_scratch_slot(slot, completed_generation);
@@ -1208,12 +1213,14 @@ static bool pp_moe_onednn_claim_scratch_slot(int device, uint32_t ring_depth, ui
             state.generations[wait_slot] != wait_generation) {
             return false;
         }
+        completed_owners.swap(state.retained_owners[wait_slot]);
         state.done_events[wait_slot] = sycl::event{};
         state.generations[wait_slot] = 0;
         state.busy[wait_slot]        = 1;
         state.next_slot              = (wait_slot + 1) % ring_depth;
         slot_out                     = wait_slot;
     }
+    completed_owners.clear();
     if (wait_generation != 0) {
         if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
             cache->release_pp_moe_onednn_scratch_slot(wait_slot, wait_generation);
@@ -1235,16 +1242,18 @@ static void pp_moe_onednn_bind_scratch_slot_generation(int device,
         state.generations.size() != ring_depth) {
         pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
     }
-    state.done_events[slot] = sycl::event{};
-    state.generations[slot] = generation;
-    state.busy[slot]        = 1;
+    state.done_events[slot]      = sycl::event{};
+    state.generations[slot]      = generation;
+    state.busy[slot]             = 1;
+    state.retained_owners[slot].clear();
 }
 
-static void pp_moe_onednn_record_scratch_slot_event(int device,
-                                                     uint32_t ring_depth,
-                                                     uint32_t slot,
-                                                     uint64_t generation,
-                                                     sycl::event done) {
+static void pp_moe_onednn_record_scratch_slot_event(int                                 device,
+                                                     uint32_t                            ring_depth,
+                                                     uint32_t                            slot,
+                                                     uint64_t                            generation,
+                                                     sycl::event                         done,
+                                                     std::vector<ggml_sycl::mem_handle> owners) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || ring_depth == 0 || slot >= ring_depth) {
         return;
     }
@@ -1257,9 +1266,10 @@ static void pp_moe_onednn_record_scratch_slot_event(int device,
     if (state.generations[slot] != generation) {
         return;
     }
-    state.done_events[slot]  = std::move(done);
-    state.generations[slot]  = generation;
-    state.busy[slot]         = 1;
+    state.done_events[slot]      = std::move(done);
+    state.generations[slot]      = generation;
+    state.busy[slot]             = 1;
+    state.retained_owners[slot]  = std::move(owners);
 }
 
 static void pp_moe_onednn_release_scratch_slot(int device, uint32_t ring_depth, uint32_t slot, uint64_t generation) {
@@ -1278,33 +1288,67 @@ static void pp_moe_onednn_release_scratch_slot(int device, uint32_t ring_depth, 
     state.done_events[slot] = sycl::event{};
     state.generations[slot] = 0;
     state.busy[slot]        = 0;
+    state.retained_owners[slot].clear();
 }
 
-static void pp_moe_onednn_release_scratch_slot_after_event(int         device,
-                                                            uint32_t    ring_depth,
-                                                            uint32_t    slot,
-                                                            uint64_t    generation,
-                                                            sycl::event done) {
-    std::thread([device, ring_depth, slot, generation, done = std::move(done)]() mutable {
+static void pp_moe_onednn_drain_scratch_slots(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
+    uint32_t ring_depth = 0;
+    for (;;) {
+        sycl::event                        wait_event;
+        uint32_t                           wait_slot = std::numeric_limits<uint32_t>::max();
+        uint64_t                           wait_generation = 0;
+        std::vector<ggml_sycl::mem_handle> completed_owners;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            ring_depth = state.ring_depth;
+            for (uint32_t slot = 0; slot < state.generations.size(); ++slot) {
+                if (!state.busy[slot] || state.generations[slot] == 0) {
+                    continue;
+                }
+                wait_slot = slot;
+                wait_generation = state.generations[slot];
+                wait_event = state.done_events[slot];
+                break;
+            }
+            if (wait_generation == 0) {
+                break;
+            }
+        }
         try {
-            done.wait_and_throw();
+            wait_event.wait_and_throw();
         } catch (...) {
         }
-        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
-            cache->release_pp_moe_onednn_scratch_slot(slot, generation);
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (ring_depth != state.ring_depth || wait_slot >= state.generations.size() ||
+                state.generations[wait_slot] != wait_generation) {
+                continue;
+            }
+            completed_owners.swap(state.retained_owners[wait_slot]);
+            state.done_events[wait_slot] = sycl::event{};
+            state.generations[wait_slot] = 0;
+            state.busy[wait_slot]        = 0;
         }
-        pp_moe_onednn_release_scratch_slot(device, ring_depth, slot, generation);
-    }).detach();
+        completed_owners.clear();
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+            cache->release_pp_moe_onednn_scratch_slot(wait_slot, wait_generation);
+        }
+    }
 }
 
 struct pp_moe_onednn_scratch_claim {
-    int           device     = -1;
-    uint32_t      ring_depth = 0;
-    uint32_t      slot       = std::numeric_limits<uint32_t>::max();
-    uint64_t      generation = 0;
-    sycl::queue * queue      = nullptr;
-    bool          active     = false;
-    bool          used       = false;
+    int                                    device     = -1;
+    uint32_t                               ring_depth = 0;
+    uint32_t                               slot       = std::numeric_limits<uint32_t>::max();
+    uint64_t                               generation = 0;
+    sycl::queue *                          queue      = nullptr;
+    std::vector<ggml_sycl::mem_handle>     owners;
+    bool                                   active     = false;
+    bool                                   used       = false;
 
     pp_moe_onednn_scratch_claim()                                                = default;
     pp_moe_onednn_scratch_claim(const pp_moe_onednn_scratch_claim &)             = delete;
@@ -1332,13 +1376,16 @@ struct pp_moe_onednn_scratch_claim {
         }
     }
 
+    void bind_owners(std::vector<ggml_sycl::mem_handle> slot_owners) {
+        owners = std::move(slot_owners);
+    }
+
     void record(sycl::event done) {
         if (!active) {
             return;
         }
-        sycl::event retained_done = done;
-        pp_moe_onednn_record_scratch_slot_event(device, ring_depth, slot, generation, std::move(done));
-        pp_moe_onednn_release_scratch_slot_after_event(device, ring_depth, slot, generation, std::move(retained_done));
+        pp_moe_onednn_record_scratch_slot_event(device, ring_depth, slot, generation, std::move(done),
+                                                std::move(owners));
         active = false;
     }
 
@@ -1350,6 +1397,7 @@ struct pp_moe_onednn_scratch_claim {
             cache->release_pp_moe_onednn_scratch_slot(slot, generation);
         }
         pp_moe_onednn_release_scratch_slot(device, ring_depth, slot, generation);
+        owners.clear();
         active = false;
     }
 
@@ -9546,12 +9594,50 @@ static std::atomic<int> g_execution_wrapper_failpoint{ 0 };
 // Rule: snapshot under EXECUTION_STATE/BINDING, then perform waits, callbacks,
 // queue drains, and final owner destruction after unlocking.
 struct ggml_sycl_execution_backend_binding {
-    uint64_t         context_id = 0;
-    int              participant_id = -1;
-    std::vector<int> covered_devices;
+    uint64_t                context_id = 0;
+    int                     participant_id = -1;
+    std::vector<int>        covered_devices;
+    uint32_t                pin_count = 0;
+    bool                    draining = false;
+    std::condition_variable cv;
 };
+
+struct ggml_sycl_execution_bound_backend_pin {
+    ggml_backend_sycl_context *                              backend = nullptr;
+    std::shared_ptr<ggml_sycl_execution_backend_binding>     binding;
+};
+
 static std::mutex g_execution_backend_binding_mutex;
-static std::unordered_map<ggml_backend_sycl_context *, ggml_sycl_execution_backend_binding> g_execution_backend_bindings;
+static std::unordered_map<ggml_backend_sycl_context *, std::shared_ptr<ggml_sycl_execution_backend_binding>> g_execution_backend_bindings;
+
+static void ggml_sycl_execution_release_backend_pin(ggml_sycl_execution_bound_backend_pin & pin) {
+    if (!pin.binding) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+    if (pin.binding->pin_count > 0) {
+        --pin.binding->pin_count;
+    }
+    if (pin.binding->draining && pin.binding->pin_count == 0) {
+        pin.binding->cv.notify_all();
+    }
+    pin.binding.reset();
+    pin.backend = nullptr;
+}
+
+static std::vector<ggml_sycl_execution_bound_backend_pin>
+    ggml_sycl_execution_pin_bound_backends_locked(uint64_t context_id) {
+    std::vector<ggml_sycl_execution_bound_backend_pin> snapshot;
+    snapshot.reserve(g_execution_backend_bindings.size());
+    for (const auto & [backend, binding] : g_execution_backend_bindings) {
+        if (!backend || !binding || binding->context_id != context_id || binding->draining) {
+            continue;
+        }
+        ++binding->pin_count;
+        snapshot.push_back({ backend, binding });
+    }
+    return snapshot;
+}
 
 static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
     switch (static_cast<ggml_sycl_execution_wrapper_failpoint>(
@@ -9635,36 +9721,36 @@ static void ggml_sycl_execution_sync_binding_devices(ggml_backend_sycl_context *
     }
     std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     auto it = g_execution_backend_bindings.find(backend);
-    if (it == g_execution_backend_bindings.end() || it->second.context_id == 0) {
+    if (it == g_execution_backend_bindings.end() || !it->second || it->second->context_id == 0 || it->second->draining) {
         return;
     }
     std::lock_guard<std::mutex> state_lock(backend->execution_state_mutex);
-    if (backend->execution_context_id != it->second.context_id || backend->execution_participant_id != it->second.participant_id) {
+    if (backend->execution_context_id != it->second->context_id || backend->execution_participant_id != it->second->participant_id) {
         return;
     }
     std::vector<int> next = devices;
     std::sort(next.begin(), next.end());
     next.erase(std::unique(next.begin(), next.end()), next.end());
-    std::vector<int> prev = it->second.covered_devices;
+    std::vector<int> prev = it->second->covered_devices;
     std::sort(prev.begin(), prev.end());
     prev.erase(std::unique(prev.begin(), prev.end()), prev.end());
     for (int d : next) {
         if (std::find(prev.begin(), prev.end(), d) == prev.end()) {
-            (void) ggml_sycl::execution::global_registry().bind_backend({ it->second.context_id }, d);
+            (void) ggml_sycl::execution::global_registry().bind_backend({ it->second->context_id }, d);
         }
     }
     for (int d : prev) {
         if (std::find(next.begin(), next.end(), d) == next.end()) {
-            (void) ggml_sycl::execution::global_registry().unbind_backend({ it->second.context_id }, d);
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ it->second->context_id }, d);
         }
     }
-    it->second.covered_devices = next;
+    it->second->covered_devices = next;
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
     std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
-        if (it->second.context_id == context_id) {
+        if (it->second && it->second->context_id == context_id) {
             ggml_sycl_execution_reset_backend_binding_state(it->first);
             it = g_execution_backend_bindings.erase(it);
         } else {
@@ -9675,19 +9761,15 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
 
 template<typename F>
 static void ggml_sycl_execution_for_each_bound_backend(uint64_t context_id, F && fn) {
-    std::vector<std::pair<ggml_backend_sycl_context *, ggml_sycl_execution_backend_binding>> snapshot;
-    {
+    auto snapshot = [&]() {
         std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-        snapshot.reserve(g_execution_backend_bindings.size());
-        for (const auto & [backend, binding] : g_execution_backend_bindings) {
-            if (binding.context_id != context_id || !backend) {
-                continue;
-            }
-            snapshot.emplace_back(backend, binding);
+        return ggml_sycl_execution_pin_bound_backends_locked(context_id);
+    }();
+    for (auto & pin : snapshot) {
+        if (pin.backend && pin.binding) {
+            fn(pin.backend, *pin.binding);
         }
-    }
-    for (const auto & [backend, binding] : snapshot) {
-        fn(backend, binding);
+        ggml_sycl_execution_release_backend_pin(pin);
     }
 }
 
@@ -9695,24 +9777,25 @@ static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) 
     if (!ctx) {
         return;
     }
-    {
-        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
-        GGML_ASSERT(ctx->execution_invocation_id == 0 && ctx->execution_graph_epoch == 0);
-    }
-    ggml_sycl_execution_backend_binding binding{};
-    bool had_binding = false;
+    std::shared_ptr<ggml_sycl_execution_backend_binding> binding;
     {
         std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
         auto it = g_execution_backend_bindings.find(ctx);
         if (it != g_execution_backend_bindings.end()) {
             binding = it->second;
+            if (binding) {
+                binding->draining = true;
+            }
             g_execution_backend_bindings.erase(it);
-            had_binding = true;
         }
     }
-    if (had_binding && binding.context_id != 0) {
-        for (int device : binding.covered_devices) {
-            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding.context_id }, device);
+    if (binding) {
+        std::unique_lock<std::mutex> lock(g_execution_backend_binding_mutex);
+        binding->cv.wait(lock, [&] { return binding->pin_count == 0; });
+    }
+    if (binding && binding->context_id != 0) {
+        for (int device : binding->covered_devices) {
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding->context_id }, device);
         }
     }
     ggml_sycl_execution_reset_backend_binding_state(ctx);
@@ -9722,15 +9805,15 @@ static std::vector<int> ggml_sycl_execution_expected_participants_locked(uint64_
                                                                            const std::vector<int> & devices) {
     std::vector<int> participants;
     for (const auto & [backend, binding] : g_execution_backend_bindings) {
-        if (!backend || binding.context_id != context_id) {
+        if (!backend || !binding || binding->context_id != context_id || binding->draining) {
             continue;
         }
-        const bool intersects = std::any_of(binding.covered_devices.begin(), binding.covered_devices.end(),
+        const bool intersects = std::any_of(binding->covered_devices.begin(), binding->covered_devices.end(),
                                             [&](int covered_device) {
                                                 return std::find(devices.begin(), devices.end(), covered_device) != devices.end();
                                             });
         if (intersects) {
-            participants.push_back(binding.participant_id);
+            participants.push_back(binding->participant_id);
         }
     }
     std::sort(participants.begin(), participants.end());
@@ -11379,7 +11462,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
             std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
             auto it = g_execution_backend_bindings.find(backend_ctx);
             if (it != g_execution_backend_bindings.end()) {
-                if (it->second.context_id != context.value) {
+                if (!it->second || it->second->draining || it->second->context_id != context.value) {
                     return GGML_SYCL_EXECUTION_BUSY;
                 }
                 ggml_sycl::execution::snapshot snap{};
@@ -11392,16 +11475,16 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
                 }
                 std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
                 backend_ctx->execution_context_id = context.value;
-                backend_ctx->execution_participant_id = it->second.participant_id;
+                backend_ctx->execution_participant_id = it->second->participant_id;
                 return xrc == ggml_sycl::execution::error::STALE ? GGML_SYCL_EXECUTION_STALE : GGML_SYCL_EXECUTION_OK;
             } else {
                 std::array<bool, ggml_sycl::execution::max_devices> used{};
                 for (const auto & [_, binding] : g_execution_backend_bindings) {
-                    if (binding.context_id != context.value) {
+                    if (!binding || binding->draining || binding->context_id != context.value) {
                         continue;
                     }
-                    if (binding.participant_id >= 0 && binding.participant_id < ggml_sycl::execution::max_devices) {
-                        used[binding.participant_id] = true;
+                    if (binding->participant_id >= 0 && binding->participant_id < ggml_sycl::execution::max_devices) {
+                        used[binding->participant_id] = true;
                     }
                 }
                 for (int i = 0; i < static_cast<int>(ggml_sycl::execution::max_devices); ++i) {
@@ -11413,7 +11496,11 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
                 if (participant_id < 0) {
                     return GGML_SYCL_EXECUTION_OVERFLOW;
                 }
-                g_execution_backend_bindings[backend_ctx] = { context.value, participant_id, { backend_ctx->device } };
+                auto binding = std::make_shared<ggml_sycl_execution_backend_binding>();
+                binding->context_id = context.value;
+                binding->participant_id = participant_id;
+                binding->covered_devices = { backend_ctx->device };
+                g_execution_backend_bindings[backend_ctx] = std::move(binding);
             }
         }
         const auto rc = ggml_sycl::execution::global_registry().bind_backend({ context.value }, backend_ctx->device);
@@ -11425,7 +11512,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_bind_backend(ggml
         }
         std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
         auto it = g_execution_backend_bindings.find(backend_ctx);
-        if (it != g_execution_backend_bindings.end() && it->second.context_id == context.value) {
+        if (it != g_execution_backend_bindings.end() && it->second && it->second->context_id == context.value) {
             g_execution_backend_bindings.erase(it);
         }
         return ggml_sycl_execution_c_result(rc);
@@ -11537,22 +11624,24 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
                                                                        std::memory_order_acq_rel) ==
                                 static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC);
         ggml_sycl::execution::error extract_rc = ggml_sycl::execution::error::OK;
-        std::vector<ggml_backend_sycl_context *> bound_backends;
-        size_t binding_count = 0;
+        std::vector<ggml_sycl_execution_bound_backend_pin> bound_backends;
         {
             std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
-            for (const auto & [backend_ctx, binding] : g_execution_backend_bindings) {
-                if (backend_ctx && binding.context_id == ticket->context_id.value) {
-                    ++binding_count;
-                    bound_backends.push_back(backend_ctx);
+            bound_backends = ggml_sycl_execution_pin_bound_backends_locked(ticket->context_id.value);
+        }
+        struct bound_backend_pin_scope {
+            std::vector<ggml_sycl_execution_bound_backend_pin> & pins;
+            ~bound_backend_pin_scope() {
+                for (auto & pin : pins) {
+                    ggml_sycl_execution_release_backend_pin(pin);
                 }
             }
-        }
-        storage->entries.resize(binding_count);
+        } pin_scope{ bound_backends };
+        storage->entries.resize(bound_backends.size());
         bool swapped = false;
         try {
             for (size_t index = 0; index < bound_backends.size(); ++index) {
-                auto * backend_ctx = bound_backends[index];
+                auto * backend_ctx = bound_backends[index].backend;
                 auto & moved_allocs = storage->entries[index];
                 std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
                 moved_allocs.swap(backend_ctx->control_host_allocs);
@@ -11566,7 +11655,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
                                                                                                            storage->count);
         } catch (...) {
             for (size_t restore_index = 0; restore_index < bound_backends.size(); ++restore_index) {
-                auto * backend_ctx = bound_backends[restore_index];
+                auto * backend_ctx = bound_backends[restore_index].backend;
                 auto & moved_allocs = storage->entries[restore_index];
                 std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
                 backend_ctx->control_host_allocs.swap(moved_allocs);
@@ -11575,7 +11664,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         }
         if (extract_rc != ggml_sycl::execution::error::OK && swapped) {
             for (size_t restore_index = 0; restore_index < bound_backends.size(); ++restore_index) {
-                auto * backend_ctx = bound_backends[restore_index];
+                auto * backend_ctx = bound_backends[restore_index].backend;
                 auto & moved_allocs = storage->entries[restore_index];
                 std::lock_guard<std::mutex> control_lock(backend_ctx->control_host_allocs_mutex);
                 backend_ctx->control_host_allocs.swap(moved_allocs);
@@ -11997,19 +12086,9 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
         return;
     }
     auto & registry = ggml_sycl::execution::global_registry();
-    if (registry.quarantine_invocation({ state.context_id }, { state.session_id },
-                                       { state.reset_epoch }, { state.graph_epoch },
-                                       { state.invocation_id }, owner, state.participant_id) == ggml_sycl::execution::error::OK) {
-        ggml_sycl::execution::snapshot snapshot{};
-        if (registry.extract({ state.context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
-            snapshot.invocation.value == 0) {
-            ggml_sycl_execution_for_each_bound_backend(state.context_id,
-                [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                    ggml_sycl_execution_clear_graph_tracking(backend_ctx);
-                });
-            ggml_sycl_execution_try_retire_terminal(ctx);
-        }
-    }
+    (void) registry.abort_invocation({ state.context_id }, { state.session_id },
+                                     { state.reset_epoch }, { state.graph_epoch },
+                                     { state.invocation_id }, owner);
 }
 
 static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx) noexcept {
@@ -12061,6 +12140,15 @@ static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx) n
         ggml_sycl_execution_try_retire_terminal(ctx);
     }
     return true;
+}
+
+static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx) {
+        return;
+    }
+    ggml_sycl_execution_quarantine_graph(ctx);
+    (void) ggml_sycl_execution_release_graph(ctx);
+    ggml_sycl_execution_clear_graph_tracking(ctx);
 }
 
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan) {
@@ -13033,12 +13121,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             }
             std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
             auto binding_it = g_execution_backend_bindings.find(backend_ctx);
-            if (binding_it != g_execution_backend_bindings.end() && binding_it->second.context_id != 0) {
+            if (binding_it != g_execution_backend_bindings.end() && binding_it->second && !binding_it->second->draining &&
+                binding_it->second->context_id != 0) {
                 ggml_sycl_execution_state_snapshot exec_state{};
                 {
                     std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
                     exec_state = ggml_sycl_execution_snapshot_locked(backend_ctx);
-                    if (binding_it->second.context_id != exec_state.context_id) {
+                    if (binding_it->second->context_id != exec_state.context_id) {
                         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
                     }
                 }
@@ -13059,8 +13148,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                 }
                 {
                     std::lock_guard<std::mutex> state_lock(backend_ctx->execution_state_mutex);
-                    if (binding_it == g_execution_backend_bindings.end() || binding_it->second.context_id != exec_state.context_id ||
-                        backend_ctx->execution_context_id != exec_state.context_id) {
+                    if (binding_it == g_execution_backend_bindings.end() || !binding_it->second ||
+                        binding_it->second->context_id != exec_state.context_id || backend_ctx->execution_context_id != exec_state.context_id) {
                         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
                     }
                     backend_ctx->execution_session_id = session.value;
@@ -13070,7 +13159,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                     backend_ctx->execution_root_slot = token.owner.slot;
                     backend_ctx->execution_root_slot_generation = token.owner.generation;
                     backend_ctx->execution_aggregate_devices = aggregate_devices;
-                    binding_it->second.covered_devices = aggregate_devices;
+                    binding_it->second->covered_devices = aggregate_devices;
                 }
             }
         }
@@ -35406,6 +35495,8 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
             }
         }
     }
+    pp_moe_onednn_drain_scratch_slots(device);
+    ggml_sycl_execution_abort_and_release_graph(this);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -73716,9 +73807,7 @@ cpu_tg_fallthrough:
             if (pp_moe_onednn_scratch.output_owner.valid()) {
                 pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
             }
-            if (!pp_moe_slot_owners.empty()) {
-                ggml_sycl::retain_handles_until_event(std::move(pp_moe_slot_owners), prompt_down_dispatch_done);
-            }
+            pp_moe_onednn_scratch_claim_state.bind_owners(std::move(pp_moe_slot_owners));
             pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
         }
         if (!pp_gpu_leases.empty()) {
@@ -96504,7 +96593,6 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
     try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
     if (cleanup_ctx) {
         try { ggml_sycl_execution_quarantine_graph(cleanup_ctx); } catch (...) {}
-        try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
         try {
             if (cleanup_ctx->last_graph_event) {
                 cleanup_ctx->last_graph_event->wait_and_throw();
@@ -96520,6 +96608,7 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
         try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
         try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
         try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
+        try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
         cleanup_ctx->last_graph_event.reset();
         cleanup_ctx->last_graph_event_deferred_decode = false;
     }
@@ -96539,7 +96628,6 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
         if (cleanup_ctx) {
             try { ggml_sycl_execution_quarantine_graph(cleanup_ctx); } catch (...) {}
-            try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
             try {
                 if (cleanup_ctx->last_graph_event) {
                     cleanup_ctx->last_graph_event->wait_and_throw();
@@ -96555,6 +96643,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
             try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
             try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
+            try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
             cleanup_ctx->last_graph_event.reset();
             cleanup_ctx->last_graph_event_deferred_decode = false;
         }
@@ -98107,6 +98196,9 @@ void ggml_backend_sycl_shutdown(void) {
     // Event-retained mem_handles and retained CPU outputs both own cache/pinned
     // allocations. Drain events synchronously, return the scratch lease, then
     // erase/free every offload-pool owner before queue or cache destruction.
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        pp_moe_onednn_drain_scratch_slots(device);
+    }
     ggml_sycl::release_graph_retained_handles();
     if (!ggml_sycl::drain_retained_handles(true, 10000)) {
         throw std::runtime_error("SYCL retained-handle drain timed out");
