@@ -390,6 +390,11 @@ int main() {
     ggml_sycl::unified_cache * cache = nullptr;
     sycl::queue *              q     = nullptr;
     try {
+        const size_t device_count = ggml_backend_sycl_get_device_count();
+        if (device_count == 0) {
+            fprintf(stderr, "no SYCL devices available after logical mapping init\n");
+            return 1;
+        }
         cache = ggml_sycl::get_unified_cache_for_device(0);
         if (!cache) {
             fprintf(stderr, "global unified cache unavailable for logical device 0\n");
