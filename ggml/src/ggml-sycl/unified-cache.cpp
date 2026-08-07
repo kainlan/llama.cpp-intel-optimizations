@@ -8774,7 +8774,22 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[UNIFIED-CACHE] reclaim_weight_entries queue drain failed: %s\n", e.what());
     }
-    drain_retained_handles(true);
+    // llama.cpp-fzem: the return here used to be discarded. drain_retained_handles()
+    // waits up to its timeout (default 10s) for the background drain worker to finish
+    // releasing event-bound mem_handle leases (retain_handles_until_event()) and gives
+    // up silently on timeout -- so a lease whose SYCL event simply hadn't been reaped
+    // yet reads as an indistinguishable "leaked_lease" a few lines below.  This is not
+    // a fix for that race (which needs the audit's per-entry acquisition site, not a
+    // scan-wide bool); it makes an already-swallowed failure mode observable, without
+    // touching reclaim/eviction/classification, so a capture caught mid-race can be
+    // told apart from an actual orphaned lease.
+    if (!drain_retained_handles(true)) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] reclaim_weight_entries(%s) drain_retained_handles timed out -- some event-bound "
+            "mem_handle leases may still be in flight; any weight:leaked_lease reported by this scan may be a "
+            "drain race, not a genuine leak\n",
+            weight_reclaim_mode_name(mode));
+    }
 
     // Weight reclaim is a reset site too, and its escape cohort is the largest
     // one confirmed so far (llama.cpp-2wv5: 291 of 516 entries preserved at an
