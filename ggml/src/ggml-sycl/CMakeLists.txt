@@ -3435,11 +3435,19 @@ endif()
 add_test(NAME test-sycl-xmx-unified-correctness COMMAND test-sycl-xmx-unified-correctness)
 set_tests_properties(test-sycl-xmx-unified-correctness PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    # Exits 77 when a capability it needs is unavailable (no SYCL device, no
-    # graph support, graphs disabled, no exec graph recorded); without
-    # SKIP_RETURN_CODE ctest renders that as FAILED rather than Skipped
-    # (llama.cpp-ivin).
+    # ONEAPI_DEVICE_SELECTOR pins ONE device (level_zero:0, the B70 -- the
+    # XMX-relevant card).  Unpinned, ggml_sycl_routable_device_count() > 1 makes
+    # graph_compute() log "Multi-device SYCL execution active: disabling full
+    # graph replay", which the test reports as informational graph state; pinning
+    # keeps that noise out.  It also fixes the meaning of the in-process device
+    # index the test passes to ggml_backend_sycl_init() (SYCL_DEVICE_INDEX = 0),
+    # and keeps the iGPU out of the run -- unpinned, the iGPU's 231.7 GB of
+    # "VRAM" is system RAM and drives host Shmem to ~128 GB (llama.cpp-403s).
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Exits 77 when a capability or configuration it needs is absent: no SYCL
+    # device, no CPU backend, or SYCL CPU offload enabled (which makes GPU
+    # execution unprovable).  Without SKIP_RETURN_CODE ctest renders that as
+    # FAILED rather than Skipped (llama.cpp-ivin).
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
