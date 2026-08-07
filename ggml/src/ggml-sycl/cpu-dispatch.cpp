@@ -1941,6 +1941,9 @@ static bool retained_cache_id_less(const ggml_sycl_cache_id & a, const ggml_sycl
     if (a.has_gguf != b.has_gguf) {
         return a.has_gguf < b.has_gguf;
     }
+    if (a.file_id != b.file_id) {
+        return a.file_id < b.file_id;
+    }
     if (a.file_idx != b.file_idx) {
         return a.file_idx < b.file_idx;
     }

@@ -36,6 +36,7 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_host_buffer_type_for_device": "ggml_backend_sycl_host_buffer_type_for_device",
     "ggml_backend_sycl_register_host_weight_tensor": "ggml_backend_sycl_register_host_weight_tensor",
     "ggml_backend_sycl_register_weight_identity": "ggml_backend_sycl_register_weight_identity",
+    "ggml_backend_sycl_register_gguf_file_identity": "ggml_backend_sycl_register_gguf_file_identity",
     "ggml_backend_sycl_register_weight_usage": "ggml_backend_sycl_register_weight_usage",
     "ggml_backend_sycl_try_register_weight_usage": "ggml_backend_sycl_try_register_weight_usage",
     "ggml_backend_sycl_stage_inventory_plan": "ggml_backend_sycl_stage_inventory_plan",
