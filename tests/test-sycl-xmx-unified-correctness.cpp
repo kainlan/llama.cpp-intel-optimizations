@@ -6,11 +6,12 @@
 // K=128 N=64 M=16, with the weight resident in the SYCL backend's own device
 // buffer, matches the ggml CPU backend to within tol=8e-2 -- and the SYCL side
 // ran on the device rather than being routed back to the CPU.  The second half
-// is established by the two-part precondition in run_backend_matmul(); read
-// that before weakening either half.  It does NOT assert which GPU kernel
-// variant was selected; that is a function of GGML_SYCL_XMX_UNIFIED (set in
-// main()) and can_use_xmx(M,N,K), which this shape satisfies (M>=8, N>=16,
-// K%16==0).
+// is established by the four-part precondition in run_backend_matmul(), backed
+// by the static_asserts on the CASE_* shape constants below; read the
+// four-group enumeration there before weakening any of it.  It does NOT assert
+// which GPU kernel variant was selected; that is a function of
+// GGML_SYCL_XMX_UNIFIED (set in main()) and can_use_xmx(M,N,K), whose
+// thresholds the CASE_* static_asserts pin.
 //
 // Exit codes are tri-state: 0 = the comparison ran and passed, 1 = a property
 // this test asserts did not hold, 77 = a capability or configuration it needs
@@ -81,6 +82,42 @@ static bool max_abs_diff(const std::vector<float> & a, const std::vector<float> 
     return true;
 }
 
+// The fixture shape.  These are compile-time constants because three separate
+// dispatch decisions hang off them, and a future edit to any one of the numbers
+// must re-trigger the analysis rather than silently move the test off the path
+// it names.  See the static_asserts below for what each one is holding shut.
+static constexpr int CASE_K = 128;  // reduction dim
+static constexpr int CASE_N = 64;   // output columns (weight rows)
+static constexpr int CASE_M = 16;   // batch/output rows (tokens); MEDIUM bucket -> dpas + XMX
+
+// Quantization: the weight is built with quantize_row_q4_0_ref, which requires
+// whole Q4_0 blocks.  This was a runtime `SKIP` + std::abort(), which exits 134
+// while printing the word SKIP -- a skip that ctest scores as a crash.  It is a
+// property of a literal, so the compiler can settle it.
+static_assert(CASE_K % QK4_0 == 0, "CASE_K must be a whole number of Q4_0 blocks");
+
+// XMX eligibility, mirroring can_use_xmx(M, N, K) in unified-kernel.hpp: M >=
+// XMX_TILE_M (8), N >= XMX_TILE_N (16), K % XMX_TILE_K (16) == 0.  The argument
+// mapping is UnifiedKernelArgs (unified-kernel.hpp:1405-1407): M = src1->ne[1],
+// N = src0->ne[1], K = src0->ne[0] -- the same roles as the fields here.
+static_assert(CASE_M >= 8, "CASE_M below XMX_TILE_M: shape is no longer XMX-eligible");
+static_assert(CASE_N >= 16, "CASE_N below XMX_TILE_N: shape is no longer XMX-eligible");
+static_assert(CASE_K % 16 == 0, "CASE_K not a multiple of XMX_TILE_K: shape is no longer XMX-eligible");
+
+// Group D closures -- these two are load-bearing for the GPU-execution claim,
+// not merely for kernel selection.  Both CPU short-circuits inside
+// ggml_sycl_mul_mat() key off src1->ne[1], which is CASE_M:
+//   D1 CPU-HOST-MAT (ggml-sycl.cpp:54774-54840) fires only at src1->ne[1] == 1.
+//      It is DEFAULT-ACTIVE (opt-out GGML_SYCL_CPU_HOST_MAT=0), so this bound is
+//      the only unconditional thing standing between this fixture and it.
+//   D2 CPU-PP (ggml-sycl.cpp:54850-54966) fires only at src1->ne[1] >=
+//      GGML_SYCL_CPU_PP_MIN_BATCH (default 64).  That default is env-tunable, so
+//      this assert is a guard on the DEFAULT configuration only; D2's
+//      unconditional closure is its residency gate, asserted at runtime below.
+// A shape change that trips either assert must go re-read GROUP D.
+static_assert(CASE_M != 1, "CASE_M == 1 opens the default-active CPU-HOST-MAT path (see GROUP D)");
+static_assert(CASE_M < 64, "CASE_M >= 64 opens the CPU-PP path at its default threshold (see GROUP D)");
+
 struct matmul_case {
     int K;  // reduction dim
     int N;  // output columns (weight rows)
@@ -90,14 +127,9 @@ struct matmul_case {
 };
 
 static void build_case(matmul_case & tc) {
-    tc.K = 128;
-    tc.N = 64;
-    tc.M = 16;  // MEDIUM bucket -> dpas + XMX layouts
-
-    if (tc.K % QK4_0 != 0) {
-        std::fprintf(stderr, "SKIP: K must be divisible by QK4_0 (K=%d QK4_0=%d)\n", tc.K, QK4_0);
-        std::abort();
-    }
+    tc.K = CASE_K;
+    tc.N = CASE_N;
+    tc.M = CASE_M;
 
     const int blocks_per_row = tc.K / QK4_0;
 
@@ -229,9 +261,19 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
     if (require_gpu_execution) {
         // ============== GPU-execution preconditions: the enumeration ==========
         // Enumerated at 9857619f3 over every site that can route a plain
-        // GGML_OP_MUL_MAT to the CPU.  They fall into three groups; parts 1 and
-        // 2 below close the first two, and the third closes on this fixture's
-        // own shape and name.
+        // GGML_OP_MUL_MAT to the CPU.  They fall into FOUR groups.
+        //
+        // Read this before adding or weakening a check, and note what the
+        // grouping is really tracking: each group is closed by a DIFFERENT
+        // residency mechanism, and they do not agree with each other.  Four
+        // distinct predicates appear below --
+        //   ggml_sycl_weight_is_currently_device_resident() (common.hpp:4546),
+        //   ggml_sycl_weight_is_planned_on_host()           (common.hpp:4499),
+        //   ggml_sycl_is_host_resident_weight()             (mmvq.cpp:2115),
+        //   ggml_backend_buffer_is_host()                   (ggml-backend)
+        // -- and asserting one of them says nothing about the others.  An
+        // earlier revision of this test asserted only the first and treated the
+        // rest as covered; they were not.
         //
         // GROUP A -- downstream of ggml_sycl_cpu_offload_available(), which is
         // ggml_sycl_info().has_cpu_device, true only when GGML_SYCL_CPU_OFFLOAD=1
@@ -260,6 +302,27 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
         // 0), a src0 name containing "output.weight" (this weight is
         // "blk.0.attn_q.weight"), and src1->ne[1] == 1 (this is M = 16).
         //
+        // GROUP D -- two CPU short-circuits INSIDE ggml_sycl_mul_mat() itself,
+        // each with its own `return` before any GPU kernel is submitted.  They
+        // sit upstream of nothing in groups A-C and are gated on residency
+        // mechanisms DIFFERENT from the one part 2 asserts:
+        //   D1 CPU-HOST-MAT (ggml-sycl.cpp:54774-54840).  DEFAULT-ACTIVE -- it
+        //     is an opt-OUT (GGML_SYCL_CPU_HOST_MAT=0), not an opt-in, so no env
+        //     default is protecting us here.  Gates: !src0_on_device (where
+        //     src0_on_device = !ggml_sycl_is_host_resident_weight(src0,
+        //     ctx.stream()), the mmvq.cpp:2115 probe), src0_planned_host (=
+        //     ggml_sycl_weight_is_planned_on_host(), the PLACEMENT PLAN -- a
+        //     third mechanism again), src1->ne[1] == 1, and quantized f32.
+        //     Closed three independent ways, all now asserted or static_asserted:
+        //     the CASE_M != 1 static_assert, the planned-host check in part 3,
+        //     and the residency checks in part 4.
+        //   D2 CPU-PP (ggml-sycl.cpp:54850-54966).  Opt-in
+        //     (GGML_SYCL_CPU_PP=1).  Gates: M >= GGML_SYCL_CPU_PP_MIN_BATCH
+        //     (default 64) and ggml_sycl_is_host_resident_weight(src0, stream).
+        //     Note the threshold is ENV-TUNABLE, so "M < 64" is a guard on the
+        //     default configuration only -- D2's unconditional closure is the
+        //     residency gate, which part 4 asserts.
+        //
         // Not reachable at all: the CPU routes in ggml_sycl_mul_mat_id(), since
         // this op is MUL_MAT and not MUL_MAT_ID.
         //
@@ -268,12 +331,17 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
         // establish where the MUL_MAT ran.  That is a configuration the test
         // cannot see through, not a wrong answer -- exit 77, not 1.
         //
-        // Be clear about what this does under ctest: nothing.  The registration
-        // pins ONEAPI_DEVICE_SELECTOR to one level_zero device, and the CPU
-        // queue is built by scanning the VISIBLE platforms for a CPU device, so
-        // has_cpu_device is already false and group A is already closed.  This
-        // check earns its place on a DIRECT invocation, where nothing pins the
-        // selector.  To confirm it is not vacuous, make a CPU device visible:
+        // Be clear about what this does under ctest: nothing, and about WHY.
+        // The primary closure is that GGML_SYCL_CPU_OFFLOAD is unset --
+        // ggml_sycl_cpu_offload_enabled() is false, so the CPU queue is never
+        // even attempted and has_cpu_device stays false.  That holds on any
+        // host, with or without a selector.  Selector pinning is a SECONDARY,
+        // belt-and-braces closure: even with the env var set, the CPU queue is
+        // built by scanning the VISIBLE platforms for a CPU device, and the
+        // registration pins ONEAPI_DEVICE_SELECTOR to one level_zero device.
+        // This check therefore earns its place on a DIRECT invocation with the
+        // env var set.  To confirm it is not vacuous you must defeat BOTH
+        // closures -- set the var AND make a CPU device visible:
         //   GGML_SYCL_CPU_OFFLOAD=1 GGML_SYCL_CPU_DEVICE_SELECTOR=opencl:cpu \
         //   ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:cpu' \
         //   ./build/bin/test-sycl-xmx-unified-correctness   # expect 77 + the SKIP
@@ -309,6 +377,74 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
                          "FAIL: weight '%s' is not device-resident on device %d before compute; MUL_MAT would be "
                          "routed to CPU and the comparison would be CPU-vs-CPU\n",
                          weight->name, SYCL_DEVICE_INDEX);
+            return finish(run_status::FAILED);
+        }
+
+        // -------------------------------- part 3 --------------------------------
+        // Group D1's placement-plan gate.  This is the SECOND residency
+        // mechanism and part 2 does not imply it: a weight can be VRAM-resident
+        // right now and still be planned onto the host, which is exactly the
+        // combination D1 keys on.  The call below is D1's own `src0_planned_host`
+        // expression, not a proxy.
+        //
+        // It holds today because this test loads no model, so the placement plan
+        // has no entries and ggml_sycl_get_planned_weight_residency() answers
+        // UNKNOWN.  That is a property of the fixture, not of the backend, so it
+        // is asserted rather than assumed -- a future test that stages a model
+        // (as tests/test-dmmv-q4-0-coalesced.cpp now does) would populate a plan
+        // and could land here without anyone noticing.
+        if (ggml_sycl_weight_is_planned_on_host(weight, SYCL_DEVICE_INDEX)) {
+            std::fprintf(stderr,
+                         "FAIL: weight '%s' is planned onto the host on device %d; the default-active CPU-HOST-MAT "
+                         "path (GROUP D1) is open\n",
+                         weight->name, SYCL_DEVICE_INDEX);
+            return finish(run_status::FAILED);
+        }
+
+        // -------------------------------- part 4 --------------------------------
+        // The residency gate shared by D1 (via !src0_on_device) and D2, which is
+        // ggml_sycl_is_host_resident_weight() at mmvq.cpp:2115.  That function is
+        // `static` in mmvq.cpp and so is NOT callable from here -- this is a
+        // MIRROR of its two checks, not the function itself.  If it ever grows a
+        // third check, this mirror silently stops covering the whole predicate;
+        // it will not start passing wrongly, but it will cover less.  Keep them
+        // in step.
+        //
+        //   its check 1: ggml_backend_buffer_is_host(src0->buffer)
+        //   its check 2: ggml_sycl_host_data(src0) is non-null AND its USM
+        //                allocation type is not `device`
+        //
+        // Both must be false for the weight to count as device-resident there.
+        if (ggml_backend_buffer_is_host(weight->buffer)) {
+            std::fprintf(stderr,
+                         "FAIL: weight '%s' sits in a host buffer; CPU-HOST-MAT/CPU-PP (GROUP D) see it as "
+                         "host-resident\n",
+                         weight->name);
+            return finish(run_status::FAILED);
+        }
+
+        // Check 2 folds two distinct causes into one answer, and the message
+        // below separates them because they need different responses.
+        // ggml_sycl_get_alloc_type() is an alloc_registry lookup that returns
+        // `unknown` for an UNREGISTERED pointer as well as for a genuinely
+        // non-USM one (alloc-registry.hpp; interior pointers into a registered
+        // range do resolve, so an offset into the buffer's arena is fine).
+        // A device-resident weight whose arena was never registered would land
+        // here reporting `unknown`.  That is still worth failing on rather than
+        // ignoring -- production asks this exact question and would answer
+        // "host-resident", opening D1's !src0_on_device gate -- but it is a
+        // registration defect, not a wrong-buffer defect, so say which.
+        const void *           weight_host_data = ggml_sycl_host_data(weight);
+        const sycl::usm::alloc weight_alloc =
+            weight_host_data ? ggml_sycl_get_alloc_type(weight_host_data) : sycl::usm::alloc::unknown;
+        if (weight_host_data != nullptr && weight_alloc != sycl::usm::alloc::device) {
+            std::fprintf(stderr,
+                         "FAIL: weight '%s' data pointer resolves to USM alloc kind %d, not `device` (%d); "
+                         "CPU-HOST-MAT/CPU-PP (GROUP D) see it as host-resident. kind `unknown` (%d) means the "
+                         "pointer is non-USM OR its allocation was never registered in alloc_registry -- check "
+                         "which before assuming the weight is misplaced\n",
+                         weight->name, (int) weight_alloc, (int) sycl::usm::alloc::device,
+                         (int) sycl::usm::alloc::unknown);
             return finish(run_status::FAILED);
         }
     }
