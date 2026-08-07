@@ -340,6 +340,20 @@ class mem_handle {
     void                  set_debug_owner(const char * owner_tag);
     mem_handle_debug_info debug_info() const;
 
+    // Debug-only: overwrite the leased cache entry's debug_last_lease_site
+    // with a caller-supplied, more specific tag.  operator=/the copy ctor
+    // always stamp the generic "mem_handle/copy-assign" / "mem_handle/copy-
+    // ctor" literals -- they have no visibility into which long-lived
+    // structure the caller is about to stash the copy into (llama.cpp-fzem).
+    // Call this immediately after a copy that is being stored in a
+    // persistent per-tensor cache (extra->data_handle[], extra->
+    // moe_expert_handles[], etc.) so a reclaim-scan dump can attribute a
+    // surviving lease to its actual holder instead of the uninformative
+    // generic string. No-op if this handle holds no lease. `site` must be a
+    // string literal or other externally-owned stable string, per the same
+    // contract as set_debug_owner above.
+    void tag_persistent_lease_site(const char * site) const;
+
   private:
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;

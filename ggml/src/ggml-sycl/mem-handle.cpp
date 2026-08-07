@@ -825,6 +825,19 @@ void mem_handle::set_debug_owner(const char * owner_tag) {
     debug_owner_tag_ = owner_tag ? owner_tag : "";
 }
 
+void mem_handle::tag_persistent_lease_site(const char * site) const {
+    if (!site) {
+        return;
+    }
+    // Mirrors the copy-ctor/copy-assign write of debug_last_lease_site: no
+    // cache lock required, this is a plain pointer write to a debug-only
+    // field on the cache entry (llama.cpp-2wv5's precedent).
+    mem_handle_lock_guard g(lock_);
+    if (leased_entry_) {
+        leased_entry_->debug_last_lease_site = site;
+    }
+}
+
 mem_handle_debug_info mem_handle::debug_info() const {
     mem_handle_debug_info info;
     info.kind                = kind_;

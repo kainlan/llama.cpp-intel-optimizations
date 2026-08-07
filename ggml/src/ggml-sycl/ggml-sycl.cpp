@@ -14282,6 +14282,11 @@ static bool ggml_sycl_publish_existing_storage_handle_for_device(const ggml_tens
     root_extra->data_handle[device]      = handle;
     root_extra->data_device_size[device] = root_size;
     root->data                           = resolved.ptr;
+    // llama.cpp-fzem: tag the persistent per-tensor cache copy so a reclaim-scan
+    // dump can attribute a surviving lease to this holder instead of the
+    // generic "mem_handle/copy-assign".
+    root_extra->data_handle[device].tag_persistent_lease_site(
+        "extra->data_handle[]/publish_existing_storage_handle_for_device(root)");
 
     if (tensor != root && tensor->extra) {
         auto * tensor_extra               = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
@@ -14291,6 +14296,8 @@ static bool ggml_sycl_publish_existing_storage_handle_for_device(const ggml_tens
         tensor_extra->data_device_size[device] =
             root_size > view_offset ? root_size - view_offset : ggml_nbytes(tensor);
         const_cast<ggml_tensor *>(tensor)->data = view_ptr;
+        tensor_extra->data_handle[device].tag_persistent_lease_site(
+            "extra->data_handle[]/publish_existing_storage_handle_for_device(view)");
     }
 
     ggml_sycl_data_ptr_cache_new_graph();
@@ -28773,6 +28780,12 @@ static void ggml_sycl_preload_model_weights() {
                     auto resolved = pin_info.handle.resolve(device);
                     if (resolved.ptr) {
                         extra->data_handle[device]      = pin_info.handle;
+                        // llama.cpp-fzem: terminal persistent publish for these
+                        // tensors -- no later publish_existing_storage_handle_for_device()
+                        // call overwrites this copy, so tag it explicitly instead of
+                        // leaving the generic "mem_handle/copy-assign".
+                        extra->data_handle[device].tag_persistent_lease_site(
+                            "extra->data_handle[]/preload_model_weights(dense-pin)");
                         extra->data_device[device]      = resolved.ptr;
                         extra->data_device_size[device] = pin_info.key.nbytes;
                     }
@@ -44045,6 +44058,20 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
         }
     };
 
+    // llama.cpp-fzem: this struct (and its four siblings of the same shape/name
+    // in ggml_sycl_try_cross_device_f16_attention, ggml_sycl_try_route_flash_attn_ext,
+    // ggml_sycl_try_route_mul_mat_weight_owner, ggml_sycl_try_route_mul_mat_activation)
+    // does copy-assign into extra->data_handle[device] via set_root_override /
+    // set_staged_root_override, and dismiss() can make that copy permanent (the
+    // dtor's restore becomes a no-op). Deliberately NOT wired into
+    // tag_persistent_lease_site(): every caller passes a
+    // ggml_sycl_scoped_staging_handle::handle, which allocate() populates
+    // exclusively via ggml_sycl_take_owned_alloc_handle() ->
+    // mem_handle::from_owned_alloc() -> from_direct() -- a DIRECT-kind handle
+    // owning its allocation via owned_alloc_, never a WEIGHT-kind lease on a
+    // unified_cache_entry (leased_entry_ stays null). tag_persistent_lease_site()
+    // no-ops on such a handle by contract, so there is no unified_cache_entry
+    // reclaim-scan lease these sites could be attributed to.
     struct scoped_handle_override {
         ggml_tensor_extra_gpu * extra  = nullptr;
         int                     device = -1;
@@ -47301,6 +47328,12 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
                                 expert_handles[slot].stable_identity_equal(handle) && ptr_payload[slot] == resolved.ptr;
         if (!same_entry) {
             expert_handles[slot] = handle;
+            // llama.cpp-fzem: tag the persistent extra->moe_expert_handles[]
+            // slot cache so a reclaim-scan dump can attribute a surviving
+            // lease to its actual holder instead of the generic
+            // "mem_handle/copy-assign".
+            expert_handles[slot].tag_persistent_lease_site(
+                "extra->moe_expert_handles[]/upload_moe_transient_ptr_table");
             ptr_payload[slot]    = resolved.ptr;
             any_updated          = true;
         }
@@ -49129,6 +49162,11 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             return false;
         }
         expert_handles[static_cast<size_t>(e)] = handle;
+        // llama.cpp-fzem: reuse the existing per-call-site debug_tag to mark the
+        // persistent extra->moe_expert_handles[] slot cache, so a reclaim-scan
+        // dump can attribute a surviving lease to its actual holder instead of
+        // the generic "mem_handle/copy-assign".
+        expert_handles[static_cast<size_t>(e)].tag_persistent_lease_site(debug_tag);
         ptr_payload[static_cast<size_t>(e)]    = resolved.ptr;
         table_leases.push_back(std::move(handle));
         GGML_SYCL_DEBUG("[MOE-PTR] Expert %ld resolved via %s, ptr=%p layout=%d on_device=%d\n", (long) e, debug_tag,
