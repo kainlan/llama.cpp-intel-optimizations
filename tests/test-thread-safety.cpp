@@ -107,7 +107,13 @@ int main(int argc, char ** argv) {
 
     // Devices touched by model m's decode calls: a single-GPU model owns just
     // its one device, the CPU model owns none, and the trailing layer-split
-    // model spans every GPU device.
+    // model spans every GPU device. Locking every GPU for the layer-split
+    // model's whole decode over-serializes it against the single-GPU models
+    // (it forfeits concurrency it could in principle have on devices its
+    // current decode isn't using yet) -- that's intentionally conservative,
+    // not a bug to "optimize" back toward per-device-only locking, since a
+    // multi-device invocation's actual device set for a given decode isn't
+    // observable from here.
     auto model_devices = [&](int m) {
         std::vector<int> devices;
         if (m < gpu_dev_count) {
@@ -196,6 +202,14 @@ int main(int argc, char ** argv) {
                         failed.store(true);
                         return;
                     }
+                    // llama_decode() can return before the SYCL backend actually
+                    // releases the device's execution lease (deferred-exit-wait
+                    // path, ggml-sycl.cpp can_defer_exit_wait): the lease is
+                    // released lazily on the next synchronize, which is normally
+                    // triggered later by a logit read. Force that release here,
+                    // still under the lock, so we never unlock a device this
+                    // thread's invocation still owns in the execution registry.
+                    llama_synchronize(ctx.get());
                 }
 
                 const auto * vocab = llama_model_get_vocab(model);
@@ -221,6 +235,13 @@ int main(int argc, char ** argv) {
                     {
                         device_decode_guard guard(device_exec_mutex, devices);
                         ret = llama_decode(ctx.get(), batch);
+                        if (ret == 0) {
+                            // See the matching comment on the prompt decode above:
+                            // force the deferred device-lease release to happen
+                            // before we unlock, not on the next (unguarded) logit
+                            // read at the top of the following iteration.
+                            llama_synchronize(ctx.get());
+                        }
                     }
                     if (ret == 1 && i > 0) {
                         LOG_INF("Context full, stopping generation.\n");
