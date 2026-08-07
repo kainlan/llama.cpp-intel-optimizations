@@ -11535,6 +11535,32 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         }
     }
 
+    // llama.cpp-fzem: confirmed root cause for the model-teardown weight-lease
+    // leak (rope_freqs.weight instance). llama_model_loader::create_tensor()'s
+    // TENSOR_DUPLICATED path (used for per-layer rope_freqs at i!=0, and for
+    // tied token_embd/output) tries to reuse the ORIGINAL ggml_tensor* via
+    // ggml_get_tensor(ctx, name) when the duplicate lands in the same buffer-
+    // type context -- but silently falls through to allocating a genuinely
+    // SEPARATE ggml_tensor* with the identical name when the context differs
+    // (llama-model-loader.cpp:1544-1550/1561-1562). This registry is keyed on
+    // owner + ggml_get_name(tensor) (ggml-sycl.cpp:9130), not the tensor
+    // pointer, so the second such tensor's registration hits the mismatch
+    // branch below. This registry row's own retain on the OLD extra was
+    // previously dropped without a matching release when the row got
+    // reassigned to the NEW extra -- if the old extra was registry-owned
+    // solely (the common case), its refcount never reached 0 again, and its
+    // own S1-PRELOAD dense-pin lease on data_handle[] survived permanently.
+    // Fixed by releasing the row's ownership of the displaced extra, mirroring
+    // the retain taken for the new one. This is refcount-safe, not a force-
+    // evict: release_extra_gpu() only performs full cleanup (including
+    // clearing data_handle[]) when this is the LAST reference: any other live
+    // handle -- e.g. an in-flight kernel's retain_handles_until_event() --
+    // keeps the underlying allocation alive regardless, so this does not
+    // touch the resources the removed "keep the old extra alive" comment was
+    // guarding against. Deferred until after the lock is dropped, matching
+    // this file's own pattern elsewhere (e.g. mem_handle::release_lease_state)
+    // of never releasing resources while holding a registry lock.
+    ggml_tensor_extra_gpu * displaced_extra = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
         const std::string           key = ggml_sycl_host_weight_registry_key(tensor, extra, owner);
@@ -11547,27 +11573,12 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         if (!insert.second) {
             sycl_host_weight_extra_entry & existing = insert.first->second;
             if (existing.extra != extra || existing.tensor != tensor) {
-                // llama.cpp-fzem: this branch REPLACES the registry's tracked
-                // (tensor, extra) without ever releasing the OLD extra's own
-                // refcount -- the comment below says "keep the old extra alive"
-                // but nothing else in this codebase calls release_extra_gpu()
-                // on it afterward. If the old extra was registry-owned solely
-                // (refcount==1, the common case), it never reaches 0 again: its
-                // own data_handle[] lease -- taken by S1-PRELOAD's dense-pin
-                // copy-assign like any other -- survives permanently. Two
-                // ggml_tensor objects sharing one registry key (same owner +
-                // same ggml_get_name()) is exactly the tied-embedding/aliased-
-                // tensor shape (llama_model_saver's own comment: "some models
-                // use the same tensor for tok_embd and output"). Bumped to the
-                // raw-stderr-bypass helper: plain GGML_LOG_WARN here was
-                // silently swallowed by test_backends()'s log filter in every
-                // capture this investigation has taken so far (round 6), so a
-                // zero-occurrences read on this line was never valid evidence.
                 ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
                                          tensor->name ? tensor->name : "unknown", (void *) existing.extra,
                                          (void *) extra);
-                // Treat as stale registry entry and replace it. Keep the old
-                // extra alive to avoid freeing resources still in use by in-flight kernels.
+                if (existing.extra != extra) {
+                    displaced_extra = existing.extra;
+                }
                 existing       = new_entry;
                 tensor->extra  = extra;
                 tensor->layout = extra ? &extra->layout : nullptr;
@@ -11578,6 +11589,9 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         } else if (!created_extra) {
             retain_extra_gpu(extra);
         }
+    }
+    if (displaced_extra) {
+        release_extra_gpu(displaced_extra);
     }
 
     int device_id = ggml_sycl_device_id_from_backend_dev(dev);
