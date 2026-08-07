@@ -14,11 +14,12 @@
 //     -> arena_reserve).  So the arena is already holding VRAM by the time the
 //     first get_unified_cache_for_device() call returns.
 //   * That reservation is deliberately NOT subtracted from budget_.  See the
-//     note above unified_cache::update_reserved_bytes(): "Arena zones now handle
-//     VRAM partitioning for runtime allocations ... handled by the overcommit
-//     guard in unified_cache_total_committed_bytes() rather than by shrinking
-//     the weight cache budget."  budget_ = base_budget_ - reserved_, and nothing
-//     charges the arena to reserved_.
+//     792vn.5 design note above unified_cache::update_reserved_bytes()
+//     (unified-cache.cpp:8573): "Arena zones now handle VRAM partitioning for
+//     runtime allocations ... handled by the overcommit guard in
+//     unified_cache_total_committed_bytes() rather than by shrinking the weight
+//     cache budget."  budget_ = base_budget_ - reserved_, and nothing charges
+//     the arena to reserved_.
 //
 // With the DEFAULT whole-device budget those two facts collide.  budget() then
 // reports very nearly all of VRAM while the arena has physically taken very
@@ -29,6 +30,14 @@
 // (unified-cache.cpp, "alloc malloc_device returned nullptr").  Sizing an
 // allocation from available() therefore asks for memory the cache itself owns,
 // and the driver returns nullptr.  That is self-starvation, not a cache defect.
+//
+// ensure_cached_alloc() is [[deprecated("use unified_alloc()")]] and has no
+// production callers -- the shim survives only for this test family, and
+// llama.cpp-og9dt tracks porting these call sites to unified_alloc() and
+// deleting it.  Until that lands, this fixture is exercising a path the
+// backend itself no longer takes: the production paths (allocate_slot,
+// unified_alloc) try the arena zone first and check live free VRAM before any
+// raw malloc, which is exactly what spares them this failure mode.
 //
 // It also makes the eviction claim unreachable.  The only path to evict_one()
 // is the used_ + size > budget_ branch, so with budget_ ~= all of VRAM the
@@ -870,6 +879,12 @@ static test_result test_eviction_fragmentation() {
 
     printf("  Large allocation succeeded (evicted small entries)\n");
 
+    // Sample before cleanup: serving the large entry must not have pushed the
+    // cache past its budget.  This is the third leg of the claim -- "served",
+    // "by evicting", and "still within budget" -- and without it a cache that
+    // simply grew to fit would pass.  Same assertion test 2 makes.
+    const size_t used_after = cache->used();
+
     // Clean up
     for (size_t i = 0; i < small_ids.size(); ++i) {
         cache->remove(small_ids[i], ggml_sycl::cache_entry_type::MOE_EXPERT, 0, static_cast<int>(i), GGML_LAYOUT_AOS);
@@ -877,6 +892,14 @@ static test_result test_eviction_fragmentation() {
     cache->remove(large_id, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
     cache->evict(0);
 
+    if (used_after > budget) {
+        printf("  FAIL: used %zu MB exceeds budget %zu MB after serving the %zu MB allocation\n",
+               used_after / (1024*1024), budget / (1024*1024), large_size / (1024*1024));
+        return test_result::FAIL;
+    }
+
+    printf("  Used %zu MB stayed within the %zu MB budget\n",
+           used_after / (1024*1024), budget / (1024*1024));
     printf("  PASS: eviction handles fragmentation\n");
     return test_result::PASS;
 }
@@ -1014,9 +1037,13 @@ int main(int /*argc*/, char ** /*argv*/) {
     // Pin the cache budget BEFORE anything can touch a SYCL device.  The first
     // cache access sets g_cache_mode_locked and this setter becomes a no-op, and
     // ggml_backend_sycl_get_device_memory() below is enough to trigger it -- so
-    // this must be the first statement in the program.  See the contract note at
-    // the top of this file for why the default whole-device budget starves the
-    // fixture instead of exercising it.
+    // this must be the first statement in the program.
+    //
+    // Why a pin is needed at all: budget() is weight-cache accounting and does
+    // NOT subtract the arena's up-front VRAM reservation, by the 792vn.5 design
+    // decision recorded at unified-cache.cpp:8573.  At the default whole-device
+    // budget that leaves every size derived from available() unallocatable.  See
+    // the contract note at the top of this file for the full arithmetic.
     ggml_sycl::set_unified_cache_budget(k_test_budget_bytes);
 
     printf("=================================================================\n");
