@@ -21,6 +21,39 @@ static bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+// For needles that are a piece of SOURCE CODE (a declaration, an expression) --
+// never for string literals or diagnostic text, where exact spacing is part of
+// what is being verified; use contains() for those. clang-format vertically
+// aligns consecutive declarations to the widest column in their group, so an
+// unrelated neighbour gaining a longer type/identifier can pad an otherwise
+// untouched declaration with extra spaces -- llama.cpp-pjgz: c3bfd71c40
+// widened `std::unique_ptr<sycl_ex::command_graph<...>> recorded`'s neighbours
+// (including retained_handles, never itself touched) from one space to dozens,
+// silently breaking a literal single-space needle even though the checked
+// declaration never moved. Squeezing runs of spaces/tabs to one before
+// comparing survives that kind of reformatting while still failing if the
+// needle's tokens are genuinely absent, renamed, or reordered.
+static bool contains_normalized(const std::string & haystack, const char * needle) {
+    auto squeeze = [](const std::string & s) {
+        std::string out;
+        out.reserve(s.size());
+        bool prev_space = false;
+        for (char c : s) {
+            const bool is_space = (c == ' ' || c == '\t');
+            if (is_space) {
+                if (!prev_space) {
+                    out.push_back(' ');
+                }
+            } else {
+                out.push_back(c);
+            }
+            prev_space = is_space;
+        }
+        return out;
+    };
+    return squeeze(haystack).find(squeeze(needle)) != std::string::npos;
+}
+
 static std::string required_region(const std::string & haystack,
                                    const char *        begin_marker,
                                    const char *        end_marker,
@@ -128,7 +161,7 @@ static int test_sequence_graphlet_has_retention_and_identity() {
     CHECK(contains(sequence_fn, "it->graph_hash != graph_hash || it->mode_hash != mode_hash") &&
               contains(sequence_fn, "it->identity_hash == identity"),
           "sequence graphlets must preserve already-recorded safe identities while pruning stale graph/mode entries");
-    CHECK(contains(sequence_fn, "std::vector<ggml_sycl::mem_handle> retained_handles"),
+    CHECK(contains_normalized(sequence_fn, "std::vector<ggml_sycl::mem_handle> retained_handles"),
           "sequence graphlet recording must collect retained handles in the sequence implementation");
     CHECK(contains(sequence_fn, "moe_graph_descriptor_moe_dispatch_supported(sycl_ctx, node)"),
           "sequence graphlet recording must require descriptor support before recording");
