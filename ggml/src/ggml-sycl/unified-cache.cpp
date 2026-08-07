@@ -8876,37 +8876,67 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     // Scoped narrowly on purpose:
     //   - MODEL_TEARDOWN only; LOAD_BOUNDARY and MID_LOAD_REPLAN keep their
     //     existing ordering.
-    //   - Skipped whenever any entry is still owned by a SURVIVING model.  That
-    //     is the same ownership-based (deliberately lease-independent)
-    //     predicate the trailing `keep_direct_tables` branch uses, so a live
-    //     model's inference-time lookup rows are never dropped here; only the
-    //     trailing surviving_ids prune may touch them.
+    //   - A row is skipped only when ITS OWN backing entries_ id is still owned
+    //     by a SURVIVING model -- decided per row, matching the trailing
+    //     `surviving_ids` prune's granularity below.
+    //
+    // llama.cpp-fzem: this used to be a single table-wide "is ANYTHING in the
+    // whole cache owned by a survivor" gate that either dropped every row here
+    // or none of them.  With two models concurrently loaded (e.g.
+    // test-llama-archs's overlapping dev/roundtrip models), any one unrelated
+    // survivor-owned entry anywhere in the cache made that gate skip the drop
+    // entirely -- including the dying model's OWN mirror rows, which share no
+    // id with the survivor's (direct_weight_entries_/direct_expert_entries_ are
+    // keyed by ggml_sycl_cache_id, which carries model_id).  The undropped
+    // mirror lease then kept in_use_count nonzero for those entries when the
+    // scan below ran, so they were preserved as "leaked"/"leased" instead of
+    // erased -- and because they survived, their id stayed in id_to_key_, so
+    // the trailing surviving_ids prune (built FROM id_to_key_ after the scan)
+    // also kept their row, re-arming the same leak on every later reclaim call.
+    // That self-sustaining loop is the 8 weight:leaked_lease + 24 weight:leased
+    // entries this ticket tracks. Per-row filtering, using ownership state
+    // captured before the scan can preserve anything, breaks the loop.
     //
     // direct_stage_mutex_ is taken on its own: nesting it inside rw_mutex_ would
     // invert the lock order the direct staging paths use.
     if (mode == weight_reclaim_mode::MODEL_TEARDOWN) {
-        const uint32_t dying_bit         = (slot < MODEL_SLOT_COUNT) ? (1u << slot) : 0u;
-        bool           owned_by_survivor = false;
+        const uint32_t dying_bit = (slot < MODEL_SLOT_COUNT) ? (1u << slot) : 0u;
+        std::unordered_set<ggml_sycl_cache_id, detail::cache_id_hash, detail::cache_id_equal_fn> ids_owned_by_survivor;
         {
             std::shared_lock<std::shared_mutex> lock(rw_mutex_);
             const uint32_t                      surviving_mask = live_model_mask_ & ~dying_bit;
             for (const auto & pair : entries_) {
                 if ((pair.second.owner_mask & ~dying_bit & surviving_mask) != 0) {
-                    owned_by_survivor = true;
-                    break;
+                    ids_owned_by_survivor.insert(pair.first.id);
                 }
             }
         }
-        if (!owned_by_survivor) {
+        {
             std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-            const size_t                        dropped_weights = direct_weight_entries_.size();
-            const size_t                        dropped_experts = direct_expert_entries_.size();
-            direct_weight_entries_.clear();
-            direct_expert_entries_.clear();
-            GGML_SYCL_DEBUG(
-                "[UNIFIED-CACHE] reclaim_weight_entries(model-teardown) released direct-stage mirror rows before "
-                "the reclaim scan: weights=%zu experts=%zu\n",
-                dropped_weights, dropped_experts);
+            size_t                              dropped_weights = 0;
+            size_t                              dropped_experts = 0;
+            for (auto it = direct_weight_entries_.begin(); it != direct_weight_entries_.end();) {
+                if (ids_owned_by_survivor.count(it->first)) {
+                    ++it;
+                } else {
+                    it = direct_weight_entries_.erase(it);
+                    ++dropped_weights;
+                }
+            }
+            for (auto it = direct_expert_entries_.begin(); it != direct_expert_entries_.end();) {
+                if (ids_owned_by_survivor.count(it->first)) {
+                    ++it;
+                } else {
+                    it = direct_expert_entries_.erase(it);
+                    ++dropped_experts;
+                }
+            }
+            if (dropped_weights > 0 || dropped_experts > 0) {
+                GGML_SYCL_DEBUG(
+                    "[UNIFIED-CACHE] reclaim_weight_entries(model-teardown) released direct-stage mirror rows "
+                    "before the reclaim scan: weights=%zu experts=%zu\n",
+                    dropped_weights, dropped_experts);
+            }
         }
     }
 
