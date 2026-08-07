@@ -342,7 +342,7 @@ static void compare_device_coalesced_layout(const uint8_t * aos,
     std::vector<uint8_t> expected(expected_bytes);
     reorder_q4_0_aos_bytes_to_coalesced(aos, expected.data(), ncols, nrows);
 
-    size_t first_bad = 0;
+    size_t       first_bad = 0;
     const size_t errors    = count_byte_mismatches(expected.data(), device_coalesced, expected_bytes, &first_bad);
 
     if (errors == 0) {
