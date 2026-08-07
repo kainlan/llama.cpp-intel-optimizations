@@ -22,40 +22,81 @@ static bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-// For needles that are a piece of SOURCE CODE (a declaration, an expression) --
-// never for string literals or diagnostic text, where exact spacing is part of
-// what is being verified; use contains() for those. clang-format vertically
-// aligns consecutive declarations to the widest column in their group, so an
+// Collapses runs of whitespace (spaces, tabs, newlines, carriage returns) to a
+// single space. When `orig_index` is supplied, records -- for each character
+// kept in the output -- which index in the input produced it, so a match
+// position found in the squeezed string can be mapped back to a position in
+// the original one. Shared by contains_normalized() (which only needs the
+// squeezed text) and find_normalized() (which needs that position mapping).
+//
+// The problem both exist to solve: for needles that are a piece of SOURCE
+// CODE (a declaration, an expression) -- never for string literals or
+// diagnostic text, where exact spacing is part of what is being verified;
+// use plain contains()/.find() for those -- clang-format vertically aligns
+// consecutive declarations to the widest column in their group, so an
 // unrelated neighbour gaining a longer type/identifier can pad an otherwise
 // untouched declaration with extra spaces -- llama.cpp-pjgz: c3bfd71c40
-// widened `std::unique_ptr<sycl_ex::command_graph<...>> recorded`'s neighbours
-// (including retained_handles, never itself touched) from one space to dozens,
-// silently breaking a literal single-space needle even though the checked
-// declaration never moved. Squeezing runs of whitespace (spaces, tabs, AND
-// newlines -- a declaration's RHS growing past the column limit wraps it onto
-// a new line the exact same way padding does, e.g. host_ids_required below)
-// to one space before comparing survives that kind of reformatting while
-// still failing if the needle's tokens are genuinely absent, renamed, or
-// reordered.
-static bool contains_normalized(const std::string & haystack, const char * needle) {
-    auto squeeze = [](const std::string & s) {
-        std::string out;
-        out.reserve(s.size());
-        bool prev_space = false;
-        for (char c : s) {
-            const bool is_space = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-            if (is_space) {
-                if (!prev_space) {
-                    out.push_back(' ');
+// widened `std::unique_ptr<sycl_ex::command_graph<...>> recorded`'s
+// neighbours (including retained_handles, never itself touched) from one
+// space to dozens, silently breaking a literal single-space needle even
+// though the checked declaration never moved. Squeezing runs of whitespace
+// (spaces, tabs, AND newlines -- a declaration's RHS growing past the column
+// limit wraps it onto a new line the exact same way padding does, e.g.
+// host_ids_required below) to one space before comparing survives that kind
+// of reformatting while still failing if the needle's tokens are genuinely
+// absent, renamed, or reordered.
+static std::string squeeze_whitespace(const std::string & s, std::vector<size_t> * orig_index = nullptr) {
+    std::string out;
+    out.reserve(s.size());
+    if (orig_index) {
+        orig_index->clear();
+        orig_index->reserve(s.size());
+    }
+    bool prev_space = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c        = s[i];
+        const bool is_space = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        if (is_space) {
+            if (!prev_space) {
+                out.push_back(' ');
+                if (orig_index) {
+                    orig_index->push_back(i);
                 }
-            } else {
-                out.push_back(c);
             }
-            prev_space = is_space;
+        } else {
+            out.push_back(c);
+            if (orig_index) {
+                orig_index->push_back(i);
+            }
         }
-        return out;
-    };
-    return squeeze(haystack).find(squeeze(needle)) != std::string::npos;
+        prev_space = is_space;
+    }
+    return out;
+}
+
+static bool contains_normalized(const std::string & haystack, const char * needle) {
+    return squeeze_whitespace(haystack).find(squeeze_whitespace(needle)) != std::string::npos;
+}
+
+// Position-returning sibling of contains_normalized(), for ordering checks
+// that need WHERE a declaration-shaped needle appears (via .find() position
+// comparisons) rather than just whether it does -- llama.cpp-pjgz found the
+// same padding class at a second call site using positions:
+// pre_guard_direct.find("auto graph_diag_report_once") against the same
+// alignment-padded `auto          graph_diag_report_once = [&]() {`
+// declaration that broke the line-132 and report_helper needles. Returns a
+// position in the ORIGINAL (unsqueezed) haystack, so it composes with plain
+// .find() results taken from the same haystack in position comparisons
+// exactly like std::string::find() would if the padding were not there.
+static size_t find_normalized(const std::string & haystack, const char * needle) {
+    std::vector<size_t> orig_index;
+    const std::string   squeezed_hay    = squeeze_whitespace(haystack, &orig_index);
+    const std::string   squeezed_needle = squeeze_whitespace(needle);
+    const size_t        sp              = squeezed_hay.find(squeezed_needle);
+    if (sp == std::string::npos) {
+        return std::string::npos;
+    }
+    return orig_index[sp];
 }
 
 static std::string required_region(const std::string & haystack,
@@ -86,8 +127,8 @@ static std::string required_region(const std::string & haystack,
 // must match exactly and in order, so a genuinely renamed/removed/reordered
 // declaration still fails loudly. Used only where a plain required_region()
 // call is confirmed broken by reformatting -- not applied file-wide, since
-// most calls here still match exactly and a regex search is unlike a plain
-// substring search than required_region()'s own semantics.
+// most calls here still match exactly, and a regex search is a heavier
+// substitute for required_region()'s own plain-substring semantics.
 static std::string whitespace_flex_pattern(const char * marker) {
     static const std::string special = "\\^$.|?*+()[]{}";
     std::string              pattern;
@@ -839,7 +880,11 @@ static int test_default_fast_path_policy_and_tg_diagnostics() {
     const std::string pre_guard_direct = required_region(sycl, "constexpr int MIN_GPU_PREFIX_NODES",
                                                          "struct prefix_suffix_guard",
                                                          "pre-guard direct fallback diagnostics");
-    const size_t      report_helper_pos = pre_guard_direct.find("auto graph_diag_report_once");
+    // Declaration-shaped: same alignment-padded "auto          graph_diag_report_once
+    // = [&]() {" declaration the report_helper region hits below. The other two
+    // needles here are printf-style diagnostic text, where exact spacing is
+    // part of what's being verified -- left as plain .find().
+    const size_t      report_helper_pos = find_normalized(pre_guard_direct, "auto graph_diag_report_once");
     const size_t      cpu_prefix_pos    = pre_guard_direct.find("GPU prefix too small");
     const size_t      evict_pos         = pre_guard_direct.find("weight pointers may be stale (evictions=%d)");
     CHECK(report_helper_pos != std::string::npos && cpu_prefix_pos != std::string::npos &&
@@ -1122,9 +1167,15 @@ static int test_grouped_decode_device_grouped_packed_q8_contract() {
     CHECK(
         contains(device_branch, "alloc_i32_scratch(grouped_chunk_groups_device, static_cast<size_t>(max_chunks)") &&
             contains(device_branch, "alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks)") &&
-            contains(device_branch,
-                     "const int       launch_chunk_cap  = std::min(max_chunks, static_cast<int>(total_batches));") &&
-            contains(device_branch, "int             device_n_chunks   = launch_chunk_cap;") &&
+            // Declaration-shaped needles below carried hardcoded alignment
+            // padding baked in from whatever column width happened to be
+            // current when written -- fragile the same way llama.cpp-pjgz's
+            // line-132 needle was, just not yet broken. contains_normalized()
+            // survives the next reformat instead of needing another
+            // whack-a-mole fix.
+            contains_normalized(
+                device_branch, "const int launch_chunk_cap = std::min(max_chunks, static_cast<int>(total_batches));") &&
+            contains_normalized(device_branch, "int device_n_chunks = launch_chunk_cap;") &&
             contains(device_branch, "device_n_chunks = mxfp4_copy_active_chunks_to_host") &&
             contains(device_branch, "active_chunks_arg = nullptr;") &&
             contains(device_branch, "static_cast<size_t>(device_n_chunks) * static_cast<size_t>(k_tiles)"),
@@ -1445,7 +1496,15 @@ static int test_grouped_decode_runtime_uses_device_ids_contract() {
               contains(sycl, "ids_device_nb0 > 0 && ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED") &&
               contains(sycl, "pair.glu_dst->ne[2] <= 1"),
           "runtime must retain positive device-id activation diagnostics and guard list for path diagnosis");
-    CHECK(contains(sycl, "const int64_t pair_ids_host_count_arg =") &&
+    // The declaration clause is whitespace-fragile (the real source is
+    // "const int64_t   pair_ids_host_count_arg =", alignment-padded) and
+    // fixed here. The second clause still names use_device_grouped_moe_decode,
+    // which the actual gate now composes into use_device_ids_for_pair_glu --
+    // that is content drift, not whitespace, and stays exact/unfixed pending
+    // the escalated adjudication (llama.cpp-pjgz: needs MoE-dispatch domain
+    // context to confirm the broadened condition still satisfies the
+    // original safety invariant before the needle is updated).
+    CHECK(contains_normalized(sycl, "const int64_t pair_ids_host_count_arg =") &&
               contains(sycl, "use_device_grouped_moe_decode ? 0 : static_cast<int64_t>(ids_n_elem);"),
           "grouped decode must pass zero host id count with nullptr host ids");
     CHECK(contains(sycl, "pair_ids_host_arg") && contains(sycl, "pair_ids_host_count_arg"),
