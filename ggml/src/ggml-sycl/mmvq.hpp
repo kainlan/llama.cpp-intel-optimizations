@@ -486,7 +486,17 @@ sycl::event mmvq_submit_mxfp4_soa_pair_glu_batched(sycl::queue &                
 // Coalesced MXFP4 MMVQ kernel submission
 // vx: coalesced-layout weights (quants tiled word-major, then exponents)
 // vy: SOA Q8_1 activations (quants[ncols] then ds[ncols/QK8_1])
-void mmvq_submit_mxfp4_coalesced(sycl::queue & q, const void * vx, const void * vy, float * dst, int ncols, int nrows);
+// total_nrows/row_low describe the slice, as for mmvq_submit_mxfp4_soa above.
+// The coalesced kernel only supports the unsliced case and aborts otherwise
+// (llama.cpp-4wkt); pass total_nrows == nrows and row_low == 0.
+void mmvq_submit_mxfp4_coalesced(sycl::queue & q,
+                                 const void *  vx,
+                                 const void *  vy,
+                                 float *       dst,
+                                 int           ncols,
+                                 int           nrows,
+                                 int           total_nrows,
+                                 int           row_low);
 
 // Float-to-Q8_1 SOA quantization kernel submission for micro-graph
 // Input:  x[ncols] float activations
