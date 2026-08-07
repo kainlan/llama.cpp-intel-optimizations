@@ -34,6 +34,29 @@
 // contract-faithful oracle the residual is f32 reassociation noise (measured
 // max_rel 3.8e-5) rather than activation quantization.
 //
+// CORRECTED A THIRD TIME (llama.cpp-szv8, 2026-08-07): Part 2 was not running
+// the coalesced kernel at all, so neither oracle applied to it. Two independent
+// reasons, both now fixed:
+//
+//  1. The weight was named "weight". ggml_sycl::infer_tensor_usage() maps that
+//     to tensor_usage::UNKNOWN, and layout_policy::get_optimal() answers SOA for
+//     UNKNOWN -- COALESCED is reachable only for ATTENTION_WEIGHT/FFN_WEIGHT.
+//     The weights are now named "blk.<n>.attn_q.weight", which is the honest,
+//     policy-reachable route to COALESCED rather than a test-only forcing.
+//  2. The weight sat in the device buffer with no model-load transaction, so
+//     ggml_backend_sycl_register_host_weight_tensor() dropped it and S1-PRELOAD
+//     -- the only producer of a dense COALESCED cache entry -- never saw it.
+//     Part 2 now stages through the same bracket as
+//     tests/test-q8-0-layout-cache-path.cpp (llama.cpp-43uy).
+//
+// The symptom was "[LAYOUT-CHECK] readback done (source=tensor-storage-fallback)"
+// followed by "Coalesced layout check: NOT RUN" on every shape, while the numeric
+// comparison happily produced FAIL rows for whatever kernel the SOA layout
+// dispatched. Part 2 now asserts its preconditions -- resolved layout is
+// COALESCED, the layout pointer is distinct from the AoS storage, and the
+// coalesced bytes are exact -- BEFORE comparing numbers, so a run that misses
+// its target says so instead of reporting a verdict about a kernel it never ran.
+//
 // The coalesced layout reorganizes SoA data into tile-based format for
 // better cache line utilization during DMMV operations.
 //
@@ -315,29 +338,21 @@ static size_t count_byte_mismatches(const uint8_t * a, const uint8_t * b, size_t
     return errors;
 }
 
-// `from_layout_ptr` says whether the bytes came from the tensor's COALESCED
-// layout pointer. When they did not, the readback fell back to a plain d2h of
-// the tensor's own storage, which holds whatever layout the backend staged --
-// so a mismatch says nothing about any coalesced buffer and must not be
-// reported as a coalesced-layout failure. That distinction is the whole value
-// of this check; without it a red verdict here reads as device corruption.
-static void compare_device_coalesced_layout(const uint8_t * aos,
+// Byte-exact verdict on the device's COALESCED buffer, against the addressing
+// contract in dmmv-coalesced-q4-0-layout.hpp. `device_coalesced` must be the
+// readback of the tensor's resolved COALESCED layout pointer -- the caller
+// establishes that before calling, because a readback of the tensor's own
+// storage holds whatever layout the backend staged and a mismatch there says
+// nothing about any coalesced buffer.
+static bool compare_device_coalesced_layout(const uint8_t * aos,
                                             const uint8_t * device_coalesced,
                                             int             ncols,
-                                            int             nrows,
-                                            bool            from_layout_ptr) {
+                                            int             nrows) {
     const int blocks_per_row = ncols / QK4_0;
     const int total_blocks = nrows * blocks_per_row;
     const size_t row_quants_bytes = ncols / 2;
     const size_t total_quants_bytes = (size_t)nrows * row_quants_bytes;
     const size_t expected_bytes = total_quants_bytes + (size_t)total_blocks * sizeof(ggml_fp16_t);
-
-    if (!from_layout_ptr) {
-        printf(
-            "  Coalesced layout check: NOT RUN (no COALESCED layout pointer for this tensor;"
-            " the readback fell back to the tensor's own storage, layout unknown)\n");
-        return;
-    }
 
     std::vector<uint8_t> expected(expected_bytes);
     reorder_q4_0_aos_bytes_to_coalesced(aos, expected.data(), ncols, nrows);
@@ -347,7 +362,7 @@ static void compare_device_coalesced_layout(const uint8_t * aos,
 
     if (errors == 0) {
         printf("  Coalesced layout check: PASSED (bytes=%zu)\n", expected_bytes);
-        return;
+        return true;
     }
 
     // Name the layout the device bytes DO match, when they match a known one.
@@ -367,27 +382,21 @@ static void compare_device_coalesced_layout(const uint8_t * aos,
             " (block-major mismatches=%zu)\n",
             soa_errors);
     }
+    return false;
 }
 
 // =============================================================================
 // GGML Backend Helpers (DMMV path)
 // =============================================================================
 
-static bool run_mul_mat_backend(ggml_backend_t         backend,
-                                ggml_type              weight_type,
-                                const void *           weight_data,
-                                size_t                 weight_size,
-                                const float *          input_data,
-                                int                    n_embd,
-                                int                    n_rows,
-                                std::vector<float> &   output,
-                                std::vector<uint8_t> * weight_out                 = nullptr,
-                                int                    device_id                  = -1,
-                                ggml_layout_mode       layout_target              = GGML_LAYOUT_AOS,
-                                bool *                 weight_out_from_layout_ptr = nullptr) {
-    if (weight_out_from_layout_ptr) {
-        *weight_out_from_layout_ptr = false;
-    }
+static bool run_mul_mat_backend(ggml_backend_t       backend,
+                                ggml_type            weight_type,
+                                const void *         weight_data,
+                                size_t               weight_size,
+                                const float *        input_data,
+                                int                  n_embd,
+                                int                  n_rows,
+                                std::vector<float> & output) {
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
 
     struct ggml_init_params params = {
@@ -443,28 +452,6 @@ static bool run_mul_mat_backend(ggml_backend_t         backend,
     if (success) {
         output.resize(n_rows);
         ggml_backend_tensor_get(out, output.data(), 0, output.size() * sizeof(float));
-        if (weight_out) {
-            fprintf(stderr, "[LAYOUT-CHECK] readback start: weight_size=%zu ptr=%p\n",
-                    weight_size, weight->data);
-            weight_out->resize(weight_size);
-            bool copied = false;
-            if (ggml_backend_buffer_is_sycl(weight->buffer) && device_id >= 0) {
-                void * layout_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, layout_target);
-                if (layout_ptr) {
-                    sycl::queue & q = dpct::dev_mgr::instance().get_device(device_id).default_queue();
-                    q.memcpy(weight_out->data(), layout_ptr, weight_size).wait();
-                    copied = true;
-                }
-            }
-            if (!copied) {
-                ggml_backend_sycl_memcpy_d2h(weight, weight_out->data(), weight_size);
-            }
-            if (weight_out_from_layout_ptr) {
-                *weight_out_from_layout_ptr = copied;
-            }
-            fprintf(stderr, "[LAYOUT-CHECK] readback done (source=%s)\n",
-                    copied ? "layout_ptr" : "tensor-storage-fallback");
-        }
     }
 
     ggml_backend_buffer_free(compute_buffer);
@@ -474,8 +461,210 @@ static bool run_mul_mat_backend(ggml_backend_t         backend,
     return success;
 }
 
-static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t cpu_backend,
-                                    int ncols, int nrows, bool verbose) {
+// =============================================================================
+// Staged GPU run (the real coalesced DMMV path)
+// =============================================================================
+
+// A staged run has several early exits -- the transaction, the resolve, the
+// layout size -- and every one of them must free the ggml context and its three
+// buffers. A destructor is the only form of that which stays correct when a new
+// early exit is added later.
+struct staged_case_resources {
+    ggml_context *        ctx        = nullptr;
+    ggml_backend_buffer_t weight_buf = nullptr;
+    ggml_backend_buffer_t input_buf  = nullptr;
+    ggml_backend_buffer_t output_buf = nullptr;
+
+    ~staged_case_resources() {
+        if (output_buf) {
+            ggml_backend_buffer_free(output_buf);
+        }
+        if (input_buf) {
+            ggml_backend_buffer_free(input_buf);
+        }
+        if (weight_buf) {
+            ggml_backend_buffer_free(weight_buf);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+};
+
+// The model token must be released on every exit path, the failing ones
+// included: an unreleased token leaves the staged weight entry owned by a model
+// nothing will ever unload, and the next case's staging then sees a live
+// foreign owner instead of a clean cache.
+struct staged_model_token {
+    ggml_sycl_model_token token{};
+    bool                  held = false;
+
+    ~staged_model_token() {
+        if (held) {
+            (void) ggml_backend_sycl_model_unloaded_token(token);
+        }
+    }
+};
+
+// Everything the preconditions need, not just the numbers: which layout the
+// dispatch resolved, whether that pointer is distinct from the AoS storage, and
+// the bytes behind that exact pointer.
+struct staged_gpu_result {
+    bool                 ok      = false;
+    const char *         failure = nullptr;
+    std::vector<float>   output;
+    std::vector<uint8_t> layout_bytes;
+    ggml_layout_mode     resolved_layout     = GGML_LAYOUT_AOS;
+    bool                 layout_ptr_distinct = false;
+};
+
+static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
+                                                 ggml_tensor *              tensor,
+                                                 ggml_backend_buffer_usage  usage) {
+    const size_t          size   = ggml_backend_buft_get_alloc_size(buft, tensor);
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!buffer) {
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buffer, usage);
+    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+    return buffer;
+}
+
+// Drives the weight through the same lifecycle a model load uses, which is the
+// only way a dense COALESCED cache entry gets produced:
+// clear registry -> model_load_begin -> register_host_weight_tensor ->
+// tensor_set -> model_load_end -> resolve. Registration is honoured only inside
+// a transaction and only for a host-resident weight buffer; outside either it
+// silently registers nothing and S1-PRELOAD never sees the tensor. Pattern and
+// full RCA: tests/test-q8-0-layout-cache-path.cpp (llama.cpp-43uy).
+static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
+                                                       int            device_id,
+                                                       const char *   weight_name,
+                                                       const void *   weight_data,
+                                                       size_t         weight_size,
+                                                       const float *  input_data,
+                                                       int            ncols,
+                                                       int            nrows) {
+    staged_gpu_result result{};
+
+    ggml_sycl::test_clear_host_weight_registry();
+
+    // Declared before `res` so it is destroyed after it: buffers go first, then
+    // the token, matching the release order test-q8-0-layout-cache-path.cpp uses.
+    staged_model_token    model;
+    staged_case_resources res;
+
+    struct ggml_init_params params = {
+        .mem_size   = 32 * 1024 * 1024,
+        .mem_buffer = NULL,
+        .no_alloc   = true,
+    };
+    res.ctx = ggml_init(params);
+    if (!res.ctx) {
+        result.failure = "ggml_init failed";
+        return result;
+    }
+
+    struct ggml_tensor * weight = ggml_new_tensor_2d(res.ctx, GGML_TYPE_Q4_0, ncols, nrows);
+    ggml_set_name(weight, weight_name);
+
+    struct ggml_tensor * input = ggml_new_tensor_2d(res.ctx, GGML_TYPE_F32, ncols, 1);
+    ggml_set_name(input, "input");
+
+    struct ggml_tensor * out = ggml_mul_mat(res.ctx, weight, input);
+    ggml_set_name(out, "output");
+
+    // The weight buffer must be host-resident: ggml_sycl_can_use_layout_for_kernel()
+    // admits a non-AoS layout for a weight that has no materialized layout yet
+    // only when the buffer is host and weights are evictable, and that is the
+    // gate S1-PRELOAD consults before honouring the layout policy's COALESCED.
+    ggml_backend_buffer_type_t weight_buft = ggml_backend_sycl_host_buffer_type();
+    ggml_backend_buffer_type_t dev_buft    = ggml_backend_get_default_buffer_type(backend);
+
+    res.weight_buf = alloc_tensor_buffer(weight_buft, weight, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    res.input_buf  = alloc_tensor_buffer(dev_buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    res.output_buf = alloc_tensor_buffer(dev_buft, out, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    if (!res.weight_buf || !res.input_buf || !res.output_buf) {
+        result.failure = "buffer allocation failed";
+        return result;
+    }
+
+    ggml_sycl_load_txn load{};
+    if (ggml_backend_sycl_model_load_begin(&load) != GGML_SYCL_LIFECYCLE_OK) {
+        result.failure = "model_load_begin failed";
+        return result;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev) {
+        ggml_backend_sycl_register_host_weight_tensor(dev, weight);
+    }
+
+    ggml_backend_tensor_set(weight, weight_data, 0, weight_size);
+
+    if (ggml_backend_sycl_model_load_end(load, true, &model.token) != GGML_SYCL_LIFECYCLE_OK) {
+        result.failure = "model_load_end failed";
+        return result;
+    }
+    model.held = true;
+
+    ggml_backend_tensor_set(input, input_data, 0, (size_t) ncols * sizeof(float));
+
+    // This is the same call the mul_mat dispatcher makes to pick a kernel, so
+    // its layout is the layout the kernel will run against -- not an adjacent
+    // signal about what the cache happens to hold.
+    auto resolved          = ggml_sycl_resolve(weight, device_id);
+    result.resolved_layout = resolved ? resolved.layout : GGML_LAYOUT_AOS;
+    if (!resolved) {
+        result.failure = "weight did not resolve";
+        return result;
+    }
+    if (resolved.layout != GGML_LAYOUT_COALESCED) {
+        result.failure = "resolved layout is not COALESCED";
+        return result;
+    }
+    result.layout_ptr_distinct = (resolved.ptr != weight->data);
+    if (!result.layout_ptr_distinct) {
+        result.failure = "COALESCED layout pointer equals the AoS storage pointer";
+        return result;
+    }
+
+    const size_t layout_size = ggml_sycl::test_layout_bytes(weight, GGML_LAYOUT_COALESCED, device_id);
+    const size_t contract_size =
+        (size_t) nrows * (size_t) (ncols / 2) + (size_t) nrows * (size_t) (ncols / QK4_0) * sizeof(ggml_fp16_t);
+    if (layout_size != contract_size) {
+        printf("  FAIL: COALESCED layout bytes=%zu, addressing contract wants %zu\n", layout_size, contract_size);
+        result.failure = "COALESCED layout size disagrees with the addressing contract";
+        return result;
+    }
+
+    fprintf(stderr, "[LAYOUT-CHECK] readback start: source=layout_ptr ptr=%p on_device=%d bytes=%zu (aos ptr=%p)\n",
+            resolved.ptr, resolved.on_device ? 1 : 0, layout_size, weight->data);
+    result.layout_bytes.resize(layout_size);
+    sycl::queue & q = dpct::dev_mgr::instance().get_device(device_id).default_queue();
+    q.memcpy(result.layout_bytes.data(), resolved.ptr, layout_size).wait();
+    fprintf(stderr, "[LAYOUT-CHECK] readback done (source=layout_ptr)\n");
+
+    struct ggml_cgraph * graph = ggml_new_graph(res.ctx);
+    ggml_build_forward_expand(graph, out);
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        result.failure = "GPU graph compute failed";
+        return result;
+    }
+
+    result.output.resize(nrows);
+    ggml_backend_tensor_get(out, result.output.data(), 0, result.output.size() * sizeof(float));
+    result.ok = true;
+    return result;
+}
+
+static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
+                                    ggml_backend_t cpu_backend,
+                                    int            ncols,
+                                    int            nrows,
+                                    int            case_index,
+                                    bool           verbose) {
     const auto * qfns = ggml_get_type_traits(GGML_TYPE_Q4_0);
     const auto * qfns_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q4_0);
     if (!qfns || !qfns_cpu || !qfns_cpu->from_float || qfns->blck_size == 0) {
@@ -501,19 +690,37 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
     std::vector<float> input_data(ncols);
     for (float & v : input_data) v = dist(rng);
 
-    std::vector<float> gpu_out;
     std::vector<float> cpu_out;
     std::vector<float> cpu_ref;
     const bool debug_coalesced = std::getenv("GGML_SYCL_COALESCED_DMMV_DEBUG") != nullptr;
-    const bool layout_check = std::getenv("GGML_SYCL_COALESCED_LAYOUT_CHECK") != nullptr;
-    std::vector<uint8_t> weight_coalesced;
-    bool                 weight_from_layout_ptr = false;
-    if (!run_mul_mat_backend(gpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes, input_data.data(), ncols,
-                             nrows, gpu_out, (debug_coalesced || layout_check) ? &weight_coalesced : nullptr,
-                             /*device_id=*/0, GGML_LAYOUT_COALESCED, &weight_from_layout_ptr)) {
-        printf("  FAIL: GPU backend compute failed\n");
+
+    // An ATTENTION_WEIGHT name is what makes layout_policy::get_optimal() answer
+    // COALESCED for Q4_0; the "weight" this test used maps to
+    // tensor_usage::UNKNOWN, whose answer is SOA. Distinct names per case keep
+    // the three shapes from colliding on one cache key.
+    char weight_name[64];
+    snprintf(weight_name, sizeof(weight_name), "blk.%d.attn_q.weight", case_index);
+
+    staged_gpu_result staged = run_dmmv_coalesced_gpu_staged(
+        gpu_backend, /*device_id=*/0, weight_name, weight_quant.data(), weight_bytes, input_data.data(), ncols, nrows);
+    if (!staged.ok) {
+        // Each precondition reports itself, so a run that never reached the
+        // coalesced kernel cannot be read as a verdict about that kernel.
+        printf("  FAIL: coalesced DMMV path not exercised -- %s (resolved layout=%s)\n",
+               staged.failure ? staged.failure : "unknown step", ggml_sycl::test_layout_name(staged.resolved_layout));
         return false;
     }
+    printf("  Precondition: resolved layout=%s, layout pointer distinct from AoS storage\n",
+           ggml_sycl::test_layout_name(staged.resolved_layout));
+
+    if (!compare_device_coalesced_layout(weight_quant.data(), staged.layout_bytes.data(), ncols, nrows)) {
+        printf("  FAIL: the COALESCED buffer the kernel reads does not match the addressing contract\n");
+        return false;
+    }
+
+    const std::vector<float> &   gpu_out          = staged.output;
+    const std::vector<uint8_t> & weight_coalesced = staged.layout_bytes;
+
     if (!run_mul_mat_backend(cpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes,
                              input_data.data(), ncols, nrows, cpu_out)) {
         printf("  FAIL: CPU backend compute failed\n");
@@ -569,10 +776,6 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
             }
         }
         printf("  Debug (coalesced CPU vs GPU): errors=%d max_diff=%.6f\n", errors, max_diff);
-    }
-    if (layout_check && !weight_coalesced.empty()) {
-        compare_device_coalesced_layout(weight_quant.data(), weight_coalesced.data(), ncols, nrows,
-                                        weight_from_layout_ptr);
     }
 
     std::vector<float> ref(nrows);
@@ -913,8 +1116,20 @@ int main() {
     // GPU tests (coalesced DMMV via ggml backend)
     printf("\n=== Part 2: GPU DMMV Tests (Coalesced) ===\n");
 
+    // The override does not produce the COALESCED buffer -- the layout policy
+    // does, via the ATTENTION_WEIGHT name. What it does is pin kernel selection:
+    // with an override active the orchestrator rejects any preferred kernel
+    // whose layout differs, then calls pick_kernel_for_layout(COALESCED), which
+    // at batch=1 is DMMV_COALESCED. Without it the priority list offers DMMV_SOA
+    // first and a host weight buffer makes that eligible.
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
+    // Required by ggml_backend_sycl_register_host_weight_tensor(), which returns
+    // early without it -- the tensor would then never reach S1-PRELOAD.
+    setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);
+
+    ggml_backend_sycl_set_unified_cache_budget_pct(90);
+    ggml_backend_sycl_set_unified_cache_host_budget_pct(90);
 
     ggml_backend_t gpu_backend = ggml_backend_sycl_init(0);
     if (!gpu_backend) {
@@ -929,9 +1144,9 @@ int main() {
     }
 
     bool gpu_ok = true;
-    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 1024, 64, true);
-    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 2048, 128, true);
-    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 4096, 256, true);
+    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 1024, 64, 0, true);
+    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 2048, 128, 1, true);
+    gpu_ok &= run_dmmv_coalesced_case(gpu_backend, cpu_backend, 4096, 256, 2, true);
 
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
