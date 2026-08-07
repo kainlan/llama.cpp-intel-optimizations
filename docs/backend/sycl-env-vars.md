@@ -271,6 +271,83 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_MOE_LAYOUT_DEBUG=1` | Emit the `[MOE-LAYOUT]` per-pass summary unconditionally. The down-i8 / gateup-i8 lines already fire on ANY decline without this; the variable adds the lines a fully-successful pass would otherwise not print. |
 | `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=<N>` | Hard cap on how many down tensors the MoE I8 layout pass upgrades. Unset (or negative) = no cap, the shipping behaviour; `0` disables the upgrade. **Diagnostic only — do not set in production.** See the measured cost below. |
 | `GGML_SYCL_ARENA_PP_PROFILE=1` | Emit `[ARENA-PP-*]` counters, including `[ARENA-PP-ONEDNN] … reserve_req_mb=W/A` — the summed oneDNN weights/activations reservation requests. This is the **only** log that reports what was actually asked for, as opposed to what was planned. |
+| `GGML_SYCL_ZONE_RESET_AUDIT=1\|2` | Default OFF. Phase 0 of the retire-zone-reset epic (llama.cpp-iiff): every reset/drain site reports what is still live in its zone as `[ZONE-RESET-AUDIT]` lines, with the allocation's own `alloc_id`/`cohort`/`role`/`category` attribution. `=1` changes no behaviour and is safe across the whole gate set. `=2` additionally suppresses the reset even when the zone is clean — host SCRATCH/STAGING are reset-only by design, so that leaks without bound. See below. |
+
+### `GGML_SYCL_ZONE_RESET_AUDIT` — reading a capture
+
+Four sites report: `device-zone-reset/<zone>:devN`, `host-zone-reset/<zone>`,
+`scratch-pool-reset/bump:devN`, and `weight-reclaim/<mode>:devN` (the mode being
+`load-boundary`, `mid-load-replan` or `model-teardown`).
+
+Read `visits_with_live` against `visits` first. They exist because an **empty
+capture is not evidence of zero escapes** — it is equally consistent with the
+site never having been reached. `visits=0` for a site means it does not appear at
+all; a run that reached no site at all says so outright
+(`NO RESET SITE WAS VISITED … this run proves NOTHING`).
+
+A full inventory is re-emitted every 256 site visits, at process exit, from the
+SYCL watchdog before its `_Exit(1)`, and from a `SIGSEGV`/`SIGABRT` handler — the
+runs with the confirmed escapes are the runs that crash. The signal handler
+chains to whatever handler it displaced (the planner canaries install their own),
+falling back to `SIG_DFL` only when there was none.
+
+#### Every line is printed twice — do not `grep -c`
+
+Output goes to WARN **plus** a raw `stderr` copy. The raw copy exists because
+`GGML_LOG_INFO` is dropped at default verbosity in every tool, so an INFO-level
+audit line would produce an empty capture indistinguishable from a clean one —
+but WARN is *not* dropped, so in the normal case **both copies survive and every
+count is doubled**.
+
+| regime | factor | how to dedup |
+|---|---|---|
+| any tool calling `common_init()` — `llama-cli`, `llama-completion`, `test-thread-safety`, `test-llama-archs` (**all four captures in the protocol**) | x2 | `common_init()` enables the log prefix, so the copies differ: the WARN copy is preceded by a timestamp and a `W ` marker, the raw copy starts at column 0. **`grep '^\[ZONE-RESET-AUDIT\]'` selects exactly the raw copy.** |
+| `llama-bench` without `-v` (null log callback) | x1 | nothing to do — only the raw copy exists |
+| a binary left on ggml's default log sink (itself a bare `fputs`) | x2 | byte-identical copies, **no discriminator — expect x2 and halve** |
+
+Two practical consequences:
+
+- Confirm the factor empirically before counting anything:
+  `grep -c 'ZONE-RESET-AUDIT] ==== end inventory'` against the number of reports
+  you expect.
+- For a true escape count use `grep 'NEW-ESCAPE' <capture> | sort -u | wc -l` —
+  those lines are unique per `(site, cohort, size)`, so `sort -u` collapses the
+  duplication without discarding real repeats.
+
+The two writes are separate calls and `common_log` is asynchronous, so their
+order is not guaranteed and they can interleave with other output. This is the
+same hazard that corrupts `test-llama-archs`' results table; prefer the prose
+lines over anything column-aligned.
+
+#### `role` / `category` / `tier` mean different things at the weight-reclaim site
+
+At the three zone sites those columns are read straight off the allocation's
+`alloc_handle` and mean what they say. A weight **cache entry** has no such
+handle, so `weight-reclaim/*` rows substitute unrelated fields into the same
+column names:
+
+| column | zone sites | `weight-reclaim/*` rows |
+|---|---|---|
+| `alloc_id` | allocation id | weight `name_hash` |
+| `role` | `alloc_role` | `cache_layout` |
+| `category` | `runtime_category` | **lease count** |
+| `tier` | `alloc_tier` | `cache_location` |
+
+This is kept for parity with c-jec1's published inventory, which was read this
+way — its "`role=4` = the MoE expert weights" decoding is a `cache_layout`, not
+an `alloc_role` — and matching that format is what lets the new capture diff
+against the old one. Decoding the columns to names is tracked as
+`llama.cpp-u7vi`.
+
+**Read the site name before reading these columns, and never compare them across
+sites.**
+
+The attribution is read from the allocation, never re-derived. It became
+trustworthy only with llama.cpp-f9tg (`85eb63dcb` / `810ae7fef`); captures taken
+before that fix mislabel COMPUTE/CONTROL allocations as GRAPH.
+
+The audit frees nothing and resets nothing at `=1`. Everything it reports stays
+owned by whoever already holds its handle.
 
 ### `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS` — what it costs to cap
 

@@ -4090,6 +4090,76 @@ void unified_cache_dump_live_zone_allocations(int          device,
                                               const char * where,
                                               size_t       max_entries = 32);
 
+// ---------------------------------------------------------------------------
+// Zone-reset escape audit (GGML_SYCL_ZONE_RESET_AUDIT)
+// ---------------------------------------------------------------------------
+// Phase 0 of the "retire zone reset" epic (llama.cpp-iiff): enumerate every
+// allocation that is still live at a reset site, with the alloc_id / cohort /
+// role / category attribution the allocation already carries, so each escape can
+// be FIXED before the reset that currently hides it is deleted. Deleting a reset
+// before its escapes are fixed converts a loud abort into silent unbounded
+// growth, which is strictly worse.
+//
+// The attribution is READ, never re-derived. It became trustworthy with
+// llama.cpp-f9tg (85eb63dcb / 810ae7fef), which replaced the process-global
+// recording predicate that had been shaping per-thread allocations with the two
+// per-thread intent builders in common.hpp. A capture taken before that fix
+// mislabels COMPUTE/CONTROL allocations as GRAPH.
+//
+// Default OFF. With the variable unset every entry point below is one function
+// static load on a cold branch and behaviour is byte-identical.
+//
+//   GGML_SYCL_ZONE_RESET_AUDIT=1  Report at every reset site, uncapped and
+//                                 aggregated; reset behaviour UNCHANGED.
+//                                 Note the VRAM and host reset sites already
+//                                 REFUSE to reset whenever anything is live, so
+//                                 for exactly the cases this audit exists to
+//                                 find, the reset does not happen at =1 either.
+//                                 What =1 adds is a complete inventory: today's
+//                                 refusal dump is capped at 4 refusals x 8 lines
+//                                 per zone. Safe across the whole gate set.
+//   GGML_SYCL_ZONE_RESET_AUDIT=2  Additionally SUPPRESS the reset even when the
+//                                 zone is clean -- the literal "report-only"
+//                                 mode. Host SCRATCH/STAGING allocations are
+//                                 reset-only by design (never individually
+//                                 freed), so memory grows without bound here.
+//                                 Bounded diagnostic runs only.
+bool zone_reset_audit_enabled();
+bool zone_reset_audit_suppresses_reset();
+
+// Bumped once per graph boundary by the backend so per-graph counters can be
+// attributed. No-op when the audit is off.
+void zone_reset_audit_begin_graph(int device);
+
+// Emit the accumulated inventory: per site, the cohort x size cross-tab, the
+// size histogram and distinct-size count, per-graph allocation counts, the
+// zone_largest_free trend, and time spent in zone alloc/free. Emitted
+// periodically during a run (so a run that dies still leaves data) and once at
+// process exit.
+//
+// ⚠ EVERY AUDIT LINE IS WRITTEN TWICE in the normal case, and a naive
+// `grep -c` therefore DOUBLE-COUNTS. Each line goes out at WARN level *and* as
+// a raw stderr copy. The raw copy exists because GGML_LOG_INFO is dropped at
+// default verbosity in every tool, so an INFO-level line yields an empty capture
+// indistinguishable from "no escapes found" -- but WARN is not dropped, so both
+// copies normally survive. Three regimes:
+//
+//   x2  every tool that calls common_init() -- llama-cli, llama-completion, and
+//       the test binaries including test-thread-safety and test-llama-archs.
+//       common_init() enables the log prefix, so the two copies ARE
+//       distinguishable: the WARN copy is preceded by a timestamp and a `W `
+//       marker, the raw copy starts at column 0. `grep '^\[ZONE-RESET-AUDIT\]'`
+//       selects exactly the raw copy.
+//   x1  llama-bench without -v, which installs a null log callback: the WARN
+//       copy is discarded and only the raw copy survives.
+//   x2  any binary left on ggml's default log sink, which is itself a bare
+//       fputs to stderr. The two copies are then byte-identical and there is NO
+//       discriminator -- expect exactly x2 and halve.
+//
+// The two writes are separate calls and common_log is asynchronous, so their
+// relative order is not guaranteed and they can interleave with other output.
+void zone_reset_audit_report(const char * where);
+
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.
 // Returns nullptr if arena is inactive or KV zone is exhausted.
 // The returned pointer is VRAM (device-local) and must NOT be freed individually —

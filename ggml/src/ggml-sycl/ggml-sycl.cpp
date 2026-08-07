@@ -83257,6 +83257,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // no stale events leak across graph boundaries.
     split_merge_drain();
 
+    // Phase 0 escape audit (GGML_SYCL_ZONE_RESET_AUDIT): bump the graph sequence
+    // so the per-zone-per-graph counters can be attributed. No-op when off.
+    ggml_sycl::zone_reset_audit_begin_graph(sycl_ctx->device);
+
     // Invalidate per-graph caches synchronously on this dispatch worker before
     // the first graph-local lookup or compute dispatch.
     ggml_sycl_data_ptr_cache_new_graph();
