@@ -12377,23 +12377,59 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             zone_cap = zone_capacity(vram_zone_id::ONEDNN);
         }
         if (total_needed <= zone_cap) {
-            // Reset the oneDNN zone to reclaim any previous allocation.
+            // Reclaim the OLD arena-owned reservation individually -- the real
+            // per-pointer release that replaces the bulk zone_reset() this branch
+            // used to depend on as its ONLY reclaim path (iiff Option C step 3,
+            // llama.cpp-67c2). Nothing else ever allocates from
+            // vram_zone_id::ONEDNN (grep-verified: the four zone_alloc(ONEDNN,
+            // ...) call sites in reserve_onednn_scratch are the sole users of
+            // this zone in the whole backend), so freeing exactly the two
+            // pointers this reservation previously handed out is a complete
+            // reclaim, not a partial one. Unlike C1's ring (many interchangeable
+            // regions, address-range lookup) or C2's TLSF population (many
+            // registered records), there is nothing here to rotate through or
+            // look up: it is a live count of at most 1 per named pointer, so the
+            // "epoch" is simply "does this pointer still point at something this
+            // reservation owns".
+            //
+            // A pointer that is NOT currently arena-owned (it grew outside the
+            // zone on an earlier call, via allocate_direct_scratch) is left
+            // untouched here -- it is already a real mem_handle lease, and the
+            // existing release_direct_scratch() cleanup a few lines down (moved,
+            // not changed) is what frees it.
+            if (onednn_weights_scratch_ && vram_owns(onednn_weights_scratch_)) {
+                zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);
+                onednn_weights_scratch_      = nullptr;
+                onednn_weights_scratch_size_ = 0;
+            }
+            if (onednn_activations_scratch_ && vram_owns(onednn_activations_scratch_)) {
+                zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_);
+                onednn_activations_scratch_      = nullptr;
+                onednn_activations_scratch_size_ = 0;
+            }
+
+            // The call site stays, but its reclaiming role has ended (mirroring
+            // C2's treatment of host_zone_reset(SCRATCH|STAGING)): by this point
+            // the two pointers above are already individually freed, so this can
+            // only ever observe an empty zone. It is kept as the audit/liveness
+            // checkpoint the Phase-0 "device-zone-reset/ONEDNN" cohort reads,
+            // rather than letting the site silently stop being visited.
             zone_reset(vram_zone_id::ONEDNN);
 
             void * w = zone_alloc(vram_zone_id::ONEDNN, weights_size);
             void * a = w ? zone_alloc(vram_zone_id::ONEDNN, activations_size) : nullptr;
             if (w && a) {
-                const size_t old_direct_total =
-                    (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_) ? onednn_weights_scratch_size_ :
-                                                                                      0) +
-                    (onednn_activations_scratch_ && !vram_owns(onednn_activations_scratch_) ?
-                         onednn_activations_scratch_size_ :
-                         0);
-                if (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_)) {
+                // Anything still non-null here can only be a DIRECT (non-arena)
+                // leftover from an earlier growth episode -- the arena-owned half
+                // was already individually reclaimed above, so no vram_owns()
+                // check is needed to tell the two apart anymore.
+                const size_t old_direct_total = (onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0) +
+                                                (onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0);
+                if (onednn_weights_scratch_) {
                     release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_,
                                            onednn_weights_scratch_size_, "weights");
                 }
-                if (onednn_activations_scratch_ && !vram_owns(onednn_activations_scratch_)) {
+                if (onednn_activations_scratch_) {
                     release_direct_scratch(onednn_activations_scratch_owner_, onednn_activations_scratch_,
                                            onednn_activations_scratch_size_, "activations");
                 }
@@ -12412,8 +12448,14 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                               weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
                 return finish(true);
             }
-            // Reset zone on partial failure.
-            zone_reset(vram_zone_id::ONEDNN);
+            // Partial failure: free exactly what THIS attempt allocated. Any
+            // arena-owned predecessor was already reclaimed above (and its
+            // fields nulled), so there is nothing else live in the zone to
+            // touch; any DIRECT predecessor is left exactly as it was, since
+            // this attempt never got far enough to replace it.
+            if (w) {
+                zone_free(vram_zone_id::ONEDNN, w);
+            }
         }
         // Two distinct causes reach this point and they must not be conflated:
         //
@@ -12422,10 +12464,10 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         //     the in-place re-plan was attempted and refused (ensure_planned_arena_zones()
         //     logs the live allocations that blocked the rebuild).
         //   * total_needed <= zone_cap — the zone was large enough but zone_alloc could
-        //     not hand out both buffers, so the partial allocation was reset above. That
-        //     is fragmentation or allocator rounding, NOT a sizing miss, and no re-plan
-        //     was attempted for it. Counting it as an under-estimate would blame the
-        //     predicate for an allocator condition.
+        //     not hand out both buffers, so the partial allocation was individually freed
+        //     above. That is fragmentation or allocator rounding, NOT a sizing miss, and
+        //     no re-plan was attempted for it. Counting it as an under-estimate would
+        //     blame the predicate for an allocator condition.
         //
         // Either way, grow through the unified-cache allocation path below rather than
         // failing the reservation.
