@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -96,6 +97,39 @@ pp_moe_onednn_scratch_admission pp_moe_onednn_admit_scratch(const pp_moe_onednn_
                                                             const pp_moe_onednn_scratch_shape & required);
 
 const char * pp_moe_onednn_scratch_admission_reason_name(pp_moe_onednn_scratch_admission_reason reason);
+
+// One-shot gate for the unconditional refusal warning.
+//
+// A refusal silently downgrades routing from the batched oneDNN fast path to a
+// slower one, so it has to be visible at DEFAULT verbosity -- GGML_LOG_INFO is
+// dropped below the default threshold, which is why the warning is WARN. But a
+// misconfigured plan refuses on every dispatch of every layer of every token,
+// so an unlatched WARN would bury the run in its own diagnostic. Each call site
+// owns a function-local static latch: the first refusal is reported in full and
+// the rest are silent, while the debug-gated per-dispatch traces still carry the
+// detailed view.
+class pp_moe_onednn_scratch_refusal_latch {
+  public:
+    pp_moe_onednn_scratch_refusal_latch()                                                        = default;
+    pp_moe_onednn_scratch_refusal_latch(const pp_moe_onednn_scratch_refusal_latch &)             = delete;
+    pp_moe_onednn_scratch_refusal_latch & operator=(const pp_moe_onednn_scratch_refusal_latch &) = delete;
+
+    // True for the first caller only. Relaxed is sufficient: this orders
+    // nothing but itself, and the exchange is already atomic.
+    bool claim() { return !reported_.exchange(true, std::memory_order_relaxed); }
+
+  private:
+    std::atomic<bool> reported_{ false };
+};
+
+// Whether THIS refusal should be reported at WARN. The short circuit is the
+// load-bearing part: an ADMITTED request must not touch the latch, or the first
+// successful dispatch burns it and the first real refusal -- the one anybody
+// needs to see -- goes unreported.
+inline bool pp_moe_onednn_should_report_refusal(const pp_moe_onednn_scratch_admission & admission,
+                                                pp_moe_onednn_scratch_refusal_latch &   latch) {
+    return !admission.allowed && latch.claim();
+}
 
 // BEHAVIORAL CONTROL SEAM -- TEST-ONLY BY DESIGN. DO NOT DELETE AS DEAD CODE.
 //

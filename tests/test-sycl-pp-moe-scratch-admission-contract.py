@@ -10,8 +10,10 @@ gate covers: that both live PP MoE executor call sites admit before they reserve
 and pass the planned sizes verbatim rather than max(planned, required), that the
 batched executor has no general temporary fallback left to make an inadmissible
 batch fit, that unified_cache::reserve_pp_moe_onednn_scratch refuses before its
-mutex and before its allocator, and that the generation/rollback protocol the
-32dg lifecycle work established survives at both sites.
+mutex and before its allocator, that each refusal is reported at WARN
+unconditionally and once per process rather than only under a debug flag, and
+that the generation/rollback protocol the 32dg lifecycle work established
+survives at both sites.
 
 Every check below fails against the pre-ijla tree. Run it that way to confirm:
 
@@ -114,6 +116,32 @@ def ordered(text, *needles):
     return True
 
 
+def latched_warn(region, latch_name):
+    """True when the region reports its refusal at WARN, once, unconditionally.
+
+    "Unconditional" is the whole point and it is the part a plain substring
+    check cannot see: a WARN nested inside the debug-gated trace guard is
+    invisible in a normal run, which is the state this check exists to end. So
+    the check reads the WHOLE enclosing condition -- from the `if (` that opens
+    the statement through to the warning -- and requires no `_trace` guard
+    anywhere in it. Reading only forward from the report call would miss the
+    obvious reintroduction, `if (trace && should_report(...))`, where the guard
+    sits BEFORE the call it disables.
+
+    The latch must also be a function-local `static`, or it is reconstructed on
+    every dispatch and "once per process" silently becomes "every time".
+    """
+    latch_at = region.find("static ggml_sycl::pp_moe_onednn_scratch_refusal_latch " + latch_name)
+    report_at = region.find("pp_moe_onednn_should_report_refusal(admission, " + latch_name + ")")
+    warn_at = region.find("GGML_LOG_WARN(", report_at) if report_at >= 0 else -1
+    if latch_at < 0 or report_at < latch_at or warn_at < 0:
+        return False
+    condition_at = region.rfind("if (", 0, report_at)
+    if condition_at < 0:
+        return False
+    return "_trace" not in region[condition_at:warn_at]
+
+
 def evaluate(sycl, cache, module, header, doc=""):
     sycl, cache = squeeze(sycl), squeeze(cache)
     module, header = squeeze(module), squeeze(header)
@@ -166,6 +194,18 @@ def evaluate(sycl, cache, module, header, doc=""):
                     "pp_moe_onednn_scratch_admission_reason_name(admission.reason)"),
         "the non-batched staging skips the cache entirely when refused":
             "admission.allowed ? ggml_sycl::get_unified_cache(*ctx.stream()) : nullptr" in staging,
+        # A refusal degrades routing silently, so it has to clear the DEFAULT
+        # verbosity threshold -- GGML_LOG_INFO does not, and the debug-gated
+        # traces beside these warnings do not either.
+        "the batched executor warns unconditionally, once, on refusal":
+            latched_warn(batched, "batched_scratch_refusal_latch"),
+        "the non-batched staging warns unconditionally, once, on refusal":
+            latched_warn(staging, "staging_scratch_refusal_latch"),
+        "each refusal warning carries the reason and the requested-vs-cap bytes":
+            all(ordered(region, "GGML_LOG_WARN(", "reported once per process",
+                        "required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu]",
+                        "pp_moe_onednn_scratch_admission_reason_name(admission.reason)")
+                for region in (batched, staging)),
         # ABSENCE: the bug this task exists for. max(planned, required) turns a
         # budgeted zone into a high-water mark of every shape ever seen.
         "no PP MoE scratch reservation upsizes past the plan":
@@ -230,6 +270,8 @@ def evaluate(sycl, cache, module, header, doc=""):
             "`pp_moe_onednn_ring_depth` → Zone: RUNTIME |" in doc,
         "the contract states planned scratch is a hard cap":
             "hard capacity ceilings, not runtime growth hints" in doc,
+        "the contract requires the refusal to be visible at default verbosity":
+            ordered(doc, "reports it at `GGML_LOG_WARN`", "latched to fire once per process"),
         "the contract requires failing closed before allocating inadmissible scratch":
             "must fail closed before allocating that scratch and select an already-planned safe route" in doc,
         "the contract preserves intentional host-pinned expert placement":
@@ -285,6 +327,22 @@ ABSENCE_MUTANTS = {
         "module",
         '#include "moe-scratch-admission.hpp"',
         '#include "moe-scratch-admission.hpp"\n#include <sycl/sycl.hpp>'),
+    # The regression this guards is the state the code was IN before the review
+    # ruling: the refusal was reported only under a debug flag, so a production
+    # run that lost its fast path said nothing. The mutant tucks the warning
+    # back inside the trace guard, which is the natural way to reintroduce it.
+    "the batched executor warns unconditionally, once, on refusal": (
+        "sycl",
+        "if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {",
+        "if (pp_mxfp4_soa_f16_batched_trace &&\n"
+        " ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {"),
+    # A latch that is not `static` is reconstructed on every dispatch, so
+    # "once per process" silently becomes "every time" -- the spam this exists
+    # to bound, and invisible to any check that only greps for the warning.
+    "the non-batched staging warns unconditionally, once, on refusal": (
+        "sycl",
+        "static ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;",
+        "ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;"),
 }
 
 

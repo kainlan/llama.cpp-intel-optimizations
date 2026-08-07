@@ -60,7 +60,12 @@ general temporary allocation to make an inadmissible batch fit.
 Refusal is a **typed, named outcome**, never a silent clamp: the decision is
 `ggml_sycl::pp_moe_onednn_admit_scratch` (`moe-scratch-admission.hpp`), and every
 `pp_moe_onednn_scratch_admission_reason` has a stable name that reaches a log, so
-a route that did not run is attributable to one predicate. The policy is pure —
+a route that did not run is attributable to one predicate. Because a refusal
+**downgrades routing without changing the tokens**, each site reports it at
+`GGML_LOG_WARN` — visible at default verbosity, where `GGML_LOG_INFO` is not —
+latched to fire once per process, since a misconfigured plan refuses on every
+dispatch of every layer. Debug-gated per-dispatch traces remain the detailed
+view; they are not a substitute for the warning. The policy is pure —
 no lock, no allocation, no device query — which is what lets it run *before* the
 reservation takes `pp_moe_onednn_scratch_mutex_` or calls the allocator (§12.5).
 `unified_cache::reserve_pp_moe_onednn_scratch` applies the same cap on its own

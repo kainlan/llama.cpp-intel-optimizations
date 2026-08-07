@@ -319,9 +319,10 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-control-plan-contract.py
             --self-test)
     set_tests_properties(sycl-moe-control-plan-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
-    # --self-test likewise: six of this gate's checks are absence-based, and the
-    # construct they forbid -- max(planned, required), the general temporary
-    # fallback, admission after the lock -- is exactly what the port removed, so
+    # --self-test likewise: eight of this gate's checks are absence-based, and
+    # the construct they forbid -- max(planned, required), the general temporary
+    # fallback, admission after the lock, a debug-gated refusal warning -- is
+    # exactly what the port removed, so
     # without a poisoned control they pass on every tree written after it. It is
     # also the only thing that can see whether the PRODUCTION executors ask the
     # admission policy anything; test-moe-scratch-admission proves the policy,

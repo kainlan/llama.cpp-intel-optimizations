@@ -27,8 +27,10 @@ using ggml_sycl::pp_moe_onednn_reserve_if_admitted;
 using ggml_sycl::pp_moe_onednn_scratch_admission;
 using ggml_sycl::pp_moe_onednn_scratch_admission_reason;
 using ggml_sycl::pp_moe_onednn_scratch_admission_reason_name;
+using ggml_sycl::pp_moe_onednn_scratch_refusal_latch;
 using ggml_sycl::pp_moe_onednn_scratch_shape;
 using ggml_sycl::PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT;
+using ggml_sycl::pp_moe_onednn_should_report_refusal;
 
 static void check(bool condition, const std::string & message) {
     if (!condition) {
@@ -375,6 +377,46 @@ static void test_refusal_reaches_no_side_effect() {
     check(admission.allowed && !failed_reserve, "an admitted request that fails to allocate still returns false");
 }
 
+// The refusal WARN is unconditional, so the latch is the only thing between a
+// misconfigured plan and one warning per dispatch per layer per token. It is
+// also the only part of the reporting path that can be wrong in a way no gate
+// on source text would catch.
+static void test_refusal_report_fires_once() {
+    const pp_moe_onednn_scratch_shape planned = gpt_oss_layer0_plan();
+
+    pp_moe_onednn_scratch_shape over_cap = planned;
+    over_cap.weight_slot_bytes += PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT;
+    const auto refused = pp_moe_onednn_admit_scratch(planned, over_cap);
+    check(!refused.allowed, "the over-cap shape is refused");
+
+    pp_moe_onednn_scratch_refusal_latch latch;
+    check(pp_moe_onednn_should_report_refusal(refused, latch), "the first refusal is reported");
+    check(!pp_moe_onednn_should_report_refusal(refused, latch), "the second refusal is silent");
+
+    // A later refusal for a DIFFERENT reason is still silent: the latch is per
+    // call site, not per reason, because the point is bounding the volume.
+    pp_moe_onednn_scratch_shape zero = planned;
+    zero.weight_slot_bytes           = 0;
+    const auto other_refusal         = pp_moe_onednn_admit_scratch(planned, zero);
+    check(!other_refusal.allowed && other_refusal.reason != refused.reason, "the second refusal has another reason");
+    check(!pp_moe_onednn_should_report_refusal(other_refusal, latch), "a differently-reasoned refusal stays silent");
+
+    // Each call site owns its own latch, so one site reporting must not silence
+    // the other.
+    pp_moe_onednn_scratch_refusal_latch other_site;
+    check(pp_moe_onednn_should_report_refusal(refused, other_site), "an independent latch reports its own refusal");
+
+    // The bug the short circuit exists to prevent: an ADMITTED request must not
+    // consume the latch, or the first successful dispatch silences the first
+    // real refusal -- the one that actually needed reporting.
+    pp_moe_onednn_scratch_refusal_latch after_success;
+    const auto                          admitted = pp_moe_onednn_admit_scratch(planned, planned);
+    check(admitted.allowed, "the exact plan is admitted");
+    check(!pp_moe_onednn_should_report_refusal(admitted, after_success), "an admitted request reports nothing");
+    check(pp_moe_onednn_should_report_refusal(refused, after_success),
+          "an admitted request does not consume the latch");
+}
+
 int main() {
     const struct {
         const char * name;
@@ -388,6 +430,7 @@ int main() {
         { "over-plan-request-is-refused",            test_over_plan_request_is_refused            },
         { "reason-names-are-stable",                 test_reason_names_are_stable                 },
         { "refusal-reaches-no-side-effect",          test_refusal_reaches_no_side_effect          },
+        { "refusal-report-fires-once",               test_refusal_report_fires_once               },
     };
 
     for (const auto & test_case : cases) {

@@ -72945,6 +72945,20 @@ cpu_tg_fallthrough:
             const ggml_sycl::pp_moe_onednn_scratch_admission admission =
                 ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
             if (!admission.allowed) {
+                // Visible at default verbosity, once per process: a refusal here
+                // silently downgrades this op to the serialized route, and a run
+                // that quietly lost its fast path looks exactly like one that
+                // never had it. The per-dispatch trace below stays debug-gated.
+                static ggml_sycl::pp_moe_onednn_scratch_refusal_latch batched_scratch_refusal_latch;
+                if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {
+                    GGML_LOG_WARN(
+                        "[SYCL] refusing unplanned PP MoE oneDNN batched scratch (reported once per process): "
+                        "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] "
+                        "required_ring=%u planned_ring=%u; falling back to the serialized MoE route\n",
+                        ctx.device, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
+                        weight_bytes, act_bytes, out_bytes, planned_weight, planned_act, planned_out,
+                        required_shape.ring_depth, planned_ring_depth);
+                }
                 if (pp_mxfp4_soa_f16_batched_trace) {
                     fprintf(stderr,
                             "[MOE-PP-ONEDNN-F16-BATCHED-ADMISSION] tensor=%s device=%d reason=%s active=%zu "
@@ -73294,6 +73308,20 @@ cpu_tg_fallthrough:
             // exit) rather than an enlargement of the planned ring.
             const ggml_sycl::pp_moe_onednn_scratch_admission admission =
                 ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
+            // Same reasoning as the batched site: default-verbosity, once per
+            // process. Here the op still runs, on its own transient staging, so
+            // the cost is the planned ring going unused -- which is invisible in
+            // a token stream and shows up only as throughput.
+            static ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;
+            if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, staging_scratch_refusal_latch)) {
+                GGML_LOG_WARN(
+                    "[SYCL] refusing unplanned PP MoE oneDNN staging scratch (reported once per process): "
+                    "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] "
+                    "required_ring=%u planned_ring=%u; staging from transient per-dispatch temporaries\n",
+                    ctx.device, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
+                    pp_mxfp4_src0_f16_bytes, src1_contiguous_f16_bytes, dst_contiguous_bytes, planned_weight_slot,
+                    planned_activation_slot, planned_output_slot, required_shape.ring_depth, planned_ring_depth_raw);
+            }
             if (!admission.allowed && pp_oor_trace) {
                 fprintf(stderr,
                         "[MOE-OOR-TRACE] stage=pp-moe-onednn-scratch-refused tensor=%s device=%d reason=%s "
