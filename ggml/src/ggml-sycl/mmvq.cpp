@@ -21158,6 +21158,36 @@ static bool mmvq_build_stream_segments(const ggml_tensor * src0,
     return true;
 }
 
+// The Q4_0 / Q8_0 / MXFP4 coalesced MMVQ kernels take neither the full tensor
+// row count nor row_low: they derive the scale (or MXFP4 exponent) base as
+// `nrows * row_quants_bytes` from the SLICE row count, and index both regions
+// with the slice-local row. That is correct only when the slice IS the whole
+// tensor. On a split-tensor dispatch the base lands inside the quants region and
+// the kernel reads quant bytes as fp16 scales -- silently, with no fault and no
+// out-of-bounds access, because the address is still inside the allocation.
+//
+// The Q6_K coalesced kernel shows the shape of the real fix: it takes
+// total_nrows and row_low, is handed `layout_base` rather than the pre-offset
+// `src0_dd_i`, and forms `global_row = row_low + local_row`
+// (mul_mat_vec_q6_k_variable_tile). Retrofitting the other three means changing
+// which pointer they receive, which cannot be validated without a GPU, so this
+// guard fails the dispatch closed until that lands (llama.cpp-szv8, c-djm7).
+//
+// Unsliced dispatches -- every single-device run -- are unaffected: row_low is 0
+// and row_diff is ne01, so the assertion holds trivially.
+static void mmvq_assert_coalesced_slice_supported(const ggml_tensor * src0,
+                                                  const int64_t       ne01,
+                                                  const int64_t       row_low,
+                                                  const int64_t       row_diff) {
+    if (row_low == 0 && row_diff == ne01) {
+        return;
+    }
+    GGML_LOG_ERROR(
+        "[MMVQ] coalesced layout does not support sliced dispatch: %s ne01=%lld row_low=%lld row_diff=%lld\n",
+        src0 && src0->name ? src0->name : "unknown", (long long) ne01, (long long) row_low, (long long) row_diff);
+    GGML_ABORT("MMVQ coalesced: sliced dispatch would read quants as scales");
+}
+
 static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                     const char *            src0_dd_i,
                                     const void *            layout_base,
@@ -21194,6 +21224,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                     if (mode == reorder_mode::COALESCED) {
                         GGML_SYCL_KTRACE("mmvq_q4_0_coalesced", " ne00=%lld row_diff=%lld", (long long) ne00,
                                          (long long) row_diff);
+                        mmvq_assert_coalesced_slice_supported(src0, ne01, row_low, row_diff);
                         coalesced_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
                                                              stream, fused_add, fused_add_ne0, fused_add_nb0,
                                                              fused_add_row_base);
@@ -21296,6 +21327,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         GGML_SYCL_DEBUG("Calling coalesced_mul_mat_vec_q8_0_q8_1_sycl\n");
                         GGML_SYCL_KTRACE("mmvq_q8_0_coalesced", " ne00=%lld row_diff=%lld", (long long) ne00,
                                          (long long) row_diff);
+                        mmvq_assert_coalesced_slice_supported(src0, ne01, row_low, row_diff);
                         coalesced_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
                                                              stream, fused_add, fused_add_ne0, fused_add_nb0,
                                                              fused_add_row_base);
@@ -21324,6 +21356,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         GGML_SYCL_DEBUG("Calling coalesced_mul_mat_vec_mxfp4_q8_1_sycl\n");
                         GGML_SYCL_KTRACE("mmvq_mxfp4_coalesced", " ne00=%lld row_diff=%lld", (long long) ne00,
                                          (long long) row_diff);
+                        mmvq_assert_coalesced_slice_supported(src0, ne01, row_low, row_diff);
                         coalesced_mul_mat_vec_mxfp4_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
                                                               stream, fused_add, fused_add_ne0, fused_add_nb0,
                                                               fused_add_row_base);
