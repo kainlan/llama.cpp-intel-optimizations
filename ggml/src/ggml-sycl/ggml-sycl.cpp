@@ -2203,7 +2203,6 @@ static thread_local bool                                                      g_
 // Canonical ranked inventory/lifecycle publication writer lock. All cache/global
 // placement publications are serialized by this existing lock.
 static std::mutex                                                g_tensor_inventory_mutex;
-static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };
 static std::atomic<bool>                                         g_fail_next_plan_publication_prepare{ false };
 
 static_assert(std::is_nothrow_move_assignable<ggml_sycl::placement_kv_info>::value,
@@ -2230,6 +2229,26 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_globa
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_identity_plan_snapshot() {
     const auto candidate = ggml_sycl_bound_load_candidate();
     return candidate ? candidate : ggml_sycl_global_plan_snapshot();
+}
+
+// Does the model this call is about actually tier -- i.e. does its authoritative
+// placement plan put weight bytes on host?  Derived on read from the immutable
+// snapshot keyed by ModelId/LoadTxnId, never latched into a process-global
+// boolean (canonical contract §12.7 forbids one as a routing authority, and a
+// latch is what made this question inherit the previous model's answer).
+//
+// Reading the identity snapshot is what keeps this coherent with
+// ggml_backend_sycl_planned_target_device(), which resolves the plan through
+// the same authority: during a load both see the bound load candidate, after
+// commit both see the publication.  A no_alloc load stages an explicit no-plan
+// candidate, so it reports false rather than inheriting anything.
+//
+// Not to be confused with g_tiered_enabled, which is the process-level "the
+// unified cache is the pointer authority" gate -- always true, since the cache
+// is the sole allocator.  Conflating the two is llama.cpp-wmc2.
+static bool ggml_sycl_current_model_planner_host_placement() {
+    const auto snapshot = ggml_sycl_identity_plan_snapshot();
+    return snapshot && snapshot->plan && snapshot->planned_host_bytes > 0;
 }
 
 static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
@@ -11954,11 +11973,23 @@ static ggml_sycl::placement_kv_info                  g_placement_kv_info{};
 // real envelope data to attribute.
 static ggml_sycl_placement_envelope                  g_placement_envelope{};
 static bool                                          g_placement_envelope_set = false;
+// PROCESS-LEVEL cache/dispatch gate, despite the name: "may a tensor pointer
+// resolve through the unified cache, and may a weight be resident outside VRAM
+// right now".  It is latched true once the backend has a device (see
+// compute_vram_budget_for_plan) and stays true, because the unified cache is
+// the sole allocator -- CLAUDE.md's "the unified cache owns all GPU/host
+// memory", and 9a0670712 removed the last opt-out.  Its consumers are kernel
+// debug-logging gates, cached-source-pointer resolution, and graph prestage's
+// host->VRAM promotion branch; all three ask a process question, and prestage
+// in particular must NOT read the planner verdict, because LRU eviction can
+// demote a weight the planner placed on device.
+//
+// The PER-MODEL question -- "does THIS model's plan put weight bytes on host"
+// -- is ggml_sycl_current_model_planner_host_placement(), derived on read from
+// the identity snapshot.  Answering it from this flag is the conflation
+// llama.cpp-wmc2 exists to close: this flag has been unconditionally true for
+// every SYCL model load, so it can only ever answer "yes".
 std::atomic<bool>                                    g_tiered_enabled{ false };
-
-// Current-model API verdict: unlike g_tiered_enabled (the cache/dispatch gate),
-// this records only whether the authoritative completed planner placed any
-// bytes on host. It is model-load scratch state, not cache capability.
 
 // Structural load-boundary reset (llama.cpp-k7b0) for every SCRATCH global in
 // this region that describes "the model currently being loaded", as opposed
@@ -12589,11 +12620,7 @@ static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publi
         [&](int i) {
             publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);
         },
-        [&] {
-            g_current_model_planner_host_placement.store(snapshot && snapshot->plan && snapshot->planned_host_bytes > 0,
-                                                         std::memory_order_release);
-            std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release);
-        });
+        [&] { std::atomic_store_explicit(&g_placement_publication, snapshot, std::memory_order_release); });
 }
 
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
@@ -13616,8 +13643,7 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "
         "(VRAM: %.2f GB free, planner host placement: %s)\n",
         g_tensor_inventory.size(), g_tensor_inventory_total_size / (1024.0 * 1024.0 * 1024.0),
-        free_mem / (1024.0 * 1024.0 * 1024.0),
-        g_current_model_planner_host_placement.load(std::memory_order_acquire) ? "yes" : "no");
+        free_mem / (1024.0 * 1024.0 * 1024.0), ggml_sycl_current_model_planner_host_placement() ? "yes" : "no");
 }
 
 void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
@@ -13978,8 +14004,8 @@ void ggml_sycl_get_moe_info(size_t * expert_total_bytes, int * n_expert, int * n
 }
 
 bool ggml_backend_sycl_is_tiered_enabled(ggml_backend_t backend) {
-    (void) backend;  // Verdict is current-model planner state, reset at the outer load boundary.
-    return g_current_model_planner_host_placement.load(std::memory_order_acquire);
+    (void) backend;  // Verdict is current-model planner placement, not a per-backend property.
+    return ggml_sycl_current_model_planner_host_placement();
 }
 
 int ggml_backend_sycl_planned_target_device(const char * tensor_name) {

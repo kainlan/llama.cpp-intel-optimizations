@@ -1013,8 +1013,23 @@ and API reporting **only**. Dispatch, placement, allocation, reset, and teardown
 must use the placement plan and resolved handles, never a process-global
 "current model has host placement" boolean. An unknown/partial/aborted verdict
 must report UNKNOWN and cannot silently inherit the previous model's value.
-`g_current_model_planner_host_placement` at `ggml-sycl.cpp:9766-9769` is current
-load scratch and is not a compliant multi-model routing authority.
+
+`g_current_model_planner_host_placement` was the non-compliant instance of
+exactly that: a process-global latch written only at publication, so
+`ggml_backend_sycl_is_tiered_enabled()` answered from the PREVIOUS model for
+the whole of the next model's load window. It is removed (llama.cpp-wmc2). The
+verdict is now derived on read by
+`ggml_sycl_current_model_planner_host_placement()` from the identity snapshot —
+bound load candidate first, publication otherwise — which is the same authority
+`ggml_backend_sycl_planned_target_device()` resolves through, so the two APIs
+cannot disagree about one model. `lifecycle_stage_placement_plan()` gives a
+staged candidate the same `planned_host_bytes` its publication will carry.
+
+Do not reintroduce a cached copy of this verdict, and do not answer it from
+`g_tiered_enabled`: that flag is the process-level "the unified cache is the
+pointer authority" gate, unconditionally true for every SYCL model load, so a
+per-model question routed through it can only answer "yes".
+`tests/test-sycl-tiered-verdict-contract.py` holds this shape, with mutants.
 
 ### 12.8 Child DAG, path ownership, and acceptance
 

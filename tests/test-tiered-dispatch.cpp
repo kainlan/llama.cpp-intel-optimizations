@@ -91,13 +91,24 @@ void run_placement_case(ggml_backend_t backend,
     if (!fixture.valid) {
         return;
     }
-    ggml_backend_sycl_set_tensor_inventory(backend, &fixture.inventory);
+    // Register through the real load bracket, not ggml_backend_sycl_set_tensor_inventory()
+    // directly.  The planner only STAGES its plan onto the bound load-effect
+    // transaction, and only ggml_backend_sycl_stage_inventory_plan() acquires
+    // one; a direct call computes a plan and drops it, leaving every
+    // ggml_backend_sycl_planned_target_device() query answering NO_PLAN and
+    // this whole case passing or failing on nothing.
+    check(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+          "inventory staging through the load bracket failed");
 
     const bool oracle  = planner_target_oracle(fixture, label);
     const bool verdict = ggml_backend_sycl_is_tiered_enabled(backend);
     check(oracle == expect_host, expect_host ? "over-budget planner oracle found no host target" :
                                                "all-device planner oracle found a host target");
-    check(verdict == oracle, "tiered query disagrees with independent planned-target oracle");
+    // Queried mid-load, before the commit below: the verdict must already come
+    // from THIS model's staged candidate.  A verdict latched at publication
+    // time answers from the previous model for the whole load window, which is
+    // false for every over-budget model until it is too late to act on.
+    check(verdict == oracle, "mid-load tiered query disagrees with independent planned-target oracle");
     check(ggml_backend_sycl_has_tensor_cache(backend), "unified cache gate unavailable for planned model");
 
     check(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK, "explicit model lifecycle commit failed");

@@ -344,6 +344,20 @@ if (BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmvq-launch-geometry-contract.py
             --self-test)
     set_tests_properties(sycl-mmvq-launch-geometry-contract PROPERTIES LABELS "sycl;mmvq;host;source-contract")
+    # The wmc2 per-model tiering verdict contract. --self-test for the usual
+    # reason -- four of its checks are absence-based -- but the check that
+    # earns this gate is the vacuity one: test-tiered-dispatch registered its
+    # inventory outside the load bracket, so the planner staged nothing and
+    # every planned-target assertion in it read NO_PLAN. A device test that
+    # asserts against nothing looks exactly like one that passes, and this is
+    # the only thing that can see the difference.
+    add_test(NAME sycl-tiered-verdict-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tiered-verdict-contract.py
+            --self-test)
+    # Deliberately NOT labelled "cache": that label is in the memory-hazard
+    # denylist the full sweep excludes, and this gate allocates nothing.
+    set_tests_properties(sycl-tiered-verdict-contract PROPERTIES LABELS "sycl;tiered;host;source-contract")
     # The 32dg claim/release source contract. Like the lifecycle executable
     # above it was written and never registered; it pins the generation-keyed
     # release and retired-slot protocol that the admission port must not regress.
