@@ -41,13 +41,23 @@
 //  1. The weight was named "weight". ggml_sycl::infer_tensor_usage() maps that
 //     to tensor_usage::UNKNOWN, and layout_policy::get_optimal() answers SOA for
 //     UNKNOWN -- COALESCED is reachable only for ATTENTION_WEIGHT/FFN_WEIGHT.
-//     The weights are now named "blk.<n>.attn_q.weight", which is the honest,
-//     policy-reachable route to COALESCED rather than a test-only forcing.
+//     The weights are now named "blk.<n>.attn_q.weight".
 //  2. The weight sat in the device buffer with no model-load transaction, so
 //     ggml_backend_sycl_register_host_weight_tensor() dropped it and S1-PRELOAD
 //     -- the only producer of a dense COALESCED cache entry -- never saw it.
 //     Part 2 now stages through the same bracket as
 //     tests/test-q8-0-layout-cache-path.cpp (llama.cpp-43uy).
+//
+// Be precise about which of those two actually drives THIS test, because it is
+// not the rename. ggml_sycl_layout_override_active() feeds S1-PRELOAD as well as
+// kernel selection (ggml-sycl.cpp:28301 and :28313), and
+// ggml_sycl_can_use_layout_for_kernel() returns true for ANY layout on ANY name
+// once the weight buffer is host and GGML_SYCL_WEIGHTS_EVICTABLE=1
+// (ggml-sycl.cpp:52714). So while the override guard in main() is held, the
+// materialized layout is COALESCED whatever the tensor is called. The rename is
+// independently sufficient via layout_policy -- which is what makes COALESCED
+// production-policy-reachable for this type and shape, and is the fact to reason
+// from about production -- but it is not the operative mechanism in this test.
 //
 // The symptom was "[LAYOUT-CHECK] readback done (source=tensor-storage-fallback)"
 // followed by "Coalesced layout check: NOT RUN" on every shape, while the numeric
@@ -578,7 +588,7 @@ static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
     // The weight buffer must be host-resident: ggml_sycl_can_use_layout_for_kernel()
     // admits a non-AoS layout for a weight that has no materialized layout yet
     // only when the buffer is host and weights are evictable, and that is the
-    // gate S1-PRELOAD consults before honouring the layout policy's COALESCED.
+    // gate S1-PRELOAD consults before honouring main()'s COALESCED override.
     ggml_backend_buffer_type_t weight_buft = ggml_backend_sycl_host_buffer_type();
     ggml_backend_buffer_type_t dev_buft    = ggml_backend_get_default_buffer_type(backend);
 
@@ -695,9 +705,12 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
     const bool debug_coalesced = std::getenv("GGML_SYCL_COALESCED_DMMV_DEBUG") != nullptr;
 
     // An ATTENTION_WEIGHT name is what makes layout_policy::get_optimal() answer
-    // COALESCED for Q4_0; the "weight" this test used maps to
-    // tensor_usage::UNKNOWN, whose answer is SOA. Distinct names per case keep
-    // the three shapes from colliding on one cache key.
+    // COALESCED for Q4_0 in production; the "weight" this test used maps to
+    // tensor_usage::UNKNOWN, whose answer is SOA. Under main()'s override guard
+    // the materialized layout would be COALESCED either way, so the name is here
+    // to keep the test's premise reachable without a forcing rather than to
+    // produce the buffer. Distinct names per case keep the three shapes from
+    // colliding on one cache key.
     char weight_name[64];
     snprintf(weight_name, sizeof(weight_name), "blk.%d.attn_q.weight", case_index);
 
@@ -1116,12 +1129,24 @@ int main() {
     // GPU tests (coalesced DMMV via ggml backend)
     printf("\n=== Part 2: GPU DMMV Tests (Coalesced) ===\n");
 
-    // The override does not produce the COALESCED buffer -- the layout policy
-    // does, via the ATTENTION_WEIGHT name. What it does is pin kernel selection:
-    // with an override active the orchestrator rejects any preferred kernel
-    // whose layout differs, then calls pick_kernel_for_layout(COALESCED), which
-    // at batch=1 is DMMV_COALESCED. Without it the priority list offers DMMV_SOA
-    // first and a host weight buffer makes that eligible.
+    // This override forces BOTH halves of the path, and the second half is easy
+    // to misattribute to the ATTENTION_WEIGHT rename:
+    //
+    //  - Materialization. S1-PRELOAD reads the override at ggml-sycl.cpp:28301
+    //    and overwrites its policy answer with it at :28313, gated only on
+    //    ggml_sycl_can_use_layout_for_kernel(), whose host-buffer + evictable
+    //    early return (:52714) admits any layout for any name. So the COALESCED
+    //    buffer here comes from the override, not from the rename -- the rename
+    //    would reach the same layout on its own, but never gets the chance while
+    //    this guard is held.
+    //  - Kernel selection. The orchestrator rejects any preferred kernel whose
+    //    layout differs from the override, then calls
+    //    pick_kernel_for_layout(COALESCED), which at batch=1 is DMMV_COALESCED.
+    //
+    // The override must stay for that second reason: DMMV_SOA precedes
+    // DMMV_COALESCED in k_mul_mat_priority, and a host + evictable weight is
+    // SOA-eligible through the same early return, so without the override the
+    // priority list would take DMMV_SOA.
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
     // Required by ggml_backend_sycl_register_host_weight_tensor(), which returns
