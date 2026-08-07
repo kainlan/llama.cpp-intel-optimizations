@@ -7,12 +7,32 @@
 // which main() never calls. main()'s actual Part 2 (run_dmmv_coalesced_case,
 // via GGML_SYCL_FORCE_DMMV=1 + a GGML_LAYOUT_COALESCED override) drives the
 // real, reachable production dispatch path -- confirmed via
-// ggml_backend_graph_compute in its backtrace, not a stub. It is real and
-// currently reproduces a genuine wrong-answer bug (~12-31% max_rel error,
-// ~35-40% of rows, at ncols/nrows 1024x64, 2048x128, 4096x256; Part 1's CPU
-// layout-integrity check passes cleanly at all three sizes, which rules out
-// the test's own coalesced-layout decoder as the cause). This is (a), a
-// live defect, not a red-by-design placeholder.
+// ggml_backend_graph_compute in its backtrace, not a stub.
+//
+// CORRECTED AGAIN (llama.cpp-szv8, 2026-08-06): the "~12-31% max_rel, ~35-40%
+// of rows" this file then attributed to a wrong-answer bug in the kernel is
+// the ORACLE's error, not the kernel's. Part 2 compared the GPU against
+// `cpu_out` -- the ggml CPU backend -- and for a Q4_0 weight the CPU backend
+// quantizes the ACTIVATION to Q8_0 (vec_dot_q4_0_q8_0). The SYCL DMMV path
+// does not: dmmv.cpp converts src1 with to_fp16_sycl and the coalesced kernel
+// multiplies in f32 (the Q8_0-activation kernel exists but is off by default,
+// GGML_SYCL_DMMV_USE_Q8). So the two sides quantize the activation
+// differently, and the gap is the CPU side's Q8_0 noise -- which the GPU does
+// not have. The GPU was the more accurate of the two all along.
+//
+// The decisive check is that an EXACT f64 dot product, scored as if it were
+// the GPU, also fails the old comparison: errors=14/37/67 at the three shapes
+// (host model, ggml/src/ggml-sycl/tests/test-dmmv-coalesced-q4-0-oracle.cpp).
+// No implementation could pass this test as written, correct or not. Part 1's
+// layout-integrity pass never contradicted that -- it is CPU-only and checks
+// the test's own two converters against each other, so it says nothing about
+// the device at all.
+//
+// Part 2 now compares against dmmv_q4_0_dfloat_reference(), which models what
+// the kernel is specified to compute. Tolerances were NOT loosened to achieve
+// this; the relative gate was tightened from 1e-2 to 1e-3, because against a
+// contract-faithful oracle the residual is f32 reassociation noise (measured
+// max_rel 3.8e-5) rather than activation quantization.
 //
 // The coalesced layout reorganizes SoA data into tile-based format for
 // better cache line utilization during DMMV operations.
@@ -81,6 +101,33 @@ static void dmmv_q4_0_cpu_reference(const block_q4_0_test * x, const float * y, 
 
             for (int i = 0; i < QK4_0; i++) {
                 sum += dequant[i] * y[b * QK4_0 + i];
+            }
+        }
+        dst[row] = sum;
+    }
+}
+
+// Oracle for the GPU DMMV path. The coalesced kernel dequantizes X to f32 and
+// multiplies by the activation as `dfloat` -- sycl::half under GGML_SYCL_F16
+// (dmmv.cpp converts src1 with to_fp16_sycl before dispatch), float otherwise --
+// accumulating in f32. Rounding y through `dfloat` here is what makes this an
+// oracle for the kernel instead of for some other arithmetic; because it is the
+// same typedef the kernel's signature uses, it tracks the build automatically.
+//
+// This is deliberately NOT the ggml CPU backend: that path quantizes the
+// activation to Q8_0, which the SYCL DMMV path does not do. See the file header.
+static void dmmv_q4_0_dfloat_reference(const block_q4_0_test * x, const float * y, float * dst, int ncols, int nrows) {
+    const int blocks_per_row = ncols / QK4_0;
+
+    for (int row = 0; row < nrows; row++) {
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_0_test * block = &x[row * blocks_per_row + b];
+            float                   dequant[QK4_0];
+            dequantize_block_q4_0_cpu(block, dequant);
+
+            for (int i = 0; i < QK4_0; i++) {
+                sum += dequant[i] * (float) (dfloat) y[b * QK4_0 + i];
             }
         }
         dst[row] = sum;
@@ -397,8 +444,11 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
                 errors_ref++;
             }
         }
-        printf("  Debug (manual CPU vs CPU backend, expected mismatch): errors=%d max_diff=%.6f\n",
-               errors_ref, max_diff_ref);
+        // The mismatch here is the CPU backend's Q8_0 activation quantization
+        // (vec_dot_q4_0_q8_0) against a full-precision activation -- the same
+        // effect that made this file's Part 2 read as a kernel bug (szv8).
+        printf("  Debug (f32-activation CPU vs CPU backend Q8_0 activation): errors=%d max_diff=%.6f\n", errors_ref,
+               max_diff_ref);
 
         const int blocks_per_row = ncols / QK4_0;
         std::vector<block_q8_0> y_q8(blocks_per_row);
@@ -434,25 +484,42 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
         compare_device_coalesced_layout(weight_quant.data(), weight_coalesced.data(), ncols, nrows);
     }
 
+    std::vector<float> ref(nrows);
+    dmmv_q4_0_dfloat_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), input_data.data(),
+                               ref.data(), ncols, nrows);
+
+    // Against a contract-faithful oracle the only residual is f32 reassociation
+    // (the kernel accumulates per-lane over tiles, then reduces across the
+    // sub-group), so the relative gate is 1e-3 -- ~26x above the 3.8e-5 a
+    // correct kernel measures in the host model. The absolute gate stays 1e-2.
     float max_diff = 0.0f;
     float max_rel = 0.0f;
     int errors = 0;
-    const std::vector<float> & ref = cpu_out;
     for (int i = 0; i < nrows; ++i) {
         float diff = fabsf(gpu_out[i] - ref[i]);
         float denom = fmaxf(1.0f, fabsf(ref[i]));
         float rel = diff / denom;
         if (diff > max_diff) max_diff = diff;
         if (rel > max_rel) max_rel = rel;
-        if (diff > 1e-2f && rel > 1e-2f) {
+        if (diff > 1e-2f && rel > 1e-3f) {
             errors++;
         }
     }
 
+    // The CPU backend delta is reported, never gated on: it is dominated by the
+    // CPU side's Q8_0 activation quantization, which the GPU path does not have.
+    // A value here in the 0.1-0.5 range is expected and is not a defect.
+    float cpu_backend_max_diff = 0.0f;
+    for (int i = 0; i < nrows; ++i) {
+        cpu_backend_max_diff = fmaxf(cpu_backend_max_diff, fabsf(gpu_out[i] - cpu_out[i]));
+    }
+
     bool pass = (errors == 0);
     if (verbose || !pass) {
-        printf("  DMMV coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s\n",
-               ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL");
+        printf(
+            "  DMMV coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s"
+            " (informational: max|gpu-cpu_backend|=%.6f, Q8_0-activation gap)\n",
+            ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL", cpu_backend_max_diff);
     }
     return pass;
 }
