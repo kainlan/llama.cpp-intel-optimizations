@@ -1,0 +1,74 @@
+0.00.026.620 I llama_completion: llama backend init
+0.00.365.528 W [SYCL] Device 0 alloc caps: raw=15488.8 MB, safe=14670.6 MB, host_unified=no
+0.00.365.981 I llama_completion: load the model and apply lora adapter, if any
+0.00.534.624 W [SYCL] dispatch tuning: failed to load /tmp/onednn_unified_bench.json (unable to open file)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+0.48.309.348 I llama_completion: llama threadpool init, n_threads = 4
+0.48.309.397 I 
+0.48.309.492 I system_info: n_threads = 4 (n_threads_batch = 4) / 20 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.48.309.495 I 
+0.48.309.555 I sampler seed: 42
+0.48.309.569 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = -1
+	top_k = 40, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.48.309.578 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist 
+0.48.309.578 I generate: n_ctx = 32768, n_batch = 2048, n_predict = 15, n_keep = 1
+0.48.309.579 I 
+0.49.467.097 I common_perf_print:    sampling time =       1.54 ms
+0.49.467.125 I common_perf_print:    samplers time =       0.48 ms /    31 tokens
+0.49.467.136 I common_perf_print:        load time =   47924.13 ms
+0.49.467.144 I common_perf_print: prompt eval time =     716.42 ms /    16 tokens (   44.78 ms per token,    22.33 tokens per second)
+0.49.467.153 I common_perf_print:        eval time =     438.36 ms /    14 runs   (   31.31 ms per token,    31.94 tokens per second)
+0.49.467.160 I common_perf_print:       total time =    1157.79 ms /    30 tokens
+0.49.467.168 I common_perf_print: unaccounted time =       1.48 ms /   0.1 %      (total - sampling - prompt eval - eval) / (total)
+0.49.467.176 I common_perf_print:    graphs reused =         13
+[ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=16 ====
+[ZONE-RESET-AUDIT] site=device-zone-reset/ONEDNN:dev0 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[2..2]
+[ZONE-RESET-AUDIT]   largest_free first=256.00 MB last=143.88 MB min=143.88 MB
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..15]
+[ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT]   largest_free first=309.54 MB last=309.54 MB min=309.54 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT]   largest_free first=223.08 MB last=223.08 MB min=223.08 MB
+[ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=13586.00 MB last=13586.00 MB min=13586.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=13586.00 MB last=13586.00 MB min=13586.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[16..16]
+[ZONE-RESET-AUDIT]   largest_free first=5218.10 MB last=5218.10 MB min=5218.10 MB
+[ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=32 alloc_MB=4096.0 alloc_ms=0.095 free_calls=32 free_ms=0.016 allocs_per_graph_max=32 allocs_per_graph_mean=2.0 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=519 alloc_MB=8374.9 alloc_ms=0.628 free_calls=519 free_ms=0.111 allocs_per_graph_max=517 allocs_per_graph_mean=32.4 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/onednn alloc_calls=6 alloc_MB=256.7 alloc_ms=0.003 free_calls=0 free_ms=0.000 allocs_per_graph_max=6 allocs_per_graph_mean=0.4 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=67 alloc_MB=144.0 alloc_ms=0.039 free_calls=67 free_ms=0.053 allocs_per_graph_max=65 allocs_per_graph_mean=4.2 graphs=16
+[ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=3 alloc_MB=40.3 alloc_ms=0.005 free_calls=2 free_ms=0.004 allocs_per_graph_max=3 allocs_per_graph_mean=0.2 graphs=16
+[ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=49 alloc_MB=102.5 alloc_ms=0.041 free_calls=1 free_ms=0.002 allocs_per_graph_max=3 allocs_per_graph_mean=2.9 graphs=16
+[ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=1269 alloc_MB=4517.5 alloc_ms=4.224 free_calls=1269 free_ms=2.440 allocs_per_graph_max=741 allocs_per_graph_mean=77.2 graphs=16
+[ZONE-RESET-AUDIT] ==== end inventory ====
+0.49.631.043 W [ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=16 ====
+0.49.631.104 W [ZONE-RESET-AUDIT] site=device-zone-reset/ONEDNN:dev0 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[2..2]
+0.49.631.114 W [ZONE-RESET-AUDIT]   largest_free first=256.00 MB last=143.88 MB min=143.88 MB
+0.49.631.119 W [ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..15]
+0.49.631.124 W [ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+0.49.631.128 W [ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.49.631.132 W [ZONE-RESET-AUDIT]   largest_free first=309.54 MB last=309.54 MB min=309.54 MB
+0.49.631.137 W [ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.49.631.146 W [ZONE-RESET-AUDIT]   largest_free first=223.08 MB last=223.08 MB min=223.08 MB
+0.49.631.150 W [ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.49.631.155 W [ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+0.49.631.158 W [ZONE-RESET-AUDIT]   largest_free first=13586.00 MB last=13586.00 MB min=13586.00 MB
+0.49.631.162 W [ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+0.49.631.165 W [ZONE-RESET-AUDIT]   largest_free first=13586.00 MB last=13586.00 MB min=13586.00 MB
+0.49.631.169 W [ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[16..16]
+0.49.631.173 W [ZONE-RESET-AUDIT]   largest_free first=5218.10 MB last=5218.10 MB min=5218.10 MB
+0.49.631.188 W [ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=32 alloc_MB=4096.0 alloc_ms=0.095 free_calls=32 free_ms=0.016 allocs_per_graph_max=32 allocs_per_graph_mean=2.0 graphs=16
+0.49.631.192 W [ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=519 alloc_MB=8374.9 alloc_ms=0.628 free_calls=519 free_ms=0.111 allocs_per_graph_max=517 allocs_per_graph_mean=32.4 graphs=16
+0.49.631.196 W [ZONE-RESET-AUDIT]   timing vram/onednn alloc_calls=6 alloc_MB=256.7 alloc_ms=0.003 free_calls=0 free_ms=0.000 allocs_per_graph_max=6 allocs_per_graph_mean=0.4 graphs=16
+0.49.631.200 W [ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=67 alloc_MB=144.0 alloc_ms=0.039 free_calls=67 free_ms=0.053 allocs_per_graph_max=65 allocs_per_graph_mean=4.2 graphs=16
+0.49.631.205 W [ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=3 alloc_MB=40.3 alloc_ms=0.005 free_calls=2 free_ms=0.004 allocs_per_graph_max=3 allocs_per_graph_mean=0.2 graphs=16
+0.49.631.212 W [ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=49 alloc_MB=102.5 alloc_ms=0.041 free_calls=1 free_ms=0.002 allocs_per_graph_max=3 allocs_per_graph_mean=2.9 graphs=16
+0.49.631.216 W [ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=1269 alloc_MB=4517.5 alloc_ms=4.224 free_calls=1269 free_ms=2.440 allocs_per_graph_max=741 allocs_per_graph_mean=77.2 graphs=16
+0.49.631.219 W [ZONE-RESET-AUDIT] ==== end inventory ====

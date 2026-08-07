@@ -1,0 +1,273 @@
+archs_table::emit: line of 514 bytes exceeds the 256-byte atomic-write bound; it may be split across writes and interleaved with log output
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, Dense)
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=15075396135491732604 size=4 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=8055907002217459089 size=1536 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=7920810405364469338 size=393216 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=4103942273045031955 size=1024 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=16957379151907101766 size=262144 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=12467192014320699603 size=131072 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=2 alloc_id=3538592250846292943 size=256 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=15075396135491732604 size=4 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=8055907002217459089 size=1536 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=7920810405364469338 size=393216 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=4103942273045031955 size=1024 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=16957379151907101766 size=262144 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=12467192014320699603 size=131072 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=2 alloc_id=3538592250846292943 size=256 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=15075396135491732604 size=4 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=4103942273045031955 size=1024 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=8055907002217459089 size=1536 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=7920810405364469338 size=393216 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=3538592250846292943 size=256 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=7263647557194232799 size=4 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=4220748150773471584 size=262144 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=2395779102517370298 size=1024 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=13707875219353611096 size=393216 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=4220748150773471584 size=262144 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=3538592250846292943 size=256 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=12467192014320699603 size=131072 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=6352768273747461299 size=1536 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=4 alloc_id=12467192014320699603 size=131072 role=0 category=1 tier=0 cohort=weight:leaked_lease
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, Dense)
+test case: llama (Meta, Dense)
+test case: llama (Intel(R) Arc(TM) Pro B70 Graphics, MoE)
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=235 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=237 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=236 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=host-zone-reset/SCRATCH graph=5 alloc_id=235 size=98304 role=6 category=5 tier=1 cohort=moe_act_pool
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=host-zone-reset/SCRATCH graph=5 alloc_id=237 size=786432 role=6 category=5 tier=1 cohort=cpu_expert_ring
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=host-zone-reset/SCRATCH graph=5 alloc_id=236 size=98304 role=6 category=5 tier=1 cohort=moe_out_pool
+0.03.667.753 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=235 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.667.759 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=237 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+0.03.667.760 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=236 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+0.03.705.070 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=270 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.706.014 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=275 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.706.472 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=280 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.707.816 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.708.067 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=294 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.708.421 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=235 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=237 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=236 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+0.03.708.891 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=235 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.708.896 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=237 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+0.03.708.897 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=236 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+0.03.709.766 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=270 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.710.024 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=275 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.710.351 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=280 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.711.104 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.711.328 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=294 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.711.554 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=6 alloc_id=6033976895229229747 size=2048 role=0 category=2 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=6 alloc_id=6033976895229229747 size=2048 role=0 category=2 tier=0 cohort=weight:leased
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=412 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=411 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=410 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.804.999 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=412 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+0.03.805.020 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=411 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+0.03.805.022 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=410 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.808.722 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=270 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.809.576 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=275 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.809.934 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=280 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.810.843 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.811.166 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=294 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.811.644 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=412 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=411 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=410 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.812.297 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01430040 alloc_id=412 size=786432 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=cpu_expert_ring
+0.03.812.303 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01418040 alloc_id=411 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_out_pool
+0.03.812.326 E [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x75dd01400040 alloc_id=410 size=98304 device=0 tier=host_pinned role=6 category=5 vram_zone=5 host_zone=3 zone_managed=1 cohort=moe_act_pool
+0.03.813.421 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x5c5ab6125ec1b4e2 aux=270 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.813.786 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0xe55e3ca93cf2a5d1 aux=275 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.814.212 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2c2c03c5845a4428 aux=280 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.815.391 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x474cbb7ffa4be3cb aux=289 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.815.742 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x9436376037e599f5 aux=294 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+0.03.816.074 E [UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight caller=direct_stage_weight model=0 name_hash=0x2f51d65e2e10e7e6 aux=299 type=0 ne=[1,2,1,1] layout=0 graph_active=1
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=8 alloc_id=6033976895229229747 size=2048 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=8 alloc_id=6033976895229229747 size=2048 role=0 category=2 tier=0 cohort=weight:leased
+test case: llama (Intel(R) Core(TM) Ultra 7 265K, MoE)
+test case: llama (Meta, MoE)
+[ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=8 ====
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..7]
+[ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev1 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..7]
+[ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=8 visits_with_live=4 live_max=3 live_total=12 distinct_sizes=2 distinct_cohorts=3 graphs=[1..8]
+0.04.077.540 W [ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=8 ====
+0.04.078.469 W [ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..7]
+0.04.078.485 W [ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+0.04.078.489 W [ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev1 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..7]
+0.04.078.492 W [ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+0.04.078.496 W [ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=8 visits_with_live=4 live_max=3 live_total=12 distinct_sizes=2 distinct_cohorts=3 graphs=[1..8]
+0.04.078.500 W [ZONE-RESET-AUDIT]   largest_free first=64.00 MB last=63.06 MB min=63.06 MB
+[ZONE-RESET-AUDIT]   largest_free first=64.00 MB last=63.06 MB min=63.06 MB
+[ZONE-RESET-AUDIT]   cohort=cpu_expert_ring size=786432 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=moe_act_pool size=98304 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=moe_out_pool size=98304 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   size-histogram 98304 x8
+[ZONE-RESET-AUDIT]   size-histogram 786432 x4
+[ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..8]
+[ZONE-RESET-AUDIT]   largest_free first=64.00 MB last=64.00 MB min=64.00 MB
+[ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..8]
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=4 visits_with_live=2 live_max=64 live_total=118 distinct_sizes=8 distinct_cohorts=1 graphs=[0..6]
+[ZONE-RESET-AUDIT]   largest_free first=29472.04 MB last=29465.27 MB min=29465.27 MB
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   size-histogram 4 x44
+[ZONE-RESET-AUDIT]   size-histogram 256 x2
+[ZONE-RESET-AUDIT]   size-histogram 1024 x28
+[ZONE-RESET-AUDIT]   size-histogram 1536 x4
+[ZONE-RESET-AUDIT]   size-histogram 2048 x2
+[ZONE-RESET-AUDIT]   size-histogram 131072 x4
+[ZONE-RESET-AUDIT]   size-histogram 262144 x16
+[ZONE-RESET-AUDIT]   size-histogram 393216 x18
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev1 visits=4 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..6]
+[ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=4 visits_with_live=2 live_max=64 live_total=118 distinct_sizes=8 distinct_cohorts=1 graphs=[0..6]
+[ZONE-RESET-AUDIT]   largest_free first=29472.04 MB last=29465.27 MB min=29465.27 MB
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   size-histogram 4 x44
+[ZONE-RESET-AUDIT]   size-histogram 256 x2
+[ZONE-RESET-AUDIT]   size-histogram 1024 x28
+[ZONE-RESET-AUDIT]   size-histogram 1536 x4
+[ZONE-RESET-AUDIT]   size-histogram 2048 x2
+[ZONE-RESET-AUDIT]   size-histogram 131072 x4
+[ZONE-RESET-AUDIT]   size-histogram 262144 x16
+[ZONE-RESET-AUDIT]   size-histogram 393216 x18
+[ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev1 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[4..6]
+[ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=4 visits_with_live=2 live_max=128 live_total=224 distinct_sizes=8 distinct_cohorts=2 graphs=[4..8]
+[ZONE-RESET-AUDIT]   largest_free first=29462.98 MB last=29463.00 MB min=29462.98 MB
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=1 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=1 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=393216 occurrences=6 graphs=1 per_graph=6.00 distinct_alloc_ids=6 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+[ZONE-RESET-AUDIT]   size-histogram 4 x88
+[ZONE-RESET-AUDIT]   size-histogram 256 x4
+[ZONE-RESET-AUDIT]   size-histogram 1024 x56
+[ZONE-RESET-AUDIT]   size-histogram 1536 x8
+[ZONE-RESET-AUDIT]   size-histogram 2048 x4
+[ZONE-RESET-AUDIT]   size-histogram 131072 x8
+[ZONE-RESET-AUDIT]   size-histogram 262144 x32
+[ZONE-RESET-AUDIT]   size-histogram 393216 x24
+[ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev1 visits=4 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[4..8]
+[ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+[ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=8 alloc_MB=2.0 alloc_ms=0.004 free_calls=8 free_ms=0.005 allocs_per_graph_max=2 allocs_per_graph_mean=1.0 graphs=8
+[ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=218 alloc_MB=18.1 alloc_ms=0.084 free_calls=218 free_ms=0.050 allocs_per_graph_max=64 allocs_per_graph_mean=27.2 graphs=8
+[ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=6 alloc_MB=2.3 alloc_ms=0.010 free_calls=5 free_ms=0.012 allocs_per_graph_max=2 allocs_per_graph_mean=0.8 graphs=8
+[ZONE-RESET-AUDIT]   timing vram/scratch alloc_calls=72 alloc_MB=3.8 alloc_ms=0.016 free_calls=72 free_ms=0.018 allocs_per_graph_max=18 allocs_per_graph_mean=6.8 graphs=8
+[ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=20 alloc_MB=18.7 alloc_ms=0.021 free_calls=19 free_ms=0.022 allocs_per_graph_max=4 allocs_per_graph_mean=2.5 graphs=8
+[ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=56 alloc_MB=0.0 alloc_ms=0.026 free_calls=0 free_ms=0.000 allocs_per_graph_max=11 allocs_per_graph_mean=5.6 graphs=8
+[ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=322 alloc_MB=20.7 alloc_ms=0.100 free_calls=322 free_ms=387.407 allocs_per_graph_max=67 allocs_per_graph_mean=37.6 graphs=8
+[ZONE-RESET-AUDIT] ==== end inventory ====
+0.04.078.747 W [ZONE-RESET-AUDIT]   cohort=cpu_expert_ring size=786432 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+0.04.078.750 W [ZONE-RESET-AUDIT]   cohort=moe_act_pool size=98304 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+0.04.078.751 W [ZONE-RESET-AUDIT]   cohort=moe_out_pool size=98304 occurrences=4 graphs=4 per_graph=1.00 distinct_alloc_ids=2 role=6 category=5 tier=1 -> RETAINED (lifetime bug only)
+0.04.078.752 W [ZONE-RESET-AUDIT]   size-histogram 98304 x8
+0.04.078.753 W [ZONE-RESET-AUDIT]   size-histogram 786432 x4
+0.04.078.754 W [ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..8]
+0.04.078.755 W [ZONE-RESET-AUDIT]   largest_free first=64.00 MB last=64.00 MB min=64.00 MB
+0.04.078.756 W [ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=8 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..8]
+0.04.078.757 W [ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=4 visits_with_live=2 live_max=64 live_total=118 distinct_sizes=8 distinct_cohorts=1 graphs=[0..6]
+0.04.078.759 W [ZONE-RESET-AUDIT]   largest_free first=29472.04 MB last=29465.27 MB min=29465.27 MB
+0.04.078.760 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.761 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.762 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.763 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+0.04.078.764 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+0.04.078.765 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.766 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.775 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.776 W [ZONE-RESET-AUDIT]   size-histogram 4 x44
+0.04.078.777 W [ZONE-RESET-AUDIT]   size-histogram 256 x2
+0.04.078.777 W [ZONE-RESET-AUDIT]   size-histogram 1024 x28
+0.04.078.778 W [ZONE-RESET-AUDIT]   size-histogram 1536 x4
+0.04.078.779 W [ZONE-RESET-AUDIT]   size-histogram 2048 x2
+0.04.078.779 W [ZONE-RESET-AUDIT]   size-histogram 131072 x4
+0.04.078.780 W [ZONE-RESET-AUDIT]   size-histogram 262144 x16
+0.04.078.781 W [ZONE-RESET-AUDIT]   size-histogram 393216 x18
+0.04.078.781 W [ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev1 visits=4 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..6]
+0.04.078.782 W [ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+0.04.078.783 W [ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=4 visits_with_live=2 live_max=64 live_total=118 distinct_sizes=8 distinct_cohorts=1 graphs=[0..6]
+0.04.078.784 W [ZONE-RESET-AUDIT]   largest_free first=29472.04 MB last=29465.27 MB min=29465.27 MB
+0.04.078.785 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.787 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.787 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.788 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+0.04.078.789 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+0.04.078.790 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.791 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.792 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.793 W [ZONE-RESET-AUDIT]   size-histogram 4 x44
+0.04.078.794 W [ZONE-RESET-AUDIT]   size-histogram 256 x2
+0.04.078.794 W [ZONE-RESET-AUDIT]   size-histogram 1024 x28
+0.04.078.795 W [ZONE-RESET-AUDIT]   size-histogram 1536 x4
+0.04.078.795 W [ZONE-RESET-AUDIT]   size-histogram 2048 x2
+0.04.078.796 W [ZONE-RESET-AUDIT]   size-histogram 131072 x4
+0.04.078.796 W [ZONE-RESET-AUDIT]   size-histogram 262144 x16
+0.04.078.797 W [ZONE-RESET-AUDIT]   size-histogram 393216 x18
+0.04.078.798 W [ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev1 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[4..6]
+0.04.078.798 W [ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+0.04.078.799 W [ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=4 visits_with_live=2 live_max=128 live_total=224 distinct_sizes=8 distinct_cohorts=2 graphs=[4..8]
+0.04.078.800 W [ZONE-RESET-AUDIT]   largest_free first=29462.98 MB last=29463.00 MB min=29462.98 MB
+0.04.078.801 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.802 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=1 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.803 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.804 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=1 tier=0 -> single-shot
+0.04.078.805 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=1 tier=0 -> single-shot
+0.04.078.807 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=1 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.808 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=1 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.809 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=393216 occurrences=6 graphs=1 per_graph=6.00 distinct_alloc_ids=6 role=0 category=1 tier=0 -> single-shot
+0.04.078.809 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=4 occurrences=44 graphs=2 per_graph=22.00 distinct_alloc_ids=28 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.810 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=256 occurrences=2 graphs=2 per_graph=1.00 distinct_alloc_ids=1 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.811 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1024 occurrences=28 graphs=2 per_graph=14.00 distinct_alloc_ids=15 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.812 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=1536 occurrences=4 graphs=1 per_graph=4.00 distinct_alloc_ids=4 role=0 category=2 tier=0 -> single-shot
+0.04.078.813 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=2048 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> single-shot
+0.04.078.813 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=131072 occurrences=4 graphs=2 per_graph=2.00 distinct_alloc_ids=2 role=0 category=2 tier=0 -> RETAINED (lifetime bug only)
+0.04.078.814 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=262144 occurrences=16 graphs=2 per_graph=8.00 distinct_alloc_ids=8 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.815 W [ZONE-RESET-AUDIT]   cohort=weight:leased size=393216 occurrences=18 graphs=2 per_graph=9.00 distinct_alloc_ids=18 role=0 category=2 tier=0 -> REALLOC-EVERY-GRAPH (retention candidate)
+0.04.078.815 W [ZONE-RESET-AUDIT]   size-histogram 4 x88
+0.04.078.816 W [ZONE-RESET-AUDIT]   size-histogram 256 x4
+0.04.078.817 W [ZONE-RESET-AUDIT]   size-histogram 1024 x56
+0.04.078.818 W [ZONE-RESET-AUDIT]   size-histogram 1536 x8
+0.04.078.818 W [ZONE-RESET-AUDIT]   size-histogram 2048 x4
+0.04.078.819 W [ZONE-RESET-AUDIT]   size-histogram 131072 x8
+0.04.078.820 W [ZONE-RESET-AUDIT]   size-histogram 262144 x32
+0.04.078.820 W [ZONE-RESET-AUDIT]   size-histogram 393216 x24
+0.04.078.821 W [ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev1 visits=4 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[4..8]
+0.04.078.821 W [ZONE-RESET-AUDIT]   largest_free first=13584.00 MB last=13584.00 MB min=13584.00 MB
+0.04.078.824 W [ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=8 alloc_MB=2.0 alloc_ms=0.004 free_calls=8 free_ms=0.005 allocs_per_graph_max=2 allocs_per_graph_mean=1.0 graphs=8
+0.04.078.825 W [ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=218 alloc_MB=18.1 alloc_ms=0.084 free_calls=218 free_ms=0.050 allocs_per_graph_max=64 allocs_per_graph_mean=27.2 graphs=8
+0.04.078.826 W [ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=6 alloc_MB=2.3 alloc_ms=0.010 free_calls=5 free_ms=0.012 allocs_per_graph_max=2 allocs_per_graph_mean=0.8 graphs=8
+0.04.078.827 W [ZONE-RESET-AUDIT]   timing vram/scratch alloc_calls=72 alloc_MB=3.8 alloc_ms=0.016 free_calls=72 free_ms=0.018 allocs_per_graph_max=18 allocs_per_graph_mean=6.8 graphs=8
+0.04.078.829 W [ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=20 alloc_MB=18.7 alloc_ms=0.021 free_calls=19 free_ms=0.022 allocs_per_graph_max=4 allocs_per_graph_mean=2.5 graphs=8
+0.04.078.830 W [ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=56 alloc_MB=0.0 alloc_ms=0.026 free_calls=0 free_ms=0.000 allocs_per_graph_max=11 allocs_per_graph_mean=5.6 graphs=8
+0.04.078.831 W [ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=322 alloc_MB=20.7 alloc_ms=0.100 free_calls=322 free_ms=387.407 allocs_per_graph_max=67 allocs_per_graph_mean=37.6 graphs=8
+0.04.078.832 W [ZONE-RESET-AUDIT] ==== end inventory ====
