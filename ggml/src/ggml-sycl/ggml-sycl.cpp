@@ -11568,7 +11568,7 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
         const std::string           key = ggml_sycl_host_weight_registry_key(tensor, extra, owner);
         if (key.empty()) {
-            GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
+            ggml_sycl_diag_emit_warn("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
         }
         sycl_host_weight_extra_entry new_entry{ tensor, extra, owner };
@@ -11576,8 +11576,25 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         if (!insert.second) {
             sycl_host_weight_extra_entry & existing = insert.first->second;
             if (existing.extra != extra || existing.tensor != tensor) {
-                GGML_LOG_WARN("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
-                              tensor->name ? tensor->name : "unknown", (void *) existing.extra, (void *) extra);
+                // llama.cpp-fzem: this branch REPLACES the registry's tracked
+                // (tensor, extra) without ever releasing the OLD extra's own
+                // refcount -- the comment below says "keep the old extra alive"
+                // but nothing else in this codebase calls release_extra_gpu()
+                // on it afterward. If the old extra was registry-owned solely
+                // (refcount==1, the common case), it never reaches 0 again: its
+                // own data_handle[] lease -- taken by S1-PRELOAD's dense-pin
+                // copy-assign like any other -- survives permanently. Two
+                // ggml_tensor objects sharing one registry key (same owner +
+                // same ggml_get_name()) is exactly the tied-embedding/aliased-
+                // tensor shape (llama_model_saver's own comment: "some models
+                // use the same tensor for tok_embd and output"). Bumped to the
+                // raw-stderr-bypass helper: plain GGML_LOG_WARN here was
+                // silently swallowed by test_backends()'s log filter in every
+                // capture this investigation has taken so far (round 6), so a
+                // zero-occurrences read on this line was never valid evidence.
+                ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
+                                         tensor->name ? tensor->name : "unknown", (void *) existing.extra,
+                                         (void *) extra);
                 // Treat as stale registry entry and replace it. Keep the old
                 // extra alive to avoid freeing resources still in use by in-flight kernels.
                 existing       = new_entry;
