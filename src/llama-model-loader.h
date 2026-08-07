@@ -13,7 +13,9 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -81,6 +83,11 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    // Path of each entry in `files`, same order and length. Empty when the model
+    // was loaded from an already-open handle and has no path. Backends key their
+    // weight caches on a whole-file identity built from this plus the file size,
+    // which is what keeps two models' splits from answering to one identity.
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

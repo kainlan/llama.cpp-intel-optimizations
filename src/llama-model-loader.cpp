@@ -29,6 +29,7 @@ struct llama_model_loader_sycl_hooks {
     decltype(&ggml_backend_sycl_host_buffer_type_for_device) host_buffer_type_for_device = nullptr;
     decltype(&ggml_backend_sycl_register_host_weight_tensor) register_host_weight        = nullptr;
     decltype(&ggml_backend_sycl_register_weight_identity)    register_identity           = nullptr;
+    decltype(&ggml_backend_sycl_register_gguf_file_identity) register_file_identity      = nullptr;
     decltype(&ggml_backend_sycl_try_register_weight_usage)   try_register_usage          = nullptr;
 };
 
@@ -47,6 +48,7 @@ static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_back
     LOAD_SYCL_PROC(host_buffer_type_for_device, "ggml_backend_sycl_host_buffer_type_for_device");
     LOAD_SYCL_PROC(register_host_weight, "ggml_backend_sycl_register_host_weight_tensor");
     LOAD_SYCL_PROC(register_identity, "ggml_backend_sycl_register_weight_identity");
+    LOAD_SYCL_PROC(register_file_identity, "ggml_backend_sycl_register_gguf_file_identity");
     LOAD_SYCL_PROC(try_register_usage, "ggml_backend_sycl_try_register_weight_usage");
 #    undef LOAD_SYCL_PROC
     return hooks;
@@ -596,6 +598,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -607,6 +610,9 @@ llama_model_loader::llama_model_loader(
                 use_direct_io = false;
 
                 // reopen file using std::fopen for mmap
+                // Replaces the same index with the same fname, so file_paths
+                // stays correct and must NOT be touched -- see the parallel
+                // array invariant on file_paths in llama-model-loader.h.
                 files.pop_back();
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
             }
@@ -678,6 +684,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -722,6 +729,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();  // loaded from an open handle: no path to identify the file by
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1337,6 +1345,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         const auto weight = weights_map.find(ggml_get_name(tensor));
         if (weight != weights_map.end()) {
+            // Publish the split's own identity before the tensor's, so the
+            // weight key can be keyed on the file rather than on a split index
+            // that every model has. Idempotent, hence the unconditional call.
+            const size_t idx = weight->second.idx;
+            if (sycl_hooks.register_file_identity && idx < files.size() && idx < file_paths.size() &&
+                !file_paths[idx].empty()) {
+                sycl_hooks.register_file_identity(weight->second.idx, file_paths[idx].c_str(),
+                                                  (uint64_t) files[idx]->size());
+            }
             sycl_hooks.register_identity(tensor, weight->second.idx, weight->second.offs, ggml_nbytes(tensor), 0);
         }
         if (sycl_hooks.weights_evictable()) {

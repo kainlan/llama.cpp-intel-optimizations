@@ -4458,11 +4458,13 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
         }
     }
     if (reason && std::strstr(reason, "moe-phase-layout") != nullptr) {
+        // Must track cache_id_equal's field list -- see the static_assert in
+        // unified-cache-key.hpp, which fires when a field is added here.
         auto same_logical_moe_expert = [](const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
             if (!a.valid || !b.valid || a.model_id != b.model_id || a.has_gguf != b.has_gguf ||
-                a.file_idx != b.file_idx || a.file_offs != b.file_offs || a.nbytes != b.nbytes ||
-                a.name_hash != b.name_hash || a.type != b.type || a.tp_sharded != b.tp_sharded ||
-                a.tp_rank != b.tp_rank || a.tp_world_size != b.tp_world_size) {
+                a.file_id != b.file_id || a.file_idx != b.file_idx || a.file_offs != b.file_offs ||
+                a.nbytes != b.nbytes || a.name_hash != b.name_hash || a.type != b.type ||
+                a.tp_sharded != b.tp_sharded || a.tp_rank != b.tp_rank || a.tp_world_size != b.tp_world_size) {
                 return false;
             }
             for (int i = 0; i < GGML_MAX_DIMS; ++i) {
@@ -11299,6 +11301,7 @@ static ggml_sycl_cache_id make_expert_cache_id(const char * tensor_name,
     id.valid         = true;
     id.model_id      = model_id;
     id.has_gguf      = false;
+    id.file_id       = 0;
     id.file_idx      = 0;
     id.file_offs     = 0;
     id.nbytes        = 0;

@@ -119,13 +119,25 @@ GGML_BACKEND_API void ggml_backend_sycl_register_host_weight_tensor(ggml_backend
 
 // Cache identity for weights and MoE experts (no pointers, layout handled separately).
 // model_id: unique per model load
-// has_gguf/file_idx/file_offs/nbytes: GGUF-backed weights
+// has_gguf/file_id/file_idx/file_offs/nbytes: GGUF-backed weights
 // name_hash/type/ne: non-GGUF weights (fallback identity)
 // aux_id: reserved for non-GGUF/MoE uniqueness (e.g., cache_uuid)
+//
+// A GGUF-backed weight is identified by WHERE ITS BYTES LIVE, not by which model
+// or graph node happens to name them: (file_id, file_offs, nbytes, type, ne) is
+// the whole identity, and model_id/name_hash are deliberately excluded from
+// equality for such keys.  Two tensors over the same bytes -- a tied embedding
+// and output head, or the same file opened by two models -- are one cache entry.
+//
+// file_idx is only a split index WITHIN one model, so it cannot separate models
+// on its own; file_id is the whole-file identity that does, published through
+// ggml_backend_sycl_register_gguf_file_identity().  A weight without GGUF
+// identity keeps every logical field in its key and never shares.
 struct ggml_sycl_cache_id {
     bool           valid;
     uint64_t       model_id;
     bool           has_gguf;
+    uint64_t       file_id;
     uint16_t       file_idx;
     size_t         file_offs;
     size_t         nbytes;
@@ -140,12 +152,33 @@ struct ggml_sycl_cache_id {
     uint64_t       aux_id;
 };
 
+// Publish the physical identity of one GGUF split file, so that weight
+// identities registered for that split carry a file identity that is unique
+// across models rather than a per-model split index.  Call it for a split
+// before registering its tensors.
+// file_idx: GGUF split index, as passed to ggml_backend_sycl_register_weight_identity
+// path: the split's file path ("" or NULL when the model was loaded from a
+//       already-open handle and has no path)
+// file_size: the split's byte size
+// A split that is never published still gets a file identity, derived from the
+// model instead: weights then never collide across models, but two models over
+// the same file no longer share one cached copy.
+GGML_BACKEND_API void ggml_backend_sycl_register_gguf_file_identity(uint16_t     file_idx,
+                                                                    const char * path,
+                                                                    uint64_t     file_size);
+
 // Register GGUF metadata for stable weight identity in the unified cache.
 // tensor: GGUF tensor
 // model_id: unique per model load
 // file_idx: GGUF split index
 // file_offs: byte offset in the GGUF file
 // tensor_nbytes: GGUF tensor byte size
+//
+// Normally called from inside a model load transaction, which supplies the
+// owning model/load identity and makes model_id==0 the usual argument.  Outside
+// one there is no lifecycle owner to attribute the registration to, so the
+// caller MUST declare a non-zero model_id; the registration is then readable
+// only while the process still has no model loaded.
 GGML_BACKEND_API void ggml_backend_sycl_register_weight_identity(const struct ggml_tensor * tensor,
                                                                  uint16_t                   file_idx,
                                                                  size_t                     file_offs,

@@ -9096,6 +9096,18 @@ static std::string ggml_sycl_owner_name_key(ggml_sycl::lifecycle::ModelToken own
            std::to_string(owner.owner.slot) + ":" + std::to_string(owner.owner.generation) + ":" + name;
 }
 
+// Registry key for a published split-file identity.  The "#file" segment cannot
+// occur in a tensor name, so file rows and weight rows share the owner prefix
+// without ever colliding.
+static std::string ggml_sycl_owner_file_key(ggml_sycl::lifecycle::ModelToken owner, uint16_t file_idx) {
+    if (owner.model.value == 0 || owner.load.value == 0) {
+        return {};
+    }
+    return std::to_string(owner.model.value) + ":" + std::to_string(owner.load.value) + ":" +
+           std::to_string(owner.owner.slot) + ":" + std::to_string(owner.owner.generation) +
+           ":#file:" + std::to_string(file_idx);
+}
+
 static std::string ggml_sycl_host_weight_registry_key(const ggml_tensor *              tensor,
                                                       const ggml_tensor_extra_gpu *    extra,
                                                       ggml_sycl::lifecycle::ModelToken owner) {
@@ -9379,6 +9391,7 @@ static uint64_t ggml_sycl_assign_cache_uuid(ggml_tensor_extra_gpu * extra) {
 
 struct ggml_sycl_weight_identity {
     uint16_t file_idx        = 0;
+    uint64_t file_id         = 0;
     size_t   file_offs       = 0;
     size_t   nbytes          = 0;
     uint64_t model_id        = 0;
@@ -9389,6 +9402,32 @@ struct ggml_sycl_weight_identity {
 
 static size_t ggml_sycl_hash_combine(size_t seed, size_t value) {
     return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+}
+
+// Whole-file identity of a GGUF split, from the split's path and byte size.  Two
+// loads of the same file agree on it; two different files do not.  This is what
+// makes cache_id_equal's model_id-free comparison safe -- file_idx alone is a
+// per-model split index and every model has a file_idx 0.
+static uint64_t ggml_sycl_file_id_from_path(const char * path, uint64_t file_size) {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+    size_t h = std::hash<std::string>()(std::string(path));
+    h        = ggml_sycl_hash_combine(h, std::hash<uint64_t>()(file_size));
+    h        = ggml_sycl_hash_combine(h, static_cast<size_t>(0x47475546ULL));  // "GGUF": keep clear of the fallback
+    const uint64_t id = static_cast<uint64_t>(h);
+    return id != 0 ? id : 1;                                                   // 0 means "no file identity"
+}
+
+// Fallback for a split whose path was never published.  Deriving it from the
+// owning model keeps two models' weights apart, which is the property that must
+// not be lost; what is lost is the sharing of one file mapped by two models.
+static uint64_t ggml_sycl_file_id_from_model(uint64_t model_id, uint16_t file_idx) {
+    size_t h          = std::hash<uint64_t>()(model_id);
+    h                 = ggml_sycl_hash_combine(h, std::hash<uint16_t>()(file_idx));
+    h                 = ggml_sycl_hash_combine(h, static_cast<size_t>(0x4E4F5041ULL));  // "NOPA": no path published
+    const uint64_t id = static_cast<uint64_t>(h);
+    return id != 0 ? id : 1;
 }
 
 static bool ggml_sycl_cache_assert_enabled();
@@ -9660,6 +9699,32 @@ struct ggml_sycl_weight_key_meta {
 
 static std::mutex                                                 g_sycl_weight_identity_mutex;
 static std::unordered_map<std::string, ggml_sycl_weight_identity> g_sycl_weight_identities_by_name;
+// Published split-file identities, keyed like the weight identities so that one
+// load cannot read another's files.  See ggml_sycl_owner_file_key().
+static std::unordered_map<std::string, uint64_t>                  g_sycl_gguf_file_ids;
+// Identities registered outside any load transaction, keyed by BARE TENSOR NAME
+// with no owner scoping, and never erased.  Read the constraints before adding a
+// caller:
+//
+//   * Reachable only when there is no owner at all -- no bound load candidate,
+//     no published plan, and no model named by the tensor's extra.  The read is
+//     gated on that in ggml_backend_sycl_get_weight_cache_key(); once any model
+//     is loaded this table is dead.
+//   * Test-only in practice.  The production loader passes model_id == 0, which
+//     ggml_backend_sycl_register_weight_identity() refuses on this path, so
+//     nothing in a real model load ever writes here.
+//   * Last-write-wins on name collision, deliberately.  Two callers declaring
+//     different models for one tensor name leave only the later.  That is
+//     tolerable precisely because the table is unreachable with a model loaded;
+//     the keys built from whichever entry survives are still model-correct,
+//     since each carries its declared model_id and a file_id derived from it.
+//
+// A real caller with model_id != 0 -- anything that must stay readable while a
+// model is live -- must give this an owner scope first, the way
+// g_sycl_weight_identities_by_name is scoped by ggml_sycl_owner_name_key().
+// Widening the read gate without that hands a live model another model's file
+// offsets under a matching name.
+static std::unordered_map<std::string, ggml_sycl_weight_identity> g_sycl_weight_identities_unowned;
 static std::unordered_map<std::string, uint64_t>                  g_sycl_named_weight_cache_uuids;
 static std::mutex                                                 g_sycl_weight_usage_mutex;
 // Weight classification is immutable model-owned metadata. The exact owner
@@ -10235,6 +10300,12 @@ static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::Mo
             } else {
                 ++it;
             }
+        }
+        // Published split identities carry the same owner prefix and must go
+        // with them, or a later load reusing the slot would inherit this one's
+        // files.
+        for (auto it = g_sycl_gguf_file_ids.begin(); it != g_sycl_gguf_file_ids.end();) {
+            it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_gguf_file_ids.erase(it) : std::next(it);
         }
     }
     {
@@ -11422,6 +11493,40 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
     }
 }
 
+void ggml_backend_sycl_register_gguf_file_identity(uint16_t file_idx, const char * path, uint64_t file_size) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return;
+    }
+
+    const uint64_t file_id = ggml_sycl_file_id_from_path(path, file_size);
+    if (file_id == 0) {
+        // No path to identify the split by.  Say nothing rather than publish a
+        // guess: the weight registrations then fall back to a model-derived
+        // file identity, which is isolating.
+        return;
+    }
+
+    auto &                                  registry = ggml_sycl::lifecycle::global_registry();
+    ggml_sycl::lifecycle::load_effect_lease effect;
+    try {
+        effect = registry.acquire_load_effect(registry.bound_candidate());
+    } catch (...) {
+        return;
+    }
+    if (!effect) {
+        return;
+    }
+
+    const std::string key = ggml_sycl_owner_file_key(effect.owner, file_idx);
+    if (key.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+    g_sycl_gguf_file_ids[key] = file_id;
+}
+
 void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
                                                 uint16_t            file_idx,
                                                 size_t              file_offs,
@@ -11440,9 +11545,32 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
     } catch (...) {
         return;
     }
+
     if (!effect) {
+        // No load transaction is open, so nothing but the caller can say which
+        // model these bytes belong to -- refuse rather than invent an owner.
+        if (model_id == 0) {
+            return;
+        }
+        ggml_sycl::dispatch_tuning::ensure_model_loaded(model_id);
+
+        const char * name = ggml_get_name(tensor);
+        if (!name || !name[0]) {
+            return;
+        }
+
+        ggml_sycl_weight_identity identity{};
+        identity.file_idx  = file_idx;
+        identity.file_id   = ggml_sycl_file_id_from_model(model_id, file_idx);
+        identity.file_offs = file_offs;
+        identity.nbytes    = tensor_nbytes;
+        identity.model_id  = model_id;
+
+        std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+        g_sycl_weight_identities_unowned[name] = identity;
         return;
     }
+
     const auto token = effect.owner;
     if (model_id != 0 && token.model.value != model_id) {
         return;
@@ -11450,18 +11578,34 @@ void ggml_backend_sycl_register_weight_identity(const ggml_tensor * tensor,
     model_id = token.model.value;
     ggml_sycl::dispatch_tuning::ensure_model_loaded(model_id);
 
-    const ggml_sycl_weight_identity identity = { file_idx,         file_offs,        tensor_nbytes,         model_id,
-                                                 token.load.value, token.owner.slot, token.owner.generation };
+    const ggml_sycl::lifecycle::ModelToken owner{
+        { model_id },
+        { token.load.value },
+        { token.owner.slot, token.owner.generation }
+    };
 
     std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
 
+    // The split's own identity, when the loader published it.  Falling back to a
+    // model-derived one costs cross-model sharing of this file and nothing else;
+    // what it must never do is let two models' splits answer to one identity.
+    uint64_t   file_id  = 0;
+    const auto file_key = ggml_sycl_owner_file_key(owner, file_idx);
+    if (!file_key.empty()) {
+        auto file_it = g_sycl_gguf_file_ids.find(file_key);
+        if (file_it != g_sycl_gguf_file_ids.end()) {
+            file_id = file_it->second;
+        }
+    }
+    if (file_id == 0) {
+        file_id = ggml_sycl_file_id_from_model(model_id, file_idx);
+    }
+
+    const ggml_sycl_weight_identity identity = { file_idx, file_id,          file_offs,        tensor_nbytes,
+                                                 model_id, token.load.value, token.owner.slot, token.owner.generation };
+
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        const ggml_sycl::lifecycle::ModelToken owner{
-            { model_id },
-            { identity.load_txn_id },
-            { identity.slot, identity.slot_generation }
-        };
         g_sycl_weight_identities_by_name[ggml_sycl_owner_name_key(owner, name)] = identity;
     }
 
@@ -11633,12 +11777,38 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     ggml_sycl_weight_identity identity{};
 
     if (!name.empty() && name != "unknown") {
-        const auto snapshot = ggml_sycl_identity_plan_snapshot();
-        const auto owner    = ggml_sycl_identity_owner(snapshot);
-        auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
-        if (name_it != g_sycl_weight_identities_by_name.end()) {
-            identity          = name_it->second;
-            has_gguf_identity = true;
+        // Resolve the owner from the tensor's own extra where it has one.  The
+        // published plan names a single model, so with two models loaded the
+        // one that is not published would otherwise find no identity at all and
+        // silently drop to the fallback UUID path.  Same lookup order as
+        // ggml_sycl_get_tensor_usage().
+        ggml_sycl::lifecycle::ModelToken owner{};
+        if (extra && extra->model_id != 0) {
+            const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
+            if (state) {
+                owner = state->token;
+            }
+        }
+        if (owner.model.value == 0) {
+            owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+        }
+
+        if (owner.model.value != 0) {
+            auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
+            if (name_it != g_sycl_weight_identities_by_name.end()) {
+                identity          = name_it->second;
+                has_gguf_identity = true;
+            }
+        } else {
+            // No owner anywhere: no load in flight, no published plan, no model
+            // named by the extra.  Nothing is loaded, so an identity registered
+            // outside a load transaction cannot be confused with a live model's
+            // weight, and this is the only place it is visible.
+            auto unowned_it = g_sycl_weight_identities_unowned.find(name);
+            if (unowned_it != g_sycl_weight_identities_unowned.end()) {
+                identity          = unowned_it->second;
+                has_gguf_identity = true;
+            }
         }
     }
 
@@ -11663,16 +11833,16 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
         id.model_id = identity.model_id;
     }
     id.has_gguf  = has_gguf_identity;
+    id.file_id   = has_gguf_identity ? identity.file_id : 0;
     id.file_idx  = has_gguf_identity ? identity.file_idx : 0;
     id.file_offs = has_gguf_identity ? identity.file_offs : 0;
     id.nbytes    = has_gguf_identity ? identity.nbytes : ggml_nbytes(tensor);
-    // Always preserve name_hash to ensure unique tensor identities.
-    // Previously we discarded name_hash for GGUF-backed tensors assuming GGUF metadata
-    // (file_idx, file_offs, nbytes) would be unique. However, this causes collisions when:
-    // - Multiple MoE experts share file offsets (stored contiguously)
-    // - Tensor views/reshapes share the same underlying data
-    // - Intermediate tensors get GGUF identity via name lookup
-    // The name_hash provides the additional uniqueness needed to distinguish them.
+    // name_hash is carried for diagnostics and for the non-GGUF identity, but it
+    // does NOT participate in equality for a GGUF-backed weight: two names over
+    // one (file_id, file_offs, nbytes, type, ne) are one weight, and separating
+    // them is what stops a tied embedding/output head sharing a cache entry.
+    // See cache_id_equal() in unified-cache-key.hpp.  MoE experts are unaffected;
+    // they take the has_gguf=false expert key path above.
     id.name_hash = name_hash;
     id.type      = tensor->type;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
@@ -11733,6 +11903,7 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
     id.valid     = true;
     id.model_id  = 0;  // No model ID for non-weight tensors
     id.has_gguf  = false;
+    id.file_id   = 0;
     id.file_idx  = 0;
     id.file_offs = static_cast<size_t>(data_id);
     id.nbytes    = ggml_nbytes(tensor);
@@ -18742,6 +18913,7 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
     // underlying expert memory, so model_id must not participate in this key.
     id.model_id      = 0;
     id.has_gguf      = false;
+    id.file_id       = 0;
     id.file_idx      = 0;
     id.file_offs     = 0;
     id.nbytes        = 0;
@@ -99159,6 +99331,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_register_weight_identity") == 0) {
         return (void *) ggml_backend_sycl_register_weight_identity;
+    }
+    if (strcmp(name, "ggml_backend_sycl_register_gguf_file_identity") == 0) {
+        return (void *) ggml_backend_sycl_register_gguf_file_identity;
     }
     if (strcmp(name, "ggml_backend_sycl_register_weight_usage") == 0) {
         return (void *) ggml_backend_sycl_register_weight_usage;

@@ -1931,6 +1931,8 @@ static bool retained_make_key(const ggml_tensor * tensor, int device, retained_c
     return true;
 }
 
+// Must track cache_id_equal's field list -- see the static_assert in
+// unified-cache-key.hpp, which fires when a field is added here.
 static bool retained_cache_id_less(const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
     if (a.valid != b.valid) {
         return a.valid < b.valid;
@@ -1940,6 +1942,9 @@ static bool retained_cache_id_less(const ggml_sycl_cache_id & a, const ggml_sycl
     }
     if (a.has_gguf != b.has_gguf) {
         return a.has_gguf < b.has_gguf;
+    }
+    if (a.file_id != b.file_id) {
+        return a.file_id < b.file_id;
     }
     if (a.file_idx != b.file_idx) {
         return a.file_idx < b.file_idx;

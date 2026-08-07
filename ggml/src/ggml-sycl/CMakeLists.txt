@@ -351,6 +351,19 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-source.py)
     set_tests_properties(sycl-pp-moe-scratch-source PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
+    # The n3pw physical-identity ruling for weight cache keys. The three
+    # executable tests (weight-key-stability, weight-key-uniqueness,
+    # moe-identity-hash) prove the policy against keys they build; none of them
+    # can see that model_id and name_hash are excluded from a GGUF-backed
+    # comparison BY THE ABSENCE OF A LINE, and two of the three still pass with
+    # either quietly folded back in. This gate holds that shape, with mutants.
+    add_test(NAME sycl-weight-key-identity-policy
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-weight-key-identity-policy.py
+            --self-test)
+    # Deliberately NOT labelled "cache": that label is in the memory-hazard
+    # denylist the full sweep excludes, and this gate allocates nothing.
+    set_tests_properties(sycl-weight-key-identity-policy PROPERTIES LABELS "sycl;weight-key;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
@@ -3056,6 +3069,9 @@ add_test(NAME test-sycl-moe-identity-hash COMMAND test-sycl-moe-identity-hash)
 set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Exits 77 when the binary was built without GGML_USE_SYCL; without this the
+    # skip would be reported as a failure instead of a skip.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
