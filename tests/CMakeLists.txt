@@ -611,6 +611,36 @@ if (NOT WIN32)
         TIMEOUT 300
     )
 
+    # Wiring gate for the Phase 0 zone-reset escape audit (llama.cpp-iiff). The
+    # audit is env-gated instrumentation whose output IS the deliverable, and its
+    # characteristic failure is silent: a reset site carrying no hook contributes
+    # nothing to the capture, and a capture missing a site looks exactly like a
+    # site with no escapes. It also encodes the canonical §12.5 lock order --
+    # the audit mutex is isolated D and stays clear of the L4/L5 allocator locks
+    # only through the declaration order of a stack guard, which is invisible at
+    # the call site and easy to "tidy" away.
+    #
+    # llama_test_cmd rather than llama_test_pytest: this is a plain script with
+    # top-level checks, not pytest test_ functions (see llama_test_pytest's own
+    # doc comment above). --self-test is passed so the positive controls for the
+    # order- and absence-based checks run in CI, not only by hand: those checks
+    # pass vacuously on any tree that never had the defect.
+    #
+    # Host-only -- reads sources, builds nothing, loads no model, touches no
+    # device. Labels deliberately avoid residency/mem-handle/cache so the
+    # documented `-LE` throttled sweep still runs it.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-zone-reset-audit-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-zone-reset-audit-source.py --self-test
+    )
+    set_tests_properties(test-sycl-zone-reset-audit-source PROPERTIES
+        LABELS "sycl;policy;audit"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         NAME test-sycl-decode-timeline-profile-script

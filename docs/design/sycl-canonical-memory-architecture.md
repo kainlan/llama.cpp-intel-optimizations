@@ -847,7 +847,7 @@ The target lock inventory and mandatory order is concrete:
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
 | L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `g_onednn_scratch_lock_mutex`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
-| isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
+| isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
 This table is exhaustive for locks touched by the lifecycle, graph, cache,
 staging, pool, and event-retention paths in scope. Foundation owner `32dg8.15.12` must update it in the
@@ -879,6 +879,27 @@ two L3 locks are never co-held. The source contract
 `tests/test-sycl-moe-bias-owner-contract.py` gates both halves of the leaf
 property: that every accessor takes the lock, and that none takes another while
 holding it.
+
+The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
+`iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`
+mode accumulates. It is a diagnostic lock and sits at isolated D on the same
+terms as the others: it is **strictly leaf**, acquires no other lock, allocates
+no device memory and submits no device work. It is never taken at all unless the
+environment variable is set.
+
+Keeping it clear of L1-L5 is the one part that is not obvious from the call
+sites, because every reset site reads its live set **under** an allocator lock --
+`vram_zone::alloc_mutex` and `g_runtime_alloc_mutex` (L5) at the two zone resets,
+`rw_mutex_` (L4) at the weight reclaim. The audit therefore never records from
+inside those scans. It fills a stack-local `zone_audit_site_visit` guard that is
+**declared before** the allocator lock guard, so reverse destruction order takes
+the record after every allocator lock has been released -- and still on the early
+`return` paths the refusals take, which is exactly where the escapes are.
+
+That ordering is invisible at the call site and reads as a stray declaration, so
+it is gated by `tests/test-sycl-zone-reset-audit-source.py`, which asserts the
+guard precedes the lock at each of the four sites and carries positive-control
+mutants that reorder them.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and

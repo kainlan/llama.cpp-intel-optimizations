@@ -651,6 +651,10 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
                     elapsed_ms, (long long) timeout_ms, n_devices);
             fflush(stderr);
             ggml_sycl_cleanup_host_allocations();
+            // _Exit bypasses atexit, so the zone-reset audit's exit report would
+            // never run on exactly the runs most worth auditing. Flush it here.
+            // No-op unless GGML_SYCL_ZONE_RESET_AUDIT is set.
+            ggml_sycl::zone_reset_audit_report("sycl-watchdog-exit");
             // _Exit bypasses atexit/destructors which might deadlock on stuck threads
             std::_Exit(1);
         }

@@ -271,6 +271,33 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_MOE_LAYOUT_DEBUG=1` | Emit the `[MOE-LAYOUT]` per-pass summary unconditionally. The down-i8 / gateup-i8 lines already fire on ANY decline without this; the variable adds the lines a fully-successful pass would otherwise not print. |
 | `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=<N>` | Hard cap on how many down tensors the MoE I8 layout pass upgrades. Unset (or negative) = no cap, the shipping behaviour; `0` disables the upgrade. **Diagnostic only — do not set in production.** See the measured cost below. |
 | `GGML_SYCL_ARENA_PP_PROFILE=1` | Emit `[ARENA-PP-*]` counters, including `[ARENA-PP-ONEDNN] … reserve_req_mb=W/A` — the summed oneDNN weights/activations reservation requests. This is the **only** log that reports what was actually asked for, as opposed to what was planned. |
+| `GGML_SYCL_ZONE_RESET_AUDIT=1\|2` | Default OFF. Phase 0 of the retire-zone-reset epic (llama.cpp-iiff): every reset/drain site reports what is still live in its zone as `[ZONE-RESET-AUDIT]` lines, with the allocation's own `alloc_id`/`cohort`/`role`/`category` attribution. `=1` changes no behaviour and is safe across the whole gate set. `=2` additionally suppresses the reset even when the zone is clean — host SCRATCH/STAGING are reset-only by design, so that leaks without bound. See below. |
+
+### `GGML_SYCL_ZONE_RESET_AUDIT` — reading a capture
+
+Four sites report: `device-zone-reset/<zone>:devN`, `host-zone-reset/<zone>`,
+`scratch-pool-reset/bump:devN`, and `weight-reclaim/<mode>:devN` (the mode being
+`load-boundary`, `mid-load-replan` or `model-teardown`).
+
+Read `visits_with_live` against `visits` first. They exist because an **empty
+capture is not evidence of zero escapes** — it is equally consistent with the
+site never having been reached. `visits=0` for a site means it does not appear at
+all; a run that reached no site at all says so outright
+(`NO RESET SITE WAS VISITED … this run proves NOTHING`).
+
+Output goes to WARN plus a raw `stderr` copy, deliberately: `GGML_LOG_INFO` is
+dropped at default verbosity in **every** tool, so an INFO-level audit line would
+produce an empty capture indistinguishable from a clean one. A full inventory is
+re-emitted every 256 site visits, at process exit, from the SYCL watchdog before
+its `_Exit(1)`, and from a `SIGSEGV`/`SIGABRT` handler — the runs with the
+confirmed escapes are the runs that crash.
+
+The attribution is read from the allocation, never re-derived. It became
+trustworthy only with llama.cpp-f9tg (`85eb63dcb` / `810ae7fef`); captures taken
+before that fix mislabel COMPUTE/CONTROL allocations as GRAPH.
+
+The audit frees nothing and resets nothing at `=1`. Everything it reports stays
+owned by whoever already holds its handle.
 
 ### `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS` — what it costs to cap
 
