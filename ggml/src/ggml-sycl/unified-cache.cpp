@@ -149,6 +149,13 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     snapshot->model_n_layer = model_n_layer;
     snapshot->kv_info       = kv_info;
     snapshot->plan          = std::make_shared<const placement_plan>(std::move(plan));
+    // Exactly the expression lifecycle_publish_placement_plan() uses, so a
+    // candidate answers the planned-host question the same way its own
+    // publication will.  Leaving it zero made every mid-load reader see "no
+    // host placement" for a plan that placed weights on host, which is how the
+    // current-model tiering verdict kept answering from the PREVIOUS model
+    // until commit.
+    snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
