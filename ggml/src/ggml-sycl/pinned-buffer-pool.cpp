@@ -38,12 +38,34 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     const size_t act_bytes = max_experts * act_dim * sizeof(float);
     const size_t out_bytes = max_experts * out_dim * sizeof(float);
 
-    // Allocate activation pool via unified_alloc with pinned host constraint
+    // Allocate activation pool via unified_alloc with pinned host constraint.
+    //
+    // role=COMPUTE, not EXPERT_STAGING (llama.cpp-cg8j): this pool is a
+    // lazy-once singleton allocated on the first MUL_MAT_ID graph and held
+    // for the process lifetime (see shutdown() -- released only at module
+    // shutdown), not a per-graph ephemeral staging buffer. alloc_role::
+    // EXPERT_STAGING is force-routed to the host SCRATCH zone by
+    // select_zone() specifically so that genuinely short-lived EXPERT_STAGING
+    // leaks stay visible to host_zone_reset()'s per-graph live scan (that
+    // routing exists on purpose -- see 9a0670712 / llama.cpp-0igs /
+    // llama.cpp-7f2e, which fixed the opposite bug of persistent allocations
+    // being silently hidden in the unswept WEIGHT zone). A handle that is
+    // deliberately retained forever is not what that scan is meant to catch:
+    // every visit finds it live, host_zone_reset(SCRATCH) refuses forever,
+    // and the Phase-0 audit logs it as a permanent "NEW-ESCAPE" even though
+    // there is no leak (single alloc_id, freed once at shutdown via the
+    // WEIGHT zone's own per-allocation host_zone_free() TLSF reclaim).
+    // role=COMPUTE + category=EXPERT_CACHE mirrors the existing
+    // g_retained_scratch precedent in cpu-dispatch.cpp (role=COMPUTE,
+    // category=HOST_COMPUTE): both hit select_zone()'s category-based WEIGHT
+    // branch, which is never swept by host_zone_reset(), while leaving the
+    // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
+    // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.
     alloc_request req_act;
     req_act.queue                               = &q;
     req_act.device                              = device_id;
     req_act.size                                = act_bytes;
-    req_act.intent.role                         = alloc_role::EXPERT_STAGING;
+    req_act.intent.role                         = alloc_role::COMPUTE;
     req_act.intent.category                     = runtime_category::EXPERT_CACHE;
     req_act.intent.cohort_id                    = "moe_act_pool";
     req_act.intent.constraints.must_host_pinned = true;

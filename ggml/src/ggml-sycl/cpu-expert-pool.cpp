@@ -65,7 +65,16 @@ void CpuExpertPool::init(int n_threads, size_t max_experts, size_t act_dim, size
         req.size   = total;
         alloc_constraints c;
         c.must_host_pinned = true;
-        req.intent         = { alloc_role::EXPERT_STAGING, runtime_category::EXPERT_CACHE, "cpu_expert_ring", c };
+        // role=COMPUTE, not EXPERT_STAGING (llama.cpp-cg8j): see the matching
+        // comment in pinned-buffer-pool.cpp -- this ring buffer is a
+        // lazy-once singleton retained for the process lifetime (freed only
+        // in shutdown()), and EXPERT_STAGING is deliberately force-routed to
+        // the per-graph-swept host SCRATCH zone to keep genuinely ephemeral
+        // leaks visible. role=COMPUTE + category=EXPERT_CACHE instead routes
+        // to the WEIGHT host zone (never swept by host_zone_reset(), freed
+        // individually via host_zone_free()), matching the existing
+        // g_retained_scratch precedent in cpu-dispatch.cpp.
+        req.intent         = { alloc_role::COMPUTE, runtime_category::EXPERT_CACHE, "cpu_expert_ring", c };
 
         ring_handle_    = unified_allocate(req);
         auto   resolved = ring_handle_.resolve();
