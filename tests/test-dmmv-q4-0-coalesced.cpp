@@ -134,6 +134,34 @@ static void dmmv_q4_0_dfloat_reference(const block_q4_0_test * x, const float * 
     }
 }
 
+// The same dot product with the ACTIVATION quantized to Q8_0, computed from AoS
+// weights. This is not a gate and never becomes one: it exists so a failing run
+// can report how much of its gap is explained purely by which activation the
+// oracle assumes. The Q4_0 DMMV dispatch has two branches -- src1 as dfloat and
+// src1 quantized to Q8_0 (dequantize_mul_mat_vec_q4_0_coalesced_q8_0) -- and the
+// dfloat reference models only the first. See llama.cpp-szv8.
+static void dmmv_q4_0_q8_activation_reference(const block_q4_0_test * x,
+                                              const block_q8_0 *      y,
+                                              float *                 dst,
+                                              int                     ncols,
+                                              int                     nrows) {
+    const int blocks_per_row = ncols / QK4_0;
+
+    for (int row = 0; row < nrows; row++) {
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_0_test * blk  = &x[row * blocks_per_row + b];
+            int                     sumi = 0;
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                sumi += ((blk->qs[j] & 0xF) - 8) * y[b].qs[j];
+                sumi += ((blk->qs[j] >> 4) - 8) * y[b].qs[j + QK4_0 / 2];
+            }
+            sum += (float) sumi * ggml_fp16_to_fp32(blk->d) * ggml_fp16_to_fp32(y[b].d);
+        }
+        dst[row] = sum;
+    }
+}
+
 static void dmmv_q4_0_cpu_from_coalesced(const uint8_t * coalesced, const float * y, float * dst,
                                          int ncols, int nrows) {
     constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
@@ -258,36 +286,86 @@ static void reorder_q4_0_aos_bytes_to_coalesced(const uint8_t * aos, uint8_t * c
     }
 }
 
-static void compare_device_coalesced_layout(const uint8_t * aos, const uint8_t * device_coalesced,
-                                            int ncols, int nrows) {
+// Block-major quants: the SoA layout, i.e. the coalesced buffer with the
+// word-plane interleave never applied. Named because it is the layout a failing
+// check has actually reported (llama.cpp-szv8): comparing SoA bytes against the
+// coalesced expectation gives first_bad=4, because byte 4 is block 1's word 0
+// under the contract and block 0's word 1 under block-major.
+static void reorder_q4_0_aos_bytes_to_block_major(const uint8_t * aos, uint8_t * soa, int ncols, int nrows) {
+    const int total_blocks       = nrows * (ncols / QK4_0);
+    const int total_quants_bytes = nrows * (ncols / 2);
+
+    for (int ib = 0; ib < total_blocks; ++ib) {
+        const uint8_t * block_aos = aos + (int64_t) ib * sizeof(block_q4_0_test);
+        memcpy(soa + (int64_t) ib * (QK4_0 / 2), block_aos + sizeof(ggml_fp16_t), QK4_0 / 2);
+        memcpy(soa + total_quants_bytes + (int64_t) ib * sizeof(ggml_fp16_t), block_aos, sizeof(ggml_fp16_t));
+    }
+}
+
+static size_t count_byte_mismatches(const uint8_t * a, const uint8_t * b, size_t n, size_t * first_bad) {
+    size_t errors = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+            if (errors == 0 && first_bad) {
+                *first_bad = i;
+            }
+            errors++;
+        }
+    }
+    return errors;
+}
+
+// `from_layout_ptr` says whether the bytes came from the tensor's COALESCED
+// layout pointer. When they did not, the readback fell back to a plain d2h of
+// the tensor's own storage, which holds whatever layout the backend staged --
+// so a mismatch says nothing about any coalesced buffer and must not be
+// reported as a coalesced-layout failure. That distinction is the whole value
+// of this check; without it a red verdict here reads as device corruption.
+static void compare_device_coalesced_layout(const uint8_t * aos,
+                                            const uint8_t * device_coalesced,
+                                            int             ncols,
+                                            int             nrows,
+                                            bool            from_layout_ptr) {
     const int blocks_per_row = ncols / QK4_0;
     const int total_blocks = nrows * blocks_per_row;
     const size_t row_quants_bytes = ncols / 2;
     const size_t total_quants_bytes = (size_t)nrows * row_quants_bytes;
     const size_t expected_bytes = total_quants_bytes + (size_t)total_blocks * sizeof(ggml_fp16_t);
 
+    if (!from_layout_ptr) {
+        printf(
+            "  Coalesced layout check: NOT RUN (no COALESCED layout pointer for this tensor;"
+            " the readback fell back to the tensor's own storage, layout unknown)\n");
+        return;
+    }
+
     std::vector<uint8_t> expected(expected_bytes);
     reorder_q4_0_aos_bytes_to_coalesced(aos, expected.data(), ncols, nrows);
 
-    int errors = 0;
     size_t first_bad = 0;
-    for (size_t i = 0; i < expected_bytes; ++i) {
-        if (expected[i] != device_coalesced[i]) {
-            if (errors == 0) {
-                first_bad = i;
-            }
-            errors++;
-            if (errors > 10) {
-                break;
-            }
-        }
-    }
+    const size_t errors    = count_byte_mismatches(expected.data(), device_coalesced, expected_bytes, &first_bad);
 
     if (errors == 0) {
         printf("  Coalesced layout check: PASSED (bytes=%zu)\n", expected_bytes);
+        return;
+    }
+
+    // Name the layout the device bytes DO match, when they match a known one.
+    // A raw (expected, got) byte pair invites a hunt through the reorder
+    // kernels; "the interleave never ran" points at the one thing to check.
+    std::vector<uint8_t> block_major(expected_bytes);
+    reorder_q4_0_aos_bytes_to_block_major(aos, block_major.data(), ncols, nrows);
+    const size_t soa_errors = count_byte_mismatches(block_major.data(), device_coalesced, expected_bytes, nullptr);
+
+    printf("  Coalesced layout check: FAILED (errors=%zu of %zu bytes, first_bad=%zu expected=0x%02x got=0x%02x)\n",
+           errors, expected_bytes, first_bad, expected[first_bad], device_coalesced[first_bad]);
+    if (soa_errors == 0) {
+        printf("    device bytes are EXACTLY block-major (SoA): the word-plane interleave never ran\n");
     } else {
-        printf("  Coalesced layout check: FAILED (errors=%d, first_bad=%zu expected=0x%02x got=0x%02x)\n",
-               errors, first_bad, expected[first_bad], device_coalesced[first_bad]);
+        printf(
+            "    device bytes match neither the coalesced contract nor block-major"
+            " (block-major mismatches=%zu)\n",
+            soa_errors);
     }
 }
 
@@ -295,13 +373,21 @@ static void compare_device_coalesced_layout(const uint8_t * aos, const uint8_t *
 // GGML Backend Helpers (DMMV path)
 // =============================================================================
 
-static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
-                                const void * weight_data, size_t weight_size,
-                                const float * input_data, int n_embd, int n_rows,
-                                std::vector<float> & output,
-                                std::vector<uint8_t> * weight_out = nullptr,
-                                int device_id = -1,
-                                ggml_layout_mode layout_target = GGML_LAYOUT_AOS) {
+static bool run_mul_mat_backend(ggml_backend_t         backend,
+                                ggml_type              weight_type,
+                                const void *           weight_data,
+                                size_t                 weight_size,
+                                const float *          input_data,
+                                int                    n_embd,
+                                int                    n_rows,
+                                std::vector<float> &   output,
+                                std::vector<uint8_t> * weight_out                 = nullptr,
+                                int                    device_id                  = -1,
+                                ggml_layout_mode       layout_target              = GGML_LAYOUT_AOS,
+                                bool *                 weight_out_from_layout_ptr = nullptr) {
+    if (weight_out_from_layout_ptr) {
+        *weight_out_from_layout_ptr = false;
+    }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
 
     struct ggml_init_params params = {
@@ -373,7 +459,11 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
             if (!copied) {
                 ggml_backend_sycl_memcpy_d2h(weight, weight_out->data(), weight_size);
             }
-            fprintf(stderr, "[LAYOUT-CHECK] readback done\n");
+            if (weight_out_from_layout_ptr) {
+                *weight_out_from_layout_ptr = copied;
+            }
+            fprintf(stderr, "[LAYOUT-CHECK] readback done (source=%s)\n",
+                    copied ? "layout_ptr" : "tensor-storage-fallback");
         }
     }
 
@@ -417,10 +507,10 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
     const bool debug_coalesced = std::getenv("GGML_SYCL_COALESCED_DMMV_DEBUG") != nullptr;
     const bool layout_check = std::getenv("GGML_SYCL_COALESCED_LAYOUT_CHECK") != nullptr;
     std::vector<uint8_t> weight_coalesced;
-    if (!run_mul_mat_backend(gpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes,
-                             input_data.data(), ncols, nrows, gpu_out,
-                             (debug_coalesced || layout_check) ? &weight_coalesced : nullptr,
-                             /*device_id=*/0, GGML_LAYOUT_COALESCED)) {
+    bool                 weight_from_layout_ptr = false;
+    if (!run_mul_mat_backend(gpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes, input_data.data(), ncols,
+                             nrows, gpu_out, (debug_coalesced || layout_check) ? &weight_coalesced : nullptr,
+                             /*device_id=*/0, GGML_LAYOUT_COALESCED, &weight_from_layout_ptr)) {
         printf("  FAIL: GPU backend compute failed\n");
         return false;
     }
@@ -481,7 +571,8 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
         printf("  Debug (coalesced CPU vs GPU): errors=%d max_diff=%.6f\n", errors, max_diff);
     }
     if (layout_check && !weight_coalesced.empty()) {
-        compare_device_coalesced_layout(weight_quant.data(), weight_coalesced.data(), ncols, nrows);
+        compare_device_coalesced_layout(weight_quant.data(), weight_coalesced.data(), ncols, nrows,
+                                        weight_from_layout_ptr);
     }
 
     std::vector<float> ref(nrows);
@@ -520,6 +611,28 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend, ggml_backend_t c
             "  DMMV coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s"
             " (informational: max|gpu-cpu_backend|=%.6f, Q8_0-activation gap)\n",
             ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL", cpu_backend_max_diff);
+    }
+    if (!pass) {
+        // How big is the gap between the two oracles alone? If the GPU's spread
+        // against the dfloat reference sits at this scale, the dispatch took the
+        // Q8_0-activation branch and the reference models the other one; a
+        // layout or addressing defect is orders of magnitude larger than this.
+        const int               blocks_per_row = ncols / QK4_0;
+        std::vector<block_q8_0> y_q8(blocks_per_row);
+        quantize_row_q8_0_ref(input_data.data(), y_q8.data(), ncols);
+
+        std::vector<float> ref_q8(nrows);
+        dmmv_q4_0_q8_activation_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), y_q8.data(),
+                                          ref_q8.data(), ncols, nrows);
+
+        float oracle_gap = 0.0f;
+        for (int i = 0; i < nrows; ++i) {
+            oracle_gap = fmaxf(oracle_gap, fabsf(ref_q8[i] - ref[i]));
+        }
+        printf(
+            "    diagnosis: max|dfloat_oracle - Q8_0_activation_oracle|=%.6f"
+            " (the gap the oracle choice alone accounts for)\n",
+            oracle_gap);
     }
     return pass;
 }
