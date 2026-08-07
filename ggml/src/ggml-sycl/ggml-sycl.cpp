@@ -10339,6 +10339,30 @@ static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::Mo
 // one owner instead of every device.
 static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept;
 
+// llama.cpp-fzem: WARN plus a raw stderr copy, mirroring unified-cache.cpp's
+// zone_audit_emit(). GGML_LOG_WARN alone is NOT enough here: this whole
+// investigation (rounds 3-5) placed WARN diagnostics at every candidate call
+// site and got total silence back, which read as "none of these run" --
+// wrong. tests/test-llama-archs.cpp's test_backends() installs its own
+// llama_log_set() callback (line ~759) with `min_level` defaulting to
+// GGML_LOG_LEVEL_ERROR (line ~1126, no -v passed in any of these captures)
+// and downgrades anything below that to GGML_LOG_LEVEL_DEBUG before handing
+// it to the real logger -- WARN=3 < ERROR=4, so `level >= min_level` is
+// false and every GGML_LOG_WARN from this backend was silently swallowed
+// regardless of whether the code path ran. A raw fputs+fflush bypasses that
+// callback entirely, the same way zone_audit_emit's lines survived while
+// plain WARN calls did not.
+static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
+    char    buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    GGML_LOG_WARN("%s", buf);
+    fputs(buf, stderr);
+    fflush(stderr);
+}
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
@@ -10365,8 +10389,8 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // model-teardown release is the signal a ModelToken-mismatch (or any
     // other unmatched-registration) hypothesis needs and could not get from
     // this line while it was INFO-only.
-    GGML_LOG_WARN("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
-                  reclaimed);
+    ggml_sycl_diag_emit_warn("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot,
+                             rows, reclaimed);
 }
 
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
@@ -10448,7 +10472,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
             // before this call -- silent from here, since the caller
             // (llama_model::~llama_model()) treats OK_ALREADY_DEAD as success
             // and logs nothing.
-            GGML_LOG_WARN(
+            ggml_sycl_diag_emit_warn(
                 "[SYCL] model teardown short-circuited (non-finisher): model=%llu load=%llu slot=%u "
                 "generation=%llu ticket_code=%d\n",
                 (unsigned long long) owner.model.value, (unsigned long long) owner.load.value, owner.owner.slot,
@@ -10791,9 +10815,9 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     // `site` names which of this function's several call sites fired, so a
     // capture can show whether it's reached before or after S1-PRELOAD has
     // taken a dense-pin lease on `owner`'s tensors.
-    GGML_LOG_WARN("[SYCL] abort_owner_effects: site=%s model=%llu load=%llu slot=%u generation=%llu\n", site,
-                  (unsigned long long) owner.model.value, (unsigned long long) owner.load.value, owner.owner.slot,
-                  (unsigned long long) owner.owner.generation);
+    ggml_sycl_diag_emit_warn("[SYCL] abort_owner_effects: site=%s model=%llu load=%llu slot=%u generation=%llu\n", site,
+                             (unsigned long long) owner.model.value, (unsigned long long) owner.load.value,
+                             owner.owner.slot, (unsigned long long) owner.owner.generation);
     bool clean = true;
     try {
         ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
