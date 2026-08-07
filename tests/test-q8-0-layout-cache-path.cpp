@@ -124,11 +124,6 @@ int main() {
         return 1;
     }
 
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev) {
-        ggml_backend_sycl_register_host_weight_tensor(dev, weight);
-    }
-
     std::vector<block_q8_0_test> weight_data(nblocks);
     fill_q8_0_ones(weight_data.data(), nblocks);
 
@@ -136,7 +131,47 @@ int main() {
     std::vector<float> ref_output(nrows, 0.0f);
     compute_reference(weight_data.data(), input_data.data(), ref_output.data(), ncols, nrows);
 
+    // Host-weight registration is only honoured inside a model-load
+    // transaction.  Outside one, ggml_backend_sycl_register_host_weight_tensor
+    // fails to acquire a load-effect lease (WRONG_TRANSACTION) and silently
+    // registers nothing, so the tensor never reaches S1-PRELOAD -- which is the
+    // only producer of a dense-weight SoA cache entry, and runs when the
+    // outermost transaction closes.  This mirrors production:
+    // llama_model_sycl_loading_guard brackets the load and the model loader
+    // registers each host weight inside that bracket.  Register and upload
+    // inside the transaction, then resolve only after it has closed.
+    // Full RCA: llama.cpp-43uy.
+    ggml_sycl::test_clear_host_weight_registry();
+
+    ggml_sycl_load_txn    load{};
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_begin(&load) != GGML_SYCL_LIFECYCLE_OK) {
+        fprintf(stderr, "Failed to begin SYCL model-load transaction\n");
+        ggml_backend_buffer_free(weight_buf);
+        ggml_backend_buffer_free(input_buf);
+        ggml_backend_buffer_free(output_buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev) {
+        ggml_backend_sycl_register_host_weight_tensor(dev, weight);
+    }
+
     ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size() * sizeof(block_q8_0_test));
+
+    if (ggml_backend_sycl_model_load_end(load, true, &model) != GGML_SYCL_LIFECYCLE_OK) {
+        fprintf(stderr, "Failed to end SYCL model-load transaction\n");
+        ggml_backend_buffer_free(weight_buf);
+        ggml_backend_buffer_free(input_buf);
+        ggml_backend_buffer_free(output_buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
     auto         resolved   = ggml_sycl_resolve(weight, 0);
@@ -149,6 +184,7 @@ int main() {
         ggml_backend_buffer_free(output_buf);
         ggml_free(ctx);
         ggml_backend_free(backend);
+        (void) ggml_backend_sycl_model_unloaded_token(model);
         return 1;
     }
     if (layout_ptr == weight->data) {
@@ -158,6 +194,7 @@ int main() {
         ggml_backend_buffer_free(output_buf);
         ggml_free(ctx);
         ggml_backend_free(backend);
+        (void) ggml_backend_sycl_model_unloaded_token(model);
         return 1;
     }
 
@@ -173,6 +210,7 @@ int main() {
         ggml_backend_buffer_free(output_buf);
         ggml_free(ctx);
         ggml_backend_free(backend);
+        (void) ggml_backend_sycl_model_unloaded_token(model);
         return 1;
     }
 
@@ -203,6 +241,7 @@ int main() {
     ggml_backend_buffer_free(output_buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
+    (void) ggml_backend_sycl_model_unloaded_token(model);
 
     return pass ? 0 : 1;
 }
