@@ -210,10 +210,18 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
         }
     }
 
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "FAIL: ggml_backend_graph_compute returned status=%d\n", (int) status);
-        return finish(run_status::FAILED);
+    // The backend's FIRST compute of any topology is a deliberate warmup pass
+    // (ggml-sycl.cpp, warmup_n_nodes gate): it runs without graph recording to
+    // populate the oneDNN primitive cache, and only a SECOND compute of the
+    // same graph records an executable graph.  One compute can therefore never
+    // satisfy the exec-graph precondition below -- run the graph twice, and
+    // compare against the second run's output.
+    for (int pass = 0; pass < 2; ++pass) {
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "FAIL: ggml_backend_graph_compute returned status=%d (pass %d)\n", (int) status, pass);
+            return finish(run_status::FAILED);
+        }
     }
 
     if (require_gpu_graph_path) {
