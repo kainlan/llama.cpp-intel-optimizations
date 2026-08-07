@@ -2203,7 +2203,7 @@ static thread_local bool                                                      g_
 // Canonical ranked inventory/lifecycle publication writer lock. All cache/global
 // placement publications are serialized by this existing lock.
 static std::mutex                                                g_tensor_inventory_mutex;
-static std::atomic<bool>                                         g_fail_next_plan_publication_prepare{ false };
+static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };
 
 static_assert(std::is_nothrow_move_assignable<ggml_sycl::placement_kv_info>::value,
               "prepared placement publication requires nonthrowing KV metadata commit");

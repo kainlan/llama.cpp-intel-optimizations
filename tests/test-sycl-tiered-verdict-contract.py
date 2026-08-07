@@ -210,9 +210,9 @@ ABSENCE_MUTANTS = {
     # and read by the API.
     "no latched process-global host-placement verdict survives": (
         "backend",
-        "static std::atomic<bool>                                         g_fail_next_plan_publication_prepare{ false };",
-        "static std::atomic<bool>                                         g_current_model_planner_host_placement{ false };\n"
-        "static std::atomic<bool>                                         g_fail_next_plan_publication_prepare{ false };"),
+        "static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };",
+        "static std::atomic<bool> g_current_model_planner_host_placement{ false };\n"
+        "static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };"),
     # The conflation this task closes: answer the per-model question with the
     # always-true process gate.
     "the per-model verdict is not routed through the process cache gate": (
