@@ -645,6 +645,16 @@ void mem_handle::store_lease_state_locked(const lease_state & state) const {
 
 void mem_handle::release_lease_state(const lease_state & state) noexcept {
     if (state.entry) {
+        // llama.cpp-fzem: record the release BEFORE the decrement below, not
+        // after -- once in_use_count drops the entry may be evicted, and the
+        // comment on the next line is explicit that this call must never
+        // dereference `entry` again past that point. No caller-site context
+        // is available here (this is the single release path shared by the
+        // destructor, move-assign detach, and copy-assign's stale release),
+        // so every event is tagged with this function's own name; the
+        // acquire-side tags (recorded at the copy ctor/assign call sites)
+        // carry the specific site.
+        state.entry->record_lease_event(false, "mem_handle/release_lease_state");
         // fetch_sub on copyable_atomic_u32::v.  The entry is guaranteed to
         // still exist (this lease held it); after this decrement the entry
         // may be evicted, but we never dereference the pointer again.
@@ -936,6 +946,7 @@ mem_handle::mem_handle(const mem_handle & other) :
             // handle state and takes no cache lock, so it is equally safe inside
             // this critical section.
             leased_entry_->debug_last_lease_site = "mem_handle/copy-ctor";
+            leased_entry_->record_lease_event(true, "mem_handle/copy-ctor");
         }
     }
     // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.  This
@@ -1001,6 +1012,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
             // llama.cpp-2wv5: see the copy ctor -- the copy holds the lease it
             // just took, so it is the site that owes the release.
             new_entry->debug_last_lease_site = "mem_handle/copy-assign";
+            new_entry->record_lease_event(true, "mem_handle/copy-assign");
         }
     }
 
