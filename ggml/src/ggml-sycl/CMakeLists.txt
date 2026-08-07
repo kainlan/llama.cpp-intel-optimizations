@@ -4041,6 +4041,28 @@ set_tests_properties(sycl-mmvq-launch-geometry PROPERTIES
     TIMEOUT 30
 )
 
+# Q4_0 coalesced DMMV addressing + oracle contract (llama.cpp-szv8).
+# Also host-only -- no -fsycl, no device -- but unlike the geometry fixture above
+# it links ggml-base, because the properties it pins are numerical and have to be
+# scored against ggml's own quantizers and fp16 conversion rather than a
+# transcription of them. It still enumerates no device and loads no model.
+add_executable(test-dmmv-coalesced-q4-0-oracle
+    tests/test-dmmv-coalesced-q4-0-oracle.cpp
+)
+target_include_directories(test-dmmv-coalesced-q4-0-oracle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-dmmv-coalesced-q4-0-oracle PRIVATE ggml-base)
+set_target_properties(test-dmmv-coalesced-q4-0-oracle PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-dmmv-coalesced-q4-0-oracle COMMAND test-dmmv-coalesced-q4-0-oracle)
+set_tests_properties(sycl-dmmv-coalesced-q4-0-oracle PROPERTIES
+    LABELS "sycl;dmmv;host-only;tsan-capable"
+    TIMEOUT 60
+)
+
 # AST/control-flow contract plus executable mutation matrix. tree-sitter parses
 # active C++ nodes, so comments and literals cannot spoof reset/TLS/order checks.
 # Python is test-only: its absence must not break a clean SYCL configuration.

@@ -1,0 +1,364 @@
+// Q4_0 coalesced DMMV: layout addressing + the oracle the GPU test compares
+// against (llama.cpp-szv8).
+//
+// Host-only: no SYCL queue, no device, no model. Two things are provable here
+// that a GPU run cannot settle, because both are properties of the arithmetic
+// rather than of the hardware:
+//
+//   1. The coalesced addressing in dmmv-coalesced-q4-0-layout.hpp round-trips.
+//      A reorder written from the header's offsets, read back through the same
+//      offsets, must reconstruct every block -- and must do so for a SLICE of a
+//      tensor, which is the case where deriving the scale base from the slice's
+//      row count instead of the tensor's silently reads quant bytes as fp16
+//      scales.
+//
+//   2. tests/test-dmmv-q4-0-coalesced.cpp used to compare the GPU against the
+//      ggml CPU backend. For a Q4_0 weight the CPU backend quantizes the
+//      ACTIVATION to Q8_0; the SYCL DMMV path does not. `oracle-rejects-exact-
+//      answer` below scores an EXACT f64 dot product against that old oracle
+//      and shows it fails -- so the test could not have been passed by any
+//      implementation, and the 12-31% max_rel it reported was the oracle's
+//      error, not the kernel's.
+//
+// `corrupted-kernel-is-caught` is the positive control for the replacement:
+// a model with the word-plane interleave dropped must FAIL the new comparison,
+// or the new oracle is decorative.
+
+#include "dmmv-coalesced-q4-0-layout.hpp"
+#include "ggml-common.h"
+#include "ggml-quants.h"
+#include "ggml.h"
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using ggml_sycl::dmmv_coalesced_q4_0_qs_offset;
+using ggml_sycl::dmmv_coalesced_q4_0_row_quants_bytes;
+using ggml_sycl::dmmv_coalesced_q4_0_scale_base;
+using ggml_sycl::dmmv_coalesced_q4_0_scale_index;
+using ggml_sycl::DMMV_COALESCED_TILE_BLOCKS;
+using ggml_sycl::dmmv_coalesced_tile_count;
+
+// The three shapes tests/test-dmmv-q4-0-coalesced.cpp drives on the GPU.
+struct shape {
+    int ncols;
+    int nrows;
+};
+
+static const shape SHAPES[] = {
+    { 1024, 64  },
+    { 2048, 128 },
+    { 4096, 256 },
+};
+
+static int failures = 0;
+
+static void check(const bool ok, const std::string & name, const std::string & detail) {
+    if (ok) {
+        std::cout << "  PASS  " << name << (detail.empty() ? "" : "  (" + detail + ")") << "\n";
+        return;
+    }
+    std::cout << "  FAIL  " << name << "  " << detail << "\n";
+    failures++;
+}
+
+// -----------------------------------------------------------------------------
+// Data
+// -----------------------------------------------------------------------------
+
+// Same generator the GPU test uses, so the numbers below are comparable to the
+// numbers it prints.
+static void make_inputs(const shape & s, std::vector<float> & weight, std::vector<float> & input) {
+    std::mt19937                          rng(1234 + s.ncols + s.nrows);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    weight.resize((size_t) s.nrows * s.ncols);
+    for (float & v : weight) {
+        v = dist(rng);
+    }
+    input.resize(s.ncols);
+    for (float & v : input) {
+        v = dist(rng);
+    }
+}
+
+// AoS Q4_0 blocks -> coalesced bytes, written entirely through the header's
+// offsets. `total_rows` is the row count of the tensor the layout belongs to;
+// `rows` may be smaller when only a slice is being written.
+static void reorder_to_coalesced(const block_q4_0 *     aos,
+                                 std::vector<uint8_t> & out,
+                                 int                    blocks_per_row,
+                                 int                    total_rows) {
+    const int64_t scale_base = dmmv_coalesced_q4_0_scale_base(total_rows, blocks_per_row);
+    const int64_t n_blocks   = (int64_t) total_rows * blocks_per_row;
+    out.assign((size_t) (scale_base + n_blocks * (int64_t) sizeof(ggml_fp16_t)), 0);
+
+    ggml_fp16_t * scales = (ggml_fp16_t *) (out.data() + scale_base);
+
+    for (int row = 0; row < total_rows; ++row) {
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const block_q4_0 * blk = &aos[(size_t) row * blocks_per_row + b];
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                out[(size_t) dmmv_coalesced_q4_0_qs_offset(row, blocks_per_row, b, j)] = blk->qs[j];
+            }
+            scales[dmmv_coalesced_q4_0_scale_index(row, blocks_per_row, b)] = blk->d;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Models of the kernel
+// -----------------------------------------------------------------------------
+
+// dequantize_mul_mat_vec_q4_0_coalesced, arithmetic and accumulation order
+// preserved: lane `l` owns block_in_tile `l` of every tile, accumulates a
+// per-lane partial, then the sub-group butterfly-reduces. `interleaved=false`
+// drops the word-plane interleave -- the corruption the positive control uses.
+static float kernel_model(const std::vector<uint8_t> & coalesced,
+                          const std::vector<float> &   yh,
+                          int                          blocks_per_row,
+                          int                          total_rows,
+                          int                          global_row,
+                          bool                         interleaved) {
+    const ggml_fp16_t * x_d =
+        (const ggml_fp16_t *) (coalesced.data() + dmmv_coalesced_q4_0_scale_base(total_rows, blocks_per_row));
+    const int tiles_per_row = dmmv_coalesced_tile_count(blocks_per_row);
+
+    std::vector<float> partial(DMMV_COALESCED_TILE_BLOCKS, 0.0f);
+
+    for (int lane = 0; lane < DMMV_COALESCED_TILE_BLOCKS; ++lane) {
+        float partial_sum = 0.0f;
+        for (int tile = 0; tile < tiles_per_row; ++tile) {
+            const int block_idx = tile * DMMV_COALESCED_TILE_BLOCKS + lane;
+            if (block_idx >= blocks_per_row) {
+                continue;
+            }
+            const float d =
+                ggml_fp16_to_fp32(x_d[dmmv_coalesced_q4_0_scale_index(global_row, blocks_per_row, block_idx)]);
+
+            float block_sum = 0.0f;
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                const int64_t off     = interleaved ?
+                                            dmmv_coalesced_q4_0_qs_offset(global_row, blocks_per_row, block_idx, j) :
+                                            (int64_t) global_row * dmmv_coalesced_q4_0_row_quants_bytes(blocks_per_row) +
+                                            (int64_t) block_idx * (QK4_0 / 2) + j;
+                const uint8_t qs_byte = coalesced[(size_t) off];
+                const float   v0      = ((float) (qs_byte & 0xF) - 8.0f) * d;
+                const float   v1      = ((float) (qs_byte >> 4) - 8.0f) * d;
+                block_sum += v0 * yh[block_idx * QK4_0 + j];
+                block_sum += v1 * yh[block_idx * QK4_0 + j + QK4_0 / 2];
+            }
+            partial_sum += block_sum;
+        }
+        partial[lane] = partial_sum;
+    }
+
+    for (int mask = DMMV_COALESCED_TILE_BLOCKS / 2; mask > 0; mask >>= 1) {
+        std::vector<float> next(DMMV_COALESCED_TILE_BLOCKS);
+        for (int l = 0; l < DMMV_COALESCED_TILE_BLOCKS; ++l) {
+            next[l] = partial[l] + partial[l ^ mask];
+        }
+        partial.swap(next);
+    }
+    return partial[0];
+}
+
+// -----------------------------------------------------------------------------
+// Oracles
+// -----------------------------------------------------------------------------
+
+// What the replacement oracle in tests/test-dmmv-q4-0-coalesced.cpp computes:
+// dequantize X to f32, multiply by the activation as dfloat, accumulate in f32.
+static float dfloat_oracle(const block_q4_0 * x, const std::vector<float> & yh, int blocks_per_row) {
+    float sum = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const float d = ggml_fp16_to_fp32(x[b].d);
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            sum += ((x[b].qs[j] & 0xF) - 8) * d * yh[b * QK4_0 + j];
+            sum += ((x[b].qs[j] >> 4) - 8) * d * yh[b * QK4_0 + j + QK4_0 / 2];
+        }
+    }
+    return sum;
+}
+
+// What the OLD oracle computed: ggml's CPU backend, i.e. vec_dot_q4_0_q8_0 with
+// the activation quantized to Q8_0.
+static float cpu_backend_oracle(const block_q4_0 * x, const block_q8_0 * y, int blocks_per_row) {
+    float sumf = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        int sumi = 0;
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            sumi += ((x[b].qs[j] & 0xF) - 8) * y[b].qs[j];
+            sumi += ((x[b].qs[j] >> 4) - 8) * y[b].qs[j + QK4_0 / 2];
+        }
+        sumf += (float) sumi * ggml_fp16_to_fp32(x[b].d) * ggml_fp16_to_fp32(y[b].d);
+    }
+    return sumf;
+}
+
+// The mathematically exact answer, in f64, from the same quantized weights and
+// the unrounded f32 activation.
+static double exact_oracle(const block_q4_0 * x, const float * y, int blocks_per_row) {
+    double sum = 0.0;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const double d = (double) ggml_fp16_to_fp32(x[b].d);
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            sum += d * (double) ((x[b].qs[j] & 0xF) - 8) * (double) y[b * QK4_0 + j];
+            sum += d * (double) ((x[b].qs[j] >> 4) - 8) * (double) y[b * QK4_0 + j + QK4_0 / 2];
+        }
+    }
+    return sum;
+}
+
+// The GPU test's pass criterion, both thresholds named so a change here is
+// visible against the change there.
+struct score {
+    int   errors;
+    float max_diff;
+    float max_rel;
+};
+
+static score apply_gate(const std::vector<float> & got, const std::vector<float> & ref, float abs_tol, float rel_tol) {
+    score s{ 0, 0.0f, 0.0f };
+    for (size_t i = 0; i < got.size(); ++i) {
+        const float diff = std::fabs(got[i] - ref[i]);
+        const float rel  = diff / std::fmax(1.0f, std::fabs(ref[i]));
+        s.max_diff       = std::fmax(s.max_diff, diff);
+        s.max_rel        = std::fmax(s.max_rel, rel);
+        if (diff > abs_tol && rel > rel_tol) {
+            s.errors++;
+        }
+    }
+    return s;
+}
+
+static std::string fmt(const score & s) {
+    return "errors=" + std::to_string(s.errors) + " max_diff=" + std::to_string(s.max_diff) +
+           " max_rel=" + std::to_string(s.max_rel);
+}
+
+// -----------------------------------------------------------------------------
+// Cases
+// -----------------------------------------------------------------------------
+
+// The header's offsets must round-trip -- and must do so when the rows being
+// read are a SLICE, because that is where a scale base taken from the slice's
+// row count stops pointing at the scales.
+static void case_addressing_round_trips() {
+    const int blocks_per_row = 64;
+    const int total_rows     = 96;
+    const int row_low        = 32;  // deliberately not 0, and not a tile multiple of the row count
+
+    std::vector<block_q4_0> aos((size_t) total_rows * blocks_per_row);
+    for (size_t i = 0; i < aos.size(); ++i) {
+        aos[i].d = ggml_fp32_to_fp16(0.01f * (float) ((i % 100) + 1));
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            aos[i].qs[j] = (uint8_t) ((i * 7 + j * 13) % 256);
+        }
+    }
+
+    std::vector<uint8_t> coalesced;
+    reorder_to_coalesced(aos.data(), coalesced, blocks_per_row, total_rows);
+
+    const int64_t       scale_base = dmmv_coalesced_q4_0_scale_base(total_rows, blocks_per_row);
+    const ggml_fp16_t * scales     = (const ggml_fp16_t *) (coalesced.data() + scale_base);
+
+    int mismatches = 0;
+    for (int row = row_low; row < total_rows; ++row) {
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const block_q4_0 & blk = aos[(size_t) row * blocks_per_row + b];
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                if (coalesced[(size_t) dmmv_coalesced_q4_0_qs_offset(row, blocks_per_row, b, j)] != blk.qs[j]) {
+                    mismatches++;
+                }
+            }
+            if (scales[dmmv_coalesced_q4_0_scale_index(row, blocks_per_row, b)] != blk.d) {
+                mismatches++;
+            }
+        }
+    }
+    check(mismatches == 0, "addressing-round-trips-over-a-slice", "mismatches=" + std::to_string(mismatches));
+
+    // The quants region must end exactly where the scales begin: an offset that
+    // can reach the scale base is the corruption this header is named for.
+    const int64_t last_quant_byte =
+        dmmv_coalesced_q4_0_qs_offset(total_rows - 1, blocks_per_row, blocks_per_row - 1, QK4_0 / 2 - 1);
+    check(last_quant_byte < scale_base, "quants-never-reach-the-scale-base",
+          "last=" + std::to_string(last_quant_byte) + " base=" + std::to_string(scale_base));
+
+    // And the defect itself, stated as an inequality rather than a story: a base
+    // taken from a slice's row count lands inside the quants.
+    const int64_t slice_base = dmmv_coalesced_q4_0_scale_base(total_rows - row_low, blocks_per_row);
+    check(slice_base < scale_base, "slice-derived-scale-base-lands-inside-quants",
+          "slice_base=" + std::to_string(slice_base) + " correct=" + std::to_string(scale_base));
+}
+
+static void case_oracles() {
+    for (const shape & s : SHAPES) {
+        const int blocks_per_row = s.ncols / QK4_0;
+
+        std::vector<float> weight;
+        std::vector<float> input;
+        make_inputs(s, weight, input);
+
+        std::vector<block_q4_0> wq((size_t) s.nrows * blocks_per_row);
+        quantize_row_q4_0_ref(weight.data(), wq.data(), (int64_t) weight.size());
+
+        std::vector<block_q8_0> yq(blocks_per_row);
+        quantize_row_q8_0_ref(input.data(), yq.data(), s.ncols);
+
+        // The activation as the kernel sees it: dfloat == sycl::half in the
+        // shipping build, so round through fp16 here too.
+        std::vector<float> yh(s.ncols);
+        for (int i = 0; i < s.ncols; ++i) {
+            yh[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(input[i]));
+        }
+
+        std::vector<uint8_t> coalesced;
+        reorder_to_coalesced(wq.data(), coalesced, blocks_per_row, s.nrows);
+
+        std::vector<float> gpu(s.nrows), corrupt(s.nrows), ref_dfloat(s.nrows), ref_cpu(s.nrows), ref_exact(s.nrows);
+        for (int row = 0; row < s.nrows; ++row) {
+            const block_q4_0 * xr = wq.data() + (size_t) row * blocks_per_row;
+            gpu[row]              = kernel_model(coalesced, yh, blocks_per_row, s.nrows, row, /*interleaved=*/true);
+            corrupt[row]          = kernel_model(coalesced, yh, blocks_per_row, s.nrows, row, /*interleaved=*/false);
+            ref_dfloat[row]       = dfloat_oracle(xr, yh, blocks_per_row);
+            ref_cpu[row]          = cpu_backend_oracle(xr, yq.data(), blocks_per_row);
+            ref_exact[row]        = (float) exact_oracle(xr, input.data(), blocks_per_row);
+        }
+
+        const std::string tag = " [" + std::to_string(s.ncols) + "x" + std::to_string(s.nrows) + "]";
+
+        // 1. The replacement oracle accepts a correct kernel, with margin.
+        const score kept = apply_gate(gpu, ref_dfloat, 1e-2f, 1e-3f);
+        check(kept.errors == 0, "contract-oracle-accepts-correct-kernel" + tag, fmt(kept));
+
+        // 2. The knockout. The exact answer, scored as if it were the GPU,
+        //    fails the oracle the test used to gate on. Nothing could pass it.
+        const score knockout = apply_gate(ref_exact, ref_cpu, 1e-2f, 1e-2f);
+        check(knockout.errors > 0, "old-oracle-rejects-the-exact-answer" + tag, fmt(knockout));
+
+        // 3. Positive control: the replacement oracle is not merely permissive.
+        const score caught = apply_gate(corrupt, ref_dfloat, 1e-2f, 1e-3f);
+        check(caught.errors > 0, "contract-oracle-catches-corrupted-kernel" + tag, fmt(caught));
+    }
+}
+
+int main() {
+    std::cout << "Q4_0 coalesced DMMV: layout addressing and oracle contract (host-only)\n";
+    case_addressing_round_trips();
+    case_oracles();
+
+    if (failures != 0) {
+        std::cout << failures << " check(s) failed\n";
+        return 1;
+    }
+    std::cout << "all checks passed\n";
+    return 0;
+}

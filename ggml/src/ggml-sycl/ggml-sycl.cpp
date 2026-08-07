@@ -54623,9 +54623,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                 t_mmvq0 = std::chrono::high_resolution_clock::now();
                             }
                             if (data_layout == ggml_sycl_unified::LayoutMode::COALESCED) {
+                                // COALESCED layout: total_nrows=N, row_low=0 (full expert slice)
                                 mmvq_submit_mxfp4_coalesced(*ctx.stream(), src0_batch_ptr, q8_soa,
                                                             dst_batch_ptr + m * N, static_cast<int>(K),
-                                                            static_cast<int>(N));
+                                                            static_cast<int>(N), static_cast<int>(N), 0);
                                 if (mxfp4_profile) {
                                     g_mxfp4_tg_timing.coalesced_rows++;
                                 }
