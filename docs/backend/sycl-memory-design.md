@@ -134,6 +134,193 @@ is the short form; this is the why):
   host-pinned pointer to a GPU kernel is slower (measured 1.6–2.6×) *and* breaks
   the tier abstraction. Let `resolve()` report residency and route accordingly.
 
+## Epoch-refcounted transient zones (llama.cpp-2757 / iiff Option C)
+
+**Background.** `llama.cpp-iiff` set out to delete the SYCL backend's bulk
+zone resets (`unified_cache_zone_reset`, `unified_cache_host_zone_reset`,
+`unified_cache_reset_scratch_pool`) outright, on the owner's ruling that
+"memory is freed only when references reach zero; the zones should not reset
+at all." `llama.cpp-37ba`'s audit (see its tracker comments) found that
+mandate cannot be executed as a blanket removal: the Phase-0 escape
+inventory's "0 live at reset" reading proves the *registry* is empty, not
+that the *physical bytes* were ever individually returned to the allocator.
+For a subset of zones — the VRAM scratch bump pool covered here, plus host
+SCRATCH/STAGING and the oneDNN scratch pointers covered by later steps — the
+codebase's own comments say outright that the bulk reset is the *only*
+reclaim path (`return_scratch()`: "we don't actually free individual
+allocations"; `unified_free_record()`: "SCRATCH/STAGING host zones:
+reset-only by design — freed by host_zone_reset()"). Deleting the reset for
+those zones without first giving them a real per-allocation release path
+would not produce correctness — it would produce the exact unbounded memory
+growth this document's "never add forced eviction ... to reclaim memory that
+still has a live handle" rule exists to prevent, just approached from the
+opposite direction (no reclaim at all, rather than reclaiming too eagerly).
+
+**The design: keep the bump allocator, refcount the epoch, rewind on zero.**
+Rather than replace the allocator or replace the reset, give each reset-only
+zone (or pool) a small ring of equal-sized **regions**, and a **live-handle
+counter per region** — the region's *epoch*:
+
+- **Each region is sized at the caller's full requested capacity, not a
+  fraction of it.** `reserve_scratch_pool(pool_bytes)` gives every region
+  `pool_bytes` (total footprint = `kScratchPoolRegionCount × pool_bytes`),
+  rather than splitting `pool_bytes` across the ring. This was a deliberate
+  fix during step 1's review: `pool_bytes` is the sizing contract callers
+  already plan and unit-test against as one epoch's full capacity (e.g.
+  `unified_cache_reserve_moe_q8_1_scratch()`'s Q8_1 demand sizing) — dividing
+  it by the region count would silently halve what a caller asked for the
+  moment a production caller exists, turning "ring adds rotation headroom"
+  into "ring steals half the requested capacity." The ring is *additional*
+  memory bought for the ability to linger a still-live epoch, not a
+  reslicing of the capacity the caller already sized for. The tradeoff is
+  paid explicitly, as a larger real allocation, rather than paid silently as
+  reduced usable capacity.
+- The bump allocator itself is unchanged: allocation is still a lock-free
+  `fetch_add` on an offset, same as before.
+- Every allocation from a region increments that region's counter; every
+  release (`return_scratch()` and its future host-zone/oneDNN equivalents)
+  decrements it. This is the literal reading of the owner's ruling — "memory
+  is freed only when references reach zero" — applied at **region
+  granularity** rather than per-byte-range, which is exactly the *RC
+  regions* pattern from Gay & Aiken (PLDI'01): a region is freed as a whole
+  once its reference count returns to zero, giving O(1) release cost with no
+  per-object bookkeeping. 4 bytes (or here, one `std::atomic` counter) per
+  region is the whole overhead.
+- At the point the old code called the bulk reset (still the same call
+  site — see Migration below), the region's counter decides the outcome:
+  - **counter == 0**: every allocation from this epoch was already
+    released. Rewind the region's offset to 0 in place. This *is* the
+    reset now — a consequence of the last release reaching zero, firing at
+    the same instant the old unconditional reset used to fire, with
+    identical behavior in the steady-state case (which the Phase-0 audit
+    proved is the overwhelming majority: single-model workloads showed 0
+    live at every measured boundary).
+  - **counter != 0**: something outlived this epoch. The region is left
+    **untouched** — any pointer still held into it stays valid, because
+    nothing physically happened to its backing memory — and the *next*
+    region in the ring becomes current for the new epoch. This is the
+    **VMA linear-allocator pattern** (`vmaCreateVirtualBlock` release-all,
+    or the simpler "linear pool" idiom): reset normally means "rewind to
+    the start," but a still-referenced allocation forces a fresh pool
+    instead of corrupting the old one.
+  - **every region in the ring is still live**: refuse the rotation,
+    loudly, in exactly the same style as the existing `host_zone_reset()`
+    / `zone_reset()` "refusing ..." guards — never wrap onto a region that
+    is still referenced, which would be reclaiming a live handle by
+    another name.
+- The assert-only Phase-0 audit machinery (`zone_reset_audit_*`,
+  `zone_audit_site_visit`) is unchanged and is exactly what names the
+  leaking site when a region lingers: the audit already distinguishes
+  "visited and clean" from "visited and live," and a lingering region is
+  visible in its `visits_with_live` / cohort inventory the same way a
+  registry-based zone's live entries are. No new instrumentation is
+  needed — the region counter *is* what the audit reads at that boundary.
+- **Deferred GPU work — event-retained epochs.** A region can outlive its
+  graph not because of a bug but because its last consumer is still an
+  in-flight SYCL event (a kernel that hasn't completed, an async copy still
+  draining). The existing `retain_handles_until_event()` mechanism is the
+  hook for this: an epoch whose only remaining "release" is a pending event
+  registers itself there instead of releasing synchronously, and the region
+  decrements (and becomes reclaimable) when the event actually completes.
+  This is the same shape as a GPU frame-arena recycled on a fence in a
+  double/triple-buffered renderer — the region is a "frame," and it can't be
+  reused until the GPU is provably done with it, which is exactly why the
+  ring needs a *minimum* of two regions (current + linger) rather than one.
+
+**The failure-mode inversion this produces is the point, not a side
+effect.** The scheduled reset's failure mode was silent, forced
+invalidation: it reclaimed a zone's memory on a clock, and a raw pointer
+still aliasing that zone became a use-after-free the instant the reset fired
+— the exact bug class (`llama.cpp-oze0`, `skgik`, `mqxer`, `FaultLevel=4`)
+that motivated this epic in the first place. Under epoch refcounting, the
+same escape produces the opposite failure mode: the memory is never
+force-freed out from under a live pointer (it lingers), and the escape shows
+up as a WARN in the audit/rotation-refusal path — a diagnosable alarm
+instead of a silent corruption. This is strictly the tradeoff the parent
+epic asks for: "an abort is a bad outcome that tells you; a leak is a bad
+outcome that does not" — and epoch refcounting turns the leak into a *told*
+outcome, because a lingering region is observable (it shows as still-live in
+the audit) rather than truly unbounded and invisible growth.
+
+**The policy generalizes; the implementation, deliberately, does not.** What
+step 1 (below) actually validated is a *policy*: per-epoch live counter,
+rewind-on-zero, rotate-on-live, refuse-on-exhaustion, never force-reclaim.
+That policy applies unchanged to every reset-only population this epic
+covers. `scratch_pool_region` — a contiguous ring of equal-sized regions
+addressed by `off`, located by address-range membership in
+`scratch_pool_region_of()` — is not that policy; it is one *shape* the
+policy can take, and it is specific to a single contiguous bump-pool
+allocation. The other two reset-only populations this document's migration
+order covers have different shapes, and forcing them through
+`scratch_pool_region`'s shape would be wrong, not just inconvenient:
+
+- **Host SCRATCH/STAGING zones (step 2).** These are TLSF-arena-backed, with
+  every allocation already individually registered — `host_zone_reset()`
+  (see "Why" above and the canonical contract) walks `g_runtime_alloc_registry`
+  per zone, not a bump offset. There is no single contiguous span to carve
+  into address-range regions and no `off` to rewind: the epoch tag belongs
+  on the *registry record* for each allocation (an epoch id alongside the
+  existing `alloc_id`/`cohort`/`role`/`category` fields), and "rewind" means
+  something different for a TLSF allocator than it does for a bump pointer.
+- **oneDNN scratch pointers (step 3).** `onednn_weights_scratch_` and
+  `onednn_activations_scratch_` are exactly two named pointers, not a pool of
+  interchangeable allocations at all. Epoch tracking here is a live count
+  *per pointer* (or, equivalently, folding the same counter into the
+  `mem_handle` these pointers should hold once converted off the raw-pointer
+  pattern this document's earlier section already flags) — there is no ring
+  to rotate through and no address-range lookup to perform.
+
+A shared `epoch_region`-style struct is therefore **deliberately not
+extracted** out of step 1's implementation. Sharing a struct across three
+populations that disagree on "where do allocations live" and "how is an
+allocation's region found" would either force two of the three into an
+address-range model they do not have, or bloat the struct with fields only
+one shape uses. What step 2 and step 3 inherit from step 1 is the *policy*
+above, expressed in whatever data structure each zone's existing allocation
+tracking already uses — not `scratch_pool_region` itself, and not a common
+base type it should be refactored into.
+
+**Migration order (each step lead-verified on hardware before the next).**
+llama.cpp-37ba's per-symbol audit is the map of which reset-only populations
+exist and how large their blast radius is if converted incorrectly;
+these steps convert them from smallest/safest to largest/most load-bearing:
+
+1. **VRAM scratch bump pool** (`llama.cpp-2757`, this doc's section origin) —
+   `unified_cache::get_scratch()` / `return_scratch()` / `reset_scratch_pool()`
+   in `unified-cache.cpp`. Chosen first because it has no production caller
+   today (only `tests/test-sycl-moe-q8-scratch.cpp` exercises it) — the
+   mechanism is validated on the lowest-stakes zone before it is trusted with
+   a zone that real inference traffic depends on.
+2. **Host SCRATCH/STAGING zones** (`llama.cpp-lbm3`) — the zones
+   `unified_free_record()` documents as "reset-only by design," with real
+   production callers (MoE CPU-expert pools, staging buffers, `get_rows`
+   indices). This is where the mechanism has to handle actual escape
+   cohorts, not just a test harness.
+3. **oneDNN scratch pointers** (`llama.cpp-67c2`) — `onednn_weights_scratch_`
+   / `onednn_activations_scratch_`, which today are raw pointers managed
+   entirely outside `mem_handle` (no registry entry at all), converted to
+   real epoch-tracked handles so the existing `zone_reset(vram_zone_id::ONEDNN)`
+   call sites in the scratch-reservation path stop being the *sole* reclaim
+   mechanism for their own previous allocation.
+4. **Delete the now-dead reset functions**, keeping only the boundary
+   asserts — this is `llama.cpp-37ba`'s original payload (the epic's Phase 3:
+   "keep the check, lose the reclamation") plus the epic's acceptance
+   criterion 1 ("no `zone_reset` / `host_zone_reset` / `reset_scratch_pool`
+   call remains"). It is sequenced last on purpose: a reset call site that
+   still exists but has become a provable no-op (its epoch counter always 0
+   at that boundary, verified by step 1–3's hardware batteries) is the
+   evidence that deleting it changes nothing — the same "delete the drain
+   steps first, re-verify empty, then delete the reset itself" discipline
+   the epic already requires, just applied to the reset call sites
+   themselves rather than their upstream drains.
+
+See [`docs/design/sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md)
+for the enforceable allocator/pointer-resolution contract this mechanism
+must continue to satisfy — in particular, a region's bump pointer is never
+exposed as a stored raw pointer outside the immediate `get_scratch()` /
+`return_scratch()` pair, matching the "raw pointer is only a transient view"
+rule above.
+
 ## Lifecycle identity and async lease boundary
 
 **Target invariants (not current APIs or current behavior).** The enforceable

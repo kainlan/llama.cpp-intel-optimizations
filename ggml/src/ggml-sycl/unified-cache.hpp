@@ -2747,30 +2747,57 @@ class unified_cache {
     size_t compute_arena_capacity() const;
     size_t compute_arena_used() const;
 
-    // === Inference Scratch Pool ===
-    // Pre-allocated VRAM pool for per-op temporaries (Q8_1, FP16 dequant, etc.).
-    // Call reserve_scratch_pool() once at context creation with the max scratch
-    // size needed across all ops.  get_scratch()/return_scratch() are lock-free
-    // bump allocators during inference — zero malloc, zero free.
+    // === Inference Scratch Pool (epoch-refcounted, llama.cpp-2757 / iiff Option C) ===
+    // Pre-allocated VRAM pool for per-op temporaries (Q8_1, FP16 dequant, etc.),
+    // split into a small ring of equal-sized regions. Call reserve_scratch_pool()
+    // once at context creation with the max scratch size needed across all ops.
+    // get_scratch()/return_scratch() are lock-free bump allocation/refcount
+    // within the CURRENT region — zero malloc, zero free. reset_scratch_pool()
+    // (called once per graph_compute boundary) rewinds the current region when
+    // its live count is back to zero, or rotates to the next region and leaves
+    // a still-live one untouched; see scratch_pool_region below and the .cpp
+    // for the full rotation policy.
 
     // Reserve the scratch pool.  Must be called before get_scratch().
     // Returns true if allocation succeeded (or pool already large enough).
     bool reserve_scratch_pool(size_t pool_bytes);
 
-    // Get a scratch buffer from the pool.  Returns nullptr if pool exhausted.
-    // The returned pointer is valid until return_scratch() or reset_scratch_pool().
+    // Get a scratch buffer from the current region.  Returns nullptr if that
+    // region is exhausted (same failure contract as before regions existed).
+    // The returned pointer is valid until return_scratch() or until
+    // reset_scratch_pool() rotates its region away while still live (in which
+    // case the region -- and this pointer -- lingers rather than being reused,
+    // so the pointer stays valid; it simply won't be rewound until released).
     void * get_scratch(size_t size);
 
-    // Return a scratch buffer to the pool.  Adjusts the bump pointer.
+    // Release a scratch buffer.  Decrements its region's live (epoch) count --
+    // this IS the reclaim signal reset_scratch_pool() reads at the next
+    // boundary; it does not itself move the bump offset.
     void return_scratch(void * ptr, size_t size);
 
-    // Reset the scratch pool bump pointer (call between graph_compute invocations).
+    // Epoch boundary: rewind the current region if its live count is zero, or
+    // rotate to the next ring region if not (never force-rewinding a live
+    // region).  Call once between graph_compute invocations.
     void reset_scratch_pool();
 
-    // Current scratch pool capacity and high-water mark.
-    size_t scratch_pool_capacity() const { return scratch_pool_size_; }
+    // Per-epoch scratch pool capacity (one region's usable bytes -- the
+    // sizing contract callers plan against, e.g.
+    // unified_cache_reserve_moe_q8_1_scratch()) and high-water mark.
+    // scratch_pool_size_ is the larger, kScratchPoolRegionCount x TOTAL
+    // footprint; deliberately not exposed here so a caller comparing its
+    // planned demand against "capacity" gets the number that sizing
+    // contract actually means.
+    size_t scratch_pool_capacity() const { return scratch_pool_region_bytes_; }
 
-    size_t scratch_pool_hwm() const { return scratch_pool_hwm_; }
+    size_t scratch_pool_hwm() const {
+        size_t hwm = 0;
+        for (const auto & region : scratch_pool_regions_) {
+            if (region.hwm > hwm) {
+                hwm = region.hwm;
+            }
+        }
+        return hwm;
+    }
 
     // === Expert Allocation ===
     // Allocates from the expert portion of the cache budget.  Falls back to
@@ -3084,15 +3111,56 @@ class unified_cache {
     std::unordered_map<std::string, persistent_scratch_entry> persistent_scratches_;
     mutable std::mutex                                        persistent_scratch_mutex_;
 
-    // === Inference Scratch Pool (Phase 3) ===
-    // Pre-allocated VRAM block for per-op temporaries.  get_scratch() bumps
-    // the offset; return_scratch() decrements it (stack discipline).
-    // reset_scratch_pool() resets to zero between graph_compute calls.
-    void *              scratch_pool_ptr_  = nullptr;  // Base pointer (device VRAM)
-    size_t              scratch_pool_size_ = 0;        // Total pool bytes
-    mem_handle          scratch_pool_owner_;           // Non-arena direct allocation owner
-    std::atomic<size_t> scratch_pool_off_{ 0 };        // Current bump offset
-    size_t              scratch_pool_hwm_ = 0;         // High-water mark for diagnostics
+    // === Inference Scratch Pool (epoch-refcounted, llama.cpp-2757 / iiff Option C) ===
+    // Pre-allocated VRAM block for per-op temporaries, split into a ring of
+    // equal-sized regions. get_scratch() bump-allocates within the CURRENT
+    // region and increments its live count; return_scratch() decrements it --
+    // the epoch refcount that replaces the pool's former unconditional-reset
+    // "stack discipline" no-op. reset_scratch_pool() rewinds the current
+    // region to offset 0 once its live count is back to zero (the same
+    // instant the old unconditional reset used to fire); if the region is
+    // still live at that boundary it is left untouched -- any pointer handed
+    // out from it must stay valid -- and the ring rotates to the next region
+    // instead. See unified_cache::reset_scratch_pool() for the full policy,
+    // including the "every region still live" refusal.
+    struct scratch_pool_region {
+        std::atomic<size_t>  off{ 0 };   // Bump offset within this region
+        std::atomic<int64_t> live{ 0 };  // Outstanding get_scratch() allocations (the epoch refcount)
+        size_t               hwm = 0;    // High-water mark for diagnostics
+    };
+
+    static constexpr int kScratchPoolRegionCount = 2;  // Minimum viable per llama.cpp-2757: current + linger
+
+    void *     scratch_pool_ptr_  = nullptr;           // Base pointer (device VRAM), spans all regions
+    size_t     scratch_pool_size_ = 0;                 // Total pool bytes across all regions
+    mem_handle scratch_pool_owner_;                    // Non-arena direct allocation owner
+
+    std::array<scratch_pool_region, kScratchPoolRegionCount> scratch_pool_regions_;
+    // Per-region (one-epoch) capacity, i.e. the reserve_scratch_pool(pool_bytes)
+    // sizing contract: scratch_pool_size_ == scratch_pool_region_bytes_ *
+    // kScratchPoolRegionCount, not the other way around -- see the sizing
+    // comment at the top of reserve_scratch_pool().
+    size_t                                                   scratch_pool_region_bytes_ = 0;
+    // Index of the region get_scratch()/reset_scratch_pool() currently
+    // target. Atomic even though reset_scratch_pool() is documented as never
+    // concurrent with in-graph get_scratch()/return_scratch() (the same
+    // assumption the old single scratch_pool_off_ relied on) -- relaxed
+    // ordering costs nothing on the fast path and removes the UB if that
+    // assumption is ever violated by a path CLAUDE.md documents as
+    // overlapping (e.g. persistent-TG/deferred-copy submission).
+    std::atomic<int>                                         scratch_pool_current_{ 0 };
+
+    // Reset every region to its just-(re)reserved empty state (off=0, live=0,
+    // hwm=0) and point scratch_pool_current_ back at region 0. Called from
+    // reserve_scratch_pool() (new/regrown pool) and shutdown teardown.
+    void scratch_pool_reset_regions();
+
+    // Map a pointer previously returned by get_scratch() back to its region
+    // index, or -1 if it does not belong to this pool. The ring is small and
+    // fixed-size, so a direct address-range check per region is cheap enough
+    // to need no separate registry (unlike unified_free_record()'s general
+    // mem_handle-keyed routing).
+    int scratch_pool_region_of(const void * ptr) const;
 
     // === Unified allocate() tracking (Phase 3) ===
     // Track pointers returned by allocate() so deallocate() knows whether
