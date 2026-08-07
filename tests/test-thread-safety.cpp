@@ -92,28 +92,62 @@ int main(int argc, char ** argv) {
 
     // Same-device concurrent inference is unsupported by the SYCL backend:
     // context-keyed KV/RUNTIME arena ownership does not exist yet, so the
-    // execution registry rejects a second concurrent decode on a device that
+    // execution registry rejects a second concurrent user of a device that
     // already owns one (docs/design/sycl-canonical-memory-architecture.md
     // §5.3, §7.3, §12.3 -- "Same-device concurrent inference: Unsupported
-    // today; no optimistic overlap"). Serialize decodes that target the same
-    // physical SYCL device so this test exercises the concurrency the backend
-    // actually supports -- different devices, and CPU alongside GPU -- rather
-    // than asserting an out-of-contract guarantee. This is backend-gated: on
-    // any backend other than SYCL the lock set stays empty and every decode
-    // runs exactly as before.
+    // today; no optimistic overlap"). Serialize every device-touching phase
+    // -- model load, context creation, and decode -- that targets the same
+    // physical SYCL device, so this test exercises the concurrency the
+    // backend actually supports -- different devices, and CPU alongside GPU
+    // -- rather than asserting an out-of-contract guarantee. This is
+    // backend-gated: on any backend other than SYCL the lock set stays empty
+    // and every phase runs exactly as before.
+    //
+    // Model load and context creation are guarded, not just decode, because
+    // both touch SYCL execution-registry state that is shared per physical
+    // device:
+    //   - llama_init_from_model() creates a ggml_backend per device
+    //     (ggml_backend_dev_init) and, for a SYCL device, creates/binds a
+    //     fresh execution-registry context as part of that (see
+    //     ggml_backend_sycl_execution_context_create/bind_backend, wired up
+    //     in src/llama-context.cpp) before any graph is ever built -- this
+    //     happens on every thread's very first device touch, unguarded, if
+    //     only decode is locked.
+    //   - llama_model_load_from_file() reserves each device's VRAM arena and
+    //     materializes weight layout directly on the device (see
+    //     ggml_sycl_model_loading_effects() and the model-load `async =
+    //     false` note next to ggml_backend_sycl_device_get_props() in
+    //     ggml-sycl.cpp), and for a SYCL device performs the same
+    //     execution-registry context create/bind as context creation above.
+    //     Model load in this test runs sequentially in the main thread
+    //     before any thread is spawned, so it never contends with another
+    //     load -- the reason to lock it anyway is that it can still contend
+    //     with the context-creation/decode threads spawned immediately after
+    //     this loop returns, which start racing on these same devices
+    //     instantly.
+    //
+    // Residual risk: unlike context creation and decode, there is no public
+    // API to force-drain a model's SYCL work before a context exists
+    // (llama_synchronize() takes a llama_context*), so the model-load guard
+    // below cannot force a settle point the way the other two do -- it only
+    // serializes submission ordering. If model load leaves SYCL work
+    // in-flight past llama_model_load_from_file()'s return the way decode
+    // used to (the deferred-release bug the context-creation/decode guards
+    // work around, see their comments), that residual window is not closed
+    // by this guard alone.
     const bool sycl_same_device_lock_needed =
         gpu_dev_count > 0 && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpus[0][0])), "SYCL") == 0;
     std::vector<std::mutex> device_exec_mutex(sycl_same_device_lock_needed ? gpu_dev_count : 0);
 
-    // Devices touched by model m's decode calls: a single-GPU model owns just
-    // its one device, the CPU model owns none, and the trailing layer-split
-    // model spans every GPU device. Locking every GPU for the layer-split
-    // model's whole decode over-serializes it against the single-GPU models
-    // (it forfeits concurrency it could in principle have on devices its
-    // current decode isn't using yet) -- that's intentionally conservative,
-    // not a bug to "optimize" back toward per-device-only locking, since a
-    // multi-device invocation's actual device set for a given decode isn't
-    // observable from here.
+    // Devices touched by model m's load/init/decode calls: a single-GPU model
+    // owns just its one device, the CPU model owns none, and the trailing
+    // layer-split model spans every GPU device. Locking every GPU for the
+    // layer-split model's whole decode over-serializes it against the
+    // single-GPU models (it forfeits concurrency it could in principle have
+    // on devices its current decode isn't using yet) -- that's intentionally
+    // conservative, not a bug to "optimize" back toward per-device-only
+    // locking, since a multi-device invocation's actual device set for a
+    // given decode isn't observable from here.
     auto model_devices = [&](int m) {
         std::vector<int> devices;
         if (m < gpu_dev_count) {
@@ -126,13 +160,14 @@ int main(int argc, char ** argv) {
         return devices;
     };
 
-    // RAII guard that locks every device a decode call touches, in ascending
-    // device-index order. That order is the same for every thread, so lock
-    // acquisition can't cycle and no separate deadlock-avoidance is needed.
-    struct device_decode_guard {
+    // RAII guard that locks every device a load/init/decode call touches, in
+    // ascending device-index order. That order is the same for every thread,
+    // so lock acquisition can't cycle and no separate deadlock-avoidance is
+    // needed.
+    struct device_exec_guard {
         std::vector<std::unique_lock<std::mutex>> locks;
 
-        device_decode_guard(std::vector<std::mutex> & mutexes, const std::vector<int> & devices) {
+        device_exec_guard(std::vector<std::mutex> & mutexes, const std::vector<int> & devices) {
             for (int d : devices) {
                 locks.emplace_back(mutexes[d]);
             }
@@ -156,7 +191,16 @@ int main(int argc, char ** argv) {
             mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
 
-        llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model;
+        {
+            // See the header comment above device_exec_mutex: this never
+            // contends with another load (this loop is sequential, main
+            // thread only) -- it exists to serialize load against the
+            // context-creation/decode threads spawned below.
+            const std::vector<int> devices = sycl_same_device_lock_needed ? model_devices(m) : std::vector<int>{};
+            device_exec_guard      guard(device_exec_mutex, devices);
+            model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        }
         if (model == NULL) {
             LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
             return 1;
@@ -171,7 +215,23 @@ int main(int argc, char ** argv) {
             threads.emplace_back([&, m, c, model]() {
                 LOG_INF("Creating context %d/%d for model %d/%d\n", c + 1, num_contexts, m + 1, num_models);
 
-                llama_context_ptr ctx { llama_init_from_model(model, cparams) };
+                const std::vector<int> devices = sycl_same_device_lock_needed ? model_devices(m) : std::vector<int>{};
+
+                llama_context_ptr ctx;
+                {
+                    // See the header comment above device_exec_mutex:
+                    // llama_init_from_model() touches SYCL execution-registry
+                    // state per device before any graph is built, so guard it
+                    // the same as decode below. Force the deferred-release
+                    // settle point (see the decode guard's comment) before
+                    // unlocking -- this is the only chance to do so before
+                    // the lock opens this device up to another thread.
+                    device_exec_guard guard(device_exec_mutex, devices);
+                    ctx.reset(llama_init_from_model(model, cparams));
+                    if (ctx != NULL && sycl_same_device_lock_needed) {
+                        llama_synchronize(ctx.get());
+                    }
+                }
                 if (ctx == NULL) {
                     LOG_ERR("failed to create context\n");
                     failed.store(true);
@@ -185,8 +245,6 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
-                const std::vector<int> devices = sycl_same_device_lock_needed ? model_devices(m) : std::vector<int>{};
-
                 llama_batch batch = {};
                 {
                     auto prompt = common_tokenize(ctx.get(), params.prompt, true);
@@ -196,7 +254,7 @@ int main(int argc, char ** argv) {
                         return;
                     }
                     batch = llama_batch_get_one(prompt.data(), prompt.size());
-                    device_decode_guard guard(device_exec_mutex, devices);
+                    device_exec_guard guard(device_exec_mutex, devices);
                     if (llama_decode(ctx.get(), batch)) {
                         LOG_ERR("failed to decode prompt\n");
                         failed.store(true);
@@ -238,7 +296,7 @@ int main(int argc, char ** argv) {
 
                     int ret;
                     {
-                        device_decode_guard guard(device_exec_mutex, devices);
+                        device_exec_guard guard(device_exec_mutex, devices);
                         ret = llama_decode(ctx.get(), batch);
                         if (ret == 0 && sycl_same_device_lock_needed) {
                             // See the matching comment on the prompt decode above:
