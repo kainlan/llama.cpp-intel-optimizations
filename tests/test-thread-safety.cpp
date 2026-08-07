@@ -2,6 +2,17 @@
 // - Loads a copy of the same model on each GPU, plus a copy on the CPU
 // - Creates n_parallel (--parallel) contexts per model
 // - Runs inference in parallel on each context
+//
+// SYCL: this test's ctest registration (tests/CMakeLists.txt) sets
+// GGML_SYCL_DISABLE_GRAPH=1 in its ENVIRONMENT -- see the comment there for
+// why (llama.cpp-b16a: SYCL command-graph replay can hold the execution
+// registry's per-device invocation across a context's whole run, which this
+// test's deliberate same-device multi-context load trips). A direct
+// `./build/bin/test-thread-safety ...` invocation does NOT get that
+// ENVIRONMENT (only `ctest -R test-thread-safety` does -- see CLAUDE.md,
+// "what the registration provides, direct invocation does not"), so it may
+// fail with DEVICE_BUSY where the same run under ctest passes. Set the
+// variable by hand for a direct run.
 
 #include "arg.h"
 #include "common.h"
