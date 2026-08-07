@@ -673,6 +673,22 @@ struct runtime_alloc_record {
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
+
+// Per-zone monotonic epoch id for host SCRATCH/STAGING (iiff Option C step 2,
+// llama.cpp-lbm3). Bumped by host_zone_reset(zone) at every call -- refused or
+// clean -- so it marks graph boundaries the same way C1's per-region epoch
+// did for the VRAM scratch bump pool. Stamped onto alloc_handle::epoch_id at
+// allocation time (see the registration site in unified_alloc()) purely for
+// diagnostics: a stuck host_zone_reset() refusal can report how many
+// boundaries the offending allocation has survived. It does not gate
+// anything -- SCRATCH/STAGING allocations free themselves individually at
+// release regardless of epoch state; see unified_free_record()'s
+// epoch-decrement branch. Global rather than per-unified_cache-instance
+// because host zones are already scanned without a device filter throughout
+// this file (host_zone_reset()'s own live scan below has none), matching
+// g_runtime_alloc_registry's existing device-agnostic scope. Only SCRATCH and
+// STAGING slots are ever written; KV/WEIGHT/COUNT stay at 0.
+static std::atomic<uint64_t>                            g_host_zone_epoch[static_cast<size_t>(host_zone_id::COUNT)]{};
 static std::mutex                                       g_offload_pool_mutex;
 static std::atomic<uint64_t>                            g_offload_pool_lease_id{ 1 };
 
@@ -10246,8 +10262,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         // and releases them after synchronous D2H -> CPU -> H2D completion.
         // The staging_buffer_pool is also an explicit owner: when it releases an
         // idle slot, the backing STAGING-zone allocation must return to TLSF
-        // immediately. Other SCRATCH/STAGING users remain reset-scoped and are
-        // reclaimed by host_zone_reset().
+        // immediately.
         // Bump-arena device allocations (from_arena=true, vram_zone==COUNT): freed by arena_reset().
         if (rec.handle.zone_managed) {
             if (rec.handle.vram_zone != vram_zone_id::COUNT) {
@@ -10258,6 +10273,39 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                        (rec.handle.host_zone == host_zone_id::STAGING && rec.cohort_id == "staging_buffer_pool")) {
                 // These zones/roles have per-allocation lifetimes and must be
                 // reclaimable during rollback or scoped MoE CPU fallback.
+                // Untouched by iiff Option C step 2 (llama.cpp-lbm3) -- these
+                // carve-outs already individually freed before this ticket.
+                auto * cache = get_unified_cache_for_device(rec.handle.device);
+                if (cache) {
+                    if (!rec.handle.all_segments.empty()) {
+                        for (const auto & seg : rec.handle.all_segments) {
+                            cache->host_zone_free(rec.handle.host_zone, seg.ptr);
+                        }
+                    } else {
+                        cache->host_zone_free(rec.handle.host_zone, rec.handle.ptr);
+                    }
+                }
+            } else if (rec.handle.host_zone == host_zone_id::SCRATCH || rec.handle.host_zone == host_zone_id::STAGING) {
+                // Epoch decrement (iiff Option C step 2, llama.cpp-lbm3): the
+                // former "reset-only by design" fall-through population --
+                // every other SCRATCH allocation (role != EXPERT_STAGING) and
+                // every other STAGING allocation (cohort != staging_buffer_pool).
+                //
+                // Per-record free at release, immediately -- not batched to
+                // epoch death. TLSF free was measured at ~350ns/op, noise
+                // against graph execution time (llama.cpp-2757 c-6ngo), and
+                // Phase 0 proved these zones do not fragment under it (9 of
+                // 11 zone/capture pairs: largest_free first==last==min). C1's
+                // bump pool needed batched/ring rewind because its "region"
+                // is one contiguous offset that a live allocation blocks from
+                // behind; TLSF has no such address-range conflict -- a new
+                // allocation always succeeds from whatever the free list
+                // currently holds, regardless of which epoch anything else
+                // outstanding belongs to. So there is no region to rotate and
+                // no ring to exhaust: this branch is the whole mechanism.
+                // rec.handle.epoch_id (stamped at allocation time, see the
+                // registration site above) is not consulted here -- it exists
+                // purely for host_zone_reset()'s refusal diagnostics.
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
                     if (!rec.handle.all_segments.empty()) {
@@ -10269,7 +10317,6 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                     }
                 }
             }
-            // SCRATCH/STAGING host zones: reset-only by design — freed by host_zone_reset().
             // Assertion: every zone-managed alloc must be accounted for by a known zone type.
             GGML_ASSERT(rec.handle.vram_zone != vram_zone_id::COUNT || rec.handle.host_zone != host_zone_id::COUNT);
             return true;
@@ -10844,6 +10891,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
 
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        // Epoch-tag SCRATCH/STAGING allocations (iiff Option C step 2,
+        // llama.cpp-lbm3) under the same lock host_zone_reset() bumps
+        // g_host_zone_epoch under, so an allocation can never straddle a
+        // reset boundary and observe a torn epoch value. See the
+        // g_host_zone_epoch declaration above for what this id is for.
+        if (rec.handle.host_zone == host_zone_id::SCRATCH || rec.handle.host_zone == host_zone_id::STAGING) {
+            rec.handle.epoch_id =
+                g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
+        }
         if (auto dup = g_runtime_alloc_registry.find(ptr); dup != g_runtime_alloc_registry.end()) {
             const auto & old = dup->second.handle;
             GGML_SYCL_DEBUG(
@@ -14194,17 +14250,41 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // several models loaded the previous ones are still running and still own host
     // allocations in this zone -- a live record here means another owner, not a leak.
     //
-    // Refusing is the only safe answer: zone_reset() hands the whole zone back to
-    // the allocator at once, so there is no way to keep one live allocation across
-    // it the way entries_ lets reset_model_weight_entries() keep one entry. Nor may
-    // we purge the registry and reset anyway (what this did before 9a0670712) --
-    // that recycles addresses still owned by live handles. Skipping leaves TLSF's
-    // free list intact, so already-freed blocks stay reusable; only the bulk
-    // reclaim is forgone. This matches zone_reset()'s existing refusals for the
-    // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
+    // Per iiff Option C step 2 (llama.cpp-lbm3): SCRATCH/STAGING allocations are
+    // no longer reset-only -- unified_free_record()'s epoch-decrement branch
+    // returns each allocation's bytes to the owning TLSF zone individually, the
+    // instant its own mem_handle releases (see that function). A record still
+    // found live here is therefore always a genuine outstanding owner, never
+    // routine reset-only bookkeeping. Refusing is still the only safe answer:
+    // this scan has no way to reclaim one allocation without touching another's
+    // (there is no per-entry alternative the way entries_ lets
+    // reset_model_weight_entries() keep one entry), and CLAUDE.md forbids
+    // force-reclaiming a live handle. Skipping leaves TLSF's free list intact,
+    // so already-individually-freed blocks stay reusable; only the (now
+    // unnecessary -- see rewind-on-zero below) bulk reclaim is forgone. This
+    // matches zone_reset()'s existing refusals for the WEIGHT zone and for KV
+    // in a shared KV+WEIGHT arena.
+
+    // Graph-boundary epoch marker (iiff Option C step 2, llama.cpp-lbm3):
+    // every call here -- refused or clean -- opens a new epoch for SCRATCH/
+    // STAGING, the two zones unified_alloc() epoch-tags (see the registration
+    // site). Allocations made from this point on carry the bumped id, so a
+    // stuck refusal's WARN below can report how many boundaries the
+    // offending allocation has survived. Bumped under g_runtime_alloc_mutex,
+    // the same lock the registration site takes to stamp epoch_id, so no
+    // allocation can straddle the boundary and observe a torn value. KV
+    // (the only other zone this function ever resets) is not epoch-tracked
+    // -- its allocations already individually free via the carve-out in
+    // unified_free_record(), predating this ticket, and KV's own reset here
+    // is unaffected by this change.
+    const bool epoch_tracked = (zone == host_zone_id::SCRATCH || zone == host_zone_id::STAGING);
+    uint64_t   new_epoch     = 0;
 
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        if (epoch_tracked) {
+            new_epoch = g_host_zone_epoch[static_cast<size_t>(zone)].fetch_add(1, std::memory_order_relaxed) + 1;
+        }
         // Budget the logging PER ZONE, not per function.  A shared counter lets a
         // busy zone spend the whole budget and then permanently silence a quieter
         // zone's first-ever refusal -- and a first occurrence is exactly what has
@@ -14219,6 +14299,7 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
         size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
+        uint64_t                    oldest_epoch     = new_epoch;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             if (it->second.handle.host_zone == zone) {
                 if (log_detail && detail_lines < 8) {
@@ -14236,25 +14317,56 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
                     audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
                                            static_cast<int>(h.tier), it->second.cohort_id });
                 }
+                if (epoch_tracked) {
+                    oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
+                }
                 live_allocations++;
             }
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
-                GGML_LOG_WARN(
-                    "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations; owners must "
-                    "release their mem_handles instead of resetting the shared allocator\n",
-                    host_zone_name(zone), live_allocations);
+                if (epoch_tracked) {
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations "
+                        "(epoch=%llu, oldest live epoch=%llu, %llu boundaries stale); owners must release their "
+                        "mem_handles instead of resetting the shared allocator\n",
+                        host_zone_name(zone), live_allocations, (unsigned long long) new_epoch,
+                        (unsigned long long) oldest_epoch, (unsigned long long) (new_epoch - oldest_epoch));
+                } else {
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations; owners "
+                        "must release their mem_handles instead of resetting the shared allocator\n",
+                        host_zone_name(zone), live_allocations);
+                }
             }
             return;
         }
     }
 
-    // GGML_SYCL_ZONE_RESET_AUDIT=2: report-only. Host SCRATCH/STAGING
-    // allocations are reset-only by design (never individually freed), so this
-    // IS the unbounded growth the epic warns about -- deliberately, and for
-    // bounded diagnostic runs only.
+    // GGML_SYCL_ZONE_RESET_AUDIT=2: report-only. Retained for symmetry with the
+    // VRAM/scratch-pool resets even though, for SCRATCH/STAGING, there is
+    // nothing left to suppress -- see the no-op note below. KV still reaches
+    // an actual host_arena_->zone_reset(zone) call past this point.
     if (zone_reset_audit_suppresses_reset()) {
+        return;
+    }
+
+    if (epoch_tracked) {
+        // Rewind-on-zero (iiff Option C step 2, llama.cpp-lbm3): the scan
+        // above found nothing live, which -- now that every SCRATCH/STAGING
+        // allocation individually frees itself at release (see
+        // unified_free_record()'s epoch-decrement branch) -- means every
+        // byte in this zone has ALREADY been returned to host_arena_'s TLSF
+        // free list. There is nothing left for a bulk
+        // host_arena_->zone_reset(zone) to reclaim: the former unconditional
+        // call here is retired as a structural no-op, not merely skipped
+        // this time around. The call site (this function) and its own
+        // callers remain per llama.cpp-lbm3's scope -- full deletion of
+        // host_zone_reset() itself is step 4 (llama.cpp-37ba), once steps
+        // 2/3 are hardware-verified. See docs/backend/sycl-memory-design.md's
+        // "Epoch-refcounted transient zones" C2 subsection for the full
+        // rationale, including why TLSF needs no ring/rotation the way the
+        // step-1 bump pool does.
         return;
     }
 

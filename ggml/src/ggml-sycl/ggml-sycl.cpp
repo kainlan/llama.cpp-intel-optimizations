@@ -83588,6 +83588,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // Reset the scratch pool bump allocator so scratch allocations from the
     // previous graph are returned to the pool.
     ggml_sycl::unified_cache_reset_scratch_pool(sycl_ctx->device);
+    // host_zone_reset(STAGING)/(SCRATCH) no longer bulk-reclaims these zones
+    // (iiff Option C step 2, llama.cpp-lbm3): every STAGING/SCRATCH
+    // allocation now individually returns its bytes to the owning TLSF zone
+    // the instant its own mem_handle releases, so by the time these calls
+    // are reached, a clean zone has nothing left to reclaim. What these
+    // calls still do is the graph-boundary liveness check -- refusing
+    // loudly (never force-reclaiming) if the drain above left something
+    // unexpectedly live -- exactly the same policy as before, just no
+    // longer backed by a scheduled bulk reset.
     ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
     ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::SCRATCH);
 
