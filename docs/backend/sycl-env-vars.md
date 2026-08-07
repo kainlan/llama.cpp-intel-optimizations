@@ -342,6 +342,43 @@ against the old one. Decoding the columns to names is tracked as
 **Read the site name before reading these columns, and never compare them across
 sites.**
 
+#### `weight-reclaim/*` cohort names
+
+`unified-cache.cpp`'s `reclaim_weight_entries()` labels every preserved entry
+with one of four cohorts, computed from `live` (lease count, i.e. `category`
+above) and `owned_by_live` (owner-mask overlap with the current live-model
+mask):
+
+| cohort | condition | meaning |
+|---|---|---|
+| `weight:leaked_lease` | `live != 0`, no live owner, entry was tagged | a real leak — `entries_leaked` counts it, `GGML_SYCL_STRICT_LEASES=1` aborts on it |
+| `weight:leased` | `live != 0`, owned by a live model OR never tagged | benign — either correct concurrent ownership, or a lease on an entry the code never claimed to attribute |
+| `weight:owned_by_live_model` | `live == 0`, owned by a live model | correct: another live model's idle weight |
+| `weight:unattributed` | `live == 0`, not owned by a live model | preserved because it was never tagged (`!entry.owner_tagged`) — see below, never a leak |
+
+`GGML_SYCL_STRICT_LEASES=1` can abort **only** on `weight:leaked_lease` —
+`entries_leaked` increments exclusively inside the `live != 0` branch of
+`reclaim_weight_entries()`, so `weight:unattributed` (`live == 0` by
+definition) can never reach it. This was adjudicated from source in
+`llama.cpp-zjz6` after the Phase-0 recapture reclassified GPT-OSS's 1536
+MoE-expert `weight-reclaim/model-teardown` entries from `weight:leased`
+(pre-`2wv5`) to `weight:unattributed` (post-`2wv5`): the change is that their
+lease dropped to zero earlier, not that their ownership tag changed — they
+were untagged in both captures. They stay untagged because they are
+materialized by `ggml_sycl_materialize_moe_tensor_phase_layout()`'s bulk-XMX
+branch (role/`cache_layout` 4 = `GGML_LAYOUT_XMX_TILED`), reached from the
+graph-compute path's `GGML_OP_MUL_MAT_ID` scan — a runtime path with no load
+transaction bound, so the load-transaction-scoped `stamp_pending_owner()` /
+`note_model_load_end()` tagging never reaches them. (`moe_prestage_popular_experts()`
+is a different function; it stages only `GGML_LAYOUT_SOA`/`GGML_LAYOUT_AOS`
+and merely *pins* an already-existing `XMX_TILED` entry, never creates one.)
+`MODEL_TEARDOWN` preserves untagged entries unconditionally, so they are not
+reclaimed until the next `MID_LOAD_REPLAN` (immediately, regardless of
+`live_mask` — untagged means `owner_mask == 0`, which never overlaps
+`live_mask`) or `LOAD_BOUNDARY` (only once `live_mask == 0`). See
+`docs/design/sycl-canonical-memory-architecture.md` §1.2 for the full chain
+and the practical consequence (delayed, not denied, reclaim).
+
 The attribution is read from the allocation, never re-derived. It became
 trustworthy only with llama.cpp-f9tg (`85eb63dcb` / `810ae7fef`); captures taken
 before that fix mislabel COMPUTE/CONTROL allocations as GRAPH.
