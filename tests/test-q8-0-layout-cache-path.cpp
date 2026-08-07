@@ -132,11 +132,15 @@ int main() {
     compute_reference(weight_data.data(), input_data.data(), ref_output.data(), ncols, nrows);
 
     // Host-weight registration is only honoured inside a model-load
-    // transaction, and the SoA cache entry is materialized by S1-PRELOAD when
-    // the outermost transaction closes.  This mirrors production:
+    // transaction.  Outside one, ggml_backend_sycl_register_host_weight_tensor
+    // fails to acquire a load-effect lease (WRONG_TRANSACTION) and silently
+    // registers nothing, so the tensor never reaches S1-PRELOAD -- which is the
+    // only producer of a dense-weight SoA cache entry, and runs when the
+    // outermost transaction closes.  This mirrors production:
     // llama_model_sycl_loading_guard brackets the load and the model loader
     // registers each host weight inside that bracket.  Register and upload
     // inside the transaction, then resolve only after it has closed.
+    // Full RCA: llama.cpp-43uy.
     ggml_sycl::test_clear_host_weight_registry();
 
     ggml_sycl_load_txn    load{};
