@@ -29,6 +29,7 @@
 #include "ggml-quants.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -42,6 +43,8 @@ using ggml_sycl::dmmv_coalesced_q4_0_qs_offset;
 using ggml_sycl::dmmv_coalesced_q4_0_row_quants_bytes;
 using ggml_sycl::dmmv_coalesced_q4_0_scale_base;
 using ggml_sycl::dmmv_coalesced_q4_0_scale_index;
+using ggml_sycl::DMMV_COALESCED_Q4_0_TILE_BYTES;
+using ggml_sycl::DMMV_COALESCED_Q4_0_WORD_STRIDE;
 using ggml_sycl::DMMV_COALESCED_TILE_BLOCKS;
 using ggml_sycl::dmmv_coalesced_tile_count;
 
@@ -110,6 +113,122 @@ static void reorder_to_coalesced(const block_q4_0 *     aos,
             scales[dmmv_coalesced_q4_0_scale_index(row, blocks_per_row, b)] = blk->d;
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Models of the producers
+// -----------------------------------------------------------------------------
+
+// The device AoS -> coalesced reorder (convert.cpp
+// reorder_q4_0_aos_to_coalesced_kernel), with the row stride and the scale base
+// left as parameters because the row stride is the axis it got wrong: it was
+// derived from ggml_sycl_q8_0_coalesced_row_quants_bytes(), which counts 32
+// quant bytes per block for Q8_0 where Q4_0 has 16.
+//
+// `out` is sized by the CONTRACT, which is how the allocation is sized in the
+// backend (planner_layout_bytes_coalesced_for_dims). Writes that fall outside
+// it are counted rather than performed -- on the device they land in whatever
+// follows the allocation.
+struct producer_result {
+    int64_t oob_writes = 0;
+};
+
+static producer_result producer_aos_to_coalesced(const block_q4_0 *     aos,
+                                                 std::vector<uint8_t> & out,
+                                                 int                    blocks_per_row,
+                                                 int                    nrows,
+                                                 int64_t                row_quants_bytes,
+                                                 int64_t                scale_base) {
+    producer_result res;
+
+    const int64_t contract_bytes = dmmv_coalesced_q4_0_scale_base(nrows, blocks_per_row) +
+                                   (int64_t) nrows * blocks_per_row * (int64_t) sizeof(ggml_fp16_t);
+    out.assign((size_t) contract_bytes, 0);
+
+    const int tiles_per_row = dmmv_coalesced_tile_count(blocks_per_row);
+
+    auto store = [&](int64_t offset, const void * src, size_t bytes) {
+        if (offset < 0 || offset + (int64_t) bytes > contract_bytes) {
+            res.oob_writes++;
+            return;
+        }
+        std::memcpy(out.data() + offset, src, bytes);
+    };
+
+    for (int row = 0; row < nrows; ++row) {
+        for (int tile = 0; tile < tiles_per_row; ++tile) {
+            for (int block_in_tile = 0; block_in_tile < DMMV_COALESCED_TILE_BLOCKS; ++block_in_tile) {
+                const int block_idx = tile * DMMV_COALESCED_TILE_BLOCKS + block_in_tile;
+                if (block_idx >= blocks_per_row) {
+                    continue;
+                }
+                const block_q4_0 * blk = &aos[(size_t) row * blocks_per_row + block_idx];
+
+                const int64_t tile_qs_base =
+                    (int64_t) row * row_quants_bytes + (int64_t) tile * DMMV_COALESCED_Q4_0_TILE_BYTES;
+                for (int word = 0; word < 4; ++word) {
+                    const int64_t off =
+                        tile_qs_base + (int64_t) word * DMMV_COALESCED_Q4_0_WORD_STRIDE + (int64_t) block_in_tile * 4;
+                    store(off, blk->qs + word * 4, 4);
+                }
+                store(scale_base + ((int64_t) row * blocks_per_row + block_idx) * (int64_t) sizeof(ggml_fp16_t),
+                      &blk->d, sizeof(ggml_fp16_t));
+            }
+        }
+    }
+    return res;
+}
+
+// The SoA -> coalesced reorder (mmvq.cpp convert_q4_0_to_coalesced_kernel):
+// one work-item per 4-byte word, block-major in, word-major out, scales left
+// where the SoA reorder already put them.
+static void producer_soa_to_coalesced(const std::vector<uint8_t> & soa,
+                                      std::vector<uint8_t> &       out,
+                                      int                          blocks_per_row,
+                                      int                          nrows) {
+    out = soa;
+
+    const int64_t bytes_per_row = dmmv_coalesced_q4_0_row_quants_bytes(blocks_per_row);
+    const int     tiles_per_row = dmmv_coalesced_tile_count(blocks_per_row);
+
+    for (int row = 0; row < nrows; ++row) {
+        for (int tile = 0; tile < tiles_per_row; ++tile) {
+            for (int block_in_tile = 0; block_in_tile < DMMV_COALESCED_TILE_BLOCKS; ++block_in_tile) {
+                for (int word = 0; word < 4; ++word) {
+                    const int64_t src = (int64_t) row * bytes_per_row +
+                                        (int64_t) tile * DMMV_COALESCED_Q4_0_TILE_BYTES +
+                                        (int64_t) block_in_tile * (QK4_0 / 2) + (int64_t) word * 4;
+                    const int64_t dst = (int64_t) row * bytes_per_row +
+                                        (int64_t) tile * DMMV_COALESCED_Q4_0_TILE_BYTES +
+                                        (int64_t) word * DMMV_COALESCED_Q4_0_WORD_STRIDE + (int64_t) block_in_tile * 4;
+                    std::memcpy(out.data() + dst, soa.data() + src, 4);
+                }
+            }
+        }
+    }
+}
+
+// Block-major quants with the scales already in their final place: the SoA
+// layout, i.e. a coalesced buffer whose word-plane interleave never ran.
+static void build_block_major(const block_q4_0 * aos, std::vector<uint8_t> & out, int blocks_per_row, int nrows) {
+    const int64_t scale_base = dmmv_coalesced_q4_0_scale_base(nrows, blocks_per_row);
+    const int64_t n_blocks   = (int64_t) nrows * blocks_per_row;
+    out.assign((size_t) (scale_base + n_blocks * (int64_t) sizeof(ggml_fp16_t)), 0);
+
+    for (int64_t ib = 0; ib < n_blocks; ++ib) {
+        std::memcpy(out.data() + ib * (QK4_0 / 2), aos[ib].qs, QK4_0 / 2);
+        std::memcpy(out.data() + scale_base + ib * (int64_t) sizeof(ggml_fp16_t), &aos[ib].d, sizeof(ggml_fp16_t));
+    }
+}
+
+static int64_t first_byte_mismatch(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+            return (int64_t) i;
+        }
+    }
+    return a.size() == b.size() ? -1 : (int64_t) n;
 }
 
 // -----------------------------------------------------------------------------
@@ -299,6 +418,70 @@ static void case_addressing_round_trips() {
           "slice_base=" + std::to_string(slice_base) + " correct=" + std::to_string(scale_base));
 }
 
+// The kernels were pinned to the addressing contract before the writers were.
+// A reader and a writer that disagree produce a buffer no oracle can vouch for,
+// and the disagreement is invisible on a host that never runs the writer -- so
+// model the writers here, against the same header.
+static void case_producers_match_the_contract() {
+    const int blocks_per_row = 64;
+    const int nrows          = 48;
+
+    std::vector<block_q4_0> aos((size_t) nrows * blocks_per_row);
+    for (size_t i = 0; i < aos.size(); ++i) {
+        aos[i].d = ggml_fp32_to_fp16(0.01f * (float) ((i % 100) + 1));
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            aos[i].qs[j] = (uint8_t) ((i * 11 + j * 5) % 256);
+        }
+    }
+
+    std::vector<uint8_t> contract;
+    reorder_to_coalesced(aos.data(), contract, blocks_per_row, nrows);
+
+    const int64_t contract_row_bytes  = dmmv_coalesced_q4_0_row_quants_bytes(blocks_per_row);
+    const int64_t contract_scale_base = dmmv_coalesced_q4_0_scale_base(nrows, blocks_per_row);
+
+    // 1. The device AoS writer, driven from the contract's own numbers.
+    std::vector<uint8_t>  produced;
+    const producer_result ok =
+        producer_aos_to_coalesced(aos.data(), produced, blocks_per_row, nrows, contract_row_bytes, contract_scale_base);
+    check(ok.oob_writes == 0 && produced == contract, "device-aos-writer-matches-contract",
+          "oob=" + std::to_string(ok.oob_writes) +
+              " first_bad=" + std::to_string(first_byte_mismatch(produced, contract)));
+
+    // 2. Positive control, and the defect this case was written for: the Q8_0
+    //    row stride. For a tile-aligned row, ggml_sycl_q8_0_coalesced_row_quants_bytes()
+    //    is tiles * (32 blocks * 32 bytes) == blocks_per_row * 32 -- exactly
+    //    twice the Q4_0 row. It must be caught, and it must be caught as an
+    //    overrun and not merely as wrong bytes.
+    const int64_t q8_row_bytes  = (int64_t) blocks_per_row * 32;
+    const int64_t q8_scale_base = (int64_t) nrows * q8_row_bytes;
+    check(q8_row_bytes == 2 * contract_row_bytes, "q8-row-stride-is-twice-the-q4-0-row",
+          "q8=" + std::to_string(q8_row_bytes) + " q4_0=" + std::to_string(contract_row_bytes));
+
+    std::vector<uint8_t>  wrong;
+    const producer_result bad =
+        producer_aos_to_coalesced(aos.data(), wrong, blocks_per_row, nrows, q8_row_bytes, q8_scale_base);
+    check(bad.oob_writes > 0, "q8-row-stride-writes-past-the-allocation",
+          "oob_writes=" + std::to_string(bad.oob_writes));
+    check(wrong != contract, "q8-row-stride-produces-a-different-layout",
+          "first_bad=" + std::to_string(first_byte_mismatch(wrong, contract)));
+
+    // 3. The SoA writer: block-major in, contract out.
+    std::vector<uint8_t> soa;
+    build_block_major(aos.data(), soa, blocks_per_row, nrows);
+    std::vector<uint8_t> from_soa;
+    producer_soa_to_coalesced(soa, from_soa, blocks_per_row, nrows);
+    check(from_soa == contract, "device-soa-writer-matches-contract",
+          "first_bad=" + std::to_string(first_byte_mismatch(from_soa, contract)));
+
+    // 4. The fingerprint an un-interleaved buffer leaves, pinned so the next
+    //    occurrence is identified instead of re-investigated: byte 4 is block 1
+    //    word 0 under the contract and block 0 word 1 under block-major, so a
+    //    check comparing the two first disagrees at exactly byte 4.
+    check(first_byte_mismatch(soa, contract) == 4, "block-major-buffer-first-differs-at-byte-4",
+          "first_bad=" + std::to_string(first_byte_mismatch(soa, contract)));
+}
+
 static void case_oracles() {
     for (const shape & s : SHAPES) {
         const int blocks_per_row = s.ncols / QK4_0;
@@ -347,12 +530,24 @@ static void case_oracles() {
         // 3. Positive control: the replacement oracle is not merely permissive.
         const score caught = apply_gate(corrupt, ref_dfloat, 1e-2f, 1e-3f);
         check(caught.errors > 0, "contract-oracle-catches-corrupted-kernel" + tag, fmt(caught));
+
+        // 4. The replacement oracle's own blind spot, stated as a number rather
+        //    than a caveat. ggml_sycl_dmmv_dispatch has two Q4_0 coalesced
+        //    branches: src1 as dfloat, and src1 quantized to Q8_0
+        //    (dequantize_mul_mat_vec_q4_0_coalesced_q8_0). The dfloat oracle
+        //    models the first, so a byte-perfect kernel taking the SECOND fails
+        //    this gate. Scored here so a GPU failure at this magnitude is read
+        //    as the branch it is, not as a layout defect -- a layout defect is
+        //    two orders of magnitude larger (case 3 above).
+        const score q8_branch = apply_gate(ref_cpu, ref_dfloat, 1e-2f, 1e-3f);
+        check(q8_branch.errors > 0, "dfloat-oracle-rejects-the-q8-activation-branch" + tag, fmt(q8_branch));
     }
 }
 
 int main() {
     std::cout << "Q4_0 coalesced DMMV: layout addressing and oracle contract (host-only)\n";
     case_addressing_round_trips();
+    case_producers_match_the_contract();
     case_oracles();
 
     if (failures != 0) {

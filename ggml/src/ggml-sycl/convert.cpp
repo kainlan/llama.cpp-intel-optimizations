@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "convert-esimd.hpp"
 #include "dequantize.hpp"
+#include "dmmv-coalesced-q4-0-layout.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "presets.hpp"
@@ -553,11 +554,8 @@ static void reorder_q4_0_aos_to_coalesced_kernel(const block_q4_0 * __restrict__
                                                  const int                blocks_per_row,
                                                  const int                nrows,
                                                  const sycl::nd_item<2> & item) {
-    constexpr int TILE_BLOCKS        = MMVQ_COALESCED_TILE_BLOCKS;
-    constexpr int QS_BYTES_PER_BLOCK = QK4_0 / 2;           // 16 bytes of qs per block
-    constexpr int D_BYTES_PER_BLOCK  = sizeof(sycl::half);  // 2 bytes for scale
-    constexpr int WORDS_PER_BLOCK    = 4;
-    constexpr int WORD_PLANE_STRIDE  = TILE_BLOCKS * 4;
+    constexpr int TILE_BLOCKS     = MMVQ_COALESCED_TILE_BLOCKS;
+    constexpr int WORDS_PER_BLOCK = 4;
 
     const int row  = item.get_global_id(0);
     const int tid  = item.get_local_id(1);  // thread within tile (warp lane)
@@ -567,16 +565,12 @@ static void reorder_q4_0_aos_to_coalesced_kernel(const block_q4_0 * __restrict__
         return;
     }
 
-    // Layout sizes
-    constexpr int qs_bytes_per_tile = TILE_BLOCKS * QS_BYTES_PER_BLOCK;
-
-    const int64_t row_quants_bytes   = (int64_t) ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row);
-    const int64_t total_quants_bytes = (int64_t) nrows * row_quants_bytes;
-
-    // Destination offsets - use int64_t to avoid overflow for large tensors
-    const int64_t row_offset   = (int64_t) row * row_quants_bytes;
-    const int64_t tile_qs_base = row_offset + (int64_t) tile * qs_bytes_per_tile;
-    const int64_t d_base       = total_quants_bytes;
+    // Every offset comes from the Q4_0 addressing contract, so this writer and
+    // the DMMV/MMVQ readers cannot drift apart. Deriving the row stride from
+    // ggml_sycl_q8_0_coalesced_row_quants_bytes() here made the stride 2x too
+    // large (Q8_0 carries 32 quant bytes per block, Q4_0 carries 16) and wrote
+    // past the end of the coalesced allocation. See llama.cpp-szv8.
+    const int64_t d_base = ggml_sycl::dmmv_coalesced_q4_0_scale_base(nrows, blocks_per_row);
 
     for (int block_in_tile = tid; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
         const int block_idx = tile * TILE_BLOCKS + block_in_tile;
@@ -589,13 +583,15 @@ static void reorder_q4_0_aos_to_coalesced_kernel(const block_q4_0 * __restrict__
 
         // Copy qs bytes in word-major order
         for (int word = 0; word < WORDS_PER_BLOCK; ++word) {
-            const int64_t word_offset = tile_qs_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
+            const int64_t word_offset =
+                ggml_sycl::dmmv_coalesced_q4_0_qs_offset(row, blocks_per_row, block_idx, word * 4);
             memcpy(dst + word_offset, src_block->qs + word * 4, 4);
         }
 
         // Copy d value (scale) - contiguous after all quants
-        *(sycl::half *) (dst + d_base + ((int64_t) row * blocks_per_row + block_idx) * D_BYTES_PER_BLOCK) =
-            src_block->d;
+        *(sycl::half *) (dst + d_base +
+                         ggml_sycl::dmmv_coalesced_q4_0_scale_index(row, blocks_per_row, block_idx) *
+                             (int64_t) sizeof(sycl::half)) = src_block->d;
     }
 }
 
