@@ -3406,8 +3406,21 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-unified-memory-e2e COMMAND test-sycl-unified-memory-e2e)
 set_tests_properties(test-sycl-unified-memory-e2e PROPERTIES
-    LABELS "sycl;hostonly;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Not "hostonly": this fixture allocates GBs of device memory through the
+    # unified cache on device 0 (llama.cpp-mequ).
+    LABELS "sycl;tdd;0igs-batch2"
+    # ONEAPI_DEVICE_SELECTOR pins ONE device (level_zero:0, the B70).  It fixes
+    # the meaning of the in-process index 0 this test passes to
+    # get_unified_cache_for_device(), and keeps the iGPU out of the run -- its
+    # "VRAM" is 231.7 GB of system RAM, and a fixture that reserves an arena
+    # against that figure drives host Shmem to ~128 GB (llama.cpp-403s).
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Exits 77 when a capability or configuration it needs is absent: no SYCL
+    # device, no unified cache, or a cache that already existed and so could not
+    # take the pinned budget every subcase sizes itself from.  Without
+    # SKIP_RETURN_CODE ctest renders that as FAILED rather than Skipped
+    # (llama.cpp-ivin).
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
