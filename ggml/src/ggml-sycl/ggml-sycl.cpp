@@ -9919,6 +9919,35 @@ static ggml_sycl_execution_result ggml_sycl_execution_c_result(ggml_sycl::execut
     return GGML_SYCL_EXECUTION_BUSY;
 }
 
+// Diagnostic-only mapping (llama.cpp-cnre): the internal registry error name,
+// for logs/exception text. Distinct from ggml_sycl_execution_c_result() above,
+// which maps to the public ggml_sycl_execution_result C enum for the
+// lifecycle-context ABI; this one stays local to ggml-sycl.cpp.
+static const char * ggml_sycl_execution_error_name(ggml_sycl::execution::error e) {
+    using E = ggml_sycl::execution::error;
+    switch (e) {
+        case E::OK:
+            return "OK";
+        case E::STALE:
+            return "STALE";
+        case E::MISMATCH:
+            return "MISMATCH";
+        case E::OVERFLOW:
+            return "OVERFLOW";
+        case E::DEVICE_BUSY:
+            return "DEVICE_BUSY";
+        case E::BUSY:
+            return "BUSY";
+        case E::NULL_OUTPUT:
+            return "NULL_OUTPUT";
+        case E::FOREIGN_BACKEND:
+            return "FOREIGN_BACKEND";
+        case E::NOT_FOUND:
+            return "NOT_FOUND";
+    }
+    return "UNKNOWN";
+}
+
 static ggml_sycl_execution_result ggml_sycl_execution_caught_bad_alloc() {
     return GGML_SYCL_EXECUTION_ALLOCATION_FAILURE;
 }
@@ -12698,7 +12727,18 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     }
 }
 
-static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noexcept {
+// out_err (llama.cpp-cnre), when non-null, receives the registry error that
+// caused a `false` return, so a caller can tell a contract-compliant refusal
+// (e.g. DEVICE_BUSY, same-device concurrent inference) apart from a registry
+// defect (MISMATCH/STALE/OVERFLOW) instead of seeing an undifferentiated
+// "failed to begin tracked SYCL execution graph". Left untouched (OK) when
+// `ctx` is null or the context isn't armed for tracked execution at all --
+// see the caller in ggml_backend_sycl_graph_compute_impl(), which only treats
+// a `false` return as a refusal once it has independently confirmed the
+// context *was* armed (execution_context_id/execution_root_model_id set), so
+// those two early-outs never reach the caller's throw.
+static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
+                                            ggml_sycl::execution::error * out_err = nullptr) noexcept {
     if (!ctx) {
         return false;
     }
@@ -12717,8 +12757,14 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     };
     ggml_sycl::execution::SessionId session{};
     ggml_sycl::execution::SessionResetEpoch reset_epoch{};
-    if (registry.attach_root({ ctx->execution_context_id }, owner, &session, &reset_epoch) != ggml_sycl::execution::error::OK) {
-        return false;
+    {
+        const auto rc = registry.attach_root({ ctx->execution_context_id }, owner, &session, &reset_epoch);
+        if (rc != ggml_sycl::execution::error::OK) {
+            if (out_err) {
+                *out_err = rc;
+            }
+            return false;
+        }
     }
     ctx->execution_session_id = session.value;
     ctx->execution_reset_epoch = reset_epoch.value;
@@ -12731,9 +12777,14 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
         std::sort(devices.begin(), devices.end());
         devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
         const auto participants = ggml_sycl_execution_expected_participants_locked(ctx->execution_context_id, devices);
-        if (registry.begin_invocation({ ctx->execution_context_id }, current.session, current.reset_epoch, current.graph_epoch,
-                                      owner, devices.data(), devices.size(), participants.data(), participants.size(),
-                                      ctx->execution_participant_id, &current.invocation) != ggml_sycl::execution::error::OK) {
+        const auto rc =
+            registry.begin_invocation({ ctx->execution_context_id }, current.session, current.reset_epoch,
+                                      current.graph_epoch, owner, devices.data(), devices.size(), participants.data(),
+                                      participants.size(), ctx->execution_participant_id, &current.invocation);
+        if (rc != ggml_sycl::execution::error::OK) {
+            if (out_err) {
+                *out_err = rc;
+            }
             return false;
         }
         ctx->execution_session_id = current.session.value;
@@ -12748,16 +12799,27 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context * ctx) noe
     devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
     const auto participants = ggml_sycl_execution_expected_participants_locked(ctx->execution_context_id, devices);
     ggml_sycl::execution::GraphEpoch graph_epoch{};
-    if (registry.begin_graph({ ctx->execution_context_id }, session, reset_epoch, owner, &graph_epoch) !=
-        ggml_sycl::execution::error::OK) {
-        return false;
+    {
+        const auto rc = registry.begin_graph({ ctx->execution_context_id }, session, reset_epoch, owner, &graph_epoch);
+        if (rc != ggml_sycl::execution::error::OK) {
+            if (out_err) {
+                *out_err = rc;
+            }
+            return false;
+        }
     }
     ggml_sycl::execution::InvocationId invocation{};
-    if (registry.begin_invocation({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner,
-                                  devices.data(), devices.size(), participants.data(), participants.size(),
-                                  ctx->execution_participant_id, &invocation) != ggml_sycl::execution::error::OK) {
-        (void) registry.rollback_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
-        return false;
+    {
+        const auto rc = registry.begin_invocation({ ctx->execution_context_id }, session, reset_epoch, graph_epoch,
+                                                  owner, devices.data(), devices.size(), participants.data(),
+                                                  participants.size(), ctx->execution_participant_id, &invocation);
+        if (rc != ggml_sycl::execution::error::OK) {
+            (void) registry.rollback_graph({ ctx->execution_context_id }, session, reset_epoch, graph_epoch, owner);
+            if (out_err) {
+                *out_err = rc;
+            }
+            return false;
+        }
     }
     ctx->execution_graph_epoch = graph_epoch.value;
     ctx->execution_invocation_id = invocation.value;
@@ -83152,11 +83214,24 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const auto t_impl_entry = std::chrono::high_resolution_clock::now();
 
     compute_impl_guard _reentry_guard(sycl_ctx->device);
-    const bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx);
+    ggml_sycl::execution::error execution_graph_error = ggml_sycl::execution::error::OK;
+    const bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
     {
         std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);
         if (sycl_ctx->execution_context_id != 0 && sycl_ctx->execution_root_model_id != 0 && !execution_graph_active) {
-            throw std::runtime_error("failed to begin tracked SYCL execution graph");
+            // llama.cpp-cnre: WARN (not INFO -- dropped at default verbosity,
+            // see CLAUDE.md) so a refusal is attributable without
+            // instrumentation. DEVICE_BUSY here is the contract-compliant
+            // "another context already owns this device" rejection
+            // (docs/design/sycl-canonical-memory-architecture.md §12.3);
+            // MISMATCH/STALE/OVERFLOW indicate an actual registry defect.
+            GGML_LOG_WARN(
+                "[SYCL] graph_compute: failed to begin tracked execution graph: error=%s device=%d "
+                "context_id=%llu\n",
+                ggml_sycl_execution_error_name(execution_graph_error), sycl_ctx->device,
+                (unsigned long long) sycl_ctx->execution_context_id);
+            throw std::runtime_error(std::string("failed to begin tracked SYCL execution graph: error=") +
+                                     ggml_sycl_execution_error_name(execution_graph_error));
         }
     }
     struct execution_graph_scope {
