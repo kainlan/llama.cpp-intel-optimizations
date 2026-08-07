@@ -72906,63 +72906,88 @@ cpu_tg_fallthrough:
             sycl::half * batched_acts    = nullptr;
             float *      batched_out     = nullptr;
 
-            scoped_unified_queue_temp<sycl::half> weight_pool;
-            scoped_unified_queue_temp<sycl::half> act_pool;
-            scoped_unified_queue_temp<float>      out_pool;
-
-            bool                        scratch_from_unified_cache = false;
+            // This batch runs on planner-owned scratch or it does not run. There
+            // is deliberately no general temporary fallback here: refusing
+            // returns false, and ggml_sycl_mul_mat_id continues through the
+            // serialized and host-aware routes below, which are already planned
+            // for. A fallback would instead let an unbudgeted batch enlarge the
+            // RUNTIME zone -- 506.25 MiB on the 32-expert GPT-OSS shape against
+            // a one-expert plan.
             pp_moe_onednn_scratch_claim batched_scratch_claim;
-            if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*ctx.stream())) {
-                const size_t planned_weight =
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);
-                const size_t planned_act =
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
-                const size_t planned_out =
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
-                uint32_t planned_ring_depth = pp_moe_onednn_runtime_ring_depth(
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device));
-                if (cache->reserve_pp_moe_onednn_scratch(std::max(planned_weight, weight_bytes),
-                                                         std::max(planned_act, act_bytes),
-                                                         std::max(planned_out, out_bytes), planned_ring_depth)) {
-                    uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
-                    ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot slot;
-                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
-                        const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
-                        const bool cache_claimed = !fail_after_local_reservation &&
-                                                   cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, slot);
-                        if (cache_claimed) {
-                            batched_scratch_claim.activate(ctx.device, planned_ring_depth, scratch_slot, slot.generation,
-                                                           ctx.stream());
-                        } else {
-                            pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, planned_ring_depth, scratch_slot);
-                        }
-                    }
-                    if (batched_scratch_claim.claimed() && slot.weight_size >= weight_bytes &&
-                        slot.activation_size >= act_bytes && slot.output_size >= out_bytes) {
-                        batched_weights            = static_cast<sycl::half *>(slot.weight);
-                        batched_acts               = static_cast<sycl::half *>(slot.activation);
-                        batched_out                = static_cast<float *>(slot.output);
-                        scratch_from_unified_cache = true;
-                        batched_scratch_claim.mark_used();
-                    } else {
-                        batched_scratch_claim.release_unused();
-                    }
-                }
+
+            ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*ctx.stream());
+            if (!cache) {
+                return reject_batched("scratch-cache-unavailable");
             }
 
-            if (!batched_weights || !batched_acts || !batched_out) {
-                try {
-                    batched_weights =
-                        weight_pool.alloc(*stream, ctx.device, total_weight_elems, "moe_pp_batched_f16_weights");
-                    batched_acts = act_pool.alloc(*stream, ctx.device, total_act_elems, "moe_pp_batched_f16_acts");
-                    batched_out  = out_pool.alloc(*stream, ctx.device, total_out_elems, "moe_pp_batched_f32_out");
-                } catch (...) {
-                    return reject_batched("scratch-alloc");
+            const size_t planned_weight =
+                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);
+            const size_t planned_act =
+                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
+            const size_t planned_out = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
+            const uint32_t planned_ring_depth =
+                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);
+
+            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {
+                planned_weight,
+                planned_act,
+                planned_out,
+                planned_ring_depth,
+            };
+            // One slot per dispatch: pp_moe_onednn_claim_scratch_slot serializes
+            // reuse, so this call needs depth 1 no matter how deep the ring is.
+            const ggml_sycl::pp_moe_onednn_scratch_shape required_shape = {
+                weight_bytes,
+                act_bytes,
+                out_bytes,
+                1,
+            };
+            const ggml_sycl::pp_moe_onednn_scratch_admission admission =
+                ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
+            if (!admission.allowed) {
+                if (pp_mxfp4_soa_f16_batched_trace) {
+                    fprintf(stderr,
+                            "[MOE-PP-ONEDNN-F16-BATCHED-ADMISSION] tensor=%s device=%d reason=%s active=%zu "
+                            "planned_weight=%zu required_weight=%zu planned_act=%zu required_act=%zu "
+                            "planned_out=%zu required_out=%zu planned_ring=%u required_ring=%u\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device,
+                            ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason), active_count,
+                            planned_weight, weight_bytes, planned_act, act_bytes, planned_out, out_bytes,
+                            planned_ring_depth, required_shape.ring_depth);
                 }
-                if (!batched_weights || !batched_acts || !batched_out) {
-                    return reject_batched("scratch-null");
-                }
+                return reject_batched(ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason));
             }
+
+            // Admission has already refused a zero planned ring depth, so the
+            // runtime helper's 0 -> 1 substitution is unreachable from here; it
+            // stays so the depth used for reservation and for claiming is
+            // derived in exactly one place.
+            const uint32_t ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth);
+            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {
+                return reject_batched("planned-scratch-unavailable");
+            }
+
+            uint32_t                                             scratch_slot = std::numeric_limits<uint32_t>::max();
+            ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
+            if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {
+                return reject_batched("scratch-slot-unavailable");
+            }
+            const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
+            if (fail_after_local_reservation || !cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
+                pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);
+                return reject_batched("scratch-slot-unavailable");
+            }
+            batched_scratch_claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation, ctx.stream());
+            if (reserved.weight_size < weight_bytes || reserved.activation_size < act_bytes ||
+                reserved.output_size < out_bytes) {
+                batched_scratch_claim.release_unused();
+                return reject_batched("scratch-slot-size");
+            }
+
+            batched_weights = static_cast<sycl::half *>(reserved.weight);
+            batched_acts    = static_cast<sycl::half *>(reserved.activation);
+            batched_out     = static_cast<float *>(reserved.output);
+            batched_scratch_claim.mark_used();
 
             if (!ready_events.empty()) {
                 stream->ext_oneapi_submit_barrier(ready_events);
@@ -73185,10 +73210,9 @@ cpu_tg_fallthrough:
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(
                         "[MOE-PP-ONEDNN-F16-BATCHED] tensor=%s device=%d layout=%s experts=%zu rows=%zu "
-                        "max_rows=%zu scratch=%s weight=%.1fMB act=%.1fMB out=%.1fMB\n",
+                        "max_rows=%zu scratch=planned-unified-cache weight=%.1fMB act=%.1fMB out=%.1fMB\n",
                         src0 && src0->name ? src0->name : "?", ctx.device, ggml_sycl_layout_mode_name(route_layout),
-                        active_count, row_maps_total, max_rows_per_expert,
-                        scratch_from_unified_cache ? "unified-cache" : "pool", weight_bytes / (1024.0 * 1024.0),
+                        active_count, row_maps_total, max_rows_per_expert, weight_bytes / (1024.0 * 1024.0),
                         act_bytes / (1024.0 * 1024.0), out_bytes / (1024.0 * 1024.0));
                 }
             }
@@ -73247,13 +73271,45 @@ cpu_tg_fallthrough:
                 ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
             const size_t planned_output_slot =
                 ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
-            uint32_t planned_ring_depth = pp_moe_onednn_runtime_ring_depth(
-                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device));
-            if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*ctx.stream())) {
-                (void) cache->reserve_pp_moe_onednn_scratch(
-                    std::max(planned_weight_slot, pp_mxfp4_src0_f16_bytes),
-                    std::max(planned_activation_slot, src1_contiguous_f16_bytes),
-                    std::max(planned_output_slot, dst_contiguous_bytes), planned_ring_depth);
+            const uint32_t planned_ring_depth_raw =
+                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);
+            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {
+                planned_weight_slot,
+                planned_activation_slot,
+                planned_output_slot,
+                planned_ring_depth_raw,
+            };
+            const ggml_sycl::pp_moe_onednn_scratch_shape required_shape = {
+                pp_mxfp4_src0_f16_bytes,
+                src1_contiguous_f16_bytes,
+                dst_contiguous_bytes,
+                1,
+            };
+            // Same hard cap as the batched executor: the planned slot sizes are
+            // a ceiling, so this staging never asks for max(planned, required).
+            // Refusing here does NOT abort the op -- unlike the batched lambda
+            // this IS the terminal MoE PP route, so it falls through to its own
+            // transient per-dispatch staging below, which is a different
+            // placement category (queue-scoped temporaries released at scope
+            // exit) rather than an enlargement of the planned ring.
+            const ggml_sycl::pp_moe_onednn_scratch_admission admission =
+                ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
+            if (!admission.allowed && pp_oor_trace) {
+                fprintf(stderr,
+                        "[MOE-OOR-TRACE] stage=pp-moe-onednn-scratch-refused tensor=%s device=%d reason=%s "
+                        "planned_weight=%zu required_weight=%zu planned_act=%zu required_act=%zu "
+                        "planned_out=%zu required_out=%zu planned_ring=%u\n",
+                        src0 && src0->name ? src0->name : "?", ctx.device,
+                        ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason), planned_weight_slot,
+                        pp_mxfp4_src0_f16_bytes, planned_activation_slot, src1_contiguous_f16_bytes,
+                        planned_output_slot, dst_contiguous_bytes, planned_ring_depth_raw);
+            }
+            const uint32_t             planned_ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth_raw);
+            ggml_sycl::unified_cache * cache =
+                admission.allowed ? ggml_sycl::get_unified_cache(*ctx.stream()) : nullptr;
+            if (cache != nullptr) {
+                (void) cache->reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,
+                                                            planned_output_slot, planned_ring_depth);
                 ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
                 uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
                 if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {

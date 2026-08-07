@@ -11830,12 +11830,41 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
                                                   size_t   activation_slot_bytes,
                                                   size_t   output_slot_bytes,
                                                   uint32_t ring_depth) {
-    weight_slot_bytes     = align_up(weight_slot_bytes, 256);
-    activation_slot_bytes = align_up(activation_slot_bytes, 256);
-    output_slot_bytes     = align_up(output_slot_bytes, 256);
-    if (ring_depth == 0 || weight_slot_bytes == 0 || activation_slot_bytes == 0 || output_slot_bytes == 0) {
+    // Admission runs FIRST -- before the scratch mutex and before a single
+    // allocator call -- so a request the planner never budgeted for costs
+    // nothing and cannot leave a partially built ring behind. The unchecked
+    // align_up this replaced wrapped on an unrepresentable size, and a wrapped
+    // size compares as small.
+    const int                         device_id = ggml_sycl_get_device_id_from_queue(queue_);
+    const pp_moe_onednn_scratch_shape planned   = {
+        unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id),
+        unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device_id),
+        unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device_id),
+        unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id),
+    };
+    const pp_moe_onednn_scratch_shape requested = {
+        weight_slot_bytes,
+        activation_slot_bytes,
+        output_slot_bytes,
+        ring_depth,
+    };
+
+    pp_moe_onednn_scratch_shape           admitted;
+    const pp_moe_onednn_scratch_admission admission = pp_moe_onednn_preflight_scratch(planned, requested, &admitted);
+    if (!admission.allowed) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] refusing unplanned PP MoE oneDNN scratch reservation: device=%d reason=%s "
+            "planned=[%zu,%zu,%zu,%u] requested=[%zu,%zu,%zu,%u]\n",
+            device_id, pp_moe_onednn_scratch_admission_reason_name(admission.reason), planned.weight_slot_bytes,
+            planned.activation_slot_bytes, planned.output_slot_bytes, planned.ring_depth, requested.weight_slot_bytes,
+            requested.activation_slot_bytes, requested.output_slot_bytes, requested.ring_depth);
         return false;
     }
+
+    weight_slot_bytes     = admitted.weight_slot_bytes;
+    activation_slot_bytes = admitted.activation_slot_bytes;
+    output_slot_bytes     = admitted.output_slot_bytes;
+    ring_depth            = admitted.ring_depth;
 
     auto release_slots = [&](std::vector<pp_moe_onednn_scratch_slot> & slots) {
         size_t released_direct = 0;
