@@ -218,6 +218,16 @@ def evaluate(cache, backend, common, header):
         'the weight reclaim hook is declared before the cache lock':
             precedes(reclaim, "zone_audit_site_visit audit(", "lock(rw_mutex_)"),
 
+        # An early-return placed BEFORE the hook makes the site vanish from
+        # the inventory entirely on that path, rather than reading as
+        # "visited and clean" -- worse than a visits=0 reading, because an
+        # absent row is indistinguishable from a wiring regression and voids
+        # baseline comparisons (llama.cpp-2757's battery finding: the
+        # unreserved-pool early-return moved above the hook during review
+        # iteration, and self-test coverage did not exist to catch it).
+        'the scratch pool reset hook is declared before the reservation early-return':
+            precedes(scratch, 'zone_audit_site_visit audit("scratch-pool-reset"', "!scratch_pool_ptr_"),
+
         # 3. The report must reach the sink. GGML_LOG_INFO is dropped at default
         #    verbosity in EVERY tool, so an INFO-level line yields an empty
         #    capture -- indistinguishable from "no escapes found".
@@ -321,6 +331,15 @@ MUTANTS = {
         "cache",
         [('        zone_audit_site_visit audit("scratch-pool-reset", "bump", ',
           '        zone_audit_site_visit unused_audit("scratch-pool-reset-renamed", "bump", ')]),
+    # Reproduces the exact llama.cpp-2757 battery regression: an early-return
+    # inserted before the hook, so the site vanishes instead of reading
+    # "visited and clean". A single insertion right after the signature is
+    # enough to make "!scratch_pool_ptr_" precede the hook -- no need to
+    # relocate the real (comment-bearing) early-return further down.
+    "the scratch pool reset hook is declared before the reservation early-return": (
+        "cache",
+        [("void unified_cache::reset_scratch_pool() {",
+          "void unified_cache::reset_scratch_pool() {\n    if (!scratch_pool_ptr_) { return; }")]),
     # The exact "tidy" this guards against: collapsing the chain back to the
     # unconditional restore the reference had.
     "the fatal handler chains to the displaced handler, not SIG_DFL": (
