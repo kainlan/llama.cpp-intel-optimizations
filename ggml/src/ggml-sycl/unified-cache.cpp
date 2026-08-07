@@ -1712,21 +1712,6 @@ struct zone_audit_live_entry {
     std::string cohort;
 };
 
-// llama.cpp-fzem: see unified_cache_entry::debug_lease_ring in unified-cache.hpp
-// for rationale. Guarded on g_ggml_sycl_debug so a normal run pays only the
-// flag check -- every call site already touches/locks this entry, so the
-// check adds no new synchronization of its own.
-void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
-    if (!g_ggml_sycl_debug || !site) {
-        return;
-    }
-    debug_lease_event & slot = debug_lease_ring[debug_lease_ring_next];
-    slot.seq                 = debug_lease_seq++;
-    slot.acquire             = acquire;
-    slot.site                = site;
-    debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
-}
-
 void zone_audit_emit(const std::string & line) {
     // WARN plus a raw stderr copy. GGML_LOG_INFO is dropped at default verbosity
     // in EVERY tool (common_get_verbosity maps INFO to TRACE=4 against a
@@ -2610,6 +2595,23 @@ unified_cache::unified_cache(sycl::queue & queue,
     // Ensure unordered_map has buckets before any find() calls.
     entries_.rehash(1);
     id_to_key_.rehash(1);
+}
+
+// llama.cpp-fzem: see unified_cache_entry::debug_lease_ring in unified-cache.hpp
+// for rationale. Guarded on g_ggml_sycl_debug so a normal run pays only the
+// flag check -- every call site already touches/locks this entry, so the
+// check adds no new synchronization of its own. (Defined here, outside the
+// zone-audit anonymous namespace above, because a member of a ggml_sycl-scope
+// struct cannot be defined inside an inner unnamed namespace.)
+void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
+    if (!g_ggml_sycl_debug || !site) {
+        return;
+    }
+    debug_lease_event & slot = debug_lease_ring[debug_lease_ring_next];
+    slot.seq                 = debug_lease_seq++;
+    slot.acquire             = acquire;
+    slot.site                = site;
+    debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
 }
 
 bool unified_cache::ensure_planned_arena_zones() {
