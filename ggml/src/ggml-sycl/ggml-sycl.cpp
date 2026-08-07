@@ -10440,6 +10440,19 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
         registry = &ggml_sycl::lifecycle::global_registry();
         ticket   = registry->prepare_teardown(owner);
         if (!ticket.finisher) {
+            // llama.cpp-fzem: WARN, not silent -- a non-finisher outcome means
+            // ggml_sycl_teardown_owner_effects()/ggml_sycl_release_model_slot_resources()
+            // (and therefore the host-weight-extras release and its "registry
+            // rows" WARN) are skipped entirely for this call. OK_ALREADY_DEAD
+            // in particular means something ELSE already tore this model down
+            // before this call -- silent from here, since the caller
+            // (llama_model::~llama_model()) treats OK_ALREADY_DEAD as success
+            // and logs nothing.
+            GGML_LOG_WARN(
+                "[SYCL] model teardown short-circuited (non-finisher): model=%llu load=%llu slot=%u "
+                "generation=%llu ticket_code=%d\n",
+                (unsigned long long) owner.model.value, (unsigned long long) owner.load.value, owner.owner.slot,
+                (unsigned long long) owner.owner.generation, (int) ticket.code);
             if (ticket.code == ggml_sycl::lifecycle::error::ALLOCATION_FAILED ||
                 ticket.code == ggml_sycl::lifecycle::error::EFFECT_FAILED) {
                 return ggml_sycl_restore_latest_live_plan() ? ggml_sycl_lifecycle_c_result(ticket.code) :
