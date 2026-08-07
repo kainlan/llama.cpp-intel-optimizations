@@ -35,6 +35,7 @@ that covers:
 | MoE expert pointer tables | `moe_expert_ptrs_bytes` → Zone: RUNTIME |
 | DMA staging pool | `dma_staging_pool_bytes` → Zone: RUNTIME |
 | PP pipeline scratch | `pp_pipeline_scratch_bytes` → Zone: RUNTIME |
+| PP MoE oneDNN scratch | `pp_moe_onednn_{weight,activation,output}_slot_bytes`, `pp_moe_onednn_ring_depth` → Zone: RUNTIME |
 | CPU quant buffers | `cpu_quant_buffer_bytes` → Zone: HOST |
 | Graph metadata | `graph_metadata_bytes` → Zone: HOST |
 | TP FFN / attn buffers | `tp_ffn_buffer_bytes`, `tp_attn_buffer_bytes` → Zone: RUNTIME |
@@ -48,6 +49,31 @@ that covers:
 **Invariant:** Dispatch code must never make host/device placement decisions by
 inspecting `ggml_tensor::data` or calling `ggml_backend_buffer_is_host()` directly.
 All placement decisions are delegated to the planner-derived handles at graph-build time.
+
+**Planned scratch admission invariant:** Planner-owned scratch dimensions and ring
+depths are **hard capacity ceilings, not runtime growth hints**. An executor whose
+required PP MoE oneDNN device scratch exceeds any planned dimension must fail
+closed before allocating that scratch and select an already-planned safe route.
+It must not enlarge a zone, evict live handles, reset a live zone, or issue a
+general temporary allocation to make an inadmissible batch fit.
+
+Refusal is a **typed, named outcome**, never a silent clamp: the decision is
+`ggml_sycl::pp_moe_onednn_admit_scratch` (`moe-scratch-admission.hpp`), and every
+`pp_moe_onednn_scratch_admission_reason` has a stable name that reaches a log, so
+a route that did not run is attributable to one predicate. The policy is pure —
+no lock, no allocation, no device query — which is what lets it run *before* the
+reservation takes `pp_moe_onednn_scratch_mutex_` or calls the allocator (§12.5).
+`unified_cache::reserve_pp_moe_onednn_scratch` applies the same cap on its own
+entry, so an executor that skipped the check cannot reach the ring through it.
+
+The cap is compared at slot-allocation granularity: both the plan and the request
+are rounded up to the ring's slot alignment with checked arithmetic, and the
+aligned plan is the ceiling. A size too large to align is refused rather than
+wrapped — a wrapped size compares as small, which would admit exactly the request
+the cap exists to stop. `tests/test-sycl-pp-moe-scratch-admission-contract.py`
+gates the production call order at both live executor sites and at the
+reservation; `test-moe-scratch-admission` proves the policy, including that a
+refusal reaches no lock and no allocator.
 
 ### 1.2 Unified Cache (`ggml_sycl::unified_cache`)
 
@@ -81,6 +107,21 @@ has four named zones distinct from `vram_zone_id`:
 Host-pinned allocations use `unified_cache_host_zone_alloc(host_zone_id zone, ...)` /
 `unified_cache_zone_alloc`. The `→ Zone: HOST` shorthand in §1.1 refers to any of
 these four `host_zone_id` zones.
+
+**Host expert residency invariant:** Host-pinned MoE expert weights are
+**intentional** when the complete model does not fit in VRAM. Scratch admission
+(§1.1) governs only the device compute scratch of a candidate executor. It must
+not force those experts into VRAM, reinterpret host residency as an allocation
+failure, or replace their planner-selected host/serialized execution route. Host
+weight and staging lifetimes remain protected by their canonical `mem_handle`
+owners and completion events.
+
+Host `WEIGHT` residency and device compute `SCRATCH` are different placement
+categories and are not substitutable in either direction: a oneDNN GPU matmul
+cannot consume a host-pinned scratch pointer, and a host-resident expert is not
+a reason to grow a device zone. An executor that requires device-local experts
+declines a host-planned one and falls through to a route that does not — that
+decline is a correct outcome, not a failure to recover from.
 
 **What the unified cache does NOT own:**
 - Placement decisions (the planner owns those).
@@ -855,6 +896,24 @@ because it runs from `moe_control_conversion_guard`'s destructor on the failure
 path. `tests/test-sycl-moe-control-plan-contract.py` gates the noexcept rollback
 and the generation stamping; `test-moe-control-plan` proves the commit/rollback
 state machine.
+
+PP MoE oneDNN scratch admission (`moe-scratch-admission.hpp`, `ijla`) adds **no
+lock at all**, and that is a load-bearing property rather than an omission. The
+policy is a pure function of two shapes: it takes no mutex, allocates nothing,
+queries no device and reads no registry, so it can and must run *before* the L5
+`pp_moe_onednn_scratch_mutex_` and before the reservation's allocator. Both live
+executor call sites and `unified_cache::reserve_pp_moe_onednn_scratch` run it
+first, so a request the planner never budgeted for is refused without taking a
+lock or leaving a partially built ring behind.
+
+That follows the same shape as the MoE CONTROL ledger above, one step further:
+where the ledger takes its capacity snapshot as a parameter to stay strictly
+leaf, this policy takes *both* operands as parameters and holds no state, so
+there is no lock to classify. `tests/test-sycl-pp-moe-scratch-admission-contract.py`
+gates the ordering by source position at all three sites, and
+`test-moe-scratch-admission` proves behaviorally that a refusal reaches neither
+the lock nor the allocator — source order shows where the call sits, only the
+behavioral seam shows that nothing downstream of it ran.
 
 Code may skip ranks but never acquire a lower-numbered rank while holding a
 higher one. Two keyed same-rank locks require the stable key order; pointer
