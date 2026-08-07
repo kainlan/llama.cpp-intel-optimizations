@@ -96,50 +96,39 @@ int main(int argc, char ** argv) {
     // already owns one (docs/design/sycl-canonical-memory-architecture.md
     // §5.3, §7.3, §12.3 -- "Same-device concurrent inference: Unsupported
     // today; no optimistic overlap"). Serialize every device-touching phase
-    // -- model load, context creation, and decode -- that targets the same
-    // physical SYCL device, so this test exercises the concurrency the
-    // backend actually supports -- different devices, and CPU alongside GPU
-    // -- rather than asserting an out-of-contract guarantee. This is
-    // backend-gated: on any backend other than SYCL the lock set stays empty
-    // and every phase runs exactly as before.
+    // that this test actually runs concurrently on the same physical SYCL
+    // device -- context creation and decode -- so this test exercises the
+    // concurrency the backend actually supports -- different devices, and
+    // CPU alongside GPU -- rather than asserting an out-of-contract
+    // guarantee. This is backend-gated: on any backend other than SYCL the
+    // lock set stays empty and every phase runs exactly as before.
     //
-    // Model load and context creation are guarded, not just decode, because
-    // both touch SYCL execution-registry state that is shared per physical
-    // device:
-    //   - llama_init_from_model() creates a ggml_backend per device
-    //     (ggml_backend_dev_init) and, for a SYCL device, creates/binds a
-    //     fresh execution-registry context as part of that (see
-    //     ggml_backend_sycl_execution_context_create/bind_backend, wired up
-    //     in src/llama-context.cpp) before any graph is ever built -- this
-    //     happens on every thread's very first device touch, unguarded, if
-    //     only decode is locked.
-    //   - llama_model_load_from_file() reserves each device's VRAM arena and
-    //     materializes weight layout directly on the device (see
-    //     ggml_sycl_model_loading_effects() and the model-load `async =
-    //     false` note next to ggml_backend_sycl_device_get_props() in
-    //     ggml-sycl.cpp), and for a SYCL device performs the same
-    //     execution-registry context create/bind as context creation above.
-    //     Model load in this test runs sequentially in the main thread
-    //     before any thread is spawned, so it never contends with another
-    //     load -- the reason to lock it anyway is that it can still contend
-    //     with the context-creation/decode threads spawned immediately after
-    //     this loop returns, which start racing on these same devices
-    //     instantly.
+    // Context creation is guarded, not just decode, because
+    // llama_init_from_model() touches SYCL execution-registry state per
+    // device before any graph is built: it creates a ggml_backend per device
+    // (ggml_backend_dev_init) and, for a SYCL device, creates/binds a fresh
+    // execution-registry context as part of that (see
+    // ggml_backend_sycl_execution_context_create/bind_backend, wired up in
+    // src/llama-context.cpp) -- this happens on every thread's very first
+    // device touch, unguarded, if only decode is locked.
     //
-    // Residual risk: unlike context creation and decode, there is no public
-    // API to force-drain a model's SYCL work before a context exists
-    // (llama_synchronize() takes a llama_context*), so the model-load guard
-    // below cannot force a settle point the way the other two do -- it only
-    // serializes submission ordering. If model load leaves SYCL work
-    // in-flight past llama_model_load_from_file()'s return the way decode
-    // used to (the deferred-release bug the context-creation/decode guards
-    // work around, see their comments), that residual window is not closed
-    // by this guard alone.
+    // Model load (llama_model_load_from_file(), below) is deliberately NOT
+    // guarded: this test's load loop is sequential in the main thread and
+    // every load completes before any thread is spawned, so by the time a
+    // load's lock would release there is no other load/init/decode call for
+    // it to contend with -- a guard there would be dead machinery that
+    // invites false confidence rather than protection. If this test is ever
+    // restructured to load models concurrently (or from a thread pool),
+    // that load would need the same guard as context creation below,
+    // including its deferred-release synchronize -- which model load has no
+    // API to perform: llama_synchronize() is context-scoped, and no
+    // lower-level ggml-sycl.h entry point drains a device's SYCL work given
+    // only a model/device index.
     const bool sycl_same_device_lock_needed =
         gpu_dev_count > 0 && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpus[0][0])), "SYCL") == 0;
     std::vector<std::mutex> device_exec_mutex(sycl_same_device_lock_needed ? gpu_dev_count : 0);
 
-    // Devices touched by model m's load/init/decode calls: a single-GPU model
+    // Devices touched by model m's init/decode calls: a single-GPU model
     // owns just its one device, the CPU model owns none, and the trailing
     // layer-split model spans every GPU device. Locking every GPU for the
     // layer-split model's whole decode over-serializes it against the
@@ -160,7 +149,7 @@ int main(int argc, char ** argv) {
         return devices;
     };
 
-    // RAII guard that locks every device a load/init/decode call touches, in
+    // RAII guard that locks every device an init/decode call touches, in
     // ascending device-index order. That order is the same for every thread,
     // so lock acquisition can't cycle and no separate deadlock-avoidance is
     // needed.
@@ -191,16 +180,10 @@ int main(int argc, char ** argv) {
             mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
 
-        llama_model * model;
-        {
-            // See the header comment above device_exec_mutex: this never
-            // contends with another load (this loop is sequential, main
-            // thread only) -- it exists to serialize load against the
-            // context-creation/decode threads spawned below.
-            const std::vector<int> devices = sycl_same_device_lock_needed ? model_devices(m) : std::vector<int>{};
-            device_exec_guard      guard(device_exec_mutex, devices);
-            model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-        }
+        // Not guarded -- see the header comment above device_exec_mutex for
+        // why this loop's sequential, single-threaded shape makes a lock
+        // here dead machinery today.
+        llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
         if (model == NULL) {
             LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
             return 1;
@@ -228,8 +211,18 @@ int main(int argc, char ** argv) {
                     // the lock opens this device up to another thread.
                     device_exec_guard guard(device_exec_mutex, devices);
                     ctx.reset(llama_init_from_model(model, cparams));
-                    if (ctx != NULL && sycl_same_device_lock_needed) {
-                        llama_synchronize(ctx.get());
+                    if (sycl_same_device_lock_needed) {
+                        if (ctx != NULL) {
+                            llama_synchronize(ctx.get());
+                        }
+                        // else: llama_init_from_model() failed, so there is no
+                        // llama_context to synchronize. llama_synchronize() is
+                        // the only drain primitive SYCL exposes and it is
+                        // context-scoped; no lower-level ggml-sycl.h entry
+                        // point can drain a device's SYCL work given only a
+                        // model/device index (same limitation documented on
+                        // model load above). Whatever a failed init call left
+                        // in flight is not drained by this guard.
                     }
                 }
                 if (ctx == NULL) {
@@ -255,11 +248,7 @@ int main(int argc, char ** argv) {
                     }
                     batch = llama_batch_get_one(prompt.data(), prompt.size());
                     device_exec_guard guard(device_exec_mutex, devices);
-                    if (llama_decode(ctx.get(), batch)) {
-                        LOG_ERR("failed to decode prompt\n");
-                        failed.store(true);
-                        return;
-                    }
+                    const int         prompt_decode_rc = llama_decode(ctx.get(), batch);
                     if (sycl_same_device_lock_needed) {
                         // llama_decode() can return before the SYCL backend
                         // actually releases the device's execution lease
@@ -271,7 +260,16 @@ int main(int argc, char ** argv) {
                         // thread's invocation still owns in the execution
                         // registry. Gated so non-SYCL backends keep the async
                         // decode overlap this stress test is meant to exercise.
+                        // Unconditional on prompt_decode_rc: a failed decode
+                        // can still have partially submitted work, and this is
+                        // the last chance to drain it before the guard below
+                        // releases the lock.
                         llama_synchronize(ctx.get());
+                    }
+                    if (prompt_decode_rc) {
+                        LOG_ERR("failed to decode prompt\n");
+                        failed.store(true);
+                        return;
                     }
                 }
 
@@ -298,11 +296,15 @@ int main(int argc, char ** argv) {
                     {
                         device_exec_guard guard(device_exec_mutex, devices);
                         ret = llama_decode(ctx.get(), batch);
-                        if (ret == 0 && sycl_same_device_lock_needed) {
-                            // See the matching comment on the prompt decode above:
-                            // force the deferred device-lease release to happen
-                            // before we unlock, not on the next (unguarded) logit
-                            // read at the top of the following iteration.
+                        if (sycl_same_device_lock_needed) {
+                            // See the matching comment on the prompt decode
+                            // above: force the deferred device-lease release to
+                            // happen before we unlock, not on the next
+                            // (unguarded) logit read at the top of the
+                            // following iteration. Unconditional on ret: a
+                            // failed decode can still have partially submitted
+                            // work, and this is the last chance to drain it
+                            // before the guard releases the lock.
                             llama_synchronize(ctx.get());
                         }
                     }
