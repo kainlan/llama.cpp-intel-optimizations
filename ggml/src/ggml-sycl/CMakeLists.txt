@@ -3436,6 +3436,10 @@ add_test(NAME test-sycl-xmx-unified-correctness COMMAND test-sycl-xmx-unified-co
 set_tests_properties(test-sycl-xmx-unified-correctness PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Exits 77 when a capability it needs is unavailable (no SYCL device, no
+    # graph support, graphs disabled, no exec graph recorded); without
+    # SKIP_RETURN_CODE ctest renders that as FAILED rather than Skipped
+    # (llama.cpp-ivin).
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )

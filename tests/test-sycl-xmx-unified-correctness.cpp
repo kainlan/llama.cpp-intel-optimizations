@@ -134,6 +134,9 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
     ggml_set_name(out_mat, "xmx_out");
 
     // Enlarge the graph to exceed MIN_GRAPH_NODES and exercise graph replay.
+    // 13 nodes total (1 MUL_MAT + 12 SCALE).  Do not grow this past 50 without
+    // reading the exec-graph precondition below -- its soundness depends on the
+    // node count staying under MIN_GPU_PREFIX_NODES.
     ggml_tensor * final_out = out_mat;
     std::vector<ggml_tensor *> extra_ops;
     for (int i = 0; i < 12; ++i) {
@@ -224,6 +227,17 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
         // count is populated only by graph_preload_weights(), which by design
         // skips device-VRAM weights ("weights already on GPU"), so it is zero on
         // a correct run of this fixture and never meant "the graph path ran".
+        //
+        // "Every node ran on the GPU" holds only because this graph is small.
+        // The GPU-prefix/CPU-suffix split records a PARTIAL graph -- nodes
+        // [0, first_cpu_node) -- and dispatches the tail on the CPU, so an exec
+        // graph can exist while later nodes ran on the host.  That split is
+        // taken only at first_cpu_node >= MIN_GPU_PREFIX_NODES (50); this
+        // fixture is 13 nodes, well under it, so a graph here is always the
+        // whole graph.  Re-check this if the fixture ever grows past 50 nodes.
+        // The split path also needs GGML_SYCL_CPU_OFFLOAD=1 (off by default),
+        // but rely on the node-count margin, not the env default: the invariant
+        // is structural and the env var is not ours to depend on.
         if (!ggml_sycl::test_backend_has_exec_graph(backend)) {
             std::fprintf(stderr, "SKIP: backend recorded no executable graph; GPU XMX path not proven\n");
             return finish(run_status::SKIPPED);
