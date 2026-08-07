@@ -3576,13 +3576,24 @@ struct alloc_handle {
     runtime_category category = runtime_category::OTHER;
     uint64_t         alloc_id = 0;
 
+    // Graph-boundary epoch this allocation was made in (iiff Option C step 2,
+    // llama.cpp-lbm3). Stamped from the zone's current epoch counter at
+    // allocation time; only meaningful for host_zone==SCRATCH|STAGING (0
+    // elsewhere). Diagnostic only -- see g_host_zone_epoch and
+    // host_zone_reset() in unified-cache.cpp for how it is bumped and read.
+    uint64_t epoch_id = 0;
+
     // Zone routing fields — set by unified_alloc when the allocation is routed
     // through a zone sub-allocator instead of a raw sycl::malloc call.
     // unified_free() uses these to dispatch the correct reclaim path:
     //   zone_managed=true, vram_zone!=COUNT → cache->zone_free(vram_zone, ptr) [TLSF reclaim]
     //   zone_managed=true, host_zone==WEIGHT|KV → cache->host_zone_free(zone, ptr) [TLSF reclaim]
     //   zone_managed=true, host_zone==SCRATCH and role==EXPERT_STAGING → scoped TLSF reclaim
-    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → reset-only (freed by host_zone_reset)
+    //   zone_managed=true, host_zone==STAGING and cohort=="staging_buffer_pool" → scoped TLSF reclaim
+    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → per-record TLSF reclaim
+    //       (iiff Option C step 2, llama.cpp-lbm3: was reset-only pre-C2, now
+    //       individually freed the instant this handle releases — see
+    //       unified_free_record())
     //   zone_managed=false                  → registry lookup → sycl::free or pinned_pool free
     bool         zone_managed = false;
     vram_zone_id vram_zone    = vram_zone_id::COUNT;

@@ -321,6 +321,137 @@ exposed as a stored raw pointer outside the immediate `get_scratch()` /
 `return_scratch()` pair, matching the "raw pointer is only a transient view"
 rule above.
 
+### C2 implementation: host SCRATCH/STAGING zones (`llama.cpp-lbm3`)
+
+Step 2 converts `unified_free_record()`'s "SCRATCH/STAGING host zones:
+reset-only by design" fall-through — every SCRATCH allocation with
+`role != EXPERT_STAGING` and every STAGING allocation with
+`cohort != staging_buffer_pool` — the same defect class step 1 fixed for the
+VRAM scratch bump pool, but on TLSF rather than a bump pointer. This
+subsection settles the three design questions the ticket posed, and states
+explicitly which parts of step 1's *implementation* (not its policy) do not
+carry over, per the "policy generalizes; the implementation, deliberately,
+does not" rule above.
+
+**Q1 — what is "rewind" for a TLSF-backed zone, and is release batched or
+immediate?** Immediate, per-record `host_zone_free()` at the instant a
+`mem_handle` releases — not batched to "epoch death" the way a candidate
+design might defer individual frees until a zone's last outstanding
+allocation clears. The two options were weighed explicitly:
+
+- **Per-record free at release** (chosen). Every SCRATCH/STAGING allocation
+  now takes the same `host_zone_free()` path the WEIGHT/KV/EXPERT_STAGING/
+  staging_buffer_pool carve-outs already used pre-C2 — the fix is simply
+  widening that carve-out to cover the rest of the population, in a third
+  `unified_free_record()` branch kept textually separate from the untouched
+  carve-out — the existing WEIGHT/KV/EXPERT_STAGING-in-SCRATCH/
+  staging_buffer_pool-in-STAGING code path is left exactly as it was, and the
+  new population-widening logic lives entirely in its own branch alongside it,
+  rather than folding the two together.
+- **Batched-at-epoch-death** (rejected). This would mirror step 1 more
+  literally — hold released allocations until a whole epoch's live count
+  reaches zero, then free them as a group — preserving whatever locality
+  bump-pointer-style batching buys.
+
+The deciding fact is structural, not a performance tradeoff: **step 1's bump
+pool needs batching/rotation because a live allocation blocks the *offset*
+behind it** — rewinding while anything is still outstanding would hand out
+already-referenced bytes again, so C1 opens a fresh region rather than touch
+the live one. **TLSF has no such conflict.** A new `host_zone_alloc()` call
+is satisfied from whatever the zone's free list currently holds, completely
+independent of which allocations from which epochs are still outstanding
+elsewhere in the same zone. There is no address range for a live allocation
+to "block," so there is nothing for batching to protect. Given that, batching
+only adds a deferred bookkeeping structure (which released-but-not-yet-freed
+records belong to which epoch) with no corresponding benefit — and per
+`llama.cpp-2757` comment `c-6ngo`, per-call TLSF free is ~350 ns, noise
+against graph execution time, and these zones do not fragment under many
+small frees (9 of 11 zone/capture pairs measured `largest_free`
+`first == last == min`). Per-record free is simultaneously the purer literal
+reading of "freed only when references reach zero" *and* the simpler
+implementation — the two considerations point the same way.
+
+One consequence follows directly: because release already reclaims
+unconditionally, `host_zone_reset(zone)`'s prior bulk
+`host_arena_->zone_reset(zone)` call is retired for SCRATCH/STAGING, not
+merely gated. In the clean case (`live_allocations == 0`) there is nothing
+left in the zone for a bulk reinitialization to reclaim — every byte was
+already individually returned by the record that used to occupy it.
+"Rewind-on-zero" for TLSF is therefore the empty action, not a rewritten
+one: `host_zone_reset()`'s remaining job is exactly the refusal check it
+already had (`live_allocations > 0` → refuse, unchanged), which is now its
+*entire* job for these two zones. KV — the only other zone this function
+resets — is unaffected: it was already in the individually-freeing carve-out
+before this ticket, and still reaches a real `host_arena_->zone_reset(KV)`
+call.
+
+**Q2 — epoch granularity: per-zone or per-zone-per-graph?** Per-zone,
+advancing at the same graph-boundary call sites step 1's regions rotate at
+— `host_zone_reset(zone)` bumps a single monotonic `g_host_zone_epoch[zone]`
+counter on every call, refused or clean, exactly mirroring where C1 opens a
+new region. The counter is **global, not per-`unified_cache`-instance**,
+because `host_zone_reset()`'s own live scan already has no device filter
+(host zones are shared across devices in this codebase, unlike the VRAM
+zones) — matching `g_runtime_alloc_registry`'s existing device-agnostic
+scope rather than introducing a new per-device split the surrounding code
+doesn't have.
+
+Unlike step 1, this counter **does not gate anything**. C1's region epoch
+decides which physical region is "current" for new allocations to land in;
+TLSF allocation never routes by epoch at all (see Q1), so there is nothing
+for the counter to decide. `alloc_handle::epoch_id`, stamped from the
+counter at allocation time, exists purely so a stuck refusal can report how
+many graph boundaries the offending allocation has survived
+(`oldest live epoch=... boundaries stale=...` in the WARN) — a diagnostic
+step 1's design doc asked for explicitly ("the epoch tag belongs on the
+registry record... alongside the existing `alloc_id`/`cohort`/`role`/
+`category` fields") that step 1 itself had no use for, since C1's regions
+are identified by address range, not a stamped id. No new audit-structure
+field was added: `zone_audit_live_entry`/`zone_audit_site_visit` are
+untouched, matching this document's "no new instrumentation is needed"
+guidance for the mechanism generally — the epoch age is text in the
+existing refusal `GGML_LOG_WARN`, not a new structured/tested column.
+
+**Q3 — how many concurrent epochs before refusal, and what bounds growth
+while one lingers?** No bound is enforced, and none is needed, for a
+structural reason rather than a policy choice: step 1's ring needed an
+exhaustion refusal ("every region in the ring is still live") because a
+bump pool has a *fixed number of interchangeable regions* and running out
+of clean ones means the next allocation has nowhere to go. TLSF has no such
+resource to exhaust — an allocation from a zone with ten lingering epochs
+and an allocation from a zone with zero both resolve identically, against
+whatever the free list currently holds. So "how many epochs can linger" is
+answered the same way it always was pre-C1: by the zone's actual configured
+capacity (`host_zone_grow`/budget), not by a ring size. A lingering epoch is
+exactly a lingering `mem_handle` — the same condition this document's
+ownership rules already require diagnosing and fixing at its source, not
+capping. What C2 adds is that the (now epoch-attributed) refusal WARN makes
+a stuck epoch's *age* directly legible, which the pre-C2 code — reporting
+only a live count, with no notion of "since when" — could not.
+
+**Event-retained epochs.** Traced rather than assumed: `mem-handle.cpp`'s
+`retain_handles_until_event()` (both its background-drain-worker path and
+its `graph_lifetime_retention_active()` command-graph path) defers only the
+`mem_handle` vector's destruction — which is what eventually reaches
+`unified_free_record()` — until the retained event completes or
+`release_graph_retained_handles()` runs. Since C2's reclaim IS the
+individual free (unlike C1, nothing is decremented separately from it —
+see Q1), and that free only ever executes when the handle's real lifetime
+ends, in-flight BCS DMA staging already respects the epoch correctly
+through this existing machinery with no additional integration required
+— there is no separate "epoch" state
+for `retain_handles_until_event()` to know about or preserve.
+
+**What this means for the shared `epoch_region`-style struct question.**
+Step 1 already declared that no shared struct should be extracted across
+the three populations. C2 reinforces why: it needed no ring, no
+address-range lookup, and no rotation-refusal at all — three of C1's four
+structural elements (region, `region_of()`, ring) don't exist here, and the
+fourth (the live counter) exists in a different form (per-zone atomic plus
+the pre-existing registry scan, not a `std::atomic<int64_t> live` per
+region). The only thing step 2 inherited from step 1, as promised, was the
+policy sentence, not any code.
+
 ## Lifecycle identity and async lease boundary
 
 **Target invariants (not current APIs or current behavior).** The enforceable

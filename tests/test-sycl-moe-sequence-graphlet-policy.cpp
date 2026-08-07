@@ -546,6 +546,15 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
           "graph-boundary reset must drain retained mem_copy staging handles before host STAGING/SCRATCH reset");
     CHECK(contains(boundary_reset, "host-zone reset never reclaims a live mem_handle owner"),
           "graph-boundary reset must document the retained-handle drain/live host-zone safety invariant");
+    // iiff Option C step 2 (llama.cpp-lbm3): STAGING/SCRATCH host_zone_reset()
+    // stopped bulk-reclaiming once every allocation in those zones began
+    // freeing itself individually at mem_handle release. The call sites here
+    // must keep documenting that their remaining job is the graph-boundary
+    // liveness check, not silently drift back to reading as a reclaim step.
+    CHECK(contains(boundary_reset, "no longer bulk-reclaims these zones") &&
+              contains(boundary_reset, "graph-boundary liveness check"),
+          "graph-boundary reset must document that STAGING/SCRATCH host_zone_reset() is a liveness "
+          "check, not a bulk reclaim, post iiff Option C step 2 (llama.cpp-lbm3)");
     return 0;
 }
 
