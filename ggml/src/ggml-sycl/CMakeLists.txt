@@ -319,6 +319,26 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-control-plan-contract.py
             --self-test)
     set_tests_properties(sycl-moe-control-plan-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    # --self-test likewise: eight of this gate's checks are absence-based, and
+    # the construct they forbid -- max(planned, required), the general temporary
+    # fallback, admission after the lock, a debug-gated refusal warning -- is
+    # exactly what the port removed, so
+    # without a poisoned control they pass on every tree written after it. It is
+    # also the only thing that can see whether the PRODUCTION executors ask the
+    # admission policy anything; test-moe-scratch-admission proves the policy,
+    # not that anyone consults it.
+    add_test(NAME sycl-pp-moe-scratch-admission-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-admission-contract.py
+            --self-test)
+    set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    # The 32dg claim/release source contract. Like the lifecycle executable
+    # above it was written and never registered; it pins the generation-keyed
+    # release and retired-slot protocol that the admission port must not regress.
+    add_test(NAME sycl-pp-moe-scratch-source
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-source.py)
+    set_tests_properties(sycl-pp-moe-scratch-source PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
@@ -3925,6 +3945,47 @@ set_tests_properties(sycl-moe-control-plan PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
     # submits to a device. Labels also avoid the throttled sweep's cache denylist.
     LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# Planner-owned PP MoE oneDNN scratch admission (llama.cpp-ijla).
+# moe-scratch-admission.cpp is dependency-free by design -- it includes no SYCL
+# header and links no backend library -- so this target compiles the production
+# source directly and takes no -fsycl, exactly like test-moe-control-plan above.
+# The policy is the whole point and it must be provable without a GPU.
+add_executable(test-moe-scratch-admission
+    tests/test-moe-scratch-admission.cpp
+    moe-scratch-admission.cpp
+)
+target_include_directories(test-moe-scratch-admission PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-moe-scratch-admission PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-scratch-admission COMMAND test-moe-scratch-admission)
+set_tests_properties(sycl-moe-scratch-admission PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# The PP MoE scratch slot lifecycle model (llama.cpp-32dg): generation binding,
+# stale release, resize-in-flight and the claim rollback failpoint, driven
+# against a standalone host model of the ring. It has existed in tests/ since
+# that work landed but was never registered, so nothing ran it -- and it is the
+# only executable proof of the claim/release protocol the admission port above
+# had to preserve. Pure host C++: no SYCL, no backend library, no device.
+add_executable(test-sycl-pp-moe-scratch-lifecycle
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-lifecycle.cpp
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-sycl-pp-moe-scratch-lifecycle PRIVATE Threads::Threads)
+set_target_properties(test-sycl-pp-moe-scratch-lifecycle PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-pp-moe-scratch-lifecycle COMMAND test-sycl-pp-moe-scratch-lifecycle)
+set_tests_properties(sycl-pp-moe-scratch-lifecycle PROPERTIES
+    LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
     TIMEOUT 30
 )
 

@@ -12,6 +12,7 @@
 #include "ggml-sycl.h"
 #include "mem-handle.hpp"
 #include "moe-control-plan.hpp"
+#include "moe-scratch-admission.hpp"
 #include "pinned-pool.hpp"
 #include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
@@ -1192,6 +1193,12 @@ size_t   unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(int devic
 size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id);
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
+
+// These four figures are a HARD CAP, not a starting size. Before asking the
+// cache for scratch, run the request through `pp_moe_onednn_admit_scratch`
+// (moe-scratch-admission.hpp) and refuse on rejection; never pass
+// max(planned, required), which grows a zone the planner already budgeted.
+// reserve_pp_moe_onednn_scratch enforces the same cap on its own entry.
 
 // Per-device planned MoE CONTROL pool requirement. Unlike the scratch figures
 // above -- which ggml-sycl.cpp publishes from the tensor inventory -- this one
