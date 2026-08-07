@@ -1712,6 +1712,21 @@ struct zone_audit_live_entry {
     std::string cohort;
 };
 
+// llama.cpp-fzem: see unified_cache_entry::debug_lease_ring in unified-cache.hpp
+// for rationale. Guarded on g_ggml_sycl_debug so a normal run pays only the
+// flag check -- every call site already touches/locks this entry, so the
+// check adds no new synchronization of its own.
+void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
+    if (!g_ggml_sycl_debug || !site) {
+        return;
+    }
+    debug_lease_event & slot = debug_lease_ring[debug_lease_ring_next];
+    slot.seq                 = debug_lease_seq++;
+    slot.acquire             = acquire;
+    slot.site                = site;
+    debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
+}
+
 void zone_audit_emit(const std::string & line) {
     // WARN plus a raw stderr copy. GGML_LOG_INFO is dropped at default verbosity
     // in EVERY tool (common_get_verbosity maps INFO to TRACE=4 against a
@@ -3836,6 +3851,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_weight/cache-hit-out_handle";
+                it->second.record_lease_event(true, "direct_stage_weight/cache-hit-out_handle");
                 *out_handle =
                     mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
                                                          it->second.layout, !it->second.host_resident, &it->second);
@@ -3990,6 +4006,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_weight/publish-out_handle";
+            stored.record_lease_event(true, "direct_stage_weight/publish-out_handle");
             *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
                                                                stored.layout, !stored.host_resident, &stored);
         }
@@ -4031,6 +4048,7 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
                                                             const char *              site) {
     entry.in_use_count.fetch_add(1);
     entry.debug_last_lease_site = site;
+    entry.record_lease_event(true, site);
     return std::make_shared<mem_handle>(mem_handle::from_weight_lease_locked(
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
@@ -4081,6 +4099,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 it->second.in_use_count.fetch_add(1);
                 it->second.debug_last_lease_site = "direct_stage_expert/cache-hit-out_handle";
+                it->second.record_lease_event(true, "direct_stage_expert/cache-hit-out_handle");
                 *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, it->second.device_ptr,
                                                                    it->second.layout, true, &it->second);
             }
@@ -4223,6 +4242,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert/host-publish-out_handle";
+                stored.record_lease_event(true, "direct_stage_expert/host-publish-out_handle");
                 *out_handle =
                     mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr, stored.layout,
                                                          stored.location == cache_location::DEVICE, &stored);
@@ -4360,6 +4380,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         if (out_handle) {
             stored.in_use_count.fetch_add(1);
             stored.debug_last_lease_site = "direct_stage_expert/publish-out_handle";
+            stored.record_lease_event(true, "direct_stage_expert/publish-out_handle");
             *out_handle = mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
                                                                stored.layout, !stored.host_resident, &stored);
         }
@@ -4454,6 +4475,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                     auto & entry = entries_.find(cache_key)->second;
                     entry.in_use_count.fetch_add(1);
                     entry.debug_last_lease_site = "direct_stage_expert_tensor/all-existing";
+                    entry.record_lease_event(true, "direct_stage_expert_tensor/all-existing");
                     out_handles->push_back(mem_handle::from_weight_lease_locked(
                         cache_key, cache_device, entry.device_ptr, entry.layout, true, &entry));
                 }
@@ -4639,6 +4661,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             if (out_handles) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "direct_stage_expert_tensor/publish-out_handles";
+                stored.record_lease_event(true, "direct_stage_expert_tensor/publish-out_handles");
                 out_handles->push_back(mem_handle::from_weight_lease_locked(cache_key, cache_device, stored.device_ptr,
                                                                             stored.layout, true, &stored));
             }
@@ -4843,6 +4866,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                 if (expert_resolution_allowed(req, location, owner, &reject_reason)) {
                     entry.in_use_count.fetch_add(1);
                     entry.debug_last_lease_site = "resolve_expert/entry-hit";
+                    entry.record_lease_event(true, "resolve_expert/entry-hit");
                     result.ptr             = entry.device_ptr;
                     result.size            = entry.size;
                     result.tier            = expert_tier_from_location(location);
@@ -5309,6 +5333,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_expert/existing-out_handle";
+                    old->second.record_lease_event(true, "register_host_expert/existing-out_handle");
                     *out_handle                       = mem_handle::from_weight_lease_locked(
                         cache_key, dev, old->second.device_ptr, old->second.layout,
                         old->second.location == cache_location::DEVICE, &old->second);
@@ -5358,6 +5383,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "register_host_expert/publish-out_handle";
+                stored.record_lease_event(true, "register_host_expert/publish-out_handle");
                 *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
                                                                    stored.location == cache_location::DEVICE, &stored);
             }
@@ -5455,6 +5481,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
                 if (out_handle) {
                     old->second.in_use_count.fetch_add(1);
                     old->second.debug_last_lease_site = "register_host_weight/existing-out_handle";
+                    old->second.record_lease_event(true, "register_host_weight/existing-out_handle");
                     *out_handle                       = mem_handle::from_weight_lease_locked(
                         cache_key, dev, old->second.device_ptr, old->second.layout,
                         old->second.location == cache_location::DEVICE, &old->second);
@@ -5504,6 +5531,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
             if (out_handle) {
                 stored.in_use_count.fetch_add(1);
                 stored.debug_last_lease_site = "register_host_weight/publish-out_handle";
+                stored.record_lease_event(true, "register_host_weight/publish-out_handle");
                 *out_handle = mem_handle::from_weight_lease_locked(cache_key, dev, stored.device_ptr, stored.layout,
                                                                    stored.location == cache_location::DEVICE, &stored);
             }
@@ -6758,6 +6786,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             // that later acquires the unique_lock (acq_rel ordering).
             entry.in_use_count.fetch_add(1);
             entry.debug_last_lease_site = "acquire_entry_lease";  // debug-only, llama.cpp-2wv5
+            entry.record_lease_event(true, "acquire_entry_lease");
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
@@ -8999,6 +9028,32 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                         (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
                         (int) entry.layout, live, entry.owner_mask,
                         entry.debug_last_lease_site ? entry.debug_last_lease_site : "(none)");
+                    // llama.cpp-fzem: dump the full acquire/release ledger for this
+                    // entry alongside the "who holds it now" line above -- see
+                    // unified_cache_entry::debug_lease_ring for rationale. Printed
+                    // through GGML_SYCL_DEBUG like every other line in this
+                    // function, so it already bypasses test harnesses that install
+                    // a stricter llama_log_set() filter (round 6 of this
+                    // investigation). The string build itself is guarded so a run
+                    // with GGML_SYCL_DEBUG unset pays only the flag check.
+                    if (g_ggml_sycl_debug) {
+                        std::string ring;
+                        for (int i = 0; i < unified_cache_entry::kDebugLeaseRingSize; ++i) {
+                            const auto & ev = entry.debug_lease_ring[i];
+                            if (!ev.site) {
+                                continue;
+                            }
+                            if (!ring.empty()) {
+                                ring += ' ';
+                            }
+                            ring +=
+                                "seq=" + std::to_string(ev.seq) + (ev.acquire ? "+acquire:" : "-release:") + ev.site;
+                        }
+                        if (!ring.empty()) {
+                            GGML_SYCL_DEBUG("[UNIFIED-CACHE] lease ring for name_hash=0x%llx: %s\n",
+                                            (unsigned long long) it->first.id.name_hash, ring.c_str());
+                        }
+                    }
                 } else if (owned_by_live) {
                     entries_owned++;
                 } else {

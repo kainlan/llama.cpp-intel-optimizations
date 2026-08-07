@@ -1669,6 +1669,34 @@ struct unified_cache_entry {
     // at that function's entry read null on every leaked entry and named nobody.
     // Static storage duration, never freed.
     const char *          debug_last_lease_site = nullptr;
+
+    // Debug-only (llama.cpp-fzem): bounded ring of recent lease acquire/
+    // release events, alongside debug_last_lease_site's "who holds it now"
+    // summary above. debug_last_lease_site alone settled which SITE took the
+    // last lease but not whether a second lease was ever released and
+    // re-taken versus simply never released -- the fzem investigation needed
+    // several rounds of single-bit "did this WARN fire" experiments to work
+    // that ambiguity out one hypothesis at a time. The ring makes it directly
+    // readable: a dump of a leaked entry's full acquire/release ledger. Fixed
+    // 8 slots, oldest entry overwritten; the sequence number makes
+    // wraparound and gaps in a dump visible instead of silently misleading.
+    // record_lease_event() is a no-op unless GGML_SYCL_DEBUG is set, so a
+    // normal run pays only the flag check at each of the sites that call it
+    // -- all of which already touch/lock this entry, so the check itself
+    // adds no new synchronization.
+    static constexpr int kDebugLeaseRingSize = 8;
+
+    struct debug_lease_event {
+        uint64_t     seq     = 0;
+        bool         acquire = false;  // true = lease taken, false = lease released
+        const char * site    = nullptr;
+    };
+
+    debug_lease_event debug_lease_ring[kDebugLeaseRingSize]{};
+    int               debug_lease_ring_next = 0;
+    uint64_t          debug_lease_seq       = 0;
+
+    void record_lease_event(bool acquire, const char * site);
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 

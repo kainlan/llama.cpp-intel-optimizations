@@ -11591,6 +11591,21 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         }
     }
     if (displaced_extra) {
+        // llama.cpp-fzem: release_extra_gpu() computes this same prev value
+        // internally (as fetch_sub's return) but doesn't expose it -- peek at
+        // it here instead of changing that function's signature for every
+        // other caller. prev>1 at this specific site means our release did
+        // NOT bring the displaced extra to 0: something else still retains
+        // it, so its data_handle[] lease will not be cleared here either --
+        // exactly the "who else held it" signal this round's investigation
+        // needed and didn't have before.
+        const int displaced_prev_refcount = displaced_extra->refcount.load(std::memory_order_relaxed);
+        if (displaced_prev_refcount > 1) {
+            ggml_sycl_diag_emit_warn(
+                "[SYCL] host weight registry mismatch: displaced extra=%p still has refcount=%d after this "
+                "release -- another holder keeps it alive, its data_handle[] lease is NOT cleared by this call\n",
+                (void *) displaced_extra, displaced_prev_refcount - 1);
+        }
         release_extra_gpu(displaced_extra);
     }
 
