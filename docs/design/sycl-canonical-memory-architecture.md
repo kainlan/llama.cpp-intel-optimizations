@@ -156,6 +156,71 @@ reset while the target zone contains live registered allocations (`4afdb6d9f`).
 Callers must release the owning handles and retry; they must not purge ownership
 records or force reclamation.
 
+**`weight:unattributed` at `MODEL_TEARDOWN` is a distinct, benign cohort from
+the leaked-lease one above, and `GGML_SYCL_STRICT_LEASES=1` cannot abort on
+it — by construction, not by observation** (`llama.cpp-zjz6`, adjudicating the
+Phase-0 `weight:unattributed` cohort at `weight-reclaim/model-teardown`,
+1536 entries on GPT-OSS). `entries_leaked` — the sole counter
+`GGML_SYCL_STRICT_LEASES=1` aborts on — increments only inside the
+`in_use_count.load() != 0` branch of `reclaim_weight_entries()`
+(`unified-cache.cpp`); the `weight:unattributed` cohort is exactly the entries
+with `in_use_count == 0`, so the two are mutually exclusive at the type level,
+not merely in every observed run.
+
+That said, `weight:unattributed` at teardown is not simply "the owner token
+was already released, so reclaim proceeds" either — for this specific cohort,
+reclaim does **not** proceed at `MODEL_TEARDOWN`. `weight_entry_reclaimable()`
+preserves every `!entry.owner_tagged` entry unconditionally when
+`mode == MODEL_TEARDOWN` regardless of `in_use_count` or `live_mask`, so an
+untagged entry survives its owning model's own teardown. Its next chance at
+reclaim depends on which reset mode reaches it, and the two remaining modes
+differ: at `MID_LOAD_REPLAN` the same function returns `true` (reclaimable)
+as soon as `in_use_count == 0`, **before** the `owner_tagged` check runs at
+all — since a never-tagged entry's `owner_mask` is always `0`, it can never
+overlap `live_mask` either, so it is reclaimed at the very next
+`MID_LOAD_REPLAN` regardless of how many other models are live. At
+`LOAD_BOUNDARY` the `owner_tagged` check is reached and gates on
+`live_mask != 0`, so an untagged entry there is preserved only while some
+model is live and reclaimed once `live_mask == 0`. In practice `MID_LOAD_REPLAN`
+is the shorter and more common path back to reclaim: it fires mid-load, before
+the incoming model even commits.
+
+The GPT-OSS 1536-entry cohort (role/`cache_layout` 4 = `GGML_LAYOUT_XMX_TILED`)
+is untagged because it is materialized by
+`ggml_sycl_materialize_moe_tensor_phase_layout()`'s bulk-XMX branch
+(`ggml-sycl.cpp`, `#if SYCL_XMX_MOE_AVAILABLE`), called via
+`ggml_sycl_materialize_moe_phase_layouts()` from the graph-compute path that
+scans `cgraph` nodes for `GGML_OP_MUL_MAT_ID` (near the `refresh_moe_after_pp`
+PP→TG transition) — a **runtime** path, not a model-load call site. (NOT
+`moe_prestage_popular_experts()`, which stages exclusively with
+`GGML_LAYOUT_SOA`/`GGML_LAYOUT_AOS` and only ever *looks up* `XMX_TILED` via a
+`pin_layouts[]` array to pin an already-existing entry — it creates nothing in
+that layout.) The bulk-XMX branch calls
+`unified_cache_direct_stage_expert_tensor()` with `target_layout ==
+GGML_LAYOUT_XMX_TILED`, which reaches `unified_cache::direct_stage_expert_tensor()`
+(`unified-cache.cpp:4390`). That function calls `acquire_bound_load_effect()`
+(`:4399`) and `stamp_pending_owner()` (`:4445`) exactly like every other
+staging call site: with no load transaction bound at this runtime call site,
+`acquire_bound_load_effect()` returns `load_effect_state::NONE`,
+`stamp_pending_owner()` is a no-op (`unified-cache.cpp:113-117`), the entry's
+`pending_load_txn_id` stays `0`, and `note_model_load_end()` — which already
+ran once, at the original load's commit — never revisits it. This is a
+structural gap in the load-transaction-scoped tagging mechanism, not a
+regression in the owner-keyed MoE migration (`nn6z`/`nlww` own separate
+discovery/bias registries and never touch `unified_cache`'s own
+`owner_mask`/`owner_tagged` fields).
+
+Practical consequence: bounded, single-shot VRAM retention past the owning
+model's unload (matches this cohort's `-> single-shot` audit classification;
+it does not grow per graph). Not a correctness or leak-abort hazard. A fix
+that tags these entries at creation must not treat "no live model owns me" as
+license to attribute an untagged entry to the model whose teardown happens to
+be running — a genuinely different, concurrently-*loading* (not yet
+committed, so not yet in `live_model_mask_`) model could be the true owner;
+this is exactly the race the existing `MODEL_TEARDOWN`-always-preserve rule
+guards against. See `llama.cpp-zjz6`'s tracker comment for the full evidence
+chain and the follow-up fix ticket.
+
 ### 1.3 `mem_handle` (`ggml_sycl::mem_handle`)
 
 **File:** `ggml/src/ggml-sycl/mem-handle.hpp`, `mem-handle.cpp`
