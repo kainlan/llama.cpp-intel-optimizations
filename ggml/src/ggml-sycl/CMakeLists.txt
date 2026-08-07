@@ -332,6 +332,18 @@ if (BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-admission-contract.py
             --self-test)
     set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    # The MMVQ launch geometry contract (llama.cpp-99ke). --self-test for the
+    # same reason: the check that matters most is absence-based -- no launch
+    # site still submits the raw row count -- and it passes on every tree
+    # written after the fix, so it needs a poisoned control. It is also the only
+    # thing that can see the PAIRING: test-mmvq-launch-geometry proves the
+    # padding arithmetic, not that all eleven sites use it, and not that the
+    # kernels they submit still reject the rows that padding invents.
+    add_test(NAME sycl-mmvq-launch-geometry-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmvq-launch-geometry-contract.py
+            --self-test)
+    set_tests_properties(sycl-mmvq-launch-geometry-contract PROPERTIES LABELS "sycl;mmvq;host;source-contract")
     # The 32dg claim/release source contract. Like the lifecycle executable
     # above it was written and never registered; it pins the generation-keyed
     # release and retired-slot protocol that the admission port must not regress.
@@ -3986,6 +3998,30 @@ set_target_properties(test-sycl-pp-moe-scratch-lifecycle PROPERTIES
 add_test(NAME sycl-pp-moe-scratch-lifecycle COMMAND test-sycl-pp-moe-scratch-lifecycle)
 set_tests_properties(sycl-pp-moe-scratch-lifecycle PROPERTIES
     LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# MMVQ sub-group-per-row launch geometry (llama.cpp-99ke).
+# mmvq-launch-geometry.hpp is dependency-free by design -- it includes no SYCL
+# header and links no backend library -- so this target compiles the production
+# header directly and takes no -fsycl, exactly like test-moe-scratch-admission
+# above. The eleven launch sites used to require nrows % 16 == 0 and threw
+# "Non-uniform work-groups are not supported by the target device" on any row
+# slice that was not, so the padding has to be provable without a GPU: the
+# shapes that reproduce it (nrows=1) are the ones no device would accept.
+add_executable(test-mmvq-launch-geometry
+    tests/test-mmvq-launch-geometry.cpp
+)
+target_include_directories(test-mmvq-launch-geometry PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-mmvq-launch-geometry PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-mmvq-launch-geometry COMMAND test-mmvq-launch-geometry)
+set_tests_properties(sycl-mmvq-launch-geometry PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
+    # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;mmvq;host-only;tsan-capable"
     TIMEOUT 30
 )
 

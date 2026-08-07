@@ -7,6 +7,7 @@
 #include "ggml-sycl-test.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
+#include "mmvq-launch-geometry.hpp"  // Row padding for the sub-group-per-row launches
 #include "moe-layer-plan.hpp"
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
@@ -3373,8 +3374,9 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y * WARP_SIZE));
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -3406,8 +3408,9 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     GGML_ASSERT(ncols % QK8_0 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y * WARP_SIZE));
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -3439,8 +3442,9 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_sycl(const void *    vx,
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y * WARP_SIZE));
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -3706,8 +3710,9 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -3969,8 +3974,9 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -4334,8 +4340,9 @@ static void coalesced_mul_mat_vec_mxfp4_q8_1_sycl(const void *    vx,
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -4723,8 +4730,9 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void *    vx,
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -4773,8 +4781,9 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void *    vx,
     GGML_ASSERT(ncols % QK_K == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -21675,8 +21684,9 @@ sycl::event mmvq_submit_q4_0_soa(sycl::queue &                    q,
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     return q.submit([&](sycl::handler & cgh) {
@@ -21704,8 +21714,9 @@ sycl::event mmvq_submit_q6_k_soa(sycl::queue &                    q,
     GGML_ASSERT(ncols % QK_K == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     return q.submit([&](sycl::handler & cgh) {
@@ -21735,8 +21746,9 @@ sycl::event mmvq_submit_mxfp4_soa(sycl::queue &                    q,
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
+    const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     return q.submit([&](sycl::handler & cgh) {
