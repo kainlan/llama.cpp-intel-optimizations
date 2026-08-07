@@ -3436,6 +3436,7 @@ add_test(NAME test-sycl-xmx-unified-correctness COMMAND test-sycl-xmx-unified-co
 set_tests_properties(test-sycl-xmx-unified-correctness PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture

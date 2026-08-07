@@ -17,8 +17,8 @@
 
 #if !defined(GGML_USE_SYCL)
 int main() {
-    std::fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    std::fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about the XMX path\n");
+    return 77;  // ctest SKIP_RETURN_CODE -- a skip must not read as a pass
 }
 #else
 
@@ -98,11 +98,21 @@ static void build_case(matmul_case & tc) {
     }
 }
 
-static bool run_backend_matmul(ggml_backend_t backend,
-                               const matmul_case & tc,
-                               bool use_host_weights,
-                               bool require_graphs,
-                               std::vector<float> & out) {
+// A run has three outcomes, and collapsing them into one bool is what made this
+// test report `FAIL: SYCL backend run failed` for a compute that returned
+// GGML_STATUS_SUCCESS.  SKIPPED means a capability the test needs is genuinely
+// absent (ctest scores it skipped via exit 77); FAILED means a property the
+// test asserts did not hold.
+enum class run_status {
+    OK,
+    SKIPPED,
+    FAILED,
+};
+
+static run_status run_backend_matmul(ggml_backend_t       backend,
+                                     const matmul_case &  tc,
+                                     bool                 require_gpu_graph_path,
+                                     std::vector<float> & out) {
     const ggml_init_params params = {
         32 * 1024 * 1024,
         nullptr,
@@ -110,7 +120,8 @@ static bool run_backend_matmul(ggml_backend_t backend,
     };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        return false;
+        std::fprintf(stderr, "FAIL: ggml_init failed\n");
+        return run_status::FAILED;
     }
 
     ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, tc.K, tc.N);
@@ -130,14 +141,20 @@ static bool run_backend_matmul(ggml_backend_t backend,
         extra_ops.push_back(final_out);
     }
 
-    ggml_backend_buffer_type_t dev_buft  = ggml_backend_get_default_buffer_type(backend);
-    ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
-    if (!dev_buft || !host_buft) {
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(backend);
+    if (!dev_buft) {
+        std::fprintf(stderr, "FAIL: backend has no default buffer type\n");
         ggml_free(ctx);
-        return false;
+        return run_status::FAILED;
     }
 
-    ggml_backend_buffer_type_t weight_buft = use_host_weights ? host_buft : dev_buft;
+    // The weight goes in the backend's own buffer, NOT in the SYCL host-pinned
+    // buffer this test used to ask for.  A host-resident weight makes
+    // ggml_sycl_mul_mat_weight_resolves_to_host() report `resolved-host-handle`,
+    // which routes MUL_MAT to CPU dispatch by design (host weights are faster on
+    // the CPU than over PCIe).  The XMX unified kernel then never runs and the
+    // comparison below degenerates to CPU-vs-CPU.
+    ggml_backend_buffer_type_t weight_buft = dev_buft;
 
     std::vector<ggml_backend_buffer_t> buffers;
     auto alloc_or_fail = [&](ggml_backend_buffer_type_t buft, ggml_tensor * t, ggml_backend_buffer_usage usage) {
@@ -152,28 +169,25 @@ static bool run_backend_matmul(ggml_backend_t backend,
         return true;
     };
 
-    if (!alloc_or_fail(weight_buft, weight, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ||
-        !alloc_or_fail(dev_buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
-        !alloc_or_fail(dev_buft, out_mat, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+    auto finish = [&](run_status status) {
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
         ggml_free(ctx);
-        return false;
+        return status;
+    };
+
+    if (!alloc_or_fail(weight_buft, weight, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ||
+        !alloc_or_fail(dev_buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
+        !alloc_or_fail(dev_buft, out_mat, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+        std::fprintf(stderr, "FAIL: tensor buffer allocation failed\n");
+        return finish(run_status::FAILED);
     }
     for (ggml_tensor * extra : extra_ops) {
         if (!alloc_or_fail(dev_buft, extra, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
+            std::fprintf(stderr, "FAIL: scale-chain buffer allocation failed\n");
+            return finish(run_status::FAILED);
         }
-    }
-
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (use_host_weights && dev) {
-        ggml_backend_sycl_register_host_weight_tensor(dev, weight);
     }
 
     ggml_backend_tensor_set(weight, tc.weights_q4.data(), 0, tc.weights_q4.size() * sizeof(block_q4_0));
@@ -182,55 +196,51 @@ static bool run_backend_matmul(ggml_backend_t backend,
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, final_out);
 
-    if (require_graphs) {
+    if (require_gpu_graph_path) {
         if (!ggml_sycl::test_backend_supports_graphs(backend)) {
             std::fprintf(stderr, "SKIP: backend does not support graphs\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
+            return finish(run_status::SKIPPED);
         }
         if (ggml_sycl::test_backend_graphs_disabled(backend)) {
             std::fprintf(stderr, "SKIP: backend graphs disabled by configuration\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
+            return finish(run_status::SKIPPED);
         }
     }
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
-        for (ggml_backend_buffer_t buf : buffers) {
-            ggml_backend_buffer_free(buf);
-        }
-        ggml_free(ctx);
-        return false;
+        std::fprintf(stderr, "FAIL: ggml_backend_graph_compute returned status=%d\n", (int) status);
+        return finish(run_status::FAILED);
     }
 
-    if (require_graphs) {
-        const size_t pinned = ggml_sycl::test_graph_pinned_entry_count(backend);
-        if (pinned == 0) {
-            std::fprintf(stderr, "SKIP: no graph-pinned entries, cannot validate graph path\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
+    if (require_gpu_graph_path) {
+        // A recorded executable graph is this test's proof that the MUL_MAT ran
+        // on the DEVICE.  compute_forward suppresses CPU dispatch while a graph
+        // is recording, so every node of a graph that exists executed on the
+        // GPU -- which is the precondition the comparison below depends on and
+        // which nothing here used to check.
+        //
+        // The previous gate counted graph-pinned weight leases instead.  That
+        // count is populated only by graph_preload_weights(), which by design
+        // skips device-VRAM weights ("weights already on GPU"), so it is zero on
+        // a correct run of this fixture and never meant "the graph path ran".
+        if (!ggml_sycl::test_backend_has_exec_graph(backend)) {
+            std::fprintf(stderr, "SKIP: backend recorded no executable graph; GPU XMX path not proven\n");
+            return finish(run_status::SKIPPED);
         }
+        std::fprintf(stderr, "INFO: executable graph recorded, replays=%llu\n",
+                     (unsigned long long) ggml_sycl::test_backend_graph_replay_count(backend));
     }
 
     out.resize(static_cast<size_t>(tc.N) * tc.M);
     ggml_backend_tensor_get(final_out, out.data(), 0, out.size() * sizeof(float));
 
-    for (ggml_backend_buffer_t buf : buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_free(ctx);
-    return true;
+    return finish(run_status::OK);
 }
+
+// ctest's SKIP_RETURN_CODE: a skip must be visible AS a skip, so it can never be
+// read as "this run verified the XMX path".
+static const int TEST_SKIP_RC = 77;
 
 int main() {
     // Enable XMX unified path BEFORE any can_use_xmx() checks.
@@ -243,28 +253,33 @@ int main() {
     {
         ggml_backend_t cpu_backend = ggml_backend_cpu_init();
         if (!cpu_backend) {
-            std::fprintf(stderr, "SKIP: CPU backend unavailable\n");
-            return 0;
+            std::fprintf(stderr, "SKIP: CPU backend unavailable; this run proves NOTHING about the XMX path\n");
+            return TEST_SKIP_RC;
         }
-        const bool ok = run_backend_matmul(cpu_backend, tc, false, false, cpu_out);
+        const run_status cpu_status = run_backend_matmul(cpu_backend, tc, false, cpu_out);
         ggml_backend_free(cpu_backend);
-        if (!ok) {
-            std::fprintf(stderr, "FAIL: CPU reference failed\n");
+        if (cpu_status != run_status::OK) {
+            std::fprintf(stderr, "FAIL: CPU reference did not run\n");
             return 1;
         }
     }
 
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
-        std::fprintf(stderr, "SKIP: SYCL backend unavailable\n");
-        return 0;
+        std::fprintf(stderr, "SKIP: SYCL backend unavailable; this run proves NOTHING about the XMX path\n");
+        return TEST_SKIP_RC;
     }
 
     std::vector<float> sycl_out;
-    const bool sycl_ok = run_backend_matmul(sycl_backend, tc, true, true, sycl_out);
+    const run_status   sycl_status = run_backend_matmul(sycl_backend, tc, true, sycl_out);
     ggml_backend_free(sycl_backend);
-    if (!sycl_ok) {
-        std::fprintf(stderr, "FAIL: SYCL backend run failed\n");
+    if (sycl_status == run_status::SKIPPED) {
+        // The reason was already printed at the point it was detected.  Exiting
+        // 77 rather than 1 keeps an unavailable capability from masquerading as
+        // a correctness failure -- and rather than 0, from masquerading as a pass.
+        return TEST_SKIP_RC;
+    }
+    if (sycl_status != run_status::OK) {
         return 1;
     }
 
