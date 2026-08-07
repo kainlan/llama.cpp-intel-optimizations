@@ -202,14 +202,19 @@ int main(int argc, char ** argv) {
                         failed.store(true);
                         return;
                     }
-                    // llama_decode() can return before the SYCL backend actually
-                    // releases the device's execution lease (deferred-exit-wait
-                    // path, ggml-sycl.cpp can_defer_exit_wait): the lease is
-                    // released lazily on the next synchronize, which is normally
-                    // triggered later by a logit read. Force that release here,
-                    // still under the lock, so we never unlock a device this
-                    // thread's invocation still owns in the execution registry.
-                    llama_synchronize(ctx.get());
+                    if (sycl_same_device_lock_needed) {
+                        // llama_decode() can return before the SYCL backend
+                        // actually releases the device's execution lease
+                        // (deferred-exit-wait path, ggml-sycl.cpp
+                        // can_defer_exit_wait): the lease is released lazily on
+                        // the next synchronize, which is normally triggered
+                        // later by a logit read. Force that release here, still
+                        // under the lock, so we never unlock a device this
+                        // thread's invocation still owns in the execution
+                        // registry. Gated so non-SYCL backends keep the async
+                        // decode overlap this stress test is meant to exercise.
+                        llama_synchronize(ctx.get());
+                    }
                 }
 
                 const auto * vocab = llama_model_get_vocab(model);
@@ -235,7 +240,7 @@ int main(int argc, char ** argv) {
                     {
                         device_decode_guard guard(device_exec_mutex, devices);
                         ret = llama_decode(ctx.get(), batch);
-                        if (ret == 0) {
+                        if (ret == 0 && sycl_same_device_lock_needed) {
                             // See the matching comment on the prompt decode above:
                             // force the deferred device-lease release to happen
                             // before we unlock, not on the next (unguarded) logit
