@@ -344,7 +344,10 @@ allocation clears. The two options were weighed explicitly:
   staging_buffer_pool carve-outs already used pre-C2 — the fix is simply
   widening that carve-out to cover the rest of the population, in a third
   `unified_free_record()` branch kept textually separate from the untouched
-  carve-out (constraint (b) of the ticket).
+  carve-out — the existing WEIGHT/KV/EXPERT_STAGING-in-SCRATCH/
+  staging_buffer_pool-in-STAGING code path is left exactly as it was, and the
+  new population-widening logic lives entirely in its own branch alongside it,
+  rather than folding the two together.
 - **Batched-at-epoch-death** (rejected). This would mirror step 1 more
   literally — hold released allocations until a whole epoch's live count
   reaches zero, then free them as a group — preserving whatever locality
@@ -431,11 +434,12 @@ only a live count, with no notion of "since when" — could not.
 its `graph_lifetime_retention_active()` command-graph path) defers only the
 `mem_handle` vector's destruction — which is what eventually reaches
 `unified_free_record()` — until the retained event completes or
-`release_graph_retained_handles()` runs. Since C2 makes "epoch decrement"
-literally synonymous with "the individual free," and that free only ever
-executes when the handle's real lifetime ends, in-flight BCS DMA staging
-already respects the epoch correctly through this existing machinery with
-no additional integration required — there is no separate "epoch" state
+`release_graph_retained_handles()` runs. Since C2's reclaim IS the
+individual free (unlike C1, nothing is decremented separately from it —
+see Q1), and that free only ever executes when the handle's real lifetime
+ends, in-flight BCS DMA staging already respects the epoch correctly
+through this existing machinery with no additional integration required
+— there is no separate "epoch" state
 for `retain_handles_until_event()` to know about or preserve.
 
 **What this means for the shared `epoch_region`-style struct question.**

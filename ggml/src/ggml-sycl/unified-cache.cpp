@@ -682,8 +682,8 @@ static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 // diagnostics: a stuck host_zone_reset() refusal can report how many
 // boundaries the offending allocation has survived. It does not gate
 // anything -- SCRATCH/STAGING allocations free themselves individually at
-// release regardless of epoch state; see unified_free_record()'s
-// epoch-decrement branch. Global rather than per-unified_cache-instance
+// release regardless of epoch state; see unified_free_record()'s per-record
+// free branch. Global rather than per-unified_cache-instance
 // because host zones are already scanned without a device filter throughout
 // this file (host_zone_reset()'s own live scan below has none), matching
 // g_runtime_alloc_registry's existing device-agnostic scope. Only SCRATCH and
@@ -10286,13 +10286,17 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                     }
                 }
             } else if (rec.handle.host_zone == host_zone_id::SCRATCH || rec.handle.host_zone == host_zone_id::STAGING) {
-                // Epoch decrement (iiff Option C step 2, llama.cpp-lbm3): the
-                // former "reset-only by design" fall-through population --
+                // Per-record TLSF reclaim (iiff Option C step 2, llama.cpp-lbm3):
+                // the former "reset-only by design" fall-through population --
                 // every other SCRATCH allocation (role != EXPERT_STAGING) and
                 // every other STAGING allocation (cohort != staging_buffer_pool).
                 //
-                // Per-record free at release, immediately -- not batched to
-                // epoch death. TLSF free was measured at ~350ns/op, noise
+                // Unconditional individual free at release, immediately -- not
+                // batched to epoch death, and NOT gated by rec.handle.epoch_id
+                // (see below): this is not a decrement of anything, unlike
+                // C1's return_scratch() (unified-cache.cpp, "Epoch decrement"),
+                // which really does decrement a per-region live counter that
+                // gates ring rotation. TLSF free was measured at ~350ns/op, noise
                 // against graph execution time (llama.cpp-2757 c-6ngo), and
                 // Phase 0 proved these zones do not fragment under it (9 of
                 // 11 zone/capture pairs: largest_free first==last==min). C1's
@@ -11283,14 +11287,17 @@ bool unified_free_ptr(void * ptr, int expected_device) {
     }
 
     // This erase must stay UNCONDITIONAL on zone.  host_zone_reset() and
-    // zone_reset() refuse to reset while this registry still lists a live
-    // allocation in the target zone, and they rely on that refusal being
-    // temporary: the registry drains as owners release, and the next reset then
-    // succeeds and reclaims everything accumulated meanwhile.  Reset-only zones
-    // (SCRATCH/STAGING, see unified_free_record) legitimately take no per-block
-    // free above -- but their record must still be dropped here.  Making this
-    // erase conditional on zone would convert that bounded retention into a
-    // permanent latch: the zone would never reset again for the process
+    // zone_reset() refuse to reset (or, for SCRATCH/STAGING post iiff Option C
+    // step 2, skip their now-inert bulk TLSF reinitialization) while this
+    // registry still lists a live allocation in the target zone, and they rely
+    // on that refusal being temporary: the registry drains as owners release,
+    // and the next reset then succeeds. unified_free_record() above already
+    // returned this allocation's bytes to whichever allocator owns them --
+    // every zone-managed branch there frees on its own, unconditionally, none
+    // of them reset-only anymore -- so this erase is pure registry bookkeeping,
+    // never a substitute for a byte-level free. Making it conditional on zone
+    // would convert a live record's absence-from-the-registry into a permanent
+    // latch: the zone would never read as clean again for the process
     // lifetime, silently and with no abort to point at it.
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     auto                        it = g_runtime_alloc_registry.find(ptr);
@@ -14251,7 +14258,7 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // allocations in this zone -- a live record here means another owner, not a leak.
     //
     // Per iiff Option C step 2 (llama.cpp-lbm3): SCRATCH/STAGING allocations are
-    // no longer reset-only -- unified_free_record()'s epoch-decrement branch
+    // no longer reset-only -- unified_free_record()'s per-record free branch
     // returns each allocation's bytes to the owning TLSF zone individually, the
     // instant its own mem_handle releases (see that function). A record still
     // found live here is therefore always a genuine outstanding owner, never
@@ -14355,7 +14362,7 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         // Rewind-on-zero (iiff Option C step 2, llama.cpp-lbm3): the scan
         // above found nothing live, which -- now that every SCRATCH/STAGING
         // allocation individually frees itself at release (see
-        // unified_free_record()'s epoch-decrement branch) -- means every
+        // unified_free_record()'s per-record free branch) -- means every
         // byte in this zone has ALREADY been returned to host_arena_'s TLSF
         // free list. There is nothing left for a bulk
         // host_arena_->zone_reset(zone) to reclaim: the former unconditional

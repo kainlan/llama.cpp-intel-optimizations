@@ -3590,7 +3590,7 @@ struct alloc_handle {
     //   zone_managed=true, host_zone==WEIGHT|KV → cache->host_zone_free(zone, ptr) [TLSF reclaim]
     //   zone_managed=true, host_zone==SCRATCH and role==EXPERT_STAGING → scoped TLSF reclaim
     //   zone_managed=true, host_zone==STAGING and cohort=="staging_buffer_pool" → scoped TLSF reclaim
-    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → epoch-decrement TLSF reclaim
+    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → per-record TLSF reclaim
     //       (iiff Option C step 2, llama.cpp-lbm3: was reset-only pre-C2, now
     //       individually freed the instant this handle releases — see
     //       unified_free_record())
