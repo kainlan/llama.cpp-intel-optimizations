@@ -14162,6 +14162,23 @@ void unified_cache::host_pool_free(void * ptr, size_t size) {
 }
 
 void unified_cache::host_zone_reset(host_zone_id zone) {
+    // Phase 0 escape audit. Declared FIRST, ahead of the reservation
+    // early-return just below, so the RAII destructor still records a visit
+    // on that path instead of the site vanishing from the inventory
+    // (llama.cpp-1ntm, mirroring 495343bb5's identical fix for
+    // reset_scratch_pool). Also stays outside the registry lock further
+    // down so the record is taken with that lock released -- see
+    // zone_audit_site_visit.
+    zone_audit_site_visit audit("host-zone-reset", host_zone_name(zone), -1);
+    if (audit.active()) {
+        // host_zone_largest_free_block() itself returns 0 when the arena/zones
+        // aren't configured yet, so querying it ahead of the check below is
+        // safe and produces the correct "nothing reserved" reading rather
+        // than an absent visit.
+        audit.largest_free       = host_zone_largest_free_block(zone);
+        audit.largest_free_valid = true;
+    }
+
     if (!host_arena_ || !host_arena_->zones_configured()) {
         return;
     }
@@ -14185,16 +14202,6 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // free list intact, so already-freed blocks stay reusable; only the bulk
     // reclaim is forgone. This matches zone_reset()'s existing refusals for the
     // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
-
-    // Phase 0 escape audit. Declared outside the registry lock below so the
-    // record is taken with that lock released -- see zone_audit_site_visit.
-    zone_audit_site_visit audit("host-zone-reset", host_zone_name(zone), -1);
-    if (audit.active()) {
-        // Queried before the registry lock: host_zone_largest_free_block() takes
-        // the pinned pool's own mutex, and there is no reason to nest the two.
-        audit.largest_free       = host_zone_largest_free_block(zone);
-        audit.largest_free_valid = true;
-    }
 
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
@@ -16702,6 +16709,22 @@ static const char * vram_zone_name(vram_zone_id zone) {
 }
 
 void unified_cache::zone_reset(vram_zone_id zone) {
+    // Phase 0 escape audit. Declared FIRST, ahead of the WEIGHT and shared-
+    // KV-arena early returns below, so the RAII destructor still records a
+    // visit on those paths instead of the site vanishing from the inventory
+    // (llama.cpp-1ntm, mirroring 495343bb5's identical fix for
+    // reset_scratch_pool). MUST also stay before the z.alloc_mutex guard
+    // further down: reverse destruction order is what takes the record with
+    // both the zone and registry locks released -- see zone_audit_site_visit.
+    zone_audit_site_visit audit("device-zone-reset", vram_zone_name(zone), ggml_sycl_get_device_id_from_queue(queue_));
+    if (audit.active()) {
+        // zone_largest_free() reads arena_zones_/weight_chunk_allocators_
+        // directly and is safe to call for any zone, including WEIGHT, ahead
+        // of the checks below.
+        audit.largest_free       = zone_largest_free(zone);
+        audit.largest_free_valid = true;
+    }
+
     if (zone == vram_zone_id::WEIGHT) {
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] ignoring WEIGHT zone_reset request; weights are owned by refcounted mem_handles and "
@@ -16739,16 +16762,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
     const auto                  t0 = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
     auto &                      z  = arena_zones_[static_cast<int>(zone)];
 
-    // Phase 0 escape audit. MUST be declared before the z.alloc_mutex guard
-    // below: reverse destruction order is what takes the record with both the
-    // zone and registry locks released -- see zone_audit_site_visit.
-    zone_audit_site_visit audit("device-zone-reset", vram_zone_name(zone), ggml_sycl_get_device_id_from_queue(queue_));
-
     std::lock_guard<std::mutex> lock(z.alloc_mutex);
-    if (audit.active()) {
-        audit.largest_free       = zone_largest_free(zone);
-        audit.largest_free_valid = true;
-    }
 
     // Purge registry entries whose pointer falls within this zone's address
     // range.  Without this, TLSF reset recycles addresses while the registry

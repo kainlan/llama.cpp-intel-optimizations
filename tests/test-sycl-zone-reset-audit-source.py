@@ -228,6 +228,16 @@ def evaluate(cache, backend, common, header):
         'the scratch pool reset hook is declared before the reservation early-return':
             precedes(scratch, 'zone_audit_site_visit audit("scratch-pool-reset"', "!scratch_pool_ptr_"),
 
+        # llama.cpp-1ntm: host_zone_reset()'s WEIGHT-zone guard and zone_reset()'s
+        # WEIGHT/shared-KV-arena refusals predate 495343bb5 and had the identical
+        # defect -- an early return ahead of the hook makes a refused reset
+        # vanish from the inventory instead of reading as "visited and
+        # refused". Same rationale as the scratch-pool check above.
+        'the host reset hook is declared before the reservation early-return':
+            precedes(host_reset, 'zone_audit_site_visit audit("host-zone-reset"', "!host_arena_"),
+        'the VRAM reset hook is declared before the WEIGHT early-return':
+            precedes(zone_reset, 'zone_audit_site_visit audit("device-zone-reset"', "zone == vram_zone_id::WEIGHT"),
+
         # 3. The report must reach the sink. GGML_LOG_INFO is dropped at default
         #    verbosity in EVERY tool, so an INFO-level line yields an empty
         #    capture -- indistinguishable from "no escapes found".
@@ -340,6 +350,16 @@ MUTANTS = {
         "cache",
         [("void unified_cache::reset_scratch_pool() {",
           "void unified_cache::reset_scratch_pool() {\n    if (!scratch_pool_ptr_) { return; }")]),
+    # llama.cpp-1ntm: reproduces the same shape one level up -- an early
+    # return inserted ahead of the hook in host_zone_reset()/zone_reset().
+    "the host reset hook is declared before the reservation early-return": (
+        "cache",
+        [("void unified_cache::host_zone_reset(host_zone_id zone) {",
+          "void unified_cache::host_zone_reset(host_zone_id zone) {\n    if (!host_arena_) { return; }")]),
+    "the VRAM reset hook is declared before the WEIGHT early-return": (
+        "cache",
+        [("void unified_cache::zone_reset(vram_zone_id zone) {",
+          "void unified_cache::zone_reset(vram_zone_id zone) {\n    if (zone == vram_zone_id::WEIGHT) { return; }")]),
     # The exact "tidy" this guards against: collapsing the chain back to the
     # unconditional restore the reference had.
     "the fatal handler chains to the displaced handler, not SIG_DFL": (
