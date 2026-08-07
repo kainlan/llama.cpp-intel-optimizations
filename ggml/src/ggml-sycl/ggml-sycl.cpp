@@ -27266,6 +27266,14 @@ static void ggml_sycl_preload_model_weights() {
     // Eviction strategy handles VRAM pressure if model doesn't fully fit.
 
     std::vector<ggml_tensor *> weights;
+    // llama.cpp-fzem: track how many DISTINCT (model, load, slot) owners end up
+    // authorized into one preload sweep. This function takes no model/owner
+    // parameter -- it scopes itself entirely via ggml_sycl_host_row_authorized()
+    // -- so if that authorization ever passes a stale/wrong candidate through,
+    // this sweep would silently re-pin another live model's already-pinned
+    // tensors (a fresh copy-assign lease on their extra->data_handle[], tagged
+    // identically to a normal dense-pin, with no other observable trace).
+    std::unordered_set<std::string> diag_seen_owner_slots;
     {
         std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
         weights.reserve(g_sycl_host_weight_extras.size());
@@ -27275,8 +27283,23 @@ static void ggml_sycl_preload_model_weights() {
             }
             if (entry.second.tensor) {
                 weights.push_back(entry.second.tensor);
+                diag_seen_owner_slots.insert(std::to_string(entry.second.owner.owner.slot) + ":gen" +
+                                             std::to_string(entry.second.owner.owner.generation));
             }
         }
+    }
+    if (diag_seen_owner_slots.size() > 1) {
+        std::string diag_slots;
+        for (const std::string & sg : diag_seen_owner_slots) {
+            if (!diag_slots.empty()) {
+                diag_slots += ',';
+            }
+            diag_slots += sg;
+        }
+        ggml_sycl_diag_emit_warn(
+            "[SYCL] S1-PRELOAD authorized %zu weights spanning %zu DISTINCT owner slots (slot:gen)=[%s] -- "
+            "this sweep is re-pinning more than one model's tensors in one call\n",
+            weights.size(), diag_seen_owner_slots.size(), diag_slots.c_str());
     }
     GGML_LOG_INFO("[S1-PRELOAD] %zu host-registered weights found for preload\n", weights.size());
     if (weights.empty()) {
