@@ -14813,6 +14813,35 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     // Free existing pool if it exists but is too small.
     // Arena-owned pointers must NOT be released through unified_free — free via TLSF zone_free instead.
     if (scratch_pool_ptr_) {
+        // Regrow discards and reallocates the ENTIRE backing buffer -- every
+        // region, not just the one that was too small -- so doing it while
+        // any region still has a nonzero live (epoch) count would free
+        // memory a caller's still-outstanding get_scratch() pointer is
+        // aliasing. That is the one path in this file that could reclaim
+        // under a live handle, directly against the "never force-reclaim"
+        // invariant this whole mechanism exists to uphold (see CLAUDE.md
+        // SYCL Memory Ownership). Refuse instead, in the same style as
+        // reset_scratch_pool()'s "refusing ..." family: growth is a rare,
+        // explicit administrative resize (not a graph-boundary operation),
+        // so a caller can simply retry once every region has drained.
+        bool any_region_live = false;
+        for (const auto & region : scratch_pool_regions_) {
+            if (region.live.load(std::memory_order_relaxed) != 0) {
+                any_region_live = true;
+                break;
+            }
+        }
+        if (any_region_live) {
+            static std::atomic<int> regrow_refusal_logs{ 0 };
+            if (regrow_refusal_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] refusing scratch pool regrow to %.1f MB: a region is still live; "
+                    "owners must release their scratch buffers before the pool can be resized\n",
+                    pool_bytes / (1024.0 * 1024.0));
+            }
+            return false;
+        }
+
         if (arena_active() && vram_owns(scratch_pool_ptr_)) {
             zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
             scratch_pool_owner_ = {};

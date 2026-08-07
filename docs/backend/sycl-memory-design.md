@@ -242,6 +242,44 @@ outcome that does not" — and epoch refcounting turns the leak into a *told*
 outcome, because a lingering region is observable (it shows as still-live in
 the audit) rather than truly unbounded and invisible growth.
 
+**The policy generalizes; the implementation, deliberately, does not.** What
+step 1 (below) actually validated is a *policy*: per-epoch live counter,
+rewind-on-zero, rotate-on-live, refuse-on-exhaustion, never force-reclaim.
+That policy applies unchanged to every reset-only population this epic
+covers. `scratch_pool_region` — a contiguous ring of equal-sized regions
+addressed by `off`, located by address-range membership in
+`scratch_pool_region_of()` — is not that policy; it is one *shape* the
+policy can take, and it is specific to a single contiguous bump-pool
+allocation. The other two reset-only populations this document's migration
+order covers have different shapes, and forcing them through
+`scratch_pool_region`'s shape would be wrong, not just inconvenient:
+
+- **Host SCRATCH/STAGING zones (step 2).** These are TLSF-arena-backed, with
+  every allocation already individually registered — `host_zone_reset()`
+  (see "Why" above and the canonical contract) walks `g_runtime_alloc_registry`
+  per zone, not a bump offset. There is no single contiguous span to carve
+  into address-range regions and no `off` to rewind: the epoch tag belongs
+  on the *registry record* for each allocation (an epoch id alongside the
+  existing `alloc_id`/`cohort`/`role`/`category` fields), and "rewind" means
+  something different for a TLSF allocator than it does for a bump pointer.
+- **oneDNN scratch pointers (step 3).** `onednn_weights_scratch_` and
+  `onednn_activations_scratch_` are exactly two named pointers, not a pool of
+  interchangeable allocations at all. Epoch tracking here is a live count
+  *per pointer* (or, equivalently, folding the same counter into the
+  `mem_handle` these pointers should hold once converted off the raw-pointer
+  pattern this document's earlier section already flags) — there is no ring
+  to rotate through and no address-range lookup to perform.
+
+A shared `epoch_region`-style struct is therefore **deliberately not
+extracted** out of step 1's implementation. Sharing a struct across three
+populations that disagree on "where do allocations live" and "how is an
+allocation's region found" would either force two of the three into an
+address-range model they do not have, or bloat the struct with fields only
+one shape uses. What step 2 and step 3 inherit from step 1 is the *policy*
+above, expressed in whatever data structure each zone's existing allocation
+tracking already uses — not `scratch_pool_region` itself, and not a common
+base type it should be refactored into.
+
 **Migration order (each step lead-verified on hardware before the next).**
 llama.cpp-37ba's per-symbol audit is the map of which reset-only populations
 exist and how large their blast radius is if converted incorrectly;
