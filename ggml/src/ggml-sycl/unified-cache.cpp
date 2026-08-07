@@ -1695,6 +1695,14 @@ int zone_reset_audit_level() {
 // is the belt to those braces.
 constexpr uint64_t k_zone_audit_report_interval = 256;
 
+// One live allocation as a reset site found it.
+//
+// ⚠ `alloc_id`, `role`, `category` and `tier` mean what their names say at the
+// three ZONE sites, which read them straight off the alloc_handle. The
+// weight-reclaim site has no such handle and SUBSTITUTES unrelated weight-entry
+// fields into the same columns (name_hash / cache_layout / lease count /
+// cache_location) -- see the push site in reclaim_weight_entries() for the exact
+// mapping and why it is kept. Read the site name before reading these columns.
 struct zone_audit_live_entry {
     uint64_t    alloc_id = 0;
     size_t      size     = 0;
@@ -1910,6 +1918,11 @@ void zone_audit_report_locked(const char * where) {
                 // fastest allocation is the one not made). The same alloc_id
                 // recurring instead means the allocation is already retained and
                 // the escape is purely a lifetime/ownership bug.
+                //
+                // The role / category / tier printed below are site-dependent:
+                // on a `weight-reclaim/*` row they carry cache_layout, the lease
+                // count and cache_location instead (see zone_audit_live_entry).
+                // Do not compare those columns across sites.
                 const double per_graph = cs.graphs_seen ? (double) cs.occurrences / (double) cs.graphs_seen : 0.0;
                 const char * verdict   = "single-shot";
                 if (cs.graphs_seen > 1) {
@@ -1948,6 +1961,19 @@ void zone_audit_report_locked(const char * where) {
     zone_audit_emit(std::string("[ZONE-RESET-AUDIT] ==== end inventory ====\n"));
 }
 
+// Handlers displaced by the audit, so an existing crash handler is CHAINED
+// rather than silently replaced. This is not hypothetical: the planner canaries
+// (tests/test-planner-canary-*.cpp) install SIGABRT/SIGSEGV spill handlers whose
+// output is the whole point of the test, and restoring SIG_DFL unconditionally
+// would disarm them for any run that happened to have the audit env set --
+// changing an unrelated test's result as a side effect of a diagnostic.
+//
+// They use sigaction with sa_handler (not SA_SIGINFO), so std::signal's return
+// value recovers the handler faithfully. A handler installed with SA_SIGINFO
+// could not be chained this way; none is today.
+std::atomic<void (*)(int)> g_zone_audit_prev_sigsegv{ SIG_DFL };
+std::atomic<void (*)(int)> g_zone_audit_prev_sigabrt{ SIG_DFL };
+
 // Flush on abnormal termination. Not async-signal-safe (it takes a mutex and
 // calls stdio), which would be unacceptable in production code -- but this runs
 // only under an opt-in diagnostic flag, on a process that is already dying, and
@@ -1967,7 +1993,16 @@ void zone_audit_fatal_signal_handler(int sig) {
             stderr);
         fflush(stderr);
     }
-    std::signal(sig, SIG_DFL);
+    // Hand the signal back to whoever owned it before the audit, so their
+    // handler still runs; SIG_DFL only when there was no previous owner.
+    // SIG_IGN is deliberately NOT honoured for a fatal signal -- re-raising an
+    // ignored SIGSEGV spins forever rather than terminating.
+    void (*prev)(int) =
+        (sig == SIGSEGV ? g_zone_audit_prev_sigsegv : g_zone_audit_prev_sigabrt).load(std::memory_order_relaxed);
+    if (prev == SIG_ERR || prev == SIG_IGN) {
+        prev = SIG_DFL;
+    }
+    std::signal(sig, prev);
     std::raise(sig);
 }
 
@@ -1980,8 +2015,15 @@ void zone_audit_install_handlers() {
             std::lock_guard<std::mutex> lock(st2.mutex);
             zone_audit_report_locked("process-exit");
         });
-        std::signal(SIGSEGV, zone_audit_fatal_signal_handler);
-        std::signal(SIGABRT, zone_audit_fatal_signal_handler);
+        // Save what we displace so the handler above can chain to it. A signal
+        // arriving between the install and the store would chain to SIG_DFL
+        // instead; that window is a few instructions wide on a path that only
+        // runs once, and losing the chain is strictly better than the crash
+        // handler racing an uninitialised pointer.
+        g_zone_audit_prev_sigsegv.store(std::signal(SIGSEGV, zone_audit_fatal_signal_handler),
+                                        std::memory_order_relaxed);
+        g_zone_audit_prev_sigabrt.store(std::signal(SIGABRT, zone_audit_fatal_signal_handler),
+                                        std::memory_order_relaxed);
     }
 }
 
@@ -2019,6 +2061,23 @@ struct zone_audit_timer {
     }
 };
 
+// The two timing accessors deliberately do NOT call zone_audit_install_handlers().
+// Every other audit entry point does, so the asymmetry is intentional and worth
+// stating:
+//
+//  - They sit on the allocation path, and installing costs an atomic
+//    compare-exchange per call. Adding an RMW to the very path whose duration
+//    the timer is measuring would contaminate the measurement the timers exist
+//    to take -- and that measurement decides the pre-registered allocator
+//    question (c-c1n3), so biasing it upward is the one error that matters here.
+//  - What a crash before the first site visit or graph boundary loses is only
+//    the timing rows, which are aggregate throughput numbers, not forensic. The
+//    inventory would be empty in that window regardless, so the report the
+//    handlers would have flushed is the "NO RESET SITE WAS VISITED" line.
+//
+// Arming happens instead at zone_audit_record_site() and
+// zone_reset_audit_begin_graph(), i.e. the first moment there is anything
+// forensic to lose.
 zone_audit_zone_timing * zone_audit_vram_timing(vram_zone_id zone) {
     if (zone_reset_audit_level() <= 0 || zone >= vram_zone_id::COUNT) {
         return nullptr;
@@ -8883,6 +8942,24 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                                        (live != 0)                                    ? "weight:leased" :
                                        owned_by_live                                  ? "weight:owned_by_live_model" :
                                                                                         "weight:unattributed";
+                    // ⚠ COLUMN SUBSTITUTION -- this site alone reuses three
+                    // shared column names for unrelated weight-entry facts:
+                    //
+                    //   alloc_id <- name_hash      (weight identity, not an allocation id)
+                    //   role     <- entry.layout   (cache_layout,      not alloc_role)
+                    //   category <- live           (lease COUNT,       not runtime_category)
+                    //   tier     <- entry.location (cache_location,    not alloc_tier)
+                    //
+                    // A weight cache entry is not a registered runtime allocation
+                    // and carries none of those fields. Kept because c-jec1's
+                    // published inventory was read this way (its "role=4 = the
+                    // MoE expert weights" decoding is a cache_layout), and the
+                    // whole point of matching that format is that the new capture
+                    // diffs against the old one. Decoding it is llama.cpp-u7vi.
+                    //
+                    // Consequence when reading a capture: a `role=` value means
+                    // different things on a weight-reclaim row than on a
+                    // device-/host-zone-reset row. Read the site name first.
                     audit.live.push_back({ (uint64_t) it->first.id.name_hash, entry.size,
                                            static_cast<int>(entry.layout), (int) live, (int) entry.location,
                                            std::string(why) });

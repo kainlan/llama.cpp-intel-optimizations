@@ -4135,9 +4135,29 @@ void zone_reset_audit_begin_graph(int device);
 // size histogram and distinct-size count, per-graph allocation counts, the
 // zone_largest_free trend, and time spent in zone alloc/free. Emitted
 // periodically during a run (so a run that dies still leaves data) and once at
-// process exit. WARN level plus a raw stderr copy -- GGML_LOG_INFO is dropped at
-// default verbosity in every tool and would produce an empty capture,
-// indistinguishable from "no escapes found".
+// process exit.
+//
+// ⚠ EVERY AUDIT LINE IS WRITTEN TWICE in the normal case, and a naive
+// `grep -c` therefore DOUBLE-COUNTS. Each line goes out at WARN level *and* as
+// a raw stderr copy. The raw copy exists because GGML_LOG_INFO is dropped at
+// default verbosity in every tool, so an INFO-level line yields an empty capture
+// indistinguishable from "no escapes found" -- but WARN is not dropped, so both
+// copies normally survive. Three regimes:
+//
+//   x2  every tool that calls common_init() -- llama-cli, llama-completion, and
+//       the test binaries including test-thread-safety and test-llama-archs.
+//       common_init() enables the log prefix, so the two copies ARE
+//       distinguishable: the WARN copy is preceded by a timestamp and a `W `
+//       marker, the raw copy starts at column 0. `grep '^\[ZONE-RESET-AUDIT\]'`
+//       selects exactly the raw copy.
+//   x1  llama-bench without -v, which installs a null log callback: the WARN
+//       copy is discarded and only the raw copy survives.
+//   x2  any binary left on ggml's default log sink, which is itself a bare
+//       fputs to stderr. The two copies are then byte-identical and there is NO
+//       discriminator -- expect exactly x2 and halve.
+//
+// The two writes are separate calls and common_log is asynchronous, so their
+// relative order is not guaranteed and they can interleave with other output.
 void zone_reset_audit_report(const char * where);
 
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.

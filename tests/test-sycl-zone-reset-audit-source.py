@@ -159,6 +159,8 @@ def evaluate(cache, backend, common, header):
     host_free = body_of(cache, "void unified_cache::host_zone_free(")
     emit = body_of(cache, "void zone_audit_emit(")
     level = body_of(cache, "int zone_reset_audit_level(")
+    sig_handler = body_of(cache, "void zone_audit_fatal_signal_handler(")
+    sig_install = body_of(cache, "void zone_audit_install_handlers(")
     report = body_of(cache, "void zone_audit_report_locked(")
     audit_block = region(cache, "struct zone_audit_cohort_size_stats {", "void zone_reset_audit_report(")
     graph_compute = body_of(backend, "static void ggml_backend_sycl_graph_compute_impl(")
@@ -177,6 +179,8 @@ def evaluate(cache, backend, common, header):
         "unified_cache::host_zone_free body": host_free,
         "zone_audit_emit body": emit,
         "zone_reset_audit_level body": level,
+        "zone_audit_fatal_signal_handler body": sig_handler,
+        "zone_audit_install_handlers body": sig_install,
         "zone_audit_report_locked body": report,
         "audit implementation block": audit_block,
         "ggml_backend_sycl_graph_compute_impl body": graph_compute,
@@ -245,6 +249,16 @@ def evaluate(cache, backend, common, header):
         'the scratch pool reset honours level-2 suppression':
             "zone_reset_audit_suppresses_reset()" in scratch,
 
+        # A diagnostic must not disarm somebody else's crash handler. The planner
+        # canaries (test-planner-canary-*.cpp) install SIGABRT/SIGSEGV spill
+        # handlers whose output IS the test; restoring SIG_DFL unconditionally
+        # would silently break them for any run with the audit env set.
+        'the install saves the handlers it displaces':
+            "g_zone_audit_prev_sigsegv.store(std::signal(SIGSEGV" in sig_install
+            and "g_zone_audit_prev_sigabrt.store(std::signal(SIGABRT" in sig_install,
+        'the fatal handler chains to the displaced handler, not SIG_DFL':
+            "g_zone_audit_prev_sigsegv" in sig_handler and "std::signal(sig, SIG_DFL)" not in sig_handler,
+
         # Per-graph attribution, and the flush on the paths that skip atexit.
         'the graph boundary bumps the audit graph sequence':
             "zone_reset_audit_begin_graph(" in graph_compute,
@@ -307,6 +321,12 @@ MUTANTS = {
         "cache",
         [('        zone_audit_site_visit audit("scratch-pool-reset", "bump", ',
           '        zone_audit_site_visit unused_audit("scratch-pool-reset-renamed", "bump", ')]),
+    # The exact "tidy" this guards against: collapsing the chain back to the
+    # unconditional restore the reference had.
+    "the fatal handler chains to the displaced handler, not SIG_DFL": (
+        "cache",
+        [("    void (*prev)(int) =", "    void (*unused_prev)(int) ="),
+         ("    std::signal(sig, prev);", "    std::signal(sig, SIG_DFL);")]),
 }
 
 
