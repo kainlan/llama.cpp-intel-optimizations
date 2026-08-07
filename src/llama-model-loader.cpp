@@ -610,6 +610,9 @@ llama_model_loader::llama_model_loader(
                 use_direct_io = false;
 
                 // reopen file using std::fopen for mmap
+                // Replaces the same index with the same fname, so file_paths
+                // stays correct and must NOT be touched -- see the parallel
+                // array invariant on file_paths in llama-model-loader.h.
                 files.pop_back();
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
             }

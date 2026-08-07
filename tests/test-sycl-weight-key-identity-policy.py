@@ -130,6 +130,7 @@ def evaluate(key, sycl, header, loader):
     key, sycl = squeeze(key), squeeze(sycl)
     header, loader = squeeze(header), squeeze(loader)
 
+    tripwire = between(key, "static_assert(sizeof(ggml_sycl_cache_id)", ");")
     equal = between(key, "static inline bool cache_id_equal(", "struct cache_id_equal_fn")
     hashfn = between(key, "struct cache_id_hash {", "\n};")
     # The comparison that runs for EVERY key, GGUF-backed or not. What appears
@@ -153,6 +154,7 @@ def evaluate(key, sycl, header, loader):
     loader_register = between(loader, "auto register_sycl_tensor_metadata = ", "auto usage_from_tensor = ")
 
     anchors = {
+        "ggml_sycl_cache_id size tripwire": tripwire,
         "cache_id_equal body": equal,
         "cache_id_hash body": hashfn,
         "cache_id_equal physical comparison": equal_physical,
@@ -167,6 +169,17 @@ def evaluate(key, sycl, header, loader):
     }
 
     checks = {
+        # The field list is written out by hand in four places and nothing in the
+        # language ties them together: a field added to three of the four makes
+        # two different weights compare equal, silently. The tripwire is the only
+        # thing that turns that into a build failure, and its message is the only
+        # thing that tells whoever hits it where the other three sites are -- so
+        # the message must still name all four.
+        "a size tripwire guards every copy of the field list": (
+            tripwire != ""
+            and all(site in tripwire for site in ("cache_id_equal", "cache_id_hash", "same_logical_moe_expert",
+                                                  "retained_cache_id_less"))),
+
         # The whole ruling in one line: for a GGUF-backed weight, which model
         # loaded it and what a graph node called it are not part of what it is.
         # Both must be reachable only under the !has_gguf guard, or a tied

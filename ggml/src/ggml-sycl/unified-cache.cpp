@@ -4458,6 +4458,8 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
         }
     }
     if (reason && std::strstr(reason, "moe-phase-layout") != nullptr) {
+        // Must track cache_id_equal's field list -- see the static_assert in
+        // unified-cache-key.hpp, which fires when a field is added here.
         auto same_logical_moe_expert = [](const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
             if (!a.valid || !b.valid || a.model_id != b.model_id || a.has_gguf != b.has_gguf ||
                 a.file_id != b.file_id || a.file_idx != b.file_idx || a.file_offs != b.file_offs ||

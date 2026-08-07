@@ -14,6 +14,23 @@
 
 namespace ggml_sycl {
 
+// ggml_sycl_cache_id's field list is written out by hand in FOUR places, and a
+// field added to only three of them is a silent identity bug: two weights that
+// differ solely in the new field compare equal and share one cache entry. There
+// is no compiler diagnostic for that, so this tripwire stands in for one --
+// adding, removing or resizing a field breaks the build until someone visits
+// all four. Update the size once every site is correct.
+//
+// The four: cache_id_equal and cache_id_hash below; same_logical_moe_expert in
+// unified-cache.cpp; retained_cache_id_less in cpu-dispatch.cpp.
+//
+// 192 is the size on the LP64 targets this backend builds for. On a platform
+// with a different layout this fires with nothing wrong -- read the four sites,
+// confirm they are complete, and record the new size.
+static_assert(sizeof(ggml_sycl_cache_id) == 192,
+              "ggml_sycl_cache_id changed: update cache_id_equal, cache_id_hash, "
+              "same_logical_moe_expert (unified-cache.cpp) and retained_cache_id_less (cpu-dispatch.cpp)");
+
 namespace detail {
 
 static inline size_t cache_hash_combine(size_t seed, size_t value) {

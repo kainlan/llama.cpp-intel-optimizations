@@ -9702,12 +9702,28 @@ static std::unordered_map<std::string, ggml_sycl_weight_identity> g_sycl_weight_
 // Published split-file identities, keyed like the weight identities so that one
 // load cannot read another's files.  See ggml_sycl_owner_file_key().
 static std::unordered_map<std::string, uint64_t>                  g_sycl_gguf_file_ids;
-// Identities registered outside any load transaction, keyed by bare tensor name.
-// There is no lifecycle owner to scope them to, so they are read back only while
-// the process has neither a load in flight nor a published plan -- that is, only
-// while there is no live model whose weights they could be mistaken for.  Each
-// entry still carries the model_id its caller declared, and its file_id is
-// derived from that model, so the keys built from it stay model-correct.
+// Identities registered outside any load transaction, keyed by BARE TENSOR NAME
+// with no owner scoping, and never erased.  Read the constraints before adding a
+// caller:
+//
+//   * Reachable only when there is no owner at all -- no bound load candidate,
+//     no published plan, and no model named by the tensor's extra.  The read is
+//     gated on that in ggml_backend_sycl_get_weight_cache_key(); once any model
+//     is loaded this table is dead.
+//   * Test-only in practice.  The production loader passes model_id == 0, which
+//     ggml_backend_sycl_register_weight_identity() refuses on this path, so
+//     nothing in a real model load ever writes here.
+//   * Last-write-wins on name collision, deliberately.  Two callers declaring
+//     different models for one tensor name leave only the later.  That is
+//     tolerable precisely because the table is unreachable with a model loaded;
+//     the keys built from whichever entry survives are still model-correct,
+//     since each carries its declared model_id and a file_id derived from it.
+//
+// A real caller with model_id != 0 -- anything that must stay readable while a
+// model is live -- must give this an owner scope first, the way
+// g_sycl_weight_identities_by_name is scoped by ggml_sycl_owner_name_key().
+// Widening the read gate without that hands a live model another model's file
+// offsets under a matching name.
 static std::unordered_map<std::string, ggml_sycl_weight_identity> g_sycl_weight_identities_unowned;
 static std::unordered_map<std::string, uint64_t>                  g_sycl_named_weight_cache_uuids;
 static std::mutex                                                 g_sycl_weight_usage_mutex;
