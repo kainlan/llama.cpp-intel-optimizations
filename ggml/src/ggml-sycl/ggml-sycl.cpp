@@ -10782,7 +10782,18 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
     }
 }
 
-static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner) noexcept {
+static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,
+                                                   const char *                     site = "(unknown)") noexcept {
+    // llama.cpp-fzem: WARN, not silent -- this is the function that releases
+    // host-weight-extras and runs the MODEL_TEARDOWN reclaim scan for `owner`
+    // OUTSIDE the normal hooks.unload() path (round 2/3 found the reclaim
+    // scan running here, not through ggml_sycl_release_model_slot_resources).
+    // `site` names which of this function's several call sites fired, so a
+    // capture can show whether it's reached before or after S1-PRELOAD has
+    // taken a dense-pin lease on `owner`'s tensors.
+    GGML_LOG_WARN("[SYCL] abort_owner_effects: site=%s model=%llu load=%llu slot=%u generation=%llu\n", site,
+                  (unsigned long long) owner.model.value, (unsigned long long) owner.load.value, owner.owner.slot,
+                  (unsigned long long) owner.owner.generation);
     bool clean = true;
     try {
         ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
@@ -10854,7 +10865,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         g_sycl_abort_load_exit = false;
         const auto ticket = registry ? registry->prepare_end(result.txn, false) : ggml_sycl::lifecycle::finish_ticket{};
         if (ticket.finisher) {
-            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
+            const bool cleanup_ok =
+                ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_begin/exception-rollback");
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
             ggml_sycl_enqueue_quarantined_result(*registry, failed, nullptr);
         }
@@ -11026,7 +11038,7 @@ static void ggml_sycl_finalize_binding_failure_abort(ggml_sycl::lifecycle::Regis
         g_sycl_abort_load_exit = true;
         ggml_sycl_model_loading_effects(false, recovery.outer);
         g_sycl_abort_load_exit = false;
-        effects_ok = ggml_sycl_abort_owner_effects_noexcept(recovery.token) && effects_ok;
+        effects_ok = ggml_sycl_abort_owner_effects_noexcept(recovery.token, "finalize_binding_failure") && effects_ok;
     } catch (...) {
         g_sycl_abort_load_exit = false;
         effects_ok             = false;
@@ -11096,7 +11108,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         g_sycl_abort_load_exit = false;
         finisher_effect        = {};
         if (!ticket.commit) {
-            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
+            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/not-committed");
             const auto failed = registry->finalize_end(ticket, cleanup_ok);
             ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
             if (model && failed.token.model.value != 0) {
@@ -11109,7 +11121,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             const auto pending    = registry->finalize_end(ticket, true);
             bool       cleanup_ok = false;
             if (pending.cleanup_required) {
-                cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);
+                cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/validate-failed");
             }
             const auto failed = pending.cleanup_required ? registry->finalize_cleanup(ticket, cleanup_ok) : pending;
             ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
@@ -11152,7 +11164,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         auto result = registry->finalize_end(ticket, true, publication, std::move(state));
         if (result.cleanup_required) {
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
-            const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(result.token);
+            const bool cleanup_ok =
+                ggml_sycl_abort_owner_effects_noexcept(result.token, "load_end/commit-then-cleanup-required");
             result = registry->finalize_cleanup(ticket, cleanup_ok);
             ggml_sycl_enqueue_quarantined_result(*registry, result, model);
             (void) ggml_sycl_restore_latest_live_plan();
@@ -11186,7 +11199,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
         }
         if (ticket.finisher) {
-            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token);
+            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/exception-rollback");
             const auto failed = registry->finalize_end(ticket, false);
             ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
             if (model && failed.token.model.value != 0) {
@@ -13722,7 +13735,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             bool released = false;
             ~owner_rollback_guard() noexcept {
                 if (started && !released) {
-                    (void) ggml_sycl_abort_owner_effects_noexcept(owner);
+                    (void) ggml_sycl_abort_owner_effects_noexcept(owner, "stage_inventory_plan/rollback-guard-dtor");
                 }
             }
         } rollback{ effect.owner, false, false };
