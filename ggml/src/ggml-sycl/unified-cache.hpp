@@ -2780,8 +2780,14 @@ class unified_cache {
     // region).  Call once between graph_compute invocations.
     void reset_scratch_pool();
 
-    // Current scratch pool capacity and high-water mark (max across regions).
-    size_t scratch_pool_capacity() const { return scratch_pool_size_; }
+    // Per-epoch scratch pool capacity (one region's usable bytes -- the
+    // sizing contract callers plan against, e.g.
+    // unified_cache_reserve_moe_q8_1_scratch()) and high-water mark.
+    // scratch_pool_size_ is the larger, kScratchPoolRegionCount x TOTAL
+    // footprint; deliberately not exposed here so a caller comparing its
+    // planned demand against "capacity" gets the number that sizing
+    // contract actually means.
+    size_t scratch_pool_capacity() const { return scratch_pool_region_bytes_; }
 
     size_t scratch_pool_hwm() const {
         size_t hwm = 0;
@@ -3130,8 +3136,19 @@ class unified_cache {
     mem_handle scratch_pool_owner_;                    // Non-arena direct allocation owner
 
     std::array<scratch_pool_region, kScratchPoolRegionCount> scratch_pool_regions_;
-    size_t scratch_pool_region_bytes_ = 0;  // scratch_pool_size_ / kScratchPoolRegionCount
-    int    scratch_pool_current_      = 0;  // Index of the region get_scratch() currently targets
+    // Per-region (one-epoch) capacity, i.e. the reserve_scratch_pool(pool_bytes)
+    // sizing contract: scratch_pool_size_ == scratch_pool_region_bytes_ *
+    // kScratchPoolRegionCount, not the other way around -- see the sizing
+    // comment at the top of reserve_scratch_pool().
+    size_t                                                   scratch_pool_region_bytes_ = 0;
+    // Index of the region get_scratch()/reset_scratch_pool() currently
+    // target. Atomic even though reset_scratch_pool() is documented as never
+    // concurrent with in-graph get_scratch()/return_scratch() (the same
+    // assumption the old single scratch_pool_off_ relied on) -- relaxed
+    // ordering costs nothing on the fast path and removes the UB if that
+    // assumption is ever violated by a path CLAUDE.md documents as
+    // overlapping (e.g. persistent-TG/deferred-copy submission).
+    std::atomic<int>                                         scratch_pool_current_{ 0 };
 
     // Reset every region to its just-(re)reserved empty state (off=0, live=0,
     // hwm=0) and point scratch_pool_current_ back at region 0. Called from

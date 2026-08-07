@@ -14796,7 +14796,15 @@ size_t unified_cache::compute_arena_used() const {
 // --- Inference Scratch Pool ---
 
 bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
-    if (scratch_pool_ptr_ && scratch_pool_size_ >= pool_bytes) {
+    // `pool_bytes` is, and has always been, the sizing contract callers plan
+    // against -- unified_cache_reserve_moe_q8_1_scratch() specs and unit-tests
+    // it as full one-epoch capacity. So each region gets pool_bytes (not
+    // pool_bytes / kScratchPoolRegionCount): the ring adds rotation headroom
+    // on top of the requested capacity rather than carving the requested
+    // capacity out of it. The tradeoff is an explicit kScratchPoolRegionCount x
+    // memory footprint, not a silent halving of what a caller asked for --
+    // see scratch_pool_region_bytes_ below for where that footprint is spent.
+    if (scratch_pool_ptr_ && scratch_pool_region_bytes_ >= pool_bytes) {
         if (!arena_active() || vram_owns(scratch_pool_ptr_)) {
             return true;  // Already large enough.
         }
@@ -14824,31 +14832,35 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
         scratch_pool_reset_regions();
     }
 
+    // Total footprint is kScratchPoolRegionCount regions of pool_bytes each --
+    // see the sizing-contract comment above.
+    const size_t total_bytes = pool_bytes * static_cast<size_t>(kScratchPoolRegionCount);
+
     // VRAM arena path: sub-allocate from the weight zone (persistent allocation).
     if (arena_active()) {
-        void * ptr = zone_alloc(vram_zone_id::WEIGHT, pool_bytes);
+        void * ptr = zone_alloc(vram_zone_id::WEIGHT, total_bytes);
         if (ptr) {
             scratch_pool_owner_        = {};
             scratch_pool_ptr_          = ptr;
-            scratch_pool_size_         = pool_bytes;
-            scratch_pool_region_bytes_ = pool_bytes / kScratchPoolRegionCount;
+            scratch_pool_size_         = total_bytes;
+            scratch_pool_region_bytes_ = pool_bytes;
             scratch_pool_reset_regions();
             GGML_LOG_INFO(
                 "[UNIFIED-CACHE] Scratch pool reserved from arena weight zone: %.1f MB (%d x %.1f MB regions)\n",
-                pool_bytes / (1024.0 * 1024.0), kScratchPoolRegionCount,
+                total_bytes / (1024.0 * 1024.0), kScratchPoolRegionCount,
                 scratch_pool_region_bytes_ / (1024.0 * 1024.0));
             return true;
         }
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Arena weight zone full for scratch pool (%.1f MB), "
             "falling back to direct alloc\n",
-            pool_bytes / (1024.0 * 1024.0));
+            total_bytes / (1024.0 * 1024.0));
     }
 
     alloc_request req{};
     req.queue                               = &queue_;
     req.device                              = ggml_sycl_get_device_id_from_queue(queue_);
-    req.size                                = pool_bytes;
+    req.size                                = total_bytes;
     req.intent.role                         = alloc_role::COMPUTE;
     req.intent.category                     = runtime_category::COMPUTE;
     req.intent.cohort_id                    = "scratch_pool";
@@ -14857,7 +14869,7 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     alloc_handle owner{};
     if (!unified_alloc(req, &owner) || owner.ptr == nullptr) {
         GGML_LOG_WARN("[UNIFIED-CACHE] reserve_scratch_pool: failed to allocate %.1f MB\n",
-                      pool_bytes / (1024.0 * 1024.0));
+                      total_bytes / (1024.0 * 1024.0));
         return false;
     }
 
@@ -14865,19 +14877,21 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     scratch_pool_ptr_   = scratch_pool_owner_.resolve().ptr;
     if (!scratch_pool_ptr_) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] reserve_scratch_pool: failed to resolve direct owner for %.1f MB\n",
-                       pool_bytes / (1024.0 * 1024.0));
+                       total_bytes / (1024.0 * 1024.0));
         scratch_pool_owner_ = {};
         return false;
     }
-    scratch_pool_size_         = pool_bytes;
-    scratch_pool_region_bytes_ = pool_bytes / kScratchPoolRegionCount;
+    scratch_pool_size_         = total_bytes;
+    scratch_pool_region_bytes_ = pool_bytes;
     scratch_pool_reset_regions();
 
-    // Preserve the historical cache-local budget charge from allocate().
-    used_.fetch_add(pool_bytes, std::memory_order_relaxed);
+    // Preserve the historical cache-local budget charge from allocate() --
+    // charge what was actually requested from the allocator (total_bytes),
+    // not the per-epoch capacity a caller asked for.
+    used_.fetch_add(total_bytes, std::memory_order_relaxed);
 
     GGML_LOG_INFO("[UNIFIED-CACHE] Scratch pool reserved: %.1f MB on device (%d x %.1f MB regions)\n",
-                  pool_bytes / (1024.0 * 1024.0), kScratchPoolRegionCount,
+                  total_bytes / (1024.0 * 1024.0), kScratchPoolRegionCount,
                   scratch_pool_region_bytes_ / (1024.0 * 1024.0));
     return true;
 }
@@ -14888,7 +14902,7 @@ void unified_cache::scratch_pool_reset_regions() {
         region.live.store(0, std::memory_order_relaxed);
         region.hwm = 0;
     }
-    scratch_pool_current_ = 0;
+    scratch_pool_current_.store(0, std::memory_order_relaxed);
 }
 
 int unified_cache::scratch_pool_region_of(const void * ptr) const {
@@ -14918,10 +14932,13 @@ void * unified_cache::get_scratch(size_t size) {
     // boundary in reset_scratch_pool(), which -- like the reset it replaces
     // -- is never concurrent with in-graph get_scratch()/return_scratch()
     // calls; that ordering, not an extra lock, is what makes reading it here
-    // without synchronization safe, exactly as scratch_pool_off_ relied on
-    // before regions existed.
-    scratch_pool_region & region = scratch_pool_regions_[scratch_pool_current_];
-    size_t                off    = region.off.fetch_add(aligned, std::memory_order_relaxed);
+    // with relaxed ordering safe, exactly as scratch_pool_off_ relied on
+    // before regions existed. It is still std::atomic<int> (not plain int)
+    // so a violation of that assumption is a data race the sanitizers/spec
+    // can see rather than silent UB -- see the field's declaration.
+    const int             current_idx = scratch_pool_current_.load(std::memory_order_relaxed);
+    scratch_pool_region & region      = scratch_pool_regions_[current_idx];
+    size_t                off         = region.off.fetch_add(aligned, std::memory_order_relaxed);
     if (off + aligned > scratch_pool_region_bytes_) {
         // Region exhausted — roll back. Unchanged failure contract: callers
         // still see nullptr exactly as before regions existed.
@@ -14943,7 +14960,7 @@ void * unified_cache::get_scratch(size_t size) {
         cur_hwm    = new_hwm;
     }
 
-    const size_t region_base_off = static_cast<size_t>(scratch_pool_current_) * scratch_pool_region_bytes_;
+    const size_t region_base_off = static_cast<size_t>(current_idx) * scratch_pool_region_bytes_;
     return static_cast<uint8_t *>(scratch_pool_ptr_) + region_base_off + off;
 }
 
@@ -14979,9 +14996,10 @@ void unified_cache::reset_scratch_pool() {
         return;
     }
 
-    scratch_pool_region & current = scratch_pool_regions_[scratch_pool_current_];
-    const size_t          off     = current.off.load(std::memory_order_relaxed);
-    const int64_t         live    = current.live.load(std::memory_order_relaxed);
+    const int             current_idx = scratch_pool_current_.load(std::memory_order_relaxed);
+    scratch_pool_region & current     = scratch_pool_regions_[current_idx];
+    const size_t          off         = current.off.load(std::memory_order_relaxed);
+    const int64_t         live        = current.live.load(std::memory_order_relaxed);
 
     if (zone_reset_audit_enabled()) {
         // The scratch pool is now epoch-refcounted (llama.cpp-2757): `live`
@@ -15016,7 +15034,7 @@ void unified_cache::reset_scratch_pool() {
     // leaked reference or stale owner to fix, not memory to reclaim out from
     // under it). Leave it exactly as-is and try to rotate onto the next
     // region in the ring instead.
-    const int             next      = (scratch_pool_current_ + 1) % kScratchPoolRegionCount;
+    const int             next      = (current_idx + 1) % kScratchPoolRegionCount;
     scratch_pool_region & candidate = scratch_pool_regions_[next];
     if (candidate.live.load(std::memory_order_relaxed) != 0) {
         // Every region in the ring is lingering. Refuse the rotation loudly,
@@ -15037,7 +15055,7 @@ void unified_cache::reset_scratch_pool() {
     // Candidate region already cleared (its own live count reached zero, or
     // it was never used) -- rotate the new epoch onto it.
     candidate.off.store(0, std::memory_order_relaxed);
-    scratch_pool_current_ = next;
+    scratch_pool_current_.store(next, std::memory_order_relaxed);
 }
 
 // --- Expert Allocation ---

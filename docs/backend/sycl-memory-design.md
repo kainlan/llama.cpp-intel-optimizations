@@ -161,6 +161,20 @@ Rather than replace the allocator or replace the reset, give each reset-only
 zone (or pool) a small ring of equal-sized **regions**, and a **live-handle
 counter per region** — the region's *epoch*:
 
+- **Each region is sized at the caller's full requested capacity, not a
+  fraction of it.** `reserve_scratch_pool(pool_bytes)` gives every region
+  `pool_bytes` (total footprint = `kScratchPoolRegionCount × pool_bytes`),
+  rather than splitting `pool_bytes` across the ring. This was a deliberate
+  fix during step 1's review: `pool_bytes` is the sizing contract callers
+  already plan and unit-test against as one epoch's full capacity (e.g.
+  `unified_cache_reserve_moe_q8_1_scratch()`'s Q8_1 demand sizing) — dividing
+  it by the region count would silently halve what a caller asked for the
+  moment a production caller exists, turning "ring adds rotation headroom"
+  into "ring steals half the requested capacity." The ring is *additional*
+  memory bought for the ability to linger a still-live epoch, not a
+  reslicing of the capacity the caller already sized for. The tradeoff is
+  paid explicitly, as a larger real allocation, rather than paid silently as
+  reduced usable capacity.
 - The bump allocator itself is unchanged: allocation is still a lock-free
   `fetch_add` on an offset, same as before.
 - Every allocation from a region increments that region's counter; every
