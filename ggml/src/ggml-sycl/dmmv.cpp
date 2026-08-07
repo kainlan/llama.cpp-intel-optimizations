@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "convert.hpp"
 #include "dequantize.hpp"
+#include "dmmv-coalesced-q4-0-layout.hpp"
 #include "dmmv-esimd.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "mem-ops.hpp"
@@ -637,6 +638,16 @@ static void dequantize_mul_mat_vec_q8_0_reorder_kernel(const void * __restrict__
     }
 }
 
+// The layout header is dependency-free so it can be unit-tested without a GPU,
+// which means it carries its own copy of the tile geometry. These bridge it to
+// the backend's constants, so a change to either side fails to compile instead
+// of silently giving the host test and the kernel different layouts.
+static_assert(ggml_sycl::DMMV_COALESCED_TILE_BLOCKS == MMVQ_COALESCED_TILE_BLOCKS,
+              "coalesced tile block count diverged from the backend constant");
+static_assert(ggml_sycl::DMMV_COALESCED_Q4_0_TILE_BYTES == MMVQ_COALESCED_TILE_BYTES_Q4_0,
+              "coalesced Q4_0 tile size diverged from the backend constant");
+static_assert(ggml_sycl::DMMV_COALESCED_Q4_0_QK == QK4_0, "coalesced Q4_0 block size diverged from QK4_0");
+
 // Coalesced DMMV kernel for Q4_0 - simplified tile+block iteration
 // Layout: [quants: nrows_full * ncols/2 bytes] [scales: nrows_full * blocks_per_row * 2 bytes]
 // Each tile: TILE_BLOCKS (32) blocks with interleaved quants for coalesced access
@@ -667,28 +678,32 @@ static void dequantize_mul_mat_vec_q4_0_coalesced(const void * __restrict__ vx,
 
     constexpr int TILE_BLOCKS    = MMVQ_COALESCED_TILE_BLOCKS;  // 32
     const int     blocks_per_row = ncols / QK4_0;
-    const int     tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
-    constexpr int word_stride    = TILE_BLOCKS * 4;  // 128 bytes
+    const int     tiles_per_row  = ggml_sycl::dmmv_coalesced_tile_count(blocks_per_row);
+    constexpr int word_stride    = ggml_sycl::DMMV_COALESCED_Q4_0_WORD_STRIDE;  // 128 bytes
 
     // X base pointers (coalesced layout: quants first, then scales)
-    const uint8_t * x_qs         = (const uint8_t *) vx;
-    const int       x_row_stride = ncols / 2;  // bytes per row of quants
-    const int       global_row   = row_low + row;
+    const uint8_t * x_qs       = (const uint8_t *) vx;
+    const int       global_row = row_low + row;
 
-    // Scales are after all quants in the FULL tensor
-    const sycl::half * x_d = (const sycl::half *) ((const char *) vx + nrows_full * x_row_stride);
+    // Scales sit after the quants of the FULL tensor, so the base comes from
+    // nrows_full -- deriving it from `nrows` (the slice) lands inside the quants
+    // region. See dmmv-coalesced-q4-0-layout.hpp.
+    const sycl::half * x_d = (const sycl::half *) ((const char *) vx + ggml_sycl::dmmv_coalesced_q4_0_scale_base(
+                                                                           nrows_full, blocks_per_row));
 
     float partial_sum = 0.0f;
 
     // Tile-by-tile iteration (matches memory layout naturally)
     for (int tile = 0; tile < tiles_per_row; ++tile) {
-        const int64_t tile_base = (int64_t) global_row * x_row_stride + (int64_t) tile * MMVQ_COALESCED_TILE_BYTES;
-
         // Each lane handles one block in this tile (TILE_BLOCKS = WARP_SIZE = 32)
         const int block_in_tile = lane_id;
         const int block_idx     = tile * TILE_BLOCKS + block_in_tile;
 
-        const float    d       = (float) x_d[global_row * blocks_per_row + block_idx];
+        // Byte 0 of this block; word w of the same block is word_stride further on.
+        const int64_t block_base =
+            ggml_sycl::dmmv_coalesced_q4_0_qs_offset(global_row, blocks_per_row, block_idx, /*byte_in_block=*/0);
+
+        const float d = (float) x_d[ggml_sycl::dmmv_coalesced_q4_0_scale_index(global_row, blocks_per_row, block_idx)];
         const dfloat * y_block = y + block_idx * QK4_0;
 
         float block_sum = 0.0f;
@@ -696,7 +711,7 @@ static void dequantize_mul_mat_vec_q4_0_coalesced(const void * __restrict__ vx,
 // Process all 16 bytes of this block (4 words × 4 bytes)
 #pragma unroll
         for (int word = 0; word < 4; ++word) {
-            const int64_t word_offset = tile_base + word * word_stride + block_in_tile * 4;
+            const int64_t word_offset = block_base + word * word_stride;
 
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
@@ -738,29 +753,22 @@ static void dequantize_mul_mat_vec_q4_0_coalesced_q8_0(const void * __restrict__
         return;
     }
 
-    constexpr int TILE_BLOCKS    = MMVQ_COALESCED_TILE_BLOCKS;
-    const int     blocks_per_row = ncols / QK4_0;
-    const int     word_stride    = TILE_BLOCKS * 4;
+    const int blocks_per_row = ncols / QK4_0;
 
-    const uint8_t *   x_qs             = (const uint8_t *) vx;
-    const int         row_quants_bytes = ncols / 2;
-    const ggml_half * x_d              = (const ggml_half *) ((const char *) vx + nrows_full * row_quants_bytes);
+    const uint8_t *   x_qs = (const uint8_t *) vx;
+    // Scale base comes from the FULL tensor row count, never the slice size.
+    const ggml_half * x_d =
+        (const ggml_half *) ((const char *) vx + ggml_sycl::dmmv_coalesced_q4_0_scale_base(nrows_full, blocks_per_row));
 
     const int global_row = row_low + row;
-    const int row_base   = global_row * row_quants_bytes;
 
     float tmp = 0.0f;
     for (int block_in_row = lane_id; block_in_row < blocks_per_row; block_in_row += WARP_SIZE) {
-        const int tile          = block_in_row / TILE_BLOCKS;
-        const int block_in_tile = block_in_row % TILE_BLOCKS;
-        const int tile_base     = row_base + tile * MMVQ_COALESCED_TILE_BYTES;
-
         int sumi = 0;
         for (int j = 0; j < QK4_0 / 2; ++j) {
-            const int     word_idx     = j / 4;
-            const int     byte_in_word = j % 4;
-            const int     qs_offset    = tile_base + word_idx * word_stride + block_in_tile * 4 + byte_in_word;
-            const uint8_t qs_byte      = x_qs[qs_offset];
+            const int64_t qs_offset =
+                ggml_sycl::dmmv_coalesced_q4_0_qs_offset(global_row, blocks_per_row, block_in_row, j);
+            const uint8_t qs_byte = x_qs[qs_offset];
 
             const int          v0    = (qs_byte & 0xF) - 8;
             const int          v1    = (qs_byte >> 4) - 8;
