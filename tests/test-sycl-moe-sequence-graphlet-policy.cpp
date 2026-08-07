@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -30,16 +31,19 @@ static bool contains(const std::string & haystack, const char * needle) {
 // widened `std::unique_ptr<sycl_ex::command_graph<...>> recorded`'s neighbours
 // (including retained_handles, never itself touched) from one space to dozens,
 // silently breaking a literal single-space needle even though the checked
-// declaration never moved. Squeezing runs of spaces/tabs to one before
-// comparing survives that kind of reformatting while still failing if the
-// needle's tokens are genuinely absent, renamed, or reordered.
+// declaration never moved. Squeezing runs of whitespace (spaces, tabs, AND
+// newlines -- a declaration's RHS growing past the column limit wraps it onto
+// a new line the exact same way padding does, e.g. host_ids_required below)
+// to one space before comparing survives that kind of reformatting while
+// still failing if the needle's tokens are genuinely absent, renamed, or
+// reordered.
 static bool contains_normalized(const std::string & haystack, const char * needle) {
     auto squeeze = [](const std::string & s) {
         std::string out;
         out.reserve(s.size());
         bool prev_space = false;
         for (char c : s) {
-            const bool is_space = (c == ' ' || c == '\t');
+            const bool is_space = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
             if (is_space) {
                 if (!prev_space) {
                     out.push_back(' ');
@@ -70,6 +74,65 @@ static std::string required_region(const std::string & haystack,
     }
     const size_t finish = end_marker ? end : haystack.size();
     return haystack.substr(begin, finish - begin);
+}
+
+// Whitespace-tolerant sibling of required_region(), for the same reason
+// contains_normalized() exists: a marker that is itself a source-code
+// fragment can be pushed out of exact-substring reach by clang-format alone
+// (llama.cpp-pjgz: "auto graph_diag_report_once = [&]()" stopped matching
+// once an unrelated neighbour's alignment padded it to "auto          graph_
+// diag_report_once = [&]()"). Runs of whitespace in the marker become "one
+// or more whitespace characters" via regex; every non-whitespace token still
+// must match exactly and in order, so a genuinely renamed/removed/reordered
+// declaration still fails loudly. Used only where a plain required_region()
+// call is confirmed broken by reformatting -- not applied file-wide, since
+// most calls here still match exactly and a regex search is unlike a plain
+// substring search than required_region()'s own semantics.
+static std::string whitespace_flex_pattern(const char * marker) {
+    static const std::string special = "\\^$.|?*+()[]{}";
+    std::string              pattern;
+    bool                     in_space = false;
+    for (const char * p = marker; *p; ++p) {
+        const bool is_space = (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r');
+        if (is_space) {
+            if (!in_space) {
+                pattern += "\\s+";
+            }
+        } else {
+            if (special.find(*p) != std::string::npos) {
+                pattern += '\\';
+            }
+            pattern += *p;
+        }
+        in_space = is_space;
+    }
+    return pattern;
+}
+
+static std::string required_region_flex(const std::string & haystack,
+                                        const char *        begin_marker,
+                                        const char *        end_marker,
+                                        const char *        label) {
+    const std::regex begin_re(whitespace_flex_pattern(begin_marker));
+    std::smatch      begin_match;
+    if (!std::regex_search(haystack, begin_match, begin_re)) {
+        std::fprintf(stderr, "FAIL: missing region begin for %s: %s\n", label, begin_marker);
+        std::exit(1);
+    }
+    const size_t begin = static_cast<size_t>(begin_match.position(0));
+    if (!end_marker) {
+        return haystack.substr(begin);
+    }
+    const size_t      after_begin = begin + static_cast<size_t>(begin_match.length(0));
+    const std::regex  end_re(whitespace_flex_pattern(end_marker));
+    std::smatch       end_match;
+    const std::string tail = haystack.substr(after_begin);
+    if (!std::regex_search(tail, end_match, end_re)) {
+        std::fprintf(stderr, "FAIL: missing region end for %s: %s\n", label, end_marker);
+        std::exit(1);
+    }
+    const size_t end = after_begin + static_cast<size_t>(end_match.position(0));
+    return haystack.substr(begin, end - begin);
 }
 
 static std::string join_path(const std::string & root, const char * rel) {
@@ -664,7 +727,7 @@ static int test_sequence_graphlet_tg_diagnostics_after_replay_drain() {
                                                           "auto host_profile_plan_detail_last",
                                                           "sequence graphlet host-id requirement gate");
     CHECK(contains(host_ids_required, "!g_ggml_sycl_graph_recording") &&
-              contains(host_ids_required, "const bool host_ids_required = !g_ggml_sycl_graph_recording"),
+              contains_normalized(host_ids_required, "const bool host_ids_required = !g_ggml_sycl_graph_recording"),
           "sequence graph recording must not force host-ID D2H for diagnostics or batched XMX grouping");
     const std::string down_direct_ids = required_region(sycl, "const bool down_full_table_direct_ids",
                                                        "const bool direct_down_sum_layout_ready",
@@ -704,9 +767,9 @@ static int test_sequence_graphlet_tg_diagnostics_after_replay_drain() {
 
     const std::string exit_diag = required_region(sycl, "const bool has_pending_non_defer_graphlets",
                                                  "if (phase_timing) {", "sequence graphlet exit diagnostics");
-    const std::string report_helper = required_region(sycl, "auto graph_diag_report_once = [&]()",
-                                                      "struct graph_diag_report_guard",
-                                                      "sequence graphlet report helper");
+    const std::string report_helper =
+        required_region_flex(sycl, "auto graph_diag_report_once = [&]()", "struct graph_diag_report_guard",
+                             "sequence graphlet report helper");
     const size_t seq_drain_pos = exit_diag.find("if (g_moe_sequence_graphlet_pending_replays > 0)");
     const size_t seq_reset_pos = exit_diag.find("g_moe_sequence_graphlet_pending_replays = 0;", seq_drain_pos);
     const size_t diag_pos = exit_diag.find("graph_diag_report_once();");
@@ -798,7 +861,11 @@ static int test_default_fast_path_policy_and_tg_diagnostics() {
     CHECK(contains(sycl, "selected_path=") && contains(sycl, "baseline-fallback") && contains(sycl, "sequence-fusion"),
           "diagnostics must include selected path names for default policy decisions");
     CHECK(contains(sycl, "SYCL_MOE_DEFAULT_POLICY_LOG_LIMIT") && contains(sycl, "logging suppressed after %d lines") &&
-              contains(sycl, "final graphdiag summaries remain parseable"),
+              // Split across the two adjacent C++ string literals the source
+              // actually uses ("...remain " \n "parseable\n") -- the runtime
+              // message is unchanged, but a needle spanning that
+              // concatenation seam can never match plain substring search.
+              contains(sycl, "final graphdiag summaries remain ") && contains(sycl, "parseable"),
           "default policy diagnostics must have a bounded logging guard while preserving final summaries");
     return 0;
 }
