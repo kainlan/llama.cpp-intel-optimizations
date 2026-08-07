@@ -15021,10 +15021,12 @@ void unified_cache::return_scratch(void * ptr, size_t size) {
 }
 
 void unified_cache::reset_scratch_pool() {
-    if (!scratch_pool_ptr_ || scratch_pool_region_bytes_ == 0) {
-        return;
-    }
-
+    // Read region 0 (the default scratch_pool_current_) even when the pool
+    // has never been reserved: scratch_pool_regions_ is a fixed-size array
+    // that always exists, so this is safe, and it is what lets the audit
+    // fire unconditionally below -- matching the pre-epoch behaviour (see
+    // the early-return comment further down) where an unreserved pool still
+    // produced a site visit rather than vanishing from the inventory.
     const int             current_idx = scratch_pool_current_.load(std::memory_order_relaxed);
     scratch_pool_region & current     = scratch_pool_regions_[current_idx];
     const size_t          off         = current.off.load(std::memory_order_relaxed);
@@ -15036,6 +15038,17 @@ void unified_cache::reset_scratch_pool() {
         // occupancy instead" fallback -- a nonzero count at this boundary
         // means exactly what a live registry entry means at the other reset
         // sites.
+        //
+        // This MUST run before the "nothing reserved yet" early-return below.
+        // The pre-epoch reset_scratch_pool() had no such early-return -- it
+        // always recorded a site visit, even when scratch_pool_size_ was 0
+        // (empty live, largest_free=0, largest_free_valid=false, since
+        // scratch_pool_size_ > off is false when both are 0). Gating the
+        // audit behind reservation state made the site VANISH from the
+        // inventory instead of reading as "visited and clean" -- worse than
+        // a visits=0 reading, because an absent row is indistinguishable
+        // from a wiring regression and voids baseline comparisons against
+        // every committed capture. See llama.cpp-2757's battery findings.
         zone_audit_site_visit audit("scratch-pool-reset", "bump", ggml_sycl_get_device_id_from_queue(queue_));
         if (live > 0) {
             audit.live.push_back({ 0, off, -1, -1, -1, std::string("scratch_pool:epoch_live") });
@@ -15045,6 +15058,10 @@ void unified_cache::reset_scratch_pool() {
         if (zone_reset_audit_suppresses_reset()) {
             return;
         }
+    }
+
+    if (!scratch_pool_ptr_ || scratch_pool_region_bytes_ == 0) {
+        return;  // Nothing reserved -- nothing to rewind or rotate.
     }
 
     if (live == 0) {
