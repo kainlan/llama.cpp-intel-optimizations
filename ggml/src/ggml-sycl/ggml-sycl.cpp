@@ -10383,7 +10383,18 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
-    GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
+    // llama.cpp-fzem: WARN, not INFO -- GGML_LOG_LEVEL_INFO maps below the
+    // default verbosity threshold (67b2b7f2f, common/log.cpp:444), so an INFO
+    // line here is invisible in a normal run and its absence in a capture
+    // proves nothing about whether this function -- or the host-weight-extras
+    // release upstream of it -- actually ran. `rows` is the one direct
+    // observable for whether ggml_sycl_release_host_weight_extras_for_owner()
+    // found and released this owner's registry entries before the
+    // reclaim_weight_entries() scan; an unexpectedly low `rows` at a
+    // model-teardown release is the signal a ModelToken-mismatch (or any
+    // other unmatched-registration) hypothesis needs and could not get from
+    // this line while it was INFO-only.
+    GGML_LOG_WARN("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot, rows,
                   reclaimed);
 }
 
