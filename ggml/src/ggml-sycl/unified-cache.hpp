@@ -2914,6 +2914,11 @@ class unified_cache {
     // zone_boundary_check() or zone_reclaim().
     void zone_settle(vram_zone_id zone);
 
+    // Host-side twin of zone_settle(): the shared internal behind
+    // host_zone_boundary_check() / host_zone_reclaim() above. Genuinely
+    // internal; same refuse-or-reclaim logic, host pinned-chunk arena.
+    void host_zone_settle(host_zone_id zone);
+
     // ONEDNN (iiff Option C step 3, llama.cpp-67c2) and SCRATCH (the
     // pool_leg compute-arena allocator, arena_alloc()/arena_free() --
     // already individually zone_free()s every allocation, never needed
