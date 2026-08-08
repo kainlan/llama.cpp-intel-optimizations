@@ -28,7 +28,7 @@ there — and an empty or missing evidence directory means *not verified*, never
 
 | file | what it is |
 |---|---|
-| `task19-run.sh` | the exact runner. The commands in it are the commands that ran |
+| `task19-run.sh` | the exact runner. The commands in it are the commands that ran — **a historical record, not a re-runnable script**: its `SCRATCH=` path points at the now-dead `d3b0c71c` session scratchpad and it `cd`s to `/Apps/llama.cpp`, so re-running it means editing both paths first |
 | `task19-names.txt` | the 50 accepted CTest names fed to the runner |
 | `task19-registered.txt` | `ctest -N` output reconciled against the accepted set before execution |
 | `task19-results.tsv` | one row per name: verdict, non-vacuity control, `Shmem` before → after |

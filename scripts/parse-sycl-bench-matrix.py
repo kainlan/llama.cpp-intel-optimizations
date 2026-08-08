@@ -34,6 +34,7 @@ Stdlib only, per the project's minimal-dependency rule.
 
 import argparse
 import glob
+import io
 import os
 import re
 import sys
@@ -230,28 +231,36 @@ def check_gate(arm, test, mean):
     return lo <= mean <= hi, "band %.2f-%.2f" % (lo, hi)
 
 
-def evaluate(arm_files, runs, min_free_overrides, out):
+def evaluate(arm_files, runs, min_free_overrides, out, err):
     """Evaluate the whole matrix. Returns an exit code (0, 1 or 2).
 
     arm_files: {arm_name: [path, ...]}. Every arm in ARMS must be present.
+
+    Stream contract, which the self-test asserts rather than assumes:
+      out (stdout) carries RESULTS -- the per-arm means table and a PASS verdict.
+      err (stderr) carries every DIAGNOSTIC that accompanies a non-zero exit.
+    So exit 2 writes nothing to stdout at all (no verdict was computable, so
+    there is no result to report), and exit 1 writes the table to stdout with
+    the failure explanation on stderr. A caller redirecting only stdout can
+    still never mistake an error for a result.
     """
     missing_arms = [a for a in sorted(ARMS) if a not in arm_files]
     if missing_arms:
-        out.write("INPUT ERROR: arm(s) entirely absent: %s\n" % ", ".join(missing_arms))
-        out.write("A missing arm is not a pass. All %d arms are required.\n" % len(ARMS))
+        err.write("INPUT ERROR: arm(s) entirely absent: %s\n" % ", ".join(missing_arms))
+        err.write("A missing arm is not a pass. All %d arms are required.\n" % len(ARMS))
         return 2
 
     unknown = [a for a in sorted(arm_files) if a not in ARMS]
     if unknown:
-        out.write("INPUT ERROR: unknown arm(s): %s\n" % ", ".join(unknown))
-        out.write("Known arms: %s\n" % ", ".join(sorted(ARMS)))
+        err.write("INPUT ERROR: unknown arm(s): %s\n" % ", ".join(unknown))
+        err.write("Known arms: %s\n" % ", ".join(sorted(ARMS)))
         return 2
 
     results = {}
     for arm in sorted(ARMS):
         paths = arm_files[arm]
         if len(paths) != runs:
-            out.write(
+            err.write(
                 "INPUT ERROR: %s has %d sample(s), required %d. A short arm is an "
                 "error, not a smaller sample.\n" % (arm, len(paths), runs)
             )
@@ -263,7 +272,7 @@ def evaluate(arm_files, runs, min_free_overrides, out):
             try:
                 samples.append(parse_log(path, floor_mib))
             except ParseError as exc:
-                out.write("INPUT ERROR: %s: %s\n" % (arm, exc))
+                err.write("INPUT ERROR: %s: %s\n" % (arm, exc))
                 return 2
         results[arm] = samples
 
@@ -293,10 +302,10 @@ def evaluate(arm_files, runs, min_free_overrides, out):
         out.write("\n")
 
     if failures:
-        out.write("VERDICT: FAIL\n")
+        err.write("VERDICT: FAIL\n")
         for f in failures:
-            out.write("  %s\n" % f)
-        out.write(
+            err.write("  %s\n" % f)
+        err.write(
             "\nPer the plan, a B70 miss opens an owner-reviewed baseline/regression\n"
             "task; it does not authorise inventing or lowering a guardrail. Before\n"
             "concluding regression, discriminate load with an interleaved paired A/B\n"
@@ -376,15 +385,28 @@ def self_test(out):
          _with(**{"b50-mistral": [_fx("b50-mistral-below-floor.txt")] * DEFAULT_RUNS}), 1),
     ]
 
-    class _Sink(object):
-        def write(self, _):
-            pass
+    # Expected stream occupancy per exit code. Checking this is the point:
+    # without it, "diagnostics go to stderr" is a claim about the source rather
+    # than a property of the program.
+    #                 exit: (stdout non-empty?, stderr non-empty?)
+    stream_contract = {0: (True, False), 1: (True, True), 2: (False, True)}
 
     failures = 0
     for name, arms, expected in cases:
-        got = evaluate(arms, DEFAULT_RUNS, {}, _Sink())
-        ok = got == expected
-        out.write("  %-62s expected %d got %d  %s\n" % (name, expected, got, "OK" if ok else "FAIL"))
+        cap_out, cap_err = io.StringIO(), io.StringIO()
+        got = evaluate(arms, DEFAULT_RUNS, {}, cap_out, cap_err)
+        want_out, want_err = stream_contract[expected]
+        streams_ok = (bool(cap_out.getvalue()) == want_out
+                      and bool(cap_err.getvalue()) == want_err)
+        ok = got == expected and streams_ok
+        note = ""
+        if got != expected:
+            note = "  <- wrong exit code"
+        elif not streams_ok:
+            note = "  <- wrong stream: stdout=%d bytes stderr=%d bytes" % (
+                len(cap_out.getvalue()), len(cap_err.getvalue()))
+        out.write("  %-62s expected %d got %d  %s%s\n"
+                  % (name, expected, got, "OK" if ok else "FAIL", note))
         if not ok:
             failures += 1
 
@@ -395,6 +417,8 @@ def self_test(out):
     out.write(
         "SELF-TEST PASSED -- the parser demonstrably returns 0, 1 and 2, so a PASS\n"
         "from it is a measurement rather than the only outcome it can produce.\n"
+        "Stream routing is checked too: exit 2 writes NOTHING to stdout, so a caller\n"
+        "capturing only stdout cannot mistake an unmeasurable run for a result.\n"
     )
     return 0
 
@@ -417,8 +441,42 @@ def parse_min_free(values):
     return out
 
 
+EPILOG = """
+exit codes -- the contract this parser exists to provide:
+
+  0  PASS                   every arm present, parseable, and within its
+                            floor/band. Results on stdout.
+  1  VERDICT FAIL           everything parsed; a mean missed its floor/band.
+                            Means table on stdout, explanation on stderr.
+                            Discriminate load from regression with an
+                            interleaved paired A/B before concluding
+                            regression. A B70 miss opens an owner-reviewed
+                            baseline task -- it never authorises lowering a
+                            guardrail.
+  2  INPUT/PARSE FAILURE    no verdict could be computed. NOTHING on stdout;
+                            diagnosis on stderr. This is neither a pass nor a
+                            fail -- fix the inputs and re-run the matrix.
+
+Exit 2 covers: missing file, empty file, an arm with fewer than the required
+samples, an arm entirely absent, a results directory that does not exist, a
+directory that exists but is empty, an unparseable t/s cell, a table with no
+'fa' column (not the -fa 1 matrix), a log with no '- NNNNN MiB free' line
+(llama-bench run without -v), and free VRAM below the contamination floor.
+
+1 and 2 are deliberately distinct: "the branch is slow" and "I could not
+measure the branch" are different facts and must not share an exit code.
+
+Verify the parser before trusting its verdict:  --self-test  (expects 10/10)
+Gate definition: docs/backend/sycl-perf-baselines.md
+"""
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--dir", help="directory holding <arm>-<n>.log|.txt")
     ap.add_argument("--arm", action="append", default=[],
                     help="<arm>=<log1>,<log2>,... (repeatable)")
@@ -466,7 +524,7 @@ def main(argv=None):
         )
         return 2
 
-    return evaluate(arm_files, args.runs, overrides, sys.stdout)
+    return evaluate(arm_files, args.runs, overrides, sys.stdout, sys.stderr)
 
 
 if __name__ == "__main__":

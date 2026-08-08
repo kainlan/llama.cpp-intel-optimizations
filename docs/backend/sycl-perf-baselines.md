@@ -517,6 +517,14 @@ already writes.
 and collapsing them into one non-zero code is how a missing arm gets triaged as
 a performance problem.
 
+**Stream routing is part of the contract**, so a caller that captures only
+stdout cannot mistake an error for a result: stdout carries results (the
+per-arm means table, and a `PASS` verdict), stderr carries every diagnostic
+that accompanies a non-zero exit. **Exit 2 writes nothing at all to stdout** —
+no verdict was computable, so there is no result to report. The `--self-test`
+asserts this per case rather than taking it on trust; a mutation routing one
+diagnostic back to stdout drops it from 10/10 to 4/10.
+
 Every one of these is exit 2, not a smaller sample: a missing file, an empty
 file, an arm with fewer than five logs, an arm entirely absent, a results
 directory that does not exist, a directory that exists but is empty, an
