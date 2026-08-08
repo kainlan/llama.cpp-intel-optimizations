@@ -2745,6 +2745,12 @@ struct test_argmax : public test_case {
                         // only n_finite values are above -inf
                         data[i] = (n_finite >= 0 && i >= n_finite) ? -INFINITY : (float) i;
                     }
+                    // Deterministic placement when padded, unlike test_top_k: a
+                    // lane scans columns tid, tid+256, ..., so finite values in
+                    // [0, n_finite) already put every lane class in play at both
+                    // shapes -- finite-holding, -inf-only, and (at ne0=16) owning
+                    // no column at all -- and the controls keep a fixed expected
+                    // index. A shuffle would only permute which lane holds which.
                     if (n_finite < 0) {
                         std::shuffle(data.begin(), data.end(), rng);
                     }
