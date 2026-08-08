@@ -195,6 +195,71 @@ static void dmmv_q4_0_q8_activation_reference(const block_q4_0_test * x,
     }
 }
 
+// The arithmetic an MMVQ dispatch actually performs for a Q4_0 weight, which is
+// neither of the two oracles above and is the one no round had modelled
+// (llama.cpp-szv8). Three details make it distinct, and all three matter:
+//
+//   * the activation is quantized to q8_1 -- 8 bits per 32-element block, scale
+//     amax/127 (ggml/src/ggml-sycl/quantize.hpp:39-56);
+//   * the block also carries `sum`, the sum of the RAW activation floats, and
+//     both it and the scale are stored as fp16 (quantize.hpp:121);
+//   * vec_dot_q4_0_q8_1_impl folds Q4_0's -8 offset as `d4 * (sumi*ds.x -
+//     8*ds.y)` (ggml/src/ggml-sycl/vecdotq.hpp:709), i.e. it subtracts that raw
+//     `sum` rather than d8*sum(q8). The two differ by the block's quantization
+//     residual, which is why a plain Q8_0-activation oracle lands at roughly
+//     half the gap and this one lands on it.
+//
+// Modelled on the host, this reproduces the reported GPU numbers to six
+// significant figures at two shapes (1024x64: errors 55, max_rel 0.165478 vs
+// 0.165479 measured; 2048x128: 116, 0.176323 vs 0.176321), which is an
+// identification of the executing path rather than a magnitude-class argument.
+static void dmmv_q4_0_q8_1_mmvq_reference(const block_q4_0_test * x,
+                                          const float *           y,
+                                          float *                 dst,
+                                          int                     ncols,
+                                          int                     nrows) {
+    const int blocks_per_row = ncols / QK4_0;  // QK8_1 == QK4_0 == 32
+
+    std::vector<ggml_fp16_t> d8(blocks_per_row);
+    std::vector<ggml_fp16_t> s8(blocks_per_row);
+    std::vector<int8_t>      q8((size_t) ncols);
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        float amax = 0.0f;
+        float sum  = 0.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            const float v = y[b * QK4_0 + j];
+            sum += v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+        const float d = (amax == 0.0f) ? 1.0f : amax / 127.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            q8[b * QK4_0 + j] = (int8_t) roundf(y[b * QK4_0 + j] / d);
+        }
+        d8[b] = ggml_fp32_to_fp16((amax == 0.0f) ? 0.0f : d);
+        s8[b] = ggml_fp32_to_fp16(sum);
+    }
+
+    for (int row = 0; row < nrows; ++row) {
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const block_q4_0_test * blk = &x[row * blocks_per_row + b];
+
+            // Note the quants are NOT offset by 8 here; the offset is the
+            // separate -8*ds.y term below, exactly as the kernel does it.
+            int raw = 0;
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                raw += (blk->qs[j] & 0xF) * q8[b * QK4_0 + j];
+                raw += (blk->qs[j] >> 4) * q8[b * QK4_0 + j + QK4_0 / 2];
+            }
+
+            sum +=
+                ggml_fp16_to_fp32(blk->d) * ((float) raw * ggml_fp16_to_fp32(d8[b]) - 8.0f * ggml_fp16_to_fp32(s8[b]));
+        }
+        dst[row] = sum;
+    }
+}
+
 static void dmmv_q4_0_cpu_from_coalesced(const uint8_t * coalesced, const float * y, float * dst,
                                          int ncols, int nrows) {
     constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
@@ -971,15 +1036,24 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         std::vector<float> ref_f32(nrows);
         dmmv_q4_0_cpu_reference(x_aos, input_data.data(), ref_f32.data(), ncols, nrows);
 
+        std::vector<float> ref_mmvq(nrows);
+        dmmv_q4_0_q8_1_mmvq_reference(x_aos, input_data.data(), ref_mmvq.data(), ncols, nrows);
+
         const oracle_score s_dfloat = score_against(gpu_out, ref, 1e-2f);
         const oracle_score s_f32    = score_against(gpu_out, ref_f32, 1e-2f);
         const oracle_score s_q8     = score_against(gpu_out, ref_q8, 1e-2f);
+        const oracle_score s_mmvq   = score_against(gpu_out, ref_mmvq, 1e-2f);
         printf("    gpu vs f32-activation    oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_f32.errors,
                s_f32.max_diff, s_f32.max_rel);
         printf("    gpu vs dfloat-activation oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_dfloat.errors,
                s_dfloat.max_diff, s_dfloat.max_rel);
         printf("    gpu vs Q8_0-activation   oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_q8.errors,
                s_q8.max_diff, s_q8.max_rel);
+        // Predicted to be the one that lands: errors=0, max_diff at f32
+        // reassociation scale (~1e-4). If it does, the executing path is MMVQ
+        // with q8_1 activations and the coalesced DMMV kernel never ran.
+        printf("    gpu vs q8_1-MMVQ         oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_mmvq.errors,
+               s_mmvq.max_diff, s_mmvq.max_rel);
 
         // Same three oracles recomputed from the ACTUAL coalesced bytes the
         // kernel reads, not from the AoS source. Agreement between the two
@@ -1026,8 +1100,8 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             const int i = s_dfloat.first_bad;
             printf(
                 "    first divergent row=%d: gpu=%.6f f32=%.6f dfloat=%.6f q8=%.6f"
-                " layout_bytes=%.6f  gpu/dfloat=%.6f\n",
-                i, gpu_out[i], ref_f32[i], ref[i], ref_q8[i], ref_from_layout[i],
+                " q8_1_mmvq=%.6f layout_bytes=%.6f  gpu/dfloat=%.6f\n",
+                i, gpu_out[i], ref_f32[i], ref[i], ref_q8[i], ref_mmvq[i], ref_from_layout[i],
                 ref[i] != 0.0f ? gpu_out[i] / ref[i] : 0.0f);
         }
     }
