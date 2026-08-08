@@ -12330,7 +12330,59 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
     if (arena_active()) {
         arena_attempt             = true;
         const size_t total_needed = weights_size + activations_size;
-        size_t       zone_cap     = zone_capacity(vram_zone_id::ONEDNN);
+
+        // Reclaim the OLD arena-owned reservation individually, UNCONDITIONALLY,
+        // before anything below consults zone capacity or attempts a re-plan --
+        // the real per-pointer release that replaces the bulk zone_reset() this
+        // function used to depend on as its ONLY reclaim path (iiff Option C
+        // step 3, llama.cpp-67c2). Nothing else ever allocates from
+        // vram_zone_id::ONEDNN (grep-verified: the four zone_alloc(ONEDNN, ...)
+        // call sites in reserve_onednn_scratch are the sole users of this zone
+        // in the whole backend), so freeing exactly the two pointers this
+        // reservation previously handed out is a complete reclaim, not a
+        // partial one. Unlike C1's ring (many interchangeable regions,
+        // address-range lookup) or C2's TLSF population (many registered
+        // records), there is nothing here to rotate through or look up: it is
+        // a live count of at most 1 per named pointer, so the "epoch" is
+        // simply "does this pointer still point at something this reservation
+        // owns".
+        //
+        // This must run BEFORE ensure_planned_arena_zones() below, not after
+        // (a spec-review finding on the first version of this step): that
+        // function's has_live_scratch refusal check treats a non-null
+        // onednn_*_scratch_ as still-live regardless of who owns it, so a
+        // request that needed to GROW the zone would leave its own
+        // predecessor's pointers set, self-refuse its own re-plan every time,
+        // and fall through to the shared direct-allocation cleanup further
+        // down -- whose arena-owned branch only nulls the fields, orphaning
+        // the TLSF bytes until arena teardown. Releasing first fixes both:
+        // the leak, and the re-plan's ability to ever actually succeed.
+        //
+        // A pointer that is NOT currently arena-owned (it grew outside the
+        // zone on an earlier call, via allocate_direct_scratch) is left
+        // untouched here -- it is already a real mem_handle lease, and the
+        // existing release_direct_scratch() cleanup further down (unchanged)
+        // is what frees it.
+        if (onednn_weights_scratch_ && vram_owns(onednn_weights_scratch_)) {
+            zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);
+            onednn_weights_scratch_      = nullptr;
+            onednn_weights_scratch_size_ = 0;
+        }
+        if (onednn_activations_scratch_ && vram_owns(onednn_activations_scratch_)) {
+            zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_);
+            onednn_activations_scratch_      = nullptr;
+            onednn_activations_scratch_size_ = 0;
+        }
+
+        // The call site stays, but its reclaiming role has ended (mirroring
+        // C2's treatment of host_zone_reset(SCRATCH|STAGING)): by this point
+        // the two pointers above are already individually freed, so this can
+        // only ever observe an empty zone. It is kept as the audit/liveness
+        // checkpoint the Phase-0 "device-zone-reset/ONEDNN" cohort reads,
+        // rather than letting the site silently stop being visited.
+        zone_reset(vram_zone_id::ONEDNN);
+
+        size_t zone_cap = zone_capacity(vram_zone_id::ONEDNN);
 
         // The planned ONEDNN zone is about to be measured against a real
         // request. Recorded whether or not it turns out to be big enough,
@@ -12377,45 +12429,9 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             zone_cap = zone_capacity(vram_zone_id::ONEDNN);
         }
         if (total_needed <= zone_cap) {
-            // Reclaim the OLD arena-owned reservation individually -- the real
-            // per-pointer release that replaces the bulk zone_reset() this branch
-            // used to depend on as its ONLY reclaim path (iiff Option C step 3,
-            // llama.cpp-67c2). Nothing else ever allocates from
-            // vram_zone_id::ONEDNN (grep-verified: the four zone_alloc(ONEDNN,
-            // ...) call sites in reserve_onednn_scratch are the sole users of
-            // this zone in the whole backend), so freeing exactly the two
-            // pointers this reservation previously handed out is a complete
-            // reclaim, not a partial one. Unlike C1's ring (many interchangeable
-            // regions, address-range lookup) or C2's TLSF population (many
-            // registered records), there is nothing here to rotate through or
-            // look up: it is a live count of at most 1 per named pointer, so the
-            // "epoch" is simply "does this pointer still point at something this
-            // reservation owns".
-            //
-            // A pointer that is NOT currently arena-owned (it grew outside the
-            // zone on an earlier call, via allocate_direct_scratch) is left
-            // untouched here -- it is already a real mem_handle lease, and the
-            // existing release_direct_scratch() cleanup a few lines down (moved,
-            // not changed) is what frees it.
-            if (onednn_weights_scratch_ && vram_owns(onednn_weights_scratch_)) {
-                zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);
-                onednn_weights_scratch_      = nullptr;
-                onednn_weights_scratch_size_ = 0;
-            }
-            if (onednn_activations_scratch_ && vram_owns(onednn_activations_scratch_)) {
-                zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_);
-                onednn_activations_scratch_      = nullptr;
-                onednn_activations_scratch_size_ = 0;
-            }
-
-            // The call site stays, but its reclaiming role has ended (mirroring
-            // C2's treatment of host_zone_reset(SCRATCH|STAGING)): by this point
-            // the two pointers above are already individually freed, so this can
-            // only ever observe an empty zone. It is kept as the audit/liveness
-            // checkpoint the Phase-0 "device-zone-reset/ONEDNN" cohort reads,
-            // rather than letting the site silently stop being visited.
-            zone_reset(vram_zone_id::ONEDNN);
-
+            // The old arena-owned pair (if any) was already point-released
+            // above, unconditionally, before the capacity check -- nothing left
+            // to reclaim here.
             void * w = zone_alloc(vram_zone_id::ONEDNN, weights_size);
             void * a = w ? zone_alloc(vram_zone_id::ONEDNN, activations_size) : nullptr;
             if (w && a) {
@@ -12493,24 +12509,46 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
 
     // Free existing if resizing — subtract old sizes from budget first.
     // Only unified_alloc()-owned (non-arena) buffers were charged to used_.
-    const size_t old_total =
-        (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_) ? onednn_weights_scratch_size_ : 0) +
-        (onednn_activations_scratch_ && !vram_owns(onednn_activations_scratch_) ? onednn_activations_scratch_size_ : 0);
-    if (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_)) {
-        release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_, onednn_weights_scratch_size_,
-                               "weights");
-    } else {
-        onednn_weights_scratch_owner_ = {};
-        onednn_weights_scratch_       = nullptr;
-        onednn_weights_scratch_size_  = 0;
+    //
+    // A non-null, arena-owned onednn_*_scratch_ reaching here is now provably
+    // unreachable: whenever arena_active() was true on entry, the unconditional
+    // point-release at the top of the arena_active() branch above already freed
+    // and nulled any arena-owned pointer; whenever arena_active() is false,
+    // vram_owns() always returns false too (it tests arena_base_/arena_chunks_,
+    // which every arena_destroy() caller already required these fields null
+    // before calling — see the design doc's C3 subsection). So the two
+    // remaining cases are "already null" (nothing to do) and "direct, not
+    // arena-owned" (release_direct_scratch handles it, unchanged). Assert
+    // rather than silently null on the impossible third case: silently nulling
+    // it is exactly the pre-fix defect (orphaned TLSF bytes, reclaimed only by
+    // whole-arena teardown), and a silent null here would let a future
+    // regression reopen that leak invisibly.
+    size_t old_total = 0;
+    if (onednn_weights_scratch_) {
+        if (vram_owns(onednn_weights_scratch_)) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] onednn_weights_scratch_ still arena-owned at the direct-scratch fallback "
+                "ptr=%p -- the arena-case point-release should already have freed it\n",
+                onednn_weights_scratch_);
+            GGML_ASSERT(false && "onednn_weights_scratch_ unexpectedly arena-owned at direct-scratch fallback");
+        } else {
+            old_total += onednn_weights_scratch_size_;
+            release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_, onednn_weights_scratch_size_,
+                                   "weights");
+        }
     }
-    if (onednn_activations_scratch_ && !vram_owns(onednn_activations_scratch_)) {
-        release_direct_scratch(onednn_activations_scratch_owner_, onednn_activations_scratch_,
-                               onednn_activations_scratch_size_, "activations");
-    } else {
-        onednn_activations_scratch_owner_ = {};
-        onednn_activations_scratch_       = nullptr;
-        onednn_activations_scratch_size_  = 0;
+    if (onednn_activations_scratch_) {
+        if (vram_owns(onednn_activations_scratch_)) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] onednn_activations_scratch_ still arena-owned at the direct-scratch fallback "
+                "ptr=%p -- the arena-case point-release should already have freed it\n",
+                onednn_activations_scratch_);
+            GGML_ASSERT(false && "onednn_activations_scratch_ unexpectedly arena-owned at direct-scratch fallback");
+        } else {
+            old_total += onednn_activations_scratch_size_;
+            release_direct_scratch(onednn_activations_scratch_owner_, onednn_activations_scratch_,
+                                   onednn_activations_scratch_size_, "activations");
+        }
     }
     if (old_total > 0) {
         saturating_sub_used(old_total);

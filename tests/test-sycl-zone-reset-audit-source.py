@@ -165,6 +165,7 @@ def evaluate(cache, backend, common, header):
     audit_block = region(cache, "struct zone_audit_cohort_size_stats {", "void zone_reset_audit_report(")
     graph_compute = body_of(backend, "static void ggml_backend_sycl_graph_compute_impl(")
     watchdog = body_of(common, "static void watchdog_thread_fn(")
+    reserve_onednn = body_of(cache, "bool unified_cache::reserve_onednn_scratch(")
 
     # Anchors: every region the checks read must have been found. A rename that
     # empties one of these reports a missing anchor rather than a silent pass.
@@ -185,6 +186,7 @@ def evaluate(cache, backend, common, header):
         "audit implementation block": audit_block,
         "ggml_backend_sycl_graph_compute_impl body": graph_compute,
         "watchdog_thread_fn body": watchdog,
+        "unified_cache::reserve_onednn_scratch body": reserve_onednn,
     }
 
     checks = {
@@ -301,6 +303,23 @@ def evaluate(cache, backend, common, header):
             all(needle in header for needle in
                 ("bool zone_reset_audit_enabled();", "void zone_reset_audit_begin_graph(int device);",
                  "void zone_reset_audit_report(const char * where);")),
+
+        # 6. iiff Option C step 3 (llama.cpp-67c2): the oneDNN scratch point-release
+        #    must free the OLD arena-owned reservation before anything consults zone
+        #    capacity or attempts a re-plan. A spec-review finding on the first
+        #    version of this step put the release inside the `total_needed <=
+        #    zone_cap` branch, AFTER ensure_planned_arena_zones() -- so on the one
+        #    path that most needed it (an existing reservation growing into a
+        #    bigger one), the pointers were still live when the live-scratch
+        #    refusal check ran, guaranteeing the re-plan refused itself, and
+        #    control fell through to the shared direct-allocation cleanup whose
+        #    arena-owned branch only nulled the fields: orphaned TLSF bytes,
+        #    reclaimed only at whole-arena teardown. Same shape as the
+        #    "hook declared before the early-return" checks above -- the ordering,
+        #    not just the presence, is what a future edit can quietly break.
+        'the oneDNN point-release precedes the growth-path re-plan':
+            precedes(reserve_onednn, "zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_)",
+                    "ensure_planned_arena_zones()"),
     }
 
     return sorted(name for name, text in anchors.items() if not text), \
@@ -366,6 +385,17 @@ MUTANTS = {
         "cache",
         [("    void (*prev)(int) =", "    void (*unused_prev)(int) ="),
          ("    std::signal(sig, prev);", "    std::signal(sig, SIG_DFL);")]),
+    # Reproduces the exact llama.cpp-67c2 spec-review regression: an earlier
+    # occurrence of ensure_planned_arena_zones() ahead of the point-release
+    # means precedes() no longer sees the release come first, the same
+    # observable shape as if the release itself had been moved after it.
+    # Inserting rather than relocating keeps this mutant a single-line,
+    # whitespace-insensitive edit rather than a multi-line block move.
+    "the oneDNN point-release precedes the growth-path re-plan": (
+        "cache",
+        [("        arena_attempt             = true;\n",
+          "        arena_attempt             = true;\n"
+          "        (void) ensure_planned_arena_zones();\n")]),
 }
 
 
