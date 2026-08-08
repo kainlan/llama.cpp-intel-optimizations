@@ -2392,8 +2392,8 @@ class unified_cache {
     // Total arena size.
     size_t arena_total_size() const { return arena_size_; }
 
-    // (zone_alloc / zone_free / zone_reset are private — use
-    //  unified_cache_zone_alloc / unified_cache_zone_reset free functions)
+    // (zone_alloc / zone_free / zone_settle are private — use
+    //  unified_cache_zone_alloc / unified_cache_zone_reclaim free functions)
 
     // Check if a pointer belongs to the VRAM arena.
     bool vram_owns(const void * ptr) const;
@@ -2752,7 +2752,7 @@ class unified_cache {
     // split into a small ring of equal-sized regions. Call reserve_scratch_pool()
     // once at context creation with the max scratch size needed across all ops.
     // get_scratch()/return_scratch() are lock-free bump allocation/refcount
-    // within the CURRENT region — zero malloc, zero free. reset_scratch_pool()
+    // within the CURRENT region — zero malloc, zero free. scratch_pool_epoch_boundary()
     // (called once per graph_compute boundary) rewinds the current region when
     // its live count is back to zero, or rotates to the next region and leaves
     // a still-live one untouched; see scratch_pool_region below and the .cpp
@@ -2765,20 +2765,31 @@ class unified_cache {
     // Get a scratch buffer from the current region.  Returns nullptr if that
     // region is exhausted (same failure contract as before regions existed).
     // The returned pointer is valid until return_scratch() or until
-    // reset_scratch_pool() rotates its region away while still live (in which
-    // case the region -- and this pointer -- lingers rather than being reused,
-    // so the pointer stays valid; it simply won't be rewound until released).
+    // scratch_pool_epoch_boundary() rotates its region away while still live
+    // (in which case the region -- and this pointer -- lingers rather than
+    // being reused, so the pointer stays valid; it simply won't be rewound
+    // until released).
     void * get_scratch(size_t size);
 
     // Release a scratch buffer.  Decrements its region's live (epoch) count --
-    // this IS the reclaim signal reset_scratch_pool() reads at the next
-    // boundary; it does not itself move the bump offset.
+    // this IS the reclaim signal scratch_pool_epoch_boundary() reads at the
+    // next boundary; it does not itself move the bump offset.
     void return_scratch(void * ptr, size_t size);
 
     // Epoch boundary: rewind the current region if its live count is zero, or
     // rotate to the next ring region if not (never force-rewinding a live
     // region).  Call once between graph_compute invocations.
-    void reset_scratch_pool();
+    //
+    // Named for what it does, not "reset": every allocation from this pool
+    // already returns its own epoch count via return_scratch() above, so by
+    // the time this runs there is nothing left for it to force-reclaim
+    // (iiff Option C step 1, llama.cpp-2757) -- it settles the epoch
+    // boundary (rewind if clean, rotate if not, refuse if the whole ring is
+    // still live); it does not perform a scheduled bulk reset. See
+    // docs/backend/sycl-memory-design.md's "Epoch-refcounted transient
+    // zones" section and its "Step 4" subsection (llama.cpp-37ba) for why
+    // the epic's acceptance criterion is worded against this name.
+    void scratch_pool_epoch_boundary();
 
     // Per-epoch scratch pool capacity (one region's usable bytes -- the
     // sizing contract callers plan against, e.g.
@@ -2817,7 +2828,27 @@ class unified_cache {
 
     void * host_pool_alloc(size_t size, size_t alignment = 64);
     void   host_pool_free(void * ptr, size_t size);
-    void   host_zone_reset(host_zone_id zone);
+
+    // Split by semantics (iiff Phase 3 / llama.cpp-37ba), not by zone alone:
+    // both share the same internal implementation (host_zone_settle(), below
+    // the friend list) but the two callable names tell the truth about what
+    // each caller gets, instead of one name ("reset") that lied for two of
+    // three zones. Each asserts the zone it was written for; passing the
+    // wrong one is a caller bug, not a valid alternate path.
+    //
+    // SCRATCH/STAGING: every allocation in these zones already frees itself
+    // individually the instant its own mem_handle releases (iiff Option C
+    // step 2, llama.cpp-lbm3) -- there is nothing left here to reclaim by the
+    // time this runs. This is a liveness/audit checkpoint only: it refuses
+    // loudly if something is unexpectedly still live, and does nothing
+    // otherwise. It is NOT how these zones' memory gets freed.
+    void host_zone_boundary_check(host_zone_id zone);
+
+    // KV: not converted by this epic (context-lifetime, on-demand reclaim at
+    // context-switch time -- see arena_reserve()) -- this is a REAL bulk
+    // reclaim, refused only while the zone still holds a live allocation.
+    void host_zone_reclaim(host_zone_id zone);
+
     void   host_zone_free(host_zone_id zone, void * ptr);
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
@@ -2872,8 +2903,29 @@ class unified_cache {
     // TLSF recovers block size from the inline block_header.
     void zone_free(vram_zone_id zone, void * ptr);
 
-    // Reset a zone (returns all memory to the pool as a single free block).
-    void zone_reset(vram_zone_id zone);
+    // Shared implementation: refuse if the zone (or, for the shared
+    // KV+WEIGHT arena, KV specifically) still holds a live allocation,
+    // otherwise return all memory to the pool as a single free block. Every
+    // vram_zone_id goes through the identical refuse-or-reclaim logic here;
+    // what differs per zone is whether there is ever anything left to
+    // reclaim by the time a caller reaches it -- that distinction lives in
+    // the two callable names below, not in this function. Genuinely internal
+    // (never called directly outside this class); callers use
+    // zone_boundary_check() or zone_reclaim().
+    void zone_settle(vram_zone_id zone);
+
+    // ONEDNN (iiff Option C step 3, llama.cpp-67c2) and SCRATCH (the
+    // pool_leg compute-arena allocator, arena_alloc()/arena_free() --
+    // already individually zone_free()s every allocation, never needed
+    // conversion): liveness/audit checkpoint only. Nothing left to reclaim
+    // by the time this runs; refuses loudly if that invariant is ever wrong.
+    void zone_boundary_check(vram_zone_id zone);
+
+    // KV and RUNTIME: context/session-lifetime zones, out of this epic's
+    // scope (never in the Phase-0/Phase-1 audit inventory) -- a REAL bulk
+    // reclaim, used on-demand at context-switch time (arena_reserve()) and
+    // capacity pressure (the KV buffer-type allocation fallback).
+    void zone_reclaim(vram_zone_id zone);
 
     // Friends: internal implementation functions that need zone access.
     // Consumer code must use unified_cache_zone_alloc / unified_allocate instead.
@@ -2882,7 +2934,8 @@ class unified_cache {
     friend void * unified_cache_kv_arena_alloc(int device_id, size_t size);
     friend void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align);
     friend void   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
-    friend void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
+    friend void   unified_cache_zone_reclaim(int device_id, vram_zone_id zone);
+    friend void   unified_cache_zone_boundary_check(int device_id, vram_zone_id zone);
     friend void * device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
 
     // Evict lowest-scoring entry to make room for new_size bytes
@@ -3116,13 +3169,13 @@ class unified_cache {
     // equal-sized regions. get_scratch() bump-allocates within the CURRENT
     // region and increments its live count; return_scratch() decrements it --
     // the epoch refcount that replaces the pool's former unconditional-reset
-    // "stack discipline" no-op. reset_scratch_pool() rewinds the current
-    // region to offset 0 once its live count is back to zero (the same
-    // instant the old unconditional reset used to fire); if the region is
-    // still live at that boundary it is left untouched -- any pointer handed
-    // out from it must stay valid -- and the ring rotates to the next region
-    // instead. See unified_cache::reset_scratch_pool() for the full policy,
-    // including the "every region still live" refusal.
+    // "stack discipline" no-op. scratch_pool_epoch_boundary() rewinds the
+    // current region to offset 0 once its live count is back to zero (the
+    // same instant the old unconditional reset used to fire); if the region
+    // is still live at that boundary it is left untouched -- any pointer
+    // handed out from it must stay valid -- and the ring rotates to the next
+    // region instead. See unified_cache::scratch_pool_epoch_boundary() for
+    // the full policy, including the "every region still live" refusal.
     struct scratch_pool_region {
         std::atomic<size_t>  off{ 0 };   // Bump offset within this region
         std::atomic<int64_t> live{ 0 };  // Outstanding get_scratch() allocations (the epoch refcount)
@@ -3141,9 +3194,9 @@ class unified_cache {
     // kScratchPoolRegionCount, not the other way around -- see the sizing
     // comment at the top of reserve_scratch_pool().
     size_t                                                   scratch_pool_region_bytes_ = 0;
-    // Index of the region get_scratch()/reset_scratch_pool() currently
-    // target. Atomic even though reset_scratch_pool() is documented as never
-    // concurrent with in-graph get_scratch()/return_scratch() (the same
+    // Index of the region get_scratch()/scratch_pool_epoch_boundary()
+    // currently target. Atomic even though scratch_pool_epoch_boundary() is
+    // documented as never concurrent with in-graph get_scratch()/return_scratch() (the same
     // assumption the old single scratch_pool_off_ relied on) -- relaxed
     // ordering costs nothing on the fast path and removes the UB if that
     // assumption is ever violated by a path CLAUDE.md documents as
@@ -3580,7 +3633,7 @@ struct alloc_handle {
     // llama.cpp-lbm3). Stamped from the zone's current epoch counter at
     // allocation time; only meaningful for host_zone==SCRATCH|STAGING (0
     // elsewhere). Diagnostic only -- see g_host_zone_epoch and
-    // host_zone_reset() in unified-cache.cpp for how it is bumped and read.
+    // host_zone_settle() in unified-cache.cpp for how it is bumped and read.
     uint64_t epoch_id = 0;
 
     // Zone routing fields — set by unified_alloc when the allocation is routed
@@ -4279,7 +4332,10 @@ bool unified_cache_reserve_scratch_pool(int device_id, size_t pool_bytes);
 // Get/return scratch from the pool.
 void * unified_cache_get_scratch(int device_id, size_t size);
 void   unified_cache_return_scratch(int device_id, void * ptr, size_t size);
-void   unified_cache_reset_scratch_pool(int device_id);
+
+// Epoch boundary for the pool -- liveness checkpoint, not a scheduled reset;
+// see unified_cache::scratch_pool_epoch_boundary()'s doc comment.
+void unified_cache_scratch_pool_epoch_boundary(int device_id);
 
 // MoE graph Q8_1 scratch demand derived from the selected MMVQ layout and
 // activation shape.  This is a planning contract: graph callers allocate one
@@ -4327,7 +4383,13 @@ void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
 
 [[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]] void *
      unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
-void unified_cache_host_zone_reset(host_zone_id zone);
+
+// Split by semantics, mirroring unified_cache::host_zone_boundary_check() /
+// host_zone_reclaim() — see those doc comments. SCRATCH/STAGING (liveness
+// checkpoint, real reclaim already happened per-allocation) vs. KV (real
+// bulk reclaim, out of this epic's scope).
+void unified_cache_host_zone_boundary_check(host_zone_id zone);
+void unified_cache_host_zone_reclaim(host_zone_id zone);
 
 // Sub-allocate from a VRAM zone (ONEDNN, RUNTIME, KV scratchpads).
 // Returns nullptr if the zone is full or the arena is inactive.
@@ -4336,8 +4398,17 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
 // Free a sub-allocation from a VRAM zone (TLSF reclaim).
 void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 
-// Reset a VRAM zone (TLSF coalescing reset — all sub-allocations become free).
-void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
+// Real bulk reclaim of a VRAM zone (TLSF coalescing — all sub-allocations
+// become free), used on-demand for KV/RUNTIME (out of this epic's scope).
+// See unified_cache::zone_reclaim()'s doc comment.
+void unified_cache_zone_reclaim(int device_id, vram_zone_id zone);
+
+// Liveness/audit checkpoint for ONEDNN/SCRATCH -- see
+// unified_cache::zone_boundary_check()'s doc comment. Reserved for tests and
+// any future external caller that needs to check a zone without asserting
+// which one in advance; production code today calls the member directly
+// from inside reserve_onednn_scratch() / arena_reset().
+void   unified_cache_zone_boundary_check(int device_id, vram_zone_id zone);
 void   unified_cache_reset_model_weight_entries(int                 device_id,
                                                 weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
 // Model lifetime fan-out over every device's cache (llama.cpp-0qlw).

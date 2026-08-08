@@ -6424,12 +6424,15 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
     req.intent.constraints.use_pinned_pool       = true;
     const bool pointer_table_payload             = cohort_id && std::strcmp(cohort_id, "moe_transient_ptr_table") == 0;
     // Command graphs capture the host source pointer for the replayed H2D copy.
-    // Reset-scoped SCRATCH/STAGING zone slices would stay live across the next
-    // host_zone_reset(), so graph-recorded payloads must use standalone
-    // unified-cache-owned host USM bases retained by the graph handle vector.
-    // Sequence graphlet pointer-table prewarm runs just before recording; keep
-    // those tiny ABI payloads standalone too so fallback/record-failure cleanup
-    // cannot leave reset-zone `moe_transient_ptr_table` staging allocations live.
+    // SCRATCH/STAGING zone slices are individually freed the instant their
+    // mem_handle releases (iiff Option C step 2), so a graph-recorded pointer
+    // whose backing handle drops before replay would dangle -- graph-recorded
+    // payloads must use standalone unified-cache-owned host USM bases
+    // retained by the graph handle vector instead. Sequence graphlet
+    // pointer-table prewarm runs just before recording; keep those tiny ABI
+    // payloads standalone too so fallback/record-failure cleanup cannot leave
+    // a `moe_transient_ptr_table` staging allocation dangling after its own
+    // release.
     req.intent.constraints.require_host_usm_base = ggml_sycl_graph_recording_active() || pointer_table_payload;
 
     ggml_sycl::alloc_handle payload_stage_owner{};
@@ -30877,12 +30880,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             }
             if (is_kv_buft) {
                 // KV allocation: use zone_available which accounts for weight usage in shared zone.
-                // Try a KV reset only when the allocator can prove it is safe. In
+                // Try a KV reclaim only when the allocator can prove it is safe. In
                 // single-chunk arenas KV and WEIGHT share one TLSF allocator, so a
-                // reset with live weight handles is refused by unified_cache.
+                // reclaim with live weight handles is refused by unified_cache. KV
+                // is out of iiff's scope -- a genuine, still load-bearing on-demand
+                // reclaim, not a liveness checkpoint (llama.cpp-37ba; see
+                // docs/backend/sycl-memory-design.md's "Step 4" subsection).
                 size_t kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
                 if (size > kv_avail) {
-                    ggml_sycl::unified_cache_zone_reset(buft_ctx->device, ggml_sycl::vram_zone_id::KV);
+                    ggml_sycl::unified_cache_zone_reclaim(buft_ctx->device, ggml_sycl::vram_zone_id::KV);
                     kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
                 }
                 if (size <= kv_avail) {
@@ -83533,12 +83539,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_sycl_cpu_staging_drain();
 
     // A0f / skgik: drain any in-flight CpuExpertPool futures before
-    // resetting STAGING/SCRATCH zones.  The TBB workers in the pool
-    // dereference act_host / output_host pointers that alias into the
-    // STAGING zone (fusion.act_host, tl_first_out, tl_down_out, etc.).
-    // If zone_reset fires while a worker is still running, the TLSF
-    // bump resets the backing DRM page and the worker's next
-    // vbroadcastss / vfmadd231ps faults in an unmapped gap — the crash
+    // checking the STAGING/SCRATCH zone boundary below.  The TBB workers in
+    // the pool dereference act_host / output_host pointers that alias into
+    // the STAGING zone (fusion.act_host, tl_first_out, tl_down_out, etc.).
+    // If a worker is still running when its allocation's owning mem_handle
+    // releases (the individual free that actually reclaims the memory,
+    // iiff Option C step 2), the TLSF free resets the backing DRM page and
+    // the worker's next vbroadcastss / vfmadd231ps faults in an unmapped gap — the crash
     // signature documented in llama.cpp-skgik.  A0d's staging drain
     // only covers the async host_task chain; A0e's future drain only
     // fires under VRAM pressure.  This drain closes the graph-boundary
@@ -83563,32 +83570,38 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         g_pending_cpu_pipeline.future = {};
     }
 
-    // Release cached staging buffer leases BEFORE zone reset.  The staging
-    // buffers are sub-allocated from the host STAGING TLSF zone; zone_reset
-    // recycles the physical memory, leaving any surviving entry.ptr dangling.
+    // Release cached staging buffer leases BEFORE the zone boundary check
+    // below.  The staging buffers are sub-allocated from the host STAGING
+    // TLSF zone; releasing here is the individual free that actually
+    // reclaims the physical memory (iiff Option C step 2) -- a surviving
+    // entry.ptr past this point would dangle.
     ggml_sycl_cpu_staging_release();
     // Drain all pending BCS DMA events in the global staging buffer pool,
-    // then release the pool-owned idle handles before STAGING zone reset.
-    // BCS H2D copies for MoE expert uploads are submitted asynchronously;
-    // if host_zone_reset(STAGING) fires before the BCS engine finishes,
+    // then release the pool-owned idle handles before the STAGING zone
+    // boundary check.  BCS H2D copies for MoE expert uploads are submitted
+    // asynchronously; if this release fires before the BCS engine finishes,
     // the DRM unmaps the page under the in-flight DMA -> FaultLevel=4.
     ggml_sycl_staging_pool().release_all_idle("graph-boundary-host-zone-reset");
-    // Drop cached non-device tensor staging before recycling STAGING.  These
-    // cache entries own reset-zone pointers; keeping them across zone_reset()
-    // leaves later graph phases reading recycled/corrupted host-USM memory.
+    // Drop cached non-device tensor staging before the STAGING zone boundary
+    // check.  These cache entries own pointers into that zone; keeping them
+    // past their individual free leaves later graph phases reading
+    // recycled/corrupted host-USM memory.
     ggml_sycl_clear_staging_cache();
     sycl_ctx->release_host_staging_buffers();
     reset_managed_host_pinned_buffers_before_host_zone_reset();
 
     // Generic mem_copy_async staging buffers are retained on completion events.
     // The queue drains above make those events eligible; drain them here so
-    // host-zone reset never reclaims a live mem_handle owner.
+    // the host-zone boundary check below never observes (and refuses on) a
+    // handle that is only "live" because its release event hasn't landed yet.
     ggml_sycl::drain_retained_handles(true);
 
-    // Reset the scratch pool bump allocator so scratch allocations from the
-    // previous graph are returned to the pool.
-    ggml_sycl::unified_cache_reset_scratch_pool(sycl_ctx->device);
-    // host_zone_reset(STAGING)/(SCRATCH) no longer bulk-reclaims these zones
+    // Settle the scratch pool bump allocator's epoch boundary -- rewinds if
+    // every scratch allocation from the previous graph was already returned,
+    // rotates (never force-reclaims) if one is still outstanding.
+    ggml_sycl::unified_cache_scratch_pool_epoch_boundary(sycl_ctx->device);
+    // host_zone_boundary_check(STAGING)/(SCRATCH) (named host_zone_reset()
+    // before llama.cpp-37ba's rename) no longer bulk-reclaims these zones
     // (iiff Option C step 2, llama.cpp-lbm3): every STAGING/SCRATCH
     // allocation now individually returns its bytes to the owning TLSF zone
     // the instant its own mem_handle releases, so by the time these calls
@@ -83596,9 +83609,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // calls still do is the graph-boundary liveness check -- refusing
     // loudly (never force-reclaiming) if the drain above left something
     // unexpectedly live -- exactly the same policy as before, just no
-    // longer backed by a scheduled bulk reset.
-    ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
-    ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::SCRATCH);
+    // longer backed by a scheduled bulk reset -- renamed to say so
+    // (llama.cpp-37ba).
+    ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::STAGING);
+    ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::SCRATCH);
 
     // Pre-attention expert prefetch: submit DMA hints for all MoE layers
     // BEFORE any compute begins. The DMA engine processes hints during

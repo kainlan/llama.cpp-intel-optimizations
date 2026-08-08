@@ -71,7 +71,7 @@ void CpuExpertPool::init(int n_threads, size_t max_experts, size_t act_dim, size
         // in shutdown()), and EXPERT_STAGING is deliberately force-routed to
         // the per-graph-swept host SCRATCH zone to keep genuinely ephemeral
         // leaks visible. role=COMPUTE + category=EXPERT_CACHE instead routes
-        // to the WEIGHT host zone (never swept by host_zone_reset(), freed
+        // to the WEIGHT host zone (never swept by host_zone_settle(), freed
         // individually via host_zone_free()), matching the existing
         // g_retained_scratch precedent in cpu-dispatch.cpp.
         req.intent         = { alloc_role::COMPUTE, runtime_category::EXPERT_CACHE, "cpu_expert_ring", c };
