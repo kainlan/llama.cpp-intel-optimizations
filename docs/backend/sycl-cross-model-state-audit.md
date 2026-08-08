@@ -624,3 +624,136 @@ the reset wholesale.
 This test needs a real SYCL device (it exercises the real load boundary,
 which calls into `ggml_sycl_info()`) — it was not run by this pass per the
 "no GPU work" constraint. See the report to `main` for what to run.
+
+---
+
+# Merge-readiness cross-model outcomes (plan Task 18)
+
+Two correctness investigations that this audit's subject matter — state that
+outlives one model inside one process — produced during merge readiness. Both
+are recorded with their **actual** disposition. Neither is a fix.
+
+## gemma3n cross-model wrong answers (`llama.cpp-8t4s`) — closed NON-BLOCKING, not fixed
+
+⚠️ **The underlying defect is ALIVE and LATENT at HEAD.** It is fenced by a
+mutation-proven guard, and the trigger that historically evaded that guard is no
+longer active. That is a materially different claim from "fixed", and the
+difference is the whole reason this ticket carries a standing reopen rule.
+
+### What was observed, and where
+
+All on the B70, `ONEAPI_DEVICE_SELECTOR=level_zero:0`:
+
+| build | scenario | result |
+|---|---|---|
+| `4407acc83` (pre-81gx-fix) | 131-arch sweep | gemma3n **FAIL** `1.14e+00` |
+| `d293bf2b3` (post-81gx-fix) | 131-arch sweep | gemma3n **FAIL** `1.14e+00` — bit-identical, all 413 rows matching |
+| `d293bf2b3` | 2-arch (llama then gemma3n) | gemma3n **FAIL** `1.03e+00` |
+| `1107a53b0` | full 130-arch sweep | gemma3n **OK** `7.57e-07`, 0 FAIL |
+| `772798e91` (HEAD) | 2-arch, once, under `GPU.lock` | llama OK `8.72e-11` dense / `8.73e-11` MoE; gemma3n **OK** `1.75e-06` |
+| `d293bf2b3` **rebuilt** in `/Apps/llama.cpp-sycl-history` | 2-arch, once | llama OK `2.95e-11`; gemma3n **OK** `6.23e-06` |
+
+The last row is the decisive one: **the recorded failure does not reproduce at
+its own SHA.** The ticket had pre-registered what that would mean before running
+it — "passes ⇒ the failure is nondeterministic… reframe around an intermittent
+defect" — so the conclusion is the pre-registered branch, not a post-hoc
+rationalisation. One honest caveat travels with it: the rebuild sits at a
+different absolute path, so its binary layout differs from the original, and the
+original build directory is gone. A bit-identical rerun is impossible. That is
+not a flaw in the experiment; it is the layout theory's own prediction.
+
+### The mechanism, and why "latent" is the right word
+
+The `llama.cpp-81gx` guard is:
+
+```cpp
+if (operand->view_src != nullptr && !ggml_sycl_tensor_is_weight(operand))
+```
+
+Three facts, each measured rather than argued:
+
+1. **The guard is load-bearing, proven by mutation.** Forcing
+   `ggml_sycl_fusion_operand_view_offset_safe` to `return true` flips
+   `-a gemma3n` from `OK (2.17e-06)` to `FAIL (7.04e-01)` in the *same build*.
+2. **The defect it fences is alive at HEAD.** With the guard bypassed on a fresh
+   build at `606e252b0`, gemma3n fails deterministically at `1.17e+00` in
+   isolation — the same magnitude class as the historical `1.03`/`1.14`
+   observations.
+3. **The guard currently classifies correctly under cross-model state.** In the
+   instrumented healthy 2-arch run at HEAD, every gemma3n unsafe view
+   (corrected-N, `view_offs=16384`, 44 occurrences) logs `is_weight=0` and is
+   refused.
+
+Together those give a coherent account of the history: **guard evasion.**
+`is_weight` flipping to 1 for gemma3n's graph-internal views once another model's
+weights were resident skips the `view_offs` check entirely and reaches the defect
+fact 2 proves is still there, at the observed magnitude. The intermittency lived
+in the *trigger*, not in the kernel — once triggered, the defect is
+deterministic. The trigger is plausibly closed by the W1 weight-usage/metadata/
+teardown hardening (this document's own `g_sycl_weight_usages` fix among them),
+but attribution to a specific commit is impossible now that the triggering state
+cannot be reconstructed.
+
+### Standing rules
+
+- **Never weaken the 81gx guard.** It is the only thing between a live defect and
+  wrong answers.
+- **STANDING REOPEN RULE:** any future gemma3n `FAIL` in any sweep reopens
+  `llama.cpp-8t4s` immediately, and **the failing build directory must be
+  preserved before anything else is run.** The last investigation was crippled
+  precisely because the original binary was gone.
+- Structural insurance is the A→B→A two-model test family in this document's
+  scope plus `llama.cpp-4pwk` — a regression assertion that `is_weight` stays 0
+  for graph-internal views under multi-model load.
+- Recommended follow-up, filed at `qcql`'s closure: reshape the Case C unit test
+  to gemma3n's exact view geometry (3D view, accumulated offset into a
+  graph-internal tensor) so a unit test can actually go RED on this defect
+  instead of relying on a 130-arch sweep to notice.
+
+## Q4_0 coalesced DMMV wrong answers (`llama.cpp-szv8`) — UNRESOLVED
+
+**Status: open / in_progress.** This is a pre-existing claim carried into merge
+readiness, and it is recorded here as unresolved. It does not block `f813` per
+the dependency graph, and it must not be reported as passing.
+
+The failure is real, deterministic and isolated: `test-dmmv-q4-0-coalesced`
+reports `errors=55/116/229` with `max_rel 0.165/0.176/0.344` across three shapes,
+bit-identical between runs and identical single-device (`level_zero:0`) and
+dual-device (`level_zero:0,1`).
+
+What the investigation has settled, and it is mostly about the *test*:
+
+- **The slice-scale-base hypothesis is refuted.** The test fails on unsliced
+  full-tensor dispatches, where the slice-vs-total distinction vanishes. (The
+  underlying concern remains valid and latent for genuinely sliced dispatches.)
+- **A real producer defect was found and fixed, and it was not what these runs
+  hit.** `reorder_q4_0_aos_to_coalesced_kernel` derived its row stride from
+  `ggml_sycl_q8_0_coalesced_row_quants_bytes()` — 32 quant bytes per block where
+  Q4_0 has 16 — so rows landed at double offset and it wrote past a
+  contract-sized allocation (modelled: 8448 out-of-bounds writes). Q4_0-only
+  copy-paste; the Q8_0 and MXFP4 siblings were correct. Fixed in `9ec521735`.
+- **An earlier "device wrote wrong bytes" finding is formally RETRACTED.** The
+  `Coalesced layout check: FAILED (errors=11, first_bad=4)` evidence compared the
+  tensor's own SoA storage against a coalesced expectation — instrumentation
+  later printed `source=tensor-storage-fallback` and `NOT RUN` on all three
+  shapes. Two sub-lessons worth keeping: `errors=11` was the loop's `break` cap,
+  not a measurement (a floor read as a bounded subset), and the test **was not
+  exercising the kernel its name claims** — the
+  a-test-can-run-fully-and-miss-its-target class.
+- **Attributability is now achieved and the numbers did not move.** After
+  `szv8c` (`7be63714e`) rewired the test through the real staging bracket, the
+  run reports `source=layout_ptr`, a distinct coalesced pointer, and
+  `Coalesced layout check: PASSED` — and then fails *near-bit-identically* to the
+  pre-fix run (`errors=55 max_rel=0.165479` vs `55 / 0.165480`;
+  `116 / 0.176321` vs `116 / 0.176323`).
+
+**That coincidence is the live, unexplained fact**, and it is stated before any
+theory: two configurations that allegedly executed different kernels over
+different buffers produced the same arithmetic error to six digits. Either both
+runs always executed the same arithmetic, or the error originates in a stage both
+share — the src1 conversion, the activation quantization, or the reference model
+itself. The recommended next step is to dump the post-conversion `src1` values
+the kernel actually receives for one failing row and hand-compute the dot against
+three candidate roundings (f32, dfloat/RNE, q8_1); the mismatch pattern
+identifies the diverging stage in one shot. An error density of 55 of 64 rows at
+up to 16% is categorical, not fp16 accumulation noise.
