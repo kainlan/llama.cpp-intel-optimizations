@@ -302,17 +302,17 @@ these steps convert them from smallest/safest to largest/most load-bearing:
    real epoch-tracked handles so the existing `zone_reset(vram_zone_id::ONEDNN)`
    call sites in the scratch-reservation path stop being the *sole* reclaim
    mechanism for their own previous allocation.
-4. **Delete the now-dead reset functions**, keeping only the boundary
-   asserts — this is `llama.cpp-37ba`'s original payload (the epic's Phase 3:
-   "keep the check, lose the reclamation") plus the epic's acceptance
-   criterion 1 ("no `zone_reset` / `host_zone_reset` / `reset_scratch_pool`
-   call remains"). It is sequenced last on purpose: a reset call site that
-   still exists but has become a provable no-op (its epoch counter always 0
-   at that boundary, verified by step 1–3's hardware batteries) is the
-   evidence that deleting it changes nothing — the same "delete the drain
-   steps first, re-verify empty, then delete the reset itself" discipline
-   the epic already requires, just applied to the reset call sites
-   themselves rather than their upstream drains.
+4. **Reconcile the reset call sites** (`llama.cpp-37ba`) — originally planned
+   as literal deletion of the reset functions, keeping only the boundary
+   asserts. Executed instead as a per-symbol audit once steps 1–3 landed: see
+   "Step 4: reconciling the reset call sites" below for what that audit
+   found. Summary, because it changes what "done" means for this step: every
+   remaining call site is *already* a provable no-op for the zones this epic
+   targets (steps 1–3's own conversions made the reclaim happen elsewhere, so
+   the call is now the assert Phase 3 asks for, not a scheduled reclaim) —
+   there is nothing left to delete without also deleting the observability
+   Phase 3 requires keeping. The zones with a call site that is *not* a
+   no-op (KV, RUNTIME) were never in this epic's audited scope to begin with.
 
 See [`docs/design/sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md)
 for the enforceable allocator/pointer-resolution contract this mechanism
@@ -647,6 +647,174 @@ drain is load-bearing for it specifically, and remains so regardless of what
 happens to the zone-level reset below. **Not proven redundant — confirmed,
 not merely re-affirmed as unresolved.** Left in place; noted here for the
 37ba finale rather than acted on in this step, per that ticket's scope.
+
+### Step 4: reconciling the reset call sites (`llama.cpp-37ba`)
+
+With C1, C2, and C3 landed, this step re-derives — per-symbol, from source,
+not from the epic's original (pre-Option-C) framing — what is actually left
+to remove. **The headline finding: nothing is literally deletable.** Every
+remaining `zone_reset()` / `host_zone_reset()` / `reset_scratch_pool()` call
+site is either (a) already a pure liveness/audit checkpoint that cannot
+force-reclaim a live handle, because C1/C2/C3 already made the real reclaim
+happen elsewhere, or (b) a genuinely load-bearing on-demand reclaim for a
+zone the epic never targeted. This is not a failure to execute step 4 — it is
+step 4's answer, and it is the *better* outcome than blanket removal would
+have been: deleting a call site destroys the audit's ability to notice a
+future regression at that boundary, and CLAUDE.md's ownership rules are
+explicit that "retiring the reset must not retire the observability."
+
+**Per-symbol disposition:**
+
+- **`unified_cache_reset_scratch_pool(device_id)`** (C1, VRAM scratch bump
+  pool, `scratch_pool_*`). One production call site
+  (`ggml-sycl.cpp`, graph boundary). Internally already rewind-on-zero /
+  rotate-on-live / refuse-on-exhaustion (C1) — the bulk-reclaim semantics are
+  gone from the *function*, not just hidden behind a guard. `get_scratch()`/
+  `return_scratch()` still have zero other production callers (re-confirmed
+  by grep), so in every measured production workload this call observes an
+  empty pool and does nothing observable. **Disposition: keep the call and
+  the name.** The function already IS the assert-only boundary check Phase 3
+  asks for; a rename would be purely cosmetic and does not change what
+  Phase-0's audit measures.
+- **`unified_cache_host_zone_reset(zone)`** (C2, host SCRATCH/STAGING; KV
+  untouched). Four production call sites: two at the graph boundary
+  (`ggml-sycl.cpp`, STAGING and SCRATCH) and two inside `arena_reserve()`
+  (`unified-cache.cpp`, context-switch: KV and STAGING). The function's own
+  `epoch_tracked` branch (`zone == SCRATCH || zone == STAGING`) already
+  returns *before* reaching `host_arena_->zone_reset(zone)` — the real bulk
+  call survives only for `!epoch_tracked` zones, i.e. KV. **Disposition:
+  keep the call, the function, and the name**, for the same reason as above,
+  with the added fact that this one symbol legitimately serves two different
+  callers with two different needs (STAGING/SCRATCH: liveness check; KV:
+  real reclaim) — splitting it into two names was considered and rejected
+  (see "Naming decision" below).
+- **`zone_reset(vram_zone_id::ONEDNN)`** (C3, internal to
+  `reserve_onednn_scratch()`). One call site, not externally wrapped — see
+  the C3 subsection above. **Disposition: keep**, already fully documented
+  there.
+
+**Out of the epic's scope, and always was — KV and RUNTIME.** The Phase-0/
+Phase-1 audit inventory that drove C1–C3 covers exactly eight sites
+(`device-zone-reset/{SCRATCH,ONEDNN}`, `host-zone-reset/{SCRATCH,STAGING}`,
+`scratch-pool-reset/bump`, `weight-reclaim/{load-boundary,mid-load-replan,
+model-teardown}` — matching the counts in every Phase-0 capture cited in the
+C1–C3 subsections). No `device-zone-reset/KV`, `/RUNTIME`, `/WEIGHT`, or
+`host-zone-reset/KV` row appears anywhere in that inventory: these zones were
+never measured, never audited, and never part of C1/C2/C3's mandate.
+Grep-verified they are also still genuinely load-bearing, not merely
+unmeasured:
+
+- **VRAM KV** (`zone_reset(vram_zone_id::KV)`): called from
+  `ggml-sycl.cpp`'s KV-buffer-type allocation fallback (device VRAM KV
+  request exceeds `zone_available(KV)` → try a reset, then re-check) and from
+  `arena_reserve()`'s context-switch path ("same model, new context — reset
+  ephemeral zones so KV/runtime space from the previous context is
+  reclaimable"). Both are on-demand reclaim triggered by an actual capacity
+  need, not a scheduled sweep, and `zone_reset()`'s own shared-KV+WEIGHT-arena
+  refusal guard (unaffected by C1–C3) still protects live weight entries.
+- **VRAM RUNTIME** (`zone_reset(vram_zone_id::RUNTIME)`): same
+  `arena_reserve()` context-switch call. RUNTIME allocations (ggml compute
+  buffers) route through `unified_alloc()` with `prefer_vram_zone = RUNTIME`
+  (`ggml-sycl.cpp`, `unified-cache.cpp`), which — unlike the internal
+  `zone_alloc()`/`zone_free()` pairs C1/C3 replaced — registers into
+  `g_runtime_alloc_registry`. So this zone's live-check is not
+  vacuous-by-construction the way ONEDNN's was: it is a real, context-lifetime
+  reclaim need, structurally the same shape as KV.
+- **Host KV** (`host_zone_reset(host_zone_id::KV)`): `!epoch_tracked`,
+  reaches the real `host_arena_->zone_reset(zone)` unconditionally when
+  clean. Called from `arena_reserve()`'s context-switch path alongside
+  host STAGING.
+- **WEIGHT** (both VRAM and host): hard-refused unconditionally
+  (`GGML_ASSERT(zone != host_zone_id::WEIGHT ...)` and the VRAM
+  `zone_reset()`'s own `zone == vram_zone_id::WEIGHT` early return, both
+  predating this epic). Never actually resets; already in the epic's
+  explicit KEEP list ("every `refusing ...` guard").
+
+**Recommendation: KV, RUNTIME, and WEIGHT are out of `llama.cpp-iiff`'s scope.**
+They are context/session-lifetime zones with a genuine on-demand reclaim
+need at context-switch or capacity-pressure boundaries, not reset-only zones
+whose sole reclaim path was a scheduled sweep — the defect class this epic
+exists to fix. Converting them (if ever warranted) is a different, future
+ticket, not a step of this one.
+
+**A fourth, previously-unenumerated population — found, and already
+compliant.** `unified_cache::arena_alloc()` / `arena_free()` / `arena_reset()`
+(`unified-cache.cpp`) implement the "pool_leg" per-op compute scratch
+allocator — a *different* mechanism from C1's `scratch_pool_*` bump pool,
+sharing only the English word "scratch." Two modes:
+
+- **`arena_active()` (the default, tested, documented configuration):**
+  `arena_alloc()`/`arena_free()`/`arena_reset()` delegate directly to
+  `zone_alloc(vram_zone_id::SCRATCH, ...)` / `zone_free(vram_zone_id::SCRATCH,
+  ptr)` / `zone_reset(vram_zone_id::SCRATCH)` — i.e. every pool_leg
+  allocation already gets a real, individual TLSF free the moment its caller
+  releases it (`arena_free()`'s arena-active branch calls `zone_free()`
+  unconditionally; there is no watermark/no-op path in this mode). The
+  `zone_reset(vram_zone_id::SCRATCH)` call in `arena_reset()` is therefore
+  *already*, structurally, the same "checkpoint over a zone that individual
+  frees already emptied" pattern C1–C3 established elsewhere — it was never
+  touched by this epic and did not need to be: it arrived at the target state
+  independently, because pool_leg was built on `zone_alloc`/`zone_free` from
+  the start rather than a raw bump offset.
+- **`arena_active() == false` (fallback, non-default):** a raw atomic bump
+  allocator (`compute_arena_off_`) with a genuine reset-only defect —
+  `arena_free()`'s non-arena branch does watermark-only reclaim (only the
+  block currently at the bump-pointer top is reclaimed; the code's own
+  comment states "Non-watermark free: no-op (space reclaimed at
+  arena_reset)"). This is architecturally the same defect class C1 fixed for
+  `scratch_pool_*`, but it is a **different, unaudited, unconverted
+  population** — never measured by Phase-0 (arena-active is the default, so
+  none of the cited captures exercised this fallback), never in C1's scope
+  (C1 explicitly targeted `scratch_pool_*`, not `compute_arena_`'s own
+  allocator), and not touched here. **Flagged as a new finding for a future
+  ticket**, not fixed as part of 37ba: fixing it would mean converting a
+  fourth, previously-unknown population under a ticket scoped to closing out
+  three known ones, and the non-arena-active configuration is not the
+  production path this fork ships.
+
+**Naming decision: keep the existing names.** Splitting `host_zone_reset`
+into a genuinely-liveness-check-only wrapper (for STAGING/SCRATCH) and a
+genuinely-reclaiming one (for KV) — or doing the equivalent for
+`reset_scratch_pool` — was considered. Rejected for this step: the runtime
+*behavior* is already correct and already matches Phase 3's target (assert,
+never force-reclaim) for every C1/C2/C3-converted zone; a rename changes only
+the symbol's name, not what it does, and would touch graph-boundary
+production code plus three test files that lock exact call-site text
+(`tests/test-sycl-moe-sequence-graphlet-policy.cpp`,
+`tests/test-sycl-fattn-packed-k-lifecycle-source.py`,
+`tests/test-sycl-zone-reset-live-refusal.cpp`) for a purely cosmetic gain,
+with no hardware verification available to the implementer to de-risk it (per
+this fork's workflow, GPU verification is lead-only). This doc's per-symbol
+disposition above, plus the strengthened source-contract check pinning
+`host_zone_reset`'s `epoch_tracked` early-return
+(`tests/test-sycl-zone-reset-audit-source.py`, "SCRATCH/STAGING return before
+host_zone_reset reaches the real bulk reset" — verified as a positive control
+against `76ede5da2^`, the commit immediately before C2), is offered as the
+"truthful name" alternative the ticket's phrasing explicitly allows ("decide
+whether the function stays as the liveness/audit boundary with a truthful
+name, or the boundary check gets its own name and the old symbol dies").
+
+**Acceptance criterion 1, reconciled — PROPOSED, pending owner/lead sign-off.**
+The epic's literal text ("No `zone_reset` / `host_zone_reset` /
+`reset_scratch_pool` call remains in the SYCL backend") was written under the
+pre-Option-C plan (blanket removal) and is now unsatisfiable *and undesirable*
+under Option C: KV and RUNTIME's calls are genuinely load-bearing, and
+deleting the SCRATCH/STAGING/ONEDNN/scratch-pool call sites would delete the
+regression-catching observability CLAUDE.md and this epic both require
+preserving. Proposed replacement, matching what C1–C3 actually built:
+
+> 1. No `zone_reset` / `host_zone_reset` / `reset_scratch_pool` call
+>    force-reclaims memory that still has a live handle. Every remaining call
+>    is either (a) a liveness/audit boundary check over a zone whose real
+>    reclaim already happened via individual per-allocation release before the
+>    call is reached (VRAM scratch bump pool, host SCRATCH/STAGING, oneDNN
+>    scratch — C1/C2/C3), or (b) an explicitly out-of-epic-scope, still
+>    load-bearing on-demand reclaim for a context/session-lifetime zone (KV,
+>    RUNTIME) that Phase-0/Phase-1's audit inventory never targeted.
+
+This wording is a proposal recorded here for review, not an edit to the
+epic's tracker record — `llama.cpp-iiff`'s acceptance criteria are the
+owner/lead's to change.
 
 ## Lifecycle identity and async lease boundary
 
