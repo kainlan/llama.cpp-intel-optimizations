@@ -6,7 +6,10 @@
 #include "mem-ops.hpp"
 #include "sycl-kernel-profiler.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
+#include <vector>
 
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 
@@ -579,6 +582,18 @@ static inline std::enable_if_t<utils::is_arithmetic_v<TIn>() && utils::is_arithm
     *reinterpret_cast<TOut *>(dst) = dst_val;
 }
 
+// SET_ROWS' index contract is that every src1 entry names a real destination row;
+// the CPU backend enforces it with GGML_ASSERT(i1 >= 0 && i1 < ne1)
+// (ggml/src/ggml-cpu/ops.cpp:5073) and aborts. A device kernel can neither abort
+// nor report, so an out-of-range index is contained rather than diagnosed -- the
+// element is dropped instead of written through a pointer outside dst, the same
+// treatment ADD_ID gives a bad expert id (add-id.cpp:179). Containment is not
+// propagation: nothing downstream learns that a write was skipped, which is why
+// GGML_SYCL_SET_ROWS_VALIDATE=1 exists to make the drops visible.
+static inline bool set_rows_dst_row_valid(int64_t dst_row, int64_t ne1) {
+    return dst_row >= 0 && dst_row < ne1;
+}
+
 template <typename TIdx, typename blockType, int qk, cpy_kernel_t cpyblck>
 static sycl::event set_rows_sycl_q(const char * __restrict__ src0_d,
                                    const TIdx * __restrict__ src1_d,
@@ -602,7 +617,8 @@ static sycl::event set_rows_sycl_q(const char * __restrict__ src0_d,
                                    const size_t  nb11,
                                    const size_t  nb12,
                                    const size_t  nb13,
-                                   // strides for dst
+                                   // dst row bound and strides
+                                   const int64_t ne1,
                                    const size_t  nb1,
                                    const size_t  nb2,
                                    const size_t  nb3,
@@ -636,7 +652,10 @@ static sycl::event set_rows_sycl_q(const char * __restrict__ src0_d,
                                                    const size_t src1_offset =
                                                        calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 });
                                                    const int64_t dst_row = src1_d[src1_offset / sizeof(TIdx)];
-                                                   const size_t  dst_offset =
+                                                   if (!set_rows_dst_row_valid(dst_row, ne1)) {
+                                                       return;
+                                                   }
+                                                   const size_t dst_offset =
                                                        calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) +
                                                        (i00 / qk) * sizeof(blockType);
                                                    char * dst_block = reinterpret_cast<char *>(
@@ -666,6 +685,7 @@ static void k_set_rows(const char * __restrict__ src0,
                        const size_t             nb10,
                        const size_t             nb11,
                        const size_t             nb12,
+                       const int64_t            ne1,
                        const size_t             nb1,
                        const size_t             nb2,
                        const size_t             nb3,
@@ -689,6 +709,9 @@ static void k_set_rows(const char * __restrict__ src0,
 
     const int64_t dst_row =
         *(const TIdx *) ((const char *) src1 + calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 }));
+    if (!set_rows_dst_row_valid(dst_row, ne1)) {
+        return;
+    }
 
     const char * src0_row    = src0 + calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 });
     const char * src_elem    = src0_row + i00 * src_type_size;
@@ -714,6 +737,7 @@ static sycl::event set_rows_sycl(const char *  src0_d,
                                  const size_t  nb10,
                                  const size_t  nb11,
                                  const size_t  nb12,
+                                 const int64_t ne1,
                                  const size_t  nb1,
                                  const size_t  nb2,
                                  const size_t  nb3,
@@ -732,7 +756,7 @@ static sycl::event set_rows_sycl(const char *  src0_d,
                                                [=](sycl::nd_item<1> item_ct1) {
                                                    k_set_rows<TIn, TIdx, TOut>(
                                                        src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12, nb01, nb02,
-                                                       nb03, nb10, nb11, nb12, nb1, nb2, nb3, src_type_size,
+                                                       nb03, nb10, nb11, nb12, ne1, nb1, nb2, nb3, src_type_size,
                                                        dst_type_size, total_elements, item_ct1);
                                                });
         });
@@ -754,6 +778,7 @@ static void k_set_rows_fp8(const char * __restrict__ src0,
                            const size_t             nb10,
                            const size_t             nb11,
                            const size_t             nb12,
+                           const int64_t            ne1,
                            const size_t             nb1,
                            const size_t             nb2,
                            const size_t             nb3,
@@ -775,6 +800,9 @@ static void k_set_rows_fp8(const char * __restrict__ src0,
 
     const int64_t dst_row =
         *(const TIdx *) ((const char *) src1 + calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 }));
+    if (!set_rows_dst_row_valid(dst_row, ne1)) {
+        return;
+    }
 
     const char *  src0_row = src0 + calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 });
     const float * src_elem = (const float *) (src0_row + i00 * sizeof(float));
@@ -800,6 +828,7 @@ static sycl::event set_rows_sycl_fp8(const char *  src0_d,
                                      const size_t  nb10,
                                      const size_t  nb11,
                                      const size_t  nb12,
+                                     const int64_t ne1,
                                      const size_t  nb1,
                                      const size_t  nb2,
                                      const size_t  nb3,
@@ -815,8 +844,8 @@ static sycl::event set_rows_sycl_fp8(const char *  src0_d,
             return profiled_queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size),
                                                [=](sycl::nd_item<1> item_ct1) {
                                                    k_set_rows_fp8<TIdx>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11,
-                                                                        ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1,
-                                                                        nb2, nb3, total_elements, item_ct1);
+                                                                        ne12, nb01, nb02, nb03, nb10, nb11, nb12, ne1,
+                                                                        nb1, nb2, nb3, total_elements, item_ct1);
                                                });
         });
 }
@@ -900,49 +929,49 @@ static sycl::event set_rows_sycl(ggml_backend_sycl_context &     ctx,
     switch (dst_raw->type) {
         case GGML_TYPE_F32:
             evt = set_rows_sycl<TIn, TIdx, float>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, ne11, ne12, nb01, nb02,
-                                                  nb03, nb10, nb11, nb12, nb1, nb2, nb3, sizeof(TIn), sizeof(float),
-                                                  stream);
+                                                  nb03, nb10, nb11, nb12, ne1, nb1, nb2, nb3, sizeof(TIn),
+                                                  sizeof(float), stream);
             break;
         case GGML_TYPE_F16:
             dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
             evt = set_rows_sycl<TIn, TIdx, sycl::half>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, ne11, ne12, nb01,
-                                                       nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, sizeof(TIn),
+                                                       nb02, nb03, nb10, nb11, nb12, ne1, nb1, nb2, nb3, sizeof(TIn),
                                                        sizeof(sycl::half), stream);
             break;
         case GGML_TYPE_BF16:
             evt = set_rows_sycl<TIn, TIdx, sycl::ext::oneapi::bfloat16>(
-                src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2,
-                nb3, sizeof(TIn), sizeof(sycl::ext::oneapi::bfloat16), stream);
+                src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, ne1, nb1,
+                nb2, nb3, sizeof(TIn), sizeof(sycl::ext::oneapi::bfloat16), stream);
             break;
         case GGML_TYPE_Q8_0:
             evt = set_rows_sycl_q<TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
                 src0_d, src1_d, (block_q8_0 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,
-                nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_1:
             evt = set_rows_sycl_q<TIdx, block_q5_1, QK5_1, cpy_blck_f32_q5_1>(
                 src0_d, src1_d, (block_q5_1 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,
-                nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_0:
             evt = set_rows_sycl_q<TIdx, block_q5_0, QK5_0, cpy_blck_f32_q5_0>(
                 src0_d, src1_d, (block_q5_0 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,
-                nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_1:
             evt = set_rows_sycl_q<TIdx, block_q4_1, QK4_1, cpy_blck_f32_q4_1>(
                 src0_d, src1_d, (block_q4_1 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,
-                nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0:
             evt = set_rows_sycl_q<TIdx, block_q4_0, QK4_0, cpy_blck_f32_q4_0>(
                 src0_d, src1_d, (block_q4_0 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,
-                nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             evt = set_rows_sycl_q<TIdx, block_iq4_nl, QK4_NL, cpy_blck_f32_iq4_nl>(
                 src0_d, src1_d, (block_iq4_nl *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+                nb02, nb03, nb10, nb11, nb12, nb13, ne1, nb1, nb2, nb3, stream);
             break;
 
         default:
@@ -951,6 +980,75 @@ static sycl::event set_rows_sycl(ggml_backend_sycl_context &     ctx,
     }
 
     return evt;
+}
+
+static bool set_rows_validate_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_SET_ROWS_VALIDATE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Host-side counterpart of the in-kernel bound: reads the index tensor back and
+// reports the entries the kernels will drop. Costs a device->host copy plus a
+// queue sync per SET_ROWS, and this op runs once per layer per ubatch on the KV
+// write path, so it stays opt-in. Skipped while a command graph is recording,
+// where a blocking copy is not legal.
+static void set_rows_validate_indices(sycl::queue &                  queue,
+                                      const ggml_sycl::sycl_tensor & dst,
+                                      const ggml_tensor *            src1,
+                                      const void *                   index_ptr,
+                                      int                            device) {
+    if (!set_rows_validate_enabled() || ggml_sycl_graph_recording_active() || !index_ptr) {
+        return;
+    }
+
+    const size_t               bytes = ggml_nbytes(src1);
+    std::vector<unsigned char> host(bytes);
+
+    ggml_sycl::mem_handle host_h = ggml_sycl::mem_handle::from_direct(host.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
+                                                                      ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle index_h = ggml_sycl_memcpy_handle_for_raw_ptr(index_ptr, device, GGML_LAYOUT_AOS,
+                                                                        /*fallback_on_device=*/true,
+                                                                        /*fallback_unknown=*/true);
+    ggml_sycl::mem_copy(host_h, index_h, bytes, queue);
+
+    const bool    is_i64    = src1->type == GGML_TYPE_I64;
+    const size_t  idx_size  = is_i64 ? sizeof(int64_t) : sizeof(int32_t);
+    const int64_t ne1       = dst.raw()->ne[1];
+    int64_t       n_invalid = 0;
+    int64_t       first_bad = 0;
+    int64_t       first_pos = -1;
+
+    for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
+        for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
+            for (int64_t i10 = 0; i10 < src1->ne[0]; ++i10) {
+                const size_t off = (size_t) i10 * src1->nb[0] + (size_t) i11 * src1->nb[1] + (size_t) i12 * src1->nb[2];
+                if (off + idx_size > bytes) {
+                    continue;
+                }
+                const int64_t idx = is_i64 ? *reinterpret_cast<const int64_t *>(host.data() + off) :
+                                             *reinterpret_cast<const int32_t *>(host.data() + off);
+                if (set_rows_dst_row_valid(idx, ne1)) {
+                    continue;
+                }
+                if (first_pos < 0) {
+                    first_pos = i10 + i11 * src1->ne[0] + i12 * src1->ne[0] * src1->ne[1];
+                    first_bad = idx;
+                }
+                ++n_invalid;
+            }
+        }
+    }
+
+    if (n_invalid > 0) {
+        fprintf(stderr,
+                "[SET_ROWS_VALIDATE] dst=%s index=%s dropped %lld of %lld indices outside [0, %lld); "
+                "first at element %lld = %lld\n",
+                dst.name() ? dst.name() : "?", src1->name, (long long) n_invalid, (long long) ggml_nelements(src1),
+                (long long) ne1, (long long) first_pos, (long long) first_bad);
+    }
 }
 
 void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -984,6 +1082,8 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                                                       plan.index_device, staged_handles.handles);
         GGML_ASSERT(plan.index_ptr != nullptr);
     }
+
+    set_rows_validate_indices(*ctx.stream(plan.owner_device, 0), dst, src1, plan.index_ptr, plan.owner_device);
 
     sycl::event evt;
     if (src1->type == GGML_TYPE_I64) {
