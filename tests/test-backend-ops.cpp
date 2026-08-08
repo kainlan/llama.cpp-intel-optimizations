@@ -5671,24 +5671,28 @@ struct test_top_k : public test_case {
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    // Number of values per row that are above -inf. -1 means all of them.
+    // When this is below k the rows are mostly -inf, which is the shape the
+    // DSA indexer mask produces: ne[0] >= k, but fewer than k finite values.
+    const int n_finite;
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        return VARS_TO_STR5(type, ne, k, ties, n_finite);
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false, int n_finite = -1)
+        : type(type), ne(ne), k(k), ties(ties), n_finite(n_finite) {}
 
     double max_err() override {
         return 0.0;
     }
 
-    // When there are ties, only validate the final result.
+    // When indices are not uniquely determined, only validate the final result.
     // The logic in err can't handle the sentinel tensors.
-    bool run_whole_graph() override { return ties; }
+    bool run_whole_graph() override { return ties || n_finite >= 0; }
 
     double err(const float * a, const float * b, size_t n) override {
         // When there are no ties, we expect the exact same set of indices,
@@ -5696,7 +5700,8 @@ struct test_top_k : public test_case {
         // can be different but the input values they correspond to should be
         // the same. The logic for ties could work for non-ties, but only for
         // the output tensor, not for the sentinel tensors.
-        if (ties) {
+        // Rows padded with -inf tie in exactly the same way.
+        if (ties || n_finite >= 0) {
             std::vector<float> src(ggml_nelements(input));
 
             ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
@@ -5715,12 +5720,29 @@ struct test_top_k : public test_case {
                     ia[c] = (int32_t)a[r * k + c];
                     ib[c] = (int32_t)b[r * k + c];
                 }
-                // The src values for each row should match.
+                // Every slot must name a real column of the row. ggml_top_k
+                // requires ne00 >= k, so k in-range indices always exist and a
+                // backend may not ship an empty slot. Checked before the values
+                // are looked up, which an out-of-range index cannot do.
+                bool in_range = true;
                 for (int64_t c = 0; c < k; c++) {
-                    asrc[c] = src[r * cols + ia[c]];
-                    bsrc[c] = src[r * cols + ib[c]];
+                    if (ia[c] < 0 || ia[c] >= cols) {
+                        diff += 1;
+                        in_range = false;
+                    }
+                    if (ib[c] < 0 || ib[c] >= cols) {
+                        diff += 1;
+                        in_range = false;
+                    }
                 }
-                diff += jdst(asrc.data(), bsrc.data(), k);
+                // The src values for each row should match.
+                if (in_range) {
+                    for (int64_t c = 0; c < k; c++) {
+                        asrc[c] = src[r * cols + ia[c]];
+                        bsrc[c] = src[r * cols + ib[c]];
+                    }
+                    diff += jdst(asrc.data(), bsrc.data(), k);
+                }
                 // There should be no duplicate indices
                 std::sort(ia.begin(), ia.end());
                 std::sort(ib.begin(), ib.end());
@@ -5772,7 +5794,10 @@ struct test_top_k : public test_case {
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
                 for (int i = 0; i < t->ne[0]; i++) {
-                    if (ties) {
+                    if (n_finite >= 0) {
+                        // only n_finite values are above -inf
+                        data[i] = i < n_finite ? (float) i : -INFINITY;
+                    } else if (ties) {
                         // integer division to introduce duplicates
                         data[i] = i / tie_denom;
                     } else {
@@ -9077,6 +9102,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+
+    // rows with fewer than k values above -inf. ggml_top_k requires ne00 >= k,
+    // so k in-range indices always exist and the CPU partial_sort returns them;
+    // a backend that leaves the surplus slots empty is what this catches.
+    // {16,...} gives every thread at most one column, {4096,...} gives each
+    // thread more columns than k.
+    for (int n_finite : {0, 3}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {  16, 2, 1, 1}, 8, false, n_finite));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096, 1, 1, 1}, 8, false, n_finite));
+    }
+    // control: exactly k values above -inf, so the surplus-slot path is unreachable
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 2, 1, 1}, 8, false, 8));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
