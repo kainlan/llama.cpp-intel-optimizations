@@ -9108,10 +9108,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a backend that leaves the surplus slots empty is what this catches.
     // {16,...} gives every thread at most one column, {4096,...} gives each
     // thread more columns than k.
-    for (int n_finite : {0, 3}) {
+    // n_finite = 7 is k-1: exactly one slot has to come from the -inf pool,
+    // which is where an off-by-one in filling the surplus would sit.
+    for (int n_finite : {0, 3, 7}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {  16, 2, 1, 1}, 8, false, n_finite));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096, 1, 1, 1}, 8, false, n_finite));
+        // ne00 == k, so every column must be selected and there is no slack at
+        // all -- the tightest reading of ggml_top_k's ne00 >= k precondition.
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {   8, 2, 1, 1}, 8, false, n_finite));
+        // DeepSeek-V3.2's sparse-attention indexer: 256 keys, 64 queries,
+        // n_indexer_top_k = 8, causally masked. The shape that produced the
+        // NaN in llama.cpp-uhfq, and the one between the two above -- neither
+        // idle lanes nor several columns per lane, but exactly one each.
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 256, 64, 1, 1}, 8, false, n_finite));
     }
+    // k = 1 leaves no room to order anything, and k = 32 is the largest k the
+    // SYCL path accepts before it hands off to the CPU.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1},  1, false, 0));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1}, 32, false, 0));
     // control: exactly k values above -inf, so the surplus-slot path is unreachable
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 2, 1, 1}, 8, false, 8));
 
