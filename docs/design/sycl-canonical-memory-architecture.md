@@ -151,7 +151,11 @@ owner is diagnosed separately as an ownerless lease and may abort when
 `GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are
 suppressed during `MID_LOAD_REPLAN`, and the state is not treated as legitimate
 concurrent-model ownership. Whole-zone resets cannot preserve a single
-allocation, so `host_zone_reset()` and `zone_reset()` refuse the entire
+allocation, so `host_zone_settle()` and `zone_settle()` (named `host_zone_reset()`
+and `zone_reset()` before `llama.cpp-37ba`'s naming split into
+`host_zone_boundary_check()`/`host_zone_reclaim()` and
+`zone_boundary_check()`/`zone_reclaim()` — see `docs/backend/sycl-memory-design.md`'s
+"Step 4" subsection) refuse the entire
 reset while the target zone contains live registered allocations (`4afdb6d9f`).
 Callers must release the owning handles and retry; they must not purge ownership
 records or force reclamation.
