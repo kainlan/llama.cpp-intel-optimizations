@@ -59,6 +59,33 @@
 // production-policy-reachable for this type and shape, and is the fact to reason
 // from about production -- but it is not the operative mechanism in this test.
 //
+// CORRECTED A FOURTH TIME, AND THIS ONE CLOSES IT (llama.cpp-szv8, 2026-08-08):
+// Part 2 was STILL not running the coalesced DMMV kernel after the third fix,
+// and the numbers say so to seven significant figures. Hardware, all three
+// shapes: the GPU matched a q8_1-MMVQ oracle at max_diff 4e-6 / 8e-6 / 5e-4
+// while missing the dfloat oracle by 0.187 / 0.268 / 0.500. One row, verbatim:
+// gpu=-14.931747, q8_1_mmvq=-14.931746, dfloat=-14.980540.
+//
+// The mechanism is ggml-sycl.cpp's TG fast-path, which claims every batch=1
+// quantized mul_mat whose weight resolved to a non-AoS layout, dispatches MMVQ
+// with q8_1-quantized activations against that layout, and returns -- before any
+// of the kernel-selection machinery that honours GGML_SYCL_FORCE_DMMV or the
+// layout override's kernel choice. Its own comment says it "bypasses
+// orchestrator, name parsing, prefetch, TP checks for maximum speed".
+//
+// This is why the third fix's preconditions could ALL pass while the verdict
+// stayed wrong: the override binds on materialization, so the coalesced buffer
+// really was built and really was byte-exact -- and then MMVQ read it. Every
+// structural check was true and the answer still came from the wrong kernel.
+// main() now also sets GGML_SYCL_TG_FAST=0, and the gate no longer takes any
+// precondition's word for it: it asserts from the numbers which kernel ran.
+//
+// Two things follow that are bigger than this test. The observed 12-31% was
+// never a wrong answer -- it is the by-design accuracy of MMVQ's 8-bit activation
+// quantization scored against a full-precision-activation oracle. And for Q4_0 at
+// batch=1 with a reordered layout, production takes that same fast-path, so the
+// coalesced DMMV kernel this file is named for is not reached by default.
+//
 // The symptom was "[LAYOUT-CHECK] readback done (source=tensor-storage-fallback)"
 // followed by "Coalesced layout check: NOT RUN" on every shape, while the numeric
 // comparison happily produced FAIL rows for whatever kernel the SOA layout
@@ -190,6 +217,86 @@ static void dmmv_q4_0_q8_activation_reference(const block_q4_0_test * x,
                 sumi += ((blk->qs[j] >> 4) - 8) * y[b].qs[j + QK4_0 / 2];
             }
             sum += (float) sumi * ggml_fp16_to_fp32(blk->d) * ggml_fp16_to_fp32(y[b].d);
+        }
+        dst[row] = sum;
+    }
+}
+
+// The arithmetic an MMVQ dispatch actually performs for a Q4_0 weight, which is
+// neither of the two oracles above and is the one no round had modelled
+// (llama.cpp-szv8). Three details make it distinct, and all three matter:
+//
+//   * the activation is quantized to q8_1 -- 8 bits per 32-element block, scale
+//     amax/127 (ggml/src/ggml-sycl/quantize.hpp:39-56);
+//   * the block also carries `sum`, the sum of the RAW activation floats, and
+//     both it and the scale are stored as fp16 (quantize.hpp:121);
+//   * vec_dot_q4_0_q8_1_impl folds Q4_0's -8 offset by subtracting that raw
+//     `sum` rather than d8*sum(q8). The two differ by the block's quantization
+//     residual, which is why a plain Q8_0-activation oracle lands at roughly
+//     half the gap and this one lands on it.
+//
+// On that last point the coefficient below is 8 while the production line reads
+// 4, and the difference is real rather than a transcription slip -- two
+// re-verifiers have now worked through it, so the derivation belongs here.
+// ggml/src/ggml-sycl/vecdotq.hpp:709 literally says
+//
+//     return d4 * (sumi * ds8f.x() - (8 * vdr / QI4_0) * ds8f.y());
+//
+// with vdr = VDR_Q4_0_Q8_1_MMVQ = 2 (vecdotq.hpp:689) and QI4_0 = QK4_0/(4*QR4_0)
+// = 4, so the coefficient is 8*2/4 = 4 -- but that is PER CALL, and each call
+// covers only vdr of the block's qi quant groups. mmvq.cpp:2174 (and :2265 for
+// the reorder variant) sets block_elements_per_subgroup = qi/vdr_mmvq = 2, so
+// two such calls cover one block and their results are summed by the sub-group
+// reduction: 2 x 4 = 8. This reference is written per whole block rather than
+// per partial group, so 8 is the correct coefficient here. Anyone reconciling
+// the two should compare totals per block, not the literal constants.
+//
+// Modelled on the host, this reproduces the reported GPU numbers to six
+// significant figures at two shapes (1024x64: errors 55, max_rel 0.165478 vs
+// 0.165479 measured; 2048x128: 116, 0.176323 vs 0.176321), which is an
+// identification of the executing path rather than a magnitude-class argument.
+static void dmmv_q4_0_q8_1_mmvq_reference(const block_q4_0_test * x,
+                                          const float *           y,
+                                          float *                 dst,
+                                          int                     ncols,
+                                          int                     nrows) {
+    const int blocks_per_row = ncols / QK4_0;  // QK8_1 == QK4_0 == 32
+
+    std::vector<ggml_fp16_t> d8(blocks_per_row);
+    std::vector<ggml_fp16_t> s8(blocks_per_row);
+    std::vector<int8_t>      q8((size_t) ncols);
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        float amax = 0.0f;
+        float sum  = 0.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            const float v = y[b * QK4_0 + j];
+            sum += v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+        const float d = (amax == 0.0f) ? 1.0f : amax / 127.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            q8[b * QK4_0 + j] = (int8_t) roundf(y[b * QK4_0 + j] / d);
+        }
+        d8[b] = ggml_fp32_to_fp16((amax == 0.0f) ? 0.0f : d);
+        s8[b] = ggml_fp32_to_fp16(sum);
+    }
+
+    for (int row = 0; row < nrows; ++row) {
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const block_q4_0_test * blk = &x[row * blocks_per_row + b];
+
+            // Note the quants are NOT offset by 8 here; the offset is the
+            // separate -8*ds.y term below, exactly as the kernel does it.
+            int raw = 0;
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                raw += (blk->qs[j] & 0xF) * q8[b * QK4_0 + j];
+                raw += (blk->qs[j] >> 4) * q8[b * QK4_0 + j + QK4_0 / 2];
+            }
+
+            sum +=
+                ggml_fp16_to_fp32(blk->d) * ((float) raw * ggml_fp16_to_fp32(d8[b]) - 8.0f * ggml_fp16_to_fp32(s8[b]));
         }
         dst[row] = sum;
     }
@@ -519,13 +626,18 @@ struct staged_model_token {
 // Everything the preconditions need, not just the numbers: which layout the
 // dispatch resolved, whether that pointer is distinct from the AoS storage, and
 // the bytes behind that exact pointer.
+//
+// `outputs` holds one result per probe activation, all computed against the SAME
+// staged weight and the SAME resolved layout pointer. Re-staging per probe would
+// let a difference between probes be a difference between stagings instead, which
+// is the one thing these probes must not be able to confound.
 struct staged_gpu_result {
-    bool                 ok      = false;
-    const char *         failure = nullptr;
-    std::vector<float>   output;
-    std::vector<uint8_t> layout_bytes;
-    ggml_layout_mode     resolved_layout     = GGML_LAYOUT_AOS;
-    bool                 layout_ptr_distinct = false;
+    bool                            ok      = false;
+    const char *                    failure = nullptr;
+    std::vector<std::vector<float>> outputs;
+    std::vector<uint8_t>            layout_bytes;
+    ggml_layout_mode                resolved_layout     = GGML_LAYOUT_AOS;
+    bool                            layout_ptr_distinct = false;
 };
 
 static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
@@ -548,14 +660,14 @@ static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft
 // a transaction and only for a host-resident weight buffer; outside either it
 // silently registers nothing and S1-PRELOAD never sees the tensor. Pattern and
 // full RCA: tests/test-q8-0-layout-cache-path.cpp (llama.cpp-43uy).
-static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
-                                                       int            device_id,
-                                                       const char *   weight_name,
-                                                       const void *   weight_data,
-                                                       size_t         weight_size,
-                                                       const float *  input_data,
-                                                       int            ncols,
-                                                       int            nrows) {
+static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t                     backend,
+                                                       int                                device_id,
+                                                       const char *                       weight_name,
+                                                       const void *                       weight_data,
+                                                       size_t                             weight_size,
+                                                       const std::vector<const float *> & input_probes,
+                                                       int                                ncols,
+                                                       int                                nrows) {
     staged_gpu_result result{};
 
     ggml_sycl::test_clear_host_weight_registry();
@@ -619,8 +731,6 @@ static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
     }
     model.held = true;
 
-    ggml_backend_tensor_set(input, input_data, 0, (size_t) ncols * sizeof(float));
-
     // This is the same call the mul_mat dispatcher makes to pick a kernel, so
     // its layout is the layout the kernel will run against -- not an adjacent
     // signal about what the cache happens to hold.
@@ -658,15 +768,102 @@ static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
 
     struct ggml_cgraph * graph = ggml_new_graph(res.ctx);
     ggml_build_forward_expand(graph, out);
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        result.failure = "GPU graph compute failed";
-        return result;
+
+    result.outputs.resize(input_probes.size());
+    for (size_t p = 0; p < input_probes.size(); ++p) {
+        ggml_backend_tensor_set(input, input_probes[p], 0, (size_t) ncols * sizeof(float));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            result.failure = "GPU graph compute failed";
+            return result;
+        }
+        result.outputs[p].resize(nrows);
+        ggml_backend_tensor_get(out, result.outputs[p].data(), 0, result.outputs[p].size() * sizeof(float));
     }
 
-    result.output.resize(nrows);
-    ggml_backend_tensor_get(out, result.output.data(), 0, result.output.size() * sizeof(float));
     result.ok = true;
     return result;
+}
+
+// =============================================================================
+// Stage-separating probes (llama.cpp-szv8)
+// =============================================================================
+//
+// The gate compares the GPU against dmmv_q4_0_dfloat_reference(), and a
+// disagreement there says only "something upstream of the answer differs". These
+// two probes split that into the stages plan Task 9 names, using activations
+// chosen so that a whole stage becomes exact rather than merely small:
+//
+//   * ONE-HOT (row addressing + scale + dequantization). y is 1.0 at a single
+//     column and 0 elsewhere, so the answer for row r is exactly the dequantized
+//     weight element (r, col) with NO accumulation and NO quantization error:
+//     1.0 and 0.0 survive f32, fp16 and 8-bit block quantization unchanged
+//     (amax=1 gives q=127 and 127*d back to within one fp16 ulp of the scale).
+//     Any disagreement here is structural -- a wrong byte, a wrong scale, or a
+//     wrong row -- and cannot be rounding.
+//
+//   * Q8-SNAPPED (activation quantization). y is the gate's own random vector
+//     pushed onto the Q8_0 grid and back, so an 8-bit-activation kernel
+//     reproduces it exactly and its quantization error vanishes. If the gate's
+//     failure collapses here while the one-hot probe is clean, the causal stage
+//     is activation handling and the arithmetic is sound; if it survives, the
+//     activation is exonerated and the defect is in the weight path.
+//
+// The pair is exhaustive over the plan's four candidate stages: materialization
+// is already proven byte-exact by compare_device_coalesced_layout(), the one-hot
+// probe covers addressing and dequantization, and the Q8-snapped probe covers
+// activation handling and accumulation.
+
+// Round-trip through the Q8_0 grid: quantize, then dequantize with the fp16
+// scale the block actually stores. The result is a fixed point of that grid, so
+// a kernel that re-quantizes it recovers the same integers.
+static void snap_activation_to_q8_0(const float * src, float * dst, int ncols) {
+    const int               nblocks = ncols / QK4_0;  // QK8_0 == QK4_0 == 32
+    std::vector<block_q8_0> q(nblocks);
+    quantize_row_q8_0_ref(src, q.data(), ncols);
+
+    for (int b = 0; b < nblocks; ++b) {
+        const float d = ggml_fp16_to_fp32(q[b].d);
+        for (int j = 0; j < QK4_0; ++j) {
+            dst[b * QK4_0 + j] = (float) q[b].qs[j] * d;
+        }
+    }
+}
+
+// The exact answer for a one-hot activation at `col`: the dequantized weight
+// element (row, col), read straight out of the AoS blocks.
+static float one_hot_expected(const block_q4_0_test * x, int ncols, int row, int col) {
+    const int               blocks_per_row = ncols / QK4_0;
+    const int               block_in_row   = col / QK4_0;
+    const int               elem_in_block  = col % QK4_0;
+    const block_q4_0_test * blk            = &x[row * blocks_per_row + block_in_row];
+
+    const uint8_t byte = blk->qs[elem_in_block % (QK4_0 / 2)];
+    const int     q    = (elem_in_block < QK4_0 / 2) ? (byte & 0xF) : (byte >> 4);
+    return (float) (q - 8) * ggml_fp16_to_fp32(blk->d);
+}
+
+struct oracle_score {
+    int   errors    = 0;
+    float max_diff  = 0.0f;
+    float max_rel   = 0.0f;
+    int   first_bad = -1;
+};
+
+static oracle_score score_against(const std::vector<float> & got, const std::vector<float> & want, float abs_gate) {
+    oracle_score s;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float diff = fabsf(got[i] - want[i]);
+        const float rel  = diff / fmaxf(1.0f, fabsf(want[i]));
+        s.max_diff       = fmaxf(s.max_diff, diff);
+        s.max_rel        = fmaxf(s.max_rel, rel);
+        if (diff > abs_gate) {
+            if (s.first_bad < 0) {
+                s.first_bad = (int) i;
+            }
+            s.errors++;
+        }
+    }
+    return s;
 }
 
 static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
@@ -714,8 +911,46 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
     char weight_name[64];
     snprintf(weight_name, sizeof(weight_name), "blk.%d.attn_q.weight", case_index);
 
-    staged_gpu_result staged = run_dmmv_coalesced_gpu_staged(
-        gpu_backend, /*device_id=*/0, weight_name, weight_quant.data(), weight_bytes, input_data.data(), ncols, nrows);
+    // Probe 0 is the gate's own activation; the rest are the stage separators
+    // described above. All six run against one staging, so a difference between
+    // them is a difference in the activation and nothing else.
+    std::vector<float> input_q8_snapped(ncols);
+    snap_activation_to_q8_0(input_data.data(), input_q8_snapped.data(), ncols);
+
+    // Columns chosen to move every axis of the addressing contract. A one-hot at
+    // column c lands in block c/32, byte (c%32)%16, and therefore WORD PLANE
+    // ((c%32)%16)/4 -- the plane index is what the coalesced layout interleaves,
+    // so covering all four is the point of the set:
+    //
+    //   0        block 0,  byte 0,  plane 0, low nibble
+    //   16       block 0,  byte 0,  plane 0, high nibble  (same byte as col 0)
+    //   33       block 1,  byte 1,  plane 0, low nibble   (different BLOCK, same plane)
+    //   20       block 0,  byte 4,  plane 1, high nibble
+    //   8        block 0,  byte 8,  plane 2, low nibble
+    //   ncols-1  last blk, byte 15, plane 3, high nibble  (last element of the row)
+    //
+    // col=33 is deliberately kept even though it does not add a plane: it is the
+    // only column that moves the BLOCK index while holding the plane fixed, which
+    // separates a block-stride error from a plane-stride one. (An earlier comment
+    // here claimed 33 crossed word planes. It does not -- byte 1 is plane 0 -- and
+    // 20 and 8 were added to make the per-plane coverage the comment described
+    // actually true.)
+    const int                       one_hot_cols[] = { 0, 16, 33, 20, 8, ncols - 1 };
+    constexpr int                   n_one_hot      = (int) (sizeof(one_hot_cols) / sizeof(one_hot_cols[0]));
+    std::vector<std::vector<float>> one_hot_inputs(n_one_hot, std::vector<float>(ncols, 0.0f));
+    for (int p = 0; p < n_one_hot; ++p) {
+        one_hot_inputs[p][one_hot_cols[p]] = 1.0f;
+    }
+
+    std::vector<const float *> probes;
+    probes.push_back(input_data.data());
+    probes.push_back(input_q8_snapped.data());
+    for (int p = 0; p < n_one_hot; ++p) {
+        probes.push_back(one_hot_inputs[p].data());
+    }
+
+    staged_gpu_result staged = run_dmmv_coalesced_gpu_staged(gpu_backend, /*device_id=*/0, weight_name,
+                                                             weight_quant.data(), weight_bytes, probes, ncols, nrows);
     if (!staged.ok) {
         // Each precondition reports itself, so a run that never reached the
         // coalesced kernel cannot be read as a verdict about that kernel.
@@ -731,7 +966,7 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         return false;
     }
 
-    const std::vector<float> &   gpu_out          = staged.output;
+    const std::vector<float> &   gpu_out          = staged.outputs[0];
     const std::vector<uint8_t> & weight_coalesced = staged.layout_bytes;
 
     if (!run_mul_mat_backend(cpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes,
@@ -821,7 +1056,39 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         cpu_backend_max_diff = fmaxf(cpu_backend_max_diff, fabsf(gpu_out[i] - cpu_out[i]));
     }
 
-    bool pass = (errors == 0);
+    // Which kernel actually ran, asserted from the numbers themselves.
+    //
+    // Three rounds of this ticket reported verdicts about a kernel that never
+    // executed, and every structural precondition passed while it happened --
+    // the layout resolved COALESCED, the pointer was distinct, the bytes were
+    // exact. What separates the two kernels is not their inputs, it is their
+    // arithmetic: the dfloat DMMV answer and the q8_1 MMVQ answer differ by
+    // ~0.19-0.50 at these shapes, four orders above a correct kernel's residual.
+    //
+    // So require the dfloat oracle to be the decisively better fit. The margin
+    // is a RATIO, not a tolerance, which is what makes it immune to the failure
+    // it guards: widening a tolerance cannot satisfy it, because loosening the
+    // gate moves both fits together. A correct DMMV run clears it by ~4 orders.
+    std::vector<float> ref_mmvq(nrows);
+    dmmv_q4_0_q8_1_mmvq_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), input_data.data(),
+                                  ref_mmvq.data(), ncols, nrows);
+    const oracle_score fit_dfloat = score_against(gpu_out, ref, 1e-2f);
+    const oracle_score fit_mmvq   = score_against(gpu_out, ref_mmvq, 1e-2f);
+
+    const bool kernel_identified = fit_mmvq.max_diff > 100.0f * fmaxf(fit_dfloat.max_diff, 1e-9f);
+    if (!kernel_identified) {
+        printf(
+            "  FAIL: the executing kernel is not the dfloat coalesced DMMV --"
+            " max|gpu-dfloat_oracle|=%.6f vs max|gpu-q8_1_MMVQ_oracle|=%.6f\n",
+            fit_dfloat.max_diff, fit_mmvq.max_diff);
+        if (fit_mmvq.max_diff < fit_dfloat.max_diff) {
+            printf(
+                "    the q8_1-MMVQ oracle fits BETTER: an MMVQ path took this dispatch."
+                " Check that GGML_SYCL_TG_FAST=0 still disables the batch=1 fast-path.\n");
+        }
+    }
+
+    bool pass = (errors == 0) && kernel_identified;
     if (verbose || !pass) {
         printf(
             "  DMMV coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s"
@@ -829,6 +1096,8 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL", cpu_backend_max_diff);
     }
     if (!pass) {
+        const auto * x_aos = reinterpret_cast<const block_q4_0_test *>(weight_quant.data());
+
         // How big is the gap between the two oracles alone? If the GPU's spread
         // against the dfloat reference sits at this scale, the dispatch took the
         // Q8_0-activation branch and the reference models the other one; a
@@ -838,8 +1107,7 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         quantize_row_q8_0_ref(input_data.data(), y_q8.data(), ncols);
 
         std::vector<float> ref_q8(nrows);
-        dmmv_q4_0_q8_activation_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), y_q8.data(),
-                                          ref_q8.data(), ncols, nrows);
+        dmmv_q4_0_q8_activation_reference(x_aos, y_q8.data(), ref_q8.data(), ncols, nrows);
 
         float oracle_gap = 0.0f;
         for (int i = 0; i < nrows; ++i) {
@@ -849,6 +1117,84 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             "    diagnosis: max|dfloat_oracle - Q8_0_activation_oracle|=%.6f"
             " (the gap the oracle choice alone accounts for)\n",
             oracle_gap);
+
+        // The comparison the previous rounds never made: the GPU scored against
+        // the Q8_0-activation oracle DIRECTLY. Scoring the two oracles against
+        // each other says how much of the gap that branch COULD explain; scoring
+        // the GPU against it says whether it DOES.
+        std::vector<float> ref_f32(nrows);
+        dmmv_q4_0_cpu_reference(x_aos, input_data.data(), ref_f32.data(), ncols, nrows);
+
+        // Alias, never a second score_against(gpu_out, ref, ...) call: the gate
+        // and this diagnostic must report the same fit, and a future threshold
+        // edit must not be able to update one and miss the other.
+        const oracle_score & s_dfloat = fit_dfloat;
+        const oracle_score s_f32    = score_against(gpu_out, ref_f32, 1e-2f);
+        const oracle_score s_q8     = score_against(gpu_out, ref_q8, 1e-2f);
+        const oracle_score s_mmvq   = fit_mmvq;
+        printf("    gpu vs f32-activation    oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_f32.errors,
+               s_f32.max_diff, s_f32.max_rel);
+        printf("    gpu vs dfloat-activation oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_dfloat.errors,
+               s_dfloat.max_diff, s_dfloat.max_rel);
+        printf("    gpu vs Q8_0-activation   oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_q8.errors,
+               s_q8.max_diff, s_q8.max_rel);
+        // Predicted to be the one that lands: errors=0, max_diff at f32
+        // reassociation scale (~1e-4). If it does, the executing path is MMVQ
+        // with q8_1 activations and the coalesced DMMV kernel never ran.
+        printf("    gpu vs q8_1-MMVQ         oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_mmvq.errors,
+               s_mmvq.max_diff, s_mmvq.max_rel);
+
+        // Same three oracles recomputed from the ACTUAL coalesced bytes the
+        // kernel reads, not from the AoS source. Agreement between the two
+        // families confirms the addressing contract reproduces the AoS weights;
+        // disagreement would move the stage to the layout reader.
+        std::vector<float> ref_from_layout(nrows);
+        dmmv_q4_0_cpu_from_coalesced(weight_coalesced.data(), input_data.data(), ref_from_layout.data(), ncols, nrows);
+        const oracle_score s_layout = score_against(ref_from_layout, ref_f32, 1e-3f);
+        printf("    coalesced-bytes oracle vs f32 oracle: errors=%d max_diff=%.6f (contract readback cross-check)\n",
+               s_layout.errors, s_layout.max_diff);
+
+        // Stage probe 1: activation quantization. Snapping the activation onto
+        // the Q8_0 grid makes an 8-bit-activation kernel exact, so a collapse
+        // here names activation handling as the causal stage and a survival
+        // exonerates it.
+        std::vector<float> ref_snapped(nrows);
+        dmmv_q4_0_dfloat_reference(x_aos, input_q8_snapped.data(), ref_snapped.data(), ncols, nrows);
+        const oracle_score s_snap = score_against(staged.outputs[1], ref_snapped, 1e-2f);
+        printf("    PROBE q8-snapped activation: errors=%d max_diff=%.6f max_rel=%.6f (gate probe was %d / %.6f)\n",
+               s_snap.errors, s_snap.max_diff, s_snap.max_rel, errors, max_diff);
+
+        // Stage probe 2: row addressing, scale selection and dequantization.
+        // Exact under every activation branch, so any error here is structural.
+        for (int p = 0; p < n_one_hot; ++p) {
+            const std::vector<float> & got = staged.outputs[2 + p];
+            std::vector<float>         want(nrows);
+            for (int i = 0; i < nrows; ++i) {
+                want[i] = one_hot_expected(x_aos, ncols, i, one_hot_cols[p]);
+            }
+            const oracle_score s             = score_against(got, want, 1e-3f);
+            const int          elem_in_block = one_hot_cols[p] % QK4_0;
+            printf("    PROBE one-hot col=%-6d (block=%-4d byte=%-3d plane=%d %s nibble): errors=%d max_diff=%.6f",
+                   one_hot_cols[p], one_hot_cols[p] / QK4_0, elem_in_block % (QK4_0 / 2),
+                   (elem_in_block % (QK4_0 / 2)) / 4, elem_in_block < QK4_0 / 2 ? "low " : "high", s.errors,
+                   s.max_diff);
+            if (s.first_bad >= 0) {
+                printf(" first_bad_row=%d gpu=%.6f want=%.6f", s.first_bad, got[s.first_bad], want[s.first_bad]);
+            }
+            printf("\n");
+        }
+
+        // The first divergent row, with every oracle side by side. A ratio near
+        // one with an additive offset reads as a rounding/quantization stage; a
+        // ratio that wanders reads as a structural one.
+        if (s_dfloat.first_bad >= 0) {
+            const int i = s_dfloat.first_bad;
+            printf(
+                "    first divergent row=%d: gpu=%.6f f32=%.6f dfloat=%.6f q8=%.6f"
+                " q8_1_mmvq=%.6f layout_bytes=%.6f  gpu/dfloat=%.6f\n",
+                i, gpu_out[i], ref_f32[i], ref[i], ref_q8[i], ref_mmvq[i], ref_from_layout[i],
+                ref[i] != 0.0f ? gpu_out[i] / ref[i] : 0.0f);
+        }
     }
     return pass;
 }
@@ -1149,6 +1495,23 @@ int main() {
     // priority list would take DMMV_SOA.
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
+    // Without this, NONE of the above binds and the test measures MMVQ
+    // (llama.cpp-szv8, hardware-confirmed). ggml-sycl.cpp's TG fast-path claims
+    // every batch=1 quantized mul_mat whose weight resolved to a non-AoS layout
+    // and dispatches
+    //   ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(..., resolved.layout)
+    // then returns -- its own comment says it "bypasses orchestrator, name
+    // parsing, prefetch, TP checks for maximum speed". GGML_SYCL_FORCE_DMMV and
+    // the layout override's KERNEL choice are both consulted downstream of that
+    // return, so neither is ever reached. The override still binds on the
+    // MATERIALIZATION side, which is why every precondition here passed while
+    // the answer came from a different kernel: the coalesced buffer was built,
+    // verified byte-exact, and then read by MMVQ.
+    //
+    // GGML_SYCL_TG_FAST=0 is that path's documented disable and falls through to
+    // the unified/orchestrator dispatch, where pick_kernel_for_layout(COALESCED)
+    // at batch=1 answers DMMV_COALESCED.
+    setenv("GGML_SYCL_TG_FAST", "0", 1);
     // Required by ggml_backend_sycl_register_host_weight_tensor(), which returns
     // early without it -- the tensor would then never reach S1-PRELOAD.
     setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);
