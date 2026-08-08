@@ -37467,7 +37467,10 @@ static void topk_f32_i32_sycl(const float * x,
             const int row        = item_ct1.get_global_id(1);
             const int block_size = item_ct1.get_local_range(2);
 
-            // Initialize local top-K with -inf
+            // Initialize local top-K with -inf. A slot with a negative index is
+            // empty and ranks below every real column, including a -inf one --
+            // CPU top_k seeds all ne00 indices and so never returns an empty
+            // slot, and ggml_top_k guarantees ncols >= k real columns exist.
             float local_vals[SYCL_TOPK_MAX_K];
             int   local_idxs[SYCL_TOPK_MAX_K];
             for (int i = 0; i < k; i++) {
@@ -37480,10 +37483,10 @@ static void topk_f32_i32_sycl(const float * x,
             for (int col = tid; col < ncols; col += block_size) {
                 float val = x[row * ncols + col];
                 // Check if this value should be in top-K
-                if (val > local_vals[k - 1]) {
+                if (local_idxs[k - 1] < 0 || val > local_vals[k - 1]) {
                     // Find insertion position
                     int pos = k - 1;
-                    while (pos > 0 && val > local_vals[pos - 1]) {
+                    while (pos > 0 && (local_idxs[pos - 1] < 0 || val > local_vals[pos - 1])) {
                         pos--;
                     }
                     // Shift elements down
@@ -37513,14 +37516,18 @@ static void topk_f32_i32_sycl(const float * x,
                     int   i = 0, j = 0, m = 0;
                     while (m < k && (i < k || j < k)) {
                         float v1 = (i < k) ? shared_vals[tid * SYCL_TOPK_MAX_K + i] : -INFINITY;
+                        int   c1 = (i < k) ? shared_idxs[tid * SYCL_TOPK_MAX_K + i] : -1;
                         float v2 = (j < k) ? shared_vals[(tid + stride) * SYCL_TOPK_MAX_K + j] : -INFINITY;
-                        if (v1 >= v2) {
+                        int   c2 = (j < k) ? shared_idxs[(tid + stride) * SYCL_TOPK_MAX_K + j] : -1;
+                        // an empty slot carries -inf just like a real -inf column does,
+                        // so occupancy has to decide before the value does
+                        if ((c1 >= 0) != (c2 >= 0) ? c1 >= 0 : v1 >= v2) {
                             merged_vals[m] = v1;
-                            merged_idxs[m] = shared_idxs[tid * SYCL_TOPK_MAX_K + i];
+                            merged_idxs[m] = c1;
                             i++;
                         } else {
                             merged_vals[m] = v2;
-                            merged_idxs[m] = shared_idxs[(tid + stride) * SYCL_TOPK_MAX_K + j];
+                            merged_idxs[m] = c2;
                             j++;
                         }
                         m++;
