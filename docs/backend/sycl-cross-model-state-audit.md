@@ -627,20 +627,20 @@ which calls into `ggml_sycl_info()`) — it was not run by this pass per the
 
 ---
 
-# Merge-readiness cross-model outcomes (plan Task 18)
+## Merge-readiness cross-model outcomes (plan Task 18)
 
 Two correctness investigations that this audit's subject matter — state that
 outlives one model inside one process — produced during merge readiness. Both
 are recorded with their **actual** disposition. Neither is a fix.
 
-## gemma3n cross-model wrong answers (`llama.cpp-8t4s`) — closed NON-BLOCKING, not fixed
+### gemma3n cross-model wrong answers (`llama.cpp-8t4s`) — closed NON-BLOCKING, not fixed
 
 ⚠️ **The underlying defect is ALIVE and LATENT at HEAD.** It is fenced by a
 mutation-proven guard, and the trigger that historically evaded that guard is no
 longer active. That is a materially different claim from "fixed", and the
 difference is the whole reason this ticket carries a standing reopen rule.
 
-### What was observed, and where
+#### What was observed, and where
 
 All on the B70, `ONEAPI_DEVICE_SELECTOR=level_zero:0`:
 
@@ -662,7 +662,7 @@ different absolute path, so its binary layout differs from the original, and the
 original build directory is gone. A bit-identical rerun is impossible. That is
 not a flaw in the experiment; it is the layout theory's own prediction.
 
-### The mechanism, and why "latent" is the right word
+#### The mechanism, and why "latent" is the right word
 
 The `llama.cpp-81gx` guard is:
 
@@ -694,7 +694,7 @@ teardown hardening (this document's own `g_sycl_weight_usages` fix among them),
 but attribution to a specific commit is impossible now that the triggering state
 cannot be reconstructed.
 
-### Standing rules
+#### Standing rules
 
 - **Never weaken the 81gx guard.** It is the only thing between a live defect and
   wrong answers.
@@ -710,7 +710,7 @@ cannot be reconstructed.
   graph-internal tensor) so a unit test can actually go RED on this defect
   instead of relying on a 130-arch sweep to notice.
 
-## Q4_0 coalesced DMMV wrong answers (`llama.cpp-szv8`) — UNRESOLVED
+### Q4_0 coalesced DMMV wrong answers (`llama.cpp-szv8`) — UNRESOLVED
 
 **Status: open / in_progress.** This is a pre-existing claim carried into merge
 readiness, and it is recorded here as unresolved. It does not block `f813` per
