@@ -641,9 +641,10 @@ one.
 37ba gate adjudication, `c-634z`, citing `m72w`'s "two graph drains separated
 by pool-retained release, not proven redundant").** The graph-boundary block
 in `ggml_backend_sycl_graph_compute` (`ggml-sycl.cpp`, immediately before the
-`unified_cache_reset_scratch_pool` / `unified_cache_host_zone_reset(STAGING)`
-/ `unified_cache_host_zone_reset(SCRATCH)` call sites C1/C2 target) contains
-exactly this shape: `ggml_sycl_cpu_staging_drain()` (WEDGE-48330, waits on
+`unified_cache_scratch_pool_epoch_boundary` / `unified_cache_host_zone_boundary_check(STAGING)`
+/ `unified_cache_host_zone_boundary_check(SCRATCH)` call sites C1/C2 target,
+renamed by `llama.cpp-37ba` — see this document's "Step 4" subsection)
+contains exactly this shape: `ggml_sycl_cpu_staging_drain()` (WEDGE-48330, waits on
 `g_cpu_staging`'s host_task/compute completion events), then a pool-retained
 release (`ggml_sycl_cpu_staging_release()`, which drops `g_cpu_staging`'s
 leases back to the offload pool with **no wait of its own**), then a second

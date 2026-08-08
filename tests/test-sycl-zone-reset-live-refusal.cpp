@@ -144,6 +144,16 @@ void test_vram_zone(int device, unified_cache * cache, sycl::queue * queue) {
         unified_free(handle);
         return;
     }
+    if (zone == vram_zone_id::WEIGHT) {
+        // Neither zone_boundary_check() nor zone_reclaim() admits WEIGHT
+        // (llama.cpp-37ba) -- calling either would fail the entry assert
+        // before ever reaching zone_settle()'s own WEIGHT refusal, aborting
+        // this binary instead of failing this one check. Mirrors
+        // test_host_zone()'s identical guard below.
+        check(false, "allocation landed outside the WEIGHT zone");
+        unified_free(handle);
+        return;
+    }
 
     // Dynamic dispatch, not a hardcoded wrapper call: zone_boundary_check()
     // (ONEDNN/SCRATCH) and zone_reclaim() (KV/RUNTIME) now assert which zones

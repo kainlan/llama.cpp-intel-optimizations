@@ -678,10 +678,10 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
     // STAGING/SCRATCH call sites are now the truthfully-named liveness/audit
     // checkpoint, host_zone_boundary_check() -- see the naming rationale in
     // docs/backend/sycl-memory-design.md's "Step 4" subsection.
-    const size_t staging_reset_pos = boundary_reset.find(
-        "ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::STAGING)");
-    const size_t scratch_reset_pos = boundary_reset.find(
-        "ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::SCRATCH)");
+    const size_t      staging_reset_pos =
+        boundary_reset.find("ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::STAGING)");
+    const size_t scratch_reset_pos =
+        boundary_reset.find("ggml_sycl::unified_cache_host_zone_boundary_check(ggml_sycl::host_zone_id::SCRATCH)");
     CHECK(drain_pos != std::string::npos && staging_reset_pos != std::string::npos &&
               scratch_reset_pos != std::string::npos && drain_pos < staging_reset_pos && drain_pos < scratch_reset_pos,
           "graph-boundary reset must drain retained mem_copy staging handles before the host STAGING/SCRATCH "
