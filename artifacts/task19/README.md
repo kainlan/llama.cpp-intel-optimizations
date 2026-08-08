@@ -32,7 +32,12 @@ there — and an empty or missing evidence directory means *not verified*, never
 | `task19-names.txt` | the 50 accepted CTest names fed to the runner |
 | `task19-registered.txt` | `ctest -N` output reconciled against the accepted set before execution |
 | `task19-results.tsv` | one row per name: verdict, non-vacuity control, `Shmem` before → after |
-| `failing-logs/` | the full captured log of each of the 11 failing tests |
+| `failing-logs/` | the full captured output of each of the 11 failing tests, one `.txt` per test |
+
+The captures are `.txt`, not `.log`, because the repository's `.gitignore` line
+17 is `*.log` — committing them under their original extension silently
+committed nothing, leaving this README pointing at an empty directory. Same
+convention as `artifacts/triage/`. Keep it.
 
 ## Result
 

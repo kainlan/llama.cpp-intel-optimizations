@@ -1,0 +1,124 @@
+Test project /Apps/llama.cpp/build
+    Start 150: test-sycl-moe-identity-hash
+1/1 Test #150: test-sycl-moe-identity-hash ......***Failed    0.59 sec
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+  weight key: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x6fef520cddfce3c0 type=2 aux_id=1
+  FAIL: model_id mismatch
+  FAIL: test_single_weight_name_hash
+  blk.0.ffn_gate.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x6fef520cddfce3c0 type=2 aux_id=1
+  blk.0.ffn_up.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x74919db2149cd436 type=2 aux_id=2
+  blk.0.ffn_down.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9217 name_hash=0xac38173202bd7abb type=2 aux_id=3
+  blk.1.ffn_gate.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9217 name_hash=0x6dec5f18f0f78e5a type=2 aux_id=4
+  blk.1.ffn_up.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9218 name_hash=0xd5fed533d7a9f43d type=2 aux_id=5
+  blk.1.ffn_down.weight: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9218 name_hash=0xbe3c27e272f3ab58 type=2 aux_id=6
+  blk.0.ffn_gate_exps.weight.0: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x6509d18a60d29d4e type=2 aux_id=7
+  blk.0.ffn_gate_exps.weight.1: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x9fdd816cca60c261 type=2 aux_id=8
+  blk.0.ffn_gate_exps.weight.2: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x994f13254a124f5c type=2 aux_id=9
+  blk.0.ffn_gate_exps.weight.3: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x4399ed39f69a7a99 type=2 aux_id=10
+  blk.0.ffn_gate_exps.weight.4: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x4fe5cfe2c4247bec type=2 aux_id=11
+  blk.0.ffn_gate_exps.weight.5: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0xfa30a9f770ad906e type=2 aux_id=12
+  blk.0.ffn_gate_exps.weight.6: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0x5eee769f1e19df50 type=2 aux_id=13
+  blk.0.ffn_gate_exps.weight.7: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=9216 name_hash=0xd609476443832666 type=2 aux_id=14
+  ffn_moe_probs: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0x19122a5a5f1f4d3d type=0 aux_id=15
+  ffn_moe_probs.0: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0x730bcba1e4eb744 type=0 aux_id=16
+  ffn_moe_probs.1: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0x3bd7973be7355448 type=0 aux_id=17
+  ffn_moe_indices: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0x86f3ce7a10a6620d type=0 aux_id=18
+  expert_weights: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0xec64da3465a41bff type=0 aux_id=19
+  expert_ids: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0xa6d373ff9729b85c type=0 aux_id=20
+  unnamed tensor: valid=1 model=0 has_gguf=0 file_idx=0 file_offs=0 nbytes=16384 name_hash=0xb61d25a289a3b09e type=0 aux_id=21
+  Hash of 'unknown': 0xb61d25a289a3b09e
+  Layer 0, Weight 0, Expert 0: aux_id=0x9e3779b97f4b74e7
+  Layer 0, Weight 0, Expert 1: aux_id=0x9e3779b97f4b74f8
+  Layer 0, Weight 0, Expert 2: aux_id=0x9e3779b97f4b74f9
+  Layer 0, Weight 0, Expert 3: aux_id=0x9e3779b97f4b74fa
+  Layer 0, Weight 0, Expert 4: aux_id=0x9e3779b97f4b74fb
+  Layer 0, Weight 0, Expert 5: aux_id=0x9e3779b97f4b74fc
+  Layer 0, Weight 0, Expert 6: aux_id=0x9e3779b97f4b74fd
+  Layer 0, Weight 0, Expert 7: aux_id=0x9e3779b97f4b74fe
+  Layer 0, Weight 1, Expert 0: aux_id=0x9e3779b97f4b74a6
+  Layer 0, Weight 1, Expert 1: aux_id=0x9e3779b97f4b74b9
+  Layer 0, Weight 1, Expert 2: aux_id=0x9e3779b97f4b74b8
+  Layer 0, Weight 1, Expert 3: aux_id=0x9e3779b97f4b74bb
+  Layer 0, Weight 1, Expert 4: aux_id=0x9e3779b97f4b74ba
+  Layer 0, Weight 1, Expert 5: aux_id=0x9e3779b97f4b74bd
+  Layer 0, Weight 1, Expert 6: aux_id=0x9e3779b97f4b74bc
+  Layer 0, Weight 1, Expert 7: aux_id=0x9e3779b97f4b74bf
+  Layer 0, Weight 2, Expert 0: aux_id=0x9e3779b97f4b7465
+  Layer 0, Weight 2, Expert 1: aux_id=0x9e3779b97f4b747a
+  Layer 0, Weight 2, Expert 2: aux_id=0x9e3779b97f4b747b
+  Layer 0, Weight 2, Expert 3: aux_id=0x9e3779b97f4b7478
+  Layer 0, Weight 2, Expert 4: aux_id=0x9e3779b97f4b7479
+  Layer 0, Weight 2, Expert 5: aux_id=0x9e3779b97f4b747e
+  Layer 0, Weight 2, Expert 6: aux_id=0x9e3779b97f4b747f
+  Layer 0, Weight 2, Expert 7: aux_id=0x9e3779b97f4b747c
+  Layer 1, Weight 0, Expert 0: aux_id=0x9e3779b97f4b7424
+  Layer 1, Weight 0, Expert 1: aux_id=0x9e3779b97f4b743b
+  Layer 1, Weight 0, Expert 2: aux_id=0x9e3779b97f4b743a
+  Layer 1, Weight 0, Expert 3: aux_id=0x9e3779b97f4b7439
+  Layer 1, Weight 0, Expert 4: aux_id=0x9e3779b97f4b7438
+  Layer 1, Weight 0, Expert 5: aux_id=0x9e3779b97f4b743f
+  Layer 1, Weight 0, Expert 6: aux_id=0x9e3779b97f4b743e
+  Layer 1, Weight 0, Expert 7: aux_id=0x9e3779b97f4b743d
+  Layer 1, Weight 1, Expert 0: aux_id=0x9e3779b97f4b7bfc
+  Layer 1, Weight 1, Expert 1: aux_id=0x9e3779b97f4b7bfd
+  Layer 1, Weight 1, Expert 2: aux_id=0x9e3779b97f4b7bfe
+  Layer 1, Weight 1, Expert 3: aux_id=0x9e3779b97f4b7bff
+  Layer 1, Weight 1, Expert 4: aux_id=0x9e3779b97f4b7bf8
+  Layer 1, Weight 1, Expert 5: aux_id=0x9e3779b97f4b7bf9
+  Layer 1, Weight 1, Expert 6: aux_id=0x9e3779b97f4b7bfa
+  Layer 1, Weight 1, Expert 7: aux_id=0x9e3779b97f4b7bfb
+  Layer 1, Weight 2, Expert 0: aux_id=0x9e3779b97f4b7bbd
+  Layer 1, Weight 2, Expert 1: aux_id=0x9e3779b97f4b7bbc
+  Layer 1, Weight 2, Expert 2: aux_id=0x9e3779b97f4b7bbf
+  Layer 1, Weight 2, Expert 3: aux_id=0x9e3779b97f4b7bbe
+  Layer 1, Weight 2, Expert 4: aux_id=0x9e3779b97f4b7bb9
+  Layer 1, Weight 2, Expert 5: aux_id=0x9e3779b97f4b7bb8
+  Layer 1, Weight 2, Expert 6: aux_id=0x9e3779b97f4b7bbb
+  Layer 1, Weight 2, Expert 7: aux_id=0x9e3779b97f4b7bba
+=== SYCL MoE Identity Hash Collision Tests ===
+
+TEST: test_single_weight_name_hash
+TEST: test_different_weights_different_hashes
+  All 6 tensors have unique name_hashes
+  PASS: test_different_weights_different_hashes
+TEST: test_moe_expert_weights_unique
+  All 8 MoE expert weights have unique cache keys
+  PASS: test_moe_expert_weights_unique
+TEST: test_moe_intermediate_tensors_unique
+  All 6 MoE intermediate tensors have unique cache keys
+  PASS: test_moe_intermediate_tensors_unique
+TEST: test_unknown_tensor_name_hash
+  PASS: test_unknown_tensor_name_hash
+TEST: test_cache_id_equality
+  cache_id_equal properly distinguishes IDs by name_hash and aux_id
+  PASS: test_cache_id_equality
+TEST: test_moe_expert_cache_key_collision_scenario
+  All 48 MoE expert cache keys are unique (name_hash=0 path)
+  Testing collision scenario: two tensors with same cache_uuid...
+  Same uuid + same expert = equal keys (correct)
+  Same uuid + different expert = different keys (correct)
+  PASS: test_moe_expert_cache_key_collision_scenario
+
+=== Summary ===
+Tests run: 7, Passed: 6, Failed: 1
+
+FAILED: Some tests did not pass. See above for details.
+This indicates the identity hash collision bug (llama.cpp-twc) is still present.
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+0igs-batch2    =   0.59 sec*proc (1 test)
+moe            =   0.59 sec*proc (1 test)
+sycl           =   0.59 sec*proc (1 test)
+tdd            =   0.59 sec*proc (1 test)
+
+Total Test time (real) =   0.59 sec
+
+The following tests FAILED:
+	150 - test-sycl-moe-identity-hash (Failed)              0igs-batch2 moe sycl tdd
+Errors while running CTest

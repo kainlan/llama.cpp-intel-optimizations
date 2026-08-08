@@ -1,0 +1,256 @@
+Test project /Apps/llama.cpp/build
+    Start 136: test-ggml-sycl-soa
+1/1 Test #136: test-ggml-sycl-soa ...............Subprocess aborted***Exception:   4.15 sec
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+| 0| [level_zero:gpu:0]|      Y|
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32600.7 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32024.7 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32600.7 MB budget=32024.7 MB (100%)
+[VRAM-ARENA] External headroom 631 MB (caller-reserved 631 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32024.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32024.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32024.0 MB total (weight=30493.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32024.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e67e30000 + 512.0 MB (offset 31512.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 189.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 189.3 GB budget, committed=0.0 GB (system total=246.9 GB available=197.3 GB reserve=8.0 GB pct=90)
+[SYCL] tensor usage UNKNOWN: name=test_weight type=q4_0 ne=[2048,64,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] tensor usage UNKNOWN: name=ffn_weight type=q4_0 ne=[4096,11008,1,1]
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG
+[SYCL] tensor usage UNKNOWN: name=leaf_0 type=q4_0 ne=[256,512,1,1]
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +46.2 MB (total 70.5 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +7.3 MB (total 31.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL-ZERO-ALLOC-CHECK] graph_compute: runtime allocation detected during tg phase: +35.3 MB (total 59.6 MB, baseline 24.2 MB). Expected zero new allocations during steady-state inference.
+[SYCL] tensor usage UNKNOWN: name=gate_0 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_0 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_0 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_1 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_1 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_1 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_2 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_2 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_2 type=q4_0 ne=[14336,4096,1,1]
+[SYCL] tensor usage UNKNOWN: name=gate_3 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=up_3 type=q4_0 ne=[4096,14336,1,1]
+[SYCL] tensor usage UNKNOWN: name=down_3 type=q4_0 ne=[14336,4096,1,1]
+[GRAPH-COMPUTE] device 0 below arena external driver headroom: free=235.6 MB target=256.0 MB. Continuing because arena scratch is already reserved internally.
+SYCL Graph: decode node count changed 1 -> 16 (variance #1)
+[UNIFIED-CACHE] Budget summary for device 0:
+  Total VRAM budget:     32024.7 MB
+  Weight bytes (used_):      0.0 MB
+  Runtime reserved:        378.1 MB
+  Total committed:         378.1 MB  (weights + runtime)
+  Total available:       31646.6 MB  (budget - committed)
+  Effective budget:      32024.7 MB
+  Available for alloc:   32024.7 MB
+  Avail for weights:     31646.6 MB
+  Budget pct:                 90 %
+  Model exceeds VRAM:         no
+[UNIFIED-CACHE] Runtime breakdown for device 0:
+  KV_ZONE           0.0 MB
+  ONEDNN_ZONE       0.0 MB
+  RUNTIME_ZONE    378.1 MB
+  SCRATCH_ZONE      0.0 MB
+[UNIFIED-CACHE] Note: external runtime tracker (378.1 MB) differs from internal reserved (0.0 MB) on device 0
+[SYCL] tensor usage UNKNOWN: name=TEST8_WEIGHT type=q4_0 ne=[4096,4096,1,1]
+SYCL Graph: decode node count changed 16 -> 1 (variance #2)
+[SYCL] tensor usage UNKNOWN: name=TEST9_MINIMAL type=q4_0 ne=[64,64,1,1]
+[SYCL] tensor usage UNKNOWN: name=TEST10_SINGLE_BLOCK type=q4_0 ne=[32,1,1,1]
+=== GGML SYCL SoA Integration Tests ===
+Using ACTUAL ggml backend API functions
+
+Layout override: Auto (layout policy)
+
+Test 1: Buffer initialization with ggml_backend_buffer_init_tensor
+  Backend: SYCL0
+  tensor->extra: set (SoA)
+  PASS: Buffer initialization completed
+
+Test 2: MUL_MAT graph execution with Q4_0 weights
+  Executing MUL_MAT graph...
+  Output: 11008/11008 non-zero values, sum=10116080.0000
+  Weight extra: 0x270c180
+  Input extra: 0x278bab0
+  PASS: MUL_MAT produced non-zero output
+
+Test 3: Prompt → Decode transition (bug scenario)
+  Phase 1: Prompt (batch=8 tokens)
+    Prompt output: 88064/88064 non-zero
+  Phase 2: Decode (batch=1 token)
+    Decode output: 11008/11008 non-zero
+  PASS: Both phases produce non-zero output
+
+Test 4: Numerical output verification
+  Output stats: non_zero=512/512, min=-128.1172, max=-128.1172, avg=-128.1172
+  First 10 values: -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 -128.117 
+  Mode: Auto (layout policy)
+  PASS: Output verified
+
+Test 5: Actual Mistral 7B layer dimensions
+  Testing token_embd [4096, 32000]... PASS (32000 non-zero)
+  Testing q_proj [4096, 4096]... PASS (4096 non-zero)
+  Testing k_proj [4096, 1024]... PASS (1024 non-zero)
+  Testing v_proj [4096, 1024]... PASS (1024 non-zero)
+  Testing o_proj [4096, 4096]... PASS (4096 non-zero)
+  Testing gate_proj [4096, 14336]... PASS (14336 non-zero)
+  Testing up_proj [4096, 14336]... PASS (14336 non-zero)
+  Testing down_proj [14336, 4096]... PASS (4096 non-zero)
+  Subtests: 8 passed, 0 failed
+
+Test 6: Q4_0 vs Q8_0 comparison (same dimensions)
+  Q4_0 test...
+    Q4_0: 14336/14336 non-zero, sum=-29387776.00, first=[-2049.8750,-2049.8750,-2049.8750]
+  Q8_0 test...
+    Q8_0: 14336/14336 non-zero, sum=-29359872.00, first=[-200691.7500,196596.0000,-200691.7500]
+  PASS: Both Q4_0 and Q8_0 produce non-zero output
+
+Test 7: Sequential MUL_MAT operations (multi-layer simulation)
+  Executing 4-layer graph...
+  Output: 4096/4096 non-zero, sum=nan
+  PASS: Multi-layer graph produced non-zero output
+
+Test 8: Q4_0 DMMV correctness (GPU vs CPU reference)
+  [DEBUG] weight->data = 0xffffd55e47e30000
+  [DEBUG] weight->extra = 0x270c180
+  [DEBUG] buffer base = 0xffffd55e47e30000
+
+  === SoA Memory Layout Debug ===
+  Tensor size: 9437184 bytes (524288 blocks x 18 = 9437184)
+  blocks_per_row: 128
+  Expected SoA qs section: 0 to 8388608
+  Expected SoA d offset: 8388608
+
+  First 20 bytes (hex): ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 
+  Bytes at d_offset 8388608 (should be fp16 d values): 00 3c 00 3c 00 3c 00 3c 00 3c 
+  d[0] raw = 0x3c00 (expected 0x3C00 for 1.0)
+  d[1] raw = 0x3c00 (expected 0x3C00 for 1.0)
+
+  AoS interpretation (if NOT reordered):
+  block[0].d = 0xffff, qs[0]=0xff
+  block[1].d = 0xffff, qs[0]=0xff
+
+  Manual SoA calculation for row 0:
+    block[0]: d_off=8388608 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+    block[1]: d_off=8388610 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+    block[2]: d_off=8388612 d_raw=0x3c00 d_float=1.00 block_sum=224.0
+  First 5 blocks sum: 1120.0 (expected 5 * 224 = 1120)
+  === End Debug ===
+
+  === Input Upload Verification ===
+  input->data = 0xffffd55e48730000
+  input->extra = 0x3444470
+  input_data[0..3] = [1.00, 1.00, 1.00, 1.00] (expected all 1.0)
+  GPU readback[0..7] = [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]
+  GPU readback[0] hex = 0x3f800000 (expected 0x3F800000 for 1.0f)
+  === End Input Verification ===
+
+  Dimensions: 4096 x 4096, 524288 blocks
+  Max diff: 3.750000 at row 0 (GPU=28668.2500, CPU=28672.0000)
+  First 5 GPU:  [28668.2500, 28668.2500, 28668.2500, 28668.2500, 28668.2500]
+  First 5 CPU:  [28672.0000, 28672.0000, 28672.0000, 28672.0000, 28672.0000]
+  PASS: GPU output matches CPU reference
+
+Test 9: Minimal dimension DMMV (64x64, batch=1)
+  Expected value per row: 448.0
+  First 10 GPU outputs: 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 447.9 
+  PASS: All 64 rows match expected value 448.0
+
+Test 10: Single Q4_0 block (32x1, batch=1)
+Non-uniform work-groups are not supported by the target device
+Exception caught at file:/Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:38688, func:operator()
+SYCL error: CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_row_size, stream)): Exception caught in this line of code.
+  in function ggml_sycl_op_mul_mat at /Apps/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:38688
+/Apps/llama.cpp/ggml/src/ggml-sycl/../ggml-sycl/common.hpp:551: SYCL error
+[New LWP 1997136]
+[New LWP 1997135]
+[New LWP 1997121]
+[New LWP 1996979]
+[New LWP 1996937]
+⚠️ warning: File "/opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/redist/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x00007ad5edea061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x00007ad5edf1cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x00007ad5f686dcda in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#5  0x00007ad5f686ce49 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#6  0x00007ad5ef038ec8 in ggml_sycl_error(char const*, char const*, char const*, int, char const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x00007ad5ef1ca11d in bool ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, void (*)(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, char const*, float const*, char const*, float*, long, long, long, long, sycl::_V1::queue* const&), ggml_layout_mode) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x00007ad5ef1b0772 in ggml_sycl_mul_mat(ggml_backend_sycl_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, ggml_layout_mode const*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x00007ad5ef20a6a7 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#10 0x00007ad5ef2ec9f7 in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#11 0x00007ad5ef16492f in ggml_backend_sycl_graph_compute_unchecked(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#12 0x00007ad5ef154525 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#13 0x00007ad5f6892d0c in ggml_backend_graph_compute () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#14 0x0000000000413b8d in test_single_block() ()
+#15 0x000000000041b754 in main ()
+[Inferior 1 (process 1996916) detached]
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+0igs-batch2    =   4.15 sec*proc (1 test)
+layout         =   4.15 sec*proc (1 test)
+sycl           =   4.15 sec*proc (1 test)
+tdd            =   4.15 sec*proc (1 test)
+
+Total Test time (real) =   4.15 sec
+
+The following tests FAILED:
+	136 - test-ggml-sycl-soa (Subprocess aborted)           0igs-batch2 layout sycl tdd
+Errors while running CTest

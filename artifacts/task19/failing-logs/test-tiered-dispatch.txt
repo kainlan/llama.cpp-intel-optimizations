@@ -1,0 +1,287 @@
+Test project /Apps/llama.cpp/build
+    Start 166: test-tiered-dispatch
+1/1 Test #166: test-tiered-dispatch .............***Failed    0.92 sec
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32602.6 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32026.6 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32602.6 MB budget=32026.6 MB (100%)
+[VRAM-ARENA] External headroom 629 MB (caller-reserved 629 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32026.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32026.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32026.0 MB total (weight=30495.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32026.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e68034000 + 512.0 MB (offset 31514.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 189.8 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 189.8 GB budget, committed=0.0 GB (system total=246.9 GB available=197.8 GB reserve=8.0 GB pct=90)
+[SYCL-PLAN] inventory oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=572.5 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=0.0 MB, exceeds_budget=false
+[SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32083.5 MB, headroom=0.0 MB
+[SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=0.0 MB
+[VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+[VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
+[VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+[VRAM-BUDGET]   Available:       32656.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+[SYCL] Plan budget tied to arena: 32026.0 MB arena (shared zone 30746.0 MB after 1280.0 MB zones)
+[PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32026.0 MB, weight zone=30495.8 MB)
+[SYCL-PLAN] inventory top-8 of 4 tensors (total 0.0 MB): all-device-first.blk.1.attn_q.weight=0.0MB(t43,0x0) all-device-first.blk.3.attn_q.weight=0.0MB(t43,0x0) all-device-first.blk.0.attn_q.weight=0.0MB(t43,0x0) all-device-first.blk.2.attn_q.weight=0.0MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 4 tensors; cardinality histogram: 4x1; largest card>=4: all-device-first.blk.0.attn_q.weight 0.0MB (card=4); largest card<=2: none
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.0 MB total=64.0 MB
+[PLACEMENT] ATTENTION       device=  4 (0.0 MB)  host=  0 (0.0 MB)
+[PLACEMENT] layer   0  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   1  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   2  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   3  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] KV sizing: n_layer=4 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=32026.0 MB)
+[SYCL] Placement plan computed: 4 entries, 0.0 MB device + 0.0 MB host
+[PLACE-4] device weight zone: 0.0 MB (4 tensors), host arena: 0.0 MB (0 tensors)
+[MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+[SYCL] Tensor inventory set: 4 tensors, 0.00 GB total (VRAM: 0.56 GB free, planner host placement: no)
+FAIL: all-device-first has no planner target for all-device-first.blk.0.attn_q.weight
+FAIL: all-device-first has no planner target for all-device-first.blk.1.attn_q.weight
+FAIL: all-device-first has no planner target for all-device-first.blk.2.attn_q.weight
+FAIL: all-device-first has no planner target for all-device-first.blk.3.attn_q.weight
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL-PLAN] inventory oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 510.3 MB)
+[SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=572.5 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=32656.0 MB, exceeds_budget=true
+[LAYER-STREAM] Built layer map: 64 layers, max_layer_size=510.3 MB, total_entries=64
+[LAYER-STREAM] Failed to allocate buffer 1 (512.0 MB)
+[SYCL-BUDGET] Layer streaming buffer allocation failed
+[SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32083.5 MB, headroom=0.0 MB
+[SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=32656.0 MB
+[SYCL] Tiered headroom reserve: 8164.0 MB (base headroom 0.0 MB, total 32656.0 MB)
+[VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+[VRAM-BUDGET]   Weights (dense): 32656.0 MB  [priority 1]
+[VRAM-BUDGET]   Headroom:        8164.0 MB  (scratch + KV + runtime)
+[VRAM-BUDGET]   Available:       0.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+[SYCL] Plan budget tied to arena: 32026.0 MB arena (shared zone 30746.0 MB after 1280.0 MB zones)
+[PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32026.0 MB, weight zone=30495.8 MB)
+[SYCL-PLAN] zone sizing found no repeated (type, ne) group in 64 inventory entries (0 distinct groups, 64 without a shape): every path-scoped maximum collapsed to zero and each zone falls back to the global 510.3 MB maximum, reclaiming nothing. If this model really is all singletons that is legitimate; otherwise the inventory adapter is not carrying type/ne/has_shape into zone_tensor_desc.
+[SYCL-PLAN] inventory top-8 of 64 tensors (total 32656.0 MB): over-budget-second.blk.7.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.4.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.1.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.3.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.5.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.0.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.2.attn_q.weight=510.3MB(t43,0x0) over-budget-second.blk.6.attn_q.weight=510.3MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 64 tensors; cardinality histogram: 64x1; largest card>=4: over-budget-second.blk.48.attn_q.weight 510.3MB (card=64); largest card<=2: none
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 510.3 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 510.3 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 510.3 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=1022.5 MB total=1038.5 MB
+[PLACEMENT] ATTENTION       device= 59 (30104.8 MB)  host=  5 (2551.3 MB)
+[PLACEMENT] layer   0  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   1  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   2  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   3  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   4  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   5  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   6  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   7  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   8  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   9  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  10  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  11  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  12  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  13  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  14  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  15  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  16  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  17  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  18  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  19  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  20  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  21  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  22  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  23  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  24  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  25  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  26  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  27  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  28  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  29  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  30  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  31  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  32  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  33  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  34  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  35  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  36  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  37  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  38  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  39  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  40  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  41  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  42  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  43  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  44  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  45  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  46  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  47  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  48  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  49  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  50  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  51  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  52  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  53  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  54  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  55  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  56  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  57  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  58  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer  59  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=host -1  kv_target=host -1
+[PLACEMENT] layer  60  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=host -1  kv_target=host -1
+[PLACEMENT] layer  61  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=host -1  kv_target=host -1
+[PLACEMENT] layer  62  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=host -1  kv_target=host -1
+[PLACEMENT] layer  63  weight=510.3 MB  kv=0.0 MB (full)  total=510.3 MB  dense_target=host -1  kv_target=host -1
+[PLACEMENT] KV sizing: n_layer=64 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT] Totals: weights=30104.8 MB device + 2551.3 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT] Total: 30104.8 MB device + 2551.3 MB host (budget=32026.0 MB)
+[SYCL] Placement plan computed: 64 entries, 30104.8 MB device + 2551.3 MB host
+[PLACE-4] device weight zone: 30104.8 MB (59 tensors), host arena: 2551.3 MB (5 tensors)
+[MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+[SYCL] Tensor inventory set: 64 tensors, 31.89 GB total (VRAM: 0.56 GB free, planner host placement: no)
+FAIL: over-budget-second has no planner target for over-budget-second.blk.0.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.1.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.2.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.3.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.4.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.5.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.6.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.7.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.8.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.9.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.10.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.11.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.12.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.13.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.14.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.15.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.16.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.17.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.18.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.19.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.20.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.21.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.22.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.23.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.24.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.25.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.26.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.27.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.28.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.29.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.30.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.31.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.32.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.33.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.34.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.35.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.36.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.37.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.38.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.39.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.40.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.41.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.42.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.43.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.44.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.45.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.46.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.47.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.48.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.49.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.50.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.51.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.52.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.53.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.54.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.55.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.56.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.57.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.58.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.59.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.60.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.61.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.62.attn_q.weight
+FAIL: over-budget-second has no planner target for over-budget-second.blk.63.attn_q.weight
+FAIL: over-budget planner oracle found no host target
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL-PLAN] inventory oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-BUDGET] budget_pct=100%, vram_budget=32656.0 MB (free=572.5 MB), arena_zones=1280.0 MB, weight_budget=31376.0 MB, model_size=0.0 MB, exceeds_budget=false
+[SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=32083.5 MB, headroom=0.0 MB
+[SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=32656.0 MB, model_size=0.0 MB
+[VRAM-BUDGET] Device 0: 32656.0 MB total, 32656.0 MB budget (100%)
+[VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
+[VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+[VRAM-BUDGET]   Available:       32656.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+[SYCL] Plan budget tied to arena: 32026.0 MB arena (shared zone 30746.0 MB after 1280.0 MB zones)
+[PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=32026.0 MB, weight zone=30495.8 MB)
+[SYCL-PLAN] inventory top-8 of 4 tensors (total 0.0 MB): all-device-third.blk.1.attn_q.weight=0.0MB(t43,0x0) all-device-third.blk.3.attn_q.weight=0.0MB(t43,0x0) all-device-third.blk.0.attn_q.weight=0.0MB(t43,0x0) all-device-third.blk.2.attn_q.weight=0.0MB(t43,0x0)
+[SYCL-PLAN] inventory groups: 1 distinct (type,ne) groups over 4 tensors; cardinality histogram: 4x1; largest card>=4: all-device-third.blk.0.attn_q.weight 0.0MB (card=4); largest card<=2: none
+[SYCL-PLAN] CPU quant buffers: 0.0 MB (3 x cpu_quant_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] DMA staging pool: 0.0 MB (2 x dma_streamed 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] oneDNN scratchpad: 0.0 MB (onednn_reorder 0.0 MB + onednn_eligible 0.0 MB; global max 0.0 MB)
+[SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=2.0 MB total=64.0 MB
+[PLACEMENT] ATTENTION       device=  4 (0.0 MB)  host=  0 (0.0 MB)
+[PLACEMENT] layer   0  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   1  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   2  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] layer   3  weight=0.0 MB  kv=0.0 MB (full)  total=0.0 MB  dense_target=device 0  kv_target=host -1
+[PLACEMENT] KV sizing: n_layer=4 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=0 (conservative) kv_per_layer=0.0 MB
+[PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host
+[PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=32026.0 MB)
+[SYCL] Placement plan computed: 4 entries, 0.0 MB device + 0.0 MB host
+[PLACE-4] device weight zone: 0.0 MB (4 tensors), host arena: 0.0 MB (0 tensors)
+[MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+[SYCL] Tensor inventory set: 4 tensors, 0.00 GB total (VRAM: 0.56 GB free, planner host placement: no)
+FAIL: all-device-third has no planner target for all-device-third.blk.0.attn_q.weight
+FAIL: all-device-third has no planner target for all-device-third.blk.1.attn_q.weight
+FAIL: all-device-third has no planner target for all-device-third.blk.2.attn_q.weight
+FAIL: all-device-third has no planner target for all-device-third.blk.3.attn_q.weight
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+73 tiered-dispatch check(s) failed
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+0igs-batch2    =   0.92 sec*proc (1 test)
+dispatch       =   0.92 sec*proc (1 test)
+sycl           =   0.92 sec*proc (1 test)
+tdd            =   0.92 sec*proc (1 test)
+
+Total Test time (real) =   0.92 sec
+
+The following tests FAILED:
+	166 - test-tiered-dispatch (Failed)                     0igs-batch2 dispatch sycl tdd
+Errors while running CTest
