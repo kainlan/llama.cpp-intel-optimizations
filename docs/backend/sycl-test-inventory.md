@@ -845,7 +845,14 @@ numeric failures (`errors=55 max_rel=0.165479` against the pre-fix
 `55 / 0.165480`). That coincidence is unexplained and is the live question on
 that ticket.
 
-### Known-failing, and not a regression
+### Known-failing, and not a regression — separate from the 11 above
+
+⚠️ **`test-sycl-moe-sequence-graphlet-policy` is NOT one of the 11 Task 19
+failures.** It carries a `mem-handle` label, so the throttled-sweep denylist
+excludes it and the Task 19 name list never contained it — which is precisely
+why it went unnoticed for so long. Every one of the 11 above maps to an RCA
+ticket in that table; none of them is this. Do not conflate the two sets when
+tallying merge-readiness reds.
 
 `test-sycl-moe-sequence-graphlet-policy` fails for a cause that predates the
 C-series base `9674a390b` and is not a production defect. Two sub-tests call
