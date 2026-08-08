@@ -710,13 +710,16 @@ cannot be reconstructed.
   graph-internal tensor) so a unit test can actually go RED on this defect
   instead of relying on a 130-arch sweep to notice.
 
-### Q4_0 coalesced DMMV wrong answers (`llama.cpp-szv8`) — UNRESOLVED
+### Q4_0 coalesced DMMV wrong answers (`llama.cpp-szv8`) — RESOLVED 2026-08-08
 
-**Status: open / in_progress.** This is a pre-existing claim carried into merge
-readiness, and it is recorded here as unresolved. It does not block `f813` per
-the dependency graph, and it must not be reported as passing.
+**Status: closed, merged `a0026c257`.** The kernel is exonerated: there was never
+a wrong answer. The test was auditing a kernel that never ran, and its "error"
+was the by-design accuracy of the kernel that did — MMVQ's q8_1 activation
+quantization — scored against a full-precision-activation oracle. The resolution
+is at the end of this section; the investigation below is kept because its
+retracted findings and sub-lessons are the reusable part.
 
-The failure is real, deterministic and isolated: `test-dmmv-q4-0-coalesced`
+The failure was real, deterministic and isolated: `test-dmmv-q4-0-coalesced`
 reports `errors=55/116/229` with `max_rel 0.165/0.176/0.344` across three shapes,
 bit-identical between runs and identical single-device (`level_zero:0`) and
 dual-device (`level_zero:0,1`).
@@ -747,13 +750,30 @@ What the investigation has settled, and it is mostly about the *test*:
   pre-fix run (`errors=55 max_rel=0.165479` vs `55 / 0.165480`;
   `116 / 0.176321` vs `116 / 0.176323`).
 
-**That coincidence is the live, unexplained fact**, and it is stated before any
-theory: two configurations that allegedly executed different kernels over
-different buffers produced the same arithmetic error to six digits. Either both
-runs always executed the same arithmetic, or the error originates in a stage both
-share — the src1 conversion, the activation quantization, or the reference model
-itself. The recommended next step is to dump the post-conversion `src1` values
-the kernel actually receives for one failing row and hand-compute the dot against
-three candidate roundings (f32, dfloat/RNE, q8_1); the mismatch pattern
-identifies the diverging stage in one shot. An error density of 55 of 64 rows at
-up to 16% is categorical, not fp16 accumulation noise.
+That coincidence was recorded here as the live, unexplained fact. **It is now
+explained, and the explanation is that neither run executed a DMMV kernel.**
+
+`ggml_sycl_mul_mat()`'s TG fast-path claims every batch=1 quantized dispatch
+whose weight resolved non-AoS, dispatches MMVQ against that layout, and returns
+upstream of both `GGML_SYCL_FORCE_DMMV` sites and of the override's kernel
+choice. Two MMVQ variants read the same weight *values* through different
+addressing and quantize the activation identically, so the pre- and post-`szv8c`
+runs agreeing to six digits is the expected result rather than a coincidence
+needing two different kernels to share an input-dependent error. The layout
+override binds on materialization but not on kernel selection — which is why
+every structural precondition passed while the named kernel never ran.
+
+A host model of MMVQ's q8_1 arithmetic, written before the confirming run,
+reproduced the measured GPU output to **seven significant figures**
+(`gpu=-14.931747` vs `q8_1_mmvq=-14.931746`, against `dfloat=-14.980540`) and
+scored `errors=0` at all three shapes. The fix was to the test: `GGML_SYCL_TG_FAST=0`
+makes the forcing bind, and the gate now asserts kernel identity from the output
+as an **oracle-fit ratio** (the dfloat oracle must fit ≥100× better than the
+q8_1-MMVQ oracle), which widening a tolerance cannot satisfy. GREEN clears it by
+4239–8150×.
+
+Carried forward as `llama.cpp-erf1`: MMVQ is the production TG path for these
+types and is documented as such in `docs/backend/sycl-perf-baselines.md`, and
+`GGML_SYCL_MUL_MAT_ROUTE_TRACE=1` now names the kernel on the fast-path route
+too, so a forced run can prove which kernel executed. Evidence: `szv8` comments
+c-lsrd, c-8b04, c-0tp9, c-f9ab.

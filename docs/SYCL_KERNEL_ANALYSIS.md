@@ -123,7 +123,12 @@ The analysis generates `ggml/src/ggml-sycl/dispatch_thresholds.hpp` with data-dr
 ### For Production Integration
 
 1. **Batch=1 (Token Generation)**:
-   - Use DMMV kernel (existing fast path)
+   - ~~Use DMMV kernel (existing fast path)~~ — **superseded.** The batch=1 fast
+     path in `ggml_sycl_mul_mat()` dispatches **MMVQ** with q8_1 activations for
+     any quantized weight that resolved to a non-AoS layout, and returns before
+     `GGML_SYCL_FORCE_DMMV` is ever read. DMMV is the fallback. See
+     `docs/backend/sycl-perf-baselines.md`, "The production TG path is MMVQ with
+     q8_1 activations — not DMMV" (`llama.cpp-szv8` / `llama.cpp-erf1`).
    - Layout conversion at load time (not runtime)
 
 2. **Batch=2-4 (Small Batch)**:

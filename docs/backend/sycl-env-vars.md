@@ -22,7 +22,7 @@ before treating any result as an active setting.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `GGML_SYCL_UNIFIED_SOA=0` | ON | Disable SOA memory layout (AOS fallback, ~4x slower TG) |
-| `GGML_SYCL_TG_FAST=0` | ON | Disable MMVQ fast-path (slower TG) |
+| `GGML_SYCL_TG_FAST=0` | ON | Disable the batch=1 MMVQ fast-path (slower TG). Also the **only** thing that lets `GGML_SYCL_FORCE_DMMV` or a kernel choice from `GGML_SYCL_LAYOUT_OVERRIDE` bind at batch=1 — see below. |
 | `GGML_SYCL_DISABLE_GRAPH=1` | OFF | Disable SYCL graph replay (minimal TG impact ~3%, mainly helps PP) |
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
@@ -79,7 +79,7 @@ Consequences worth knowing before you reach for this flag:
 | `GGML_SYCL_FORCE_MMVQ=1` | Force MMVQ kernels for all batch sizes |
 | `GGML_SYCL_FORCE_ESIMD=1` | Force ESIMD kernels |
 | `GGML_SYCL_FORCE_MMQ=1` | Force MMQ kernels |
-| `GGML_SYCL_FORCE_DMMV=1` | Force DMMV kernels |
+| `GGML_SYCL_FORCE_DMMV=1` | Force DMMV kernels. ⚠️ **No effect at batch=1 on its own** — the TG fast-path returns upstream of both sites that read it. Pair with `GGML_SYCL_TG_FAST=0`; see "The TG fast-path claims batch=1" below. |
 | `GGML_SYCL_ESIMD_MIN_BATCH=N` | Min batch size for ESIMD dispatch |
 | `GGML_SYCL_ONEDNN_PP_MIN_BATCH=N` | Min batch for oneDNN PP path |
 | `GGML_SYCL_ONEDNN_MUL=1` | Enable oneDNN for element-wise MUL (default OFF, SYCL kernel is 2.3x faster) |
@@ -88,6 +88,33 @@ Consequences worth knowing before you reach for this flag:
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
 | `GGML_SYCL_USE_XMX_GEMM=1` | Route quantized MUL_MAT through the experimental XMX GEMM kernels (measured 5–11x **slower** for quantized models). Needs a build carrying **both** `GGML_SYCL_XMX_GEMM` and `GGML_SYCL_MMQ_XMX`; in a default build it does nothing. `=0` disables it on both dispatch paths (it did not until `llama.cpp-wvbw`; see below). |
 | `GGML_SYCL_XMX_THRESHOLD=N` | Upper batch bound for the XMX GEMM path; the gate is `batch >= 1 && batch < N`. Default **64**, stated only by the settings table in `ggml_check_sycl()` — not by the global's initializer. Same build requirement as above. See below. |
+
+### The TG fast-path claims batch=1, so the force/override variables never see it
+
+`ggml_sycl_mul_mat()` short-circuits batch=1 quantized `MUL_MAT` on a
+GPU-accessible weight that resolved to a non-AoS layout: it dispatches MMVQ with
+q8_1 activations against that layout and **returns**, upstream of both
+`GGML_SYCL_FORCE_DMMV` reads and of the kernel choice made by
+`GGML_SYCL_LAYOUT_OVERRIDE`. Its own comment says it "bypasses orchestrator, name
+parsing, prefetch, TP checks for maximum speed".
+
+So for Q4_0 (and any type `ggml_sycl_supports_reorder_mmvq()` accepts):
+
+- **MMVQ is the production TG kernel.** The coalesced DMMV kernel is a
+  fallback/debug path in a default configuration.
+- **`GGML_SYCL_FORCE_DMMV=1` by itself changes nothing at batch=1.** It is not
+  overridden — it is never read. `GGML_SYCL_TG_FAST=0` is what makes it bind.
+- **`GGML_SYCL_LAYOUT_OVERRIDE` still binds on materialization.** The overridden
+  buffer is really built, in the requested layout, byte-correct — and then MMVQ
+  reads it. A passing layout precondition is not evidence about which kernel ran.
+
+`llama.cpp-szv8` spent three RCA rounds on a test that hit this: every structural
+precondition passed and the kernel under test never executed. Confirm the kernel
+from output, not from setup — either `GGML_SYCL_MUL_MAT_ROUTE_TRACE=1` (below) or
+an oracle-fit ratio, never a tolerance. Full write-up, including the by-design
+accuracy contract of q8_1 activation quantization, is in
+`docs/backend/sycl-perf-baselines.md` ("The production TG path is MMVQ with q8_1
+activations — not DMMV").
 
 ### `GGML_SYCL_USE_XMX_GEMM` / `GGML_SYCL_XMX_THRESHOLD` — the XMX GEMM path
 
@@ -291,6 +318,8 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_VALIDATE=1` | Enable A/B validation between kernel paths |
 | `GGML_SYCL_SET_ROWS_VALIDATE=1` | Default OFF (`set_rows.cpp`). Reads the SET_ROWS index tensor back to the host and reports the entries the kernels will drop, as one `[SET_ROWS_VALIDATE]` line per op **only when at least one index is out of range** — silence means every index was in `[0, ne1)`. Reports, never aborts: an out-of-range index is a caller error the CPU backend catches with `GGML_ASSERT(i1 >= 0 && i1 < ne1)` (`ggml-cpu/ops.cpp:5073`), while SET_ROWS has no status channel on any backend, so the SYCL kernels merely *contain* it by dropping the element. This flag exists because that containment is otherwise silent. Costs a device→host copy plus a queue sync per SET_ROWS, and the op runs once per layer per ubatch on the KV write path — diagnostic only, never in production. **Skipped while a command graph is recording**, where a blocking copy is not legal, so pair it with `GGML_SYCL_DISABLE_GRAPH=1` to see the KV-cache writes that graph replay would otherwise hide. Read once and cached. |
 | `GGML_SYCL_ADD_ID_VALIDATE=1` / `GGML_SYCL_ADD_ID_VALIDATE_LIMIT=<N>` | Default OFF (`add-id.cpp:13-21`). The ADD_ID sibling of the above and the pattern it was modelled on: reads src1/src2 back and prints an `[ADD_ID_VALIDATE]` line carrying `ids_min`/`ids_max`/`ids_oob` plus NaN/inf counts over the selected rows. Reports, never aborts. Three things to know before reading a capture, because each can make it look like nothing is wrong: it fires **twice per op** (`site=before` and `site=after`); it is **filtered to tensors whose name contains `ffn_moe_`**, so a non-MoE model prints nothing however bad the ids are; and it emits at most `GGML_SYCL_ADD_ID_VALIDATE_LIMIT` lines (default 32) before going quiet, which is a cap and not a clean bill of health. Unlike `GGML_SYCL_SET_ROWS_VALIDATE` it re-reads `getenv` per call and is **not** suppressed during graph recording. |
+| `GGML_SYCL_MUL_MAT_ROUTE_TRACE=1` / `GGML_SYCL_MUL_MAT_ROUTE_TRACE_LIMIT=<N>` | Default OFF. One `[MUL-MAT-ROUTE] <stage> idx=… kernel=… layout=…` line per `MUL_MAT` stage, on raw `fprintf(stderr)` so it survives the `GGML_LOG_INFO` verbosity gate. **This is how you prove which kernel produced a number.** Stages: `entry` and `graph` (bookkeeping, no kernel named); `selected` / `dispatch-legacy` / `dispatched-legacy` and their `-failed` and `-retry-aos` siblings (orchestrator route); `dispatch-tg-fast` / `dispatched-tg-fast` / `-failed` and the `-split` variants (the batch=1 fast-path — added by `llama.cpp-erf1`, before which a traced fast-path run named no kernel at all). The `kernel=` token separates `DMMV_COALESCED` from `DMMV_SOA`, which `GGML_SYCL_DMMV_Q8_DEBUG=1`'s `[DMMV] dispatch` line cannot. `…_LIMIT` caps traced ops at N (default **256**) — a cap, not a clean bill of health. Both are read once and latched. |
+| `GGML_SYCL_DMMV_Q8_DEBUG=1` | Default OFF (`dmmv.cpp`). Emits `[DMMV] dispatch: … src0_type=… layout=… src1_q8=…` when a DMMV kernel runs, so its **absence** proves DMMV did not run. It does not say *which* DMMV kernel — pair with the route trace above for that. |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent hangs 1:1 with their triggering op. |

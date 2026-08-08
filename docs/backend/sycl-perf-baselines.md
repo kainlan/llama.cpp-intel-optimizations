@@ -163,6 +163,113 @@ rather than from their own logs.
 
 ---
 
+## The production TG path is MMVQ with q8_1 activations — not DMMV
+
+**For a batch=1 quantized `MUL_MAT` whose weight resolved to a non-AoS layout, a
+default run dispatches MMVQ, and the coalesced DMMV kernel does not execute.**
+This is the settled answer to a question that cost `llama.cpp-szv8` three rounds
+of RCA, and it changes how two other things must be read: the accuracy figures
+below, and what a `GGML_SYCL_FORCE_DMMV` run actually proves.
+
+### The mechanism
+
+`ggml_sycl_mul_mat()` carries a **TG fast-path** whose own comment says it
+"bypasses orchestrator, name parsing, prefetch, TP checks for maximum speed". For
+`src1->ne[1] == 1`, a quantized and GPU-accessible `src0`, and a resolved layout
+other than `GGML_LAYOUT_AOS`, it calls
+
+```cpp
+ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst,
+                                                    ggml_sycl_op_mul_mat_vec_q, soa_layout);
+return;
+```
+
+and **returns**. Both `GGML_SYCL_FORCE_DMMV` consultation sites — the one in
+`ggml_sycl_select_preferred_kernel()` and the one in the main dispatch body — sit
+downstream of that `return`, as does the kernel choice made by
+`GGML_SYCL_LAYOUT_OVERRIDE`. Q4_0 always qualifies, because
+`ggml_sycl_supports_reorder_mmvq(GGML_TYPE_Q4_0)` is true.
+
+Locate the block and both force sites rather than trusting line numbers, which
+drift constantly in this file:
+
+```bash
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'TG fast-path\|FORCE_DMMV'
+```
+
+Consequences:
+
+- **`GGML_SYCL_FORCE_DMMV=1` alone does not reach a DMMV kernel at batch=1.** It
+  is not ignored — it is never read, because the dispatch already returned. Pair
+  it with `GGML_SYCL_TG_FAST=0`, which is the fast-path's documented disable and
+  the only thing that makes the forcing bind.
+- **The Q4_0 coalesced DMMV kernel is a fallback/debug path**, not the production
+  TG kernel for reorder-eligible types. Its test coverage certifies a fallback.
+  It is still reached for weights that resolve AoS, for types MMVQ cannot reorder,
+  and whenever the fast-path's dispatch fails and falls through.
+- **A layout override binds on materialization but not on kernel selection.** In
+  `szv8` the COALESCED buffer really was built and really was byte-exact against
+  the addressing contract, and MMVQ then read it. Every structural precondition
+  passed while the named kernel never ran.
+
+### The accuracy contract of MMVQ q8_1 activations — by design, not a defect
+
+MMVQ quantizes the activation to **q8_1**: 8 bits per 32-element block, scale
+`amax/127`, plus a per-block `sum` of the raw activation floats, with both scale
+and sum stored as fp16. `vec_dot_q4_0_q8_1_impl` folds Q4_0's −8 offset as
+`d4 * (sumi*ds.x − 8*ds.y)`, subtracting that raw sum. This matches the upstream
+CUDA convention.
+
+So MMVQ's output is **not** the full-precision-activation answer, and scoring it
+against a full-precision oracle produces large relative errors that are correct
+behaviour rather than a bug. Measured on the B70 (`llama.cpp-szv8`, three shapes
+`ncols×nrows` = 1024×64 / 2048×128 / 4096×256):
+
+| MMVQ output scored against | errors past the 1e-2/1e-3 gate | max_rel |
+|---|---|---|
+| full-precision (dfloat) activation oracle | 55 / 116 / 229 | 0.165 / 0.176 / 0.344 |
+| **the q8_1-MMVQ arithmetic it actually implements** | **0 / 0 / 0** | **~4e-6 / 8e-6 / 5e-4** |
+
+The historical "12–31% wrong answer" for the Q4_0 coalesced DMMV path is the
+first row of that table. It was never a wrong answer; it was the right kernel
+being scored against the wrong arithmetic. The single clearest line from the
+hardware run, row 0 of the first shape: `gpu=-14.931747`,
+`q8_1_mmvq=-14.931746`, `dfloat=-14.980540` — seven significant figures against
+an oracle written before the run.
+
+**Read accuracy claims about a batch=1 quantized dispatch as a ratio, never as a
+tolerance.** Widening a tolerance moves every candidate oracle's fit together and
+so cannot tell you which kernel ran; the fit *ratio* between two oracles can.
+`tests/test-dmmv-q4-0-coalesced.cpp` gates on exactly that (the dfloat oracle
+must fit ≥100× better than the q8_1-MMVQ oracle) and clears it by 4239–8150×
+when DMMV genuinely runs.
+
+### Proving which kernel ran
+
+`GGML_SYCL_MUL_MAT_ROUTE_TRACE=1` emits a line naming the kernel and layout at
+the point of dispatch, on both routes (the fast-path half was added by
+`llama.cpp-erf1`; before it, a traced fast-path run printed `entry` and no kernel
+name at all):
+
+```
+[MUL-MAT-ROUTE] dispatch-tg-fast idx=… kernel=MMVQ_COALESCED layout=coalesced …   # default TG
+[MUL-MAT-ROUTE] dispatch-legacy  idx=… kernel=DMMV_COALESCED layout=coalesced …   # GGML_SYCL_TG_FAST=0
+```
+
+The kernel token distinguishes `DMMV_COALESCED` from `DMMV_SOA`, which the
+`[DMMV] dispatch` line under `GGML_SYCL_DMMV_Q8_DEBUG=1` cannot. Both are raw
+`fprintf(stderr)` sites, so they survive the `GGML_LOG_INFO` verbosity gate that
+swallows most backend logging; neither costs anything when its variable is unset.
+`GGML_SYCL_MUL_MAT_ROUTE_TRACE_LIMIT=N` caps the number of traced ops (default
+256).
+
+Evidence: `llama.cpp-szv8` comments c-lsrd (offline identification of the q8_1
+arithmetic), c-8b04 (seven-prediction scorecard and the mechanism), c-0tp9
+(RED/GREEN on hardware), c-f9ab (lead verification and close-out);
+`llama.cpp-erf1` (this section and the route trace).
+
+---
+
 ## `GGML_SYCL_UNIFIED_FORCE_LEGACY` — measured, and the +21.8% claim does not replicate
 
 An earlier task reported this flag worth **+21.8% tg128 on the B70** (37.27 ± 2.70
