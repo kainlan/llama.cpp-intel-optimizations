@@ -614,7 +614,7 @@ replacement into the same critical section as acquisition, which is a
 concurrency-control change to the reservation protocol, not a reclaim-path
 change.
 
-The growth-path leak fix (below) moves the point-release earlier within this
+The growth-path leak fix (above) moves the point-release earlier within this
 same function — to the top of the `arena_active()` branch instead of inside
 the `total_needed <= zone_cap` branch — but this does not change the analysis
 above. Both the old position and the new one are inside the single

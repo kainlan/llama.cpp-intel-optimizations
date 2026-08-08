@@ -55,6 +55,10 @@ parser.add_argument("--self-test", action="store_true",
 args = parser.parse_args()
 
 
+# NOTE: the precedes()-style ordering checks depend on this stripping: code
+# comments legitimately name the anchors they discuss (e.g. the C3 hoist comment
+# names ensure_planned_arena_zones() before the real call), and an unstripped
+# source would false-fail them. Never bypass strip_comments for a subset of checks.
 def strip_comments(source):
     """Remove C and C++ comments, preserving string literals and line count.
 
