@@ -763,6 +763,11 @@ static sycl::event set_rows_sycl(const char *  src0_d,
 }
 
 // FP8 E4M3 specific kernel (can't use templated convert with non-SYCL type)
+//
+// Unreachable today: ggml_sycl_op_set_rows' dst-type switch has no FP8 case, so
+// neither this kernel nor set_rows_sycl_fp8 below has a caller. Both still carry
+// the dst_row bound, for defence in depth should a case ever be added; that guard
+// is the one thing here no test can cover.
 template <typename TIdx>
 static void k_set_rows_fp8(const char * __restrict__ src0,
                            const TIdx * __restrict__ src1,
