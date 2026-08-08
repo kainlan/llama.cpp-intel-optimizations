@@ -2659,23 +2659,78 @@ struct test_rms_norm_mul_rope : public test_case {
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    // Number of values per row that are above -inf. -1 means all of them, and
+    // the row is shuffled so the argmax index is unique. When it is 0 every
+    // column of the row is a maximum, which is the shape a fully masked
+    // attention/indexer row produces.
+    const int n_finite;
+    ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, n_finite);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1},
+            int n_finite = -1)
+        : type(type), ne(ne), n_finite(n_finite) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(a, "a");
+        input = a;
 
         ggml_tensor * out = ggml_argmax(ctx, a);
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    // When the maximum is not unique the index is not determined either, so
+    // err has to look the values up. The logic there can't handle the sentinel
+    // tensors.
+    bool run_whole_graph() override { return n_finite >= 0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // With unique values the index itself is determined, so compare it
+        // directly. Rows padded with -inf tie across every padded column, and
+        // any of them is a correct argmax.
+        if (n_finite < 0) {
+            return test_case::err(a, b, n);
+        }
+
+        std::vector<float> src(ggml_nelements(input));
+
+        ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
+
+        double diff = 0.0f;
+
+        GGML_ASSERT(n == (size_t) ggml_nrows(input));
+        int64_t cols = input->ne[0];
+        for (int64_t r = 0; r < ggml_nrows(input); r++) {
+            int64_t ia = (int32_t) a[r];
+            int64_t ib = (int32_t) b[r];
+            // The index must name a real column of the row. Every row has
+            // ne00 >= 1 columns, so an in-range index always exists and a
+            // backend may not ship the negative sentinel it seeded a scan
+            // with. Checked before the values are looked up, which an
+            // out-of-range index cannot do.
+            bool in_range = true;
+            if (ia < 0 || ia >= cols) {
+                diff += 1;
+                in_range = false;
+            }
+            if (ib < 0 || ib >= cols) {
+                diff += 1;
+                in_range = false;
+            }
+            // Whichever column each backend named, it has to hold the same
+            // value -- that is what makes both of them a maximum of the row.
+            if (in_range && src[r * cols + ia] != src[r * cols + ib]) {
+                diff += 1;
+            }
+        }
+        return diff;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -2687,9 +2742,12 @@ struct test_argmax : public test_case {
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        // only n_finite values are above -inf
+                        data[i] = (n_finite >= 0 && i >= n_finite) ? -INFINITY : (float) i;
                     }
-                    std::shuffle(data.begin(), data.end(), rng);
+                    if (n_finite < 0) {
+                        std::shuffle(data.begin(), data.end(), rng);
+                    }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
                 }
             } else {
@@ -8251,6 +8309,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+
+    // rows padded with -inf. On an all--inf row every column is a maximum, so
+    // an in-range index always exists; a backend that seeds its scan with
+    // (-inf, -1) and admits on `>` alone never takes a -inf column and ships
+    // the sentinel instead. {16,...} gives a 256-lane block at most one column
+    // per lane, {4096,...} gives each lane more than one.
+    for (int n_finite : {0, 3}) {
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {  16, 2, 1, 1}, n_finite));
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {4096, 1, 1, 1}, n_finite));
+    }
+    // control: no -inf at all, so the empty-lane path is unreachable
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16, 2, 1, 1}, 16));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
