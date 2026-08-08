@@ -94,6 +94,17 @@ static void probe_s4_woq_matmul(dnnl::engine & eng) {
 }
 #endif
 
+// This is a CAPABILITY PROBE, not a regression gate: the three `probe_*`
+// functions report what the installed oneDNN supports and no observed answer is
+// wrong. Until llama.cpp-u2mz it returned 0 from every path including engine
+// creation failure, so "oneDNN could not be reached at all" was reported as a
+// pass. It now exits 77 (ctest SKIP_RETURN_CODE) whenever it could not probe.
+//
+// The support matrix it prints is still informational -- pinning it as an
+// expectation, so that a oneDNN upgrade which changes the answer goes red,
+// needs one recorded run to establish the current matrix first.
+static constexpr int EXIT_SKIP = 77;
+
 int main() {
 #if GGML_SYCL_DNNL
     probe_e8m0_scale_descriptor();
@@ -103,16 +114,16 @@ int main() {
         probe_f4_e2m1_matmul(eng);
         probe_s4_woq_matmul(eng);
     } catch (const dnnl::error & e) {
-        std::printf("onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
-        std::puts("onednn.mxfp4.f4_e2m1.matmul unsupported reason=setup_failed");
-        std::puts("onednn.mxfp4.s4_woq.matmul unsupported reason=setup_failed");
+        std::printf("SKIP: onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
+        return EXIT_SKIP;
     } catch (const std::exception & e) {
-        std::printf("onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
-        std::puts("onednn.mxfp4.f4_e2m1.matmul unsupported reason=setup_failed");
-        std::puts("onednn.mxfp4.s4_woq.matmul unsupported reason=setup_failed");
+        std::printf("SKIP: onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
+        return EXIT_SKIP;
     }
-#else
-    std::puts("onednn.mxfp4.probe skipped GGML_SYCL_DNNL=0");
-#endif
+    std::puts("PASS: onednn.mxfp4.probe completed (3 probes reported)");
     return 0;
+#else
+    std::puts("SKIP: onednn.mxfp4.probe GGML_SYCL_DNNL=0");
+    return EXIT_SKIP;
+#endif
 }

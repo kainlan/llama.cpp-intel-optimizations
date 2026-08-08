@@ -8,6 +8,24 @@
 // Integration tests for UnifiedKernel persistent execution
 // Tests the plan-build-execute workflow and validates correctness
 //
+// ⚠️ REPAIRED BUT NOT YET BUILT (llama.cpp-u2mz). This file had rotted against
+// the production API and was the single target blocking the whole
+// GGML_SYCL_BUILD_XMX_TESTS suite -- the option would not build with it in.
+// The repair was made in a lane that is not permitted to build, so the FIRST
+// person to configure with -DGGML_SYCL_BUILD_XMX_TESTS=ON should expect to
+// finish it rather than to find it green.
+//
+// What changed, and why the obvious repair was the wrong one: add_set_rows and
+// add_strided_copy used to take a DEVICE pointer to the meta struct; they now
+// take a const reference and COPY it into the OperationDescriptor
+// (`op.set_rows_meta = meta; op.has_embedded_meta = true;`, unified-kernel.cpp
+// :8600 and :8624). So the fix is not to dereference the device pointer
+// host-side -- it is to pass the host struct and delete the three
+// sycl::malloc_device<*Meta> staging buffers entirely, which is what happened.
+// StridedCopyMeta also lost `type_size`/`pad` in favour of
+// src_type/dst_type/src_size/dst_size (unified-kernel.hpp:295-302); SetRowsMeta
+// kept its `pad`, so only the StridedCopyMeta writes needed changing.
+//
 
 #include <cmath>
 #include <cstdio>
@@ -1364,9 +1382,6 @@ static bool test_persistent_set_rows_attention_residual(sycl::queue & q) {
     meta.idx_type = 0;
     meta.pad = 0;
 
-    SetRowsMeta * d_meta = sycl::malloc_device<SetRowsMeta>(1, q);
-    q.memcpy(d_meta, &meta, sizeof(meta)).wait();
-
     ggml_sycl::UnifiedKernel     kernel(q);
     ggml_sycl_unified::XMXConfig config = {};
     config.supported                    = true;
@@ -1377,8 +1392,8 @@ static bool test_persistent_set_rows_attention_residual(sycl::queue & q) {
 
     const int n_elements = head_dim * n_tokens * n_kv_heads;
     const int64_t sr_bytes = set_rows_output_bytes(meta);
-    kernel.add_set_rows(0, d_src_k, d_indices, d_k_cache, d_meta, n_elements, nullptr, sr_bytes);
-    kernel.add_set_rows(0, d_src_v, d_indices, d_v_cache, d_meta, n_elements, nullptr, sr_bytes);
+    kernel.add_set_rows(0, d_src_k, d_indices, d_k_cache, meta, n_elements, nullptr, sr_bytes);
+    kernel.add_set_rows(0, d_src_v, d_indices, d_v_cache, meta, n_elements, nullptr, sr_bytes);
 
     AttentionDescriptor desc = {};
     desc.q          = d_q;
@@ -1428,7 +1443,6 @@ static bool test_persistent_set_rows_attention_residual(sycl::queue & q) {
     sycl::free(d_indices, q);
     sycl::free(d_attn_out, q);
     sycl::free(d_out, q);
-    sycl::free(d_meta, q);
 
     print_result("persistent_set_rows_attention_residual (heads=2, dim=8, seq=4)", passed, error);
     return passed;
@@ -1470,12 +1484,12 @@ static bool test_persistent_strided_copy_transpose(sycl::queue & q) {
     meta.nb[1] = (int64_t) sizeof(float);
     meta.nb[2] = 0;
     meta.nb[3] = 0;
-    meta.type_size = (int32_t) sizeof(float);
-    meta.pad = 0;
+    meta.src_type = 0;  // 0 = F32/raw, 1 = F16
+    meta.dst_type = 0;
+    meta.src_size = (int32_t) sizeof(float);
+    meta.dst_size = (int32_t) sizeof(float);
 
-    StridedCopyMeta * d_meta = sycl::malloc_device<StridedCopyMeta>(1, q);
     q.memcpy(d_base, h_base.data(), h_base.size() * sizeof(float)).wait();
-    q.memcpy(d_meta, &meta, sizeof(meta)).wait();
 
     ggml_sycl::UnifiedKernel     kernel(q);
     ggml_sycl_unified::XMXConfig config = {};
@@ -1484,7 +1498,7 @@ static bool test_persistent_strided_copy_transpose(sycl::queue & q) {
     kernel.configure(config);
 
     kernel.begin_persistent(1, 1, cols, cols, 1, 1, ne0_view, 0);
-    kernel.add_strided_copy(0, d_base, d_out, d_meta, n_elements,
+    kernel.add_strided_copy(0, d_base, d_out, meta, n_elements,
                             (int64_t) n_elements * (int64_t) sizeof(float));
     kernel.execute_persistent();
 
@@ -1496,7 +1510,6 @@ static bool test_persistent_strided_copy_transpose(sycl::queue & q) {
 
     sycl::free(d_base, q);
     sycl::free(d_out, q);
-    sycl::free(d_meta, q);
 
     print_result("persistent_strided_copy_transpose (3x5 -> 5x3)", passed, error);
     return passed;
@@ -1951,9 +1964,6 @@ static bool test_persistent_mini_tg_pipeline(sycl::queue & q) {
     meta.idx_type = 0;
     meta.pad = 0;
 
-    SetRowsMeta * d_meta = sycl::malloc_device<SetRowsMeta>(1, q);
-    q.memcpy(d_meta, &meta, sizeof(meta)).wait();
-
     ggml_sycl::UnifiedKernel     kernel(q);
     ggml_sycl_unified::XMXConfig config = {};
     config.supported                    = true;
@@ -2000,8 +2010,8 @@ static bool test_persistent_mini_tg_pipeline(sycl::queue & q) {
 
     const int n_elements = head_dim * 1 * n_kv_heads;
     const int64_t sr_bytes = set_rows_output_bytes(meta);
-    kernel.add_set_rows(0, d_k_rope, d_indices, d_k_cache, d_meta, n_elements, nullptr, sr_bytes);
-    kernel.add_set_rows(0, d_v, d_indices, d_v_cache, d_meta, n_elements, nullptr, sr_bytes);
+    kernel.add_set_rows(0, d_k_rope, d_indices, d_k_cache, meta, n_elements, nullptr, sr_bytes);
+    kernel.add_set_rows(0, d_v, d_indices, d_v_cache, meta, n_elements, nullptr, sr_bytes);
 
     AttentionDescriptor attn_desc = {};
     attn_desc.q          = d_q_rope;
@@ -2168,7 +2178,6 @@ static bool test_persistent_mini_tg_pipeline(sycl::queue & q) {
     sycl::free(d_cos, q);
     sycl::free(d_sin, q);
     sycl::free(d_indices, q);
-    sycl::free(d_meta, q);
 
     print_result("persistent_mini_tg_pipeline (hidden=32, heads=4, inter=64)", passed, first_err);
     return passed;

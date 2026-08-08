@@ -179,6 +179,17 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
+    # COMPILE-TIME ABI GATE, registered as a ctest entry only so that a missing
+    # binary is noticed (llama.cpp-u2mz). The 18 static_asserts in the source are
+    # checked by the COMPILER: `ninja test-sycl-lifecycle-public-api` is the
+    # gate, and a green `ctest -R sycl-lifecycle-public-wrappers` proves only
+    # that some binary exists -- possibly a stale one from an earlier build.
+    #
+    # It deliberately does not link ggml-sycl: under GGML_BACKEND_DL the backend
+    # is a MODULE library and cannot be linked into an executable, and this
+    # registration is outside the `if (NOT GGML_BACKEND_DL)` fixture. The cost is
+    # that the assertions constrain declared signatures without odr-using them,
+    # so they say nothing about whether the symbols link.
     add_executable(test-sycl-lifecycle-public-api
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-api.cpp)
     target_include_directories(test-sycl-lifecycle-public-api PRIVATE
@@ -1213,24 +1224,54 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     #      UNIFIED_KERNEL_TEST_STANDALONE note at the top of this guard.  All
     #      eight unified-kernel.cpp targets now link ggml-sycl instead.
     #
-    #   2. OPEN, and it blocks test-unified-kernel-persistent ONLY.
-    #      tests/test-unified-kernel-persistent.cpp has rotted against the
-    #      production API: "no member named 'type_size' in 'StridedCopyMeta'",
-    #      "no member named 'pad'", plus five pointer-vs-const-reference
-    #      mismatches where add_set_rows/add_strided_copy now take
-    #      `const SetRowsMeta &` / `const StridedCopyMeta &` and the test still
-    #      passes a device pointer.  Dereferencing that pointer host-side is NOT
-    #      the fix; the meta contract itself changed, so repairing this needs
-    #      someone who knows the current one.
+    #   2. REPAIRED by llama.cpp-u2mz -- but NOT YET BUILT, see the warning
+    #      below.  tests/test-unified-kernel-persistent.cpp had rotted against
+    #      the production API.  The drift, and its repair, were both narrower
+    #      than this comment used to claim:
     #
-    #      It also declares an EXTERNAL ggml_sycl_test_extract_layer_index in
-    #      its non-standalone branch, and no such symbol exists anywhere in the
-    #      tree -- so that branch has never been compiled either.
+    #        - "no member named 'type_size' in 'StridedCopyMeta'" -- real.  The
+    #          struct (unified-kernel.hpp:295-302) carries src_type/dst_type and
+    #          src_size/dst_size instead; the test now sets all four, matching
+    #          how ggml-sycl.cpp:90755-90758 fills it.
+    #        - "no member named 'pad'" -- WRONG for StridedCopyMeta and right
+    #          only there.  SetRowsMeta DOES have `pad`, so the two `meta.pad`
+    #          writes on that struct were always legal; only the StridedCopyMeta
+    #          one was not.
+    #        - five pointer-vs-const-reference mismatches -- real, and the fix
+    #          is NOT to dereference host-side.  The contract changed direction:
+    #          add_set_rows/add_strided_copy now COPY the meta into the
+    #          OperationDescriptor (`op.set_rows_meta = meta;
+    #          op.has_embedded_meta = true;` at unified-kernel.cpp:8600 and
+    #          :8624), so the test passes its host struct and the three
+    #          sycl::malloc_device<*Meta> staging buffers are simply gone.
     #
-    # So GGML_SYCL_BUILD_XMX_TESTS=ON still fails, on this one target and for a
-    # reason unrelated to the guard.  Twelve of the thirteen targets build.
-    # Do NOT "fix" this by commenting the target out: a test deleted to make a
-    # flag green is the exact failure mode llama.cpp-5exz documents.
+    #      The EXTERNAL ggml_sycl_test_extract_layer_index claim was FALSE and
+    #      is retracted.  The symbol is defined at ggml-sycl.cpp:89939 (added by
+    #      2c49f9e13) and is exported from the built library -- settled against
+    #      the artifact rather than the source:
+    #        nm -D --defined-only build/bin/libggml-sycl.so \
+    #          | grep _Z34ggml_sycl_test_extract_layer_indexPKc   # -> T
+    #      The mangling matches the test's declaration, so that branch links.
+    #
+    # ⚠️ The repair was made in a lane that is not permitted to build, so
+    # GGML_SYCL_BUILD_XMX_TESTS=ON is EXPECTED to configure and build and has
+    # NOT been confirmed to.  Verify with a single target first:
+    #     ./scripts/sycl-build.sh -r  (with -DGGML_SYCL_BUILD_XMX_TESTS=ON)
+    #     ninja -C build test-unified-kernel-persistent
+    # If it still fails, fix it forward -- do NOT comment the target out.  A
+    # test deleted to make a flag green is the exact failure mode
+    # llama.cpp-5exz documents.
+    #
+    # Target count, since three previous revisions of this comment each got it
+    # wrong ("twelve of the thirteen" -- both numbers): this guard contains 14
+    # add_executable calls. Count it without hardcoding line numbers, which is
+    # how the earlier figures went stale:
+    #     awk '/^if \(GGML_SYCL_BUILD_XMX_TESTS AND/,/^else\(\)$/' CMakeLists.txt \
+    #       | grep -v '^ *#' | grep -c add_executable      # -> 14
+    # (the `grep -v` matters: this comment block mentions the command it runs,
+    # so counting without it returns 15 and counts this line)
+    # The else() branch at the bottom of the guard registers the same 14 names as
+    # DISABLED placeholders when the option is OFF; keep the two in sync.
     add_executable(test-unified-kernel-ops
         tests/test-unified-kernel-ops.cpp
         unified-kernel.cpp
@@ -1284,6 +1325,56 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         TIMEOUT 300
     )
+else()
+    # llama.cpp-u2mz: make the ABSENCE of these fourteen tests VISIBLE.
+    #
+    # With the option OFF -- the default, and therefore what every sweep on this
+    # machine actually configures -- none of the targets above is created, so
+    # none of their ctest names exists. `ctest -R xmx-config` then prints
+    # "No tests were found" and EXITS 0, which is indistinguishable from a pass;
+    # that is the first trap named in this ticket, and it was live on all
+    # fourteen names.
+    #
+    # ctest cannot be made to fail on a zero-match, so the fix is to make the
+    # match non-zero: register each name as a DISABLED placeholder. ctest then
+    # lists it (`ctest -N -R xmx-config` prints it) and reports it under
+    # "The following tests did not run: ... (Disabled)" instead of silently
+    # finding nothing. A DISABLED test's COMMAND is never executed, so it is safe
+    # that these name a `cmake -E echo` rather than a binary, and they add
+    # nothing to the runtime of any sweep.
+    #
+    # KEEP THIS LIST IN SYNC with the add_test(NAME ...) calls in the guard
+    # above. Machine-checkable -- the two sides must print the same 14 names:
+    #   awk '/^if \(GGML_SYCL_BUILD_XMX_TESTS AND/,/^else\(\)$/' CMakeLists.txt \
+    #     | grep -oP 'add_test\(NAME \K\S+' | sort
+    #   awk '/^else\(\)$/,/^endif\(\)$/' CMakeLists.txt \
+    #     | grep -oP '^    +\K[a-z0-9-]+$' | sort
+    foreach(_xmx_absent_test
+        xmx-hardware-detect
+        xmx-esimd-basic
+        xmx-moe-mxfp4
+        moe-mxfp4-dp4a
+        mxfp4-vector-dequant
+        unified-kernel
+        xmx-compute
+        xmx-default-enable
+        xmx-optimization
+        xmx-config
+        esimd-vectorized-dequant
+        esimd-prefetch
+        unified-kernel-ops
+        unified-kernel-persistent
+    )
+        # The guard is `GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL
+        # "INTEL"`, so name both conditions -- on a non-Intel SYCL target the
+        # option alone is not enough.
+        add_test(NAME ${_xmx_absent_test}
+            COMMAND ${CMAKE_COMMAND} -E echo
+                    "not built: needs -DGGML_SYCL_BUILD_XMX_TESTS=ON and GGML_SYCL_TARGET=INTEL")
+        set_tests_properties(${_xmx_absent_test} PROPERTIES
+            DISABLED TRUE
+            LABELS "sycl;xmx;not-built")
+    endforeach()
 endif()
 
 # =============================================================================
@@ -1325,25 +1416,19 @@ set(SYCL_LINK_ONLY_TEST_OPTIONS
     "-Wno-narrowing"
 )
 
-# Batch-size gating logic for ESIMD dispatch. Pure C++: no SYCL headers, no
-# device, no GPU allocation -- hence no compile options at all.
-add_executable(test-kernel-dispatch
-    tests/test-kernel-dispatch.cpp
-)
-target_include_directories(test-kernel-dispatch PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-)
-target_compile_definitions(test-kernel-dispatch PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-add_test(NAME kernel-dispatch COMMAND test-kernel-dispatch)
-set_tests_properties(kernel-dispatch PROPERTIES
-    LABELS "sycl;xmx;dispatch;gating"
-    TIMEOUT 60
-)
+# test-kernel-dispatch was DELETED by llama.cpp-u2mz. It defined its own
+# `namespace ggml_sycl_unified_test` copy of KernelPath, XMXConfig,
+# get_esimd_min_batch() and select_kernel_path() -- "mirror the definitions
+# without SYCL dependencies" -- included no project header and linked nothing,
+# and the mirror had already drifted: production select_kernel_path() grew an
+# ESIMD_LARGE_TILE path (unified-kernel.cpp:4148) the copy did not model, so it
+# was green while disagreeing with the code it was named after.
+#
+# The real thing IS testable, and a replacement is worth writing: both
+# select_kernel_path() and get_esimd_min_batch() are `inline` in
+# unified-kernel.hpp (:1172 and :875), so a test that includes that header calls
+# the production definitions -- it needs -fsycl and the SYCL include dir, which
+# this target deliberately lacked, but no extra link dependency.
 
 # unified_matmul winners map to the orchestrator entrypoint. Host-only.
 add_executable(test-sycl-dispatch-tuning
@@ -2192,6 +2277,13 @@ set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
+# llama.cpp-u2mz removed four members of this loop --
+# test-sycl-moe-token-major-metadata, test-sycl-moe-direct-final-token-major-bridge,
+# test-sycl-moe-glu-q8-artifact-policy and test-sycl-moe-glu-q8-fused-store-policy.
+# Each drove a `test_moe_*` helper that exists once in ggml-sycl.cpp (definition)
+# plus once in ggml-sycl-test.hpp (declaration) and is called by no production
+# path, so a green from them said nothing about the shipped backend. See the
+# commit message and docs/backend/sycl-test-inventory.md.
 foreach(_residency_test
     test-sycl-mem-handle-lifetime
     test-sycl-residency-reservation
@@ -2199,12 +2291,8 @@ foreach(_residency_test
     test-sycl-moe-residency-preflight
     test-sycl-residency-diagnostics
     test-sycl-moe-fused-down-sum-policy
-    test-sycl-moe-token-major-metadata
-    test-sycl-moe-direct-final-token-major-bridge
     test-sycl-moe-direct-final-scratch-plan
     test-sycl-moe-same-expert-grouping
-    test-sycl-moe-glu-q8-artifact-policy
-    test-sycl-moe-glu-q8-fused-store-policy
     test-sycl-moe-gateup-prepack-policy
     test-sycl-moe-gateup-prepack-scratch
     test-sycl-moe-xmx-tiled-single-layout-policy
@@ -2907,33 +2995,12 @@ set_tests_properties(test-mul-mat-host-streaming PROPERTIES
 )
 endif() # static SYCL backend fixture
 
-if (NOT GGML_BACKEND_DL)
-add_executable(test-onednn-fallback
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-onednn-fallback.cpp
-)
-target_include_directories(test-onednn-fallback PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-onednn-fallback PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-onednn-fallback PRIVATE "-fsycl")
-target_compile_definitions(test-onednn-fallback PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-onednn-fallback PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-onednn-fallback PRIVATE IntelSYCL::SYCL_CXX)
-endif()
-add_test(NAME test-onednn-fallback COMMAND test-onednn-fallback)
-set_tests_properties(test-onednn-fallback PROPERTIES
-    LABELS "sycl;onednn;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
-)
-endif() # static SYCL backend fixture
+# test-onednn-fallback was DELETED by llama.cpp-u2mz: ~90 assertions over a class
+# no shipped path can reach. ggml/src/ggml-sycl/onednn-fallback.hpp is included
+# by nothing outside that test; its execute_cached() has every real parameter
+# commented out and never calls oneDNN, and its init() takes an `int *` as the
+# "queue". The header is now unreferenced -- deleting it belongs to whoever owns
+# ggml/src/ggml-sycl/*.hpp, and is logged in docs/backend/sycl-test-inventory.md.
 
 if (NOT GGML_BACKEND_DL)
 add_executable(test-onednn-woq
@@ -3235,7 +3302,11 @@ if (NOT GGML_BACKEND_DL)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE IntelSYCL::SYCL_CXX)
     endif()
-    add_test(NAME test-mmvq-q8-0-streaming-bench COMMAND test-mmvq-q8-0-streaming-bench)
+    # llama.cpp-u2mz removed a bare `add_test(NAME test-mmvq-q8-0-streaming-bench
+    # COMMAND test-mmvq-q8-0-streaming-bench)` here. It carried no ENVIRONMENT, so
+    # it always printed "SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run" and exited 77 --
+    # a registration that could never do work. The three names below drive the
+    # same binary with the env it needs, and are the live ones.
     add_test(NAME test-mmvq-q8-0-streaming-smoke COMMAND test-mmvq-q8-0-streaming-bench)
     set_tests_properties(test-mmvq-q8-0-streaming-smoke PROPERTIES
         ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=cache;GGML_SYCL_MMVQ_BENCH_NROWS=256;GGML_SYCL_MMVQ_BENCH_NCOLS=512;GGML_SYCL_MMVQ_BENCH_ITERS=1;GGML_SYCL_MMVQ_BENCH_WARMUP=0;GGML_SYCL_MMVQ_BENCH_SLICE_MB=1;GGML_SYCL_MMVQ_BENCH_BUFFERS=1"
@@ -3249,7 +3320,6 @@ if (NOT GGML_BACKEND_DL)
         ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=1"
     )
     set_tests_properties(
-        test-mmvq-q8-0-streaming-bench
         test-mmvq-q8-0-streaming-smoke
         test-mmq-q8-0-streaming-smoke
         test-mmq-q8-0-streaming-forced
@@ -3257,7 +3327,6 @@ if (NOT GGML_BACKEND_DL)
         LABELS "sycl;sycl-restored;gpu;benchmark;manual;streaming;restored"
     )
     set_tests_properties(
-        test-mmvq-q8-0-streaming-bench
         test-mmq-q8-0-streaming-smoke
         test-mmq-q8-0-streaming-forced
         PROPERTIES
@@ -3591,6 +3660,18 @@ target_compile_definitions(test-xmx-host-streaming PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
+# llama.cpp-u2mz: test-xmx-host-streaming.cpp gates its whole body on
+# GGML_SYCL_XMX_GEMM && GGML_SYCL_MMQ_XMX, but both are set on the LIBRARY as
+# `target_compile_definitions(ggml-sycl PRIVATE ...)` (lines 89 and 570), so
+# they never reached this target and no -D a user could pass would execute one
+# line of the test. Mirror the library's own conditions here, so that turning
+# the options on turns the test on too.
+if (GGML_SYCL_MMQ_XMX)
+    target_compile_definitions(test-xmx-host-streaming PRIVATE GGML_SYCL_MMQ_XMX)
+endif()
+if (GGML_SYCL_XMX_GEMM)
+    target_compile_definitions(test-xmx-host-streaming PRIVATE GGML_SYCL_XMX_GEMM)
+endif()
 target_link_libraries(test-xmx-host-streaming PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-xmx-host-streaming PRIVATE IntelSYCL::SYCL_CXX)
@@ -3599,93 +3680,37 @@ add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
 set_tests_properties(test-xmx-host-streaming PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # 77 = XMX off at build time, no SYCL backend, or a device without XMX
+    # INT8/Q4_0. With both options OFF (the default) this test SKIPS -- which is
+    # the honest report; it used to exit 0 and read as a pass.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
 
-if (NOT GGML_BACKEND_DL)
-add_executable(test-xmx-kernel-config
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-kernel-config.cpp
-)
-target_include_directories(test-xmx-kernel-config PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-xmx-kernel-config PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-xmx-kernel-config PRIVATE "-fsycl")
-target_compile_definitions(test-xmx-kernel-config PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-xmx-kernel-config PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-xmx-kernel-config PRIVATE IntelSYCL::SYCL_CXX)
-endif()
-add_test(NAME test-xmx-kernel-config COMMAND test-xmx-kernel-config)
-set_tests_properties(test-xmx-kernel-config PROPERTIES
-    LABELS "sycl;xmx;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
-)
-endif() # static SYCL backend fixture
+# test-xmx-kernel-config was DELETED by llama.cpp-u2mz. Every check in it was a
+# static_assert and every subtest ended `return true;`, so main had exactly one
+# reachable exit -- and worse, a wrong constant failed the BUILD while ctest then
+# ran the previous binary and printed "All tests PASSED!". Two of its eight
+# subtests static_asserted arithmetic on literals (8*32 == 256).
+#
+# It was not repaired into a runtime test because the header it gates is dead:
+# xmx-kernel-config.hpp is included only by xmx-unified-q4-kernel.hpp, which is
+# included only by tests. Giving it runtime checks would have produced a
+# real-looking test over code no shipped path reaches.
+
+# test-xmx-quant-loaders was DELETED by llama.cpp-u2mz: xmx-quant-loaders.hpp is
+# included only by xmx-unified-q4-kernel.hpp, whose only includer was a test, so
+# the include chain terminates and no production TU pulls any of it in.
+
+# test-xmx-unified-kernel was DELETED by llama.cpp-u2mz. Titled "matches outputs
+# of all 7 original kernel variants", it compared compute_reference_q4_0_q8_1
+# -- a host loop whose own comment says it "computes the same result regardless
+# of Config", the template parameter being unused -- against a line-for-line
+# duplicate of itself in the same file. No SYCL kernel, no joint_matrix, and no
+# UnifiedXMXKernel::operator() was ever invoked.
 
 if (NOT GGML_BACKEND_DL)
-add_executable(test-xmx-quant-loaders
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-quant-loaders.cpp
-)
-target_include_directories(test-xmx-quant-loaders PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-xmx-quant-loaders PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-xmx-quant-loaders PRIVATE "-fsycl")
-target_compile_definitions(test-xmx-quant-loaders PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-xmx-quant-loaders PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-xmx-quant-loaders PRIVATE IntelSYCL::SYCL_CXX)
-endif()
-add_test(NAME test-xmx-quant-loaders COMMAND test-xmx-quant-loaders)
-set_tests_properties(test-xmx-quant-loaders PROPERTIES
-    LABELS "sycl;xmx;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
-)
-endif() # static SYCL backend fixture
-
-if (NOT GGML_BACKEND_DL)
-add_executable(test-xmx-unified-kernel
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-xmx-unified-kernel.cpp
-)
-target_include_directories(test-xmx-unified-kernel PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-xmx-unified-kernel PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-xmx-unified-kernel PRIVATE "-fsycl")
-target_compile_definitions(test-xmx-unified-kernel PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-xmx-unified-kernel PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-xmx-unified-kernel PRIVATE IntelSYCL::SYCL_CXX)
-endif()
-add_test(NAME test-xmx-unified-kernel COMMAND test-xmx-unified-kernel)
-set_tests_properties(test-xmx-unified-kernel PROPERTIES
-    LABELS "sycl;xmx;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
-)
-
 # Test: reset_model_weight_entries() must preserve entries still leased by a
 # live model at a model-load boundary instead of aborting (llama.cpp-ljb9,
 # commit acdb192d4), and must keep id_to_key_ pointed at a surviving layout
@@ -3795,7 +3820,14 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-esimd-float-atomic-compile PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
-set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
+set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES
+    LABELS "sycl;esimd;compile;tdd"
+    # 77 = no device / no ESIMD runtime. Until llama.cpp-u2mz every path in this
+    # test returned 0, including all four catch blocks, so an absent device and
+    # a working fadd atomic were indistinguishable.
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
 
 # LEVEL_ZERO_LOADER was located above for the packed-K native-event fixture.
 add_executable(test-sycl-level-zero-vmem-feasibility
@@ -3844,6 +3876,10 @@ add_test(NAME test-sycl-onednn-mxfp4-feasibility COMMAND test-sycl-onednn-mxfp4-
 set_tests_properties(test-sycl-onednn-mxfp4-feasibility PROPERTIES
     LABELS "sycl;onednn;mxfp4;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # 77 = could not probe (no oneDNN build, or engine creation failed). This is
+    # a capability probe, not a gate: no support matrix it reports is "wrong",
+    # so the only failure it can express is "the probe did not happen".
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -4118,24 +4154,20 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
     TIMEOUT 30
 )
 
-# The PP MoE scratch slot lifecycle model (llama.cpp-32dg): generation binding,
-# stale release, resize-in-flight and the claim rollback failpoint, driven
-# against a standalone host model of the ring. It has existed in tests/ since
-# that work landed but was never registered, so nothing ran it -- and it is the
-# only executable proof of the claim/release protocol the admission port above
-# had to preserve. Pure host C++: no SYCL, no backend library, no device.
-add_executable(test-sycl-pp-moe-scratch-lifecycle
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-lifecycle.cpp
-)
-find_package(Threads REQUIRED)
-target_link_libraries(test-sycl-pp-moe-scratch-lifecycle PRIVATE Threads::Threads)
-set_target_properties(test-sycl-pp-moe-scratch-lifecycle PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-add_test(NAME sycl-pp-moe-scratch-lifecycle COMMAND test-sycl-pp-moe-scratch-lifecycle)
-set_tests_properties(sycl-pp-moe-scratch-lifecycle PROPERTIES
-    LABELS "sycl;moe;lifecycle;host-only;tsan-capable"
-    TIMEOUT 30
-)
+# test-sycl-pp-moe-scratch-lifecycle was DELETED by llama.cpp-u2mz. It was
+# described as "the only executable proof of the claim/release protocol", but it
+# included ZERO project headers and its target had one source plus
+# Threads::Threads -- slot_backing, local_slot_state and model were all defined
+# in an anonymous namespace inside the test. Nothing it could observe was a
+# property of ggml/src/ggml-sycl/; test_arena_reset_destroy_generation_bump()
+# was literally `uint64_t g = 7; const uint64_t stale = g; g++;
+# require(stale != g, ...)`, i.e. an assertion that ++ increments.
+#
+# The real claim/release protocol is still gated, by the SOURCE-CONTRACT test
+# sycl-pp-moe-scratch-source registered above, whose checks read
+# unified-cache.hpp/.cpp and ggml-sycl.cpp directly. The six checks in that
+# script that only asserted this deleted file contained certain case names were
+# removed with it.
 
 # MMVQ sub-group-per-row launch geometry (llama.cpp-99ke).
 # mmvq-launch-geometry.hpp is dependency-free by design -- it includes no SYCL

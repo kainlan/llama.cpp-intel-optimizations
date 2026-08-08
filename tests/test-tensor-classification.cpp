@@ -10,6 +10,16 @@
 #include <iostream>
 #include <string>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiled every one
+// of the 41 assertions below out and left `return 0` as main's sole reachable
+// exit -- a program that could not fail (llama.cpp-u2mz Phase A).
+//
+// Same fix, same reason, as tests/test-tensor-placement.cpp:14. Must precede
+// <cassert>, which binds the assert macro at include time.
+#undef NDEBUG
+#include <cassert>
+
 using namespace ggml_sycl;
 
 void test_tensor_classification() {
@@ -106,7 +116,9 @@ int main() {
         test_extract_layer_id();
         test_extract_expert_id();
         test_make_tensor_info();
-        std::cout << "\nAll tensor classification tests PASSED!\n";
+        // The count is load-bearing: it is how a stale binary is caught. Update
+        // it when assertions are added or removed.
+        std::cout << "\nAll tensor classification tests PASSED! (41 live assertions)\n";
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "Test FAILED: " << e.what() << "\n";

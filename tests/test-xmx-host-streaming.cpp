@@ -17,8 +17,8 @@
 
 #if !defined(GGML_USE_SYCL)
 int main() {
-    fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled\n");
+    return 77;  // ctest SKIP_RETURN_CODE -- see the note above main() below
 }
 #else
 
@@ -203,10 +203,24 @@ static bool run_sycl_case(ggml_backend_t sycl_backend,
     return true;
 }
 
+// llama.cpp-u2mz: every one of this test's early exits used to return 0, so a
+// build with XMX off, a missing SYCL backend and a device without XMX INT8 all
+// reported success. They now exit 77 (ctest SKIP_RETURN_CODE); only a real
+// mismatch against the CPU reference returns 1.
+//
+// The build-time gate was additionally unreachable by construction until the
+// registration in ggml/src/ggml-sycl/CMakeLists.txt started propagating
+// GGML_SYCL_XMX_GEMM / GGML_SYCL_MMQ_XMX to this target -- they are set
+// `target_compile_definitions(ggml-sycl PRIVATE ...)` on the library, so no
+// -D a user passes to the build ever reached this TU.
+static constexpr int EXIT_SKIP = 77;
+
 int main() {
 #if !defined(GGML_SYCL_XMX_GEMM) || !defined(GGML_SYCL_MMQ_XMX)
-    fprintf(stderr, "XMX GEMM not enabled at build time; skipping test.\n");
-    return 0;
+    fprintf(stderr,
+            "SKIP: XMX GEMM not enabled at build time "
+            "(configure with -DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON)\n");
+    return EXIT_SKIP;
 #else
     setenv("GGML_SYCL_DMA_SLICE_MB", "1", 1);
     setenv("GGML_SYCL_DMA_BUFFERS", "2", 1);
@@ -218,7 +232,7 @@ int main() {
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
         fprintf(stderr, "SKIP: Could not initialize SYCL backend\n");
-        return 0;
+        return EXIT_SKIP;
     }
 
     int xmx_m = 0, xmx_n = 0, xmx_k = 0;
@@ -226,7 +240,7 @@ int main() {
     if (xmx_m == 0 || xmx_n == 0 || xmx_k == 0 || !ggml_sycl_xmx_supports_type(GGML_TYPE_Q4_0)) {
         fprintf(stderr, "SKIP: Device does not support XMX INT8/Q4_0\n");
         ggml_backend_free(sycl_backend);
-        return 0;
+        return EXIT_SKIP;
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -280,6 +294,7 @@ int main() {
         return 1;
     }
 
+    printf("PASS: xmx host streaming (2 SYCL cases vs CPU reference: aos, xmx_gemm_tiled)\n");
     ggml_backend_free(cpu_backend);
     ggml_backend_free(sycl_backend);
     return 0;

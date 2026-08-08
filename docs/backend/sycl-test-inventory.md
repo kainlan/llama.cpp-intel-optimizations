@@ -10,6 +10,18 @@ executed, because this pass ran without `BUILD.lock` or device access — those
 still need the lead (or a follow-up) to actually run the described mutation and
 confirm the reasoning.
 
+> ⚠️ **This document is cumulative and parts of it are HISTORY.** A remediation
+> pass on 2026-08-08 deleted ten tests, repaired or reclassified six more, and
+> changed the population from 127 to 117 — see **REMEDIATION PASS** below, which
+> is the current state. Sections above it (the `llama.cpp-0igs` restoration
+> audit, Task 16/17d/19) are point-in-time records and still name files and
+> registrations that no longer exist: `test-onednn-fallback`,
+> `test-xmx-kernel-config`, `test-xmx-quant-loaders`, `test-xmx-unified-kernel`,
+> `test-kernel-dispatch`, `test-sycl-pp-moe-scratch-lifecycle` and the four
+> `test-sycl-moe-*-policy`/`-metadata`/`-bridge` mocks. They are left as written
+> rather than back-edited, because rewriting an executed audit's record makes it
+> unciteable. **Read the dispositions table before acting on any row above.**
+
 ## ⚠️ TOP-LINE ANSWER: the `llama.cpp-0igs` merge-blocker question
 
 **At the original inventory baseline on 2026-08-02 (`333a8d7b2`), 64
@@ -1362,6 +1374,13 @@ minus already mutation-proven (excluded from this plan) ........   4
 PLANNED IN THIS SECTION ....................................... 127
 ```
 
+⚠️ **127 is the Phase A figure and the derivation above is its history — it is
+not the current population.** The remediation pass deleted ten of the tests it
+counted, so the live number is **117**; see *REMEDIATION PASS* below and the
+appendix, which carries the arithmetic. Re-running the `grep -c 'add_test('`
+command below will now return a smaller number than the 156 recorded here, for
+the same reason.
+
 Reproduce the arithmetic (registration-only; executes nothing):
 
 ```bash
@@ -1420,7 +1439,7 @@ all. The other two rows are *control runs* of shipped fault injectors — they
 cost nothing and prove the harness reaches its target before you pay for the
 real mutation, which for both lives in a later batch (`test-q6k-dispatch` in H,
 `test-sycl-transient-alloc-intent-scope` in G). Only the two gates count toward
-the 127.
+the population total.
 
 | test | mutation | runtime | verifiability | expected RED | notes |
 |---|---|---|---|---|---|
@@ -1503,7 +1522,7 @@ independent; sequence them in one file-open.
 | test | mutation (`ggml/src/ggml-sycl/mmvq.cpp:`) | runtime | verifiability | expected RED | notes |
 |---|---|---|---|---|---|
 | `test-sycl-moe-gateup-prepack-policy` | `:1018` `result.reason = "down-sum";` → `"capacity"` | CPU-ONLY | PASSFAIL, `PASS: MoE gate/up prepack policy`; CHECK prints `FAIL: %s:%d: %s` with file+line | `FAIL: tests/test-sycl-moe-gateup-prepack-policy.cpp:184: missing direct down-sum compatibility must reject before route selection`, rc 1 | 1 CHECK; the whole reject *ladder* is preserved, only one label moves. A sibling policy exists in `ggml-sycl.cpp:24474` — prefer this site, same evidence, ~20 min cheaper. |
-| `test-sycl-moe-fused-down-sum-policy` | `:250-251` `if (std::strcmp(env,"tile4")==0) { return 4; }` → `return 2;` | CPU-ONLY | PASSFAIL, `PASS: MoE XMX down-sum direct-final policy` | `FAIL: tests/test-sycl-moe-fused-down-sum-policy.cpp:335: tile4 down Q8 DPAS tile env must parse`, rc 1 | 1 CHECK in the 13th of 17 subtests. 3 subtests source-grep `mmvq.cpp` and `std::exit(1)` (not CHECK) if the file is not found — a confusing hard exit from an unexpected CWD. Editing env-name *strings* would trip those greps as collateral; this mutation touches none. |
+| `test-sycl-moe-fused-down-sum-policy` | `:250-251` `if (std::strcmp(env,"tile4")==0) { return 4; }` → `return 2;` | CPU-ONLY | PASSFAIL, `PASS: MoE XMX down-sum direct-final policy` | `FAIL: tests/test-sycl-moe-fused-down-sum-policy.cpp:335: tile4 down Q8 DPAS tile env must parse`, rc 1 | 1 CHECK in the 13th of 17 subtests. 3 subtests source-grep `mmvq.cpp` and `std::exit(1)` (not CHECK) if the file is not found — a confusing hard exit from an unexpected CWD. Editing env-name *strings* would trip those greps as collateral; this mutation touches none. ⚠️ **THE MUTATION ABOVE IS TEST-LOCAL AND DOES NOT SATISFY THE ADJUDICATION** (see *Deferred dead code* → ADJUDICATED): only **5 of the 17** subtests reach production, via the memoized wrappers in `mmvq.cpp` ~`:214-364` to the dispatch sites `:19184-19208`. Pin the Phase B mutation to one of those five before spending the build slot; the row's `:250-251` edit reddens an env parser inside the test file. |
 | `test-moe-mul-mat-id-q4q8` | `:2751` in `mul_mat_vec_q_id` swap the ids strides: `iid1 * ids_nb1 + id * ids_nb0` → `iid1 * ids_nb0 + id * ids_nb1` | GPU | PASSFAIL, per-case `nmse=%.6e max_diff=%.6f` | `MoE MUL_MAT_ID Q4_0 (base): nmse=<large> ...` + `FAIL: ... mismatch beyond tolerance (nmse>1.0e-03 or max_diff>2.00)`, rc 1 | Route verified on-path (n_experts=8, top_k=4, ne12=4 → threshold 32 ≥ batch 4, so MMVQ). Swapped strides stay in-bounds (max byte 108 of 128) so it corrupts rather than faults. Low specificity is unavoidable — main `break`s on the first failing case. |
 | `test-moe-mul-mat-id` | `:4102` `get_int_from_table_16(v0, kvalues_mxfp4)` → `(v1, ...)` | GPU | PASSFAIL, per-case `nmse=... max_diff=...` | `MoE MUL_MAT_ID MXFP4 (base): nmse=<large> ...` + `FAIL: ... (nmse>5.0e-04 or max_diff>1.00)`, rc 1 | ⚠️ **Route uncertainty — confirm before building.** The test registers weights on the *host* buffer type, and CLAUDE.md routes host-resident weights to CPU dispatch; if so the live MXFP4 kernel is `ggml_sycl_cpu_expert_mul_mat_batched` in `cpu-dispatch.cpp`, not `mmvq.cpp`. Run once with `GGML_SYCL_DEBUG=1` and read the dispatch line first. ⚠️ Do **not** mutate `kvalues_mxfp4` in `ggml-common.h` — it is shared with the ggml-cpu reference, so both sides move and the test stays green. |
 | `test-q8-0-layout-cache-path-mmvq` | `:21361` pass `src0_dd_i` (AoS base) instead of `soa_base` to `reorder_mul_mat_vec_q8_0_q8_1_sycl` | GPU | PASSFAIL, `Max diff: ... Result: PASS/FAIL` | `Max diff: 2.560000e+02, max rel: 1.000000e+00, min abs: 0.000000` then `Result: FAIL`, rc 1 | The test memsets `weight->data` to zero after caching, so an AoS read yields exactly 0 — unambiguous. The widest-blast mutation here, acceptable because the test's whole premise is "did the SoA pointer get used". Do not simplify the load-transaction bracket (RCA `llama.cpp-43uy`, lines 137–146). |
@@ -1578,7 +1597,7 @@ mock can fail. They moved to the mock/deletion bucket.
 | `test-tensor-placement` | `:8855` `if (strstr(name,"attn_") \|\| strstr(name,"ffn_"))` → drop the `ffn_` term | CPU-ONLY | bare `assert()` — aborts on the first | `Assertion 'ggml_sycl_classify_tensor("blk.10.ffn_down.weight") == 0' failed.`, **rc 134** | Fires 2 of 9 asserts but only one line prints. The file `#undef NDEBUG`s at line 14 *before* re-including `<cassert>` and records a verified mutation in its header — **do not remove that `#undef`**. |
 | `test-cross-model-weight-usage` | `:11833` `it->second = tensor_usage::UNKNOWN;` → `it->second = mapped;` | **GPU** (hint was wrong — the plan stage inits a backend per device) | COUNT `=== %d checks, %d failures ===` (14) | `=== 14 checks, 2 failures ===` + `FAIL: check 2: model A's own tied-weight case forces UNKNOWN (precondition for check 4)` + `FAIL: check 5: A->B->reactivate-A lookup restores A exact same-name usage`, rc 1 | Has a built-in positive control (check 1) and negative control (check 3); this mutation leaves both green deliberately. The alternative "key by bare name" at `:11822` breaks 4 of 6 and destroys the controls. |
 | `test-sycl-weight-key-stability` | `:11996` `id.file_offs = has_gguf_identity ? identity.file_offs : 0;` → `= 0;` | CPU-ONLY | PASSFAIL, `PASS: weight cache key remained stable` | `FAIL: cache key missing GGUF identity fields`, rc 1 | Only 3 checks total, so no partial-red outcome is available. Cheap to evaluate, expensive to build. |
-| `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. |
+| `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. ⚠️ **WEAKEST-COVERAGE ROW IN BATCH I** (adjudicated 2026-08-08, KEEP): exactly one thin production-reaching function, evidenced only by those 3 `contains()` checks. Revisit when the token-major bridge integration wires its mocks to production; first candidate to drop if it does not. |
 | `test-xmx-moe-mxfp4` | `:24489` in `test_moe_gateup_singlecol_policy` delete the `return out;` in the `graph_recording` arm | CPU for the 3 reachable subtests (they run *before* the device gate) | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 after the host tests | `FAILED: graph recording must reject first implementation`, `Tests run: 3, Passed: 2, Skipped: 0, Failed: 1`, rc 1 | **BLOCKED** by `GGML_SYCL_BUILD_XMX_TESTS` (see below). Note a 77 here still means 3 real assertions ran. |
 | `test-sycl-moe-sequence-graphlet-policy` | `:24797` `if (unsafe_fused_q8_requested)` → `if (false && ...)` in `moe_default_fast_path_policy_from_flags` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-sequence-graphlet-policy.cpp:939: known unsafe fused-Q8 request must quarantine default sequence replay`, rc 1 | 47 of its 49 assertions are source-text greps; the two truth-table cases are the only behavioural coverage — but they **do** reach production (`:24775`), unlike the glu-q8 sibling. Because most cases read source at runtime, a text-only mutation reddens it with no rebuild. |
 | `test-unified-cache-integrity` | `:29105` `if (!host_buffer && !sycl_buffer)` → `if (!host_buffer)` | GPU (768 staged weights, 128 MB ctx) | PASSFAIL, `Unified cache integrity test: %s` | `Failed to cache layout for type=2 idx=0` then `... FAIL`, rc 1 | Clean phase-1-green / phase-2-red split. ⚠️ Do **not** mutate `unified_cache::validate()` — that mutates the checker, not the property. The "on-topic" `id_to_key_[key] =` deletion at `unified-cache.cpp:4034` is unreliable (five other write sites can repopulate) — demand a positive control if you use it. |
@@ -1599,7 +1618,227 @@ mock can fail. They moved to the mock/deletion bucket.
 
 ---
 
+# REMEDIATION PASS (2026-08-08) — what was executed against the three trailing groups
+
+Phase A's headline finding was that a fifth of the registered SYCL C++ suite
+either cannot go red, tests a copy of itself, or is not built. This pass carried
+out the spec's own remedy — *fix it or delete it* — on all of it. Nothing below
+was built, run on a GPU, or ctest-ed; see **Pre-registered for the lead** at the
+end of this section for what still has to be executed.
+
+⚠️ **The set is 29, not 25.** The "25 findings" figure comes from the first
+revision of the Phase A comment (7 cannot-fail + 6 mocks + 12 blocked). The fix
+commit `4cd2145bb` moved four tests from Batch I into the mock bucket, taking it
+to 6 → 10, so the correct total against the merged plan is
+**7 + 10 + 12 = 29**. The doc body and appendix were already consistent at 29;
+only the summary sentence lagged.
+
+## Dispositions executed
+
+| test | Phase A group | disposition |
+|---|---|---|
+| `test-tensor-classification` | CANNOT-FAIL | **FIXED** — `#undef NDEBUG` + re-include, 41 assertions now live |
+| `test-sycl-esimd-float-atomic-compile` | CANNOT-FAIL | **FIXED** — reads back the atomic (`*ptr == 1.0f`); skips exit 77 |
+| `test-sycl-onednn-mxfp4-feasibility` | CANNOT-FAIL | **RECLASSIFIED** `PROBE` — exits 77 when it could not probe |
+| `test-xmx-host-streaming` | CANNOT-FAIL | **FIXED** — registration propagates the two options; skips exit 77 |
+| `test-sycl-lifecycle-public-api` | CANNOT-FAIL | **RECLASSIFIED** `COMPILE-GATE` — source + registration documented |
+| `test-unified-kernel-persistent` | CANNOT-FAIL | **REPAIRED** (unverified) — now `XMX-BLOCKED`; it was the suite's blocker |
+| `test-xmx-kernel-config` | CANNOT-FAIL | **DELETED** — all `static_assert`, and over a dead header chain |
+| `test-kernel-dispatch` | MOCK | **DELETED** — drifted mirror of `select_kernel_path` |
+| `test-onednn-fallback` | MOCK | **DELETED** — `onednn-fallback.hpp` reaches no production TU |
+| `test-sycl-pp-moe-scratch-lifecycle` | MOCK | **DELETED** — zero project headers; one case asserts `++` increments |
+| `test-xmx-quant-loaders` | MOCK | **DELETED** — terminated include chain |
+| `test-xmx-unified-kernel` | MOCK | **DELETED** — compares a duplicate of itself |
+| `test-sycl-moe-glu-q8-artifact-policy` | MOCK | **DELETED** — condemned four, production-unreachable helper |
+| `test-sycl-moe-glu-q8-fused-store-policy` | MOCK | **DELETED** — same |
+| `test-sycl-moe-direct-final-token-major-bridge` | MOCK | **DELETED** — same |
+| `test-sycl-moe-token-major-metadata` | MOCK | **DELETED** — same |
+| `test-sycl-level-zero-vmem-feasibility` | MOCK | **KEPT**, reclassified `PROBE` — see the correction below |
+| the 12 `GGML_SYCL_BUILD_XMX_TESTS` targets | XMX-BLOCKED | **UNBLOCKED (route a) + made visible (route b)** |
+| `test-mmvq-q8-0-streaming-bench` (bare ctest name) | — | **DELETED** — no ENVIRONMENT, so it could only ever skip |
+
+Commits: `b453f9a8d` (fixes), `059d28670` (deletions), `2414b5948` (XMX).
+
+## The XMX group — both routes taken
+
+**(a) The blocker is repaired.** `test-unified-kernel-persistent` was the single
+target that stopped `GGML_SYCL_BUILD_XMX_TESTS=ON` building, so one rotted file
+held 13 siblings hostage. The drift turned out to be five call sites and one
+struct's fields, and the CMake comment describing it was wrong in two ways — see
+*Corrections* below. ⚠️ **The repair is UNVERIFIED**: this lane cannot build.
+
+**(b) The absence is now visible.** `ctest -R` cannot be made to fail on a
+zero-match, so the fix is to make the match non-zero. With the option OFF, all 14
+guarded names are registered as `DISABLED` placeholders, so `ctest -N -R
+xmx-config` prints the test and a run reports it under *"The following tests did
+not run: … (Disabled)"* rather than *"No tests were found"* and exit 0. A
+`DISABLED` test's COMMAND never executes, so it costs nothing and needs no
+target. The two name lists are machine-checkable against each other from the
+CMake file itself; the check is written into the comment beside them.
+
+## Corrections to the Phase A plan, found while executing it
+
+1. **`test-tensor-classification` has 41 bare assertions, not 33** — 20 + 8 + 5 +
+   3 + 5 across its five cases. The disposition is unchanged.
+2. **`StridedCopyMeta` vs `SetRowsMeta` were conflated.** The inherited claim was
+   that the test writes `meta.pad` on a struct with no such member at lines
+   1365/1474/1952. **`SetRowsMeta` does have `pad`**, so 1365 and 1952 were always
+   legal; only 1474 was not. The compile-failure disposition survives on
+   `type_size` and the five pointer-vs-reference mismatches alone.
+3. **The `add_set_rows`/`add_strided_copy` fix is the opposite of the obvious
+   one.** The meta is no longer read through a device pointer — it is *copied
+   into* the `OperationDescriptor` (`op.has_embedded_meta = true`,
+   `unified-kernel.cpp:8600` and `:8624`). So the device staging buffers are
+   deleted rather than dereferenced.
+4. **`test-sycl-level-zero-vmem-feasibility` already exits 77 and its
+   registration already carries `SKIP_RETURN_CODE 77`.** The `llama.cpp-k208`
+   note repeated here ("skips render as FAILED") is stale — it was fixed, with a
+   comment distinguishing genuine absence (77) from a Level Zero call that should
+   have worked and did not (1). Nothing to do; the test is kept and reclassified
+   as a `PROBE` because it contains no llama.cpp code.
+5. **The `ggml_sycl_test_extract_layer_index` extern claim is dead, settled
+   against the artifact.** `nm -D --defined-only build/bin/libggml-sycl.so`
+   reports `T _Z34ggml_sycl_test_extract_layer_indexPKc` — global, exported, and
+   mangled exactly as the test declares it.
+6. **`tests/test-sycl-pp-moe-scratch-source.py` carried a tautology.** Its
+   arena-generation check read
+   `sycl_cpp.count("arena_generation_bump") >= 0 and cache_cpp.count(...) >= 3`.
+   The first clause is true for every possible input, and that symbol does not
+   occur in `ggml-sycl.cpp` at all (it lives in `unified-cache.hpp:2456` with 3
+   call sites in `unified-cache.cpp`). Removed; the informative clause is kept.
+
+## ⚠️ Deferred dead code — MUCH smaller than the handoff assumed
+
+The handoff asked for the four condemned `test_moe_*` function bodies in
+`ggml-sycl.cpp` to be recorded as "dead code pending lane pass". **Three of the
+four are not dead**, because tests this pass KEEPS still call them. Deleting them
+would break the build or redden a live test:
+
+| helper | definition | still consumed by |
+|---|---|---|
+| `test_moe_down_sum_direct_final_policy` | `ggml-sycl.cpp:24071`, decl `ggml-sycl-test.hpp:202` | `tests/test-sycl-moe-fused-down-sum-policy.cpp` (**26** call sites), `tests/test-sycl-moe-same-expert-grouping.cpp:215` |
+| `test_moe_build_token_major_metadata` | `ggml-sycl.cpp:24191`, decl `ggml-sycl-test.hpp:238` | `tests/test-sycl-moe-same-expert-grouping.cpp:81` |
+| `test_moe_glu_q8_artifact_policy` | `ggml-sycl.cpp:24403`, decl `ggml-sycl-test.hpp:323` | `tests/test-sycl-moe-fusion-noactivation.cpp:77` — a **source-text** assertion, `contains(sycl, "test_moe_glu_q8_artifact_policy")`, "helper must exist" |
+| `test_moe_glu_q8_fused_store_policy` | `ggml-sycl.cpp:24502`, decl `ggml-sycl-test.hpp:378` | **nothing** — genuinely unreferenced now |
+
+So the lane pass has exactly **one** mechanical deletion available:
+`test_moe_glu_q8_fused_store_policy`, together with its declaration and the
+`test_moe_glu_q8_fused_store_*` input/result/counter types and the
+`test_moe_glu_q8_kernel_path` enum around `ggml-sycl-test.hpp:352-380`. Confirm
+the exact bounds at deletion time rather than trusting these line numbers, which
+drift with every commit to that file.
+
+**The wider finding this exposes, for the lead rather than for a lane owner:**
+two tests that KEEP a Phase B build slot drive production-unreachable helpers —
+`test-sycl-moe-fused-down-sum-policy` (Batch E) is **26** calls into
+`test_moe_down_sum_direct_final_policy`, and `test-sycl-moe-same-expert-grouping`
+(Batch I) calls two of them. The build-slot rule that condemned the four deleted
+tests applies to those calls too.
+
+**ADJUDICATED 2026-08-08 (spec review of the remediation): BOTH TESTS KEEP.** The
+answer is mixed rather than clean, which is why it needed adjudicating:
+
+- **`test-sycl-moe-fused-down-sum-policy` — KEEP, with its mutation pinned.**
+  5 of its 17 test functions are production-reaching, traced through the
+  memoized wrappers in `mmvq.cpp` (~`:214-364`) to the dispatch sites at
+  `:19184-19208`. Its Batch E mutation **must target those five**; a mutation
+  aimed at any of the other twelve would redden a mock and prove nothing. The 12
+  pure-mock functions are scope-reduction candidates for a later pass, not a
+  deletion this ticket makes.
+- **`test-sycl-moe-same-expert-grouping` — KEEP, marginal.** Only one thin
+  production-reaching function, and its evidence is 3 source-text `contains()`
+  checks. Recorded as **the weakest-coverage row in Batch I**. Revisit when the
+  token-major bridge integration wires its mocks to production; if that work
+  does not land, this row is the first candidate to drop.
+
+## Orphaned by the deletions — not this lane's files
+
+Deleting the tests left three headers with no includer anywhere in the tree.
+They are backend sources, outside this lane's scope:
+
+- `ggml/src/ggml-sycl/onednn-fallback.hpp`
+- `ggml/src/ggml-sycl/xmx-unified-q4-kernel.hpp` — and, through it,
+  `xmx-kernel-config.hpp` and `xmx-quant-loaders.hpp`, whose only remaining
+  includer is that header
+- `ggml/src/ggml-sycl/xmx-esimd-gemm.hpp` and `xmx-esimd-gemm-q4.hpp` were
+  *already* included by nothing before this pass; `xmx-esimd-common.hpp` is
+  reachable only through them
+
+## Pre-registered for the lead
+
+Nothing in this pass was built or run. In order:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+
+# 1. CONFIGURE + BUILD -- the decisive check. Ten deleted sources and six removed
+#    CMake blocks are exactly what breaks a configure.
+./scripts/sycl-build.sh -r
+
+# 2. The deletions must have left no dangling ctest names.
+ctest --test-dir build -N | grep -cE 'kernel-dispatch|onednn-fallback|xmx-kernel-config|xmx-quant-loaders|xmx-unified-kernel|pp-moe-scratch-lifecycle'   # want 0
+ctest --test-dir build -N -R 'xmx-config'      # want 1 test, shown as Disabled -- NOT "No tests were found"
+
+# 3. The route-(a) claim, which is UNVERIFIED and the most likely to fail.
+cmake -B build-xmx -G Ninja -DGGML_SYCL=ON -DGGML_SYCL_F16=ON -DGGML_SYCL_BUILD_XMX_TESTS=ON
+ninja -C build-xmx test-unified-kernel-persistent
+#    If it still does not compile: fix it forward. Do NOT comment the target out.
+
+# 4. RED/GREEN on the two repaired tests. GREEN first, then the mutation.
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build \
+  -R '^(test-tensor-classification|test-sycl-esimd-float-atomic-compile)$' --output-on-failure
+```
+
+**RED controls to run for step 4** — a fix that makes a test *able* to fail is
+worth nothing until something has made it fail:
+
+| test | mutation | expected |
+|---|---|---|
+| `test-tensor-classification` | `tests/test-tensor-classification.cpp:17` `== tensor_class::EMBEDDING` → `== tensor_class::OUTPUT` | abort, rc **134**, no `All tensor classification tests PASSED! (41 live assertions)` line. Before this pass the same edit exited **0**. |
+| `test-sycl-esimd-float-atomic-compile` | in the kernel, `simd<float, 1> value = 1.0f;` → `= 0.0f` | `FAIL: ESIMD fadd atomic did not apply: expected 1.0, observed 0.000000`, rc **1**. Before this pass: rc 0, `PASS:` printed. |
+
+Grep the printed `PASS:`/`FAIL:` strings, never `rc 0` — both of these exit 77 on
+a missing device, and `test-sycl-esimd-float-atomic-compile` uses
+`default_selector_v`, so **pin the selector** or it will pick the iGPU
+(`llama.cpp-403s`).
+
+`test-xmx-host-streaming` has no RED control here: it needs
+`-DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON`, and confirming it now SKIPs
+with 77 rather than passing with 0 in the default build is the check that
+matters.
+
+Format: `clang-format-19 --dry-run -Werror` was run on every touched source. All
+report pre-existing whole-file drift on lines this pass did not touch; **no line
+added by this pass is reformatted** by clang-format — verified per file by
+diffing the formatted output and grepping for the added text.
+
+Structure of `ggml/src/ggml-sycl/CMakeLists.txt`: **balanced under a
+comment-aware `if`/`foreach` stack check at every commit in the range**
+(`fe48225ba`, `b453f9a8d`, `059d28670`, `2414b5948`, `b752806ce` — depth 0 at
+EOF, zero mismatched closers in each). **Naive `grep -c` tallies are unreliable
+in this file** and no specific pair of counts should be quoted: comment prose
+contains `if (` tokens, and the file is long enough that a stale or mid-edit
+sample is easy to take without noticing. Check the *property* (balanced), not a
+*number*.
+
+⚠️ **THIS DOC SUPERSEDES TWO FIGURES IN THE COMMIT MESSAGES.** Both are
+write-up errors; no code or logic depends on either, and the commits are not
+amended because re-writing mid-range messages churns SHAs the review already
+cites.
+
+| figure | where it is wrong | correct value |
+|---|---|---|
+| "25 call sites" / "25 calls" into `test_moe_down_sum_direct_final_policy` | `059d28670` message | **26** — `grep -c 'test_moe_down_sum_direct_final_policy(' tests/test-sycl-moe-fused-down-sum-policy.cpp` |
+| "if/endif 219/219 (was 226/226, -7 for the removed blocks)" | `059d28670` message | **unreproducible; do not quote.** The same commands now yield 224→220. The substantive claim — that the file is balanced — is independently confirmed above, and is the claim that matters. |
+
+---
+
 ## Tests that CANNOT be made to fail — deletion candidates per the spec
+
+> **STATUS: REMEDIATED.** All seven are dispositioned in the table above — four
+> fixed or reclassified, one repaired, one deleted, and
+> `test-sycl-lifecycle-public-api` documented as a compile-time gate. The
+> analysis below is retained as the evidence for those decisions.
 
 Seven registrations, in three failure modes. Each is a *permanently green*
 result that a merge certification would otherwise count as coverage.
@@ -1674,6 +1913,13 @@ result that a merge certification would otherwise count as coverage.
   ***This single rotted target is what blocks the entire XMX suite*** — see below.
 
 ## Tests that reach no production code (mocks) — repair or delete
+
+> **STATUS: REMEDIATED.** Nine of the ten scored `MOCK` were deleted; the tenth,
+> `test-sycl-level-zero-vmem-feasibility`, was kept and reclassified `PROBE`
+> (its `SKIP_RETURN_CODE 77` defect had already been fixed — see *Corrections*).
+> The `MOCK` group is now empty. Three of the four condemned helpers turned out
+> **not** to be dead code; see *Deferred dead code* above before deleting
+> anything from `ggml-sycl.cpp`.
 
 These *can* be made to fail, but only by mutating the test's own copy of the
 logic. A green from them says nothing about the shipped backend. Listed loudest
@@ -1750,6 +1996,15 @@ caught. Push back if the three should keep their slots.
 | partial: `test-q6k-reorder-dispatch` (1 of 8 subtests production), `test-sycl-moe-xmx-tiled-materialization` (2 of 5), `test-sycl-moe-direct-final-scratch-plan` (1 of 3, and that one is a text grep), `test-mmq-xmx-dispatch` (1 of 5), `test-sycl-moe-sequence-graphlet-policy` (2 of 49) | see the batch rows |
 
 ## Blocked: targets that do not exist in the current configuration
+
+> **STATUS: REMEDIATED both ways.** The build break that made
+> `GGML_SYCL_BUILD_XMX_TESTS=ON` fail is repaired (unverified — it has not been
+> built), and all 14 guarded names are now registered as `DISABLED` placeholders
+> when the option is off, so `ctest -R` on them can no longer exit 0 by matching
+> zero tests. The group is 13 in the appendix rather than 12, because
+> `test-unified-kernel-persistent` moved here out of `CANNOT-FAIL` once repaired.
+> `test-xmx-kernel-config` did not: it was deleted, and it was never in this
+> group anyway (it is registered outside the guard).
 
 ⚠️ **Read the counting convention first.** This section is a **cross-reference,
 not an additive bucket.** Only the `GGML_SYCL_BUILD_XMX_TESTS` group of **12**
@@ -1854,8 +2109,9 @@ batches have no recorded concurrent owner.
 Cheapest-per-test first, which also front-loads the tests most likely to
 produce a clean, unambiguous RED:
 
-**The 127 partition exactly — machine-checked, no test in two groups and none
-unassigned:**
+**The partition exactly — machine-checked, no test in two groups and none
+unassigned. 127 rows as planned in Phase A; 117 after the remediation pass,
+whose deletions all came from the three trailing groups:**
 
 | # | group | tests | builds | est. |
 |---|---|---|---|---|
@@ -1868,24 +2124,33 @@ unassigned:**
 | 7 | G — `common.hpp` | 5 | 6 | ~2.5 h |
 | 8 | H — other shared headers | 14 | 24 | ~7 h |
 | 9 | I — `ggml-sycl.cpp` + its private headers | 23 | 28 | ~9 h |
-| — | cannot be made to fail (delete/repair) | 7 | — | not executable |
-| — | mocks outside a batch (delete/repair) | 10 | — | mutation reaches no production code |
-| — | blocked by `GGML_SYCL_BUILD_XMX_TESTS` | 12 | — | target does not exist |
-| | **total** | **127** | **~139** | **~30 h** |
+| — | ~~cannot be made to fail~~ → `REMEDIATED-B` | 2 | — | fixed; Phase B rows still to write |
+| — | ~~cannot be made to fail~~ → `PROBE` / `COMPILE-GATE` / `XMX-OPT-GATED` | 4 | — | reclassified; not batch work |
+| — | blocked by `GGML_SYCL_BUILD_XMX_TESTS` | 13 | — | not built by default; blocker repaired, unverified |
+| — | ~~mocks outside a batch~~ | 0 | — | 9 deleted, 1 reclassified `PROBE` |
+| | **total** | **117** | **~139** | **~30 h** |
+
+⚠️ **These twelve rows changed in the remediation pass; the batch rows A–I did
+not.** The 98 batch tests, their ~139 builds and the ~30 h estimate are
+untouched — every deletion came from the three trailing groups, which were never
+scheduled for Phase B. The trailing groups went 29 → 19 (ten deletions), so the
+total goes 127 → 117. Arithmetic and the full group breakdown are in the
+appendix.
 
 Cost is dominated by builds, not runs: ~139 builds are the whole number, and 53
-of the 127 tests are CPU-only or device-free — those can be *run* by anyone.
+of the tests are CPU-only or device-free — those can be *run* by anyone.
 Only the builds (shared `build/`) and the GPU runs are lead-serialised.
 
 ⚠️ **Counting convention, because the first revision of this plan got it
-wrong.** These twelve rows are a **partition**: every one of the 127 tests
+wrong.** These twelve rows are a **partition**: every one of the 117 tests
 appears in exactly one, and the *Blocked* section further down is a
 cross-reference view over them, not an additional bucket. Two entries there
 (`test-sycl-module-dlopen`, `test-sycl-weight-key-uniqueness`) name tests
 already scored in Batch I and Batch H; adding them again is the double-count
 the `ona8` spec review caught. **The flat appendix at the end of this section is
-the authority** — 127 lines, one test each, checkable with
-`sort | uniq -d` returning nothing.
+the authority** — 117 lines, one test each, checkable with the command given
+there (which includes a positive control, because a mis-anchored `sed` range
+makes the duplicate check pass vacuously).
 
 Of the 23 Batch I rows, **19 mutate `ggml-sycl.cpp` itself** and 4 mutate
 headers that only `ggml-sycl.cpp` includes (`moe-bias-state.hpp`,
@@ -1895,11 +2160,17 @@ The last of those is cheap in practice — its test target links only
 and never touches the mega-TU; it is scored in I because the header's other
 consumer is the mega-TU, but budget it as Batch-B-class work.
 
-⚠️ **The three trailing groups are 25 of 127 — one test in five.** That is the
-headline finding of Phase A, and it is not an execution cost, it is a coverage
-result available today: a fifth of the registered SYCL C++ suite either cannot
-go red, tests a copy of itself, or is not built at all. The `ctest -R` exit-0
-trap in this ticket's description is live on thirteen of them right now.
+⚠️ **The three trailing groups were 29 of 127 — nearly one test in four.** That
+is the headline finding of Phase A, and it is not an execution cost, it is a
+coverage result: nearly a quarter of the registered SYCL C++ suite either could
+not go red, tested a copy of itself, or was not built at all. (The often-quoted
+"25" is from the first revision of the Phase A comment and predates the fix
+commit that moved four tests from Batch I into the mock bucket.)
+
+**All 29 have now been dispositioned** — see *REMEDIATION PASS* above. Ten were
+deleted, six fixed or repaired, four reclassified, and the `ctest -R` exit-0
+trap that was live on fourteen registrations is closed by `DISABLED`
+placeholders.
 
 ⚠️ Two standing rules apply throughout, from CLAUDE.md:
 
@@ -1913,14 +2184,55 @@ trap in this ticket's description is live on thirteen of them right now.
   backend. For each, grep for the test's own `PASS:` string, never for `rc 0`
   — and treat an implausibly short runtime as a signal.
 
-## Appendix: the flat partition (127 lines, one test each)
+## Appendix: the flat partition (117 lines, one test each)
 
-Generated from the group assignments above, not retyped. Every registered SYCL
-C++ test in scope appears **exactly once**. Verify with:
+**N changed from 127 to 117 in the remediation pass (2026-08-08).** The
+arithmetic, so it is checkable rather than asserted:
+
+```
+127  Phase A population
+- 10  deleted (9 MOCK + 1 CANNOT-FAIL) -- see "REMEDIATED" below
+= 117
+```
+
+The ten removed are `test-kernel-dispatch`, `test-onednn-fallback`,
+`test-sycl-moe-direct-final-token-major-bridge`,
+`test-sycl-moe-glu-q8-artifact-policy`,
+`test-sycl-moe-glu-q8-fused-store-policy`,
+`test-sycl-moe-token-major-metadata`, `test-sycl-pp-moe-scratch-lifecycle`,
+`test-xmx-quant-loaders`, `test-xmx-unified-kernel` (all `MOCK`) and
+`test-xmx-kernel-config` (`CANNOT-FAIL`). One row is **renamed** rather than
+removed: `test-mmvq-q8-0-streaming-bench` → `test-mmvq-q8-0-streaming-smoke`,
+because the bare registration under the old name was dropped and the binary's
+live ctest name is the smoke one. The binary itself is unchanged, so Batch D is
+still 14.
+
+Group counts after the pass, summing to 117:
+
+```
+A 2   B 19   C 5   D 14   E 5   F 11   G 5   H 14   I 23      = 98  (Phase B batches)
+REMEDIATED-B 2   PROBE 2   COMPILE-GATE 1   XMX-OPT-GATED 1
+XMX-BLOCKED 13                                                = 19  (not batch work)
+                                                                117
+```
+
+`MOCK` and `CANNOT-FAIL` are now **empty** — every member was either deleted or
+retagged. `XMX-BLOCKED` grew 12 → 13 because `test-unified-kernel-persistent`
+moved out of `CANNOT-FAIL`: it was repaired, so it is no longer a test that
+cannot fail, merely one that is not built by default.
+
+Every registered SYCL C++ test in scope appears **exactly once**. Verify with:
 
 ```bash
-# 127 lines, no duplicate test name
-awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must print nothing
+# The table header is `| group | test |` -- NO backticks around the two words.
+# Anchoring on a backticked header matches nothing and the check passes
+# vacuously; that mistake was made and caught while writing this line.
+sed -n '/^| group | test |/,$p' docs/backend/sycl-test-inventory.md \
+  | grep -oP '^\| `[A-Z-]+` \| `\K[a-z0-9-]+' > /tmp/u2mz-names
+wc -l < /tmp/u2mz-names        # must print 117
+sort /tmp/u2mz-names | uniq -d # must print nothing
+# positive control -- the duplicate check must be able to fire:
+sort /tmp/u2mz-names <(echo test-cold-start) | uniq -d   # must print test-cold-start
 ```
 
 | group | test |
@@ -1937,7 +2249,6 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `F` | `test-fattn-thread-local` |
 | `H` | `test-ggml-sycl-soa` |
 | `B` | `test-gpu-arch` |
-| `MOCK` | `test-kernel-dispatch` |
 | `I` | `test-layout-bytes` |
 | `D` | `test-mem-handle-eviction` |
 | `C` | `test-mem-handle-wrong-device` |
@@ -1945,7 +2256,7 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `F` | `test-mmq-q6k-gpu` |
 | `B` | `test-mmq-xmx-dispatch` |
 | `B` | `test-mmvq-launch-geometry` |
-| `D` | `test-mmvq-q8-0-streaming-bench` |
+| `D` | `test-mmvq-q8-0-streaming-smoke` |
 | `I` | `test-moe-bias-owner-state` |
 | `B` | `test-moe-control-plan` |
 | `I` | `test-moe-discovery-owner-state` |
@@ -1958,7 +2269,6 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `I` | `test-mul-mat-host-streaming` |
 | `XMX-BLOCKED` | `test-mxfp4-vector-dequant` |
 | `F` | `test-mxfp4-xmx-tiled` |
-| `MOCK` | `test-onednn-fallback` |
 | `B` | `test-onednn-woq` |
 | `H` | `test-q6k-dispatch` |
 | `F` | `test-q6k-reorder-dispatch` |
@@ -1971,7 +2281,7 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `I` | `test-sycl-device-uuid-api` |
 | `B` | `test-sycl-dispatch-tuning` |
 | `B` | `test-sycl-e2e-profile` |
-| `CANNOT-FAIL` | `test-sycl-esimd-float-atomic-compile` |
+| `REMEDIATED-B` | `test-sycl-esimd-float-atomic-compile` |
 | `F` | `test-sycl-fattn-onednn-descriptors` |
 | `F` | `test-sycl-fattn-onednn-materialization` |
 | `H` | `test-sycl-fattn-xmx-policy` |
@@ -1980,11 +2290,11 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `I` | `test-sycl-kv-planned-device-materialization` |
 | `G` | `test-sycl-kv-view-resolution` |
 | `D` | `test-sycl-layout-choice` |
-| `MOCK` | `test-sycl-level-zero-vmem-feasibility` |
+| `PROBE` | `test-sycl-level-zero-vmem-feasibility` |
 | `B` | `test-sycl-lifecycle-event-lease` |
 | `B` | `test-sycl-lifecycle-load-txn` |
 | `B` | `test-sycl-lifecycle-owner-reset` |
-| `CANNOT-FAIL` | `test-sycl-lifecycle-public-api` |
+| `COMPILE-GATE` | `test-sycl-lifecycle-public-api` |
 | `B` | `test-sycl-lifecycle-runtime-host` |
 | `B` | `test-sycl-lifecycle-runtime-wrapper` |
 | `B` | `test-sycl-lifecycle-wrapper-overlap` |
@@ -1992,28 +2302,23 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `C` | `test-sycl-mem-handle-lifetime` |
 | `I` | `test-sycl-module-dlopen` |
 | `A` | `test-sycl-moe-direct-final-scratch-plan` |
-| `MOCK` | `test-sycl-moe-direct-final-token-major-bridge` |
 | `I` | `test-sycl-moe-expert-parallelism` |
 | `E` | `test-sycl-moe-fused-down-sum-policy` |
 | `A` | `test-sycl-moe-fusion-noactivation` |
 | `E` | `test-sycl-moe-gateup-prepack-policy` |
 | `H` | `test-sycl-moe-gateup-prepack-scratch` |
-| `MOCK` | `test-sycl-moe-glu-q8-artifact-policy` |
-| `MOCK` | `test-sycl-moe-glu-q8-fused-store-policy` |
 | `D` | `test-sycl-moe-handle-resolution` |
 | `H` | `test-sycl-moe-identity-hash` |
 | `D` | `test-sycl-moe-q8-scratch` |
 | `D` | `test-sycl-moe-residency-preflight` |
 | `I` | `test-sycl-moe-same-expert-grouping` |
 | `I` | `test-sycl-moe-sequence-graphlet-policy` |
-| `MOCK` | `test-sycl-moe-token-major-metadata` |
 | `I` | `test-sycl-moe-xmx-tiled-materialization` |
 | `D` | `test-sycl-moe-xmx-tiled-single-layout-planner` |
 | `H` | `test-sycl-moe-xmx-tiled-single-layout-policy` |
-| `CANNOT-FAIL` | `test-sycl-onednn-mxfp4-feasibility` |
+| `PROBE` | `test-sycl-onednn-mxfp4-feasibility` |
 | `I` | `test-sycl-onednn-packed-cache` |
 | `I` | `test-sycl-orchestrator` |
-| `MOCK` | `test-sycl-pp-moe-scratch-lifecycle` |
 | `D` | `test-sycl-reset-model-weight-lease-preserve` |
 | `D` | `test-sycl-residency-diagnostics` |
 | `D` | `test-sycl-residency-reservation` |
@@ -2029,7 +2334,7 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `I` | `test-sycl-weight-key-stability` |
 | `H` | `test-sycl-weight-key-uniqueness` |
 | `G` | `test-sycl-xmx-unified-correctness` |
-| `CANNOT-FAIL` | `test-tensor-classification` |
+| `REMEDIATED-B` | `test-tensor-classification` |
 | `I` | `test-tensor-placement` |
 | `I` | `test-tiered-dispatch` |
 | `D` | `test-unified-cache-bugs` |
@@ -2039,21 +2344,32 @@ awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must prin
 | `H` | `test-unified-dispatch-integration` |
 | `XMX-BLOCKED` | `test-unified-kernel` |
 | `XMX-BLOCKED` | `test-unified-kernel-ops` |
-| `CANNOT-FAIL` | `test-unified-kernel-persistent` |
+| `XMX-BLOCKED` | `test-unified-kernel-persistent` |
 | `XMX-BLOCKED` | `test-xmx-compute` |
 | `XMX-BLOCKED` | `test-xmx-config` |
 | `XMX-BLOCKED` | `test-xmx-default-enable` |
 | `XMX-BLOCKED` | `test-xmx-esimd-basic` |
 | `XMX-BLOCKED` | `test-xmx-hardware-detect` |
-| `CANNOT-FAIL` | `test-xmx-host-streaming` |
-| `CANNOT-FAIL` | `test-xmx-kernel-config` |
+| `XMX-OPT-GATED` | `test-xmx-host-streaming` |
 | `I` | `test-xmx-moe-mxfp4` |
 | `XMX-BLOCKED` | `test-xmx-optimization` |
-| `MOCK` | `test-xmx-quant-loaders` |
-| `MOCK` | `test-xmx-unified-kernel` |
 | `B` | `test-zone-sizing` |
 
-Group keys: `A`–`I` are the execution batches in order; `CANNOT-FAIL` is the
-deletion/repair set that no mutation can redden; `MOCK` reaches no production
-code; `XMX-BLOCKED` does not currently build. The last three are findings,
-not work items — nothing in them is scheduled for Phase B.
+Group keys. `A`–`I` are the execution batches in order and are the only Phase B
+work. The rest are dispositions, not schedule:
+
+- `REMEDIATED-B` — was permanently green, has been fixed, and is now a Phase B
+  candidate whose mutation row still has to be written and run.
+- `PROBE` — a capability probe rather than a gate: it reports what the driver or
+  oneDNN supports, and no observed answer is "wrong". The only failure it can
+  express is "the probe did not happen", which it now does by exiting 77.
+- `COMPILE-GATE` — checked by the compiler, not by ctest. Mutating and running
+  it proves nothing; build the target and read the compiler.
+- `XMX-OPT-GATED` — real test, body reachable only with `GGML_SYCL_XMX_GEMM=ON`
+  and `GGML_SYCL_MMQ_XMX=ON`. Those definitions now reach the test target;
+  before this pass no `-D` could execute one line of it.
+- `XMX-BLOCKED` — behind `GGML_SYCL_BUILD_XMX_TESTS` (default OFF). The build
+  break that stopped `=ON` from working has been repaired but **not yet built**,
+  and each of the 14 names is now also registered as a DISABLED placeholder when
+  the option is off, so `ctest -R` on them can no longer match zero silently.
+- `MOCK`, `CANNOT-FAIL` — both empty; retained as key definitions only.
