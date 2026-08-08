@@ -1,0 +1,421 @@
+[SYCL] Device 0 alloc caps: raw=31023.2 MB, safe=29472.0 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 30.3 GB (min max_mem_alloc_size across 1 active devices)
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+[UNIFIED-CACHE] Capping budget from 32656.0 MB to 32602.6 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=32026.6 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=32602.6 MB budget=32026.6 MB (100%)
+[VRAM-ARENA] External headroom 629 MB (caller-reserved 629 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 32026.0 MB exceeds raw per-allocation cap 31023.2 MB (safe chunk cap 29472.0 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 3 chunks, 32026.0 MB total (per-chunk cap 29472.0 MB)
+[VRAM-ARENA] Reserved 3 chunks, 32026.0 MB total (weight=30495.8, KV=250.2, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 3 chunk(s), 32026.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55e68034000 + 512.0 MB (offset 31514.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 209.7 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 209.7 GB budget, committed=0.0 GB (system total=246.9 GB available=217.7 GB reserve=8.0 GB pct=90)
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+Testing 2 devices
+
+Backend 1/2: SYCL0
+  Device description: Intel(R) Arc(TM) Pro B70 Graphics
+  Device memory: 32656 MB (32602 MB free)
+
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[1,8,1,3],nr23=[1,1],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i32,ne=[1,8,1,3],nr23=[1,1],r=2,v=0): [SYCL] tensor usage UNKNOWN: name=dst type=q8_0 ne=[256,5,1,3]
+[SYCL] tensor usage UNKNOWN: name=out type=q8_0 ne=[256,5,1,3]
+[1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i32,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f32,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=f16,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[3,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[31,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[33,5,1,1],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[3,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[31,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=bf16,type_idx=i64,ne=[33,5,1,7],nr23=[2,3],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q4_1,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q5_1,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q8_0,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[384,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[384,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[384,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q1_0,type_idx=i64,ne=[384,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=mxfp4,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[192,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[192,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[192,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=nvfp4,type_idx=i64,ne=[192,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q2_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q3_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q4_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q5_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=q6_K,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xxs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_xs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq2_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_xxs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq1_m,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[96,3,1,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=0): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq4_nl,type_idx=i64,ne=[96,3,7,1],nr23=[2,3],r=2,v=1): [1;32mOK[0m
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq3_s,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,5,1,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,11,1,1],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[768,3,1,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=0): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,5,7,3],nr23=[1,1],r=1,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[256,11,1,7],nr23=[2,3],r=7,v=1): not supported [SYCL0] 
+  SET_ROWS(type_src=f32,type_dst=iq4_xs,type_idx=i64,ne=[768,3,7,1],nr23=[2,3],r=2,v=1): not supported [SYCL0] 
+/Apps/llama.cpp/ggml/src/ggml-sycl/set_rows.cpp:1064: GGML_ASSERT(src0->type == GGML_TYPE_F32) failed
+[New LWP 2451529]
+[New LWP 2451313]
+[New LWP 2451295]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+⚠️ warning: File "/opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x00007ce1132a061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x00007ce11331cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x00007ce11b921cda in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x00007ce11b920e49 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x00007ce114886805 in ggml_sycl_op_set_rows(ggml_backend_sycl_context&, ggml_sycl::sycl_tensor) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#7  0x00007ce114213726 in ggml_sycl_compute_forward(ggml_backend_sycl_context&, ggml_tensor*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#8  0x00007ce1142f757f in ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#9  0x00007ce11416db49 in ggml_backend_sycl_graph_compute_unchecked(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#10 0x00007ce11415d645 in ggml_backend_sycl_graph_compute(ggml_backend*, ggml_cgraph*) () from /Apps/llama.cpp/build/bin/libggml-sycl.so.0
+#11 0x00007ce11b951848 in ggml_backend_compare_graph_backend () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#12 0x0000000000509369 in test_case::eval(ggml_backend*, ggml_backend*, char const*, printer*) ()
+#13 0x000000000045c785 in test_backend(ggml_backend*, ggml_backend_device*, test_mode, char const*, char const*, printer*, char const*, int)::$_5::operator()(ggml_backend*, ggml_backend*) const ()
+#14 0x0000000000417a18 in main ()
+[Inferior 1 (process 2451263) detached]
