@@ -98273,7 +98273,29 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                    (op->src[1]->type == GGML_TYPE_F32);
         case GGML_OP_SET_ROWS:
             {
-                return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                // This predicate must admit exactly what ggml_sycl_op_set_rows accepts:
+                //   src0  F32 only            -- asserted at set_rows.cpp:1064, and set_rows_sycl is
+                //                                instantiated with TIn=float at set_rows.cpp:1095/1097
+                //   src1  I64 or I32          -- asserted at set_rows.cpp:1065
+                //   dst   the list below      -- the dst-type switch at set_rows.cpp:934-985; any other
+                //                                type reaches its GGML_ABORT("Unsupported tensor type!")
+                // The src0 clause was missing, so the F16-src cases in test-backend-ops
+                // (test_set_rows at tests/test-backend-ops.cpp:7921-7924) passed this filter and then
+                // tripped the :1064 assert (llama.cpp-9wjb).
+                //
+                // CUDA and CPU do accept an F16 src0 when dst is F16 (ggml-cuda/set-rows.cu:380,
+                // ggml-cpu/ops.cpp:5110-5122). SYCL has no F16-src instantiation, so those cases are
+                // declined here and fall back to CPU; adding the instantiation is a separate capability
+                // change (llama.cpp-9vm3), not part of making this predicate agree with the op.
+                //
+                // ggml_sycl_type_is_fp8_e4m3() is unconditionally false today (common.hpp:6304). Should
+                // an FP8 E4M3 ggml type ever appear, the dst-type switch needs an FP8 case first -- its
+                // kernel exists but has no caller (set_rows.cpp:765-856).
+                if (op->src[0] == nullptr || op->src[1] == nullptr) {
+                    return false;
+                }
+                return ((op->src[0]->type == GGML_TYPE_F32) &&
+                        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          ggml_sycl_type_is_fp8_e4m3(op->type) || op->type == GGML_TYPE_Q8_0 ||
                          op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 || op->type == GGML_TYPE_Q4_1 ||
                          op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
