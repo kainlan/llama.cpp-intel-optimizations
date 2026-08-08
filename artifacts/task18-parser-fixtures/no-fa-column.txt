@@ -1,0 +1,11 @@
+ggml_sycl_init: GGML_SYCL_FORCE_MMQ:   no
+ggml_sycl_init: SYCL_USE_XMX: yes
+ggml_sycl_init: found 1 SYCL devices:
+llama_model_loader: loaded meta data with 24 key-value pairs and 291 tensors from /models/mistral-7b-v0.1.Q4_0.gguf
+llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B50 Graphics) (unknown id) - 14677 MiB free
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |           pp512 |      1187.83 ± 18.79 |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |           tg128 |         46.53 ± 0.19 |
+
+build: df51c5130 (7412)

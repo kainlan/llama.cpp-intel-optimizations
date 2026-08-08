@@ -41,6 +41,31 @@ is an eviction guard, not a per-device concurrency control. Same-device
 concurrent inference also remains unsupported for the distinct context/arena
 ownership reasons documented in the canonical contract §5.
 
+⚠️ **`GGML_SYCL_DISABLE_GRAPH=1` is currently load-bearing for multi-context
+workloads, and that is an open question rather than a setting to recommend.**
+Measured at `98deb46ed` with replay ON (the default): the first context to begin
+a tracked graph on a device holds its invocation indefinitely — a replay-active
+graph never reaches a terminal state, so `release_invocation` silently no-ops —
+and every other context's claim on that device is refused `DEVICE_BUSY` exactly
+once, with no path by which it later succeeds. The discriminator is clean:
+`test-thread-safety` (3 models × 4 contexts, decodes serialized per device)
+fails at 3.4 s with replay on and passes at 6.95 s with replay off, both pinned
+`level_zero:0,1`.
+
+Consequences worth knowing before you reach for this flag:
+
+- The `test-thread-safety` **ctest registration sets it** (the
+  `llama.cpp-b16a`/`llama.cpp-cnre` disposition). That makes the test pass; it
+  does not resolve the production question. Do not read that green result as
+  evidence that multi-context works on the default configuration.
+- Whether winner-holds-forever is intended exclusivity or a gap is being
+  adjudicated on `llama.cpp-u7vj` (open, P2), with the analysis in the canonical
+  contract §5.3.
+- The blast radius is larger than the device count suggests: on current Level
+  Zero multi-GPU runtimes the scheduler-visible device set collapses to **one**
+  device, so all contexts in a process share device 0's registry slot regardless
+  of how many physical GPUs are installed.
+
 ## Experimental (opt-in, off by default)
 
 | Variable | Default | Effect |
@@ -267,11 +292,12 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent hangs 1:1 with their triggering op. |
+| `GGML_SYCL_FUSION_BIT1_REACH_DEBUG=1` | Default OFF (`ggml-sycl.cpp:83907`). Logs one `[FUSION-BIT1-GUARD]` line per bit1 fusion candidate: `is_weight`, the accumulated `view_offs`, `nb[0]`, element size, the per-operand `safe` verdict, and the full gate chain. Built for the gemma3n cross-model investigation (`llama.cpp-8t4s`), and still the way to answer "did the 81gx view-offset guard classify this operand correctly?" — in the healthy 2-arch run at HEAD, all 44 of gemma3n's unsafe views log `is_weight=0` and are refused. Diagnostic only; the block is guarded by the flag. |
 | `GGML_SYCL_HANDLE_STRICT=1` | Default OFF; reports `ggml_tensor_extra_gpu` `data_handle`/`data_device` divergence (first 16 only) without needing `GGML_SYCL_DEBUG=1`. Diagnostic only, no perf effect. Plan: `docs/plans/2026-07-30-extra-device-indexed-handle-storage.md`. |
 | `GGML_SYCL_MOE_LAYOUT_DEBUG=1` | Emit the `[MOE-LAYOUT]` per-pass summary unconditionally. The down-i8 / gateup-i8 lines already fire on ANY decline without this; the variable adds the lines a fully-successful pass would otherwise not print. |
 | `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=<N>` | Hard cap on how many down tensors the MoE I8 layout pass upgrades. Unset (or negative) = no cap, the shipping behaviour; `0` disables the upgrade. **Diagnostic only — do not set in production.** See the measured cost below. |
 | `GGML_SYCL_ARENA_PP_PROFILE=1` | Emit `[ARENA-PP-*]` counters, including `[ARENA-PP-ONEDNN] … reserve_req_mb=W/A` — the summed oneDNN weights/activations reservation requests. This is the **only** log that reports what was actually asked for, as opposed to what was planned. |
-| `GGML_SYCL_ZONE_RESET_AUDIT=1\|2` | Default OFF. Phase 0 of the retire-zone-reset epic (llama.cpp-iiff): every reset/drain site reports what is still live in its zone as `[ZONE-RESET-AUDIT]` lines, with the allocation's own `alloc_id`/`cohort`/`role`/`category` attribution. `=1` changes no behaviour and is safe across the whole gate set. `=2` additionally suppresses the reset even when the zone is clean — host SCRATCH/STAGING are reset-only by design, so that leaks without bound. See below. |
+| `GGML_SYCL_ZONE_RESET_AUDIT=1\|2` | Default OFF. Phase 0 of the retire-zone-reset epic (llama.cpp-iiff): every reset/drain site reports what is still live in its zone as `[ZONE-RESET-AUDIT]` lines, with the allocation's own `alloc_id`/`cohort`/`role`/`category` attribution. `=1` changes no behaviour and is safe across the whole gate set. `=2` additionally suppresses the reset even when the zone is clean — host SCRATCH/STAGING are reset-only by design, so that leaks without bound. See below. ⚠️ **The variable name and its site strings (`host-zone-reset/*`, `scratch-pool-reset/bump`, `device-zone-reset/*`, `weight-reclaim/*`) were deliberately NOT renamed when `llama.cpp-37ba` renamed the underlying API to `*_boundary_check` / `*_reclaim` / `scratch_pool_epoch_boundary`.** They are stable historical identifiers that keep captures 01–17 baseline-comparable. They look stale against the current code; they are not. Do not "fix" them. |
 
 ### `GGML_SYCL_ZONE_RESET_AUDIT` — reading a capture
 

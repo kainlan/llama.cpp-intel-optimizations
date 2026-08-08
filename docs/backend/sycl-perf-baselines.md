@@ -336,11 +336,16 @@ For orientation only — **not gates** — this build on clean cards delivers:
 | GPT-OSS 20B MXFP4 | ≈ 1410 PP512 / ≈ 43 TG128 | ≈ 894 PP512 / ≈ 32 TG128 |
 | Mistral 7B Q4_0 | ≈ 2495 PP512 / ≈ 108 TG128 | ≈ 1188 PP512 / ≈ 47 TG128 |
 
-### Open regression: the B50 is far below its documented guardrail
+### Open regression: the B50 GPT-OSS PP gap against its historical evidence
 
-`CLAUDE.md` records the B50 GPT-OSS 20B MXFP4 FA-on guardrail as **≥1100 PP512
-and ~50+ TG128**, citing restored-fast-path evidence of ~1255 PP512 / 52 TG128,
-and this document previously listed ~926 PP512 / ~48 TG128 as "current".
+⚠️ **Read the amendment at the end of this section before quoting the ≥1100
+figure. It is no longer a guardrail anywhere, and resurrecting it as one has
+already caused three false-regression scares in a single session.**
+
+`CLAUDE.md` **used to** record the B50 GPT-OSS 20B MXFP4 FA-on guardrail as
+**≥1100 PP512 and ~50+ TG128**, citing restored-fast-path evidence of ~1255
+PP512 / 52 TG128, and this document previously listed ~926 PP512 / ~48 TG128 as
+"current".
 
 Measured on this build: **893.77 PP512 / 32.06 TG128.**
 
@@ -374,9 +379,189 @@ against the build that produced 1255/52 — not the TG one.
 > than something to keep current.
 
 **These numbers are reported as a regression, not adopted as the new B50
-baseline.** Per `CLAUDE.md`'s regression rule, the documented guardrails stand.
-The residual cause may predate this plan. Do not "fix" the discrepancy by
-lowering the guardrail.
+baseline.** The residual cause may predate this plan. Do not "fix" the
+discrepancy by lowering a guardrail.
+
+#### Amendment 2026-08-08: the ≥1100 / ~50+ figures are RETIRED as a gate
+
+The sentence above originally read "the documented guardrails stand." That is no
+longer accurate about the ≥1100 PP512 / ~50+ TG128 pair specifically, and the
+correction matters in the opposite direction from the rest of this section.
+
+`CLAUDE.md` **removed** that guardrail on 2026-07-25 on the grounds that it
+predates the 26.27 driver: against it, a healthy B50 (~894–902 PP512) reads as an
+~18% catastrophe, and it triggered three separate false-regression scares in one
+session. Its current text is explicit — *"A `≥1100 PP512, ~50+ TG128` B50 GPT-OSS
+guardrail appeared here until 2026-07-25 and was wrong… If you find it quoted
+anywhere else, it is wrong there too."* This document was one of the places it
+was quoted.
+
+What survives the retirement, and what does not:
+
+- **Not a gate:** ≥1100 PP512 and ~50+ TG128. Never block a merge, fail a run, or
+  open a regression ticket on them. The same applies wherever they are still
+  baked into tracker acceptance criteria — `llama.cpp-po3nd.2` and its children,
+  `llama.cpp-ix58x`, `llama.cpp-aqzz3` — which a doc pass cannot reach and which
+  therefore cannot be closed as written.
+- **Still a gate:** the merge-certification floors in the section below, which
+  are the numbers this branch is actually certified against.
+- **Still genuinely open:** the *analysis*. The measured 893.77 PP512 sits ~29%
+  below the 1255 PP512 restored-fast-path evidence, the driver explains only
+  ~1.4% of it, and nothing has attributed the remainder. That is an unexplained
+  historical gap on the GPT-OSS/MoE path, worth a bisect against the build that
+  produced 1255/52 — but it is **not** a regression of this branch against a live
+  guardrail, and merge certification does not turn on it.
+
+The distinction is the whole point: a retired guardrail is not the same as a
+resolved question. Retiring the number does not close the investigation, and the
+investigation does not license reinstating the number.
+
+---
+
+## Merge-certification performance gate (plan Task 20 step 6)
+
+The numeric conditions under which
+`docs/plans/2026-08-02-sycl-merge-readiness.md` certifies this branch. They are
+stated here so the gate is read from the baseline document rather than from a
+task's acceptance criteria — several of which still carry the retired figures
+above.
+
+**Matrix.** Five separate `llama-bench` processes per arm, four arms
+(B70/B50 × Mistral 7B Q4_0 / GPT-OSS 20B MXFP4), `-p 512 -n 128 -fa 1 -r 5 -v`,
+selector pinned per card, each call through the plan's `run_gpu` wrapper so
+memory settlement is enforced between runs. `-v` is mandatory: without it
+`llama-bench` installs a null log callback and the free-VRAM line never appears.
+
+**B50 — explicit floors.** Five-process mean must be at least:
+
+| model | PP512 floor | TG128 floor |
+|---|---:|---:|
+| GPT-OSS 20B MXFP4 | 849 | 30.4 |
+| Mistral 7B Q4_0 | 1128 | 44.6 |
+
+**B70 — no numeric floor is authorized.** This document does not license one.
+The test is band membership against the recorded historical min–max:
+
+| model | PP512 band | TG128 band |
+|---|---|---|
+| GPT-OSS 20B MXFP4 | 1384.81–1434.14 | 40.18–46.27 |
+| Mistral 7B Q4_0 | 2425.24–2594.58 | 106.57–109.15 |
+
+A B70 mean outside its band **blocks merge and opens an owner-reviewed
+baseline/regression task**. It does not authorize inventing a floor, and it does
+not authorize lowering one.
+
+**Free VRAM must be checked on every run**, from the `-v` log: about 32602 MiB
+(B70) and 16250 MiB (B50). A B70 run reporting ~13.8 GB is confounded by another
+tenant and must be discarded, not rationalized.
+
+**No quiet-host precondition** (owner ruling, 2026-08-07). The host's ambient
+load — roughly 60, from Emby, the `ws2022ci` qemu VM and Frigate's ffmpeg — is
+its permanent operating state. Run the matrix under it; never defer waiting for
+quiet. If an arm misses its floor or band, discriminate load from regression with
+an interleaved paired A/B against a known-good comparator build on the same card,
+model and host state. Paired ratio within noise means load-depressed (file the
+owner-reviewed baseline task with the pairing attached); branch consistently
+slower within pairs means a real regression and blocks merge. Absolute numbers
+taken under load still must not become new baselines.
+
+### Fail-closed parsing — required procedure, and its current gap
+
+The gate above is only as good as the step that reads the logs, and reading them
+by eye fails **open**: a missing arm, a truncated log, or a run that emitted no
+`-fa 1` row all look the same as a clean pass. The plan therefore requires a
+parser that:
+
+1. extracts the `-fa 1` PP512 and TG128 rows from each `llama-bench -v` log;
+2. asserts **exactly five samples per arm** — a short arm is an error, not a
+   smaller sample;
+3. asserts the free-VRAM line is present and within the expected band for that
+   selector;
+4. computes the per-arm mean and compares it against the floor or band above;
+5. **exits non-zero on any missing, short, or unparseable sample** — never
+   reports a verdict it could not compute.
+
+Point 5 is the fail-closed property and the reason the parser exists. An empty
+grep over an empty capture returns clean forever; the parser must be able to say
+"I could not measure this", and that must be a failure.
+
+### `scripts/parse-sycl-bench-matrix.py` — the implementation
+
+Stdlib-only Python, invoked directly by the lead. It is deliberately **not** a
+registered CTest target: it reads evidence, it is not a test.
+
+```sh
+# after the matrix has run
+python3 scripts/parse-sycl-bench-matrix.py --dir artifacts/perf-final
+
+# verify the parser itself before trusting its verdict (see below)
+python3 scripts/parse-sycl-bench-matrix.py --self-test
+
+# explicit arms, if the logs are not in the conventional layout
+python3 scripts/parse-sycl-bench-matrix.py --arm b50-mistral=a.log,b.log,c.log,d.log,e.log ...
+```
+
+`--dir` expects `<arm>-<n>.log` (or `.txt`) for n in 1..5, with arms named
+`b70-mistral`, `b70-gptoss`, `b50-mistral`, `b50-gptoss` — the layout plan step 6
+already writes.
+
+**Exit codes, and why there are three rather than two:**
+
+| exit | meaning | what to do |
+|---:|---|---|
+| 0 | every arm present, parseable, and within its floor/band | proceed |
+| 1 | **VERDICT FAIL** — everything parsed, and a mean missed its gate | discriminate load from regression with an interleaved paired A/B; a B70 miss opens an owner-reviewed baseline task |
+| 2 | **INPUT/PARSE FAILURE** — no verdict could be computed | fix the inputs and re-run the matrix; **this is not a pass and not a fail** |
+
+"The branch is slow" and "I could not measure the branch" are different facts,
+and collapsing them into one non-zero code is how a missing arm gets triaged as
+a performance problem.
+
+**Stream routing is part of the contract**, so a caller that captures only
+stdout cannot mistake an error for a result: stdout carries results (the
+per-arm means table, and a `PASS` verdict), stderr carries every diagnostic
+that accompanies a non-zero exit. **Exit 2 writes nothing at all to stdout** —
+no verdict was computable, so there is no result to report. The `--self-test`
+asserts this per case rather than taking it on trust; a mutation routing one
+diagnostic back to stdout drops it from 10/10 to 4/10.
+
+Every one of these is exit 2, not a smaller sample: a missing file, an empty
+file, an arm with fewer than five logs, an arm entirely absent, a results
+directory that does not exist, a directory that exists but is empty, an
+unparseable `t/s` cell, a table with no `fa` column (i.e. not the `-fa 1`
+matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), and a
+run whose free VRAM is below the contamination floor.
+
+**Verify the parser before trusting it.** `--self-test` runs it against the
+committed fixtures in `artifacts/task18-parser-fixtures/` and must report
+**10/10**. The cases exist to prove the parser returns *all three* exit codes —
+including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
+measurement rather than the only answer it is capable of giving. A checker nobody
+has seen fail is indistinguishable from a checker that cannot fail.
+
+> ⚠️ **The free-VRAM floors are contamination detectors, not precision checks,
+> and the documented B50 figure does not match reality.** This document states
+> "~16.2 GB free on the B50", but the only two committed real B50 `-v` captures
+> (`captures/16-soak-mistral-bench-r30.err`, `captures/17-soak-gptoss-bench-r15.err`)
+> both report **14677 / 14679 MiB free on a healthy card**. A check pinned to the
+> documented figure would fail every healthy B50 run — the same shape as the
+> retired ≥1100 guardrail, a stale number manufacturing a false alarm. The
+> discrepancy is unresolved (16250 is suspiciously close to the card's ~16304 MB
+> *total*, so the documented value may be a total rather than an observed free),
+> so the parser defaults to floors that catch gross contamination — 30000 MiB
+> (B70) and 14000 MiB (B50) — and exposes `--min-free-mib b70=NNNNN`. **No
+> committed B70 `-v` capture exists at all**; the B70 floor is derived from the
+> ~32602 MiB figure here and should be tightened once a real capture lands.
+
+> ⚠️ **The matrix itself has not been run.** `artifacts/perf-final/` does not
+> exist, so there are no results to parse yet — the parser is verified against
+> fixtures only. Until Task 20 runs the matrix, this gate is unmeasured, and an
+> unmeasured gate must never be recorded as passed.
+
+Historical note on what *not* to copy: `captures/soak_analyze.py` prints
+`NO SITE ROWS -- capture is VOID, not clean` on empty input but **exits 0 on
+every path**. It is fail-loud, not fail-closed — fine for a human reading its
+output, useless in a gate that checks a status code.
 
 ---
 
@@ -405,8 +590,20 @@ A B580 record of `5b206c499-dirty` at **2173.92 PP512 / 88.42 TG128** (Mistral
 GPT-OSS 20B MXFP4 on the B580: **~66 PP512 / ~17 TG128** — its small VRAM budget
 caused heavy memory pressure on this model.
 
-The three-device split figure above involves a card that no longer exists;
-**B70↔B50 P2P has not been re-tested** (see `CLAUDE.md`).
+The three-device split figure above involves a card that no longer exists.
+
+⚠️ **The "B70↔B50 P2P has not been re-tested" hedge that stood here is RETIRED.**
+It was re-verified on the B70 on 2026-07-31 and the answer is settled: **there is
+no direct P2P between the two discrete cards**, and the cause is PCI topology
+rather than a property of either card — different CPU root ports (`00:06.0` vs
+`00:06.3`), no shared upstream bridge, so the kernel refuses peer DMA outright.
+A 256 KiB direct device-to-device USM copy fails **both** directions with
+`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` on a card with 31.89 GiB free, and
+`can_access_peer` returns false both directions. Note that
+`ext_oneapi_enable_peer_access()` returns OK anyway — it is not a capability
+check. Full account in `CLAUDE.md`, "Patched compute-runtime & P2P topology".
+Consequently host-bounce (`level_zero:0,1`) remains the only multi-device
+transfer path and `GGML_SYCL_MOE_MULTI_GPU` stays opt-in.
 
 ---
 
@@ -419,9 +616,25 @@ Mistral 7B Q4_0 (card still installed; these predate the current build):
 | PP512 (Level 0, all VRAM) | ~1197 | default no-FA bench path, ECC disabled |
 | TG128 (Level 0, all VRAM) | ~44 | Coalesced/SOA MMVQ, 70 W power cap |
 
-Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers. It can
-raise PP throughput, but the deterministic completion gate produces incorrect
-output with the current `nc != D` contiguity fast-path.
+⚠️ **RETIRED 2026-08-08 — the warning that stood here was wrong in both
+directions.** It read: *"Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore
+Mistral PP numbers. It can raise PP throughput, but the deterministic completion
+gate produces incorrect output with the current `nc != D` contiguity
+fast-path."* Both clauses are false:
+
+1. **The variable does not exist.** `3c8f296fd` (2026-05-15) removed the
+   `getenv("GGML_SYCL_FA_ONEDNN_ALLOW")` bypass **and added that warning in the
+   same commit** — it documented a footgun it had just deleted. Setting the name
+   today is a no-op. The only surviving occurrences are stale prose: a source
+   comment at `ggml/src/ggml-sycl/fattn.cpp:2804` and one line in
+   `docs/backend/SYCL.md:896`, neither of which this document can correct.
+2. **oneDNN SDPA is on by default and Mistral uses it, with no correctness
+   penalty.** `16a241dd1` (2026-05-30) added the `MATERIALIZE_REQUIRED` path, so
+   nc≠D GQA is no longer rejected. Disabling it costs ~39% of PP512 (1.63x
+   slower) on an interleaved paired B50 A/B.
+
+The real variable is **`GGML_SYCL_FA_ONEDNN`** (default ON; `=0` disables).
+Full derivation in `CLAUDE.md`, "Performance Expectations".
 
 Multi-device (`level_zero:0,1`) GPT-OSS throughput is still **TBD**; direct P2P
 is unavailable, so host-bounce transfer paths are required.

@@ -1,0 +1,11 @@
+ggml_sycl_init: GGML_SYCL_FORCE_MMQ:   no
+ggml_sycl_init: SYCL_USE_XMX: yes
+ggml_sycl_init: found 1 SYCL devices:
+llama_model_loader: loaded meta data with 24 key-value pairs and 291 tensors from /models/gpt-oss-20b-mxfp4.gguf
+llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B70 Graphics) (unknown id) - 32602 MiB free
+| model                          |       size |     params | backend    | ngl | fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -: | --------------: | -------------------: |
+| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           pp512 |      1415.13 ± 14.63 |
+| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           tg128 |         43.40 ± 1.83 |
+
+build: df51c5130 (7412)
