@@ -619,6 +619,17 @@ live `CMakeLists.txt`, rather than treating a source-name match or a zero-match
 | declined | **16** | **0** | **no declined basename has an active `add_executable` or `add_test` in either CMake file** |
 
 Thus the source-row decision remains **48 accepted + 16 declined = 64/64**.
+
+> ⚠️ **The figures in this Task 17d section are pinned at `fc606640e` and are
+> superseded as a current count.** They were correct when the audit ran; the
+> `test-sycl-expert-prefetch` re-decline landed afterwards (`a4791b7a9`,
+> 2026-08-05, reconciled into the Task 16 tables by `8518c9b70`), taking the
+> accepted set to **47 rows / 50 CTest names / 17 declined**. They are left
+> unedited deliberately: this section is the record of what the audit examined,
+> and rewriting its numbers would make it a record of something that never
+> happened. For the current counts read the Task 16 reconciliation above; for
+> what actually executed, the Task 19 section below.
+
 The difference between 48 accepted rows and 51 CTest names is intentional and
 comes only from `test-mmvq-q8-0-streaming-bench.cpp`, whose one executable has
 four required modes. The `sycl-restored` label identifies only the 11
@@ -734,6 +745,125 @@ forbidden restored-label matches=0 before runtime delegation. Mutation proofs
 remain with `llama.cpp-8u22`, and clean accepted-set GPU runtime remains with
 Task 19 (`llama.cpp-8kyi`); this audit claims neither.
 
+
+## Task 19: accepted-set lead gate — executed results
+
+The single recorded runtime execution of the accepted set. Source:
+`llama.cpp-8kyi` (closed 2026-08-06), its comment `c-jx40`, and the committed
+evidence in `artifacts/task19/`. Everything below is copied from that record;
+nothing here is inferred.
+
+### Build
+
+| item | value |
+|---|---|
+| build SHA | `772798e91814340d07f20a4e9e3969427759ed2d` |
+| command | `run_build restored-build ./scripts/sycl-build.sh` |
+| rc | 0 |
+| backend present | `grep -E '^GGML_SYCL:' build/CMakeCache.txt` → `BOOL=ON`; `ldd build/bin/llama-completion \| grep -cE 'libggml-sycl\|libsycl'` → 2 |
+
+The backend check is not ceremonial. A reconfigure can silently reset
+`GGML_SYCL` to `OFF`, the build still succeeds, and every token-level gate still
+passes — on the CPU, ~13x slower. A green test run proves nothing about which
+backend produced it.
+
+### Registration reconciliation (before any execution)
+
+`ctest -N` at `772798e91` found **50 of the 51** accepted CTest names registered
+exactly once. The missing name, `test-sycl-expert-prefetch`, was deliberately
+dropped by `a4791b7a9` — its source includes the removed `expert-cache.hpp`. The
+Task 16 tables above carry that re-decline (accepted set **47 rows / 50 CTest
+names**). Task 19 ran the amended 50.
+
+### Runtime
+
+Serial, one `ctest` invocation per name, under `GPU.lock`, on the B70:
+
+```sh
+export ONEAPI_DEVICE_SELECTOR=level_zero:0          # selector, pinned
+timeout 300 ctest --test-dir build -R "^${t}\$" --output-on-failure \
+    > "task19-logs/$t.log" 2>&1
+```
+
+Per name the runner recorded rc, `Shmem` before and after (2 s settle), and a
+**non-vacuity control**: `grep -cE '^\s*Start ' "$log"`, the count of tests the
+regex actually selected. A count of 0 would have written a `ZERO_MATCH` row. All
+50 rows report `matched=1` and **no `ZERO_MATCH` row exists** — so no result
+below is a zero-match filter reading as a pass. The runner also aborted the whole
+sweep if `Shmem` exceeded 100 GB after any test; it never fired.
+
+| outcome | count |
+|---|---:|
+| pass (rc 0) | 38 |
+| skip (rc 77, `***Skipped`) | 1 — `test-mmvq-q8-0-streaming-bench`, the opt-in benchmark mode |
+| fail (ctest rc 8) | 11 |
+| **total** | **50** |
+
+Elapsed 2026-08-06 16:24:14 → 16:29:05 (−04:00), 4 min 51 s. Memory stayed flat
+across the whole sweep: `Shmem` 5602656 kB at the first sample → 5623064 kB at
+the last (5.60 → 5.62 GB), final `MemAvailable` 207398448 kB (~207 GB). Nowhere
+near the hazard this document's model-loading rules guard against — these are
+unit fixtures, not model loads.
+
+### The 11 failures, with the exact printed signal
+
+Every signal below is a string the binary actually prints, taken from that
+test's captured log. None is a probe that could not have fired.
+
+| test | printed signal | RCA ticket | ticket status |
+|---|---|---|---|
+| `test-dmmv-q4-0-coalesced` | `errors=88 max_diff=0.427313 max_rel=0.309105 FAIL` | `llama.cpp-szv8` | **in_progress** |
+| `test-dmmv-q6k-coalesced` | `SYCL error: CHECK_TRY_ERROR(op(...))` at `ggml-sycl.cpp:38688` in `ggml_sycl_op_mul_mat`; subprocess aborted | `llama.cpp-99ke` | closed |
+| `test-ggml-sycl-soa` | same `ggml-sycl.cpp:38688` abort (its own 8 subtests passed first) | `llama.cpp-99ke` | closed |
+| `test-q8-0-layout-cache-path` | `Failed to resolve SoA layout pointer (source=wrong_layout)` | `llama.cpp-43uy` | closed |
+| `test-q8-0-layout-cache-path-mmvq` | same `wrong_layout` resolve failure | `llama.cpp-43uy` | closed |
+| `test-sycl-moe-identity-hash` | `FAIL: model_id mismatch` / `FAIL: test_single_weight_name_hash` (6 of 7 passed) | `llama.cpp-qvid` | closed |
+| `test-sycl-unified-memory-e2e` | `[UNIFIED-CACHE] alloc malloc_device returned nullptr` | `llama.cpp-mequ` | closed |
+| `test-sycl-weight-key-stability` | `FAIL: cache key missing GGUF identity fields` | `llama.cpp-n3pw` | closed |
+| `test-sycl-weight-key-uniqueness` | `FAIL: tied weights did not share cache identity` | `llama.cpp-n3pw` | closed |
+| `test-sycl-xmx-unified-correctness` | `SKIP: no graph-pinned entries, cannot validate graph path` then `FAIL: SYCL backend run failed` | `llama.cpp-sfe9` | closed |
+| `test-tiered-dispatch` | `FAIL: all-device-first has no planner target for all-device-first.blk.0.attn_q.weight` | `llama.cpp-wmc2` | closed |
+
+⚠️ **Ten of those eleven tickets have since closed, and that is NOT the same as
+ten of those eleven tests now passing.** The closures are RCA-and-fix closures
+landed at later SHAs (`llama.cpp-sfe9` at `ab6cbe970`, `llama.cpp-mequ`,
+`llama.cpp-n3pw`, `llama.cpp-wmc2`, `llama.cpp-43uy`, `llama.cpp-99ke`,
+`llama.cpp-qvid`), each verified against its own gate. **No re-run of the
+accepted set has been recorded since `772798e91`.** The 38/1/11 split above
+therefore remains the only executed result for this set, and a fresh serial
+sweep is owed before certification claims the set is green. Do not read the
+closed column as a pass column.
+
+`llama.cpp-szv8` is the one still open. Its own investigation established
+something worth carrying: `test-dmmv-q4-0-coalesced` **did not exercise the
+kernel it names** at the time of this sweep — the readback fell back to the
+tensor's SoA storage (`source=tensor-storage-fallback`), so the numeric rows
+were measuring an unintended path. `szv8c` (`7be63714e`) rewired it through the
+real staging bracket, and the first attributable run then reported
+`source=layout_ptr` with `Coalesced layout check: PASSED` and *near-bit-identical*
+numeric failures (`errors=55 max_rel=0.165479` against the pre-fix
+`55 / 0.165480`). That coincidence is unexplained and is the live question on
+that ticket.
+
+### Known-failing, and not a regression
+
+`test-sycl-moe-sequence-graphlet-policy` fails for a cause that predates the
+C-series base `9674a390b` and is not a production defect. Two sub-tests call
+`read_required_file` on `docs/plans/2026-06-24-sycl-moe-aggregation-decision.md`
+and `docs/plans/2026-06-24-sycl-moe-default-fast-path-decision.md`, which
+`std::exit(1)` when absent — and **neither document was ever committed, at any
+point in git history**, despite the test reading them since its first commit
+`b08e732cd` (2026-06-29). So this test has never passed end-to-end in its
+existence; the `mem-handle` label exclusion kept that invisible. Two further
+items in the same file are equally unfixable as text drift: both region markers
+for the `xmx_branch` sub-tests were removed from `ggml-sycl.cpp` by
+`d87d54cdd`/`9402d151e`, and the `grouped_decode_runtime_uses_device_ids_contract`
+gating flag was renamed into a broader flag. Tracked as `llama.cpp-26ak`
+(**open**). Treat a red here as this known wall, not as a new failure — and do
+not "fix" it by writing plausible-looking decision docs, since the two sub-tests
+would then assert against invented content.
+
+---
 
 ## Two instances named in the ticket
 
