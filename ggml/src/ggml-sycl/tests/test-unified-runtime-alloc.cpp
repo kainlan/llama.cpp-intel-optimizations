@@ -649,7 +649,7 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     req.role                                = offload_buffer_role::SET_TENSOR_STAGE;
     req.intent.role                         = alloc_role::STAGING;
     req.intent.category                     = runtime_category::STAGING;
-    req.intent.cohort_id                    = "test:host_zone_reset";
+    req.intent.cohort_id                    = "test:host_zone_boundary_check";
     req.intent.constraints.must_host_pinned = true;
 
     offload_buffer_lease lease{};
@@ -660,11 +660,16 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
 
     void *       ptr = lease.handle.ptr;
     alloc_handle looked{};
-    TEST_ASSERT(unified_lookup(ptr, &looked), "released lease should be registered before reset");
+    TEST_ASSERT(unified_lookup(ptr, &looked), "released lease should be registered before boundary check");
     TEST_ASSERT(release_offload_buffer(lease), "release failed");
 
-    cache->host_zone_reset(host_zone_id::STAGING);
-    TEST_ASSERT(!unified_lookup(ptr, &looked), "reset should remove released offload-pool registration");
+    // host_zone_reset() before llama.cpp-37ba's rename. The offload pool
+    // caches released leases for reuse rather than freeing them immediately
+    // (see offload_buffer_pool_trim_host_zone(), called from inside
+    // host_zone_settle()), so this call is still what purges an idle
+    // offload-pool registration for STAGING, not a pure no-op liveness check.
+    cache->host_zone_boundary_check(host_zone_id::STAGING);
+    TEST_ASSERT(!unified_lookup(ptr, &looked), "boundary check should remove released offload-pool registration");
 
     TEST_PASS();
     return true;

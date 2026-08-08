@@ -149,9 +149,13 @@ def precedes(text, first, second):
 def evaluate(cache, backend, common, header):
     cache, backend, common, header = squeeze(cache), squeeze(backend), squeeze(common), squeeze(header)
 
-    zone_reset = body_of(cache, "void unified_cache::zone_reset(")
-    host_reset = body_of(cache, "void unified_cache::host_zone_reset(")
-    scratch = body_of(cache, "void unified_cache::reset_scratch_pool(")
+    # Variable names kept as zone_reset/host_reset/scratch (pre-llama.cpp-37ba
+    # rename) -- they are local Python bindings, not asserted-against C++
+    # identifiers; only the body_of() search strings below (the actual C++
+    # signatures) needed to follow the rename.
+    zone_reset = body_of(cache, "void unified_cache::zone_settle(")
+    host_reset = body_of(cache, "void unified_cache::host_zone_settle(")
+    scratch = body_of(cache, "void unified_cache::scratch_pool_epoch_boundary(")
     reclaim = body_of(cache, "size_t unified_cache::reclaim_weight_entries(")
     zone_alloc = body_of(cache, "void * unified_cache::zone_alloc(")
     zone_free = body_of(cache, "void unified_cache::zone_free(")
@@ -167,7 +171,7 @@ def evaluate(cache, backend, common, header):
     watchdog = body_of(common, "static void watchdog_thread_fn(")
     reserve_onednn = body_of(cache, "bool unified_cache::reserve_onednn_scratch(")
 
-    # llama.cpp-37ba: the segment of host_zone_reset() between its level-2
+    # llama.cpp-37ba: the segment of host_zone_settle() between its level-2
     # suppression check and the real bulk host_arena_->zone_reset(zone) call.
     # "if (zone_reset_audit_suppresses_reset()) {" is unique within this
     # function (the level-2 check appears nowhere else in it), so slicing from
@@ -180,12 +184,49 @@ def evaluate(cache, backend, common, header):
         host_reset[_host_reset_suppress_idx:_host_reset_call_idx]
         if _host_reset_suppress_idx >= 0 and _host_reset_call_idx >= 0 else "")
 
+    # Owner-ruled acceptance criterion 1, made a machine check (llama.cpp-37ba):
+    # the three OLD dispatcher names -- as real call/definition syntax, name
+    # immediately followed by '(' -- must have zero occurrences in production
+    # backend code. Both the bare member names (zone_reset, host_zone_reset,
+    # reset_scratch_pool) and their free-function wrappers
+    # (unified_cache_zone_reset, unified_cache_host_zone_reset,
+    # unified_cache_reset_scratch_pool) are checked explicitly, because a
+    # word-boundary check for the bare name alone does NOT catch the wrapper
+    # form: "unified_cache_" ends in '_', a word character, so there is no
+    # boundary before "zone_reset" inside "unified_cache_zone_reset" and a
+    # bare-name-only pattern would silently miss a surviving wrapper call.
+    #
+    # Comments never reach this point at all -- strip_comments() already ran
+    # (module level) before evaluate() ever sees `cache`/`backend`/`common`/
+    # `header`, so every "named X() before llama.cpp-37ba's rename" narrative
+    # comment is gone before this scan runs; only real code and string
+    # literals remain, and no renamed string literal was left pointing at an
+    # old name (verified: every log-message string was updated alongside its
+    # call site). The one deliberate real-code survivor is
+    # host_arena_->zone_reset(...), the pinned_chunk_pool TLSF-layer primitive
+    # the owner ruling explicitly exempts ("genuinely internal ... not
+    # reachable as backend policy") -- excluded by lookbehind, not by skipping
+    # its defining file, because it is CALLED from unified-cache.cpp, which
+    # this script does read. pinned-pool.cpp/.hpp (where it and
+    # scratch_pool_reset_regions -- also exempted -- are DEFINED) are outside
+    # this script's four sources entirely, so no separate exemption is needed
+    # for the definition side.
+    _old_dispatcher_pattern = re.compile(
+        r"(?<!host_arena_->)(?<!pinned_chunk_pool::)\b"
+        r"(unified_cache_zone_reset|unified_cache_host_zone_reset|unified_cache_reset_scratch_pool|"
+        r"zone_reset|host_zone_reset|reset_scratch_pool)\s*\(")
+    old_dispatcher_name_survivors = [
+        "{}:{}".format(_label, _m.group(1))
+        for _label, _src in (("cache", cache), ("backend", backend), ("common", common), ("header", header))
+        for _m in _old_dispatcher_pattern.finditer(_src)
+    ]
+
     # Anchors: every region the checks read must have been found. A rename that
     # empties one of these reports a missing anchor rather than a silent pass.
     anchors = {
-        "unified_cache::zone_reset body": zone_reset,
-        "unified_cache::host_zone_reset body": host_reset,
-        "unified_cache::reset_scratch_pool body": scratch,
+        "unified_cache::zone_settle body": zone_reset,
+        "unified_cache::host_zone_settle body": host_reset,
+        "unified_cache::scratch_pool_epoch_boundary body": scratch,
         "unified_cache::reclaim_weight_entries body": reclaim,
         "unified_cache::zone_alloc body": zone_alloc,
         "unified_cache::zone_free body": zone_free,
@@ -243,7 +284,7 @@ def evaluate(cache, backend, common, header):
         'the scratch pool reset hook is declared before the reservation early-return':
             precedes(scratch, 'zone_audit_site_visit audit("scratch-pool-reset"', "!scratch_pool_ptr_"),
 
-        # llama.cpp-1ntm: host_zone_reset()'s WEIGHT-zone guard and zone_reset()'s
+        # llama.cpp-1ntm: host_zone_settle()'s WEIGHT-zone guard and zone_settle()'s
         # WEIGHT/shared-KV-arena refusals predate 495343bb5 and had the identical
         # defect -- an early return ahead of the hook makes a refused reset
         # vanish from the inventory instead of reading as "visited and
@@ -335,7 +376,7 @@ def evaluate(cache, backend, common, header):
                     "ensure_planned_arena_zones()"),
 
         # 7. llama.cpp-37ba (iiff Phase 3 / epic acceptance criterion 1, reconciled):
-        #    host_zone_reset()'s SCRATCH/STAGING population no longer needs the bulk
+        #    host_zone_settle()'s SCRATCH/STAGING population no longer needs the bulk
         #    host_arena_->zone_reset(zone) call to reclaim anything -- C2 made every
         #    allocation in those zones free itself individually at release, so by the
         #    time this function's registry scan finds nothing live, there is nothing
@@ -344,15 +385,31 @@ def evaluate(cache, backend, common, header):
         #    genuine on-demand reclaim need at context-switch time -- see
         #    arena_reserve() and the KV buffer-type fallback in ggml-sycl.cpp).
         #    epoch_tracked's early return is what keeps SCRATCH/STAGING out of that
-        #    real reset -- if a future edit weakens or removes it, the two zones
-        #    silently regain a live dependency on a reset that C2 already proved is
-        #    unreachable for them, undoing this step's whole point.
-        'SCRATCH/STAGING return before host_zone_reset reaches the real bulk reset':
+        #    real reclaim -- if a future edit weakens or removes it, the two zones
+        #    silently regain a live dependency on a path that C2 already proved is
+        #    unreachable for them, undoing this step's whole point. Dispatched
+        #    through host_zone_boundary_check() (SCRATCH/STAGING) and
+        #    host_zone_reclaim() (KV) since llama.cpp-37ba's naming split; both
+        #    call this same shared implementation, so the property is checked
+        #    once here rather than per-wrapper.
+        'SCRATCH/STAGING return before host_zone_settle reaches the real bulk reclaim':
             "if (epoch_tracked) {" in host_reset_epoch_guard_tail and "return;" in host_reset_epoch_guard_tail,
+
+        # 8. llama.cpp-37ba, owner-ruled rename (acceptance criterion 1 becomes a
+        #    machine check): the three OLD dispatcher names must have zero call
+        #    sites or definitions left in production backend code. Word-boundary
+        #    regex so a compound identifier that happens to CONTAIN one of the
+        #    old names as a substring (host_zone_settle, zone_boundary_check,
+        #    scratch_pool_epoch_boundary, zone_reset_calls/us profiling fields,
+        #    zone_reset_audit_* -- an entirely separate naming family) does not
+        #    false-positive; see the exemption list below for what is
+        #    deliberately allowed to remain.
+        'the three old reset/boundary dispatcher names have zero production call sites':
+            old_dispatcher_name_survivors == [],
     }
 
     return sorted(name for name, text in anchors.items() if not text), \
-           sorted(name for name, ok in checks.items() if not ok), len(checks)
+           sorted(name for name, ok in checks.items() if not ok), len(checks), old_dispatcher_name_survivors
 
 
 # Positive controls. An order check and an absence check both pass vacuously on a
@@ -396,18 +453,19 @@ MUTANTS = {
     # relocate the real (comment-bearing) early-return further down.
     "the scratch pool reset hook is declared before the reservation early-return": (
         "cache",
-        [("void unified_cache::reset_scratch_pool() {",
-          "void unified_cache::reset_scratch_pool() {\n    if (!scratch_pool_ptr_) { return; }")]),
+        [("void unified_cache::scratch_pool_epoch_boundary() {",
+          "void unified_cache::scratch_pool_epoch_boundary() {\n    if (!scratch_pool_ptr_) { return; }")]),
     # llama.cpp-1ntm: reproduces the same shape one level up -- an early
-    # return inserted ahead of the hook in host_zone_reset()/zone_reset().
+    # return inserted ahead of the hook in host_zone_settle()/zone_settle()
+    # (named host_zone_reset()/zone_reset() before llama.cpp-37ba's rename).
     "the host reset hook is declared before the reservation early-return": (
         "cache",
-        [("void unified_cache::host_zone_reset(host_zone_id zone) {",
-          "void unified_cache::host_zone_reset(host_zone_id zone) {\n    if (!host_arena_) { return; }")]),
+        [("void unified_cache::host_zone_settle(host_zone_id zone) {",
+          "void unified_cache::host_zone_settle(host_zone_id zone) {\n    if (!host_arena_) { return; }")]),
     "the VRAM reset hook is declared before the WEIGHT early-return": (
         "cache",
-        [("void unified_cache::zone_reset(vram_zone_id zone) {",
-          "void unified_cache::zone_reset(vram_zone_id zone) {\n    if (zone == vram_zone_id::WEIGHT) { return; }")]),
+        [("void unified_cache::zone_settle(vram_zone_id zone) {",
+          "void unified_cache::zone_settle(vram_zone_id zone) {\n    if (zone == vram_zone_id::WEIGHT) { return; }")]),
     # The exact "tidy" this guards against: collapsing the chain back to the
     # unconditional restore the reference had.
     "the fatal handler chains to the displaced handler, not SIG_DFL": (
@@ -430,10 +488,19 @@ MUTANTS = {
     # survives a longer or shorter rationale comment on the guard. The effect
     # is the same as deleting the guard -- SCRATCH/STAGING would fall through
     # to the real host_arena_->zone_reset(zone) call again.
-    "SCRATCH/STAGING return before host_zone_reset reaches the real bulk reset": (
+    "SCRATCH/STAGING return before host_zone_settle reaches the real bulk reclaim": (
         "cache",
         [("if (zone_reset_audit_suppresses_reset()) {\n        return;\n    }\n\n    if (epoch_tracked) {",
           "if (zone_reset_audit_suppresses_reset()) {\n        return;\n    }\n\n    if (false && epoch_tracked) {")]),
+    # Simulates exactly what llama.cpp-37ba's rename must never regress to: a
+    # stray call to an old dispatcher name (here, the free-function wrapper
+    # form specifically, since that is the one a bare-word-boundary check
+    # would silently miss -- see the check's own comment).
+    "the three old reset/boundary dispatcher names have zero production call sites": (
+        "cache",
+        [("void unified_cache::zone_free(vram_zone_id zone, void * ptr) {",
+          "void unified_cache::zone_free(vram_zone_id zone, void * ptr) {\n"
+          "    unified_cache_zone_reset(0, zone);")]),
 }
 
 
@@ -448,7 +515,7 @@ def self_test(cache, backend, common, header):
             continue
         for anchor, replacement in edits:
             sources[target] = sources[target].replace(anchor, replacement, 1)
-        _, failed, _ = evaluate(sources["cache"], sources["backend"], sources["common"], sources["header"])
+        _, failed, _, _ = evaluate(sources["cache"], sources["backend"], sources["common"], sources["header"])
         if name not in failed:
             problems.append("check did not fire on its mutant: " + name)
     return problems
@@ -459,12 +526,15 @@ backend = strip_comments(Path(args.backend).read_text())
 common = strip_comments(Path(args.common).read_text())
 header = strip_comments(Path(args.header).read_text())
 
-missing_anchors, failed, n_checks = evaluate(cache, backend, common, header)
+missing_anchors, failed, n_checks, old_dispatcher_name_survivors = evaluate(cache, backend, common, header)
 
 for name in missing_anchors:
     print("MISSING ANCHOR: " + name)
 for name in failed:
     print("FAIL: " + name)
+    if name == 'the three old reset/boundary dispatcher names have zero production call sites':
+        for survivor in old_dispatcher_name_survivors:
+            print("  survivor: " + survivor)
 
 if missing_anchors or failed:
     sys.exit(1)

@@ -106,13 +106,13 @@ static bool test_graph_scratch_owner_survives_pool_reset_and_growth() {
     TEST_ASSERT(transient_a != nullptr, "transient scratch allocation should succeed");
     TEST_ASSERT(transient_a != graph_ptr, "graph scratch must not alias transient scratch pool");
 
-    ggml_sycl::unified_cache_reset_scratch_pool(0);
+    ggml_sycl::unified_cache_scratch_pool_epoch_boundary(0);
     void * transient_b = ggml_sycl::unified_cache_get_scratch(0, demand.bytes_per_buffer);
-    TEST_ASSERT(transient_b != nullptr, "transient scratch allocation after reset should succeed");
-    TEST_ASSERT(transient_b != graph_ptr, "scratch reset must not recycle graph scratch ownership");
+    TEST_ASSERT(transient_b != nullptr, "transient scratch allocation after epoch boundary should succeed");
+    TEST_ASSERT(transient_b != graph_ptr, "scratch epoch boundary must not recycle graph scratch ownership");
 
-    // At this point transient_a's region was left lingering by the reset
-    // above (never returned) and transient_b's region is live too -- every
+    // At this point transient_a's region was left lingering by the epoch
+    // boundary above (never returned) and transient_b's region is live too -- every
     // region in the ring is live. Regrow must refuse rather than discard and
     // reallocate the backing buffer out from under either still-outstanding
     // pointer (llama.cpp-2757 review finding: the one path that could

@@ -1460,8 +1460,9 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
-    # Gate for llama.cpp-fz2u: host_zone_reset() / zone_reset() must REFUSE to
-    # reset a zone that still holds a live registered allocation, instead of
+    # Gate for llama.cpp-fz2u: host_zone_settle() / zone_settle() (named
+    # host_zone_reset() / zone_reset() before llama.cpp-37ba's rename) must
+    # REFUSE to reset a zone that still holds a live registered allocation, instead of
     # aborting (9a0670712) or purging the registry and resetting anyway (the
     # behaviour before it, which recycled addresses still owned by live handles).
     #
