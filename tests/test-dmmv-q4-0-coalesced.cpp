@@ -230,11 +230,26 @@ static void dmmv_q4_0_q8_activation_reference(const block_q4_0_test * x,
 //     amax/127 (ggml/src/ggml-sycl/quantize.hpp:39-56);
 //   * the block also carries `sum`, the sum of the RAW activation floats, and
 //     both it and the scale are stored as fp16 (quantize.hpp:121);
-//   * vec_dot_q4_0_q8_1_impl folds Q4_0's -8 offset as `d4 * (sumi*ds.x -
-//     8*ds.y)` (ggml/src/ggml-sycl/vecdotq.hpp:709), i.e. it subtracts that raw
+//   * vec_dot_q4_0_q8_1_impl folds Q4_0's -8 offset by subtracting that raw
 //     `sum` rather than d8*sum(q8). The two differ by the block's quantization
 //     residual, which is why a plain Q8_0-activation oracle lands at roughly
 //     half the gap and this one lands on it.
+//
+// On that last point the coefficient below is 8 while the production line reads
+// 4, and the difference is real rather than a transcription slip -- two
+// re-verifiers have now worked through it, so the derivation belongs here.
+// ggml/src/ggml-sycl/vecdotq.hpp:709 literally says
+//
+//     return d4 * (sumi * ds8f.x() - (8 * vdr / QI4_0) * ds8f.y());
+//
+// with vdr = VDR_Q4_0_Q8_1_MMVQ = 2 (vecdotq.hpp:689) and QI4_0 = QK4_0/(4*QR4_0)
+// = 4, so the coefficient is 8*2/4 = 4 -- but that is PER CALL, and each call
+// covers only vdr of the block's qi quant groups. mmvq.cpp:2174 (and :2265 for
+// the reorder variant) sets block_elements_per_subgroup = qi/vdr_mmvq = 2, so
+// two such calls cover one block and their results are summed by the sub-group
+// reduction: 2 x 4 = 8. This reference is written per whole block rather than
+// per partial group, so 8 is the correct coefficient here. Anyone reconciling
+// the two should compare totals per block, not the literal constants.
 //
 // Modelled on the host, this reproduces the reported GPU numbers to six
 // significant figures at two shapes (1024x64: errors 55, max_rel 0.165478 vs
@@ -902,10 +917,25 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
     std::vector<float> input_q8_snapped(ncols);
     snap_activation_to_q8_0(input_data.data(), input_q8_snapped.data(), ncols);
 
-    // Columns chosen to move every axis of the addressing contract: low vs high
-    // nibble of the same byte, a different word plane of a different block, and
-    // the last element of the last tile of the row.
-    const int                       one_hot_cols[] = { 0, 16, 33, ncols - 1 };
+    // Columns chosen to move every axis of the addressing contract. A one-hot at
+    // column c lands in block c/32, byte (c%32)%16, and therefore WORD PLANE
+    // ((c%32)%16)/4 -- the plane index is what the coalesced layout interleaves,
+    // so covering all four is the point of the set:
+    //
+    //   0        block 0,  byte 0,  plane 0, low nibble
+    //   16       block 0,  byte 0,  plane 0, high nibble  (same byte as col 0)
+    //   33       block 1,  byte 1,  plane 0, low nibble   (different BLOCK, same plane)
+    //   20       block 0,  byte 4,  plane 1, high nibble
+    //   8        block 0,  byte 8,  plane 2, low nibble
+    //   ncols-1  last blk, byte 15, plane 3, high nibble  (last element of the row)
+    //
+    // col=33 is deliberately kept even though it does not add a plane: it is the
+    // only column that moves the BLOCK index while holding the plane fixed, which
+    // separates a block-stride error from a plane-stride one. (An earlier comment
+    // here claimed 33 crossed word planes. It does not -- byte 1 is plane 0 -- and
+    // 20 and 8 were added to make the per-plane coverage the comment described
+    // actually true.)
+    const int                       one_hot_cols[] = { 0, 16, 33, 20, 8, ncols - 1 };
     constexpr int                   n_one_hot      = (int) (sizeof(one_hot_cols) / sizeof(one_hot_cols[0]));
     std::vector<std::vector<float>> one_hot_inputs(n_one_hot, std::vector<float>(ncols, 0.0f));
     for (int p = 0; p < n_one_hot; ++p) {
@@ -1095,7 +1125,10 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         std::vector<float> ref_f32(nrows);
         dmmv_q4_0_cpu_reference(x_aos, input_data.data(), ref_f32.data(), ncols, nrows);
 
-        const oracle_score s_dfloat = score_against(gpu_out, ref, 1e-2f);
+        // Alias, never a second score_against(gpu_out, ref, ...) call: the gate
+        // and this diagnostic must report the same fit, and a future threshold
+        // edit must not be able to update one and miss the other.
+        const oracle_score & s_dfloat = fit_dfloat;
         const oracle_score s_f32    = score_against(gpu_out, ref_f32, 1e-2f);
         const oracle_score s_q8     = score_against(gpu_out, ref_q8, 1e-2f);
         const oracle_score s_mmvq   = fit_mmvq;
@@ -1139,9 +1172,11 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             for (int i = 0; i < nrows; ++i) {
                 want[i] = one_hot_expected(x_aos, ncols, i, one_hot_cols[p]);
             }
-            const oracle_score s = score_against(got, want, 1e-3f);
-            printf("    PROBE one-hot col=%-6d (block=%d %s nibble): errors=%d max_diff=%.6f", one_hot_cols[p],
-                   one_hot_cols[p] / QK4_0, (one_hot_cols[p] % QK4_0) < QK4_0 / 2 ? "low " : "high", s.errors,
+            const oracle_score s             = score_against(got, want, 1e-3f);
+            const int          elem_in_block = one_hot_cols[p] % QK4_0;
+            printf("    PROBE one-hot col=%-6d (block=%-4d byte=%-3d plane=%d %s nibble): errors=%d max_diff=%.6f",
+                   one_hot_cols[p], one_hot_cols[p] / QK4_0, elem_in_block % (QK4_0 / 2),
+                   (elem_in_block % (QK4_0 / 2)) / 4, elem_in_block < QK4_0 / 2 ? "low " : "high", s.errors,
                    s.max_diff);
             if (s.first_bad >= 0) {
                 printf(" first_bad_row=%d gpu=%.6f want=%.6f", s.first_bad, got[s.first_bad], want[s.first_bad]);
