@@ -1939,6 +1939,53 @@ set_tests_properties(test-sycl-retained-handoff-barrier PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the publisher ticket must leave NO gap in which an owner is invisible to
+# drain_retained_handles(true) (llama.cpp-fbj5, plan Task 12c).  This is the oze0
+# device-free reproducer (artifacts/oze0/repro-drain-barrier.cpp) with its polarity
+# flipped: what it measured as a defect at 79-99% of boundary crossings is the
+# behaviour 1f84f1a95's ticket removed, so the same concurrent shape is now a
+# contract assertion.  The guard it pins is the `state.publishers == 0` clause of
+# the drain predicate; artifacts/fbj5/guard-mutation.diff removes exactly that
+# clause and must turn this red.
+#
+# Distinct from its single-threaded sibling test-sycl-retained-handoff-barrier,
+# which covers the ticket's API contract but cannot observe a handoff GAP -- that
+# is only visible from another thread while the owner is mid-hold.  The names are
+# deliberately NOT prefixes of one another: ctest -R/-E take unanchored substrings,
+# so a name ending "-barrier-contended" would silently ride along with every
+# filter aimed at the sibling.
+#
+# CPU-only by construction: DIRECT handle views over stack buffers plus
+# default-constructed (already complete) events -- no device, queue or cache, and
+# safe at any ctest parallelism.  Labels avoid every word in CLAUDE.md's throttled
+# sweep denylist (-LE 'residency|mem-handle|cache'), which is about
+# memory-exhaustion hazard rather than subject matter.
+add_executable(test-sycl-retained-handoff-contended
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-retained-handoff-contended.cpp
+)
+target_include_directories(test-sycl-retained-handoff-contended PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-retained-handoff-contended PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-retained-handoff-contended PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-retained-handoff-contended PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-retained-handoff-contended PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-retained-handoff-contended PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-retained-handoff-contended COMMAND test-sycl-retained-handoff-contended)
+set_tests_properties(test-sycl-retained-handoff-contended PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+)
+
 # Test: the scoped transient allocators must decide allocation SHAPE -- role, category, arena
 # zone, allocator path -- from THIS thread's recording state (llama.cpp-f9tg).  The three
 # scoped_unified_*_temp templates in ggml-sycl.cpp took it from

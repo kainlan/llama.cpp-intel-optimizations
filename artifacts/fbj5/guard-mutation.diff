@@ -1,0 +1,12 @@
+diff --git a/ggml/src/ggml-sycl/mem-handle.cpp b/ggml/src/ggml-sycl/mem-handle.cpp
+--- a/ggml/src/ggml-sycl/mem-handle.cpp
++++ b/ggml/src/ggml-sycl/mem-handle.cpp
+@@ -1269,7 +1269,7 @@
+     auto &                       state = *g_retained_handles_state;
+     std::unique_lock<std::mutex> lock(state.mutex);
+     return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&state] {
+-        return state.queue.empty() && state.active == 0 && state.publishers == 0;
++        return state.queue.empty() && state.active == 0;
+     });
+ }
+ 
