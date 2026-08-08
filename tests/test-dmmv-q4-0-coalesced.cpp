@@ -59,6 +59,33 @@
 // production-policy-reachable for this type and shape, and is the fact to reason
 // from about production -- but it is not the operative mechanism in this test.
 //
+// CORRECTED A FOURTH TIME, AND THIS ONE CLOSES IT (llama.cpp-szv8, 2026-08-08):
+// Part 2 was STILL not running the coalesced DMMV kernel after the third fix,
+// and the numbers say so to seven significant figures. Hardware, all three
+// shapes: the GPU matched a q8_1-MMVQ oracle at max_diff 4e-6 / 8e-6 / 5e-4
+// while missing the dfloat oracle by 0.187 / 0.268 / 0.500. One row, verbatim:
+// gpu=-14.931747, q8_1_mmvq=-14.931746, dfloat=-14.980540.
+//
+// The mechanism is ggml-sycl.cpp's TG fast-path, which claims every batch=1
+// quantized mul_mat whose weight resolved to a non-AoS layout, dispatches MMVQ
+// with q8_1-quantized activations against that layout, and returns -- before any
+// of the kernel-selection machinery that honours GGML_SYCL_FORCE_DMMV or the
+// layout override's kernel choice. Its own comment says it "bypasses
+// orchestrator, name parsing, prefetch, TP checks for maximum speed".
+//
+// This is why the third fix's preconditions could ALL pass while the verdict
+// stayed wrong: the override binds on materialization, so the coalesced buffer
+// really was built and really was byte-exact -- and then MMVQ read it. Every
+// structural check was true and the answer still came from the wrong kernel.
+// main() now also sets GGML_SYCL_TG_FAST=0, and the gate no longer takes any
+// precondition's word for it: it asserts from the numbers which kernel ran.
+//
+// Two things follow that are bigger than this test. The observed 12-31% was
+// never a wrong answer -- it is the by-design accuracy of MMVQ's 8-bit activation
+// quantization scored against a full-precision-activation oracle. And for Q4_0 at
+// batch=1 with a reordered layout, production takes that same fast-path, so the
+// coalesced DMMV kernel this file is named for is not reached by default.
+//
 // The symptom was "[LAYOUT-CHECK] readback done (source=tensor-storage-fallback)"
 // followed by "Coalesced layout check: NOT RUN" on every shape, while the numeric
 // comparison happily produced FAIL rows for whatever kernel the SOA layout
@@ -999,7 +1026,39 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         cpu_backend_max_diff = fmaxf(cpu_backend_max_diff, fabsf(gpu_out[i] - cpu_out[i]));
     }
 
-    bool pass = (errors == 0);
+    // Which kernel actually ran, asserted from the numbers themselves.
+    //
+    // Three rounds of this ticket reported verdicts about a kernel that never
+    // executed, and every structural precondition passed while it happened --
+    // the layout resolved COALESCED, the pointer was distinct, the bytes were
+    // exact. What separates the two kernels is not their inputs, it is their
+    // arithmetic: the dfloat DMMV answer and the q8_1 MMVQ answer differ by
+    // ~0.19-0.50 at these shapes, four orders above a correct kernel's residual.
+    //
+    // So require the dfloat oracle to be the decisively better fit. The margin
+    // is a RATIO, not a tolerance, which is what makes it immune to the failure
+    // it guards: widening a tolerance cannot satisfy it, because loosening the
+    // gate moves both fits together. A correct DMMV run clears it by ~4 orders.
+    std::vector<float> ref_mmvq(nrows);
+    dmmv_q4_0_q8_1_mmvq_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), input_data.data(),
+                                  ref_mmvq.data(), ncols, nrows);
+    const oracle_score fit_dfloat = score_against(gpu_out, ref, 1e-2f);
+    const oracle_score fit_mmvq   = score_against(gpu_out, ref_mmvq, 1e-2f);
+
+    const bool kernel_identified = fit_mmvq.max_diff > 100.0f * fmaxf(fit_dfloat.max_diff, 1e-9f);
+    if (!kernel_identified) {
+        printf(
+            "  FAIL: the executing kernel is not the dfloat coalesced DMMV --"
+            " max|gpu-dfloat_oracle|=%.6f vs max|gpu-q8_1_MMVQ_oracle|=%.6f\n",
+            fit_dfloat.max_diff, fit_mmvq.max_diff);
+        if (fit_mmvq.max_diff < fit_dfloat.max_diff) {
+            printf(
+                "    the q8_1-MMVQ oracle fits BETTER: an MMVQ path took this dispatch."
+                " Check that GGML_SYCL_TG_FAST=0 still disables the batch=1 fast-path.\n");
+        }
+    }
+
+    bool pass = (errors == 0) && kernel_identified;
     if (verbose || !pass) {
         printf(
             "  DMMV coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s"
@@ -1036,13 +1095,10 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         std::vector<float> ref_f32(nrows);
         dmmv_q4_0_cpu_reference(x_aos, input_data.data(), ref_f32.data(), ncols, nrows);
 
-        std::vector<float> ref_mmvq(nrows);
-        dmmv_q4_0_q8_1_mmvq_reference(x_aos, input_data.data(), ref_mmvq.data(), ncols, nrows);
-
         const oracle_score s_dfloat = score_against(gpu_out, ref, 1e-2f);
         const oracle_score s_f32    = score_against(gpu_out, ref_f32, 1e-2f);
         const oracle_score s_q8     = score_against(gpu_out, ref_q8, 1e-2f);
-        const oracle_score s_mmvq   = score_against(gpu_out, ref_mmvq, 1e-2f);
+        const oracle_score s_mmvq   = fit_mmvq;
         printf("    gpu vs f32-activation    oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_f32.errors,
                s_f32.max_diff, s_f32.max_rel);
         printf("    gpu vs dfloat-activation oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_dfloat.errors,
@@ -1404,6 +1460,23 @@ int main() {
     // priority list would take DMMV_SOA.
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
+    // Without this, NONE of the above binds and the test measures MMVQ
+    // (llama.cpp-szv8, hardware-confirmed). ggml-sycl.cpp's TG fast-path claims
+    // every batch=1 quantized mul_mat whose weight resolved to a non-AoS layout
+    // and dispatches
+    //   ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(..., resolved.layout)
+    // then returns -- its own comment says it "bypasses orchestrator, name
+    // parsing, prefetch, TP checks for maximum speed". GGML_SYCL_FORCE_DMMV and
+    // the layout override's KERNEL choice are both consulted downstream of that
+    // return, so neither is ever reached. The override still binds on the
+    // MATERIALIZATION side, which is why every precondition here passed while
+    // the answer came from a different kernel: the coalesced buffer was built,
+    // verified byte-exact, and then read by MMVQ.
+    //
+    // GGML_SYCL_TG_FAST=0 is that path's documented disable and falls through to
+    // the unified/orchestrator dispatch, where pick_kernel_for_layout(COALESCED)
+    // at batch=1 answers DMMV_COALESCED.
+    setenv("GGML_SYCL_TG_FAST", "0", 1);
     // Required by ggml_backend_sycl_register_host_weight_tensor(), which returns
     // early without it -- the tensor would then never reach S1-PRELOAD.
     setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);
