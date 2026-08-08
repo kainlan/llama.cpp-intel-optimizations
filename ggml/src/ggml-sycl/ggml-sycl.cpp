@@ -54592,6 +54592,23 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 src1 && src1->name ? src1->name : "?", dst && dst->name ? dst->name : "?", (long long) M, (long long) K,
                 (long long) N, forced_layout ? ggml_sycl_layout_mode_name(*forced_layout) : "none");
     };
+    // The TG fast-path below returns before the orchestrator runs, so none of the
+    // trace_decision() sites downstream of it ever fire for a batch=1 reordered
+    // dispatch -- a traced run showed only `entry` and no line naming a kernel.
+    // Emit the same line from the fast-path so a forced run can prove which kernel
+    // produced the numbers, and so DMMV_COALESCED is distinguishable from DMMV_SOA
+    // on the other route (llama.cpp-erf1, closing llama.cpp-szv8's residual).
+    auto trace_fast_path = [&](const char * stage, ggml_sycl_mul_mat_kernel kernel, layout_mode layout) {
+        if (!route_trace_enabled || route_trace_idx < 0 || route_trace_idx >= ggml_sycl_mul_mat_route_trace_limit()) {
+            return;
+        }
+        ggml_sycl::MatmulDecision decision{};
+        decision.valid   = true;
+        decision.backend = ggml_sycl::MatmulBackend::LegacyKernel;
+        decision.kernel  = kernel;
+        decision.layout  = layout;
+        trace_decision(stage, decision);
+    };
     // DEBUG: trace mul_mat entry
     GGML_SYCL_DEBUG("[DEBUG-MULMAT] ENTER: src0=%s src1=%s dst=%s\n", src0->name ? src0->name : "(null)",
                     src1->name ? src1->name : "(null)", dst->name ? dst->name : "(null)");
@@ -55354,14 +55371,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             if (has_soa_reorder || has_reorder) {
                 const layout_mode soa_layout =
                     has_reorder ? resolved.layout : (has_soa_reorder ? effective_layout : GGML_LAYOUT_AOS);
+                const ggml_sycl_mul_mat_kernel fast_kernel = soa_layout == GGML_LAYOUT_COALESCED ?
+                                                                 ggml_sycl_mul_mat_kernel::MMVQ_COALESCED :
+                                                                 ggml_sycl_mul_mat_kernel::MMVQ_SOA;
                 // Tensor split: cooperative multi-device MUL_MAT
                 split_config_init(ctx.stream());
                 if (g_split_config.enabled) {
                     const int split_pct = (int) (g_split_config.ratio[2] * 100.0f + 0.5f);
+                    trace_fast_path("dispatch-tg-fast-split", fast_kernel, soa_layout);
                     if (ggml_sycl_mul_mat_tensor_split(ctx, src0, src1, dst, split_pct, soa_layout)) {
+                        trace_fast_path("dispatched-tg-fast-split", fast_kernel, soa_layout);
                         return;
                     }
                     // Fall through to normal GPU dispatch if split failed
+                    trace_fast_path("dispatch-tg-fast-split-failed", fast_kernel, soa_layout);
                 }
 
                 // Non-tensor-split path: drain any pending merge
@@ -55371,24 +55394,30 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_SYCL_DEBUG("[TG-FAST] batch=1 MMVQ+reorder for %s (type=%d layout=%d%s)\n",
                                 src0->name ? src0->name : "?", src0->type, static_cast<int>(soa_layout),
                                 has_reorder ? " cache" : "");
+                trace_fast_path("dispatch-tg-fast", fast_kernel, soa_layout);
                 if (ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst,
                                                                         ggml_sycl_op_mul_mat_vec_q, soa_layout)) {
+                    trace_fast_path("dispatched-tg-fast", fast_kernel, soa_layout);
                     return;
                 }
                 // Reorder MMVQ failed — fall through to full dispatch
                 GGML_SYCL_DEBUG("[TG-FAST] MMVQ+reorder failed for %s, falling through\n",
                                 src0->name ? src0->name : "?");
+                trace_fast_path("dispatch-tg-fast-failed", fast_kernel, soa_layout);
             } else if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
                 // MMVQ with AOS layout
                 split_merge_drain();
                 GGML_SYCL_DEBUG("[TG-FAST] batch=1 MMVQ+AOS for %s (type=%d)\n", src0->name ? src0->name : "?",
                                 src0->type);
+                trace_fast_path("dispatch-tg-fast", ggml_sycl_mul_mat_kernel::MMVQ_AOS, GGML_LAYOUT_AOS);
                 if (ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q,
                                                         GGML_LAYOUT_AOS)) {
+                    trace_fast_path("dispatched-tg-fast", ggml_sycl_mul_mat_kernel::MMVQ_AOS, GGML_LAYOUT_AOS);
                     return;
                 }
                 // MMVQ+AOS failed (e.g. weight unavailable) — fall through to full dispatch
                 GGML_SYCL_DEBUG("[TG-FAST] MMVQ+AOS failed for %s, falling through\n", src0->name ? src0->name : "?");
+                trace_fast_path("dispatch-tg-fast-failed", ggml_sycl_mul_mat_kernel::MMVQ_AOS, GGML_LAYOUT_AOS);
             } else {
                 // DMMV fallback for types not supported by MMVQ
                 split_merge_drain();
