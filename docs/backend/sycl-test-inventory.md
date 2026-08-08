@@ -1522,7 +1522,7 @@ independent; sequence them in one file-open.
 | test | mutation (`ggml/src/ggml-sycl/mmvq.cpp:`) | runtime | verifiability | expected RED | notes |
 |---|---|---|---|---|---|
 | `test-sycl-moe-gateup-prepack-policy` | `:1018` `result.reason = "down-sum";` → `"capacity"` | CPU-ONLY | PASSFAIL, `PASS: MoE gate/up prepack policy`; CHECK prints `FAIL: %s:%d: %s` with file+line | `FAIL: tests/test-sycl-moe-gateup-prepack-policy.cpp:184: missing direct down-sum compatibility must reject before route selection`, rc 1 | 1 CHECK; the whole reject *ladder* is preserved, only one label moves. A sibling policy exists in `ggml-sycl.cpp:24474` — prefer this site, same evidence, ~20 min cheaper. |
-| `test-sycl-moe-fused-down-sum-policy` | `:250-251` `if (std::strcmp(env,"tile4")==0) { return 4; }` → `return 2;` | CPU-ONLY | PASSFAIL, `PASS: MoE XMX down-sum direct-final policy` | `FAIL: tests/test-sycl-moe-fused-down-sum-policy.cpp:335: tile4 down Q8 DPAS tile env must parse`, rc 1 | 1 CHECK in the 13th of 17 subtests. 3 subtests source-grep `mmvq.cpp` and `std::exit(1)` (not CHECK) if the file is not found — a confusing hard exit from an unexpected CWD. Editing env-name *strings* would trip those greps as collateral; this mutation touches none. |
+| `test-sycl-moe-fused-down-sum-policy` | `:250-251` `if (std::strcmp(env,"tile4")==0) { return 4; }` → `return 2;` | CPU-ONLY | PASSFAIL, `PASS: MoE XMX down-sum direct-final policy` | `FAIL: tests/test-sycl-moe-fused-down-sum-policy.cpp:335: tile4 down Q8 DPAS tile env must parse`, rc 1 | 1 CHECK in the 13th of 17 subtests. 3 subtests source-grep `mmvq.cpp` and `std::exit(1)` (not CHECK) if the file is not found — a confusing hard exit from an unexpected CWD. Editing env-name *strings* would trip those greps as collateral; this mutation touches none. ⚠️ **THE MUTATION ABOVE IS TEST-LOCAL AND DOES NOT SATISFY THE ADJUDICATION** (see *Deferred dead code* → ADJUDICATED): only **5 of the 17** subtests reach production, via the memoized wrappers in `mmvq.cpp` ~`:214-364` to the dispatch sites `:19184-19208`. Pin the Phase B mutation to one of those five before spending the build slot; the row's `:250-251` edit reddens an env parser inside the test file. |
 | `test-moe-mul-mat-id-q4q8` | `:2751` in `mul_mat_vec_q_id` swap the ids strides: `iid1 * ids_nb1 + id * ids_nb0` → `iid1 * ids_nb0 + id * ids_nb1` | GPU | PASSFAIL, per-case `nmse=%.6e max_diff=%.6f` | `MoE MUL_MAT_ID Q4_0 (base): nmse=<large> ...` + `FAIL: ... mismatch beyond tolerance (nmse>1.0e-03 or max_diff>2.00)`, rc 1 | Route verified on-path (n_experts=8, top_k=4, ne12=4 → threshold 32 ≥ batch 4, so MMVQ). Swapped strides stay in-bounds (max byte 108 of 128) so it corrupts rather than faults. Low specificity is unavoidable — main `break`s on the first failing case. |
 | `test-moe-mul-mat-id` | `:4102` `get_int_from_table_16(v0, kvalues_mxfp4)` → `(v1, ...)` | GPU | PASSFAIL, per-case `nmse=... max_diff=...` | `MoE MUL_MAT_ID MXFP4 (base): nmse=<large> ...` + `FAIL: ... (nmse>5.0e-04 or max_diff>1.00)`, rc 1 | ⚠️ **Route uncertainty — confirm before building.** The test registers weights on the *host* buffer type, and CLAUDE.md routes host-resident weights to CPU dispatch; if so the live MXFP4 kernel is `ggml_sycl_cpu_expert_mul_mat_batched` in `cpu-dispatch.cpp`, not `mmvq.cpp`. Run once with `GGML_SYCL_DEBUG=1` and read the dispatch line first. ⚠️ Do **not** mutate `kvalues_mxfp4` in `ggml-common.h` — it is shared with the ggml-cpu reference, so both sides move and the test stays green. |
 | `test-q8-0-layout-cache-path-mmvq` | `:21361` pass `src0_dd_i` (AoS base) instead of `soa_base` to `reorder_mul_mat_vec_q8_0_q8_1_sycl` | GPU | PASSFAIL, `Max diff: ... Result: PASS/FAIL` | `Max diff: 2.560000e+02, max rel: 1.000000e+00, min abs: 0.000000` then `Result: FAIL`, rc 1 | The test memsets `weight->data` to zero after caching, so an AoS read yields exactly 0 — unambiguous. The widest-blast mutation here, acceptable because the test's whole premise is "did the SoA pointer get used". Do not simplify the load-transaction bracket (RCA `llama.cpp-43uy`, lines 137–146). |
@@ -1597,7 +1597,7 @@ mock can fail. They moved to the mock/deletion bucket.
 | `test-tensor-placement` | `:8855` `if (strstr(name,"attn_") \|\| strstr(name,"ffn_"))` → drop the `ffn_` term | CPU-ONLY | bare `assert()` — aborts on the first | `Assertion 'ggml_sycl_classify_tensor("blk.10.ffn_down.weight") == 0' failed.`, **rc 134** | Fires 2 of 9 asserts but only one line prints. The file `#undef NDEBUG`s at line 14 *before* re-including `<cassert>` and records a verified mutation in its header — **do not remove that `#undef`**. |
 | `test-cross-model-weight-usage` | `:11833` `it->second = tensor_usage::UNKNOWN;` → `it->second = mapped;` | **GPU** (hint was wrong — the plan stage inits a backend per device) | COUNT `=== %d checks, %d failures ===` (14) | `=== 14 checks, 2 failures ===` + `FAIL: check 2: model A's own tied-weight case forces UNKNOWN (precondition for check 4)` + `FAIL: check 5: A->B->reactivate-A lookup restores A exact same-name usage`, rc 1 | Has a built-in positive control (check 1) and negative control (check 3); this mutation leaves both green deliberately. The alternative "key by bare name" at `:11822` breaks 4 of 6 and destroys the controls. |
 | `test-sycl-weight-key-stability` | `:11996` `id.file_offs = has_gguf_identity ? identity.file_offs : 0;` → `= 0;` | CPU-ONLY | PASSFAIL, `PASS: weight cache key remained stable` | `FAIL: cache key missing GGUF identity fields`, rc 1 | Only 3 checks total, so no partial-red outcome is available. Cheap to evaluate, expensive to build. |
-| `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. |
+| `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. ⚠️ **WEAKEST-COVERAGE ROW IN BATCH I** (adjudicated 2026-08-08, KEEP): exactly one thin production-reaching function, evidenced only by those 3 `contains()` checks. Revisit when the token-major bridge integration wires its mocks to production; first candidate to drop if it does not. |
 | `test-xmx-moe-mxfp4` | `:24489` in `test_moe_gateup_singlecol_policy` delete the `return out;` in the `graph_recording` arm | CPU for the 3 reachable subtests (they run *before* the device gate) | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 after the host tests | `FAILED: graph recording must reject first implementation`, `Tests run: 3, Passed: 2, Skipped: 0, Failed: 1`, rc 1 | **BLOCKED** by `GGML_SYCL_BUILD_XMX_TESTS` (see below). Note a 77 here still means 3 real assertions ran. |
 | `test-sycl-moe-sequence-graphlet-policy` | `:24797` `if (unsafe_fused_q8_requested)` → `if (false && ...)` in `moe_default_fast_path_policy_from_flags` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-sequence-graphlet-policy.cpp:939: known unsafe fused-Q8 request must quarantine default sequence replay`, rc 1 | 47 of its 49 assertions are source-text greps; the two truth-table cases are the only behavioural coverage — but they **do** reach production (`:24775`), unlike the glu-q8 sibling. Because most cases read source at runtime, a text-only mutation reddens it with no rebuild. |
 | `test-unified-cache-integrity` | `:29105` `if (!host_buffer && !sycl_buffer)` → `if (!host_buffer)` | GPU (768 staged weights, 128 MB ctx) | PASSFAIL, `Unified cache integrity test: %s` | `Failed to cache layout for type=2 idx=0` then `... FAIL`, rc 1 | Clean phase-1-green / phase-2-red split. ⚠️ Do **not** mutate `unified_cache::validate()` — that mutates the checker, not the property. The "on-topic" `id_to_key_[key] =` deletion at `unified-cache.cpp:4034` is unreliable (five other write sites can repopulate) — demand a positive control if you use it. |
@@ -1716,7 +1716,7 @@ would break the build or redden a live test:
 
 | helper | definition | still consumed by |
 |---|---|---|
-| `test_moe_down_sum_direct_final_policy` | `ggml-sycl.cpp:24071`, decl `ggml-sycl-test.hpp:202` | `tests/test-sycl-moe-fused-down-sum-policy.cpp` (25 call sites), `tests/test-sycl-moe-same-expert-grouping.cpp:215` |
+| `test_moe_down_sum_direct_final_policy` | `ggml-sycl.cpp:24071`, decl `ggml-sycl-test.hpp:202` | `tests/test-sycl-moe-fused-down-sum-policy.cpp` (**26** call sites), `tests/test-sycl-moe-same-expert-grouping.cpp:215` |
 | `test_moe_build_token_major_metadata` | `ggml-sycl.cpp:24191`, decl `ggml-sycl-test.hpp:238` | `tests/test-sycl-moe-same-expert-grouping.cpp:81` |
 | `test_moe_glu_q8_artifact_policy` | `ggml-sycl.cpp:24403`, decl `ggml-sycl-test.hpp:323` | `tests/test-sycl-moe-fusion-noactivation.cpp:77` — a **source-text** assertion, `contains(sycl, "test_moe_glu_q8_artifact_policy")`, "helper must exist" |
 | `test_moe_glu_q8_fused_store_policy` | `ggml-sycl.cpp:24502`, decl `ggml-sycl-test.hpp:378` | **nothing** — genuinely unreferenced now |
@@ -1730,11 +1730,26 @@ drift with every commit to that file.
 
 **The wider finding this exposes, for the lead rather than for a lane owner:**
 two tests that KEEP a Phase B build slot drive production-unreachable helpers —
-`test-sycl-moe-fused-down-sum-policy` (Batch E) is 25 calls into
+`test-sycl-moe-fused-down-sum-policy` (Batch E) is **26** calls into
 `test_moe_down_sum_direct_final_policy`, and `test-sycl-moe-same-expert-grouping`
 (Batch I) calls two of them. The build-slot rule that condemned the four deleted
-tests applies to those calls too. Not acted on here: both are scheduled work in
-a merged plan, and re-scoping them is a decision, not a remediation.
+tests applies to those calls too.
+
+**ADJUDICATED 2026-08-08 (spec review of the remediation): BOTH TESTS KEEP.** The
+answer is mixed rather than clean, which is why it needed adjudicating:
+
+- **`test-sycl-moe-fused-down-sum-policy` — KEEP, with its mutation pinned.**
+  5 of its 17 test functions are production-reaching, traced through the
+  memoized wrappers in `mmvq.cpp` (~`:214-364`) to the dispatch sites at
+  `:19184-19208`. Its Batch E mutation **must target those five**; a mutation
+  aimed at any of the other twelve would redden a mock and prove nothing. The 12
+  pure-mock functions are scope-reduction candidates for a later pass, not a
+  deletion this ticket makes.
+- **`test-sycl-moe-same-expert-grouping` — KEEP, marginal.** Only one thin
+  production-reaching function, and its evidence is 3 source-text `contains()`
+  checks. Recorded as **the weakest-coverage row in Batch I**. Revisit when the
+  token-major bridge integration wires its mocks to production; if that work
+  does not land, this row is the first candidate to drop.
 
 ## Orphaned by the deletions — not this lane's files
 
@@ -1796,6 +1811,25 @@ Format: `clang-format-19 --dry-run -Werror` was run on every touched source. All
 report pre-existing whole-file drift on lines this pass did not touch; **no line
 added by this pass is reformatted** by clang-format — verified per file by
 diffing the formatted output and grepping for the added text.
+
+Structure of `ggml/src/ggml-sycl/CMakeLists.txt`: **balanced under a
+comment-aware `if`/`foreach` stack check at every commit in the range**
+(`fe48225ba`, `b453f9a8d`, `059d28670`, `2414b5948`, `b752806ce` — depth 0 at
+EOF, zero mismatched closers in each). **Naive `grep -c` tallies are unreliable
+in this file** and no specific pair of counts should be quoted: comment prose
+contains `if (` tokens, and the file is long enough that a stale or mid-edit
+sample is easy to take without noticing. Check the *property* (balanced), not a
+*number*.
+
+⚠️ **THIS DOC SUPERSEDES TWO FIGURES IN THE COMMIT MESSAGES.** Both are
+write-up errors; no code or logic depends on either, and the commits are not
+amended because re-writing mid-range messages churns SHAs the review already
+cites.
+
+| figure | where it is wrong | correct value |
+|---|---|---|
+| "25 call sites" / "25 calls" into `test_moe_down_sum_direct_final_policy` | `059d28670` message | **26** — `grep -c 'test_moe_down_sum_direct_final_policy(' tests/test-sycl-moe-fused-down-sum-policy.cpp` |
+| "if/endif 219/219 (was 226/226, -7 for the removed blocks)" | `059d28670` message | **unreproducible; do not quote.** The same commands now yield 224→220. The substantive claim — that the file is balanced — is independently confirmed above, and is the claim that matters. |
 
 ---
 
