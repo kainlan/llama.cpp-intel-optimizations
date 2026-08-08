@@ -20,9 +20,10 @@
 // Two consequences, both real:
 //
 //   1. LOUD.  Transient scratch stays live in the shared zones for as long as
-//      any other context keeps recording.  The next graph boundary's zone reset
-//      is then correctly refused ("refusing zone_reset of VRAM zone SCRATCH
-//      with N live registered allocations") and graph launch aborts.  Observed
+//      any other context keeps recording.  The next graph boundary's zone
+//      check is then correctly refused ("refusing zone_settle of VRAM zone
+//      SCRATCH with N live registered allocations") and graph launch
+//      aborts.  Observed
 //      in test-thread-safety on both of get_rows' staging cohorts:
 //      get_rows:seq_device (VRAM SCRATCH, getrows.cpp) and
 //      get_rows_indices_small_host (host STAGING, getrows.cpp) -- two escape

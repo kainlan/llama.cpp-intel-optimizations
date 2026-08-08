@@ -3013,10 +3013,11 @@ void ggml_sycl_cpu_staging_drain() {
 }
 
 // Release all staging buffer leases back to the offload pool and clear cached
-// pointers.  Must be called before host_zone_reset(STAGING) — the staging
-// buffers are sub-allocated from the host STAGING TLSF zone, and zone_reset
+// pointers.  Must be called before host_zone_boundary_check(STAGING) (named
+// host_zone_reset() before llama.cpp-37ba's rename) — the staging buffers
+// are sub-allocated from the host STAGING TLSF zone, and zone_settle
 // recycles the physical memory.  Any cached entry.ptr that survives a zone
-// reset becomes a dangling pointer, causing SIGSEGV on the next memcpy.
+// settle becomes a dangling pointer, causing SIGSEGV on the next memcpy.
 void ggml_sycl_cpu_staging_release() {
     for (int b = 0; b < STAGING_BANKS; ++b) {
         for (int s = 0; s < STAGING_SLOTS_PER_BANK; ++s) {

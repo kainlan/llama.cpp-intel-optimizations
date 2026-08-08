@@ -2888,8 +2888,9 @@ struct staging_buffer_pool {
         return true;
     }
 
-    // Wait for all pending async DMA events before a zone reset can safely
-    // recycle the underlying memory.  Must be called before host_zone_reset().
+    // Wait for all pending async DMA events before a zone boundary check can
+    // safely observe the underlying memory as reclaimed.  Must be called
+    // before host_zone_boundary_check().
     //
     // IMPORTANT: releases the mutex before each event.wait() to avoid
     // deadlocking with release() calls from concurrent CPU worker threads.

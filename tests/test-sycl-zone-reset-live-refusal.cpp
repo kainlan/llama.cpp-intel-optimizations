@@ -4,15 +4,19 @@
 // Background, because the correct behaviour here is narrow and two adjacent
 // behaviours are both wrong:
 //
-//   * 9a0670712 made both host_zone_reset() and zone_reset() GGML_ABORT on a
-//     live allocation. That is wrong because several llama_model objects may be
-//     loaded at once (tests/test-thread-safety.cpp exercises exactly that), so a
-//     live allocation belonging to another still-running model is CORRECT, not a
+//   * 9a0670712 made both host_zone_reset() and zone_reset() (renamed to
+//     host_zone_settle() / zone_settle() by llama.cpp-37ba, dispatched
+//     through host_zone_boundary_check()/host_zone_reclaim() and
+//     zone_boundary_check()/zone_reclaim() -- see those symbols' doc
+//     comments) GGML_ABORT on a live allocation. That is wrong because
+//     several llama_model objects may be loaded at once
+//     (tests/test-thread-safety.cpp exercises exactly that), so a live
+//     allocation belonging to another still-running model is CORRECT, not a
 //     leak.
 //   * Before 9a0670712 both purged the registry and reset anyway. That is wrong
 //     in the other direction: it recycles addresses still owned by live handles.
 //
-// The answer is to refuse -- which is what zone_reset() already does for the
+// The answer is to refuse -- which is what zone_settle() already does for the
 // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
 //
 // Two properties are asserted. The second is the one that is easy to lose and
@@ -23,12 +27,14 @@
 //                  unchanged and the allocation is still usable.
 //   2. NO LATCH -- once the owner releases, the NEXT reset must succeed.
 //                  The refusal is only safe because unified_free() drops the
-//                  registry record for every zone, including the reset-only
-//                  SCRATCH/STAGING host zones that take no per-block free. If
-//                  that erase ever becomes conditional on zone, the zone would
-//                  never reset again for the lifetime of the process -- silently,
-//                  with no abort to point at. Property 1 alone still passes in
-//                  that broken world, which is why property 2 is here.
+//                  registry record for every zone -- including SCRATCH/STAGING,
+//                  which now free each allocation individually at release
+//                  (iiff Option C step 2) rather than relying on this call at
+//                  all. If that erase ever becomes conditional on zone, the
+//                  zone would never reset again for the lifetime of the
+//                  process -- silently, with no abort to point at. Property 1
+//                  alone still passes in that broken world, which is why
+//                  property 2 is here.
 //
 // This test deliberately does NOT hardcode which zone an allocation lands in.
 // It allocates through the real unified_alloc() path and reads the resulting
@@ -60,9 +66,11 @@ using ggml_sycl::host_zone_id;
 using ggml_sycl::runtime_category;
 using ggml_sycl::unified_alloc;
 using ggml_sycl::unified_cache;
-using ggml_sycl::unified_cache_host_zone_reset;
+using ggml_sycl::unified_cache_host_zone_boundary_check;
+using ggml_sycl::unified_cache_host_zone_reclaim;
 using ggml_sycl::unified_cache_host_zone_used;
-using ggml_sycl::unified_cache_zone_reset;
+using ggml_sycl::unified_cache_zone_boundary_check;
+using ggml_sycl::unified_cache_zone_reclaim;
 using ggml_sycl::unified_free;
 using ggml_sycl::vram_zone_id;
 
@@ -113,10 +121,11 @@ bool alloc_tracked(int                                  device,
 // not abort" would be the only signal and a reset that silently did nothing
 // would look identical to a correct refusal.
 void test_vram_zone(int device, unified_cache * cache, sycl::queue * queue) {
-    printf("VRAM zone_reset refusal:\n");
+    printf("VRAM zone_settle refusal:\n");
 
-    // RUNTIME is a real TLSF zone in the arena and is what arena_reserve() resets
-    // on a new context -- the same zone_reset() call this test is gating.
+    // RUNTIME is a real TLSF zone in the arena and is what arena_reserve() reclaims
+    // on a new context -- the same zone_settle() call (reached via zone_reclaim(),
+    // llama.cpp-37ba) this test is gating.
     ggml_sycl::alloc_constraints constraints;
     constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
 
@@ -129,24 +138,48 @@ void test_vram_zone(int device, unified_cache * cache, sycl::queue * queue) {
 
     const vram_zone_id zone = handle.vram_zone;
     if (zone == vram_zone_id::COUNT) {
-        // Not zone-managed: this test cannot exercise zone_reset() at all, and
+        // Not zone-managed: this test cannot exercise zone_settle() at all, and
         // reporting success would be a vacuous pass.
-        check(false, "allocation is zone-managed (required to reach zone_reset)");
+        check(false, "allocation is zone-managed (required to reach zone_settle)");
         unified_free(handle);
         return;
     }
+    if (zone == vram_zone_id::WEIGHT) {
+        // Neither zone_boundary_check() nor zone_reclaim() admits WEIGHT
+        // (llama.cpp-37ba) -- calling either would fail the entry assert
+        // before ever reaching zone_settle()'s own WEIGHT refusal, aborting
+        // this binary instead of failing this one check. Mirrors
+        // test_host_zone()'s identical guard below.
+        check(false, "allocation landed outside the WEIGHT zone");
+        unified_free(handle);
+        return;
+    }
+
+    // Dynamic dispatch, not a hardcoded wrapper call: zone_boundary_check()
+    // (ONEDNN/SCRATCH) and zone_reclaim() (KV/RUNTIME) now assert which zones
+    // they accept (llama.cpp-37ba), so this test -- which deliberately reads
+    // the zone back rather than assuming routing -- must call whichever one
+    // actually accepts it, to keep testing the right zone if routing changes.
+    const bool is_boundary_check_zone = (zone == vram_zone_id::ONEDNN || zone == vram_zone_id::SCRATCH);
+    auto       call_zone_settle       = [&]() {
+        if (is_boundary_check_zone) {
+            unified_cache_zone_boundary_check(device, zone);
+        } else {
+            unified_cache_zone_reclaim(device, zone);
+        }
+    };
 
     const size_t used_live = cache->zone_used(zone);
     check(used_live > 0, "zone_used() is non-zero while the allocation is live");
 
     // Property 1: refusal. Reaching the next line at all is half the assertion --
     // before the fix this aborted the process.
-    unified_cache_zone_reset(device, zone);
+    call_zone_settle();
     check(cache->zone_used(zone) == used_live, "refused reset left zone_used() unchanged");
 
     // Property 2: no latch.
     unified_free(handle);
-    unified_cache_zone_reset(device, zone);
+    call_zone_settle();
     check(cache->zone_used(zone) == 0, "reset succeeds once the owner has released (no latch)");
 }
 
@@ -156,7 +189,7 @@ void test_vram_zone(int device, unified_cache * cache, sycl::queue * queue) {
 // triggered the abort in test-thread-safety (role=STAGING, category=STAGING,
 // host_zone=STAGING, cohort=get_rows_indices_small_host).
 void test_host_zone(int device, sycl::queue * queue) {
-    printf("host_zone_reset refusal:\n");
+    printf("host_zone_settle refusal:\n");
 
     // must_host_pinned is what routes into the host branch; role/category then
     // select which host zone. use_pinned_pool matches how the real staging
@@ -174,16 +207,29 @@ void test_host_zone(int device, sycl::queue * queue) {
 
     const host_zone_id zone = handle.host_zone;
     if (zone == host_zone_id::COUNT) {
-        check(false, "allocation is host-zone-managed (required to reach host_zone_reset)");
+        check(false, "allocation is host-zone-managed (required to reach host_zone_boundary_check/host_zone_reclaim)");
         unified_free(handle);
         return;
     }
     if (zone == host_zone_id::WEIGHT) {
-        // host_zone_reset() asserts on WEIGHT by contract; nothing to test.
+        // host_zone_settle() asserts on WEIGHT by contract; nothing to test.
         check(false, "allocation landed outside the WEIGHT zone");
         unified_free(handle);
         return;
     }
+
+    // Dynamic dispatch, matching test_vram_zone(): host_zone_boundary_check()
+    // (SCRATCH/STAGING) and host_zone_reclaim() (KV) now assert which zone
+    // they accept (llama.cpp-37ba), so call whichever one actually accepts
+    // whatever zone this allocation landed in.
+    const bool is_boundary_check_zone = (zone == host_zone_id::SCRATCH || zone == host_zone_id::STAGING);
+    auto       call_host_zone_settle  = [&]() {
+        if (is_boundary_check_zone) {
+            unified_cache_host_zone_boundary_check(zone);
+        } else {
+            unified_cache_host_zone_reclaim(zone);
+        }
+    };
 
     const size_t used_live = unified_cache_host_zone_used(zone);
     check(used_live > 0, "host_zone_used() is non-zero while the allocation is live");
@@ -192,14 +238,17 @@ void test_host_zone(int device, sycl::queue * queue) {
     // the fix it aborted -- but "did not abort" cannot tell a correct refusal
     // apart from a reset that silently did nothing, so assert the zone's
     // accounting is untouched as well.
-    unified_cache_host_zone_reset(zone);
+    call_host_zone_settle();
     check(unified_cache_host_zone_used(zone) == used_live, "refused reset left host_zone_used() unchanged");
 
-    // Property 2: no latch. The reset-only host zones (SCRATCH/STAGING) take no
-    // per-block free, so this leans entirely on unified_free() still dropping
-    // the registry record for them.
+    // Property 2: no latch. SCRATCH/STAGING now free each allocation
+    // individually at release (iiff Option C step 2) rather than relying on
+    // this call to reclaim them; KV still leans on this call as its real
+    // bulk reclaim. Either way, unified_free() dropping the registry record
+    // is what this call (or the individual free that already happened) is
+    // being checked against.
     unified_free(handle);
-    unified_cache_host_zone_reset(zone);
+    call_host_zone_settle();
     check(unified_cache_host_zone_used(zone) == 0, "reset succeeds once the owner has released (no latch)");
 }
 

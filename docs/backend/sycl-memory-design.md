@@ -204,10 +204,11 @@ counter per region** — the region's *epoch*:
     the start," but a still-referenced allocation forces a fresh pool
     instead of corrupting the old one.
   - **every region in the ring is still live**: refuse the rotation,
-    loudly, in exactly the same style as the existing `host_zone_reset()`
-    / `zone_reset()` "refusing ..." guards — never wrap onto a region that
-    is still referenced, which would be reclaiming a live handle by
-    another name.
+    loudly, in exactly the same style as the existing `host_zone_settle()`
+    / `zone_settle()` "refusing ..." guards (named `host_zone_reset()` /
+    `zone_reset()` before `llama.cpp-37ba`'s naming split) — never wrap
+    onto a region that is still referenced, which would be reclaiming a
+    live handle by another name.
 - The assert-only Phase-0 audit machinery (`zone_reset_audit_*`,
   `zone_audit_site_visit`) is unchanged and is exactly what names the
   leaking site when a region lingers: the audit already distinguishes
@@ -255,8 +256,9 @@ order covers have different shapes, and forcing them through
 `scratch_pool_region`'s shape would be wrong, not just inconvenient:
 
 - **Host SCRATCH/STAGING zones (step 2).** These are TLSF-arena-backed, with
-  every allocation already individually registered — `host_zone_reset()`
-  (see "Why" above and the canonical contract) walks `g_runtime_alloc_registry`
+  every allocation already individually registered — `host_zone_settle()`
+  (named `host_zone_reset()` before `llama.cpp-37ba`'s rename; see "Why"
+  above and the canonical contract) walks `g_runtime_alloc_registry`
   per zone, not a bump offset. There is no single contiguous span to carve
   into address-range regions and no `off` to rewind: the epoch tag belongs
   on the *registry record* for each allocation (an epoch id alongside the
@@ -286,8 +288,10 @@ exist and how large their blast radius is if converted incorrectly;
 these steps convert them from smallest/safest to largest/most load-bearing:
 
 1. **VRAM scratch bump pool** (`llama.cpp-2757`, this doc's section origin) —
-   `unified_cache::get_scratch()` / `return_scratch()` / `reset_scratch_pool()`
-   in `unified-cache.cpp`. Chosen first because it has no production caller
+   `unified_cache::get_scratch()` / `return_scratch()` /
+   `scratch_pool_epoch_boundary()` (named `reset_scratch_pool()` before
+   `llama.cpp-37ba`'s rename) in `unified-cache.cpp`. Chosen first because it
+   has no production caller
    today (only `tests/test-sycl-moe-q8-scratch.cpp` exercises it) — the
    mechanism is validated on the lowest-stakes zone before it is trusted with
    a zone that real inference traffic depends on.
@@ -299,20 +303,21 @@ these steps convert them from smallest/safest to largest/most load-bearing:
 3. **oneDNN scratch pointers** (`llama.cpp-67c2`) — `onednn_weights_scratch_`
    / `onednn_activations_scratch_`, which today are raw pointers managed
    entirely outside `mem_handle` (no registry entry at all), converted to
-   real epoch-tracked handles so the existing `zone_reset(vram_zone_id::ONEDNN)`
-   call sites in the scratch-reservation path stop being the *sole* reclaim
+   real epoch-tracked handles so the existing `zone_boundary_check(vram_zone_id::ONEDNN)`
+   call site (`zone_reset(vram_zone_id::ONEDNN)` before `llama.cpp-37ba`'s
+   rename) in the scratch-reservation path stops being the *sole* reclaim
    mechanism for their own previous allocation.
-4. **Delete the now-dead reset functions**, keeping only the boundary
-   asserts — this is `llama.cpp-37ba`'s original payload (the epic's Phase 3:
-   "keep the check, lose the reclamation") plus the epic's acceptance
-   criterion 1 ("no `zone_reset` / `host_zone_reset` / `reset_scratch_pool`
-   call remains"). It is sequenced last on purpose: a reset call site that
-   still exists but has become a provable no-op (its epoch counter always 0
-   at that boundary, verified by step 1–3's hardware batteries) is the
-   evidence that deleting it changes nothing — the same "delete the drain
-   steps first, re-verify empty, then delete the reset itself" discipline
-   the epic already requires, just applied to the reset call sites
-   themselves rather than their upstream drains.
+4. **Reconcile the reset call sites** (`llama.cpp-37ba`) — originally planned
+   as literal deletion of the reset functions, keeping only the boundary
+   asserts. Executed instead as a per-symbol audit once steps 1–3 landed: see
+   "Step 4: reconciling the reset call sites" below for what that audit
+   found. Summary, because it changes what "done" means for this step: every
+   remaining call site is *already* a provable no-op for the zones this epic
+   targets (steps 1–3's own conversions made the reclaim happen elsewhere, so
+   the call is now the assert Phase 3 asks for, not a scheduled reclaim) —
+   there is nothing left to delete without also deleting the observability
+   Phase 3 requires keeping. The zones with a call site that is *not* a
+   no-op (KV, RUNTIME) were never in this epic's audited scope to begin with.
 
 See [`docs/design/sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md)
 for the enforceable allocator/pointer-resolution contract this mechanism
@@ -372,25 +377,26 @@ reading of "freed only when references reach zero" *and* the simpler
 implementation — the two considerations point the same way.
 
 One consequence follows directly: because release already reclaims
-unconditionally, `host_zone_reset(zone)`'s prior bulk
+unconditionally, `host_zone_settle(zone)`'s prior bulk
 `host_arena_->zone_reset(zone)` call is retired for SCRATCH/STAGING, not
 merely gated. In the clean case (`live_allocations == 0`) there is nothing
 left in the zone for a bulk reinitialization to reclaim — every byte was
 already individually returned by the record that used to occupy it.
 "Rewind-on-zero" for TLSF is therefore the empty action, not a rewritten
-one: `host_zone_reset()`'s remaining job is exactly the refusal check it
+one: `host_zone_settle()`'s remaining job is exactly the refusal check it
 already had (`live_allocations > 0` → refuse, unchanged), which is now its
-*entire* job for these two zones. KV — the only other zone this function
+*entire* job for these two zones, reached through `host_zone_boundary_check()`
+(`llama.cpp-37ba`'s naming split). KV — the only other zone this function
 resets — is unaffected: it was already in the individually-freeing carve-out
 before this ticket, and still reaches a real `host_arena_->zone_reset(KV)`
-call.
+call, through `host_zone_reclaim()`.
 
 **Q2 — epoch granularity: per-zone or per-zone-per-graph?** Per-zone,
 advancing at the same graph-boundary call sites step 1's regions rotate at
-— `host_zone_reset(zone)` bumps a single monotonic `g_host_zone_epoch[zone]`
+— `host_zone_settle(zone)` bumps a single monotonic `g_host_zone_epoch[zone]`
 counter on every call, refused or clean, exactly mirroring where C1 opens a
 new region. The counter is **global, not per-`unified_cache`-instance**,
-because `host_zone_reset()`'s own live scan already has no device filter
+because `host_zone_settle()`'s own live scan already has no device filter
 (host zones are shared across devices in this codebase, unlike the VRAM
 zones) — matching `g_runtime_alloc_registry`'s existing device-agnostic
 scope rather than introducing a new per-device split the surrounding code
@@ -458,8 +464,10 @@ Step 3 converts `onednn_weights_scratch_` / `onednn_activations_scratch_`
 (`unified-cache.hpp`, alongside their `_size_`/`_owner_` siblings), the
 reservation logic in `unified_cache::reserve_onednn_scratch()`
 (`unified-cache.cpp`), and the two `zone_reset(vram_zone_id::ONEDNN)` call
-sites that used to be that reservation's sole reclaim path for its own
-previous allocation. **Mechanism name: point release** — distinct from C1's
+sites (renamed to `zone_boundary_check(vram_zone_id::ONEDNN)` by
+`llama.cpp-37ba` — one of the two was retired outright, see below) that used
+to be that reservation's sole reclaim path for its own previous allocation.
+**Mechanism name: point release** — distinct from C1's
 *epoch decrement* (many interchangeable ring regions, address-range lookup)
 and C2's *per-record free* (many independently-registered TLSF records). C3
 has neither a ring nor a population: it is exactly two named pointers, each
@@ -564,11 +572,15 @@ run): on Mistral, `onednn_reorder` — the largest oneDNN reorder buffer, see
 the observed dip to the byte. The "occupancy" was always these two pointers;
 nothing else was ever a candidate.
 
-**The `zone_reset(vram_zone_id::ONEDNN)` call site stays, but its role ends
-— mirroring C2's treatment of `host_zone_reset(SCRATCH|STAGING)`.** Unlike
-C1/C2, there is no *separate* periodic reset call outside this function: the
-reservation-replacement branch was always the only caller of
-`zone_reset(vram_zone_id::ONEDNN)` in the codebase, so there is no
+**The call site stays, but its role ends — mirroring C2's treatment of
+`host_zone_boundary_check(SCRATCH|STAGING)`.** (`llama.cpp-37ba` later
+renamed this call from `zone_reset(vram_zone_id::ONEDNN)` to
+`zone_boundary_check(vram_zone_id::ONEDNN)`, matching the same-named
+renaming/dispatch split it applied throughout this document — see this
+document's "Step 4" subsection.) Unlike C1/C2, there is no *separate*
+periodic reset call outside this function: the reservation-replacement
+branch was always the only caller of this checkpoint in the codebase, so
+there is no
 graph-boundary checkpoint elsewhere to leave alone. The call is kept at the
 same position, now placed *after* the point-release frees above it, so by
 construction it can only ever observe an empty zone. This is deliberately not
@@ -629,9 +641,10 @@ one.
 37ba gate adjudication, `c-634z`, citing `m72w`'s "two graph drains separated
 by pool-retained release, not proven redundant").** The graph-boundary block
 in `ggml_backend_sycl_graph_compute` (`ggml-sycl.cpp`, immediately before the
-`unified_cache_reset_scratch_pool` / `unified_cache_host_zone_reset(STAGING)`
-/ `unified_cache_host_zone_reset(SCRATCH)` call sites C1/C2 target) contains
-exactly this shape: `ggml_sycl_cpu_staging_drain()` (WEDGE-48330, waits on
+`unified_cache_scratch_pool_epoch_boundary` / `unified_cache_host_zone_boundary_check(STAGING)`
+/ `unified_cache_host_zone_boundary_check(SCRATCH)` call sites C1/C2 target,
+renamed by `llama.cpp-37ba` — see this document's "Step 4" subsection)
+contains exactly this shape: `ggml_sycl_cpu_staging_drain()` (WEDGE-48330, waits on
 `g_cpu_staging`'s host_task/compute completion events), then a pool-retained
 release (`ggml_sycl_cpu_staging_release()`, which drops `g_cpu_staging`'s
 leases back to the offload pool with **no wait of its own**), then a second
@@ -647,6 +660,203 @@ drain is load-bearing for it specifically, and remains so regardless of what
 happens to the zone-level reset below. **Not proven redundant — confirmed,
 not merely re-affirmed as unresolved.** Left in place; noted here for the
 37ba finale rather than acted on in this step, per that ticket's scope.
+
+### Step 4: reconciling the reset call sites (`llama.cpp-37ba`)
+
+With C1, C2, and C3 landed, this step re-derived — per-symbol, from source,
+not from the epic's original (pre-Option-C) framing — what was actually left
+to remove. **The headline finding: nothing was literally deletable.** Every
+remaining call site was either (a) already a pure liveness/audit checkpoint
+that cannot force-reclaim a live handle, because C1/C2/C3 already made the
+real reclaim happen elsewhere, or (b) a genuinely load-bearing on-demand
+reclaim for a zone the epic never targeted. Deleting a call site would have
+destroyed the audit's ability to notice a future regression at that
+boundary, contradicting CLAUDE.md's "retiring the reset must not retire the
+observability."
+
+**Owner ruling: split by semantics rather than keep the old names.** An
+earlier version of this section proposed keeping the three names and
+reconciling the acceptance criterion's wording instead (a rename was judged
+disproportionate — cosmetic gain, real risk, no implementer-side hardware
+verification). The owner overruled that: acceptance criterion 1 is honored
+*literally*, by making every name say what it does, splitting each dispatcher
+by semantics so no symbol lies about which of the two things it does. Final
+vocabulary, all landed:
+
+| Old name | Zones | New name(s) |
+|---|---|---|
+| `unified_cache_reset_scratch_pool(device_id)` | VRAM scratch bump pool (C1) | `unified_cache_scratch_pool_epoch_boundary(device_id)` |
+| `unified_cache_host_zone_reset(zone)` | SCRATCH/STAGING (liveness check) | `unified_cache_host_zone_boundary_check(zone)` |
+| `unified_cache_host_zone_reset(zone)` | KV (real reclaim, out of scope) | `unified_cache_host_zone_reclaim(zone)` |
+| `unified_cache::zone_reset(zone)` (private) | ONEDNN/SCRATCH (liveness check) | `unified_cache::zone_boundary_check(zone)` / `unified_cache_zone_boundary_check(device_id, zone)` |
+| `unified_cache::zone_reset(zone)` (private) | KV/RUNTIME (real reclaim, out of scope) | `unified_cache::zone_reclaim(zone)` / `unified_cache_zone_reclaim(device_id, zone)` |
+
+Each pair shares one private, genuinely-internal implementation
+(`unified_cache::host_zone_settle(zone)` / `unified_cache::zone_settle(zone)`
+— unchanged logic, renamed from `host_zone_reset()`/`zone_reset()`) that the
+two truthfully-named callers dispatch into after an assert restricting which
+zones each may pass:
+
+- `host_zone_boundary_check(zone)` asserts `zone == SCRATCH || zone == STAGING`.
+- `host_zone_reclaim(zone)` asserts `zone == KV`.
+- `zone_boundary_check(zone)` asserts `zone == ONEDNN || zone == SCRATCH`.
+- `zone_reclaim(zone)` asserts `zone == KV || zone == RUNTIME`.
+
+**Internal TLSF-layer primitives kept their names, per the ruling's explicit
+exemption** ("genuinely internal ... not reachable as backend policy" — the
+criterion governs the backend's *policy surface*, not every private helper
+that happens to contain the word "reset"): `pinned_chunk_pool::zone_reset()`
+(`pinned-pool.hpp`/`.cpp`, the host-zone TLSF primitive `host_zone_settle()`
+still calls via `host_arena_->zone_reset(zone)`) and
+`scratch_pool_reset_regions()` (`unified-cache.hpp`). Neither is reachable
+from `ggml-sycl.cpp` or any free-function wrapper; both are pure allocator
+internals.
+
+**Not renamed: the audit environment variable and the audit site-name
+strings**, per the ruling's explicit exclusion. `GGML_SYCL_ZONE_RESET_AUDIT`
+is an external interface referenced by every committed capture and every
+piece of prior documentation — renaming it would break nothing at the type
+level but would orphan every historical capture's instructions. The audit
+site-name strings (`"device-zone-reset"`, `"host-zone-reset"`,
+`"scratch-pool-reset"`, `"weight-reclaim"`, passed as the first argument to
+`zone_audit_site_visit`) are baseline-comparison identifiers across captures
+01–14 cited throughout this document and the tracker; renaming them would
+silently break every prior-capture comparison that keys on those strings. Both
+are stable historical identifiers now, independent of the current C++ function
+names they originated from — read them as such, not as a naming
+inconsistency.
+
+**Per-symbol disposition (unchanged conclusions, now expressed with the new
+names):**
+
+- **`unified_cache_scratch_pool_epoch_boundary(device_id)`** (C1, VRAM
+  scratch bump pool, `scratch_pool_*`). One production call site
+  (`ggml-sycl.cpp`, graph boundary). Internally rewind-on-zero /
+  rotate-on-live / refuse-on-exhaustion (C1) — the bulk-reclaim semantics
+  were already gone from the *function*, not just hidden behind a guard.
+  `get_scratch()`/`return_scratch()` still have zero other production
+  callers (re-confirmed by grep), so in every measured production workload
+  this call observes an empty pool and does nothing observable. No KV-style
+  dual-purpose need existed for this symbol, so it took a single honest
+  rename rather than a two-way split.
+- **`unified_cache_host_zone_boundary_check(zone)`** / **`unified_cache_host_zone_reclaim(zone)`**
+  (C2, host SCRATCH/STAGING vs. KV). Four production call sites: two at the
+  graph boundary (`ggml-sycl.cpp`, STAGING/SCRATCH → `boundary_check`) and
+  two inside `arena_reserve()` (`unified-cache.cpp`, context-switch: KV →
+  `reclaim`, STAGING → `boundary_check`). Both dispatch into the shared
+  `host_zone_settle(zone)`, whose `epoch_tracked` branch
+  (`zone == SCRATCH || zone == STAGING`) still returns *before* reaching
+  `host_arena_->zone_reset(zone)` — the real bulk call is reached only
+  through `host_zone_reclaim()`, i.e. for KV.
+- **`unified_cache::zone_boundary_check(vram_zone_id::ONEDNN)`** (C3,
+  internal to `reserve_onednn_scratch()`) and
+  **`unified_cache::zone_boundary_check(vram_zone_id::SCRATCH)`** (the
+  pool_leg compute-arena checkpoint in `arena_reset()`, found by this step —
+  see below). Both call sites, not externally wrapped for these two zones
+  today (a free-function `unified_cache_zone_boundary_check(device_id, zone)`
+  exists for future/test callers, but no production caller uses it).
+
+**Out of the epic's scope, and always was — KV and RUNTIME.** The Phase-0/
+Phase-1 audit inventory that drove C1–C3 covers exactly eight sites
+(`device-zone-reset/{SCRATCH,ONEDNN}`, `host-zone-reset/{SCRATCH,STAGING}`,
+`scratch-pool-reset/bump`, `weight-reclaim/{load-boundary,mid-load-replan,
+model-teardown}` — matching the counts in every Phase-0 capture cited in the
+C1–C3 subsections). No `device-zone-reset/KV`, `/RUNTIME`, `/WEIGHT`, or
+`host-zone-reset/KV` row appears anywhere in that inventory: these zones were
+never measured, never audited, and never part of C1/C2/C3's mandate.
+Grep-verified they are also still genuinely load-bearing, not merely
+unmeasured:
+
+- **VRAM KV** (`unified_cache::zone_reclaim(vram_zone_id::KV)`, reached via
+  `unified_cache_zone_reclaim(device_id, KV)`): called from `ggml-sycl.cpp`'s
+  KV-buffer-type allocation fallback (device VRAM KV request exceeds
+  `zone_available(KV)` → try a reclaim, then re-check) and from
+  `arena_reserve()`'s context-switch path ("same model, new context —
+  reclaim ephemeral zones so KV/runtime space from the previous context is
+  reclaimable"). Both are on-demand reclaim triggered by an actual capacity
+  need, not a scheduled sweep, and `zone_settle()`'s own
+  shared-KV+WEIGHT-arena refusal guard (unaffected by C1–C3) still protects
+  live weight entries.
+- **VRAM RUNTIME** (`unified_cache::zone_reclaim(vram_zone_id::RUNTIME)`):
+  same `arena_reserve()` context-switch call. RUNTIME allocations (ggml
+  compute buffers) route through `unified_alloc()` with
+  `prefer_vram_zone = RUNTIME` (`ggml-sycl.cpp`, `unified-cache.cpp`), which
+  — unlike the internal `zone_alloc()`/`zone_free()` pairs C1/C3 replaced —
+  registers into `g_runtime_alloc_registry`. So this zone's live-check is not
+  vacuous-by-construction the way ONEDNN's was: it is a real, context-lifetime
+  reclaim need, structurally the same shape as KV.
+- **Host KV** (`unified_cache::host_zone_reclaim(host_zone_id::KV)`):
+  `!epoch_tracked`, reaches the real `host_arena_->zone_reset(zone)`
+  unconditionally when clean. Called from `arena_reserve()`'s context-switch
+  path alongside host STAGING's `host_zone_boundary_check()`.
+- **WEIGHT** (both VRAM and host): hard-refused unconditionally
+  (`GGML_ASSERT(zone != host_zone_id::WEIGHT ...)` and `zone_settle()`'s own
+  `zone == vram_zone_id::WEIGHT` early return, both predating this epic).
+  Never actually resets; already in the epic's explicit KEEP list ("every
+  `refusing ...` guard"). Neither `zone_boundary_check()` nor
+  `zone_reclaim()`'s assert admits WEIGHT — a caller that tried would fail
+  the assert before ever reaching `zone_settle()`'s own refusal.
+
+**Recommendation, standing: KV, RUNTIME, and WEIGHT are out of
+`llama.cpp-iiff`'s scope.** They are context/session-lifetime zones with a
+genuine on-demand reclaim need at context-switch or capacity-pressure
+boundaries, not reset-only zones whose sole reclaim path was a scheduled
+sweep — the defect class this epic exists to fix. Converting them (if ever
+warranted) is a different, future ticket, not a step of this one.
+
+**A fourth, previously-unenumerated population — found, and already
+compliant.** `unified_cache::arena_alloc()` / `arena_free()` / `arena_reset()`
+(`unified-cache.cpp`) implement the "pool_leg" per-op compute scratch
+allocator — a *different* mechanism from C1's `scratch_pool_*` bump pool,
+sharing only the English word "scratch." Two modes:
+
+- **`arena_active()` (the default, tested, documented configuration):**
+  `arena_alloc()`/`arena_free()`/`arena_reset()` delegate directly to
+  `zone_alloc(vram_zone_id::SCRATCH, ...)` / `zone_free(vram_zone_id::SCRATCH,
+  ptr)` / `zone_boundary_check(vram_zone_id::SCRATCH)` — i.e. every pool_leg
+  allocation already gets a real, individual TLSF free the moment its caller
+  releases it (`arena_free()`'s arena-active branch calls `zone_free()`
+  unconditionally; there is no watermark/no-op path in this mode). The
+  boundary check in `arena_reset()` is therefore *already*, structurally, the
+  same "checkpoint over a zone that individual frees already emptied"
+  pattern C1–C3 established elsewhere — it was never touched by this epic
+  and did not need to be: it arrived at the target state independently,
+  because pool_leg was built on `zone_alloc`/`zone_free` from the start
+  rather than a raw bump offset. This is also why it uses
+  `zone_boundary_check()`, not `zone_reclaim()`, despite living in
+  `arena_reset()`'s "reset" name.
+- **`arena_active() == false` (fallback, non-default):** a raw atomic bump
+  allocator (`compute_arena_off_`) with a genuine reset-only defect —
+  `arena_free()`'s non-arena branch does watermark-only reclaim (only the
+  block currently at the bump-pointer top is reclaimed; the code's own
+  comment states "Non-watermark free: no-op (space reclaimed at
+  arena_reset)"). This is architecturally the same defect class C1 fixed for
+  `scratch_pool_*`, but it is a **different, unaudited, unconverted
+  population** — never measured by Phase-0 (arena-active is the default, so
+  none of the cited captures exercised this fallback), never in C1's scope
+  (C1 explicitly targeted `scratch_pool_*`, not `compute_arena_`'s own
+  allocator), and not touched here. **Flagged as a new finding for a future
+  ticket**, not fixed as part of 37ba: fixing it would mean converting a
+  fourth, previously-unknown population under a ticket scoped to closing out
+  three known ones, and the non-arena-active configuration is not the
+  production path this fork ships.
+
+**Acceptance criterion 1 is now literally satisfied, machine-checked.**
+`tests/test-sycl-zone-reset-audit-source.py`'s "the three old reset/boundary
+dispatcher names have zero production call sites" check scans
+`unified-cache.cpp`, `unified-cache.hpp`, `ggml-sycl.cpp`, and `common.cpp`
+(the same four sources every other check in that file reads) for
+`zone_reset`, `host_zone_reset`, and `reset_scratch_pool` — both the bare
+member-function spellings and their `unified_cache_*` free-function wrapper
+spellings — as real call/definition syntax (name immediately followed by
+`(`), with a lookbehind exemption for the two internal TLSF primitives named
+above. Comments never reach the scan at all (`strip_comments()` runs before
+the check does), so the historical "named `host_zone_reset()` before
+`llama.cpp-37ba`'s rename" narration scattered through this codebase for
+readers' benefit does not trip it. Verified as a genuine positive control: a
+mutant reintroducing a single stray `unified_cache_zone_reset(0, zone)` call
+makes the check fail and print exactly which file and which old name
+survived.
 
 ## Lifecycle identity and async lease boundary
 

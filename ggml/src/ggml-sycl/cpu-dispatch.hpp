@@ -25,7 +25,7 @@ void ggml_sycl_cpu_quant_cache_new_graph();
 void ggml_sycl_cpu_staging_drain();
 
 // Release all g_cpu_staging buffer leases back to the offload pool.
-// Must be called before host_zone_reset(STAGING) to prevent dangling pointers.
+// Must be called before host_zone_boundary_check(STAGING) to prevent dangling pointers.
 void ggml_sycl_cpu_staging_release();
 
 // Clear persistent staging cache for leaf tensors.

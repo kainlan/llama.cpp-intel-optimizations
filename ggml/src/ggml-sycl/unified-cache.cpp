@@ -675,19 +675,21 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 
 // Per-zone monotonic epoch id for host SCRATCH/STAGING (iiff Option C step 2,
-// llama.cpp-lbm3). Bumped by host_zone_reset(zone) at every call -- refused or
-// clean -- so it marks graph boundaries the same way C1's per-region epoch
-// did for the VRAM scratch bump pool. Stamped onto alloc_handle::epoch_id at
-// allocation time (see the registration site in unified_alloc()) purely for
-// diagnostics: a stuck host_zone_reset() refusal can report how many
-// boundaries the offending allocation has survived. It does not gate
-// anything -- SCRATCH/STAGING allocations free themselves individually at
-// release regardless of epoch state; see unified_free_record()'s per-record
-// free branch. Global rather than per-unified_cache-instance
-// because host zones are already scanned without a device filter throughout
-// this file (host_zone_reset()'s own live scan below has none), matching
-// g_runtime_alloc_registry's existing device-agnostic scope. Only SCRATCH and
-// STAGING slots are ever written; KV/WEIGHT/COUNT stay at 0.
+// llama.cpp-lbm3). Bumped by host_zone_settle(zone) at every call -- refused
+// or clean, reached via either host_zone_boundary_check() or
+// host_zone_reclaim() (llama.cpp-37ba) -- so it marks graph boundaries the
+// same way C1's per-region epoch did for the VRAM scratch bump pool. Stamped
+// onto alloc_handle::epoch_id at allocation time (see the registration site
+// in unified_alloc()) purely for diagnostics: a stuck host_zone_boundary_check()
+// refusal can report how many boundaries the offending allocation has
+// survived. It does not gate anything -- SCRATCH/STAGING allocations free
+// themselves individually at release regardless of epoch state; see
+// unified_free_record()'s per-record free branch. Global rather than
+// per-unified_cache-instance because host zones are already scanned without
+// a device filter throughout this file (host_zone_settle()'s own live scan
+// below has none), matching g_runtime_alloc_registry's existing
+// device-agnostic scope. Only SCRATCH and STAGING slots are ever written;
+// KV/WEIGHT/COUNT stay at 0.
 static std::atomic<uint64_t>                            g_host_zone_epoch[static_cast<size_t>(host_zone_id::COUNT)]{};
 static std::mutex                                       g_offload_pool_mutex;
 static std::atomic<uint64_t>                            g_offload_pool_lease_id{ 1 };
@@ -10247,7 +10249,7 @@ alloc_tier unified_select_tier(const alloc_request & req) {
 
 static bool unified_free_record(const runtime_alloc_record & rec) {
     bool ok = true;
-    // Arena zones handle their own accounting via zone_reset/zone_alloc.
+    // Arena zones handle their own accounting via zone_settle/zone_alloc.
     // No separate counter bookkeeping needed.
 
     try {
@@ -10309,7 +10311,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                 // no ring to exhaust: this branch is the whole mechanism.
                 // rec.handle.epoch_id (stamped at allocation time, see the
                 // registration site above) is not consulted here -- it exists
-                // purely for host_zone_reset()'s refusal diagnostics.
+                // purely for host_zone_boundary_check()'s refusal diagnostics.
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
                     if (!rec.handle.all_segments.empty()) {
@@ -10418,7 +10420,7 @@ static void runtime_reset_reclaimed_log_live_locked(const runtime_alloc_record &
     fprintf(stderr,
             "[UNIFIED-ALLOC] %s live allocation at reset ptr=%p alloc_id=%llu size=%zu device=%d tier=%s role=%d "
             "category=%d vram_zone=%d host_zone=%d zone_managed=%d cohort=%s\n",
-            reset_scope ? reset_scope : "zone_reset", h.ptr, static_cast<unsigned long long>(h.alloc_id), h.size,
+            reset_scope ? reset_scope : "zone-settle", h.ptr, static_cast<unsigned long long>(h.alloc_id), h.size,
             h.device, alloc_tier_name(h.tier), static_cast<int>(h.role), static_cast<int>(h.category),
             static_cast<int>(h.vram_zone), static_cast<int>(h.host_zone), h.zone_managed ? 1 : 0,
             rec.cohort_id.empty() ? "(none)" : rec.cohort_id.c_str());
@@ -10426,7 +10428,7 @@ static void runtime_reset_reclaimed_log_live_locked(const runtime_alloc_record &
     GGML_LOG_ERROR(
         "[UNIFIED-ALLOC] %s live allocation at reset ptr=%p alloc_id=%llu size=%zu device=%d tier=%s role=%d "
         "category=%d vram_zone=%d host_zone=%d zone_managed=%d cohort=%s\n",
-        reset_scope ? reset_scope : "zone_reset", h.ptr, static_cast<unsigned long long>(h.alloc_id), h.size, h.device,
+        reset_scope ? reset_scope : "zone-settle", h.ptr, static_cast<unsigned long long>(h.alloc_id), h.size, h.device,
         alloc_tier_name(h.tier), static_cast<int>(h.role), static_cast<int>(h.category), static_cast<int>(h.vram_zone),
         static_cast<int>(h.host_zone), h.zone_managed ? 1 : 0,
         rec.cohort_id.empty() ? "(none)" : rec.cohort_id.c_str());
@@ -10722,7 +10724,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // for any request that also carried HOST_COMPUTE/EXPERT_CACHE,
             // silently overriding the "must be released by scoped smart-
             // handle owners before reset" contract above with a zone that is
-            // *not* swept by host_zone_reset() -- llama.cpp-0igs /
+            // *not* swept by host_zone_settle() -- llama.cpp-0igs /
             // llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
             auto select_zone = [&]() {
                 if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
@@ -10865,7 +10867,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Weight buffers are the primary model data allocated by ggml framework;
     // they must NOT count against the cache budget (reserved_) because the
     // cache manages SOA/XMX layouts in the REMAINING VRAM after weights.
-    // Arena zones track non-weight allocations via zone_alloc/zone_reset.
+    // Arena zones track non-weight allocations via zone_alloc/zone_settle.
     // No separate counter bookkeeping needed — zones are the single source of truth.
     // Weight allocations are excluded from runtime tracking (they live in the WEIGHT zone).
 
@@ -10896,7 +10898,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // Epoch-tag SCRATCH/STAGING allocations (iiff Option C step 2,
-        // llama.cpp-lbm3) under the same lock host_zone_reset() bumps
+        // llama.cpp-lbm3) under the same lock host_zone_settle() bumps
         // g_host_zone_epoch under, so an allocation can never straddle a
         // reset boundary and observe a torn epoch value. See the
         // g_host_zone_epoch declaration above for what this id is for.
@@ -11286,8 +11288,8 @@ bool unified_free_ptr(void * ptr, int expected_device) {
         return false;
     }
 
-    // This erase must stay UNCONDITIONAL on zone.  host_zone_reset() and
-    // zone_reset() refuse to reset (or, for SCRATCH/STAGING post iiff Option C
+    // This erase must stay UNCONDITIONAL on zone.  host_zone_settle() and
+    // zone_settle() refuse to reset (or, for SCRATCH/STAGING post iiff Option C
     // step 2, skip their now-inert bulk TLSF reinitialization) while this
     // registry still lists a live allocation in the target zone, and they rely
     // on that refusal being temporary: the registry drains as owners release,
@@ -11575,7 +11577,7 @@ bool unified_cache_has_pending_deferred_frees(int device) {
 }
 
 // unified_cache_add/sub_runtime_bytes removed — arena zones are the single source of truth.
-// Zone_alloc/zone_reset handle accounting internally.
+// Zone_alloc/zone_settle handle accounting internally.
 
 size_t unified_cache_get_runtime_bytes(int device) {
     return unified_cache_arena_non_weight_used(device);
@@ -12303,7 +12305,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         // Route through the ONEDNN zone normally. On the growth path the zone is
         // already known to be too small for the pair, so bypass it: a partial
         // zone allocation would be reclaimed underneath its owning mem_handle by
-        // the zone_reset() that the arena sub-allocation path performs.
+        // the zone_boundary_check() that the arena sub-allocation path performs.
         req.intent.constraints.prefer_vram_zone = arena_zone_exhausted ? vram_zone_id::COUNT : vram_zone_id::ONEDNN;
         owner                                   = {};
         alloc_handle handle{};
@@ -12333,9 +12335,10 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
 
         // Reclaim the OLD arena-owned reservation individually, UNCONDITIONALLY,
         // before anything below consults zone capacity or attempts a re-plan --
-        // the real per-pointer release that replaces the bulk zone_reset() this
-        // function used to depend on as its ONLY reclaim path (iiff Option C
-        // step 3, llama.cpp-67c2). Nothing else ever allocates from
+        // the real per-pointer release that replaces the bulk zone_settle()
+        // (named zone_reset() before llama.cpp-37ba's rename) this function
+        // used to depend on as its ONLY reclaim path (iiff Option C step 3,
+        // llama.cpp-67c2). Nothing else ever allocates from
         // vram_zone_id::ONEDNN (grep-verified: the four zone_alloc(ONEDNN, ...)
         // call sites in reserve_onednn_scratch are the sole users of this zone
         // in the whole backend), so freeing exactly the two pointers this
@@ -12375,12 +12378,14 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         }
 
         // The call site stays, but its reclaiming role has ended (mirroring
-        // C2's treatment of host_zone_reset(SCRATCH|STAGING)): by this point
-        // the two pointers above are already individually freed, so this can
-        // only ever observe an empty zone. It is kept as the audit/liveness
-        // checkpoint the Phase-0 "device-zone-reset/ONEDNN" cohort reads,
-        // rather than letting the site silently stop being visited.
-        zone_reset(vram_zone_id::ONEDNN);
+        // C2's treatment of host_zone_boundary_check(SCRATCH|STAGING)): by
+        // this point the two pointers above are already individually freed,
+        // so this can only ever observe an empty zone. It is kept as the
+        // audit/liveness checkpoint the Phase-0 "device-zone-reset/ONEDNN"
+        // cohort reads, rather than letting the site silently stop being
+        // visited (llama.cpp-37ba renamed the call itself to
+        // zone_boundary_check() to say so truthfully).
+        zone_boundary_check(vram_zone_id::ONEDNN);
 
         size_t zone_cap = zone_capacity(vram_zone_id::ONEDNN);
 
@@ -14304,14 +14309,14 @@ void unified_cache::host_pool_free(void * ptr, size_t size) {
     host_arena_->deallocate(ptr, size);
 }
 
-void unified_cache::host_zone_reset(host_zone_id zone) {
+void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
     // on that path instead of the site vanishing from the inventory
     // (llama.cpp-1ntm, mirroring 495343bb5's identical fix for
-    // reset_scratch_pool). Also stays outside the registry lock further
-    // down so the record is taken with that lock released -- see
-    // zone_audit_site_visit.
+    // scratch_pool_epoch_boundary(), named reset_scratch_pool() at the time).
+    // Also stays outside the registry lock further down so the record is
+    // taken with that lock released -- see zone_audit_site_visit.
     zone_audit_site_visit audit("host-zone-reset", host_zone_name(zone), -1);
     if (audit.active()) {
         // host_zone_largest_free_block() itself returns 0 when the arena/zones
@@ -14349,7 +14354,7 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // force-reclaiming a live handle. Skipping leaves TLSF's free list intact,
     // so already-individually-freed blocks stay reusable; only the (now
     // unnecessary -- see rewind-on-zero below) bulk reclaim is forgone. This
-    // matches zone_reset()'s existing refusals for the WEIGHT zone and for KV
+    // matches zone_settle()'s existing refusals for the WEIGHT zone and for KV
     // in a shared KV+WEIGHT arena.
 
     // Graph-boundary epoch marker (iiff Option C step 2, llama.cpp-lbm3):
@@ -14414,14 +14419,14 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
                 if (epoch_tracked) {
                     GGML_LOG_WARN(
-                        "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations "
+                        "[UNIFIED-CACHE] refusing %s host_zone_boundary_check with %zu live registered allocations "
                         "(epoch=%llu, oldest live epoch=%llu, %llu boundaries stale); owners must release their "
                         "mem_handles instead of resetting the shared allocator\n",
                         host_zone_name(zone), live_allocations, (unsigned long long) new_epoch,
                         (unsigned long long) oldest_epoch, (unsigned long long) (new_epoch - oldest_epoch));
                 } else {
                     GGML_LOG_WARN(
-                        "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations; owners "
+                        "[UNIFIED-CACHE] refusing %s host_zone_reclaim with %zu live registered allocations; owners "
                         "must release their mem_handles instead of resetting the shared allocator\n",
                         host_zone_name(zone), live_allocations);
                 }
@@ -14448,16 +14453,36 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         // host_arena_->zone_reset(zone) to reclaim: the former unconditional
         // call here is retired as a structural no-op, not merely skipped
         // this time around. The call site (this function) and its own
-        // callers remain per llama.cpp-lbm3's scope -- full deletion of
-        // host_zone_reset() itself is step 4 (llama.cpp-37ba), once steps
-        // 2/3 are hardware-verified. See docs/backend/sycl-memory-design.md's
-        // "Epoch-refcounted transient zones" C2 subsection for the full
-        // rationale, including why TLSF needs no ring/rotation the way the
-        // step-1 bump pool does.
+        // callers remain per llama.cpp-lbm3's scope. Step 4 (llama.cpp-37ba)
+        // found nothing here safe to delete outright -- KV still reaches
+        // the real host_arena_->zone_reset(zone) call below on every call,
+        // genuinely load-bearing -- so it split this function's two
+        // semantics into two truthfully-named callers (host_zone_boundary_check()
+        // for SCRATCH/STAGING, host_zone_reclaim() for KV) instead. See
+        // docs/backend/sycl-memory-design.md's "Epoch-refcounted transient
+        // zones" C2 subsection for the reclaim rationale, and its "Step 4"
+        // subsection for the naming split.
         return;
     }
 
     host_arena_->zone_reset(zone);
+}
+
+// SCRATCH/STAGING: liveness/audit checkpoint only -- see the doc comment on
+// the declaration in unified-cache.hpp. Asserts misuse rather than silently
+// reclaiming or silently doing nothing for the wrong zone.
+void unified_cache::host_zone_boundary_check(host_zone_id zone) {
+    GGML_ASSERT((zone == host_zone_id::SCRATCH || zone == host_zone_id::STAGING) &&
+                "host_zone_boundary_check() is for SCRATCH/STAGING only -- KV needs host_zone_reclaim()");
+    host_zone_settle(zone);
+}
+
+// KV: real bulk reclaim, out of this epic's scope -- see the doc comment on
+// the declaration in unified-cache.hpp.
+void unified_cache::host_zone_reclaim(host_zone_id zone) {
+    GGML_ASSERT(zone == host_zone_id::KV &&
+                "host_zone_reclaim() is for KV only -- SCRATCH/STAGING need host_zone_boundary_check()");
+    host_zone_settle(zone);
 }
 
 void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
@@ -14965,7 +14990,12 @@ void unified_cache::arena_reset() {
     const bool profile_active = arena_pp_profile_active();
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
     if (arena_active()) {
-        zone_reset(vram_zone_id::SCRATCH);
+        // pool_leg (arena_alloc()/arena_free() above) already zone_free()s every
+        // allocation individually the instant its caller releases it -- this
+        // is a liveness/audit checkpoint, not the reclaim path (llama.cpp-37ba;
+        // see docs/backend/sycl-memory-design.md's "Step 4" subsection, "a
+        // fourth, previously-unenumerated population").
+        zone_boundary_check(vram_zone_id::SCRATCH);
         if (profile_active) {
             t_arena_pp_profile.compute_arena_reset_calls++;
             t_arena_pp_profile.compute_arena_reset_us += arena_profile_elapsed_us(t0);
@@ -15027,7 +15057,7 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
         // under a live handle, directly against the "never force-reclaim"
         // invariant this whole mechanism exists to uphold (see CLAUDE.md
         // SYCL Memory Ownership). Refuse instead, in the same style as
-        // reset_scratch_pool()'s "refusing ..." family: growth is a rare,
+        // scratch_pool_epoch_boundary()'s "refusing ..." family: growth is a rare,
         // explicit administrative resize (not a graph-boundary operation),
         // so a caller can simply retry once every region has drained.
         bool any_region_live = false;
@@ -15164,8 +15194,8 @@ void * unified_cache::get_scratch(size_t size) {
     // Atomic bump allocator within the CURRENT epoch's region -- lock-free,
     // same as before, just scoped to one region instead of the whole pool.
     // scratch_pool_current_ itself is only ever changed at the graph
-    // boundary in reset_scratch_pool(), which -- like the reset it replaces
-    // -- is never concurrent with in-graph get_scratch()/return_scratch()
+    // boundary in scratch_pool_epoch_boundary(), which -- like the reset it
+    // replaces -- is never concurrent with in-graph get_scratch()/return_scratch()
     // calls; that ordering, not an extra lock, is what makes reading it here
     // with relaxed ordering safe, exactly as scratch_pool_off_ relied on
     // before regions existed. It is still std::atomic<int> (not plain int)
@@ -15182,7 +15212,7 @@ void * unified_cache::get_scratch(size_t size) {
     }
 
     // Epoch refcount: this allocation keeps the region live until
-    // return_scratch() drops it back. This is what lets reset_scratch_pool()
+    // return_scratch() drops it back. This is what lets scratch_pool_epoch_boundary()
     // tell "safe to rewind" from "must linger" at the next graph boundary.
     region.live.fetch_add(1, std::memory_order_relaxed);
 
@@ -15209,7 +15239,7 @@ void unified_cache::return_scratch(void * ptr, size_t size) {
 
     // Epoch decrement -- this replaces the pool's former unconditional-reset
     // "stack discipline" no-op (llama.cpp-2757 / llama.cpp-iiff Option C). A
-    // region's live count reaching zero is what lets reset_scratch_pool()
+    // region's live count reaching zero is what lets scratch_pool_epoch_boundary()
     // rewind it in place instead of leaving it to linger.
     scratch_pool_region & region = scratch_pool_regions_[region_idx];
     const int64_t         before = region.live.fetch_sub(1, std::memory_order_relaxed);
@@ -15226,7 +15256,7 @@ void unified_cache::return_scratch(void * ptr, size_t size) {
     }
 }
 
-void unified_cache::reset_scratch_pool() {
+void unified_cache::scratch_pool_epoch_boundary() {
     // Read region 0 (the default scratch_pool_current_) even when the pool
     // has never been reserved: scratch_pool_regions_ is a fixed-size array
     // that always exists, so this is safe, and it is what lets the audit
@@ -15246,7 +15276,9 @@ void unified_cache::reset_scratch_pool() {
         // sites.
         //
         // This MUST run before the "nothing reserved yet" early-return below.
-        // The pre-epoch reset_scratch_pool() had no such early-return -- it
+        // The pre-epoch reset_scratch_pool() (this function's name before
+        // llama.cpp-37ba's rename to scratch_pool_epoch_boundary()) had no
+        // such early-return -- it
         // always recorded a site visit, even when scratch_pool_size_ was 0
         // (empty live, largest_free=0, largest_free_valid=false, since
         // scratch_pool_size_ > off is false when both are 0). Gating the
@@ -15290,7 +15322,7 @@ void unified_cache::reset_scratch_pool() {
     scratch_pool_region & candidate = scratch_pool_regions_[next];
     if (candidate.live.load(std::memory_order_relaxed) != 0) {
         // Every region in the ring is lingering. Refuse the rotation loudly,
-        // exactly like host_zone_reset()/zone_reset()'s "refusing ..." family
+        // exactly like host_zone_settle()/zone_settle()'s "refusing ..." family
         // -- do not wrap onto a still-live region, which would be reclaiming
         // a live handle by another name.
         static std::atomic<int> exhaustion_logs{ 0 };
@@ -15702,10 +15734,10 @@ void unified_cache_return_scratch(int device_id, void * ptr, size_t size) {
     }
 }
 
-void unified_cache_reset_scratch_pool(int device_id) {
+void unified_cache_scratch_pool_epoch_boundary(int device_id) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (cache) {
-        cache->reset_scratch_pool();
+        cache->scratch_pool_epoch_boundary();
     }
 }
 
@@ -15918,10 +15950,17 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
     return cache->zone_alloc(zone, size, align);
 }
 
-void unified_cache_zone_reset(int device_id, vram_zone_id zone) {
+void unified_cache_zone_reclaim(int device_id, vram_zone_id zone) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (cache) {
-        cache->zone_reset(zone);
+        cache->zone_reclaim(zone);
+    }
+}
+
+void unified_cache_zone_boundary_check(int device_id, vram_zone_id zone) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (cache) {
+        cache->zone_boundary_check(zone);
     }
 }
 
@@ -15981,10 +16020,17 @@ void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr) {
     }
 }
 
-void unified_cache_host_zone_reset(host_zone_id zone) {
+void unified_cache_host_zone_boundary_check(host_zone_id zone) {
     auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
     if (cache) {
-        cache->host_zone_reset(zone);
+        cache->host_zone_boundary_check(zone);
+    }
+}
+
+void unified_cache_host_zone_reclaim(host_zone_id zone) {
+    auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
+    if (cache) {
+        cache->host_zone_reclaim(zone);
     }
 }
 
@@ -16324,24 +16370,30 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        runtime_bytes,
                                   size_t        device_total_vram) {
     if (arena_base_) {
-        // Same model, new context — reset ephemeral zones so KV/runtime
-        // space from the previous context is reclaimable.  In single-chunk
-        // arenas KV and WEIGHT share the same TLSF allocator; zone_reset(KV)
-        // detects live weight entries and refuses to reset in that case.
-        // SCRATCH resets at graph_compute start via arena_reset().
-        zone_reset(vram_zone_id::KV);
-        zone_reset(vram_zone_id::RUNTIME);
+        // Same model, new context — reclaim ephemeral zones so KV/runtime
+        // space from the previous context is reclaimable. KV and RUNTIME are
+        // out of iiff's scope (llama.cpp-37ba; see docs/backend/sycl-memory-design.md's
+        // "Step 4" subsection) -- this is a genuine, still load-bearing bulk
+        // reclaim, not a liveness checkpoint. In single-chunk arenas KV and
+        // WEIGHT share the same TLSF allocator; zone_reclaim(KV) detects
+        // live weight entries and refuses to reclaim in that case. SCRATCH
+        // is a liveness checkpoint at graph_compute start via arena_reset().
+        zone_reclaim(vram_zone_id::KV);
+        zone_reclaim(vram_zone_id::RUNTIME);
 
-        // Host zones: reset KV and STAGING so host-pinned buffers from the
-        // previous context (output buffer, KV spill) are reclaimable.
-        // WEIGHT is persistent, SCRATCH resets at graph_compute.
-        // Use host_zone_reset() (not host_arena_->zone_reset()) to also
-        // purge the registry of stale host zone entries.
-        host_zone_reset(host_zone_id::KV);
-        host_zone_reset(host_zone_id::STAGING);
+        // Host zones: reclaim KV (genuine, out-of-scope reclaim, same as
+        // above) and check STAGING's boundary (SCRATCH/STAGING already free
+        // themselves individually per-allocation, iiff Option C step 2 --
+        // nothing left here to reclaim by the time this runs) so
+        // host-pinned buffers from the previous context (output buffer, KV
+        // spill) are reclaimable. WEIGHT is persistent, SCRATCH's boundary
+        // is checked at graph_compute. Use these (not host_arena_->zone_reset()
+        // directly) to also purge the registry of stale host zone entries.
+        host_zone_reclaim(host_zone_id::KV);
+        host_zone_boundary_check(host_zone_id::STAGING);
 
         // Arena zones are the single source of truth for runtime tracking.
-        // zone_reset() above already zeroes zone_used() for KV and RUNTIME.
+        // zone_reclaim() above already zeroes zone_used() for KV and RUNTIME.
         return true;
     }
 
@@ -16907,14 +16959,18 @@ static const char * vram_zone_name(vram_zone_id zone) {
     }
 }
 
-void unified_cache::zone_reset(vram_zone_id zone) {
+// Shared implementation for zone_boundary_check() / zone_reclaim() (below) --
+// see the doc comment on zone_settle()'s declaration in unified-cache.hpp for
+// why this is genuinely internal and not called directly outside this class.
+void unified_cache::zone_settle(vram_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the WEIGHT and shared-
     // KV-arena early returns below, so the RAII destructor still records a
     // visit on those paths instead of the site vanishing from the inventory
     // (llama.cpp-1ntm, mirroring 495343bb5's identical fix for
-    // reset_scratch_pool). MUST also stay before the z.alloc_mutex guard
-    // further down: reverse destruction order is what takes the record with
-    // both the zone and registry locks released -- see zone_audit_site_visit.
+    // scratch_pool_epoch_boundary(), named reset_scratch_pool() at the time).
+    // MUST also stay before the z.alloc_mutex guard further down: reverse
+    // destruction order is what takes the record with both the zone and
+    // registry locks released -- see zone_audit_site_visit.
     zone_audit_site_visit audit("device-zone-reset", vram_zone_name(zone), ggml_sycl_get_device_id_from_queue(queue_));
     if (audit.active()) {
         // zone_largest_free() reads arena_zones_/weight_chunk_allocators_
@@ -16926,7 +16982,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
 
     if (zone == vram_zone_id::WEIGHT) {
         GGML_LOG_WARN(
-            "[UNIFIED-CACHE] ignoring WEIGHT zone_reset request; weights are owned by refcounted mem_handles and "
+            "[UNIFIED-CACHE] ignoring WEIGHT zone_settle request; weights are owned by refcounted mem_handles and "
             "must be released by dropping handles\n");
         return;
     }
@@ -16948,7 +17004,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
             static std::atomic<int> shared_kv_reset_logs{ 0 };
             if (shared_kv_reset_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
                 GGML_LOG_WARN(
-                    "[UNIFIED-CACHE] refusing KV zone_reset in shared KV+WEIGHT arena with %zu device weight "
+                    "[UNIFIED-CACHE] refusing KV zone_settle in shared KV+WEIGHT arena with %zu device weight "
                     "entries; KV/compute buffers must release their mem_handles instead of resetting the shared "
                     "allocator\n",
                     device_weight_entries);
@@ -16980,7 +17036,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
     // above already give; only the bulk reclaim is lost, TLSF's free list is intact.
     if (arena_base_ && z.size > 0) {
         std::lock_guard<std::mutex> reg_lock(g_runtime_alloc_mutex);
-        // Per-zone budgets -- see the matching note in host_zone_reset(): a shared
+        // Per-zone budgets -- see the matching note in host_zone_settle(): a shared
         // counter lets one busy zone silence another zone's first-ever refusal.
         static std::atomic<int>     refusal_logs[static_cast<int>(vram_zone_id::COUNT)]{};
         std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
@@ -17014,7 +17070,7 @@ void unified_cache::zone_reset(vram_zone_id zone) {
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
                 GGML_LOG_WARN(
-                    "[UNIFIED-CACHE] refusing zone_reset of VRAM zone %s with %zu live registered allocations; owners "
+                    "[UNIFIED-CACHE] refusing zone_settle of VRAM zone %s with %zu live registered allocations; owners "
                     "must release their mem_handles instead of resetting the shared allocator\n",
                     vram_zone_name(zone), live_allocations);
             }
@@ -17040,6 +17096,26 @@ void unified_cache::zone_reset(vram_zone_id zone) {
         t_arena_pp_profile.zone_reset_calls[idx]++;
         t_arena_pp_profile.zone_reset_us[idx] += arena_profile_elapsed_us(t0);
     }
+}
+
+// ONEDNN (iiff Option C step 3, llama.cpp-67c2) and SCRATCH (the pool_leg
+// compute-arena allocator -- already individually zone_free()s every
+// allocation, never needed conversion, see arena_reset()): liveness/audit
+// checkpoint only.
+void unified_cache::zone_boundary_check(vram_zone_id zone) {
+    GGML_ASSERT((zone == vram_zone_id::ONEDNN || zone == vram_zone_id::SCRATCH) &&
+                "zone_boundary_check() is for ONEDNN/SCRATCH only -- KV/RUNTIME need zone_reclaim()");
+    zone_settle(zone);
+}
+
+// KV and RUNTIME: context/session-lifetime zones, out of this epic's scope
+// (never in the Phase-0/Phase-1 audit inventory) -- a real bulk reclaim, used
+// on-demand at context-switch time (arena_reserve()) and capacity pressure
+// (the KV buffer-type allocation fallback in ggml-sycl.cpp).
+void unified_cache::zone_reclaim(vram_zone_id zone) {
+    GGML_ASSERT((zone == vram_zone_id::KV || zone == vram_zone_id::RUNTIME) &&
+                "zone_reclaim() is for KV/RUNTIME only -- ONEDNN/SCRATCH need zone_boundary_check()");
+    zone_settle(zone);
 }
 
 void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
