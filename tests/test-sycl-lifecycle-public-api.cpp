@@ -1,5 +1,24 @@
+// COMPILE-TIME ABI GATE -- not a runtime test (llama.cpp-u2mz).
+//
+// Every check below is a static_assert, so `main` has exactly one reachable
+// exit and the ctest entry `sycl-lifecycle-public-wrappers` cannot go red for
+// any ABI reason. THE GATE IS THE BUILD: to exercise it, change a signature in
+// ggml-sycl.h and confirm `ninja test-sycl-lifecycle-public-api` fails to
+// compile. Do NOT run ctest to check it -- ctest would happily run a stale
+// binary from a previous build and print a pass.
+//
+// Retained rather than deleted because it pins the public C ABI, which is real
+// coverage that nothing else provides. Its one honest limitation: the operands
+// of `decltype(&f)` are unevaluated, so these assertions constrain the declared
+// SIGNATURES only -- they do not odr-use the functions and therefore prove
+// nothing about whether the symbols link. Giving it that property would mean
+// linking ggml-sycl into this target, which is not possible under
+// GGML_BACKEND_DL (the backend is then a MODULE library); see the note on its
+// registration in ggml/src/ggml-sycl/CMakeLists.txt.
+
 #include "ggml-sycl.h"
 
+#include <cstdio>
 #include <type_traits>
 
 using begin_fn = ggml_sycl_lifecycle_result (*)(ggml_sycl_load_txn *);
@@ -37,5 +56,10 @@ static_assert(GGML_SYCL_EXECUTION_DEVICE_BUSY != GGML_SYCL_EXECUTION_BUSY);
 static_assert(GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND != GGML_SYCL_LIFECYCLE_STALE_IDENTITY);
 
 int main() {
+    // Deliberately says what it did and did not prove. A silent `return 0` here
+    // was indistinguishable from a stale binary.
+    std::puts(
+        "PASS: public lifecycle/execution ABI signatures (18 static_asserts, "
+        "verified at COMPILE time -- this run proves only that a binary exists)");
     return 0;
 }

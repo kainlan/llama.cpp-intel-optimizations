@@ -179,6 +179,17 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")
+    # COMPILE-TIME ABI GATE, registered as a ctest entry only so that a missing
+    # binary is noticed (llama.cpp-u2mz). The 18 static_asserts in the source are
+    # checked by the COMPILER: `ninja test-sycl-lifecycle-public-api` is the
+    # gate, and a green `ctest -R sycl-lifecycle-public-wrappers` proves only
+    # that some binary exists -- possibly a stale one from an earlier build.
+    #
+    # It deliberately does not link ggml-sycl: under GGML_BACKEND_DL the backend
+    # is a MODULE library and cannot be linked into an executable, and this
+    # registration is outside the `if (NOT GGML_BACKEND_DL)` fixture. The cost is
+    # that the assertions constrain declared signatures without odr-using them,
+    # so they say nothing about whether the symbols link.
     add_executable(test-sycl-lifecycle-public-api
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-public-api.cpp)
     target_include_directories(test-sycl-lifecycle-public-api PRIVATE
@@ -3591,6 +3602,18 @@ target_compile_definitions(test-xmx-host-streaming PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
+# llama.cpp-u2mz: test-xmx-host-streaming.cpp gates its whole body on
+# GGML_SYCL_XMX_GEMM && GGML_SYCL_MMQ_XMX, but both are set on the LIBRARY as
+# `target_compile_definitions(ggml-sycl PRIVATE ...)` (lines 89 and 570), so
+# they never reached this target and no -D a user could pass would execute one
+# line of the test. Mirror the library's own conditions here, so that turning
+# the options on turns the test on too.
+if (GGML_SYCL_MMQ_XMX)
+    target_compile_definitions(test-xmx-host-streaming PRIVATE GGML_SYCL_MMQ_XMX)
+endif()
+if (GGML_SYCL_XMX_GEMM)
+    target_compile_definitions(test-xmx-host-streaming PRIVATE GGML_SYCL_XMX_GEMM)
+endif()
 target_link_libraries(test-xmx-host-streaming PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-xmx-host-streaming PRIVATE IntelSYCL::SYCL_CXX)
@@ -3599,6 +3622,10 @@ add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
 set_tests_properties(test-xmx-host-streaming PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # 77 = XMX off at build time, no SYCL backend, or a device without XMX
+    # INT8/Q4_0. With both options OFF (the default) this test SKIPS -- which is
+    # the honest report; it used to exit 0 and read as a pass.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3795,7 +3822,14 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-esimd-float-atomic-compile PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
-set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
+set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES
+    LABELS "sycl;esimd;compile;tdd"
+    # 77 = no device / no ESIMD runtime. Until llama.cpp-u2mz every path in this
+    # test returned 0, including all four catch blocks, so an absent device and
+    # a working fadd atomic were indistinguishable.
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
 
 # LEVEL_ZERO_LOADER was located above for the packed-K native-event fixture.
 add_executable(test-sycl-level-zero-vmem-feasibility
@@ -3844,6 +3878,10 @@ add_test(NAME test-sycl-onednn-mxfp4-feasibility COMMAND test-sycl-onednn-mxfp4-
 set_tests_properties(test-sycl-onednn-mxfp4-feasibility PROPERTIES
     LABELS "sycl;onednn;mxfp4;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # 77 = could not probe (no oneDNN build, or engine creation failed). This is
+    # a capability probe, not a gate: no support matrix it reports is "wrong",
+    # so the only failure it can express is "the probe did not happen".
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
