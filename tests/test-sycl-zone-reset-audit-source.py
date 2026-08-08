@@ -167,6 +167,19 @@ def evaluate(cache, backend, common, header):
     watchdog = body_of(common, "static void watchdog_thread_fn(")
     reserve_onednn = body_of(cache, "bool unified_cache::reserve_onednn_scratch(")
 
+    # llama.cpp-37ba: the segment of host_zone_reset() between its level-2
+    # suppression check and the real bulk host_arena_->zone_reset(zone) call.
+    # "if (zone_reset_audit_suppresses_reset()) {" is unique within this
+    # function (the level-2 check appears nowhere else in it), so slicing from
+    # there to the reset call isolates exactly the epoch_tracked early-return
+    # guard without depending on how many comment lines separate them --
+    # robust to reformatting or a longer/shorter rationale comment.
+    _host_reset_suppress_idx = host_reset.find("if (zone_reset_audit_suppresses_reset()) {")
+    _host_reset_call_idx = host_reset.find("host_arena_->zone_reset(zone);")
+    host_reset_epoch_guard_tail = (
+        host_reset[_host_reset_suppress_idx:_host_reset_call_idx]
+        if _host_reset_suppress_idx >= 0 and _host_reset_call_idx >= 0 else "")
+
     # Anchors: every region the checks read must have been found. A rename that
     # empties one of these reports a missing anchor rather than a silent pass.
     anchors = {
@@ -320,6 +333,22 @@ def evaluate(cache, backend, common, header):
         'the oneDNN point-release precedes the growth-path re-plan':
             precedes(reserve_onednn, "zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_)",
                     "ensure_planned_arena_zones()"),
+
+        # 7. llama.cpp-37ba (iiff Phase 3 / epic acceptance criterion 1, reconciled):
+        #    host_zone_reset()'s SCRATCH/STAGING population no longer needs the bulk
+        #    host_arena_->zone_reset(zone) call to reclaim anything -- C2 made every
+        #    allocation in those zones free itself individually at release, so by the
+        #    time this function's registry scan finds nothing live, there is nothing
+        #    left to reclaim. The remaining call exists only for KV, which is
+        #    deliberately out of the epic's scope (a context-lifetime zone with a
+        #    genuine on-demand reclaim need at context-switch time -- see
+        #    arena_reserve() and the KV buffer-type fallback in ggml-sycl.cpp).
+        #    epoch_tracked's early return is what keeps SCRATCH/STAGING out of that
+        #    real reset -- if a future edit weakens or removes it, the two zones
+        #    silently regain a live dependency on a reset that C2 already proved is
+        #    unreachable for them, undoing this step's whole point.
+        'SCRATCH/STAGING return before host_zone_reset reaches the real bulk reset':
+            "if (epoch_tracked) {" in host_reset_epoch_guard_tail and "return;" in host_reset_epoch_guard_tail,
     }
 
     return sorted(name for name, text in anchors.items() if not text), \
@@ -396,6 +425,15 @@ MUTANTS = {
         [("        arena_attempt             = true;\n",
           "        arena_attempt             = true;\n"
           "        (void) ensure_planned_arena_zones();\n")]),
+    # Neuters the epoch_tracked guard's condition rather than deleting the
+    # whole block: the anchor is short and comment-length-independent, so it
+    # survives a longer or shorter rationale comment on the guard. The effect
+    # is the same as deleting the guard -- SCRATCH/STAGING would fall through
+    # to the real host_arena_->zone_reset(zone) call again.
+    "SCRATCH/STAGING return before host_zone_reset reaches the real bulk reset": (
+        "cache",
+        [("if (zone_reset_audit_suppresses_reset()) {\n        return;\n    }\n\n    if (epoch_tracked) {",
+          "if (zone_reset_audit_suppresses_reset()) {\n        return;\n    }\n\n    if (false && epoch_tracked) {")]),
 }
 
 
