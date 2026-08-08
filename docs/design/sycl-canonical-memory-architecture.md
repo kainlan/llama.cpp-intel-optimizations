@@ -440,6 +440,51 @@ Keep these cases separate:
   same-device limitation remains: same-device concurrent inference is
   unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
+#### OPEN ADJUDICATION: a replay-active graph holds the device invocation indefinitely (`llama.cpp-u7vj`)
+
+**Unresolved. Documented here as an open question, not as a decided contract
+rule.** It is P2 and non-blocking, but it is the production-facing half of a
+question the test suite currently sidesteps.
+
+Measured at `98deb46ed` with `GGML_SYCL_DISABLE_GRAPH` unset — that is, **replay
+ON, which is the default**: the first context to begin a tracked graph on a
+device holds its invocation indefinitely. `begin_invocation` reuses an open
+invocation for its own context without re-touching `device_owners_`;
+`release_invocation` requires a TERMINAL state (COMPLETE/QUARANTINED) and
+silently no-ops otherwise; and a replay-active graph never reaches TERMINAL.
+Every *other* context's fresh claim on that device is refused `DEVICE_BUSY`
+exactly once, after which the caller typically aborts. (File/line references are
+in the ticket and are pinned to that SHA; treat them as drifting.)
+
+The discriminator is clean: `test-thread-safety` — 3 models × 4 contexts,
+decodes serialized per device under the lock — fails at 3.4 s with replay on and
+passes at 6.95 s with replay off, both pinned `level_zero:0,1`.
+
+The question to adjudicate is whether winner-holds-forever is **intended
+exclusivity** under this section's record/replay lifetime semantics, or a **gap**:
+
+- If intended, it belongs in this section as a rule, and the refusal message
+  should be made actionable (suggest `GGML_SYCL_DISABLE_GRAPH=1` or context
+  teardown).
+- If a gap, the registry needs a way to retire or suspend a replay-active
+  graph's invocation between decodes — e.g. release at the graph-epoch boundary
+  with revalidation on the next `begin` — without breaking replay correctness.
+
+Why it is not merely academic: **serialized** multi-context on one device
+(create N contexts, decode them one at a time) is a plausible production pattern
+for a process holding several models or contexts, and on the default
+configuration it currently deadlocks-by-refusal — `DEVICE_BUSY` is returned, and
+there is no path by which the second context ever succeeds while the first keeps
+its replay graph active. The blast radius is wider than the device count
+suggests: on current Level Zero multi-GPU runtimes the scheduler-visible device
+set is collapsed to **one** device, so all contexts in a process share device 0's
+registry slot regardless of how many physical GPUs are installed.
+
+Setting `GGML_SYCL_DISABLE_GRAPH=1` in the `test-thread-safety` registration
+(the `llama.cpp-b16a`/`llama.cpp-cnre` disposition) makes the *test* pass. It
+does not answer this question, and the green result in §11.2 must not be read as
+though it did.
+
 ---
 
 ## 6. Memory Operation Helpers
@@ -587,6 +632,37 @@ placement-plan state, or host accessibility rather than cache enablement.
 | `llama.cpp-32dg8.4` | Removed optional unified-cache mode branches |
 | `llama.cpp-32dg8.3` | Delete legacy host-weight fallback registration (precondition for T3) |
 
+**Owner ruling, `llama.cpp-7f2e` (2026-08-04): do not restore the cache
+opt-out.** That ticket audited all 338 changed files and 4,087 textual hunks of
+`9a0670712` ("sycl: checkpoint unified memory ownership work") and found **no
+remaining commit-specific runtime defect** beyond the four fixes it landed —
+`282069dd4`, `06f8887a6`, `acdb192d4`, `4afdb6d9f`. Its children `5cxw` (removal
+docs), `gza7` (actual-placement tier contract), `966h` (selector-default
+provenance) and `7ler` (final immutable manifest) are complete.
+
+Two corrections from that audit are worth carrying, because the ticket initially
+read scarier than the evidence supported:
+
+- `unified_cache_enabled()` was **deleted**, not bypassed at one site — it was a
+  real `GGML_SYCL_UNIFIED_CACHE=0` toggle called at ~30 sites. But "unified cache
+  always on" is the **documented architecture decision of 2026-02-09**, four
+  months before that commit, so the direction was intentional. What was real and
+  narrower is that the opt-out vanished *silently*: no deprecation note, no doc
+  update. That convention gap is closed in `docs/backend/sycl-env-vars.md`, which
+  now records the name as removed with no replacement.
+- `g_tiered_enabled` conflating "is the unified cache active" with "does this
+  model need tiering" **predates** `9a0670712`. The decisive check is that
+  `test-tiered-dispatch` never set `GGML_SYCL_UNIFIED_CACHE` at any point in its
+  history, so `unified_cache_enabled()` was already returning its default for
+  that test's scenario. The commit removed the one thing that could have masked a
+  pre-existing flaw in a scenario the test never exercised.
+
+The general lesson the audit recorded, and the reason a grep-only pass may not be
+reported as a clean result: a pattern tuned to catch a hardcoded-constant
+substitution is structurally blind to a widened condition. Any future pass over
+that commit must say which files were **read** and which were not, and stop by
+that criterion rather than by running out of grep ideas.
+
 ### 9.4 `mem_handle::from_direct` with implicit device 0
 
 All `from_direct(ptr, layout, on_device)` calls omit device identity. These are
@@ -671,6 +747,127 @@ owner nor closes foundations `1q72`/`o6jx`. It does not prove server slots with
 different context sizes, explicit context-keyed arena ownership, or keyed resets
 for KV/RUNTIME/HOST zones. C1 remains open until the target ownership keys and
 callers land and the test matrix covers different `n_ctx`/slot lifetimes.
+
+### 11.2 Option-C epoch migration — shipped state and its enforcement gates
+
+The `llama.cpp-iiff` epic ("eliminate zone reset — `mem_handle` refcounting
+becomes the sole reclamation model") closed 2026-08-08 with all five acceptance
+criteria met. The **design** lives in `docs/backend/sycl-memory-design.md`
+("Epoch-refcounted transient zones"); recorded here is only what the contract
+must now enforce, and what proves it.
+
+Shipped in four lead-verified steps, each on hardware before the next:
+
+| step | ticket | scope |
+|---|---|---|
+| C1 | `llama.cpp-2757` | VRAM scratch bump pool → epoch rewind-on-zero |
+| C2 | `llama.cpp-lbm3` | host SCRATCH/STAGING → per-record TLSF free |
+| C3 | `llama.cpp-67c2` | oneDNN scratch → real epoch-tracked handles, point release |
+| finale | `llama.cpp-37ba` | rename by semantics; criterion 1 machine-checked |
+
+**Criterion 1 is machine-checked, not asserted.** The owner ruling was that no
+`zone_reset` / `host_zone_reset` / `reset_scratch_pool` call may remain, achieved
+by renaming surviving operations to their true semantics rather than deleting
+load-bearing code: liveness/boundary checks became `*_boundary_check`, genuine
+on-demand reclaims became `*_reclaim`, and C1's pool operation became
+`scratch_pool_epoch_boundary`. A source-contract check asserts the three old
+symbols have **zero production call sites or definitions**, in both the bare and
+`unified_cache_*` spellings. The full old→new mapping is in the memory-design
+document.
+
+> ⚠️ **The audit site strings are deliberately NOT renamed, and must stay that
+> way.** `GGML_SYCL_ZONE_RESET_AUDIT` and the site identifiers
+> `host-zone-reset/*`, `scratch-pool-reset/bump`, `device-zone-reset/*`,
+> `weight-reclaim/*` are stable historical identifiers that keep captures 01–17
+> baseline-comparable. They look stale against the renamed API; they are not.
+> Do not "fix" them.
+
+**Criterion 5 was settled by measurement, not by mechanism.** Three
+pre-registered single-process soaks (criteria written before running,
+`captures/15-17-soak-preregistration.md`; analyzer `captures/soak_analyze.py`,
+positive-controlled against capture 01 which it reproduces exactly) recorded
+`first == last == min` on **every zone**:
+
+| soak | shape | graphs |
+|---|---|---:|
+| A | Mistral `llama-completion -n 3000` | 3001 |
+| B | Mistral `llama-bench -p 512 -n 128 -r 30` | 3872 |
+| C | GPT-OSS `llama-bench -p 512 -n 128 -r 15` | 1937 |
+
+Soak B is 242x the 16-graph Phase-0 baseline. The headline is a disappearance:
+the ONEDNN `256.00 → 143.88 MB` drop — the only moving number in the entire
+Phase-0 fragmentation dataset — holds **flat at 256.00** across 3872 graphs
+post-C3, because the predecessor reservation is now point-released rather than
+waiting for a bulk reset. Capture 02's 2.1% transient STAGING dip likewise does
+not recur. Soak A is reported as **UNMEASURED** for ONEDNN (its prompt is too
+small to exercise the zone), not as clean — per the pre-registration's void rule.
+Committed as `2c4a05977`.
+
+One honest residual, filed rather than smoothed over: the WEIGHT zone's largest
+free block reads 12820/12822 MB at the load boundary in all three soaks against
+13586 MB in the pre-C-series captures. It is present at the **first** visit
+(graph 0), identical across both models, and constant within every run — a
+starting-layout difference, not erosion. Cause unidentified.
+
+#### The two gates that hold this contract shut
+
+Both are registered tests, both lead-verified at `df51c5130`, and both were
+proven able to fail:
+
+**`test-sycl-retained-handoff-contended`** (`llama.cpp-fbj5`) — the publisher
+barrier. Device-free, ~1 s, no GPU device opened.
+
+| step | result |
+|---|---|
+| GREEN at HEAD | `ctest --test-dir build -R '^test-sycl-retained-handoff-contended$'` → **Passed, 1.13 s** |
+| mutation | delete the `state.publishers == 0` clause from the drain predicate in `drain_retained_handles()` (`mem-handle.cpp`), the guard introduced by `1f84f1a95` — one file, one hunk, one line |
+| RED | **exit 1**, verbatim per pre-registration: `FAIL: retained-handle barrier violated: drain reported clear while owner 0 held an unpublished handle (owners=1 hold_state=3 crossings=0)`; stats `violations=1 graph_parked=0` |
+| restore | reverse-apply, rebuild → **Passed, 0.78 s**, working tree clean |
+
+The clause matters because `state.queue` and `state.active` only describe handles
+already handed to `retain_handles_until_event()`. An owner that holds an
+allocation but has not yet reached that call appears in neither.
+`begin_retained_handle_publish()` increments `publishers` under the state mutex
+*before* the owner touches the allocation, and the decrement happens only after
+the handles are in `state.queue` — no gap. The `publishers == 0` clause is what
+makes the barrier consult that fact. **The test constrains ordering, not merely
+the counter's existence**, so it is not made redundant by its single-threaded
+sibling.
+
+**`test-thread-safety`** (`llama.cpp-3ovk`) — one-shot lead hardware
+verification at `df51c5130`, via the plan's `run_gpu` wrapper, selector
+`level_zero:0`, once, no loops:
+
+- `2/2 Test #243: test-thread-safety ... Passed 8.21 sec` — and explicitly **not
+  a 77-skip**, which was checked because `SKIP_RETURN_CODE 77` makes a skip read
+  as ctest rc 0.
+- **Zero** hits on `refusing zone_reset` / `refusing.*reset`, `arena scratch
+  unavailable`, `forced (reset|reclaim)` / `live allocation at reset`, and
+  `ggml-sycl\.cpp:[0-9]+:`. Each of those probes has a positive control in this
+  binary's own recorded failing runs, so the zeros are measurements rather than
+  patterns that never could have matched.
+- Memory settled: `Shmem` 2528532 → 2541972 kB across the run (~13 MB delta);
+  kernel log clean for GT reset / `guc_id` / CAT error / GPU hang.
+
+Historical contrast worth keeping: this same binary used to abort at
+`ggml-sycl.cpp:78815 arena scratch unavailable` — the `llama.cpp-oze0` TOCTOU.
+The epoch migration plus the publisher barrier dissolved that failure mode.
+
+Its registration carries `GGML_SYCL_DISABLE_GRAPH=1` (the
+`llama.cpp-b16a`/`llama.cpp-cnre` disposition). **That is a test-environment
+disposition, not a statement that the underlying question is closed** — see the
+open adjudication in §5.3.
+
+#### Open, non-blocking, and tracked
+
+None of these blocks the epic's closure; all of them are real.
+
+| ticket | state | what it is |
+|---|---|---|
+| `llama.cpp-u7vj` | open, P2 | replay-active graph holds the device invocation — §5.3 |
+| `llama.cpp-2498` | open | the one known residual population: a non-default fallback mode not converted to refcounted release |
+| `llama.cpp-26ak` | open | `test-sycl-moe-sequence-graphlet-policy` debt (never-committed decision docs, vanished region markers) |
+| `llama.cpp-ndn9`, `llama.cpp-1z58`, `llama.cpp-yy17`, `llama.cpp-aog4`, `llama.cpp-cpsi` | open | ordinary backlog descendants of the epic |
 
 ---
 
