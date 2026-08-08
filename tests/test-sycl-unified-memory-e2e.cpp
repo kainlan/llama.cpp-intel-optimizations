@@ -31,13 +31,22 @@
 // allocation from available() therefore asks for memory the cache itself owns,
 // and the driver returns nullptr.  That is self-starvation, not a cache defect.
 //
-// ensure_cached_alloc() is [[deprecated("use unified_alloc()")]] and has no
-// production callers -- the shim survives only for this test family, and
-// llama.cpp-og9dt tracks porting these call sites to unified_alloc() and
-// deleting it.  Until that lands, this fixture is exercising a path the
-// backend itself no longer takes: the production paths (allocate_slot,
-// unified_alloc) try the arena zone first and check live free VRAM before any
-// raw malloc, which is exactly what spares them this failure mode.
+// ensure_cached_alloc() has no production callers -- it survives only for this
+// test family.  llama.cpp-og9dt tried to port these call sites and delete it,
+// and established that it cannot be ported: it is a distinct allocation policy
+// (fail-closed, device-only, budget-gated, entry-creating, src_size independent
+// of alloc_size) that no shipping API implements.  unified_alloc() creates no
+// cache entry at all, and ensure_cached() falls back to host memory instead of
+// failing when eviction is impossible -- which would invert this file's
+// pressure assertions.  The seam is therefore RETAINED by decision and is no
+// longer marked [[deprecated]]; see the constraint comment on its declaration
+// in unified-cache.hpp, and llama.cpp-og9dt c-4lcs.
+//
+// So this fixture does exercise a path the backend itself does not take: the
+// production paths (allocate_slot, unified_alloc) try the arena zone first and
+// check live free VRAM before any raw malloc, which is exactly what spares them
+// this failure mode.  What the fixture still covers through that seam is real
+// production machinery -- evict_one(), pinning, and used_ accounting.
 //
 // It also makes the eviction claim unreachable.  The only path to evict_one()
 // is the used_ + size > budget_ branch, so with budget_ ~= all of VRAM the
