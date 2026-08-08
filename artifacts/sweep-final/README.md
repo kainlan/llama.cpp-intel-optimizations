@@ -36,8 +36,9 @@ derives its `-x` exclusion set by parsing the arch column out of this exact file
 historical rerun at `d293bf2b3`). The `grep -E '[a-z0-9]'` in that pipeline is required —
 without it the separator row parses as an arch name and the run dies at argument validation.
 
-**`sweep-at-1107a53b0.txt` — the disappearance.** Same binary family, three behaviour-neutral
-commits later, gemma3n passes and the sweep is clean. `c-9427` ruled out the diagnostic flag,
+**`sweep-at-1107a53b0.txt` — the disappearance.** Two commits later — `77f7d7c8a` (an env-gated
+bit1 guard diagnostic plus a semantically identical refactor) and `1107a53b0` itself (a test
+file) — gemma3n passes and the sweep is clean. `c-9427` ruled out the diagnostic flag,
 `e2df03733`, `77f7d7c8a`'s refactor, and an arch-count change, one at a time, and raised the
 leading theory: **binary layout, not a fix** — env-gated diagnostic code still changes binary
 size and shifts allocation addresses, and a defect sensitive to accumulated view offsets can
