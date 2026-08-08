@@ -1325,3 +1325,735 @@ remaining population the same way: read the assertions, trace them against
 the real function being called (not a local reimplementation, and not merely
 "a real header is included"), and where a build is available, run the
 described mutation rather than reasoning through it.
+
+---
+
+# Phase A: the batched mutation-verification plan (owner ruling 2026-08-08, `ona8` c-ntbb)
+
+Written by `impl-u2mz-plan` as **analysis only** — no build, no GPU, no ctest, no
+binary was run producing this section, and no production or test code was
+touched. Everything below is a *prediction* the lead executes in Phase B. Where
+a row says "fires exactly N of M checks", that is a reading of the source, not a
+transcript.
+
+## The population, and why it is 131 and not "~65–70"
+
+The earlier estimate in *What this pass did NOT cover* ("the remaining ~65–70
+currently-registered SYCL C++ tests outside that loop") **undercounts by roughly
+half.** Derived from the CMake sources rather than a directory listing or a
+possibly-stale generated `build/` tree:
+
+```
+ggml/src/ggml-sycl/CMakeLists.txt
+  literal add_test(...) calls .................................. 156
+  after expanding the five foreach loops
+    (_case h2 x36, _case h10 x5, _mutation x3,
+     _residency_test x19, _packed_k_checkpoint x5) ............. 219 ctest names
+  of those, naming a C++ executable target ..................... 199
+  of those, naming ${Python3_EXECUTABLE} or a script ...........  20
+  DISTINCT C++ executable targets .............................. 131
+
+minus already mutation-proven (excluded from this plan) ........   4
+  test-kv-slice-sizing            (ticket description: assign->resize, 8 of 87)
+  test-sycl-retained-handoff-contended  (llama.cpp-fbj5)
+  test-sycl-set-rows-bounds             (llama.cpp-nhip)
+  test-dmmv-q4-0-coalesced              (llama.cpp-szv8, ratio gate)
+                                        ------------------------------------
+PLANNED IN THIS SECTION ....................................... 127
+```
+
+Reproduce the arithmetic (registration-only; executes nothing):
+
+```bash
+grep -c 'add_test(' ggml/src/ggml-sycl/CMakeLists.txt          # 156
+grep -c 'llama_build_and_test(' tests/CMakeLists.txt           # 45 (2 are inside comments)
+```
+
+⚠️ **The `-N` cross-check must come from the source, not `build/`.** The main
+checkout's generated tree can be stale, and 21 of the 131 targets sit behind
+CMake guards that are OFF in the current cache — so `ctest -N` in `build/`
+lists *fewer* tests than the sources register, and the difference is not
+drift, it is the guards (see *Blocked* below). `ctest -R` on a guarded-off
+name **exits 0 by matching zero tests**, which is the trap the ticket already
+names.
+
+The 127 rows are the SYCL-side population. Tests registered in
+`tests/CMakeLists.txt` that are not SYCL-specific (`test-chat`,
+`test-tokenizer-*`, `test-grammar-*`, the 71 `llama_test_pytest` gates already
+cleared in c-2qqk) are out of scope for this ticket and are not planned here.
+
+## How to run a batch (this is the whole cost model)
+
+The saving is **not** parallel mutation — one mutation is live at a time,
+always. The saving is that mutations landing in the **same file** share one
+build sequence:
+
+```
+apply mutation 1 -> build -> run test 1 -> REPLACE with mutation 2 (same file)
+ -> build -> run test 2 -> ... -> restore file -> build once
+```
+
+That is **N+1 builds for N tests** instead of 2N, and every build after the
+first is a ccache-warm rebuild of one TU plus a link. Restoring between tests
+is what costs money; don't.
+
+Build-cost classes used below (from CLAUDE.md's recorded figures: ~10 min warm
+full build, ~15 min device links, ~50 min for `ggml-sycl.cpp` at a *cold* path):
+
+| class | what it dirties | est. per build |
+|---|---|---|
+| `NO-REBUILD` | nothing (source-text gate, or a shipped `--flag` control) | 0 |
+| `STANDALONE` | a small .cpp compiled directly into the test target only | ~2 min |
+| `SMALL-TU` | one backend .cpp inside `libggml-sycl` (compile + device link) | ~12 min |
+| `HEADER-WIDE` | a widely-included .hpp — most of the backend recompiles | ~25 min |
+| `MEGA-TU` | `ggml-sycl.cpp` (100k lines) or a header only it includes | ~20 min |
+
+These are estimates from recorded figures, not measurements taken by this pass.
+
+---
+
+## Batch A — NO REBUILD (2 tests + 2 control runs, ~10 min total)
+
+Run these first. Two are source-text contract gates that read the worktree
+`.cpp` **at runtime**, so editing the file turns them red with no compile at
+all. The other two rows are *control runs* of shipped fault injectors — they
+cost nothing and prove the harness reaches its target before you pay for the
+real mutation, which for both lives in a later batch (`test-q6k-dispatch` in H,
+`test-sycl-transient-alloc-intent-scope` in G). Only the two gates count toward
+the 127.
+
+| test | mutation | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-q6k-dispatch` | none — run `./build/bin/test-q6k-dispatch --corrupt-q8-reference` (also `--reference=f32`, documented delta 1.444%) | GPU | COUNT `Results: %d passed, %d failed, %d skipped` | `FAIL: <n>/<rows> rows violate the enforced Q8_1 contract` in tests 1/2/4; `Results: 1 passed, 3 failed`; rc 1 | Built-in positive control. Do this before spending the header-wide `vecdotq.hpp` rebuild in Batch H. Device-less: every subtest prints `SKIP: Could not initialize SYCL backend` and **returns true** — exit 0 having tested nothing. |
+| `test-sycl-moe-fusion-noactivation` | `ggml/src/ggml-sycl/mmvq.cpp:418` `return unsafe && std::atoi(unsafe) != 0;` → `return true;` | CPU-ONLY | PASSFAIL, `PASS: MoE fusion probes no-activation guard` | `FAIL: tests/test-sycl-moe-fusion-noactivation.cpp:123: GGML_SYCL_MOE_GLU_Q8_FUSED_XMX alone must not activate runtime fused store`; rc 1 | Fires 1 of ~40 CHECKs. It greps `mmvq.cpp`/`ggml-sycl.cpp` as text, so it can only ever see *string* edits — a behavioural regression that leaves the text intact is invisible to it. `read_required_file` `std::exit(1)`s if run from a tree without the sources. |
+| `test-sycl-moe-direct-final-scratch-plan` | `ggml/src/ggml-sycl/mmvq.cpp:19808` delete the `n_ids > max_i64 / n_tokens ||` term | CPU-ONLY | PASSFAIL, `PASS: direct-final scratch plan` | `FAIL: tests/test-sycl-moe-direct-final-scratch-plan.cpp:82: direct-final total_batches overflow check must be present`; rc 1 | Same source-grep mechanism. Its other two cases assert `test_moe_direct_final_scratch_plan` (`ggml-sycl.cpp:24368`), a test-only reimplementation with no production caller — see *Mocks*. |
+| `test-sycl-transient-alloc-intent-scope` | none for the control run: the file header (lines 36–47) tabulates exit codes for two wrong-fix predicate variants; run `./build/bin/test-sycl-transient-alloc-intent-scope own-thread` / `other-thread` | DEVICE-FREE-THREADS | PASSFAIL, 3 progress `PASS:` lines + final | see Batch G for the real mutation | Best-instrumented test in the population; property 2 is explicitly the positive control for property 1. |
+
+## Batch B — STANDALONE test-target TUs (19 tests, ~1.5 h)
+
+None of these relink `libggml-sycl`; the mutated .cpp/.hpp is compiled straight
+into the test binary. Sub-batch by file — the `model-lifecycle.cpp` group of
+four is the single best value in the whole plan.
+
+### B1 `ggml/src/ggml-sycl/model-lifecycle.cpp` — 4 tests, 5 builds
+
+| test | mutation | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-lifecycle-load-txn` | `:668` `++rollbacks_;` → `rollbacks_ += 2;` | DEVICE-FREE-THREADS | PASSFAIL — silent on success | `rollback was not idempotent` on stderr, rc 1 | **Outstanding specificity: this binary backs 42 ctest names** (36 `h2-*`, 5 `h10-*`, `multi-model`) and only `sycl-lifecycle-h2-rollback-idempotence` goes red. Ships built-in fault injectors `--mutation M1/M2/M3` driven by `tests/test-sycl-lifecycle-mutations.py` (ctest `sycl-lifecycle-mutation-M1..M3`) — **your mutation must leave those green**. `publication-concurrency` is the slow case (20k publishes x 4 readers). |
+| `test-sycl-lifecycle-owner-reset` | `:817` `return { dead->second.first == token ? error::OK_ALREADY_DEAD : error::STALE_IDENTITY, ... };` → `return { error::STALE_IDENTITY, ... };` | CPU-ONLY | PASSFAIL — silent on success | `H14 repeat teardown is not OK_ALREADY_DEAD`, rc 1 | 9 ctest names share this binary; only `sycl-lifecycle-h14` (+ the unqualified name) goes red. ⚠️ The source comment at lines 301–307 warns `prepare_teardown`'s two stale-identity guards are individually **null mutations** — do not pick those. |
+| `test-sycl-lifecycle-wrapper-overlap` | `:169` drop `|| active_txn_ != 0` from the LOAD_BUSY guard | DEVICE-FREE-THREADS | PASSFAIL — silent on success | `BUSY reaper/destructor overlap lost wrapper semantics`, rc 1 | Fail-fast, so the 6 later scenarios are masked. RUN_SERIAL. |
+| `test-sycl-lifecycle-runtime-host` | `:100` in `quarantine_queue::enqueue` `if (tokens_[i] == token) { return true; }` → `if (false) { ... }` | DEVICE-FREE-THREADS | PASSFAIL — silent on success | `BUSY destructor/reaper overlap lost or duplicated token`, rc 1 | `require()` is a real function, not `assert()` — NDEBUG-safe. |
+
+### B2 — one test per file (15 tests, 30 builds)
+
+| test | mutation | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-gpu-arch` | `gpu-arch.cpp:89` `name_contains(name, "B70")` → `"B71"` | CPU-ONLY | PASSFAIL, `=== All gpu-arch tests passed ===` | `FAIL: tests/test-gpu-arch.cpp:84: B70 name must fall back to ARC_BATTLEMAGE, not ARC_ALCHEMIST`, rc 1 | Uses a CHECK macro, not `assert()` — deliberate, the build is `-DNDEBUG`. Fires 4 assertions but CHECK returns on the first. |
+| `test-esimd-dpas-gate` | `gpu-arch.cpp:63` `return sycl_gpu_family::ARC_BATTLEMAGE;` → `ARC_ALCHEMIST` | CPU-ONLY | PASSFAIL, `=== All esimd-dpas-gate tests passed ===` | 6 `ok: ... (ESIMD dpas enabled)` lines, then `FAIL: tests/test-esimd-dpas-gate.cpp:112: Battlemage architecture must classify as ARC_BATTLEMAGE`, rc 1 | Same file as the row above — **batch these two together**. Its link seams stub `XMXConfig::from_device`, a documented coverage gap. |
+| `test-cold-start` | `cold-start.cpp:134` `else if (caps.eu_count >= 256)` → `>= 257` | CPU-ONLY | COUNT `Results: %d passed, %d failed` | `FAIL: A580 should use tile_m=32` / `Expected: 32, Got: 16` / `Results: 4 passed, 1 failed`, rc 1 | `test-gpu-arch` also compiles `cold-start.cpp`; expect a collateral red there. |
+| `test-moe-scratch-admission` | `moe-scratch-admission.cpp:79` `if (aligned.ring_depth > cap.ring_depth)` → `> cap.ring_depth + 1` | CPU-ONLY | COUNT `test-moe-scratch-admission: PASS (9 cases)` + per-case `ok:` | 5 `ok:` lines then `FAIL: over-plan-request-is-refused: a deeper ring than planned is refused (allowed=1 reason=allowed)`, rc 1 | Narrowest clause available; a `>`→`>=` on any cap line detonates 5 cases at once. Has its own positive control (`refusal-reaches-no-side-effect`). |
+| `test-mmvq-launch-geometry` | `mmvq-launch-geometry.hpp:58` `(rows + subgroups_per_workgroup - 1) / n` → `(rows + subgroups_per_workgroup) / n` | CPU-ONLY | COUNT `test-mmvq-launch-geometry: PASS (6 cases)` | `ok: slice-of-one-pads-to-one-workgroup` then `FAIL: already-aligned-shapes-are-unchanged: aligned row count 16 must pad to itself`, rc 1 | Only `mmvq.cpp` includes the header in production, and the test target compiles it directly — so this is standalone. Has a built-in positive control (`the-uniformity-predicate-can-fail`). |
+| `test-moe-control-plan` | `moe-control-plan.cpp:188` drop `&& std::strstr(name, "_chexps") == nullptr` | CPU-ONLY | fixed-count only — `moe control plan: PASS (25 cases)` where 25 is `sizeof(cases)/sizeof(...)`, **not** a running count | `FAIL: grovemoe-chexps-family-parses: chunked gate must be a matrix`, rc 1 | The "25" cannot be diffed for partial breakage — treat as PASSFAIL. `moe_control_reset_all_state()` brackets every ledger case. |
+| `test-zone-sizing` | `zone-sizing.cpp:139` `if (zone_is_moe_expert_tensor(tensor))` → `if (false && ...)` | CPU-ONLY | PASSFAIL, `PASS: zone-sizing structural path-scoped maxima` | `FAIL: tests/test-zone-sizing.cpp:145: gpt-oss onednn_eligible must skip the expert family and fall to the dense attention family`, rc 1 | Sibling predicates keep expert tensors, so they stay green — good specificity. Case 11 exists to distinguish `&&` from `||`; do not "simplify" it. |
+| `test-sycl-dispatch-tuning` | `dispatch-tuning.cpp:242` `return ...MMVQ_COALESCED;` → `MMVQ_SOA` | CPU-ONLY | PASSFAIL, `PASS` | `FAILED: mmvq kernel mismatch`, rc 1 | 1 of 3 assertions. Writes `/tmp/dispatch_tuning_test.json` (tmpfs) and removes it on success. |
+| `test-sycl-e2e-profile` | `e2e-profile.cpp:135` `g_e2e_tg_profile.tokens += 1;` → `+= 0;` | CPU-ONLY | PASSFAIL via `std::abort()` | stderr `test-sycl-e2e-profile: [SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 ...` then **SIGABRT, rc 134** | Failure mode is abort, not exit 1 — do not grep for "FAIL". Chosen so the RED string is quotable; the `GGML_OP_MUL_MAT_ID → MOE` alternative gives only `requirement failed`. |
+| `test-sycl-cpu-traits-parity` | `cpu-traits-support.cpp:158` `index >= 0 && index < GGML_TYPE_COUNT` → `index <= GGML_TYPE_COUNT` | CPU-ONLY | PASSFAIL — prints **nothing** on success | `bounds check failed`, rc 1 | Cheapest in the plan (1 TU, links only ggml-base/ggml-cpu). Despite the name it calls no SYCL symbol. Returns an out-of-bounds pointer but never dereferences it. |
+| `test-sycl-timeline` | `sycl-timeline.cpp:468` drop `|| state.successful_file_flushes > 0` | CPU-ONLY | PASSFAIL via `std::abort()` | `test-sycl-timeline: second flush must not clobber the first trace file`, **rc 134** | ~45 preceding `require()`s stay green. Targets an invariant the source comment states (lines 483–484). |
+| `test-onednn-woq` | `onednn-woq.cpp:33` `out.scales_mask = (1<<0)|(1<<1);` → `(1<<0)` | GPU (test 4 only) | PASSFAIL | `FAILED: expected scales/zp mask=3 got 1/3`, rc 1 | 89-line TU — the cheapest backend file in the tree. ⚠️ `test_woq_gemm_q4_0` **fails open in five places** (`SKIP: ...` → `return true`). |
+| `test-mmq-xmx-dispatch` | `xmx-dispatch-gate.hpp:46` `batch >= 1 && batch < threshold` → `batch <= threshold` | GPU-gated, launches nothing | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 on no device | `FAILED: threshold <= 1 must accept no batch at all`, `Tests run: 5, Passed: 4, ... Failed: 1`, rc 1 | Test target links no `ggml-sycl` at all — build only this target and the mega-TU is untouched. ⚠️ Tests 1/2/4/5 are near-vacuous (they exercise the file's own CPU reference GEMM); test 3 is the only production-bound one, and its header records that test 3 *itself* used to be vacuous (`llama.cpp-cwev`). |
+| `test-sycl-lifecycle-runtime-wrapper` | `ggml/src/ggml-backend-reg.cpp:1146` `case REMOVED: return "REMOVED";` → `"REMOVED_"` | DEVICE-FREE-THREADS in this build | PASSFAIL, `[sycl-runtime-wrapper] <phase>` markers | `[sycl-runtime-wrapper] assert failed: failed first publication registry tombstone state != REMOVED` + `state=REMOVED_ durable_owners=0 lookup_visible=0` + `generic registry lifecycle fixture failed`, rc 1 | ⚠️ **Big time-saver: in the default (non-DL) build this test touches no SYCL code at all** — its whole SYCL half is under `#if defined(GGML_SYCL_RUNTIME_MODULE)`, defined only when `GGML_BACKEND_DL=ON` (default OFF). The mutation lives in core ggml, so it is red in both builds. RUN_SERIAL. |
+| `test-sycl-lifecycle-event-lease` | `execution-lifecycle.cpp:270` in `release_invocation_locked` `if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;` → prefix `false &&` | CPU-ONLY (links only `Threads::Threads`, never includes `sycl/sycl.hpp`) | PASSFAIL — prints **nothing** on success | stderr `H13b release accepted wrong root`, rc 1, under `--case H13b` and under the bare all-cases run | **2-of-11 specificity**: 11 ctest names share this binary and only `sycl-lifecycle-h13b` (+ the unqualified name) goes red — H13b is the only case passing a deliberately wrong root. The binary is already mutation-aware: `test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY` (`execution-lifecycle.cpp:245`) is a compiled-in fault injector that cases M7/M7b assert against. ⚠️ `execution-lifecycle.cpp` is also compiled into `test-sycl-lifecycle-owner-reset` — expect collateral reds there. ⚠️ `g6c()` runs only in the all-cases path; there is **no** `add_test(NAME sycl-lifecycle-g6c ...)`, unlike its siblings. |
+
+---
+
+## Batch C — `mem-handle.cpp` (5 tests, 6 builds, ~1.4 h)
+
+| test | mutation | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-mem-handle-lifetime` | `:786` drop the trailing `&& arena_gen_ == other.arena_gen_` from `stable_identity_equal` | CPU-ONLY | PASSFAIL, `PASS: mem_handle lifetime diagnostics` | `FAIL: different arena generations must not compare stable-equal`, rc 1 | Fires exactly 1 of 15 CHECKs; the hash at `:761` still folds `arena_gen_`, so only the equality predicate moves. |
+| `test-sycl-graph-retention-scope` | `:91` `... || g_ggml_sycl_graph_recording;` → `... || ggml_sycl_graph_recording_active();` (re-widens the guard; reintroduces `llama.cpp-oze0`) | DEVICE-FREE-THREADS | PASSFAIL, 3 `PASS:` + final | `FAIL: a non-recording thread's handle was parked for command-graph lifetime because ANOTHER thread was recording: count 0 -> 1.`, rc 1 | Best-designed test in the population: property 2 **is** the anti-mutation ("narrowing all the way to never-retain also makes property 1 pass"), and it carries a setup-inertness check. This is the ticket's premise-was-wrong instance 2 (c-g0zx) — it is registered, and this row upgrades the code-review verdict to a real mutation. |
+| `test-sycl-retained-handoff-barrier` | `:1227` in `begin_retained_handle_publish` `++state.publishers;` → `state.publishers += 2;` | DEVICE-FREE-THREADS | PASSFAIL, three `PASS:` lines | `FAIL: drain did not clear after the publisher handed off its handle`, rc 1, after the ~1000 ms drain timeout | ⚠️ Do **not** instead delete `state.publishers == 0` from the drain predicate at `:1272` — that fires the very first check *and* every later one, so it tells you nothing about which half of the barrier works (and it is the mutation `llama.cpp-fbj5` already executed on the *contended* sibling). ⚠️ Removing `cv.notify_all()` from `retained_handle_publish_ticket::reset()` is a **void** mutation — `cv.wait_for` re-evaluates its predicate at timeout. |
+| `test-mem-handle-wrong-device` | `:816` `self.ptr == theirs.ptr && size_ == other.size_;` → `size_ == other.size_;` | GPU | COUNT `Tests: %d run, %d passed, %d skipped` | `FAILED: CHUNK_LEASE stable identity must distinguish different ptrs inside the same leased chunk`, `Tests: 6 run, 5 passed, 2 skipped`, rc 1 | ⚠️ The obvious target — the wrong-device guard at `:504` — is a **null mutation under this registration**: ctest pins `level_zero:1`, so `total_gpu_count < 2` and both wrong-device cases `TEST_SKIP`. |
+| `test-sycl-mem-handle-concurrent-resolve` | `:1011` in `operator=(const mem_handle &)` delete `new_entry->in_use_count.fetch_add(1);` | DEVICE-FREE-THREADS | PASSFAIL, one `PASS:` per subtest | `PASS: concurrent resolve() never observes a half-written state` then `FAIL: lease refcounts drifted: entry_a=4294967295 entry_b=4294967295 (expected 1 and 1)`, rc 1 | Deterministic, not race-dependent (the uint32 underflows). Selectable: `./build/bin/test-sycl-mem-handle-concurrent-resolve lease-once`. ⚠️ Do not mutate `take_lease_state_locked`'s `leased_entry_ = nullptr` — `store_lease_state_locked` overwrites it immediately, a silent no-op. |
+
+## Batch D — `unified-cache.cpp` (14 tests, 15 builds, ~3.5 h) — the largest single-file group
+
+23,238 lines, so each build is at the slow end of `SMALL-TU`. All 14 sites are
+independent; sequence them in one file-open.
+
+| test | mutation (`ggml/src/ggml-sycl/unified-cache.cpp:`) | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-residency-reservation` | `:390` `plan.bytes_reserved = plan.bytes_requested;` → `= 0;` | CPU-ONLY | PASSFAIL, `PASS: residency reservation policy` | `FAIL: reserved bytes must match accepted request`, rc 1 | The most surgical row in the plan: **1 of 22 CHECKs**. Alternative for the forced-budget path: delete `:359`'s `std::min(..., forced_bytes)` → fires only subtest 5. |
+| `test-sycl-moe-residency-preflight` | `:383` `plan.reason = residency_reject_reason::FRAGMENTATION;` → `::BUDGET;` | CPU-ONLY | PASSFAIL, `PASS: MoE residency preflight policy` | `FAIL: enough total bytes but too-small largest block must reject as fragmentation`, rc 1 | 1 of 21 CHECKs — exactly the "does this distinguish exhaustion from fragmentation" question the subtest was written for. Each subtest `unsetenv`s the force-budget var first: a real built-in control. |
+| `test-sycl-residency-diagnostics` | `:3746` `if (live == 0 && !old.retired)` → `if (live == 0)` | CPU-ONLY | PASSFAIL, `PASS: residency diagnostics` | `FAIL: retired entry replacement must be refused`, rc 1 | 1 of ~17 CHECKs; the live-lease refusal in the *same* subtest stays green — strong specificity. |
+| `test-sycl-moe-handle-resolution` | `:4800` `if (location == cache_location::HOST_MMAP && !req.allow_mmap_host)` → `if (false)` | GPU (32 MB WEIGHT arena) | PASSFAIL, `SYCL MoE handle resolution tests: PASS/FAIL` | `  FAIL: plain host expert should honor allow_mmap_host=false`, rc 1 | ⚠️ **Mislabelled `hostonly`** — it allocates GPU memory, and because its labels omit `cache`/`residency` the throttled sweep *runs* it. ⚠️ **No `ONEAPI_DEVICE_SELECTOR` in the registration** and the source self-defaults to `level_zero:0` — the B70. Pin `level_zero:1` manually or it perturbs any benchmark in flight. |
+| `test-unified-cache-bugs` | `:5621-5625` delete the `direct_expert_it` probe block in `is_cached` | GPU | PASSFAIL, `Unified cache bug tests: PASS/FAIL` | a failure inside `=== Test: is_cached layout/type coverage ===` case (c), then `... FAIL`, rc 1 | Reproduces the exact pre-fix `llama.cpp-5pvn` bug, and the subtest is written as a discriminating control (its comment predicts which cases a *blanket* break would also take down). ⚠️ CLAUDE.md never-loop family, ~8.5 GB RSS, one run only. One subtest self-skips unless `GGML_SYCL_TEST_UNIFIED_CACHE_GRAPH=1` and prints its SKIP without affecting `ok` — so a green run has always left that property unverified. |
+| `test-unified-cache-fast-path` | `:5755` `if (entry.retired \|\| entry.layout != layout)` → `== layout` | GPU | COUNT `Tests: %d run, %d passed, %d skipped` | `FAILED: try_get_cached_fast should return non-null for cached entry`, `Tests: 2 run, 1 passed`, rc 1 | Only 2 tests exist, so 1-of-2 is the maximum specificity available; test 1 is a near-tautology. Side observation: `try_get_cached_fast` takes a `unique_lock` despite the "fast path / shared_lock" naming — pre-existing, untested. |
+| `test-mem-handle-eviction` | `:6766` `if (have_mapped && !(mapped == ckey))` → `if (false && ...)` (kills the `id_to_key_` fallback in `acquire_weight_lease`) | GPU | COUNT `Tests: %d run, %d passed` | `[TEST] lease_and_plain_lookup_agree ... FAILED: acquire_weight_lease must resolve whatever get_weight_ptr resolves`, `Tests: 6 run, 5 passed`, rc 1 | **The test's own source certifies this discriminator** (lines 227–228). Tests 1c/2/3/4 carry explicit positive preconditions so they cannot pass vacuously. |
+| `test-unified-cache-concurrent` | `:7589` in `evict_one` `if (entry.pinned)` → `if (false)` | GPU + 8/4 threads | PASSFAIL, `Unified cache concurrency tests: PASS/FAIL` | `Pinned entries evicted unexpectedly (used_before=4096 used_after=0)`, rc 1 | Deliberately does **not** touch the sibling `in_use_count > 0` lease guard 12 lines below — that is the canonical-contract guard and a much broader break. Tiny budgets (2 MiB), no memory hazard. Defaults to `level_zero:0` (B70) if unset. |
+| `test-sycl-reset-model-weight-lease-preserve` | `:8643` `if (!entry.owner_tagged && (mode == MODEL_TEARDOWN \|\| live_mask != 0))` → drop the `\|\| live_mask != 0` | GPU (64 KB budgets) | PASSFAIL + `GREEN:`/`RED (control):` progress lines; exits 77 correctly | `FAIL: an unattributed entry was freed at a load boundary while a model is still live. ...`, rc 1 | **Already carries paired mutation controls** — `set_live_model_mask(0)` re-runs each preserve assertion in the state where reclaim *must* happen, so a no-op mutation cannot masquerade as a pass. Peak RSS 317 MB. Do not instead mutate `:8632` — that fires four test functions at once. |
+| `test-mmvq-q8-0-streaming-bench` | `:9529` `copy_to_device_async(..., src.ptr + offset, cur, ...)` → `+ offset + 1` | GPU | PASSFAIL + timing lines | on `test-mmvq-q8-0-streaming-smoke`: `FAIL: GPU(cache) mismatch (nmse>2.0e-04 or max_abs>5.00e-02)`, rc 1 | **Four ctest names share this binary and only two are live.** The bare `test-mmvq-q8-0-streaming-bench` registration has no ENVIRONMENT, so it prints `SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run` and exits 77 **always** — it is not a test (see *Undeletable/unmutatable*). The mutation fires only the `-smoke` (cache) name; the two `mmq` names take the graph path and stay green — useful cross-registration specificity. ⚠️ `test-mmvq-q8-0-streaming-smoke` is the one registration deliberately left out of the `SKIP_RETURN_CODE 77` list, so a 77 from it reads as FAILED. |
+| `test-sycl-runtime-alloc` | `:11279` `if (expected_device >= 0 && expected_device != it->second.handle.device)` → `expected_device < -1 && ...` | GPU | COUNT `Tests: %d run, %d passed` (27) | `[TEST] strict_device_mismatch_fails ... FAILED: device mismatch free should fail`, `Tests: 27 run, 26 passed`, rc 1 | `ok &= f(q)` so all 27 still run after the failure — ideal for count-diffing. |
+| `test-sycl-moe-q8-scratch` | `:15815` `demand.total_bytes = graph_op_count * demand.aligned_bytes_per_buffer;` → `* demand.bytes_per_buffer` | GPU (subtest 3) | PASSFAIL, `PASS: sycl MoE Q8_1 scratch sizing` | `FAIL: total scratch should reserve every graph Q8_1 buffer`, rc 1 | Only the totals assertion moves (12960 → 13056 alignment). `failed += !test(...)` with no early exit, so subtests 2/3 still run and pass. Subtest 3 prints `SKIP: SYCL backend unavailable` and **returns true** — a false green. |
+| `test-sycl-moe-xmx-tiled-single-layout-planner` | `:18093-18095` delete the `if (legacy_env) { return std::atoi(legacy_env) != 0; }` branch | CPU-ONLY | PASSFAIL, `single-layout XMX_TILED planner tests passed` | `FAIL: tests/test-sycl-moe-xmx-tiled-single-layout-planner.cpp:84: legacy unsafe PP knob must still be honored with forced prompt XMX`, rc 1 | Fires the last CHECK of the last of 4 subtests. Not a mock: the planner helper delegates to the same `mxfp4_moe_single_gateup_layout_policy` production calls at `:18615`. |
+| `test-sycl-layout-choice` | `:621` in `arena_default_external_headroom` delete the `std::max(..., arena_min_safe_external_headroom(...))` clamp | **CPU-ONLY** (hint was wrong) | 12 `PASS: <policy>` lines, no totals | 11 `PASS:` then `FAIL: arena headroom should raise undersized caller slack to the safe floor, got 592445440 expected 603979776`, rc 1 | Its device half is gated behind `GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND=1`, which ctest never sets — the registered run prints `SKIP: backend layout choice purge requires ...` and returns 0. The `ONEAPI_DEVICE_SELECTOR` in its ENVIRONMENT is vestigial. Fail-fast, so mutate late in the sequence, never in `run_fused_gate_up_role_test`. |
+
+## Batch E — `mmvq.cpp` (5 tests, 6 builds, ~1.4 h)
+
+| test | mutation (`ggml/src/ggml-sycl/mmvq.cpp:`) | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-moe-gateup-prepack-policy` | `:1018` `result.reason = "down-sum";` → `"capacity"` | CPU-ONLY | PASSFAIL, `PASS: MoE gate/up prepack policy`; CHECK prints `FAIL: %s:%d: %s` with file+line | `FAIL: tests/test-sycl-moe-gateup-prepack-policy.cpp:184: missing direct down-sum compatibility must reject before route selection`, rc 1 | 1 CHECK; the whole reject *ladder* is preserved, only one label moves. A sibling policy exists in `ggml-sycl.cpp:24474` — prefer this site, same evidence, ~20 min cheaper. |
+| `test-sycl-moe-fused-down-sum-policy` | `:250-251` `if (std::strcmp(env,"tile4")==0) { return 4; }` → `return 2;` | CPU-ONLY | PASSFAIL, `PASS: MoE XMX down-sum direct-final policy` | `FAIL: tests/test-sycl-moe-fused-down-sum-policy.cpp:335: tile4 down Q8 DPAS tile env must parse`, rc 1 | 1 CHECK in the 13th of 17 subtests. 3 subtests source-grep `mmvq.cpp` and `std::exit(1)` (not CHECK) if the file is not found — a confusing hard exit from an unexpected CWD. Editing env-name *strings* would trip those greps as collateral; this mutation touches none. |
+| `test-moe-mul-mat-id-q4q8` | `:2751` in `mul_mat_vec_q_id` swap the ids strides: `iid1 * ids_nb1 + id * ids_nb0` → `iid1 * ids_nb0 + id * ids_nb1` | GPU | PASSFAIL, per-case `nmse=%.6e max_diff=%.6f` | `MoE MUL_MAT_ID Q4_0 (base): nmse=<large> ...` + `FAIL: ... mismatch beyond tolerance (nmse>1.0e-03 or max_diff>2.00)`, rc 1 | Route verified on-path (n_experts=8, top_k=4, ne12=4 → threshold 32 ≥ batch 4, so MMVQ). Swapped strides stay in-bounds (max byte 108 of 128) so it corrupts rather than faults. Low specificity is unavoidable — main `break`s on the first failing case. |
+| `test-moe-mul-mat-id` | `:4102` `get_int_from_table_16(v0, kvalues_mxfp4)` → `(v1, ...)` | GPU | PASSFAIL, per-case `nmse=... max_diff=...` | `MoE MUL_MAT_ID MXFP4 (base): nmse=<large> ...` + `FAIL: ... (nmse>5.0e-04 or max_diff>1.00)`, rc 1 | ⚠️ **Route uncertainty — confirm before building.** The test registers weights on the *host* buffer type, and CLAUDE.md routes host-resident weights to CPU dispatch; if so the live MXFP4 kernel is `ggml_sycl_cpu_expert_mul_mat_batched` in `cpu-dispatch.cpp`, not `mmvq.cpp`. Run once with `GGML_SYCL_DEBUG=1` and read the dispatch line first. ⚠️ Do **not** mutate `kvalues_mxfp4` in `ggml-common.h` — it is shared with the ggml-cpu reference, so both sides move and the test stays green. |
+| `test-q8-0-layout-cache-path-mmvq` | `:21361` pass `src0_dd_i` (AoS base) instead of `soa_base` to `reorder_mul_mat_vec_q8_0_q8_1_sycl` | GPU | PASSFAIL, `Max diff: ... Result: PASS/FAIL` | `Max diff: 2.560000e+02, max rel: 1.000000e+00, min abs: 0.000000` then `Result: FAIL`, rc 1 | The test memsets `weight->data` to zero after caching, so an AoS read yields exactly 0 — unambiguous. The widest-blast mutation here, acceptable because the test's whole premise is "did the SoA pointer get used". Do not simplify the load-transaction bracket (RCA `llama.cpp-43uy`, lines 137–146). |
+
+## Batch F — remaining single-file backend TUs (11 tests across 9 files, ~4 h)
+
+| test | mutation | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-q8-0-layout-cache-path` | `dmmv.cpp:3705` drop `\|\| src0->type == GGML_TYPE_Q8_0` from `allow_layout` | GPU | PASSFAIL, `Result: PASS/FAIL` | `Max diff: 2.560000e+02, max rel: 1.000000e+00, min abs: 0.000000` / `Result: FAIL`, rc 1 | Same zeroed-AoS trick as its mmvq sibling. Backend-init failure returns 1, not 0 — no false green here. |
+| `test-dmmv-q6k-coalesced` | `dmmv.cpp:1775` `tile_byte_offset += ts * (128 + 64 + 16);` → `ts * (128 + 64)` | GPU | COUNT — per-case `errors=%d max_diff=... max_rel=... PASS/FAIL` + `=== Summary: %s ===` | four green `ncols=8192` lines then `ncols=16384 nrows=8: errors=<n> ... FAIL` and `=== Summary: FAIL ===`, rc 1 | Maximum specificity: at ncols=8192 `num_tiles=1` so warp 0 never enters the loop. **Same file as the row above — batch them.** Confirm the run hits the COALESCED branch (`dmmv.cpp:3429`, KTRACE `dmmv_q6_k_coalesced_variable`) or nothing fires. False green: init failure prints `SKIP:` and returns 0. |
+| `test-sycl-fattn-onednn-descriptors` | `fattn-onednn.cpp:182` `if ((H_q != H_kv) && (k_nc_stride != D \|\| v_nc_stride != D))` → prefix `false &&` | GPU | PASSFAIL, `SYCL oneDNN FA descriptor tests: %s` + `Descriptor child WIFEXITED status=%d` | `FAIL: GQA-5D-materialized max_abs=<big>` + 16 `[i] actual= expected=` lines, same for `MQA-5D-materialized`; the two `-direct` cases stay tiny; rc 1 | The test forks a child specifically so a numeric failure is provably `WIFEXITED status=1` and never a signal. Self-sets `level_zero:0` (B70) if unset. |
+| `test-sycl-fattn-onednn-materialization` | `fattn-onednn.cpp:263` `const int64_t nb1 = value_tensor ? desc.v_src_nb1 : desc.k_src_nb1;` → `= desc.k_src_nb1;` | GPU (test 4) | PASSFAIL, one summary line | `FAIL: GQA V source byte offset mismatch` + `FAIL: non-monotonic V source byte offset mismatch` + `SYCL oneDNN FA materialization tests: FAIL`, rc 1 | **Same file as the row above — batch them.** Every K-side assertion and all of test 4 stay green. ⚠️ `#if !GGML_SYCL_DNNL` prints a skip and returns **0**, not 77. |
+| `test-fattn-thread-local` | `fattn.cpp:908` in `tl_seq_id_buffers::free_all()` `if (g_fattn_shutting_down.load(acquire)) return;` → `if (false) return;` | GPU | PASSFAIL, `Thread-local buffers cleaned up successfully` | `Shutdown guard freed buffers unexpectedly (before=<N> after=<N-2>)`, rc 1 | 1 of 4 checks. ⚠️ Its ctest ENVIRONMENT sets only `LD_LIBRARY_PATH` — **no selector** — and the test self-defaults only if the var is unset, so under ctest it enumerates the iGPU. Pin manually. Two sibling `free_all()` overloads at `:851`/`:962` are not exercised. |
+| `test-sycl-set-rows-owner-routing` | `set_rows.cpp:434` prefix `false &&` to the untracked-device-USM fail-closed clause | GPU (case 6 only) | PASSFAIL, `SYCL SET_ROWS owner routing tests: %s` | `  FAIL: untracked device USM must fail closed instead of being treated as host-stageable`, rc 1 | ⚠️ The mutated case is the **only** device-touching one; a device-less run SKIPs it and reports green. Confirm `=== Test: untracked device USM fails closed ===` is not followed by `SKIP:`. A device-free alternative exists in the dst-root-owner resolution (fires cases 1 and 5). |
+| `test-sycl-cpu-dispatch` | `cpu-dispatch.cpp:1510` `const int n_full = std::min(threshold, n_tasks);` → `= n_tasks;` | CPU-ONLY | COUNT `%d passed, %d failed` | `test_int4_kernel_correctness ... FAIL (INT4 output identical to baseline, mean_diff=0.000000)` + `test_adaptive_split ... FAIL (expected 2 INT4-different tasks, got 0)`, `2 passed, 2 failed`, rc 1 | ⚠️ **Finding: the test is insensitive to the threshold constant it appears to guard** — every expectation is derived from `ggml_sycl_expert_miss_burst_threshold()` itself, so mutating that constant fires nothing. INT4 path is `#if defined(__AVX2__)`. This binary aborted in a past sweep (`artifacts/verify/restored41.txt:1207`) — confirm a green baseline first. |
+| `test-mem-ops` | `mem-ops.cpp:255` both-host fast path `std::memcpy(dst_ptr, src_ptr, size);` → `size / 2` | GPU | `FAIL: %d mem_ops checks failed` on red; `PASS: ...` on green; exits 77 correctly | `FAIL: H2H copy byte 2048 expected 0x11 got 0x00` + `FAIL: 1 mem_ops checks failed`, rc 1 | 1 of 5 checks (the other four have a device endpoint). ⚠️ The "temporary handle event lifetime" check is **weak**: all four handles are `from_direct` raw views owning no lease, so flipping `retain_until_event` at `:507`/`:517` would **not** redden it. |
+| `test-mxfp4-xmx-tiled` | `moe-tile-convert.cpp:153` out-of-range scale padding `*dst_ptr++ = 0;` → `= 1;` (AoS kernel only) | GPU | PASSFAIL | `AoS conversion mismatch at byte <N>: expected=0 got=1`, rc 1 (the SoA comparison passes first) | ⚠️ Do **not** mutate `MXFPXMXLayoutInfo::compute` or `reorder_mxfp4_to_xmx_layout` — the CPU reference and the GPU kernels are compared against each other, so shared layout math moves both sides and **cannot fail**. Exits 77 properly on no-device/non-XMX. |
+| `test-q6k-reorder-dispatch` | `convert.cpp:1021` `scales_ptr[ib*(QK_K/16)+j] = x[ib].scales[j];` → `= x[ib].scales[0];` | GPU | COUNT `=== All Tests Complete: %d failure(s) ===` + per-subtest `Result: PASS/FAIL` | `=== Test 1: Production Q6_K Reorder Layout Verification ===` / `Result: FAIL`, later subtests still PASS, `1 failure(s)`, rc 1 | ⚠️ **Only 1 of 8 subtests reaches production.** Tests 2/3/5/6/7/8 re-derive the `quants.hpp` offsets and transcribe `vec_dot_q6_K_q8_1_impl_mmvq` inline — mark them MOCK. That is also why this mutation is clean (`failures` accumulates, no early exit). No 77 path: a device-less host prints `FAIL: SYCL error:` and exits 1. |
+| `test-mmq-q6k-gpu` | `mmq.cpp:2007` swap the two scale indices in `sumf_d += d8[i0/4] * (sc[i0/2+0]*sumi_d.x() + sc[i0/2+1]*sumi_d.y())` | GPU | COUNT `Results: %d passed, %d failed` + `Max relative error: %.4f%%` | `FAIL: <N> mismatches in 4096 values (...%)` for batch 2/8/16, `Results: 0 passed, 3 failed`, rc 1 | **Not specific** — the Q6_K MMQ launch macro selects on compute capability, never on ncols, so all three batches fire together. `vec_dot_q6_K_q8_1_impl_mmq` is shared by the AoS/SoA/coalesced kernels. ~200 lines of layout noise precede the verdict; grep `Results:`. |
+
+## Batch G — `common.hpp` (5 tests, 6 builds, ~2.5 h)
+
+The most widely included backend header — every build here is a full backend
+rebuild including the mega-TU. **Land this batch when no other agent is
+building** ([[land-header-changes-first-in-multi-agent-waves]]).
+
+| test | mutation (`ggml/src/ggml-sycl/common.hpp:`) | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-tensor-placement` | `:1502` `strstr(name, "ffn_down_chexps");` → `false;` in `infer_tensor_usage`'s `moe_exps_name` | DEVICE-FREE-THREADS | COUNT `%d/%d tests passed` then `OK`/`FAILED`; checks accumulate rather than early-return | `FAIL usage(blk.0.ffn_down_chexps.weight): expected <MOE_EXPERT_WEIGHT>, got <FFN_WEIGHT>`, count one short, `FAILED`, rc 1 | **The ticket's instance 1, now the best-designed test in the population.** Its header states the exact mutation contract, and `check_role(...)` stays green because the role classifier is an independent literal list in `unified-cache.hpp:203` — one literal fires exactly one assertion of ~40. Real negative controls (`ffn_norm_exps`→NORM, `ffn_gate_shexp`→UNKNOWN). |
+| `test-sycl-tensor-usage` | `:1544` `if (strstr(name, "_norm"))` → `"_normx"` | CPU-ONLY | PASSFAIL, `Tensor usage test: PASS/FAIL` | `FAIL: norm expected=5 got=0` then `Tensor usage test: FAIL`, rc 1 | Checks are `ok = ok && ...` so they **short-circuit** — mutating an early classifier hides everything after it. `_norm` is the 6th of 7 deliberately: five green checks run first. The 7th is skipped by the short-circuit; a missing 7th line is not a second failure. |
+| `test-sycl-transient-alloc-intent-scope` | `:369` `intent.constraints.use_pinned_pool = !graph_lifetime;` → `= true;` | DEVICE-FREE-THREADS | PASSFAIL, 3 progress `PASS:` + final; `FAIL [%s]: ...` + `^ %d field(s) ...` | `FAIL [this thread recording]: host transient use_pinned_pool is 1, expected 0` + `^ 1 field(s) denied graph-lifetime treatment to a thread that IS recording.`, rc 1 | Ships a documented mutation matrix (header lines 36–47) tabulating exit codes for two wrong-fix variants — cross-check against it. Subtests selectable by argv. |
+| `test-sycl-kv-view-resolution` | `:3871` `void * ptr = static_cast<char *>(base_ptr) + view_offs;` → drop `+ view_offs` | **CPU-ONLY** (hint was wrong — mocked topology, host stack "device" pointers) | PASSFAIL, `SYCL KV view resolution tests: PASS/FAIL`, per-subtest `FAIL:` lines | `FAIL: device-1 view should resolve as root device-1 pointer plus view_offs` (192), the permuted/flattened/slow equivalents, then `... FAIL`, rc 1 | Fires ~4 of 20; the 16 routing/ownership subtests stay green, and `ok &= ...` means all 20 run. Its one real-USM subtest is gated behind `GGML_SYCL_TEST_KV_VIEW_RUNTIME=1`, unset by ctest. ⚠️ Do not instead delete the fail-closed clause at `:3866` — it falls through to `..._slow()`, which may also return nullptr, so it can silently produce no RED. |
+| `test-sycl-xmx-unified-correctness` | `:4552` `return resolved.ptr != nullptr && resolved.on_device;` → `&& !resolved.on_device;` | GPU | PASSFAIL; tri-state exit, 77 is a genuine skip | `FAIL: weight 'weight' is not device-resident on device 0 before compute; MUL_MAT would be routed to CPU and the comparison would be CPU-vs-CPU`, rc 1 | ⚠️ **Null-mutation trap stated by the test itself**: it does not assert which GPU kernel variant ran, so mutating `can_use_xmx()` thresholds or any single XMX kernel can silently reroute to a correct non-XMX path and stay green. The residency predicate is the only production property it hard-asserts. |
+
+## Batch H — other shared headers (14 tests across 9 headers, ~6 h)
+
+| test | mutation | radius | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|---|
+| `test-sycl-unified-memory-e2e` | `unified-cache.hpp:2183` `budget_ - used` → `budget_ - used + 1` | HEADER-WIDE | GPU (hundreds of MB) | COUNT `E2E Test Results: %d/%d passed, %d failed, %d skipped`; exits 77 for skip *and* partial-skip | `  FAIL: available (<X>) != budget (<Y>) - used (<Z>)` then `E2E Test Results: 9/10 passed, 1 failed`, rc 1 | Off-by-one is too small to alter any other subcase's sizing. ⚠️ 77 here is neither pass nor fail (header lines 63–65). If the `base_budget()` pre-flight trips (another test created the device-0 cache in-process) you get 77 before any subcase runs and the mutation proves nothing — verify the run reached `Cache budget pinned:`. |
+| `test-sycl-unified-cache` | `unified-cache.hpp:2183` `budget_ - used` → `budget_ + used` | HEADER-WIDE | **GPU** (hint was wrong) | COUNT `Test Results: %d/%d passed, %d failed` (13) | `FAIL: available=<budget+used>, expected <budget-used>` + `FAIL: available > budget (...)`, `Test Results: 11/13 passed, 2 failed`, rc 1 | **Same line as the row above — one build covers both** (apply the `+ used` form, run both, they are distinguishable by their own messages). Device-less: prints `ERROR: No SYCL device found` and returns **1**, never 77. |
+| `test-sycl-moe-xmx-tiled-single-layout-policy` | `unified-cache.hpp:274` `if (in.pp_rows > 1 && !in.pp_supported)` → `> 4096` | HEADER-WIDE | CPU-ONLY | PASSFAIL, `single-layout XMX_TILED gate/up policy tests passed` | `FAIL: tests/test-sycl-moe-xmx-tiled-single-layout-policy.cpp:80: missing PP proof must reject`, rc 1 | Fixture uses pp_rows=2048, so raising the threshold silently admits a request with no PP proof — the exact fail-open the clause prevents. Fires 2 of 18 CHECKs. **Same header as the two rows above — batch all three.** |
+| `test-sycl-weight-key-uniqueness` | `unified-cache-key.hpp:61` `const bool compare_logical = !a.has_gguf;` → `= true;` | HEADER-WIDE | GPU-lite (reaches `ggml_backend_sycl_reg()` despite the `hostonly` label) | PASSFAIL | `FAIL: tied weights did not share cache identity`, rc 1 | 🚨 **CHECK THE BASELINE FIRST — this test appears pre-existing RED at exactly the assertion this mutation targets** (`artifacts/task19/failing-logs/test-sycl-weight-key-uniqueness.txt`, `0% tests passed`). If still red the experiment is void and the finding is "fix this first". Fallback if phase 3 is already red: `ggml-sycl.cpp:~12005` `id.valid = true;` → `false`, firing phase 1's `FAIL: gguf_keys contains null key`. |
+| `test-sycl-moe-identity-hash` | `unified-cache-key.hpp:61` — **the same line** | HEADER-WIDE | CPU-ONLY | COUNT `Tests run: %d, Passed: %d, Failed: %d` | `FAIL: two models mapping the same GGUF bytes must share one key` (tests 2/4, likely 6), `Tests run: 7, Passed: 4, Failed: 3`, `FAILED: the weight cache key no longer implements the n3pw physical-identity ruling.`, rc 1 | **One build covers this and the row above.** Exits 77 correctly when `GGML_USE_SYCL` is undefined. Narrower alternative: delete `\|\| a.aux_id != b.aux_id` (lines 66–67) → fires only test 7. Do not mutate `cache_id_hash` at `:83` as well — it must stay consistent with `cache_id_equal`. |
+| `test-sycl-moe-gateup-prepack-scratch` | `moe-layer-plan.hpp:411` `if (!handle.has_stable_owner_identity())` → `if (false)` | HEADER-WIDE (via common.hpp) | CPU-ONLY | PASSFAIL, `PASS: MoE gate/up prepack scratch descriptor`; `FAIL: %s:%d: %s` | `FAIL: tests/test-sycl-moe-gateup-prepack-scratch.cpp:152: raw direct pointer handle without stable owner identity must be rejected`, rc 1 | This is the canonical-memory-contract property ("raw pointers are not ownership tokens") stated as a test — the right thing to mutate. ~35 earlier CHECKs pass first. Sibling guards at `:154`/`:504` — mutate **only** `:411`. |
+| `test-sycl-descriptor-retention` | `moe-layer-plan.hpp:185` `if (resolved.layout != entry.expected_layout)` → `!= resolved.layout` | HEADER-WIDE | CPU-ONLY | PASSFAIL, `PASS: descriptor retention and replay validation` | `FAIL: layout change must reject replay`, rc 1 | Fires the 9th and last check; the other 8 stay green. **Same header as the row above — batch them.** Labelled `residency|mem-handle|cache`, so the throttled sweep excludes it; run by name. |
+| `test-ggml-sycl-soa` | `quants.hpp:59` `d_offset = total_qs_bytes + block_index*sizeof(ggml_half)` → `total_qs_bytes - sizeof(ggml_half) + ...` | HEADER-WIDE | GPU | COUNT `Results: %d passed, %d failed` (~24) + per-subtest `Subtests: %d passed, %d failed` | `Test 11: SoA layout byte-level verification` → four `Block N d at offset ...: 0x0000 (expected 0x3C00) MISMATCH` + `FAIL: SoA layout mismatch (qs_correct=1, d_correct=0)`, `Results: 23 passed, 1 failed`, rc 1 | Writer and reader both go through `get_d_offset`, so numerics stay consistent and only the byte-level test sees it — but the 2-byte overlap clobbers the last qs block's tail, so **1–2 failures is the expected RED**. ⚠️ 19 separate `SKIP: Could not initialize SYCL backend` sites that `return true` — confirm real passes in `Results:` before trusting green. |
+| `test-unified-dispatch-integration` | `dispatch.hpp:91` `return false; // FP16, BF16, F32, Q6_K ... legacy` → `return type == GGML_TYPE_Q8_0;` | HEADER-WIDE | GPU | COUNT `=== Results: %d/%d tests passed ===`; exits 77 if `GGML_SYCL_UNIFIED_DISPATCH=0` | `FAILED: should_use_unified(Q8_0) returned true, expected false`, `=== Results: 8/9 tests passed ===`, rc 1 | ⚠️ **Memory hazard**: no selector in the registration and the test uses `sycl::default_selector_v` — it will enumerate the iGPU (`llama.cpp-403s`, 231.7 GB of "VRAM"). Run as `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`. Do not leave the mutation applied across a benchmark. |
+| `test-q6k-dispatch` | `vecdotq.hpp:105` `byte_sub_4(vil1 \| vih1, 0x20202020)` → `0x21212121` | HEADER-WIDE | GPU | COUNT `Results: %d passed, %d failed, %d skipped` | `FAIL: <n>/<rows> rows violate the enforced Q8_1 contract` in tests 1/2/4, `Results: 1 passed, 3 failed`, rc 1 | **Try Batch A's `--corrupt-q8-reference` first** — it needs no rebuild. Only spend this header build if you want the production-side proof too. |
+| `test-moe-mini-graph` | `dequantize.hpp:294` `v.x() = d * kvalues_mxfp4[q & 0xF] * 0.5f;` → `* 0.55f` | HEADER-WIDE | GPU | PASSFAIL + `MoE mini-graph: nmse=%.6e max_diff=%.6f` | `FAIL: mismatch beyond tolerance (nmse>5.0e-04 or max_diff>1.00)`, rc 1 | ⚠️ **Reach unverified** — the test forces XMX-tiled MoE, which may decode MXFP4 without `dequantize_mxfp4`. Guaranteed-reach fallback (MEGA-TU): `ggml-sycl.cpp:37186` `dst[i] = scale*x[i] + bias;` → `* 1.01f` — the graph chains 6 `ggml_scale` nodes, 1.01^6 ≈ 1.062 → nmse ≈ 3.8e-3. ⚠️ **Vacuous-pass trap**: any failure inside the SYCL leg is reported as `SKIP: SYCL graph path unavailable or disabled` with **rc 0**. |
+| `test-fattn-packed-k-lifecycle` | `fattn.hpp:126` `address >= begin && address < begin + size;` → `<= begin + size` | HEADER-WIDE | GPU nominally — **but the mutated check runs in `verify_host_boundaries()` before `preflight_device()`, so the RED reproduces with no GPU** | PASSFAIL, `PASS checkpoint=%s shape=... async_wait_failures=%d`; 77 on no device | `FAIL host packed-K boundary checks: host end-exclusive range arithmetic included its end`, rc 1, for **all five** registered checkpoints | 5 ctest names, one mutation. Cheapest GPU-family RED in the plan because the host prologue precedes the device gate. |
+| `test-sycl-fattn-xmx-policy` | `fattn-xmx-f16.hpp:178` `return XMX_BATCH_KV_LARGE;` → `/ 2` | narrow header (only `fattn.cpp` + a bench + this test) | CPU-ONLY | PASSFAIL, `SYCL fattn policy tests: %s`; per-check `FAIL: <name> got %d want %d` | `FAIL: D128 ncols8 uses larger batch when local memory permits got 24 want 48` then `SYCL fattn policy tests: FAIL`, rc 1 | Fires 1 of ~35; `ok &=` so nothing is masked. Good "some green, some red" demonstration. |
+| `test-dmmv-coalesced-q4-0-oracle` | `dmmv-coalesced-q4-0-layout.hpp:64` `blocks_per_row * DMMV_COALESCED_Q4_0_BLOCK_BYTES` → `* 32` (the literal Q8_0-stride defect the file is named for) | narrow header (convert.cpp + dmmv.cpp + 2 tests) | CPU-ONLY | COUNT — per-check `PASS`/`FAIL` lines + `%d check(s) failed` / `all checks passed` | exactly 4 of 20: `FAIL q8-row-stride-is-twice-the-q4-0-row q8=2048 q4_0=2048`, `... writes-past-the-allocation oob_writes=0`, `... produces-a-different-layout first_bad=-1`, `FAIL device-soa-writer-matches-contract first_bad=...`; `4 check(s) failed`, rc 1 | Round-trip and all 12 oracle checks stay green because writer and reader share the header — that is the point. Built-in positive control (`contract-oracle-catches-corrupted-kernel`): a fully-red run means you over-mutated. |
+
+## Batch I — MEGA-TU `ggml-sycl.cpp` and headers only it includes (23 tests, 28 builds, ~9 h)
+
+Do this last. Every build here is the 100k-line TU. One row is blocked
+(`test-sycl-module-dlopen`, kept here as its build slot is real once the DL
+config exists).
+
+⚠️ **Four rows were removed from this batch on adjudication** — see *The
+build-slot rule* below. `test-sycl-moe-glu-q8-artifact-policy`,
+`test-sycl-moe-glu-q8-fused-store-policy`,
+`test-sycl-moe-direct-final-token-major-bridge` and
+`test-sycl-moe-token-major-metadata` each mutate a **test-only mirror with zero
+production callers**, so a ~20-minute mega-TU build would prove only that a
+mock can fail. They moved to the mock/deletion bucket.
+
+| test | mutation (`ggml/src/ggml-sycl/ggml-sycl.cpp:` unless noted) | runtime | verifiability | expected RED | notes |
+|---|---|---|---|---|---|
+| `test-sycl-moe-xmx-tiled-materialization` | `:2734` drop `&& target_layout == GGML_LAYOUT_XMX_TILED` from `..._single_xmx_chunked_fallback_policy` | CPU-ONLY | PASSFAIL | `FAIL: tests/test-sycl-moe-xmx-tiled-materialization.cpp:161: non-XMX target must not use chunked fallback`, rc 1 | ⚠️ **Partial mock**: `test_moe_xmx_tiled_materialization_invariants` (`:24024`) has **zero production callers**, so 3 of its 5 test functions prove nothing. Only the two policy delegations are real — mutate within those. |
+| `test-sycl-moe-expert-parallelism` | `:2820` `(int64_t(layer_id) << 32) \| int64_t(uint32_t(expert_id))` → `int64_t(layer_id) + int64_t(expert_id)` | DEVICE-FREE-THREADS | COUNT `=== Results: %d/%d passed, %d failed ===` | `FAIL: rank should be unique per entry` + `FAIL: test_popularity_key_uniqueness`, `=== Results: 6/7 passed, 1 failed ===`, rc 1 | Sound test of a real production structure. Its thread-safety subtest is weak (the reader only range-checks), so a green there is not evidence about the shared_mutex. |
+| `test-tensor-placement` | `:8855` `if (strstr(name,"attn_") \|\| strstr(name,"ffn_"))` → drop the `ffn_` term | CPU-ONLY | bare `assert()` — aborts on the first | `Assertion 'ggml_sycl_classify_tensor("blk.10.ffn_down.weight") == 0' failed.`, **rc 134** | Fires 2 of 9 asserts but only one line prints. The file `#undef NDEBUG`s at line 14 *before* re-including `<cassert>` and records a verified mutation in its header — **do not remove that `#undef`**. |
+| `test-cross-model-weight-usage` | `:11833` `it->second = tensor_usage::UNKNOWN;` → `it->second = mapped;` | **GPU** (hint was wrong — the plan stage inits a backend per device) | COUNT `=== %d checks, %d failures ===` (14) | `=== 14 checks, 2 failures ===` + `FAIL: check 2: model A's own tied-weight case forces UNKNOWN (precondition for check 4)` + `FAIL: check 5: A->B->reactivate-A lookup restores A exact same-name usage`, rc 1 | Has a built-in positive control (check 1) and negative control (check 3); this mutation leaves both green deliberately. The alternative "key by bare name" at `:11822` breaks 4 of 6 and destroys the controls. |
+| `test-sycl-weight-key-stability` | `:11996` `id.file_offs = has_gguf_identity ? identity.file_offs : 0;` → `= 0;` | CPU-ONLY | PASSFAIL, `PASS: weight cache key remained stable` | `FAIL: cache key missing GGUF identity fields`, rc 1 | Only 3 checks total, so no partial-red outcome is available. Cheap to evaluate, expensive to build. |
+| `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. |
+| `test-xmx-moe-mxfp4` | `:24489` in `test_moe_gateup_singlecol_policy` delete the `return out;` in the `graph_recording` arm | CPU for the 3 reachable subtests (they run *before* the device gate) | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 after the host tests | `FAILED: graph recording must reject first implementation`, `Tests run: 3, Passed: 2, Skipped: 0, Failed: 1`, rc 1 | **BLOCKED** by `GGML_SYCL_BUILD_XMX_TESTS` (see below). Note a 77 here still means 3 real assertions ran. |
+| `test-sycl-moe-sequence-graphlet-policy` | `:24797` `if (unsafe_fused_q8_requested)` → `if (false && ...)` in `moe_default_fast_path_policy_from_flags` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-sequence-graphlet-policy.cpp:939: known unsafe fused-Q8 request must quarantine default sequence replay`, rc 1 | 47 of its 49 assertions are source-text greps; the two truth-table cases are the only behavioural coverage — but they **do** reach production (`:24775`), unlike the glu-q8 sibling. Because most cases read source at runtime, a text-only mutation reddens it with no rebuild. |
+| `test-unified-cache-integrity` | `:29105` `if (!host_buffer && !sycl_buffer)` → `if (!host_buffer)` | GPU (768 staged weights, 128 MB ctx) | PASSFAIL, `Unified cache integrity test: %s` | `Failed to cache layout for type=2 idx=0` then `... FAIL`, rc 1 | Clean phase-1-green / phase-2-red split. ⚠️ Do **not** mutate `unified_cache::validate()` — that mutates the checker, not the property. The "on-topic" `id_to_key_[key] =` deletion at `unified-cache.cpp:4034` is unreliable (five other write sites can repopulate) — demand a positive control if you use it. |
+| `test-sycl-kv-planned-device-materialization` | `:31532` `la.on_device && la.owner_device >= 0 ? la.owner_device : ctx->device` → `ctx->device` | **GPU, needs ≥2 physical devices** (hint was wrong) | PASSFAIL, `SYCL planned-device KV materialization test: PASS` | `  FAIL: cache_k_l1 smart handle for planned device 1 must resolve`, rc 1 | The host-KV-zone rollback half and the registry-owner checks stay green. ⚠️ Do not mutate `planned_owner` at `:32218/:32260` — `valid_device_kv_handle` then refuses and the run collapses into a generic assert. With <2 devices it prints `SKIP: need at least two physical SYCL devices` and returns **0**, not 77. |
+| `test-mul-mat-host-streaming` | `:38382` `float * dst_ptr = ctx->dst_dd_i + row_start;` → `= ctx->dst_dd_i;` | GPU | PASSFAIL + `mul_mat host streaming: nmse=%.6e max_diff=%.6f` | `FAIL: mismatch beyond tolerance (nmse>5.0e-05 or max_diff>0.01)`, rc 1 | ⚠️ **Control first**: confirm the sliced path is taken (`GGML_SYCL_MUL_MAT_STREAM_DEBUG=1` → `[MUL_MAT_STREAM] row_start=... row_count=...`, a DEBUG-level line) or the mutation is inert. False green: `SKIP: Could not initialize SYCL backend` returns 0. |
+| `test-cpu-gpu-soa-interaction` | `:46423` `if (cols % block_elements != 0)` → `if (false)` in `ggml_sycl_reorder_expected_size` | GPU | COUNT `Results: %d passed, %d failed` + per-test `Results: %d/10` | `FAIL: reorder geometry accepted non-representable dimensions or unsupported type` then `Results: 5 passed, 1 failed`, rc 1 | **Has a built-in positive control**: `--corrupt-post-copy` emits `[SOA-REACH]`/`[SOA-POSITIVE-CONTROL]` and rc 1 — run that first to prove reach. RUN_SERIAL with `GGML_SYCL_VRAM_ARENA=0;GGML_SYCL_ASYNC_MEM=1`. |
+| `test-layout-bytes` | `:47060` MXFP4 arm `const size_t scale_bytes = nblocks;` → `nblocks * 2;` | GPU | PASSFAIL, `Layout bytes test: PASS/FAIL` | `MXFP4 coalesced bytes: expected 340, got 360` then `Layout bytes test: FAIL`, rc 1 | Q4_0/Q8_0/Q6_K and the XMX-tiled case stay green (`ok &=`). ⚠️ `SKIP: SYCL backend unavailable` returns **0**. Do **not** pick the Q8_0 case: it calls the production `ggml_sycl_q8_0_coalesced_row_quants_bytes()` on both sides, so a mutation there moves both and cannot fail. |
+| `test-sycl-kernel-selection` | `:52428` `{ "MMQ_COALESCED", ...MMQ_COALESCED }` → `...MMQ_SOA` | GPU-optional (4 of 6 subtests device-free) | COUNT `%d/%d tests passed` (hint said PASSFAIL — wrong) | `FAIL (parsed wrong kernel)` from `test_parse_force_kernel_valid`, `5/6 tests passed`, rc 1 | ⚠️ Device-less, the two backend subtests print `SKIP (SYCL backend unavailable)` and **return true**, counting as passes — a 6/6 green may have exercised only 4. |
+| `test-sycl-orchestrator` | `:53055` `if (kernel == ggml_sycl_mul_mat_kernel::ONEDNN_AOS)` → `if (false && ...)` | GPU | COUNT `%d/%d tests passed` (total hardcoded 5) | `  test_tuning_prefers_onednn: FAIL (expected onednn path selection)`, `4/5 tests passed`, rc 1 | It sets `GGML_SYCL_UNIFIED_DISPATCH=0` before init, so it exercises the **legacy** selection arm — do not mutate the unified early-return at `:52991`, it is unreachable here. `SKIP (SYCL backend unavailable)` returns **0**. |
+| `test-rms-norm-mul-add-broadcast` | `:77372` in `ggml_sycl_fusion_operand_view_offset_safe`, the `view_src != nullptr && accumulated_view_offs != 0` arm `return false;` → `return true;` | GPU | COUNT `=== %d checks, %d failures ===` + per-case detail; 77 on no device | `  [FAIL] ncols=64 view-at-nonzero-offset (root cause) (... max_err=<O(1)>, tol=1.0e-03)` + the ncols=256 twin, `=== 6 checks, 2 failures ===`, `SOME CHECKS FAILED`, rc 1 | **Pre-validated**: the test's own comment (lines 371–378) prescribes exactly this A/B. Cases A/B are its declared positive control. |
+| `test-sycl-device-uuid-api` | `:97917` inside `if (dev == nullptr \|\| uuid == nullptr)` `return false;` → `return true;` | CPU-ONLY for the assertions (but `ggml_backend_sycl_reg()` runs discovery — source oneAPI) | PASSFAIL — silent on success | `UUID registry procedure missing or accepted null device`, rc 1 | ⚠️ Do not mutate the `ggml_backend_dev_backend_reg(dev) != ggml_backend_sycl_reg()` identity guard instead — it would `static_cast` a CPU device context and read `ctx->device`, i.e. UB/segfault rather than a clean assertion. |
+| `test-sycl-module-dlopen` | `:100006` `return 1u; // GGML_BACKEND_LIFETIME_POLICY_PROCESS` → `return 2u;` | CPU-ONLY | PASSFAIL — silent on success | `missing PROCESS_LIFETIME policy export`, rc 1 | **BLOCKED** — registered under `BUILD_TESTING AND GGML_BACKEND_DL`, and `GGML_BACKEND_DL` is OFF. Needs a separate `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` tree. Deprioritise. |
+| `test-sycl-onednn-packed-cache` | `:26922` `... && onednn_pack_m > 0) ?` → `< 0) ?` | GPU | PASSFAIL, `PASS: onednn packed layout cached and AoS evicted` | `FAIL: expected onednn pack_m=32, got=0`, rc 1 | ⚠️ **Worst false-green in the population: six `SKIP:` paths all `return true` → exit 0**, including `SKIP: SYCL backend unavailable` and `SKIP: unified cache unavailable`. Grep for the `PASS:` line, never for rc 0. |
+| `test-moe-bias-owner-state` | `moe-bias-state.hpp:193` in `clear()` `act_alpha = 0.0f;` → `act_alpha = act_alpha;` | MEGA (only `ggml-sycl.cpp` includes it) | CPU-ONLY | COUNT on pass only — `moe bias owner state: PASS (12 cases)` | `FAIL: activation-variants: the second model inherited the first model's swiglu alpha/limit`, rc 1 | Its CMake comment states outright that it never enumerates a device. Contains a real positive control and four `static_assert`s no runtime mutation can reach. |
+| `test-moe-layer-ids-worker-reset` | `moe-layer-ids-cache.hpp:32` `entry.ids_host.clear();` → `entry.ids_host = std::vector<int32_t>();` | MEGA (only `ggml-sycl.cpp` includes it) | DEVICE-FREE-THREADS | PASSFAIL, `two-worker TLS graph-boundary reset passed 1000 iterations` | `FAIL: IDs vector capacity was released`, rc 1 | Fires 1 of 11 per-entry checks — move-assign frees the buffer so capacity drops while `empty()` still holds, leaving all four emptiness checks green. Do not use `cache.clear()` — it blows up size/bucket/address checks at once. |
+| `test-tiered-dispatch` | `tiered-plan-clear.hpp:13` `if (!has_plan \|\| !multi_device)` → `\|\| multi_device` | MEGA (sole includer is `ggml-sycl.cpp:320`) | GPU (3 load-bracket transactions, no GGUF) | COUNT `%d tiered-dispatch check(s) failed` / `All tiered-dispatch checks passed`; returns **77** for both skips | `FAIL: single-device plan was reported as cleared`, `FAIL: single-device plan was cleared`, `FAIL: completed multi-device plan was not cleared`, the three `PASS: <label>` placement lines, `3 tiered-dispatch check(s) failed`, rc 1 | 3 of 5 contract checks fire and the whole (expensive) placement half stays green — a precise count signal. Every alternative target lives in `ggml-sycl.cpp` anyway, so **batch this with the KV-materialization row**. |
+| `test-moe-discovery-owner-state` | `moe-discovery-state.hpp:57` `key.slot < moe_discovery_max_owners && key.slot_generation != 0;` → drop the generation clause | header is MEGA-reaching, **but this test target links only `Threads::Threads`** — `ninja test-moe-discovery-owner-state` rebuilds one file | DEVICE-FREE-THREADS | COUNT `moe discovery owner state: PASS (15 cases)` | `FAIL: invalid-owner-is-inert: a slot with no generation was accepted as an owner identity`, rc 1, PASS line absent | **Build only the test target** and this becomes a Batch-B-class cost. Its fixture is a recording stand-in for the process globals, but the registry under test is production. |
+
+---
+
+## Tests that CANNOT be made to fail — deletion candidates per the spec
+
+Seven registrations, in three failure modes. Each is a *permanently green*
+result that a merge certification would otherwise count as coverage.
+
+**1. Every exit path returns 0.**
+
+- **`test-sycl-esimd-float-atomic-compile`** — prints `PASS:` on success and
+  `SKIP: ...` + `return 0` from all four catch blocks. It never reads back the
+  value it atomically adds, so the atomic could add nothing and it still
+  passes. Touches **zero** fork code (pure oneAPI/ESIMD). Its only real value
+  is that it compiles, which a build gate already provides. Also uses
+  `default_selector_v` with no selector in its registration → iGPU.
+  *Fix: assert `*ptr == 1.0f` and exit 77 on skips; otherwise delete.*
+- **`test-sycl-onednn-mxfp4-feasibility`** — a capability **probe**, not a test.
+  Three `probe_*` functions each print "supported"/"unsupported" and return; main
+  returns 0 on every path including engine-creation failure. Touches no fork code.
+  *Fix: convert to a recorded-expectation gate (assert the observed support
+  matrix so a oneDNN upgrade that changes the answer goes red), or unregister.*
+- **`test-mmvq-q8-0-streaming-bench`** (the bare registration only) — has no
+  ENVIRONMENT, so it always prints `SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run`
+  and exits 77. Permanently skipped. The three sibling names on the same binary
+  are live. *Fix: give it the env or drop the registration.*
+
+**2. Assertions erased at compile time.**
+
+- **`test-tensor-classification`** — 33 bare `assert()`s and **zero**
+  occurrences of `NDEBUG` in the file. The build is Release `-O3 -DNDEBUG`
+  (`scripts/sycl-build.sh:150-151`), so every assertion is preprocessed away
+  and `main`'s only reachable exit is `return 0`; the `catch` block is dead.
+  ⚠️ The comment at `ggml/src/ggml-sycl/CMakeLists.txt:2155-2161` claims
+  `50723136a` already added the `#undef NDEBUG` fix — **that claim is false for
+  this file** (it appears to describe `test-tensor-placement.cpp`, registered
+  directly below). *Fix: one line, `#undef NDEBUG` after the includes.*
+- **`test-xmx-kernel-config`** — every check is a `static_assert` and every
+  subtest is `return true;` after them, so `main` has exactly one reachable
+  exit. Worse, a mutation makes the **build** fail while ctest then runs the
+  **stale binary**, which prints `All tests PASSED!` rc 0. Two of eight subtests
+  static_assert arithmetic on literals (`8*32==256`). *Fix: it is a compile-time
+  gate — either accept that and unregister it as a runtime test, or give it
+  runtime checks.*
+- **`test-sycl-lifecycle-public-api`** — `int main() { return 0; }` plus 15
+  `static_assert`s. This is legitimate (it pins public ABI signatures), but the
+  mutation protocol differs: **build the target and read the compiler**, do not
+  run ctest. Not a deletion candidate; a documentation candidate.
+
+**3. The body is unreachable.**
+
+- **`test-xmx-host-streaming`** — `main` opens with
+  `#if !defined(GGML_SYCL_XMX_GEMM) || !defined(GGML_SYCL_MMQ_XMX)`. Both
+  options default OFF **and even with both ON they are
+  `target_compile_definitions(ggml-sycl PRIVATE ...)`, so they never reach this
+  test target.** There is no `-D` combination a user can pass that executes one
+  line of its body; fixing it requires a CMake change. Compounding it, the live
+  body's failure paths print `SKIP:` and `return 0` rather than 77.
+- **`test-unified-kernel-persistent`** — cannot be built at all. Behind
+  `GGML_SYCL_BUILD_XMX_TESTS` (OFF), and with the guard ON it **fails to
+  compile** against the current API: `StridedCopyMeta`
+  (`unified-kernel.hpp:295-302`) has no `type_size` and no `pad`, yet the test
+  writes `meta.type_size` (line 1473) and `meta.pad` (1365/1474/1952);
+  `add_set_rows`/`add_strided_copy` now take `const SetRowsMeta &` /
+  `const StridedCopyMeta &` while the test passes device pointers.
+  `CMakeLists.txt:1216-1231` documents this as OPEN, and the mismatch is
+  independently checkable against `unified-kernel.hpp`.
+  ⚠️ **Correction to this plan's first revision:** it also repeated that
+  comment's claim that the test declares an extern
+  `ggml_sycl_test_extract_layer_index` "that exists nowhere in the tree".
+  **That is false** — the symbol is defined at
+  `ggml/src/ggml-sycl/ggml-sycl.cpp:89939` (added by `2c49f9e13`), so the
+  extern at `test-unified-kernel-persistent.cpp:42` would resolve fine. The
+  disposition is unchanged because it never depended on that claim; the stale
+  CMake comment is logged as its own micro-finding under *Blocked*.
+  ***This single rotted target is what blocks the entire XMX suite*** — see below.
+
+## Tests that reach no production code (mocks) — repair or delete
+
+These *can* be made to fail, but only by mutating the test's own copy of the
+logic. A green from them says nothing about the shipped backend. Listed loudest
+first.
+
+⚠️ **This table is descriptive, not a scoring bucket** — the same convention as
+*Blocked*, and it matters because **12 rows appear here while only 10 are
+scored `MOCK`** in the appendix. A test can be both a mock and unbuildable;
+`test-esimd-vectorized-dequant`, `test-moe-mxfp4-dp4a` and
+`test-xmx-hardware-detect` are all three, and are scored `XMX-BLOCKED`.
+
+**Scoring precedence, applied uniformly:** `XMX-BLOCKED` > `CANNOT-FAIL` >
+`MOCK` > batch. The blocker wins because it is the operative fact — you cannot
+build the target to confirm the mock diagnosis, so "repair the guard" precedes
+"repair the test". `test-xmx-quant-loaders` is scored `MOCK` rather than
+`XMX-BLOCKED` because it is registered **outside** the guard
+(`ggml/src/ggml-sycl/CMakeLists.txt:3654`) and does build — it merely exercises
+a header whose include chain terminates.
+
+| test | what it actually exercises |
+|---|---|
+| `test-sycl-pp-moe-scratch-lifecycle` | Includes **zero** project headers; the CMake target has one source and `Threads::Threads`. Every type (`slot_backing`, `local_slot_state`, `model`) is defined in an anonymous namespace in the test. `test_arena_reset_destroy_generation_bump()` is literally `uint64_t g = 7; const uint64_t stale = g; g++; require(stale != g, ...)` — it asserts that `++` increments. Seven "cases" named after PP MoE scratch lifecycle, none of which can observe any change under `ggml/src/ggml-sycl/`. |
+| `test-onednn-fallback` | `onednn-fallback.hpp` is included by **nothing** outside its own test. `execute_cached()` has every real parameter commented out and never calls oneDNN; `init()` takes an `int*` as the "queue". ~90 assertions over a class no shipped path can reach. |
+| `test-kernel-dispatch` | Defines its own `namespace ggml_sycl_unified_test` copy of `KernelPath`, `XMXConfig`, `get_esimd_min_batch()` and `select_kernel_path()` ("mirror the definitions… without SYCL dependencies"), includes no project header, links nothing. **The mirror has already drifted** — production `select_kernel_path` has grown `ESIMD_LARGE_TILE` (`unified-kernel.cpp:4148`) that the copy does not model. |
+| `test-xmx-unified-kernel` | Titled "matches outputs of all 7 original kernel variants", but `compute_reference_q4_0_q8_1<Config>` is a host loop whose own comment says it "computes the same result regardless of Config" — the template parameter is unused. It compares that against a line-for-line duplicate in the test file. No SYCL kernel, no `joint_matrix`, no `UnifiedXMXKernel::operator()` is ever invoked. |
+| `test-esimd-vectorized-dequant` | Re-implements every dequant inline in its own ESIMD kernels and scores them against its own `reference_dequant_q4_0/q8_0`; its only non-system include is `sycl-test-skip.hpp`. |
+| `test-moe-mxfp4-dp4a` | Redefines `block_mxfp4`, `block_q8_1`, `kvalues_mxfp4`, `dp4a_cpu`, `mxfp4_dot_*` locally; `target_link_libraries` is `IntelSYCL::SYCL_CXX` only — no `ggml-sycl`. |
+| `test-sycl-level-zero-vmem-feasibility` | Contains no llama.cpp code at all — a Level Zero driver capability probe. Belongs in a driver preflight script. (Its skip/fail split is well done, but its registration lacks `SKIP_RETURN_CODE 77`, so skips render as FAILED — `llama.cpp-k208`.) |
+| `test-xmx-hardware-detect` / `test-xmx-quant-loaders` | Both exercise `xmx-esimd-common.hpp` / `xmx-quant-loaders.hpp`, whose include chains **terminate** — no production TU pulls them in. The former additionally tests a `#ifdef XMX_TEST_STANDALONE` shim for its "hardware detection" half, and its `add_test` has no `set_tests_properties` at all: no `SKIP_RETURN_CODE 77`, no `LD_LIBRARY_PATH`. |
+| `test-sycl-moe-glu-q8-artifact-policy` | `test_moe_glu_q8_artifact_policy` (`ggml-sycl.cpp:24403`) — definition plus a declaration in `ggml-sycl-test.hpp:323`, and **no caller anywhere**. Its body is a self-contained ladder over a `test_moe_glu_q8_artifact_input` struct of bools, incrementing `g_test_moe_glu_q8_*` counters; it calls no production function. Same shape `test-sycl-tensor-placement` was rewritten to escape. |
+| `test-sycl-moe-glu-q8-fused-store-policy` | `test_moe_glu_q8_fused_store_policy` (`ggml-sycl.cpp:24502`, declared `ggml-sycl-test.hpp:378`) — same: definition + declaration, zero callers, and `test_moe_glu_q8_kernel_path_supports_fused_store` switches over a `test_moe_glu_q8_kernel_path` enum that exists only in the test block. |
+| `test-sycl-moe-direct-final-token-major-bridge` | `test_moe_down_sum_direct_final_policy` (`ggml-sycl.cpp:24071`, declared `ggml-sycl-test.hpp:202`) — zero callers; the real direct-final gate is re-implemented inline at `:66656-66706` and shares no code with it. Compounding: `test_moe_token_major_metadata_is_complete` sits behind `GGML_SYCL_TEST_MOE_XMX_FUSED_HELPERS`, whose only definition in the tree is line 2 of this test file. |
+| `test-sycl-moe-token-major-metadata` | `test_moe_build_token_major_metadata` (`ggml-sycl.cpp:24191`, declared `ggml-sycl-test.hpp:238`) — zero callers. Its overflow arithmetic is genuinely good and genuinely untested elsewhere, which argues for **promoting it to production** rather than deleting the test. |
+
+### The build-slot rule (adjudication, `ona8` spec review 2026-08-08)
+
+Four of these were originally given a Batch I build slot *and* flagged as mocks
+— two instructions, one of which had to win. The rule that resolves it:
+
+> **A build slot is only justified when the mutated line is production-reachable.**
+> Mutating a mirror proves the mirror can fail, which nobody doubted. The u2mz
+> spec's own remedy for a decorative test is to fix or delete it, not to spend
+> ~20 minutes of mega-TU rebuild demonstrating its decorativeness.
+
+Verified per function rather than assumed — each of the four is a definition in
+`ggml-sycl.cpp` plus a declaration in `ggml-sycl-test.hpp`, with **no third
+occurrence** in the 100k-line TU:
+
+```bash
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_glu_q8_artifact_policy       # 1 (the definition)
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_glu_q8_fused_store_policy    # 1
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_down_sum_direct_final_policy # 1
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_build_token_major_metadata   # 1
+```
+
+⚠️ **The same check clears two neighbours that look identical and are not** —
+name similarity is not evidence here, so run the grep rather than pattern-match
+on the `test_` prefix:
+
+- `ggml_sycl_moe_single_xmx_chunked_fallback_policy` (`:2734`, **3** occurrences)
+  is production, called by `..._chunked_fallback_allowed`. So
+  `test-sycl-moe-xmx-tiled-materialization` **keeps** its Batch I slot — with
+  the mutation pinned to that line, not to the test-only
+  `test_moe_xmx_tiled_materialization_invariants` (1 occurrence) that 3 of its
+  5 test functions drive.
+- `moe_default_fast_path_policy_from_flags` (`:24775`, **3** occurrences) is
+  production, so `test-sycl-moe-sequence-graphlet-policy` keeps its slot too,
+  even though 47 of its 49 assertions are source-text greps.
+
+The lead's steer covered `test-sycl-moe-glu-q8-artifact-policy`; this pass
+extended it to the three siblings **by the same rule**, because applying it to
+one and not the others would reproduce exactly the inconsistency the review
+caught. Push back if the three should keep their slots.
+| partial: `test-q6k-reorder-dispatch` (1 of 8 subtests production), `test-sycl-moe-xmx-tiled-materialization` (2 of 5), `test-sycl-moe-direct-final-scratch-plan` (1 of 3, and that one is a text grep), `test-mmq-xmx-dispatch` (1 of 5), `test-sycl-moe-sequence-graphlet-policy` (2 of 49) | see the batch rows |
+
+## Blocked: targets that do not exist in the current configuration
+
+⚠️ **Read the counting convention first.** This section is a **cross-reference,
+not an additive bucket.** Only the `GGML_SYCL_BUILD_XMX_TESTS` group of **12**
+is scored here in the partition; the `GGML_BACKEND_DL` and pre-existing-RED
+entries below name tests that are *already counted in Batch I and Batch H
+respectively* and appear here only so a reader looking for blockers finds them.
+Adding this section's items to the batch totals double-counts. The flat
+appendix at the end is the authority: every test appears in it exactly once.
+
+### Behind `GGML_SYCL_BUILD_XMX_TESTS` — 14 guarded, 12 scored here
+
+⚠️ **Nobody in this chain has previously had the right number**, so it is
+recounted here against the literal `if`/`endif` bounds rather than by eye. The
+guard opens at `ggml/src/ggml-sycl/CMakeLists.txt:761`
+(`if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")`, the
+`option(... OFF)` being at `:759`) and its matching `endif()` is at `:1287`. It
+contains **14** `add_executable` calls:
+
+```bash
+awk 'NR>=761 && NR<=1287 && /add_executable\(/' ggml/src/ggml-sycl/CMakeLists.txt | wc -l   # 14
+```
+
+The 14, with the disposition that keeps label = list = sum:
+
+| # | target | scored under |
+|---|---|---|
+| 1 | `test-xmx-hardware-detect` | XMX-blocked |
+| 2 | `test-xmx-esimd-basic` | XMX-blocked |
+| 3 | `test-xmx-moe-mxfp4` | **Batch I** (its mutation is in `ggml-sycl.cpp`) |
+| 4 | `test-moe-mxfp4-dp4a` | XMX-blocked |
+| 5 | `test-mxfp4-vector-dequant` | XMX-blocked |
+| 6 | `test-unified-kernel` | XMX-blocked |
+| 7 | `test-xmx-compute` | XMX-blocked |
+| 8 | `test-xmx-default-enable` | XMX-blocked |
+| 9 | `test-xmx-optimization` | XMX-blocked |
+| 10 | `test-xmx-config` | XMX-blocked |
+| 11 | `test-esimd-vectorized-dequant` | XMX-blocked |
+| 12 | `test-esimd-prefetch` | XMX-blocked |
+| 13 | `test-unified-kernel-ops` | XMX-blocked |
+| 14 | `test-unified-kernel-persistent` | **cannot be made to fail** (does not compile) |
+
+**14 guarded = 12 XMX-blocked + 1 Batch I + 1 cannot-fail.** The prior revision
+of this section said "Ten" in its label, enumerated 13 names, and summed 12 in
+its table — three different wrong numbers for one set.
+
+⚠️ **Turning the flag ON does not fix it — the build then fails** on the rotted
+`test-unified-kernel-persistent` (see its entry above). Until that one target is
+repaired or excluded, build **single targets** (`ninja test-xmx-esimd-basic`),
+never `all` with the flag on.
+
+⚠️ And right now, `ctest -R xmx-config` (or any of those 14 names) **exits 0 by
+matching zero tests.** That is the ticket's own first trap, live, on fourteen
+registrations.
+
+⚠️ **The pre-existing CMake comment at `:1216-1231` is itself miscounted and
+partly false** — a micro-finding in its own right, because it is the first
+thing the next reader will consult:
+
+- It says *"Twelve of the thirteen targets build."* There are **14** targets in
+  the guard, so both figures are wrong (13 build, 1 does not).
+- It says `test-unified-kernel-persistent` *"declares an EXTERNAL
+  `ggml_sycl_test_extract_layer_index` in its non-standalone branch, and no
+  such symbol exists anywhere in the tree."* **That symbol does exist**, at
+  `ggml/src/ggml-sycl/ggml-sycl.cpp:89939`, added by `2c49f9e13` ("sycl: expand
+  unified persistent TG graph integration") — confirmed with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n ggml_sycl_test_extract_layer_index`
+  (codescout is blind in that file, so the pipe-grep is the honest query). The
+  comment simply predates the commit.
+
+The **compile-failure disposition survives untouched** — it rests on the
+`StridedCopyMeta`/`SetRowsMeta` mismatch, which is independently verifiable and
+unaffected. Only the supporting extern claim was wrong, and this plan's first
+revision carried it forward from the comment without checking it. Correcting the
+CMake comment belongs to whoever owns
+`ggml/src/ggml-sycl/CMakeLists.txt` (`impl-w1`).
+
+### Cross-references (already counted elsewhere — do not add)
+
+- **Behind `GGML_BACKEND_DL`** (OFF): `test-sycl-module-dlopen`. Needs a
+  separate `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` build tree. **Counted
+  in Batch I.**
+- **Pre-existing RED**: `test-sycl-weight-key-uniqueness` — see its Batch H
+  row; resolve the baseline before running the mutation or the experiment is
+  void. **Counted in Batch H.**
+
+## Cross-task file conflicts — flag, do not route around silently
+
+Three mutation sites land in files another live task owns. **Do not apply
+these while that task is in flight; coordinate through `main`.**
+
+| file | tests affected | owner note |
+|---|---|---|
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | all 23 Batch I rows | W1 owns it concurrently per the u2mz ticket's own constraints section. This is the largest conflict in the plan. |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | all 14 Batch D rows | Same constraints section names W1 as the owner. |
+| `ggml/src/ggml-sycl/CMakeLists.txt` | none of the mutations, but every *fix* implied by the Blocked and Deletion sections | `impl-w1`'s as of 2026-08-02 (c-2qqk ownership note). This pass is scoped to `docs/` only and touched nothing. |
+
+The `mem-handle.cpp`, `mmvq.cpp`, `dmmv.cpp`, `fattn*.cpp` and standalone-TU
+batches have no recorded concurrent owner.
+
+## Execution order and total cost
+
+Cheapest-per-test first, which also front-loads the tests most likely to
+produce a clean, unambiguous RED:
+
+**The 127 partition exactly — machine-checked, no test in two groups and none
+unassigned:**
+
+| # | group | tests | builds | est. |
+|---|---|---|---|---|
+| 1 | A — no rebuild | 2 | 0 | ~10 min |
+| 2 | B — standalone TUs | 19 | 34 | ~1.5 h |
+| 3 | C — `mem-handle.cpp` | 5 | 6 | ~1.4 h |
+| 4 | E — `mmvq.cpp` | 5 | 6 | ~1.4 h |
+| 5 | D — `unified-cache.cpp` | 14 | 15 | ~3.5 h |
+| 6 | F — other backend TUs | 11 | 20 | ~4 h |
+| 7 | G — `common.hpp` | 5 | 6 | ~2.5 h |
+| 8 | H — other shared headers | 14 | 24 | ~7 h |
+| 9 | I — `ggml-sycl.cpp` + its private headers | 23 | 28 | ~9 h |
+| — | cannot be made to fail (delete/repair) | 7 | — | not executable |
+| — | mocks outside a batch (delete/repair) | 10 | — | mutation reaches no production code |
+| — | blocked by `GGML_SYCL_BUILD_XMX_TESTS` | 12 | — | target does not exist |
+| | **total** | **127** | **~139** | **~30 h** |
+
+Cost is dominated by builds, not runs: ~139 builds are the whole number, and 53
+of the 127 tests are CPU-only or device-free — those can be *run* by anyone.
+Only the builds (shared `build/`) and the GPU runs are lead-serialised.
+
+⚠️ **Counting convention, because the first revision of this plan got it
+wrong.** These twelve rows are a **partition**: every one of the 127 tests
+appears in exactly one, and the *Blocked* section further down is a
+cross-reference view over them, not an additional bucket. Two entries there
+(`test-sycl-module-dlopen`, `test-sycl-weight-key-uniqueness`) name tests
+already scored in Batch I and Batch H; adding them again is the double-count
+the `ona8` spec review caught. **The flat appendix at the end of this section is
+the authority** — 127 lines, one test each, checkable with
+`sort | uniq -d` returning nothing.
+
+Of the 23 Batch I rows, **19 mutate `ggml-sycl.cpp` itself** and 4 mutate
+headers that only `ggml-sycl.cpp` includes (`moe-bias-state.hpp`,
+`moe-layer-ids-cache.hpp`, `tiered-plan-clear.hpp`, `moe-discovery-state.hpp`).
+The last of those is cheap in practice — its test target links only
+`Threads::Threads`, so `ninja test-moe-discovery-owner-state` rebuilds one file
+and never touches the mega-TU; it is scored in I because the header's other
+consumer is the mega-TU, but budget it as Batch-B-class work.
+
+⚠️ **The three trailing groups are 25 of 127 — one test in five.** That is the
+headline finding of Phase A, and it is not an execution cost, it is a coverage
+result available today: a fifth of the registered SYCL C++ suite either cannot
+go red, tests a copy of itself, or is not built at all. The `ctest -R` exit-0
+trap in this ticket's description is live on thirteen of them right now.
+
+⚠️ Two standing rules apply throughout, from CLAUDE.md:
+
+- **Pin the selector on every run**: `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`
+  (or `:1` for B50-only). Six of these tests use `default_selector_v` or
+  self-default to device 0 with no selector in their registration, and the iGPU
+  reports 231.7 GB of "VRAM" (`llama.cpp-403s`). `test-unified-cache-bugs` is
+  additionally in the never-loop family (~8.5 GB RSS).
+- **A green is not evidence until you know work happened.** Fourteen tests in
+  this population print `SKIP: ...` and `return 0` on a missing device or
+  backend. For each, grep for the test's own `PASS:` string, never for `rc 0`
+  — and treat an implausibly short runtime as a signal.
+
+## Appendix: the flat partition (127 lines, one test each)
+
+Generated from the group assignments above, not retyped. Every registered SYCL
+C++ test in scope appears **exactly once**. Verify with:
+
+```bash
+# 127 lines, no duplicate test name
+awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must print nothing
+```
+
+| group | test |
+|---|---|
+| `B` | `test-cold-start` |
+| `I` | `test-cpu-gpu-soa-interaction` |
+| `I` | `test-cross-model-weight-usage` |
+| `H` | `test-dmmv-coalesced-q4-0-oracle` |
+| `F` | `test-dmmv-q6k-coalesced` |
+| `B` | `test-esimd-dpas-gate` |
+| `XMX-BLOCKED` | `test-esimd-prefetch` |
+| `XMX-BLOCKED` | `test-esimd-vectorized-dequant` |
+| `H` | `test-fattn-packed-k-lifecycle` |
+| `F` | `test-fattn-thread-local` |
+| `H` | `test-ggml-sycl-soa` |
+| `B` | `test-gpu-arch` |
+| `MOCK` | `test-kernel-dispatch` |
+| `I` | `test-layout-bytes` |
+| `D` | `test-mem-handle-eviction` |
+| `C` | `test-mem-handle-wrong-device` |
+| `F` | `test-mem-ops` |
+| `F` | `test-mmq-q6k-gpu` |
+| `B` | `test-mmq-xmx-dispatch` |
+| `B` | `test-mmvq-launch-geometry` |
+| `D` | `test-mmvq-q8-0-streaming-bench` |
+| `I` | `test-moe-bias-owner-state` |
+| `B` | `test-moe-control-plan` |
+| `I` | `test-moe-discovery-owner-state` |
+| `I` | `test-moe-layer-ids-worker-reset` |
+| `H` | `test-moe-mini-graph` |
+| `E` | `test-moe-mul-mat-id` |
+| `E` | `test-moe-mul-mat-id-q4q8` |
+| `XMX-BLOCKED` | `test-moe-mxfp4-dp4a` |
+| `B` | `test-moe-scratch-admission` |
+| `I` | `test-mul-mat-host-streaming` |
+| `XMX-BLOCKED` | `test-mxfp4-vector-dequant` |
+| `F` | `test-mxfp4-xmx-tiled` |
+| `MOCK` | `test-onednn-fallback` |
+| `B` | `test-onednn-woq` |
+| `H` | `test-q6k-dispatch` |
+| `F` | `test-q6k-reorder-dispatch` |
+| `F` | `test-q8-0-layout-cache-path` |
+| `E` | `test-q8-0-layout-cache-path-mmvq` |
+| `I` | `test-rms-norm-mul-add-broadcast` |
+| `F` | `test-sycl-cpu-dispatch` |
+| `B` | `test-sycl-cpu-traits-parity` |
+| `H` | `test-sycl-descriptor-retention` |
+| `I` | `test-sycl-device-uuid-api` |
+| `B` | `test-sycl-dispatch-tuning` |
+| `B` | `test-sycl-e2e-profile` |
+| `CANNOT-FAIL` | `test-sycl-esimd-float-atomic-compile` |
+| `F` | `test-sycl-fattn-onednn-descriptors` |
+| `F` | `test-sycl-fattn-onednn-materialization` |
+| `H` | `test-sycl-fattn-xmx-policy` |
+| `C` | `test-sycl-graph-retention-scope` |
+| `I` | `test-sycl-kernel-selection` |
+| `I` | `test-sycl-kv-planned-device-materialization` |
+| `G` | `test-sycl-kv-view-resolution` |
+| `D` | `test-sycl-layout-choice` |
+| `MOCK` | `test-sycl-level-zero-vmem-feasibility` |
+| `B` | `test-sycl-lifecycle-event-lease` |
+| `B` | `test-sycl-lifecycle-load-txn` |
+| `B` | `test-sycl-lifecycle-owner-reset` |
+| `CANNOT-FAIL` | `test-sycl-lifecycle-public-api` |
+| `B` | `test-sycl-lifecycle-runtime-host` |
+| `B` | `test-sycl-lifecycle-runtime-wrapper` |
+| `B` | `test-sycl-lifecycle-wrapper-overlap` |
+| `C` | `test-sycl-mem-handle-concurrent-resolve` |
+| `C` | `test-sycl-mem-handle-lifetime` |
+| `I` | `test-sycl-module-dlopen` |
+| `A` | `test-sycl-moe-direct-final-scratch-plan` |
+| `MOCK` | `test-sycl-moe-direct-final-token-major-bridge` |
+| `I` | `test-sycl-moe-expert-parallelism` |
+| `E` | `test-sycl-moe-fused-down-sum-policy` |
+| `A` | `test-sycl-moe-fusion-noactivation` |
+| `E` | `test-sycl-moe-gateup-prepack-policy` |
+| `H` | `test-sycl-moe-gateup-prepack-scratch` |
+| `MOCK` | `test-sycl-moe-glu-q8-artifact-policy` |
+| `MOCK` | `test-sycl-moe-glu-q8-fused-store-policy` |
+| `D` | `test-sycl-moe-handle-resolution` |
+| `H` | `test-sycl-moe-identity-hash` |
+| `D` | `test-sycl-moe-q8-scratch` |
+| `D` | `test-sycl-moe-residency-preflight` |
+| `I` | `test-sycl-moe-same-expert-grouping` |
+| `I` | `test-sycl-moe-sequence-graphlet-policy` |
+| `MOCK` | `test-sycl-moe-token-major-metadata` |
+| `I` | `test-sycl-moe-xmx-tiled-materialization` |
+| `D` | `test-sycl-moe-xmx-tiled-single-layout-planner` |
+| `H` | `test-sycl-moe-xmx-tiled-single-layout-policy` |
+| `CANNOT-FAIL` | `test-sycl-onednn-mxfp4-feasibility` |
+| `I` | `test-sycl-onednn-packed-cache` |
+| `I` | `test-sycl-orchestrator` |
+| `MOCK` | `test-sycl-pp-moe-scratch-lifecycle` |
+| `D` | `test-sycl-reset-model-weight-lease-preserve` |
+| `D` | `test-sycl-residency-diagnostics` |
+| `D` | `test-sycl-residency-reservation` |
+| `C` | `test-sycl-retained-handoff-barrier` |
+| `D` | `test-sycl-runtime-alloc` |
+| `F` | `test-sycl-set-rows-owner-routing` |
+| `G` | `test-sycl-tensor-placement` |
+| `G` | `test-sycl-tensor-usage` |
+| `B` | `test-sycl-timeline` |
+| `G` | `test-sycl-transient-alloc-intent-scope` |
+| `H` | `test-sycl-unified-cache` |
+| `H` | `test-sycl-unified-memory-e2e` |
+| `I` | `test-sycl-weight-key-stability` |
+| `H` | `test-sycl-weight-key-uniqueness` |
+| `G` | `test-sycl-xmx-unified-correctness` |
+| `CANNOT-FAIL` | `test-tensor-classification` |
+| `I` | `test-tensor-placement` |
+| `I` | `test-tiered-dispatch` |
+| `D` | `test-unified-cache-bugs` |
+| `D` | `test-unified-cache-concurrent` |
+| `D` | `test-unified-cache-fast-path` |
+| `I` | `test-unified-cache-integrity` |
+| `H` | `test-unified-dispatch-integration` |
+| `XMX-BLOCKED` | `test-unified-kernel` |
+| `XMX-BLOCKED` | `test-unified-kernel-ops` |
+| `CANNOT-FAIL` | `test-unified-kernel-persistent` |
+| `XMX-BLOCKED` | `test-xmx-compute` |
+| `XMX-BLOCKED` | `test-xmx-config` |
+| `XMX-BLOCKED` | `test-xmx-default-enable` |
+| `XMX-BLOCKED` | `test-xmx-esimd-basic` |
+| `XMX-BLOCKED` | `test-xmx-hardware-detect` |
+| `CANNOT-FAIL` | `test-xmx-host-streaming` |
+| `CANNOT-FAIL` | `test-xmx-kernel-config` |
+| `I` | `test-xmx-moe-mxfp4` |
+| `XMX-BLOCKED` | `test-xmx-optimization` |
+| `MOCK` | `test-xmx-quant-loaders` |
+| `MOCK` | `test-xmx-unified-kernel` |
+| `B` | `test-zone-sizing` |
+
+Group keys: `A`–`I` are the execution batches in order; `CANNOT-FAIL` is the
+deletion/repair set that no mutation can redden; `MOCK` reaches no production
+code; `XMX-BLOCKED` does not currently build. The last three are findings,
+not work items — nothing in them is scheduled for Phase B.
