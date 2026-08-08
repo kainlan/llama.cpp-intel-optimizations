@@ -519,13 +519,18 @@ struct staged_model_token {
 // Everything the preconditions need, not just the numbers: which layout the
 // dispatch resolved, whether that pointer is distinct from the AoS storage, and
 // the bytes behind that exact pointer.
+//
+// `outputs` holds one result per probe activation, all computed against the SAME
+// staged weight and the SAME resolved layout pointer. Re-staging per probe would
+// let a difference between probes be a difference between stagings instead, which
+// is the one thing these probes must not be able to confound.
 struct staged_gpu_result {
-    bool                 ok      = false;
-    const char *         failure = nullptr;
-    std::vector<float>   output;
-    std::vector<uint8_t> layout_bytes;
-    ggml_layout_mode     resolved_layout     = GGML_LAYOUT_AOS;
-    bool                 layout_ptr_distinct = false;
+    bool                            ok      = false;
+    const char *                    failure = nullptr;
+    std::vector<std::vector<float>> outputs;
+    std::vector<uint8_t>            layout_bytes;
+    ggml_layout_mode                resolved_layout     = GGML_LAYOUT_AOS;
+    bool                            layout_ptr_distinct = false;
 };
 
 static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
@@ -548,14 +553,14 @@ static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft
 // a transaction and only for a host-resident weight buffer; outside either it
 // silently registers nothing and S1-PRELOAD never sees the tensor. Pattern and
 // full RCA: tests/test-q8-0-layout-cache-path.cpp (llama.cpp-43uy).
-static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
-                                                       int            device_id,
-                                                       const char *   weight_name,
-                                                       const void *   weight_data,
-                                                       size_t         weight_size,
-                                                       const float *  input_data,
-                                                       int            ncols,
-                                                       int            nrows) {
+static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t                     backend,
+                                                       int                                device_id,
+                                                       const char *                       weight_name,
+                                                       const void *                       weight_data,
+                                                       size_t                             weight_size,
+                                                       const std::vector<const float *> & input_probes,
+                                                       int                                ncols,
+                                                       int                                nrows) {
     staged_gpu_result result{};
 
     ggml_sycl::test_clear_host_weight_registry();
@@ -619,8 +624,6 @@ static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
     }
     model.held = true;
 
-    ggml_backend_tensor_set(input, input_data, 0, (size_t) ncols * sizeof(float));
-
     // This is the same call the mul_mat dispatcher makes to pick a kernel, so
     // its layout is the layout the kernel will run against -- not an adjacent
     // signal about what the cache happens to hold.
@@ -658,15 +661,102 @@ static staged_gpu_result run_dmmv_coalesced_gpu_staged(ggml_backend_t backend,
 
     struct ggml_cgraph * graph = ggml_new_graph(res.ctx);
     ggml_build_forward_expand(graph, out);
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        result.failure = "GPU graph compute failed";
-        return result;
+
+    result.outputs.resize(input_probes.size());
+    for (size_t p = 0; p < input_probes.size(); ++p) {
+        ggml_backend_tensor_set(input, input_probes[p], 0, (size_t) ncols * sizeof(float));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            result.failure = "GPU graph compute failed";
+            return result;
+        }
+        result.outputs[p].resize(nrows);
+        ggml_backend_tensor_get(out, result.outputs[p].data(), 0, result.outputs[p].size() * sizeof(float));
     }
 
-    result.output.resize(nrows);
-    ggml_backend_tensor_get(out, result.output.data(), 0, result.output.size() * sizeof(float));
     result.ok = true;
     return result;
+}
+
+// =============================================================================
+// Stage-separating probes (llama.cpp-szv8)
+// =============================================================================
+//
+// The gate compares the GPU against dmmv_q4_0_dfloat_reference(), and a
+// disagreement there says only "something upstream of the answer differs". These
+// two probes split that into the stages plan Task 9 names, using activations
+// chosen so that a whole stage becomes exact rather than merely small:
+//
+//   * ONE-HOT (row addressing + scale + dequantization). y is 1.0 at a single
+//     column and 0 elsewhere, so the answer for row r is exactly the dequantized
+//     weight element (r, col) with NO accumulation and NO quantization error:
+//     1.0 and 0.0 survive f32, fp16 and 8-bit block quantization unchanged
+//     (amax=1 gives q=127 and 127*d back to within one fp16 ulp of the scale).
+//     Any disagreement here is structural -- a wrong byte, a wrong scale, or a
+//     wrong row -- and cannot be rounding.
+//
+//   * Q8-SNAPPED (activation quantization). y is the gate's own random vector
+//     pushed onto the Q8_0 grid and back, so an 8-bit-activation kernel
+//     reproduces it exactly and its quantization error vanishes. If the gate's
+//     failure collapses here while the one-hot probe is clean, the causal stage
+//     is activation handling and the arithmetic is sound; if it survives, the
+//     activation is exonerated and the defect is in the weight path.
+//
+// The pair is exhaustive over the plan's four candidate stages: materialization
+// is already proven byte-exact by compare_device_coalesced_layout(), the one-hot
+// probe covers addressing and dequantization, and the Q8-snapped probe covers
+// activation handling and accumulation.
+
+// Round-trip through the Q8_0 grid: quantize, then dequantize with the fp16
+// scale the block actually stores. The result is a fixed point of that grid, so
+// a kernel that re-quantizes it recovers the same integers.
+static void snap_activation_to_q8_0(const float * src, float * dst, int ncols) {
+    const int               nblocks = ncols / QK4_0;  // QK8_0 == QK4_0 == 32
+    std::vector<block_q8_0> q(nblocks);
+    quantize_row_q8_0_ref(src, q.data(), ncols);
+
+    for (int b = 0; b < nblocks; ++b) {
+        const float d = ggml_fp16_to_fp32(q[b].d);
+        for (int j = 0; j < QK4_0; ++j) {
+            dst[b * QK4_0 + j] = (float) q[b].qs[j] * d;
+        }
+    }
+}
+
+// The exact answer for a one-hot activation at `col`: the dequantized weight
+// element (row, col), read straight out of the AoS blocks.
+static float one_hot_expected(const block_q4_0_test * x, int ncols, int row, int col) {
+    const int               blocks_per_row = ncols / QK4_0;
+    const int               block_in_row   = col / QK4_0;
+    const int               elem_in_block  = col % QK4_0;
+    const block_q4_0_test * blk            = &x[row * blocks_per_row + block_in_row];
+
+    const uint8_t byte = blk->qs[elem_in_block % (QK4_0 / 2)];
+    const int     q    = (elem_in_block < QK4_0 / 2) ? (byte & 0xF) : (byte >> 4);
+    return (float) (q - 8) * ggml_fp16_to_fp32(blk->d);
+}
+
+struct oracle_score {
+    int   errors    = 0;
+    float max_diff  = 0.0f;
+    float max_rel   = 0.0f;
+    int   first_bad = -1;
+};
+
+static oracle_score score_against(const std::vector<float> & got, const std::vector<float> & want, float abs_gate) {
+    oracle_score s;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float diff = fabsf(got[i] - want[i]);
+        const float rel  = diff / fmaxf(1.0f, fabsf(want[i]));
+        s.max_diff       = fmaxf(s.max_diff, diff);
+        s.max_rel        = fmaxf(s.max_rel, rel);
+        if (diff > abs_gate) {
+            if (s.first_bad < 0) {
+                s.first_bad = (int) i;
+            }
+            s.errors++;
+        }
+    }
+    return s;
 }
 
 static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
@@ -714,8 +804,31 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
     char weight_name[64];
     snprintf(weight_name, sizeof(weight_name), "blk.%d.attn_q.weight", case_index);
 
-    staged_gpu_result staged = run_dmmv_coalesced_gpu_staged(
-        gpu_backend, /*device_id=*/0, weight_name, weight_quant.data(), weight_bytes, input_data.data(), ncols, nrows);
+    // Probe 0 is the gate's own activation; the rest are the stage separators
+    // described above. All six run against one staging, so a difference between
+    // them is a difference in the activation and nothing else.
+    std::vector<float> input_q8_snapped(ncols);
+    snap_activation_to_q8_0(input_data.data(), input_q8_snapped.data(), ncols);
+
+    // Columns chosen to move every axis of the addressing contract: low vs high
+    // nibble of the same byte, a different word plane of a different block, and
+    // the last element of the last tile of the row.
+    const int                       one_hot_cols[] = { 0, 16, 33, ncols - 1 };
+    constexpr int                   n_one_hot      = (int) (sizeof(one_hot_cols) / sizeof(one_hot_cols[0]));
+    std::vector<std::vector<float>> one_hot_inputs(n_one_hot, std::vector<float>(ncols, 0.0f));
+    for (int p = 0; p < n_one_hot; ++p) {
+        one_hot_inputs[p][one_hot_cols[p]] = 1.0f;
+    }
+
+    std::vector<const float *> probes;
+    probes.push_back(input_data.data());
+    probes.push_back(input_q8_snapped.data());
+    for (int p = 0; p < n_one_hot; ++p) {
+        probes.push_back(one_hot_inputs[p].data());
+    }
+
+    staged_gpu_result staged = run_dmmv_coalesced_gpu_staged(gpu_backend, /*device_id=*/0, weight_name,
+                                                             weight_quant.data(), weight_bytes, probes, ncols, nrows);
     if (!staged.ok) {
         // Each precondition reports itself, so a run that never reached the
         // coalesced kernel cannot be read as a verdict about that kernel.
@@ -731,7 +844,7 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         return false;
     }
 
-    const std::vector<float> &   gpu_out          = staged.output;
+    const std::vector<float> &   gpu_out          = staged.outputs[0];
     const std::vector<uint8_t> & weight_coalesced = staged.layout_bytes;
 
     if (!run_mul_mat_backend(cpu_backend, GGML_TYPE_Q4_0, weight_quant.data(), weight_bytes,
@@ -829,6 +942,8 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL", cpu_backend_max_diff);
     }
     if (!pass) {
+        const auto * x_aos = reinterpret_cast<const block_q4_0_test *>(weight_quant.data());
+
         // How big is the gap between the two oracles alone? If the GPU's spread
         // against the dfloat reference sits at this scale, the dispatch took the
         // Q8_0-activation branch and the reference models the other one; a
@@ -838,8 +953,7 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
         quantize_row_q8_0_ref(input_data.data(), y_q8.data(), ncols);
 
         std::vector<float> ref_q8(nrows);
-        dmmv_q4_0_q8_activation_reference(reinterpret_cast<const block_q4_0_test *>(weight_quant.data()), y_q8.data(),
-                                          ref_q8.data(), ncols, nrows);
+        dmmv_q4_0_q8_activation_reference(x_aos, y_q8.data(), ref_q8.data(), ncols, nrows);
 
         float oracle_gap = 0.0f;
         for (int i = 0; i < nrows; ++i) {
@@ -849,6 +963,73 @@ static bool run_dmmv_coalesced_case(ggml_backend_t gpu_backend,
             "    diagnosis: max|dfloat_oracle - Q8_0_activation_oracle|=%.6f"
             " (the gap the oracle choice alone accounts for)\n",
             oracle_gap);
+
+        // The comparison the previous rounds never made: the GPU scored against
+        // the Q8_0-activation oracle DIRECTLY. Scoring the two oracles against
+        // each other says how much of the gap that branch COULD explain; scoring
+        // the GPU against it says whether it DOES.
+        std::vector<float> ref_f32(nrows);
+        dmmv_q4_0_cpu_reference(x_aos, input_data.data(), ref_f32.data(), ncols, nrows);
+
+        const oracle_score s_dfloat = score_against(gpu_out, ref, 1e-2f);
+        const oracle_score s_f32    = score_against(gpu_out, ref_f32, 1e-2f);
+        const oracle_score s_q8     = score_against(gpu_out, ref_q8, 1e-2f);
+        printf("    gpu vs f32-activation    oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_f32.errors,
+               s_f32.max_diff, s_f32.max_rel);
+        printf("    gpu vs dfloat-activation oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_dfloat.errors,
+               s_dfloat.max_diff, s_dfloat.max_rel);
+        printf("    gpu vs Q8_0-activation   oracle: errors=%d max_diff=%.6f max_rel=%.6f\n", s_q8.errors,
+               s_q8.max_diff, s_q8.max_rel);
+
+        // Same three oracles recomputed from the ACTUAL coalesced bytes the
+        // kernel reads, not from the AoS source. Agreement between the two
+        // families confirms the addressing contract reproduces the AoS weights;
+        // disagreement would move the stage to the layout reader.
+        std::vector<float> ref_from_layout(nrows);
+        dmmv_q4_0_cpu_from_coalesced(weight_coalesced.data(), input_data.data(), ref_from_layout.data(), ncols, nrows);
+        const oracle_score s_layout = score_against(ref_from_layout, ref_f32, 1e-3f);
+        printf("    coalesced-bytes oracle vs f32 oracle: errors=%d max_diff=%.6f (contract readback cross-check)\n",
+               s_layout.errors, s_layout.max_diff);
+
+        // Stage probe 1: activation quantization. Snapping the activation onto
+        // the Q8_0 grid makes an 8-bit-activation kernel exact, so a collapse
+        // here names activation handling as the causal stage and a survival
+        // exonerates it.
+        std::vector<float> ref_snapped(nrows);
+        dmmv_q4_0_dfloat_reference(x_aos, input_q8_snapped.data(), ref_snapped.data(), ncols, nrows);
+        const oracle_score s_snap = score_against(staged.outputs[1], ref_snapped, 1e-2f);
+        printf("    PROBE q8-snapped activation: errors=%d max_diff=%.6f max_rel=%.6f (gate probe was %d / %.6f)\n",
+               s_snap.errors, s_snap.max_diff, s_snap.max_rel, errors, max_diff);
+
+        // Stage probe 2: row addressing, scale selection and dequantization.
+        // Exact under every activation branch, so any error here is structural.
+        for (int p = 0; p < n_one_hot; ++p) {
+            const std::vector<float> & got = staged.outputs[2 + p];
+            std::vector<float>         want(nrows);
+            for (int i = 0; i < nrows; ++i) {
+                want[i] = one_hot_expected(x_aos, ncols, i, one_hot_cols[p]);
+            }
+            const oracle_score s = score_against(got, want, 1e-3f);
+            printf("    PROBE one-hot col=%-6d (block=%d %s nibble): errors=%d max_diff=%.6f", one_hot_cols[p],
+                   one_hot_cols[p] / QK4_0, (one_hot_cols[p] % QK4_0) < QK4_0 / 2 ? "low " : "high", s.errors,
+                   s.max_diff);
+            if (s.first_bad >= 0) {
+                printf(" first_bad_row=%d gpu=%.6f want=%.6f", s.first_bad, got[s.first_bad], want[s.first_bad]);
+            }
+            printf("\n");
+        }
+
+        // The first divergent row, with every oracle side by side. A ratio near
+        // one with an additive offset reads as a rounding/quantization stage; a
+        // ratio that wanders reads as a structural one.
+        if (s_dfloat.first_bad >= 0) {
+            const int i = s_dfloat.first_bad;
+            printf(
+                "    first divergent row=%d: gpu=%.6f f32=%.6f dfloat=%.6f q8=%.6f"
+                " layout_bytes=%.6f  gpu/dfloat=%.6f\n",
+                i, gpu_out[i], ref_f32[i], ref[i], ref_q8[i], ref_from_layout[i],
+                ref[i] != 0.0f ? gpu_out[i] / ref[i] : 0.0f);
+        }
     }
     return pass;
 }
