@@ -98286,7 +98286,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 // CUDA and CPU do accept an F16 src0 when dst is F16 (ggml-cuda/set-rows.cu:380,
                 // ggml-cpu/ops.cpp:5110-5122). SYCL has no F16-src instantiation, so those cases are
                 // declined here and fall back to CPU; adding the instantiation is a separate capability
-                // change, not part of making this predicate agree with the op.
+                // change (llama.cpp-9vm3), not part of making this predicate agree with the op.
                 //
                 // ggml_sycl_type_is_fp8_e4m3() is unconditionally false today (common.hpp:6304). Should
                 // an FP8 E4M3 ggml type ever appear, the dst-type switch needs an FP8 case first -- its
