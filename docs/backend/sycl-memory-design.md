@@ -114,9 +114,26 @@ budget gate at all. The seam is retained by decision, not by inertia — full
 adjudication in `llama.cpp-og9dt` comment `c-4lcs`.
 
 **Do not add a production caller.** The zero-production-caller state is the
-enforcement mechanism; verify with
-`grep -rn ensure_cached_alloc ggml/ src/ common/ tools/ examples/`, which must
-return only the declaration and its definition.
+enforcement mechanism — a convention, not a constraint, so it is worth checking
+rather than assuming:
+
+```bash
+grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
+     --include='*.cpp' --include='*.hpp' --exclude-dir=tests
+```
+
+Expect **exactly two** lines — the declaration in `unified-cache.hpp` and the
+definition in `unified-cache.cpp`. A third line is the violation signature, and
+it names the offending file. Verified both directions: two lines today, three
+with a deliberately injected caller. `--exclude-dir=tests` drops both `tests/`
+and `ggml/src/ggml-sycl/tests/`, which are legitimate callers. The pattern is
+literal, so read a third line rather than trusting it — a production-side
+*comment* that spells the name with parens would also appear.
+
+Do **not** substitute a bare `grep -rn ensure_cached_alloc ggml/ src/ …`. That
+returns 14 lines (the implementation's diagnostic strings, comments, the check's
+own text, and a historical planning doc under
+`ggml/src/ggml-sycl/docs/`), so it reads as a violation when nothing is wrong.
 
 ## Weights: cache-managed WEIGHT handles
 

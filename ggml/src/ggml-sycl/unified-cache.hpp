@@ -2897,9 +2897,23 @@ class unified_cache {
     // flows through unified-cache APIs" holds as written.
     //
     // Enforcement is the zero-production-caller state itself.  Before adding a
-    // caller, confirm you are not the first outside tests/:
-    //   grep -rn ensure_cached_alloc ggml/ src/ common/ tools/ examples/
-    // must return only this declaration and unified-cache.cpp's definition.
+    // caller, confirm you would be the first outside tests/:
+    //
+    //   grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
+    //        --include='*.cpp' --include='*.hpp' --exclude-dir=tests
+    //
+    // Expect EXACTLY TWO lines: this declaration, and the definition in
+    // unified-cache.cpp.  A third line is the violation signature and it names
+    // the offending file.  (Verified both ways: 2 today, 3 with an injected
+    // caller.)  The pattern is deliberately literal, so read a third line rather
+    // than trusting it — a production-side *comment* spelling the name with
+    // parens would also show up.  --exclude-dir=tests drops both tests/ and
+    // ggml/src/ggml-sycl/tests/, which are legitimate callers.
+    //
+    // Do NOT substitute a bare `grep -rn ensure_cached_alloc ggml/ src/ ...`:
+    // that returns 14 lines — diagnostic strings, comments, this comment's own
+    // text, and a historical planning doc — so it reads as a violation when
+    // nothing is wrong.
     //
     // Full adjudication (34 call sites, all under tests/): llama.cpp-og9dt c-4lcs.
     void *           ensure_cached_alloc(const ggml_sycl_cache_id & key,
