@@ -625,9 +625,14 @@ fast-path."* Both clauses are false:
 1. **The variable does not exist.** `3c8f296fd` (2026-05-15) removed the
    `getenv("GGML_SYCL_FA_ONEDNN_ALLOW")` bypass **and added that warning in the
    same commit** — it documented a footgun it had just deleted. Setting the name
-   today is a no-op. The only surviving occurrences are stale prose: a source
-   comment at `ggml/src/ggml-sycl/fattn.cpp:2804` and one line in
-   `docs/backend/SYCL.md:896`, neither of which this document can correct.
+   today is a no-op. Both sites this note first listed as stale prose have since
+   been corrected and are now history rather than advice:
+   `ggml/src/ggml-sycl/fattn.cpp:2803-2807` states outright that "That getenv was
+   removed in `3c8f296fd` and the materializer landed in `16a241dd1`; the
+   variable no longer exists anywhere, so do not reintroduce it as a 'safety'
+   switch", and `docs/backend/SYCL.md:897` carries its own correction. The last
+   live settings of the dead name — one test leg and two lines of
+   `scripts/validate-kkxtv7-sycl.sh` — were removed under `llama.cpp-ivue`.
 2. **oneDNN SDPA is on by default and Mistral uses it, with no correctness
    penalty.** `16a241dd1` (2026-05-30) added the `MATERIALIZE_REQUIRED` path, so
    nc≠D GQA is no longer rejected. Disabling it costs ~39% of PP512 (1.63x

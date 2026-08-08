@@ -41,7 +41,6 @@
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
@@ -106,21 +105,32 @@ static fattn_params mqa_like_params(int k_nc_stride_elems) {
     return params;
 }
 
+// ggml_sycl_flash_attn_ext_onednn_eligible is the boolean face of the planner,
+// and it must answer "DIRECT-eligible", not merely "not rejected". A GQA shape
+// with nc_stride != D plans MATERIALIZE_REQUIRED, so the wrapper has to report
+// false: what makes that shape safe is the materializer building dense f16 K/V
+// first, never the direct descriptor.
+//
+// This case used to wrap the call in setenv("GGML_SYCL_FA_ONEDNN_ALLOW", "1")
+// and assert the shape stayed ineligible *even with* the bypass set. That leg
+// was vacuous — 3c8f296fd removed that getenv, so it was the unset call made
+// twice and could not fail differently. Repointing it at the real variable
+// GGML_SYCL_FA_ONEDNN would be vacuous the same way: that name gates
+// g_sycl_fa_onednn_enabled in fattn.cpp, a file-scope flag the planner cannot
+// see (documented at fattn-onednn.hpp's declaration) and which latches once per
+// process. The planner reads no environment at all except
+// GGML_SYCL_FA_ONEDNN_MIN_NCOLS, itself cached in a function-local static.
+// The layout property below is the falsifiable part and is what survives.
 static bool test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible() {
-    setenv("GGML_SYCL_FA_ONEDNN_ALLOW", "1", 1);
-
     fattn_params params   = mistral_like_params(/*k_nc_stride_elems=*/512);
     const bool   eligible = ggml_sycl_flash_attn_ext_onednn_eligible(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                      /*multi_seq=*/false);
 
-    unsetenv("GGML_SYCL_FA_ONEDNN_ALLOW");
-    TEST_ASSERT(!eligible, "nc_stride != D GQA must not be direct-eligible even with GGML_SYCL_FA_ONEDNN_ALLOW=1");
+    TEST_ASSERT(!eligible, "nc_stride != D GQA plans MATERIALIZE_REQUIRED and must not report direct-eligible");
     return true;
 }
 
 static bool test_gqa_nc_stride_equal_d_remains_onednn_eligible() {
-    unsetenv("GGML_SYCL_FA_ONEDNN_ALLOW");
-
     fattn_params params   = mistral_like_params(/*k_nc_stride_elems=*/128);
     const bool   eligible = ggml_sycl_flash_attn_ext_onednn_eligible(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                      /*multi_seq=*/false);

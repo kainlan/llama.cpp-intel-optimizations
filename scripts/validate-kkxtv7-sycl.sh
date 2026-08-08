@@ -390,9 +390,12 @@ record_unsafe_onednn_repro_evidence() {
     local evidence="${LOG_DIR}/mistral-unsafe-onednn-repro-evidence.txt"
     local cmd="${LOG_DIR}/mistral-unsafe-onednn-repro.cmd"
 
+    # The pre-fix command additionally set GGML_SYCL_FA_ONEDNN_ALLOW=1. That
+    # getenv was removed in 3c8f296fd, so emitting the name here would put a
+    # dead variable into a file whose whole purpose is to be copy-pasted. The
+    # fact is recorded as prose in the evidence text below instead.
     shell_quote env \
         ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-        GGML_SYCL_FA_ONEDNN_ALLOW=1 \
         GGML_SYCL_FA_FORCE_PATH=onednn \
         "${BUILD_PATH}/bin/llama-completion" \
         -m "${MISTRAL_MODEL}" \
@@ -402,6 +405,8 @@ record_unsafe_onednn_repro_evidence() {
     {
         echo "Historical unsafe oneDNN deterministic completion repro."
         echo "This is intentionally not rerun after the safety fix because the override is now barred."
+        echo "The pre-fix invocation also set GGML_SYCL_FA_ONEDNN_ALLOW=1; 3c8f296fd removed that getenv,"
+        echo "so the name is inert today and is omitted from cmd_file to keep that file runnable as written."
         echo "cmd_file=${cmd}"
         echo "historical_log=${MISTRAL_UNSAFE_ONEDNN_REPRO_LOG}"
         if [[ -f "${MISTRAL_UNSAFE_ONEDNN_REPRO_LOG}" ]]; then
@@ -618,9 +623,13 @@ if [[ "${mode}" == "full" ]]; then
             require_min_speed "mistral-${device_label}-pp512-tg128" \
                 "${LOG_DIR}/mistral-${device_label}-pp512-tg128.log" tg128 "${MISTRAL_B580_MIN_TG}"
 
+            # GGML_SYCL_FA_ONEDNN is ON by default; pinning it keeps this leg
+            # independent of an inherited GGML_SYCL_FA_ONEDNN=0. It replaces a
+            # GGML_SYCL_FA_ONEDNN_ALLOW=1 line that had been a no-op since
+            # 3c8f296fd removed that getenv.
             run_env_logged "mistral-${device_label}-force-onednn-materialized" \
                 ONEAPI_DEVICE_SELECTOR="${selector}" \
-                GGML_SYCL_FA_ONEDNN_ALLOW=1 \
+                GGML_SYCL_FA_ONEDNN=1 \
                 GGML_SYCL_FA_FORCE_PATH=onednn \
                 GGML_SYCL_FA_DISPATCH_DEBUG=1 \
                 GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT=4 \
