@@ -2875,19 +2875,59 @@ class unified_cache {
     bool   contains_pinned_backing_allocation(const void * ptr, size_t size) const;
     size_t pre_allocate_host_pool(size_t total_bytes);
 
-    // Deprecated shim — tests written against the old API. Migrate callers to unified_alloc().
-    [[deprecated("use unified_alloc()")]] void * ensure_cached_alloc(const ggml_sycl_cache_id & key,
-                                                                     const void *               src_ptr,
-                                                                     size_t                     src_size,
-                                                                     size_t                     alloc_size,
-                                                                     cache_entry_type           type,
-                                                                     int                        layer_id,
-                                                                     int                        expert_id,
-                                                                     ggml_layout_mode           layout,
-                                                                     bool                       validate_content,
-                                                                     bool *                     needs_fill);
-    size_t                                       pre_allocate_all(size_t model_weight_bytes);
-    size_t                                       pre_allocate_runtime_chunks(size_t total_bytes);
+    // TEST-ONLY SEAM — do not call from production code.  NOT deprecated.
+    //
+    // This carried [[deprecated("use unified_alloc()")]] until llama.cpp-og9dt,
+    // and that advice was wrong: neither named alternative can replace it.
+    //   - unified_alloc() creates NO cache entry, so is_cached()/get()/remove()/
+    //     evict()/pin()/used() cannot observe the allocation at all.
+    //   - ensure_cached() host-falls-back when eviction is impossible instead of
+    //     failing, and host-resident entries do not charge used_ — so every
+    //     "allocation refused under budget pressure" assertion inverts.  It also
+    //     takes a single size, so src_size != alloc_size is inexpressible.
+    //   - allocate_slot() prefers the arena, and arena-routed entries set
+    //     cache_budget_charged = false; it has no budget gate at all.
+    //
+    // What is unique here, and what the cache fixtures need: entry-creating,
+    // budget-gated (used_ + size > budget_ -> evict_one -> nullptr), device-only
+    // and FAIL-CLOSED, caller-filled via needs_fill, with src_size independent
+    // of alloc_size.  Allocating OUTSIDE the arena is deliberate — it is the
+    // property under test, not a contract violation: the implementation lives
+    // inside unified-cache.cpp, so the canonical contract's "all allocation
+    // flows through unified-cache APIs" holds as written.
+    //
+    // Enforcement is the zero-production-caller state itself.  Before adding a
+    // caller, confirm you would be the first outside tests/:
+    //
+    //   grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
+    //        --include='*.cpp' --include='*.hpp' --exclude-dir=tests
+    //
+    // Expect EXACTLY TWO lines: this declaration, and the definition in
+    // unified-cache.cpp.  A third line is the violation signature and it names
+    // the offending file.  (Verified both ways: 2 today, 3 with an injected
+    // caller.)  The pattern is deliberately literal, so read a third line rather
+    // than trusting it — a production-side *comment* spelling the name with
+    // parens would also show up.  --exclude-dir=tests drops both tests/ and
+    // ggml/src/ggml-sycl/tests/, which are legitimate callers.
+    //
+    // Do NOT substitute a bare `grep -rn ensure_cached_alloc ggml/ src/ ...`:
+    // that returns 14 lines — diagnostic strings, comments, this comment's own
+    // text, and a historical planning doc — so it reads as a violation when
+    // nothing is wrong.
+    //
+    // Full adjudication (34 call sites, all under tests/): llama.cpp-og9dt c-4lcs.
+    void *           ensure_cached_alloc(const ggml_sycl_cache_id & key,
+                                         const void *               src_ptr,
+                                         size_t                     src_size,
+                                         size_t                     alloc_size,
+                                         cache_entry_type           type,
+                                         int                        layer_id,
+                                         int                        expert_id,
+                                         ggml_layout_mode           layout,
+                                         bool                       validate_content,
+                                         bool *                     needs_fill);
+    size_t           pre_allocate_all(size_t model_weight_bytes);
+    size_t           pre_allocate_runtime_chunks(size_t total_bytes);
     // Host zone allocation (owned by unified_cache).
     segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
     void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);

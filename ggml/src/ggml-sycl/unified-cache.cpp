@@ -14032,11 +14032,28 @@ size_t unified_cache::available_device() const {
     return free_mem - VRAM_SAFETY_MARGIN;
 }
 
-// --- Deprecated shim: ensure_cached_alloc ---
-// Restored verbatim from pre-kcru9 deletion to keep test suite building.
-// New code must use unified_alloc() instead.
-// TODO: Port test suite (tests/test-sycl-unified-cache*, ~40 call sites across 5 files) to
-// unified_alloc(), then delete this shim. Tracked in bd: llama.cpp-og9dt.
+// --- Test-only seam: ensure_cached_alloc ---
+// Restored verbatim from pre-kcru9 deletion. Originally kept "to keep the test
+// suite building", and marked [[deprecated("use unified_alloc()")]] with a TODO
+// to port the callers and delete it. llama.cpp-og9dt tried to execute that TODO
+// and found it is not executable: this is a distinct allocation POLICY, not an
+// alias, and nothing else in the class implements it.
+//
+// Retained deliberately. The attribute is gone and the TODO is withdrawn — see
+// the constraint comment on the declaration in unified-cache.hpp for why each
+// named alternative (unified_alloc, ensure_cached, allocate_slot) fails, and
+// llama.cpp-og9dt c-4lcs for the full adjudication.
+//
+// The two properties that make it irreplaceable are both visible below:
+//   1. FAIL-CLOSED under budget pressure — the `while (used_ + alloc_size >
+//      budget_)` loops return nullptr when evict_one() cannot free. There is no
+//      host fallback; ensure_cached() has one, which is why it cannot stand in.
+//   2. src_size and alloc_size are independent — only src_size is ever read
+//      (compute_content_hash), so a test can request an allocation far larger
+//      than its source buffer to drive the failure path.
+//
+// Do not call this from production code. As of llama.cpp-og9dt all 34 call
+// sites are under tests/; that zero-production-caller state is the enforcement.
 
 void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                                           const void *               src_ptr,

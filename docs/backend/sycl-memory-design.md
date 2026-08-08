@@ -90,6 +90,51 @@ The older `unified_alloc(req, &alloc_handle)` / `unified_free(handle)` pair
 machinery; `unified_allocate` is the smart-pointer front that most callers
 should use. `alloc_handle::as_mem_handle()` bridges the two.
 
+### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
+
+`unified_cache::ensure_cached_alloc()` is the single allocation path that
+**deliberately allocates outside the arena** — it gates on
+`used_ + size > budget_`, evicts, and then calls `sycl::malloc_device` directly.
+It has **zero production callers**; all 34 call sites are under `tests/`.
+
+This does not violate the entry-point rule above: the implementation lives
+*inside* `unified-cache.cpp` and hands back cache-owned memory, which is exactly
+what the canonical contract requires. What it provides that nothing else does is
+a **fail-closed, device-only, budget-gated, entry-creating** allocation with
+`src_size` independent of `alloc_size` — the shape the cache fixtures need to
+drive eviction refusal and allocation failure deterministically.
+
+It carried `[[deprecated("use unified_alloc()")]]` until `llama.cpp-og9dt`. That
+advice was wrong and the attribute has been removed: `unified_alloc()` creates no
+cache entry (so `is_cached`/`evict`/`used()` cannot see the allocation),
+`ensure_cached()` falls back to host memory rather than failing when eviction is
+impossible (inverting every "refused under pressure" assertion, and host-resident
+entries do not charge `used_`), and `allocate_slot()` prefers the arena with no
+budget gate at all. The seam is retained by decision, not by inertia — full
+adjudication in `llama.cpp-og9dt` comment `c-4lcs`.
+
+**Do not add a production caller.** The zero-production-caller state is the
+enforcement mechanism — a convention, not a constraint, so it is worth checking
+rather than assuming:
+
+```bash
+grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
+     --include='*.cpp' --include='*.hpp' --exclude-dir=tests
+```
+
+Expect **exactly two** lines — the declaration in `unified-cache.hpp` and the
+definition in `unified-cache.cpp`. A third line is the violation signature, and
+it names the offending file. Verified both directions: two lines today, three
+with a deliberately injected caller. `--exclude-dir=tests` drops both `tests/`
+and `ggml/src/ggml-sycl/tests/`, which are legitimate callers. The pattern is
+literal, so read a third line rather than trusting it — a production-side
+*comment* that spells the name with parens would also appear.
+
+Do **not** substitute a bare `grep -rn ensure_cached_alloc ggml/ src/ …`. That
+returns 14 lines (the implementation's diagnostic strings, comments, the check's
+own text, and a historical planning doc under
+`ggml/src/ggml-sycl/docs/`), so it reads as a violation when nothing is wrong.
+
 ## Weights: cache-managed WEIGHT handles
 
 Weights aren't allocated ad-hoc — they're materialized into the cache per the
