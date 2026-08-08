@@ -497,31 +497,72 @@ request:
   there. No conversion needed for this case; the `_owner_` fields the ticket
   flagged for verification were already doing the job.
 
-**The fix, scoped to the arena case only.** Before allocating a new pair,
-`reserve_onednn_scratch()` now individually `zone_free()`s whichever of the
-two OLD pointers is currently arena-owned (`vram_owns(ptr)`), then nulls that
-field. A pointer that is instead a DIRECT leftover from an earlier growth
-episode is left untouched by this step — it is already a real lease, and the
-existing `release_direct_scratch()` cleanup a few lines later (unchanged)
-still frees it. On a partial failure (the weights half allocates but the
-activations half does not, or vice versa), only the half that this attempt
-itself allocated is freed — the old pair was already individually reclaimed
-up front, so there is nothing else in the zone to touch.
+**The fix, scoped to the arena case only.** Before doing anything else —
+before even reading `zone_capacity()` — `reserve_onednn_scratch()` now
+individually `zone_free()`s whichever of the two OLD pointers is currently
+arena-owned (`vram_owns(ptr)`), then nulls that field. A pointer that is
+instead a DIRECT leftover from an earlier growth episode is left untouched by
+this step — it is already a real lease, and the existing
+`release_direct_scratch()` cleanup a few lines later (unchanged) still frees
+it. On a partial failure (the weights half allocates but the activations
+half does not, or vice versa), only the half that this attempt itself
+allocated is freed — the old pair was already individually reclaimed up
+front, so there is nothing else in the zone to touch.
+
+**The point-release must run unconditionally, before the capacity check —
+not inside the "zone is big enough" branch.** The first version of this step
+put the release inside `if (total_needed <= zone_cap)`, after the
+`total_needed > zone_cap` branch's `ensure_planned_arena_zones()` re-plan
+attempt. Spec review caught the consequence: `ensure_planned_arena_zones()`'s
+`has_live_scratch` refusal check
+(`onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr
+|| ...`) treats a non-null pointer as still-live *regardless of who owns
+it* — including the reservation's own predecessor, about to be replaced by
+the very call that is checking. So on exactly the path that most needed the
+fix — an existing arena reservation growing into a bigger one — the old
+pointers were still set when the refusal check ran, the re-plan refused
+itself every time, `total_needed <= zone_cap` stayed false after the
+refusal, the point-release block was skipped entirely, and control fell
+through to the shared direct-allocation cleanup further down. That cleanup's
+arena-owned branch only nulled the fields (it predates this step and was
+never in scope for the original design) — orphaning the TLSF bytes until
+whole-arena teardown. Because the refusal predicate and the leak precondition
+are the same non-null fields, **every growth attempt following a prior arena
+reservation leaked**, and the in-place growth path had plausibly never
+actually succeeded. The fix moves the point-release to the top of the
+`arena_active()` branch, unconditional on the capacity check: this closes the
+leak and, as a direct consequence, lets `ensure_planned_arena_zones()`
+actually succeed when nothing else is live, since the reservation's own
+predecessor no longer counts against itself. The shared direct-allocation
+cleanup's arena-owned branch is now provably unreachable (whenever
+`arena_active()` was true, the point-release already ran; whenever it is
+false, `vram_owns()` is always false too, since it tests `arena_base_`, which
+every `arena_destroy()` caller already required these fields null before
+calling) — it is now an assert/log rather than a silent null, so a future
+regression that reopens this leak announces itself instead of orphaning
+memory quietly again. A CPU-only source-contract check
+(`tests/test-sycl-zone-reset-audit-source.py`, "the oneDNN point-release
+precedes the growth-path re-plan") pins the ordering the same way the
+existing hook-before-early-return checks pin theirs, and is confirmed to fail
+against the pre-fix commit.
 
 **Nothing else lives in the ONEDNN VRAM zone — grep-verified, not assumed.**
 The only `zone_alloc(vram_zone_id::ONEDNN, ...)` call sites in the entire
 backend are the four inside `reserve_onednn_scratch()` itself (two on the
 sub-allocation path just described, two on a `use_arena_zone` growth path
 that the surrounding code comment already documents as unreachable given the
-function's current control flow). So freeing exactly the two pointers this
-reservation previously handed out is a *complete* reclaim of the zone, not a
-partial one — there is no third occupant to enumerate or worry about. This
-also explains the Phase-0 audit's one genuinely-moving `zone_largest_free`
-reading (256 → 143.88 MB, no recovery across the captured run): on Mistral,
-`onednn_reorder` — the largest oneDNN reorder buffer, see "Path-scoped zone
-sizing" below — is 112.0 MB, and 256 − 112 ≈ 144 MB matches the observed dip
-to the byte. The "occupancy" was always these two pointers; nothing else was
-ever a candidate.
+function's current control flow). So, now that the release runs
+unconditionally rather than only on the zone-was-big-enough path, freeing
+exactly the two pointers this reservation previously handed out is a
+*complete* reclaim of the zone on every path that reaches
+`reserve_onednn_scratch()`'s arena branch, not only the ones where the zone
+happened to already be big enough — there is no third occupant to enumerate
+or worry about. This also explains the Phase-0 audit's one genuinely-moving
+`zone_largest_free` reading (256 → 143.88 MB, no recovery across the captured
+run): on Mistral, `onednn_reorder` — the largest oneDNN reorder buffer, see
+"Path-scoped zone sizing" below — is 112.0 MB, and 256 − 112 ≈ 144 MB matches
+the observed dip to the byte. The "occupancy" was always these two pointers;
+nothing else was ever a candidate.
 
 **The `zone_reset(vram_zone_id::ONEDNN)` call site stays, but its role ends
 — mirroring C2's treatment of `host_zone_reset(SCRATCH|STAGING)`.** Unlike
@@ -572,6 +613,17 @@ known pre-existing gap for a future ticket, not fixed here: closing it needs
 replacement into the same critical section as acquisition, which is a
 concurrency-control change to the reservation protocol, not a reclaim-path
 change.
+
+The growth-path leak fix (below) moves the point-release earlier within this
+same function — to the top of the `arena_active()` branch instead of inside
+the `total_needed <= zone_cap` branch — but this does not change the analysis
+above. Both the old position and the new one are inside the single
+`std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);` that spans the
+entire function body; moving the release earlier within that one critical
+section neither adds a new lock nor consults the CV/refcount pair that was
+already the only thing missing. The race described above is exactly as
+present, and exactly as unchanged, at the new call site as it was at the old
+one.
 
 **The two graph-boundary drains, re-derived from source (carried from the
 37ba gate adjudication, `c-634z`, citing `m72w`'s "two graph drains separated
