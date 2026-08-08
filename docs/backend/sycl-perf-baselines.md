@@ -485,15 +485,75 @@ Point 5 is the fail-closed property and the reason the parser exists. An empty
 grep over an empty capture returns clean forever; the parser must be able to say
 "I could not measure this", and that must be a failure.
 
-> ⚠️ **Status 2026-08-08: NOT IMPLEMENTED.** No script in `scripts/`,
-> `captures/`, or `artifacts/` performs this parse. The nearest neighbour,
-> `captures/soak_analyze.py`, parses `ZONE-RESET-AUDIT` captures rather than
-> `llama-bench` output, and although it prints `NO SITE ROWS -- capture is VOID,
-> not clean` on empty input it **exits 0 on every path** — fail-loud, not
-> fail-closed, and therefore not a model to copy. `artifacts/perf-final/` does
-> not exist, so the matrix itself has not been run. **Until a parser implements
-> the five conditions above, the Task 20 performance gate must not be
-> certified from a manual reading of the logs.** Tracked on `llama.cpp-f813`.
+### `scripts/parse-sycl-bench-matrix.py` — the implementation
+
+Stdlib-only Python, invoked directly by the lead. It is deliberately **not** a
+registered CTest target: it reads evidence, it is not a test.
+
+```sh
+# after the matrix has run
+python3 scripts/parse-sycl-bench-matrix.py --dir artifacts/perf-final
+
+# verify the parser itself before trusting its verdict (see below)
+python3 scripts/parse-sycl-bench-matrix.py --self-test
+
+# explicit arms, if the logs are not in the conventional layout
+python3 scripts/parse-sycl-bench-matrix.py --arm b50-mistral=a.log,b.log,c.log,d.log,e.log ...
+```
+
+`--dir` expects `<arm>-<n>.log` (or `.txt`) for n in 1..5, with arms named
+`b70-mistral`, `b70-gptoss`, `b50-mistral`, `b50-gptoss` — the layout plan step 6
+already writes.
+
+**Exit codes, and why there are three rather than two:**
+
+| exit | meaning | what to do |
+|---:|---|---|
+| 0 | every arm present, parseable, and within its floor/band | proceed |
+| 1 | **VERDICT FAIL** — everything parsed, and a mean missed its gate | discriminate load from regression with an interleaved paired A/B; a B70 miss opens an owner-reviewed baseline task |
+| 2 | **INPUT/PARSE FAILURE** — no verdict could be computed | fix the inputs and re-run the matrix; **this is not a pass and not a fail** |
+
+"The branch is slow" and "I could not measure the branch" are different facts,
+and collapsing them into one non-zero code is how a missing arm gets triaged as
+a performance problem.
+
+Every one of these is exit 2, not a smaller sample: a missing file, an empty
+file, an arm with fewer than five logs, an arm entirely absent, a results
+directory that does not exist, a directory that exists but is empty, an
+unparseable `t/s` cell, a table with no `fa` column (i.e. not the `-fa 1`
+matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), and a
+run whose free VRAM is below the contamination floor.
+
+**Verify the parser before trusting it.** `--self-test` runs it against the
+committed fixtures in `artifacts/task18-parser-fixtures/` and must report
+**10/10**. The cases exist to prove the parser returns *all three* exit codes —
+including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
+measurement rather than the only answer it is capable of giving. A checker nobody
+has seen fail is indistinguishable from a checker that cannot fail.
+
+> ⚠️ **The free-VRAM floors are contamination detectors, not precision checks,
+> and the documented B50 figure does not match reality.** This document states
+> "~16.2 GB free on the B50", but the only two committed real B50 `-v` captures
+> (`captures/16-soak-mistral-bench-r30.err`, `captures/17-soak-gptoss-bench-r15.err`)
+> both report **14677 / 14679 MiB free on a healthy card**. A check pinned to the
+> documented figure would fail every healthy B50 run — the same shape as the
+> retired ≥1100 guardrail, a stale number manufacturing a false alarm. The
+> discrepancy is unresolved (16250 is suspiciously close to the card's ~16304 MB
+> *total*, so the documented value may be a total rather than an observed free),
+> so the parser defaults to floors that catch gross contamination — 30000 MiB
+> (B70) and 14000 MiB (B50) — and exposes `--min-free-mib b70=NNNNN`. **No
+> committed B70 `-v` capture exists at all**; the B70 floor is derived from the
+> ~32602 MiB figure here and should be tightened once a real capture lands.
+
+> ⚠️ **The matrix itself has not been run.** `artifacts/perf-final/` does not
+> exist, so there are no results to parse yet — the parser is verified against
+> fixtures only. Until Task 20 runs the matrix, this gate is unmeasured, and an
+> unmeasured gate must never be recorded as passed.
+
+Historical note on what *not* to copy: `captures/soak_analyze.py` prints
+`NO SITE ROWS -- capture is VOID, not clean` on empty input but **exits 0 on
+every path**. It is fail-loud, not fail-closed — fine for a human reading its
+output, useless in a gate that checks a status code.
 
 ---
 
