@@ -3375,6 +3375,39 @@ if (NOT GGML_BACKEND_DL)
     )
 endif()
 
+# Bounds gate for the SET_ROWS index contract (llama.cpp-nhip). Unlike the
+# owner-routing test above this one runs kernels on a device, so ENVIRONMENT pins
+# the selector: an unpinned run enumerates the iGPU, whose reported "VRAM" is
+# system RAM (see CLAUDE.md, llama.cpp-403s).
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-set-rows-bounds
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-set-rows-bounds.cpp
+    )
+    target_include_directories(test-sycl-set-rows-bounds PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-set-rows-bounds PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-set-rows-bounds PRIVATE "-fsycl")
+    target_compile_definitions(test-sycl-set-rows-bounds PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-set-rows-bounds PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-set-rows-bounds PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-sycl-set-rows-bounds COMMAND test-sycl-set-rows-bounds)
+    set_tests_properties(test-sycl-set-rows-bounds PROPERTIES
+        LABELS "sycl;gpu;set-rows;bounds"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
+endif()
+
 if (NOT GGML_BACKEND_DL)
     add_executable(test-unified-dispatch-integration
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-dispatch-integration.cpp
