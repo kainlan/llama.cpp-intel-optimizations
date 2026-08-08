@@ -37407,10 +37407,15 @@ static void argmax_f32_i32_sycl(const float * x, int * dst, const int ncols, con
             const int row     = item_ct1.get_global_id(1);
             float     max_val = -INFINITY;
 
+            // A negative index means the lane has taken no column yet, and it
+            // ranks below every real column, including a -inf one -- -inf >
+            // -inf is false, so on an all--inf row no lane would ever take a
+            // column and dst[row] would be the -1 seed. CPU argmax seeds
+            // idx = 0 and returns an in-range column for any row.
             int max_idx = -1;
             for (int col = tid; col < ncols; col += 256) {
                 float val = x[row * ncols + col];
-                if (val > max_val) {
+                if (max_idx < 0 || val > max_val) {
                     max_val = val;
                     max_idx = col;
                 }
@@ -37420,12 +37425,19 @@ static void argmax_f32_i32_sycl(const float * x, int * dst, const int ncols, con
             item_ct1.barrier(sycl::access::fence_space::local_space);
             for (int stride = 256 / 2; stride > 0; stride >>= 1) {
                 if (tid < stride) {
-                    float val1 = shared_data[tid];
-                    float val2 = shared_data[tid + stride];
-                    if (val2 > val1) {
-                        shared_data[tid] = val2;
-
-                        shared_indices[tid] = shared_indices[tid + stride];
+                    float     val1 = shared_data[tid];
+                    float     val2 = shared_data[tid + stride];
+                    const int idx1 = shared_indices[tid];
+                    const int idx2 = shared_indices[tid + stride];
+                    // An empty lane carries -inf just like a real -inf column,
+                    // so occupancy has to decide before the value does -- the
+                    // same rule as the TOP_K merge below. This guards the
+                    // invariant rather than the defect: with the scan above a
+                    // lane is occupied exactly when tid < ncols, so an empty
+                    // lane can never sit below an occupied one here.
+                    if ((idx2 >= 0) != (idx1 >= 0) ? idx2 >= 0 : val2 > val1) {
+                        shared_data[tid]    = val2;
+                        shared_indices[tid] = idx2;
                     }
                 }
                 item_ct1.barrier(sycl::access::fence_space::local_space);
