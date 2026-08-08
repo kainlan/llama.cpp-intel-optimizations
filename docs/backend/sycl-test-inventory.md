@@ -863,6 +863,42 @@ gating flag was renamed into a broader flag. Tracked as `llama.cpp-26ak`
 not "fix" it by writing plausible-looking decision docs, since the two sub-tests
 would then assert against invented content.
 
+## `test-q6k-dispatch` — the oracle was the bug (`llama.cpp-2ln5`)
+
+Closed 2026-08-04. Worth recording as a *contract* outcome rather than a bug
+fix, because the disposition is the interesting part: a ~1% GPU-vs-CPU deviation
+turned out not to justify a production change, so the correction landed in the
+**reference**, not in the kernel and not in a widened tolerance.
+
+The test compares a Q6_K GPU dispatch against a CPU reference. Its old reference
+computed in F32 while the GPU path quantizes activations to Q8_1 — so it scored
+the right answer against the wrong oracle, and the residual ~1.44% was the oracle
+disagreeing with itself. The contract is now "match `CPU_Q8_1`
+(`abs <= max(1e-3, 1e-4*abs(CPU_Q8_1))`)", with the F32 column retained as a
+reported diagnostic rather than a gate.
+
+Landed as `91c95398b` + `4178587d2` (from `a21067805` + `c004cb659`). Lead-verified
+on hardware, build rc=0, under `GPU.lock`, `ONEAPI_DEVICE_SELECTOR=level_zero:0`
+— **one default green and two expected-RED controls**, which is what makes the
+green mean anything:
+
+| mode | rc | signal |
+|---|---:|---|
+| default | 0 | every Test 1/2 row satisfies the `CPU_Q8_1` contract — row 100 reports `GPU-REF 0.000%` while `Q8-F32` is `1.444%`; Tests 3/4 PASS |
+| `--reference=f32` | 1 | the legacy mismatched oracle restored: Test 1 fails 2 of 16, Test 2 rows 100/1000 at 1.444%/1.440%; Tests 3/4 still PASS |
+| `--corrupt-q8-reference` | 1 | the matching oracle perturbed: 16/16 and 6/6 specific `CPU_Q8` contract failures; Tests 3/4 still PASS |
+
+The two controls answer different questions. `--reference=f32` proves the new
+contract is the thing that changed the verdict; `--corrupt-q8-reference` proves
+the new contract can still fail. Tests 3 and 4 pass in all three modes, which
+demonstrates the change is scoped to the oracle rather than disabling the suite.
+`MATCH_REF`/`GPU-REF` diagnostics were confirmed truthful in every mode. Memory
+recovered afterwards (`MemAvailable` ~200 GiB, `Shmem` ~4.2 GiB).
+
+The general lesson, which cost this project time elsewhere: **if the exact answer
+also fails the test, the oracle is the bug.** A CPU reference is not
+automatically a reference for a GPU kernel that takes a different numeric path.
+
 ---
 
 ## Two instances named in the ticket
