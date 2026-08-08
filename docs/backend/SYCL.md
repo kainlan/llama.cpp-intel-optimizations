@@ -893,7 +893,17 @@ as oneDNN strided logical tensors:
 `GGML_SYCL_FA_FORCE_PATH=onednn` is diagnostic for unsupported layouts: it prints
 the planner reason and falls back instead of bypassing safety. For proven
 MATERIALIZE_REQUIRED GQA/MQA shapes it exercises the materialized oneDNN path.
-`GGML_SYCL_FA_ONEDNN_ALLOW` does not override the layout planner.
+
+⚠️ **`GGML_SYCL_FA_ONEDNN_ALLOW` does not exist.** This paragraph used to end
+"`GGML_SYCL_FA_ONEDNN_ALLOW` does not override the layout planner", which reads
+as though the name were a live but ineffective knob. `3c8f296fd` (2026-05-15)
+removed the `getenv("GGML_SYCL_FA_ONEDNN_ALLOW")` bypass; setting the name today
+is a no-op. The variable that does exist is **`GGML_SYCL_FA_ONEDNN`** (default
+ON, `=0` disables), and disabling it costs roughly 39% of Mistral PP512 on the
+B50. Corrected history, with the interleaved paired A/B behind that figure, is
+in `docs/backend/sycl-perf-baselines.md` ("Historical — Arc Pro B50, ECC
+disabled", RETIRED-2026-08-08 note), which named this line as one it could not
+reach.
 
 Token-generation decode uses a separate native FA policy. The conservative
 safe-decode fallback remains available, but the default now bypasses it for
@@ -1230,8 +1240,12 @@ bash scripts/sycl-gptoss-e2e-profile-matrix.sh --dry-run
 
 Real model validation is lead-owned and validates the explicitly selected device.
 The harness defaults to `ONEAPI_DEVICE_SELECTOR=level_zero:1` (B50 on this
-workstation); use `--device-selector level_zero:0` for B580 or another explicit
-selector. Real execution requires:
+workstation); use `--device-selector level_zero:0` for the Arc Pro B70 or
+another explicit selector. (`level_zero:0` was a B580 until 2026-07-24, when
+that card was replaced by the B70; see `CLAUDE.md`, "SYCL Device Selection",
+for the current PCI/render-node mapping. Any B580 figure elsewhere in this
+document is history for a card that is no longer installed.) Real execution
+requires:
 
 ```bash
 bash scripts/sycl-gptoss-e2e-profile-matrix.sh --run --i-understand-this-runs-gpu-models

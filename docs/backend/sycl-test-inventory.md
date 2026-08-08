@@ -620,20 +620,32 @@ live `CMakeLists.txt`, rather than treating a source-name match or a zero-match
 
 Thus the source-row decision remains **48 accepted + 16 declined = 64/64**.
 
-> ⚠️ **The figures in this Task 17d section are pinned at `fc606640e` and are
-> superseded as a current count.** They were correct when the audit ran; the
-> `test-sycl-expert-prefetch` re-decline landed afterwards (`a4791b7a9`,
-> 2026-08-05, reconciled into the Task 16 tables by `8518c9b70`), taking the
-> accepted set to **47 rows / 50 CTest names / 17 declined**. They are left
-> unedited deliberately: this section is the record of what the audit examined,
+> ⚠️ **The accepted/declined figures in this Task 17d section are pinned at
+> `fc606640e`; the restored-registration figures below are corrected forward.**
+> The `test-sycl-expert-prefetch` re-decline landed after the audit ran
+> (`a4791b7a9`, 2026-08-05, reconciled into the Task 16 tables by `8518c9b70`),
+> taking the accepted set to **47 rows / 50 CTest names / 17 declined**.
+>
+> The **48 / 51 / 16** counts in the reconciliation table above are left
+> unedited deliberately: that table is the record of what the audit examined,
 > and rewriting its numbers would make it a record of something that never
-> happened. For the current counts read the Task 16 reconciliation above; for
-> what actually executed, the Task 19 section below.
+> happened. For the current accepted counts read the Task 16 reconciliation
+> above; for what actually executed, the Task 19 section below.
+>
+> The **restored target/property table**, the **reproducible clean-configuration
+> script**, and the **JSON reconciliation gate** that follow are a different
+> kind of statement — they describe what a configure registers, and the script
+> is meant to be run, so a stale figure there is a broken instruction rather
+> than a misremembered record. Those are corrected to the post-`a4791b7a9`
+> values (**10** restored CTest names, **6** `RUN_SERIAL`, **6**
+> `SKIP_RETURN_CODE 77`), cited in place, with the `fc606640e` value kept
+> alongside so the audit's own reading stays legible.
 
 The difference between 48 accepted rows and 51 CTest names is intentional and
 comes only from `test-mmvq-q8-0-streaming-bench.cpp`, whose one executable has
 four required modes. The `sycl-restored` label identifies only the 11
-registrations added by Task 17; it is not retroactively applied to the 40
+registrations added by Task 17 — **10** of them at HEAD, after `a4791b7a9`
+dropped `test-sycl-expert-prefetch`; it is not retroactively applied to the 40
 registrations that were already live.
 
 ### Restored target/property table
@@ -651,21 +663,27 @@ when found.
 | `test-mmvq-q8-0-streaming-bench` | 4 | static | 4 | 0 | 3 | 4 |
 | `test-mxfp4-xmx-tiled` | 1 | static | 1 | 1 | 1 | 0 |
 | `test-q6k-reorder-dispatch` | 1 | static | 1 | 1 | 0 | 0 |
-| `test-sycl-expert-prefetch` | 1 | static | 1 | 1 | 1 | 0 |
+| `test-sycl-expert-prefetch` — **removed by `a4791b7a9`** | 0 | — | 0 | 0 | 0 | 0 |
 | `test-sycl-fattn-onednn-descriptors` | 1 | static + oneDNN | 1 | 1 | 1 | 0 |
 | `test-sycl-set-rows-owner-routing` | 1 | static | 1 | 1 | 0 | 0 |
 | `test-unified-dispatch-integration` | 1 | static | 1 | 1 | 1 | 0 |
-| **total** | **11** | **8 targets** | **11** | **7** | **7** | **4** |
+| **total at HEAD** (post-`a4791b7a9`) | **10** | **7 targets** | **10** | **6** | **6** | **4** |
+| total as audited at `fc606640e` | 11 | 8 targets | 11 | 7 | 7 | 4 |
+
+The `test-sycl-expert-prefetch` row carried one `sycl-restored` name, one
+`RUN_SERIAL` and one `SKIP_RETURN_CODE 77`, which is the whole of the
+11→10 / 7→6 / 7→6 delta; `a4791b7a9` deleted its `add_executable`, `add_test`
+and property block together, so nothing else in the table moved.
 
 The four streaming names share one label property call. Their bare benchmark,
 MMQ smoke, and forced-MMQ modes have `SKIP_RETURN_CODE 77`; the cache smoke
 mode is deliberately not included because its configured path has no exit-77
-branch (unavailable cache/device work is a failure there). The other four
-skip-77 registrations match explicit source exits of 77. The seven ordinary
-GPU fixtures are `RUN_SERIAL`; the four opt-in streaming modes instead carry
-the `manual` label as a group. A substring-regex scan of every restored label
-found zero matches for the throttled-sweep denylist
-`residency|mem-handle|cache`.
+branch (unavailable cache/device work is a failure there). The other three
+skip-77 registrations match explicit source exits of 77 (four before
+`a4791b7a9`). The six ordinary GPU fixtures are `RUN_SERIAL` (seven before
+`a4791b7a9`); the four opt-in streaming modes instead carry the `manual` label
+as a group. A substring-regex scan of every restored label found zero matches
+for the throttled-sweep denylist `residency|mem-handle|cache`.
 
 ### Generated CTest evidence and lead handoff
 
@@ -720,14 +738,16 @@ if command -v ccache >/dev/null 2>&1; then
 fi
 cmake "${configure_args[@]}"
 
+# test-sycl-expert-prefetch is deliberately absent: a4791b7a9 deleted the
+# target, so naming it here would fail the build.
 cmake --build build --config Release --target \
   test-cpu-gpu-soa-interaction test-mmvq-q8-0-streaming-bench \
   test-mxfp4-xmx-tiled test-q6k-reorder-dispatch \
-  test-sycl-expert-prefetch test-sycl-fattn-onednn-descriptors \
+  test-sycl-fattn-onednn-descriptors \
   test-sycl-set-rows-owner-routing test-unified-dispatch-integration -j 1
 
 # Registration/property inspection only; these commands execute no tests.
-ctest --test-dir build -N -L '^sycl-restored$'  # expected: 11 tests
+ctest --test-dir build -N -L '^sycl-restored$'  # expected: 10 tests (11 before a4791b7a9)
 ctest --test-dir build -N -L '^manual$'         # expected: 4 tests
 ctest --test-dir build --show-only=json-v1 > /tmp/kdfh-ctest.json
 ```
@@ -737,13 +757,17 @@ There is intentionally no `-DGGML_SYCL_DNNL=ON` option to add: for
 and sets its internal `GGML_SYCL_DNNL=1` only after finding an Intel oneDNN
 package. A clean configure that cannot find that package fails rather than
 silently omitting oneDNN. This is the oneDNN-enabled assumption under which
-`test-sycl-fattn-onednn-descriptors` contributes the eleventh restored name.
+`test-sycl-fattn-onednn-descriptors` contributes the tenth restored name.
 
-The JSON proof must remain nonzero and reconcile to total 250,
-`sycl-restored=11`, `RUN_SERIAL=7`, `SKIP_RETURN_CODE 77=7`, `manual=4`, and
-forbidden restored-label matches=0 before runtime delegation. Mutation proofs
-remain with `llama.cpp-8u22`, and clean accepted-set GPU runtime remains with
-Task 19 (`llama.cpp-8kyi`); this audit claims neither.
+The JSON proof must remain nonzero and reconcile to `sycl-restored=10`,
+`RUN_SERIAL=6`, `SKIP_RETURN_CODE 77=6`, `manual=4`, and forbidden
+restored-label matches=0 before runtime delegation — the post-`a4791b7a9`
+figures. The audit at `fc606640e` reconciled the pre-`a4791b7a9` set (total 250,
+`sycl-restored=11`, `RUN_SERIAL=7`, `SKIP_RETURN_CODE 77=7`); the total is not
+restated as a current gate because commits after `fc606640e` add and remove
+unrelated registrations, so only the restored-label figures are stable enough to
+assert. Mutation proofs remain with `llama.cpp-8u22`, and clean accepted-set GPU
+runtime remains with Task 19 (`llama.cpp-8kyi`); this audit claims neither.
 
 
 ## Task 19: accepted-set lead gate — executed results
