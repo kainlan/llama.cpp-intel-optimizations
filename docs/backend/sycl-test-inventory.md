@@ -1557,11 +1557,19 @@ building** ([[land-header-changes-first-in-multi-agent-waves]]).
 | `test-sycl-fattn-xmx-policy` | `fattn-xmx-f16.hpp:178` `return XMX_BATCH_KV_LARGE;` → `/ 2` | narrow header (only `fattn.cpp` + a bench + this test) | CPU-ONLY | PASSFAIL, `SYCL fattn policy tests: %s`; per-check `FAIL: <name> got %d want %d` | `FAIL: D128 ncols8 uses larger batch when local memory permits got 24 want 48` then `SYCL fattn policy tests: FAIL`, rc 1 | Fires 1 of ~35; `ok &=` so nothing is masked. Good "some green, some red" demonstration. |
 | `test-dmmv-coalesced-q4-0-oracle` | `dmmv-coalesced-q4-0-layout.hpp:64` `blocks_per_row * DMMV_COALESCED_Q4_0_BLOCK_BYTES` → `* 32` (the literal Q8_0-stride defect the file is named for) | narrow header (convert.cpp + dmmv.cpp + 2 tests) | CPU-ONLY | COUNT — per-check `PASS`/`FAIL` lines + `%d check(s) failed` / `all checks passed` | exactly 4 of 20: `FAIL q8-row-stride-is-twice-the-q4-0-row q8=2048 q4_0=2048`, `... writes-past-the-allocation oob_writes=0`, `... produces-a-different-layout first_bad=-1`, `FAIL device-soa-writer-matches-contract first_bad=...`; `4 check(s) failed`, rc 1 | Round-trip and all 12 oracle checks stay green because writer and reader share the header — that is the point. Built-in positive control (`contract-oracle-catches-corrupted-kernel`): a fully-red run means you over-mutated. |
 
-## Batch I — MEGA-TU `ggml-sycl.cpp` and headers only it includes (27 tests, 32 builds, ~10 h)
+## Batch I — MEGA-TU `ggml-sycl.cpp` and headers only it includes (23 tests, 28 builds, ~9 h)
 
-Do this last. Every build here is the 100k-line TU. Four rows are worth
-re-reading before you spend the time: three of them mutate **test-only mirror
-code** with no production caller (see *Mocks*), and one is blocked.
+Do this last. Every build here is the 100k-line TU. One row is blocked
+(`test-sycl-module-dlopen`, kept here as its build slot is real once the DL
+config exists).
+
+⚠️ **Four rows were removed from this batch on adjudication** — see *The
+build-slot rule* below. `test-sycl-moe-glu-q8-artifact-policy`,
+`test-sycl-moe-glu-q8-fused-store-policy`,
+`test-sycl-moe-direct-final-token-major-bridge` and
+`test-sycl-moe-token-major-metadata` each mutate a **test-only mirror with zero
+production callers**, so a ~20-minute mega-TU build would prove only that a
+mock can fail. They moved to the mock/deletion bucket.
 
 | test | mutation (`ggml/src/ggml-sycl/ggml-sycl.cpp:` unless noted) | runtime | verifiability | expected RED | notes |
 |---|---|---|---|---|---|
@@ -1570,12 +1578,8 @@ code** with no production caller (see *Mocks*), and one is blocked.
 | `test-tensor-placement` | `:8855` `if (strstr(name,"attn_") \|\| strstr(name,"ffn_"))` → drop the `ffn_` term | CPU-ONLY | bare `assert()` — aborts on the first | `Assertion 'ggml_sycl_classify_tensor("blk.10.ffn_down.weight") == 0' failed.`, **rc 134** | Fires 2 of 9 asserts but only one line prints. The file `#undef NDEBUG`s at line 14 *before* re-including `<cassert>` and records a verified mutation in its header — **do not remove that `#undef`**. |
 | `test-cross-model-weight-usage` | `:11833` `it->second = tensor_usage::UNKNOWN;` → `it->second = mapped;` | **GPU** (hint was wrong — the plan stage inits a backend per device) | COUNT `=== %d checks, %d failures ===` (14) | `=== 14 checks, 2 failures ===` + `FAIL: check 2: model A's own tied-weight case forces UNKNOWN (precondition for check 4)` + `FAIL: check 5: A->B->reactivate-A lookup restores A exact same-name usage`, rc 1 | Has a built-in positive control (check 1) and negative control (check 3); this mutation leaves both green deliberately. The alternative "key by bare name" at `:11822` breaks 4 of 6 and destroys the controls. |
 | `test-sycl-weight-key-stability` | `:11996` `id.file_offs = has_gguf_identity ? identity.file_offs : 0;` → `= 0;` | CPU-ONLY | PASSFAIL, `PASS: weight cache key remained stable` | `FAIL: cache key missing GGUF identity fields`, rc 1 | Only 3 checks total, so no partial-red outcome is available. Cheap to evaluate, expensive to build. |
-| `test-sycl-moe-direct-final-token-major-bridge` | `:24087` `reject_direct_final_for_test("tokens")` → `("token")` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-bridge.cpp:189: prompt reject reason must be tokens`, rc 1 | ⚠️ **Policy mirror**: `test_moe_down_sum_direct_final_policy` (`:24071`) has no production caller; the real gate is re-implemented inline at `:66656-66706` sharing no code. Worse, `test_moe_token_major_metadata_is_complete` sits behind `GGML_SYCL_TEST_MOE_XMX_FUSED_HELPERS`, whose only definition is line 2 of the test file. |
-| `test-sycl-moe-token-major-metadata` | `:24240` `test_moe_token_major_reject("expert")` → `("experts")` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-token-major-metadata.cpp:95: negative expert id must reject`, rc 1 | Same policy-mirror family. Its overflow arithmetic is genuinely good and genuinely untested elsewhere — an argument for **promoting** it to production rather than deleting the test. Subtests chain with early `return 1`. |
 | `test-sycl-moe-same-expert-grouping` | `:24339` `has_lane_filled_group \|\| count > 1` → `count >= 1` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-same-expert-grouping.cpp:187: all-singleton grouping must fail closed so runtime falls back`, rc 1 | ⚠️ Its case 4 is a **source-text grep** of `mmvq.cpp` for three literals — it cannot fail behaviourally and passes even if the surrounding code is deleted. Needs the repo tree present at runtime. |
-| `test-sycl-moe-glu-q8-artifact-policy` | `:24410` `test_moe_glu_q8_reject("layout", false)` → `("artifact", false)` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-glu-q8-artifact-policy.cpp:118: bad layout reason must be layout`, rc 1 | 🚨 **Full mock** — `test_moe_glu_q8_artifact_policy` (`:24403`) is called from nowhere but this test (1 occurrence in 100k lines vs 9 in the test). A mega-TU rebuild for zero production coverage. Consider deleting instead of running. |
 | `test-xmx-moe-mxfp4` | `:24489` in `test_moe_gateup_singlecol_policy` delete the `return out;` in the `graph_recording` arm | CPU for the 3 reachable subtests (they run *before* the device gate) | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 after the host tests | `FAILED: graph recording must reject first implementation`, `Tests run: 3, Passed: 2, Skipped: 0, Failed: 1`, rc 1 | **BLOCKED** by `GGML_SYCL_BUILD_XMX_TESTS` (see below). Note a 77 here still means 3 real assertions ran. |
-| `test-sycl-moe-glu-q8-fused-store-policy` | `:24509` `test_moe_glu_q8_fused_store_reject("shape")` → `("shapes")` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-fused-store-policy.cpp:67: prompt must reject as shape`, rc 1 | Policy mirror: every symbol it touches lives only in the `test_*` block at `:24451-24537`; grep for `fused_store` finds no production call site. |
 | `test-sycl-moe-sequence-graphlet-policy` | `:24797` `if (unsafe_fused_q8_requested)` → `if (false && ...)` in `moe_default_fast_path_policy_from_flags` | CPU-ONLY | PASSFAIL | `FAIL: tests/...-sequence-graphlet-policy.cpp:939: known unsafe fused-Q8 request must quarantine default sequence replay`, rc 1 | 47 of its 49 assertions are source-text greps; the two truth-table cases are the only behavioural coverage — but they **do** reach production (`:24775`), unlike the glu-q8 sibling. Because most cases read source at runtime, a text-only mutation reddens it with no rebuild. |
 | `test-unified-cache-integrity` | `:29105` `if (!host_buffer && !sycl_buffer)` → `if (!host_buffer)` | GPU (768 staged weights, 128 MB ctx) | PASSFAIL, `Unified cache integrity test: %s` | `Failed to cache layout for type=2 idx=0` then `... FAIL`, rc 1 | Clean phase-1-green / phase-2-red split. ⚠️ Do **not** mutate `unified_cache::validate()` — that mutates the checker, not the property. The "on-topic" `id_to_key_[key] =` deletion at `unified-cache.cpp:4034` is unreliable (five other write sites can repopulate) — demand a positive control if you use it. |
 | `test-sycl-kv-planned-device-materialization` | `:31532` `la.on_device && la.owner_device >= 0 ? la.owner_device : ctx->device` → `ctx->device` | **GPU, needs ≥2 physical devices** (hint was wrong) | PASSFAIL, `SYCL planned-device KV materialization test: PASS` | `  FAIL: cache_k_l1 smart handle for planned device 1 must resolve`, rc 1 | The host-KV-zone rollback half and the registry-owner checks stay green. ⚠️ Do not mutate `planned_owner` at `:32218/:32260` — `valid_device_kv_handle` then refuses and the run collapses into a generic assert. With <2 devices it prints `SKIP: need at least two physical SYCL devices` and returns **0**, not 77. |
@@ -1656,9 +1660,17 @@ result that a merge certification would otherwise count as coverage.
   (`unified-kernel.hpp:295-302`) has no `type_size` and no `pad`, yet the test
   writes `meta.type_size` (line 1473) and `meta.pad` (1365/1474/1952);
   `add_set_rows`/`add_strided_copy` now take `const SetRowsMeta &` /
-  `const StridedCopyMeta &` while the test passes device pointers. It also
-  declares an extern `ggml_sycl_test_extract_layer_index` that exists nowhere
-  in the tree. `CMakeLists.txt:1216-1231` documents this as OPEN.
+  `const StridedCopyMeta &` while the test passes device pointers.
+  `CMakeLists.txt:1216-1231` documents this as OPEN, and the mismatch is
+  independently checkable against `unified-kernel.hpp`.
+  ⚠️ **Correction to this plan's first revision:** it also repeated that
+  comment's claim that the test declares an extern
+  `ggml_sycl_test_extract_layer_index` "that exists nowhere in the tree".
+  **That is false** — the symbol is defined at
+  `ggml/src/ggml-sycl/ggml-sycl.cpp:89939` (added by `2c49f9e13`), so the
+  extern at `test-unified-kernel-persistent.cpp:42` would resolve fine. The
+  disposition is unchanged because it never depended on that claim; the stale
+  CMake comment is logged as its own micro-finding under *Blocked*.
   ***This single rotted target is what blocks the entire XMX suite*** — see below.
 
 ## Tests that reach no production code (mocks) — repair or delete
@@ -1666,6 +1678,20 @@ result that a merge certification would otherwise count as coverage.
 These *can* be made to fail, but only by mutating the test's own copy of the
 logic. A green from them says nothing about the shipped backend. Listed loudest
 first.
+
+⚠️ **This table is descriptive, not a scoring bucket** — the same convention as
+*Blocked*, and it matters because **12 rows appear here while only 10 are
+scored `MOCK`** in the appendix. A test can be both a mock and unbuildable;
+`test-esimd-vectorized-dequant`, `test-moe-mxfp4-dp4a` and
+`test-xmx-hardware-detect` are all three, and are scored `XMX-BLOCKED`.
+
+**Scoring precedence, applied uniformly:** `XMX-BLOCKED` > `CANNOT-FAIL` >
+`MOCK` > batch. The blocker wins because it is the operative fact — you cannot
+build the target to confirm the mock diagnosis, so "repair the guard" precedes
+"repair the test". `test-xmx-quant-loaders` is scored `MOCK` rather than
+`XMX-BLOCKED` because it is registered **outside** the guard
+(`ggml/src/ggml-sycl/CMakeLists.txt:3654`) and does build — it merely exercises
+a header whose include chain terminates.
 
 | test | what it actually exercises |
 |---|---|
@@ -1677,32 +1703,137 @@ first.
 | `test-moe-mxfp4-dp4a` | Redefines `block_mxfp4`, `block_q8_1`, `kvalues_mxfp4`, `dp4a_cpu`, `mxfp4_dot_*` locally; `target_link_libraries` is `IntelSYCL::SYCL_CXX` only — no `ggml-sycl`. |
 | `test-sycl-level-zero-vmem-feasibility` | Contains no llama.cpp code at all — a Level Zero driver capability probe. Belongs in a driver preflight script. (Its skip/fail split is well done, but its registration lacks `SKIP_RETURN_CODE 77`, so skips render as FAILED — `llama.cpp-k208`.) |
 | `test-xmx-hardware-detect` / `test-xmx-quant-loaders` | Both exercise `xmx-esimd-common.hpp` / `xmx-quant-loaders.hpp`, whose include chains **terminate** — no production TU pulls them in. The former additionally tests a `#ifdef XMX_TEST_STANDALONE` shim for its "hardware detection" half, and its `add_test` has no `set_tests_properties` at all: no `SKIP_RETURN_CODE 77`, no `LD_LIBRARY_PATH`. |
-| `test-sycl-moe-glu-q8-artifact-policy` | `test_moe_glu_q8_artifact_policy` (`ggml-sycl.cpp:24403`) — one occurrence in 100k lines, nine in the test. Same shape `test-sycl-tensor-placement` was rewritten to escape. |
+| `test-sycl-moe-glu-q8-artifact-policy` | `test_moe_glu_q8_artifact_policy` (`ggml-sycl.cpp:24403`) — definition plus a declaration in `ggml-sycl-test.hpp:323`, and **no caller anywhere**. Its body is a self-contained ladder over a `test_moe_glu_q8_artifact_input` struct of bools, incrementing `g_test_moe_glu_q8_*` counters; it calls no production function. Same shape `test-sycl-tensor-placement` was rewritten to escape. |
+| `test-sycl-moe-glu-q8-fused-store-policy` | `test_moe_glu_q8_fused_store_policy` (`ggml-sycl.cpp:24502`, declared `ggml-sycl-test.hpp:378`) — same: definition + declaration, zero callers, and `test_moe_glu_q8_kernel_path_supports_fused_store` switches over a `test_moe_glu_q8_kernel_path` enum that exists only in the test block. |
+| `test-sycl-moe-direct-final-token-major-bridge` | `test_moe_down_sum_direct_final_policy` (`ggml-sycl.cpp:24071`, declared `ggml-sycl-test.hpp:202`) — zero callers; the real direct-final gate is re-implemented inline at `:66656-66706` and shares no code with it. Compounding: `test_moe_token_major_metadata_is_complete` sits behind `GGML_SYCL_TEST_MOE_XMX_FUSED_HELPERS`, whose only definition in the tree is line 2 of this test file. |
+| `test-sycl-moe-token-major-metadata` | `test_moe_build_token_major_metadata` (`ggml-sycl.cpp:24191`, declared `ggml-sycl-test.hpp:238`) — zero callers. Its overflow arithmetic is genuinely good and genuinely untested elsewhere, which argues for **promoting it to production** rather than deleting the test. |
+
+### The build-slot rule (adjudication, `ona8` spec review 2026-08-08)
+
+Four of these were originally given a Batch I build slot *and* flagged as mocks
+— two instructions, one of which had to win. The rule that resolves it:
+
+> **A build slot is only justified when the mutated line is production-reachable.**
+> Mutating a mirror proves the mirror can fail, which nobody doubted. The u2mz
+> spec's own remedy for a decorative test is to fix or delete it, not to spend
+> ~20 minutes of mega-TU rebuild demonstrating its decorativeness.
+
+Verified per function rather than assumed — each of the four is a definition in
+`ggml-sycl.cpp` plus a declaration in `ggml-sycl-test.hpp`, with **no third
+occurrence** in the 100k-line TU:
+
+```bash
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_glu_q8_artifact_policy       # 1 (the definition)
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_glu_q8_fused_store_policy    # 1
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_down_sum_direct_final_policy # 1
+cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c test_moe_build_token_major_metadata   # 1
+```
+
+⚠️ **The same check clears two neighbours that look identical and are not** —
+name similarity is not evidence here, so run the grep rather than pattern-match
+on the `test_` prefix:
+
+- `ggml_sycl_moe_single_xmx_chunked_fallback_policy` (`:2734`, **3** occurrences)
+  is production, called by `..._chunked_fallback_allowed`. So
+  `test-sycl-moe-xmx-tiled-materialization` **keeps** its Batch I slot — with
+  the mutation pinned to that line, not to the test-only
+  `test_moe_xmx_tiled_materialization_invariants` (1 occurrence) that 3 of its
+  5 test functions drive.
+- `moe_default_fast_path_policy_from_flags` (`:24775`, **3** occurrences) is
+  production, so `test-sycl-moe-sequence-graphlet-policy` keeps its slot too,
+  even though 47 of its 49 assertions are source-text greps.
+
+The lead's steer covered `test-sycl-moe-glu-q8-artifact-policy`; this pass
+extended it to the three siblings **by the same rule**, because applying it to
+one and not the others would reproduce exactly the inconsistency the review
+caught. Push back if the three should keep their slots.
 | partial: `test-q6k-reorder-dispatch` (1 of 8 subtests production), `test-sycl-moe-xmx-tiled-materialization` (2 of 5), `test-sycl-moe-direct-final-scratch-plan` (1 of 3, and that one is a text grep), `test-mmq-xmx-dispatch` (1 of 5), `test-sycl-moe-sequence-graphlet-policy` (2 of 49) | see the batch rows |
 
-## Blocked: 12 targets that do not exist in the current configuration
+## Blocked: targets that do not exist in the current configuration
 
-**Ten behind `GGML_SYCL_BUILD_XMX_TESTS`** (`ggml/src/ggml-sycl/CMakeLists.txt:759`,
-`option(... OFF)`): `test-mxfp4-vector-dequant`, `test-unified-kernel`,
-`test-xmx-moe-mxfp4`, `test-xmx-compute`, `test-xmx-optimization`,
-`test-xmx-config`, `test-esimd-prefetch`, `test-xmx-default-enable`,
-`test-esimd-vectorized-dequant`, `test-moe-mxfp4-dp4a`, `test-xmx-esimd-basic`,
-`test-unified-kernel-ops`, `test-xmx-hardware-detect`.
+⚠️ **Read the counting convention first.** This section is a **cross-reference,
+not an additive bucket.** Only the `GGML_SYCL_BUILD_XMX_TESTS` group of **12**
+is scored here in the partition; the `GGML_BACKEND_DL` and pre-existing-RED
+entries below name tests that are *already counted in Batch I and Batch H
+respectively* and appear here only so a reader looking for blockers finds them.
+Adding this section's items to the batch totals double-counts. The flat
+appendix at the end is the authority: every test appears in it exactly once.
+
+### Behind `GGML_SYCL_BUILD_XMX_TESTS` — 14 guarded, 12 scored here
+
+⚠️ **Nobody in this chain has previously had the right number**, so it is
+recounted here against the literal `if`/`endif` bounds rather than by eye. The
+guard opens at `ggml/src/ggml-sycl/CMakeLists.txt:761`
+(`if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")`, the
+`option(... OFF)` being at `:759`) and its matching `endif()` is at `:1287`. It
+contains **14** `add_executable` calls:
+
+```bash
+awk 'NR>=761 && NR<=1287 && /add_executable\(/' ggml/src/ggml-sycl/CMakeLists.txt | wc -l   # 14
+```
+
+The 14, with the disposition that keeps label = list = sum:
+
+| # | target | scored under |
+|---|---|---|
+| 1 | `test-xmx-hardware-detect` | XMX-blocked |
+| 2 | `test-xmx-esimd-basic` | XMX-blocked |
+| 3 | `test-xmx-moe-mxfp4` | **Batch I** (its mutation is in `ggml-sycl.cpp`) |
+| 4 | `test-moe-mxfp4-dp4a` | XMX-blocked |
+| 5 | `test-mxfp4-vector-dequant` | XMX-blocked |
+| 6 | `test-unified-kernel` | XMX-blocked |
+| 7 | `test-xmx-compute` | XMX-blocked |
+| 8 | `test-xmx-default-enable` | XMX-blocked |
+| 9 | `test-xmx-optimization` | XMX-blocked |
+| 10 | `test-xmx-config` | XMX-blocked |
+| 11 | `test-esimd-vectorized-dequant` | XMX-blocked |
+| 12 | `test-esimd-prefetch` | XMX-blocked |
+| 13 | `test-unified-kernel-ops` | XMX-blocked |
+| 14 | `test-unified-kernel-persistent` | **cannot be made to fail** (does not compile) |
+
+**14 guarded = 12 XMX-blocked + 1 Batch I + 1 cannot-fail.** The prior revision
+of this section said "Ten" in its label, enumerated 13 names, and summed 12 in
+its table — three different wrong numbers for one set.
 
 ⚠️ **Turning the flag ON does not fix it — the build then fails** on the rotted
-`test-unified-kernel-persistent` (CMakeLists.txt:1216-1231 records this as
-open). Until that one target is repaired or excluded, the lead must build
-**single targets** (`ninja test-xmx-esimd-basic`), never `all` with the flag on.
+`test-unified-kernel-persistent` (see its entry above). Until that one target is
+repaired or excluded, build **single targets** (`ninja test-xmx-esimd-basic`),
+never `all` with the flag on.
 
-⚠️ And right now, `ctest -R xmx-config` (or any of these names) **exits 0 by
-matching zero tests.** That is the ticket's own first trap, live, on thirteen
+⚠️ And right now, `ctest -R xmx-config` (or any of those 14 names) **exits 0 by
+matching zero tests.** That is the ticket's own first trap, live, on fourteen
 registrations.
 
-**One behind `GGML_BACKEND_DL`** (OFF): `test-sycl-module-dlopen`. Needs a
-separate `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` build tree.
+⚠️ **The pre-existing CMake comment at `:1216-1231` is itself miscounted and
+partly false** — a micro-finding in its own right, because it is the first
+thing the next reader will consult:
 
-**One pre-existing RED**: `test-sycl-weight-key-uniqueness` — see its Batch H
-row. Resolve the baseline before running the mutation, or the experiment is void.
+- It says *"Twelve of the thirteen targets build."* There are **14** targets in
+  the guard, so both figures are wrong (13 build, 1 does not).
+- It says `test-unified-kernel-persistent` *"declares an EXTERNAL
+  `ggml_sycl_test_extract_layer_index` in its non-standalone branch, and no
+  such symbol exists anywhere in the tree."* **That symbol does exist**, at
+  `ggml/src/ggml-sycl/ggml-sycl.cpp:89939`, added by `2c49f9e13` ("sycl: expand
+  unified persistent TG graph integration") — confirmed with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n ggml_sycl_test_extract_layer_index`
+  (codescout is blind in that file, so the pipe-grep is the honest query). The
+  comment simply predates the commit.
+
+The **compile-failure disposition survives untouched** — it rests on the
+`StridedCopyMeta`/`SetRowsMeta` mismatch, which is independently verifiable and
+unaffected. Only the supporting extern claim was wrong, and this plan's first
+revision carried it forward from the comment without checking it. Correcting the
+CMake comment belongs to whoever owns
+`ggml/src/ggml-sycl/CMakeLists.txt` (`impl-w1`).
+
+### Cross-references (already counted elsewhere — do not add)
+
+- **Behind `GGML_BACKEND_DL`** (OFF): `test-sycl-module-dlopen`. Needs a
+  separate `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` build tree. **Counted
+  in Batch I.**
+- **Pre-existing RED**: `test-sycl-weight-key-uniqueness` — see its Batch H
+  row; resolve the baseline before running the mutation or the experiment is
+  void. **Counted in Batch H.**
 
 ## Cross-task file conflicts — flag, do not route around silently
 
@@ -1736,15 +1867,33 @@ unassigned:**
 | 6 | F — other backend TUs | 11 | 20 | ~4 h |
 | 7 | G — `common.hpp` | 5 | 6 | ~2.5 h |
 | 8 | H — other shared headers | 14 | 24 | ~7 h |
-| 9 | I — `ggml-sycl.cpp` + its private headers | 27 | 32 | ~10 h |
+| 9 | I — `ggml-sycl.cpp` + its private headers | 23 | 28 | ~9 h |
 | — | cannot be made to fail (delete/repair) | 7 | — | not executable |
-| — | mocks outside a batch (delete/repair) | 6 | — | mutation reaches no production code |
+| — | mocks outside a batch (delete/repair) | 10 | — | mutation reaches no production code |
 | — | blocked by `GGML_SYCL_BUILD_XMX_TESTS` | 12 | — | target does not exist |
-| | **total** | **127** | **~143** | **~31 h** |
+| | **total** | **127** | **~139** | **~30 h** |
 
-Cost is dominated by builds, not runs: ~143 builds are the whole number, and 53
+Cost is dominated by builds, not runs: ~139 builds are the whole number, and 53
 of the 127 tests are CPU-only or device-free — those can be *run* by anyone.
 Only the builds (shared `build/`) and the GPU runs are lead-serialised.
+
+⚠️ **Counting convention, because the first revision of this plan got it
+wrong.** These twelve rows are a **partition**: every one of the 127 tests
+appears in exactly one, and the *Blocked* section further down is a
+cross-reference view over them, not an additional bucket. Two entries there
+(`test-sycl-module-dlopen`, `test-sycl-weight-key-uniqueness`) name tests
+already scored in Batch I and Batch H; adding them again is the double-count
+the `ona8` spec review caught. **The flat appendix at the end of this section is
+the authority** — 127 lines, one test each, checkable with
+`sort | uniq -d` returning nothing.
+
+Of the 23 Batch I rows, **19 mutate `ggml-sycl.cpp` itself** and 4 mutate
+headers that only `ggml-sycl.cpp` includes (`moe-bias-state.hpp`,
+`moe-layer-ids-cache.hpp`, `tiered-plan-clear.hpp`, `moe-discovery-state.hpp`).
+The last of those is cheap in practice — its test target links only
+`Threads::Threads`, so `ninja test-moe-discovery-owner-state` rebuilds one file
+and never touches the mega-TU; it is scored in I because the header's other
+consumer is the mega-TU, but budget it as Batch-B-class work.
 
 ⚠️ **The three trailing groups are 25 of 127 — one test in five.** That is the
 headline finding of Phase A, and it is not an execution cost, it is a coverage
@@ -1763,3 +1912,148 @@ trap in this ticket's description is live on thirteen of them right now.
   this population print `SKIP: ...` and `return 0` on a missing device or
   backend. For each, grep for the test's own `PASS:` string, never for `rc 0`
   — and treat an implausibly short runtime as a signal.
+
+## Appendix: the flat partition (127 lines, one test each)
+
+Generated from the group assignments above, not retyped. Every registered SYCL
+C++ test in scope appears **exactly once**. Verify with:
+
+```bash
+# 127 lines, no duplicate test name
+awk '/^[A-Z].*\ttest-/ {print $2}' <this section> | sort | uniq -d   # must print nothing
+```
+
+| group | test |
+|---|---|
+| `B` | `test-cold-start` |
+| `I` | `test-cpu-gpu-soa-interaction` |
+| `I` | `test-cross-model-weight-usage` |
+| `H` | `test-dmmv-coalesced-q4-0-oracle` |
+| `F` | `test-dmmv-q6k-coalesced` |
+| `B` | `test-esimd-dpas-gate` |
+| `XMX-BLOCKED` | `test-esimd-prefetch` |
+| `XMX-BLOCKED` | `test-esimd-vectorized-dequant` |
+| `H` | `test-fattn-packed-k-lifecycle` |
+| `F` | `test-fattn-thread-local` |
+| `H` | `test-ggml-sycl-soa` |
+| `B` | `test-gpu-arch` |
+| `MOCK` | `test-kernel-dispatch` |
+| `I` | `test-layout-bytes` |
+| `D` | `test-mem-handle-eviction` |
+| `C` | `test-mem-handle-wrong-device` |
+| `F` | `test-mem-ops` |
+| `F` | `test-mmq-q6k-gpu` |
+| `B` | `test-mmq-xmx-dispatch` |
+| `B` | `test-mmvq-launch-geometry` |
+| `D` | `test-mmvq-q8-0-streaming-bench` |
+| `I` | `test-moe-bias-owner-state` |
+| `B` | `test-moe-control-plan` |
+| `I` | `test-moe-discovery-owner-state` |
+| `I` | `test-moe-layer-ids-worker-reset` |
+| `H` | `test-moe-mini-graph` |
+| `E` | `test-moe-mul-mat-id` |
+| `E` | `test-moe-mul-mat-id-q4q8` |
+| `XMX-BLOCKED` | `test-moe-mxfp4-dp4a` |
+| `B` | `test-moe-scratch-admission` |
+| `I` | `test-mul-mat-host-streaming` |
+| `XMX-BLOCKED` | `test-mxfp4-vector-dequant` |
+| `F` | `test-mxfp4-xmx-tiled` |
+| `MOCK` | `test-onednn-fallback` |
+| `B` | `test-onednn-woq` |
+| `H` | `test-q6k-dispatch` |
+| `F` | `test-q6k-reorder-dispatch` |
+| `F` | `test-q8-0-layout-cache-path` |
+| `E` | `test-q8-0-layout-cache-path-mmvq` |
+| `I` | `test-rms-norm-mul-add-broadcast` |
+| `F` | `test-sycl-cpu-dispatch` |
+| `B` | `test-sycl-cpu-traits-parity` |
+| `H` | `test-sycl-descriptor-retention` |
+| `I` | `test-sycl-device-uuid-api` |
+| `B` | `test-sycl-dispatch-tuning` |
+| `B` | `test-sycl-e2e-profile` |
+| `CANNOT-FAIL` | `test-sycl-esimd-float-atomic-compile` |
+| `F` | `test-sycl-fattn-onednn-descriptors` |
+| `F` | `test-sycl-fattn-onednn-materialization` |
+| `H` | `test-sycl-fattn-xmx-policy` |
+| `C` | `test-sycl-graph-retention-scope` |
+| `I` | `test-sycl-kernel-selection` |
+| `I` | `test-sycl-kv-planned-device-materialization` |
+| `G` | `test-sycl-kv-view-resolution` |
+| `D` | `test-sycl-layout-choice` |
+| `MOCK` | `test-sycl-level-zero-vmem-feasibility` |
+| `B` | `test-sycl-lifecycle-event-lease` |
+| `B` | `test-sycl-lifecycle-load-txn` |
+| `B` | `test-sycl-lifecycle-owner-reset` |
+| `CANNOT-FAIL` | `test-sycl-lifecycle-public-api` |
+| `B` | `test-sycl-lifecycle-runtime-host` |
+| `B` | `test-sycl-lifecycle-runtime-wrapper` |
+| `B` | `test-sycl-lifecycle-wrapper-overlap` |
+| `C` | `test-sycl-mem-handle-concurrent-resolve` |
+| `C` | `test-sycl-mem-handle-lifetime` |
+| `I` | `test-sycl-module-dlopen` |
+| `A` | `test-sycl-moe-direct-final-scratch-plan` |
+| `MOCK` | `test-sycl-moe-direct-final-token-major-bridge` |
+| `I` | `test-sycl-moe-expert-parallelism` |
+| `E` | `test-sycl-moe-fused-down-sum-policy` |
+| `A` | `test-sycl-moe-fusion-noactivation` |
+| `E` | `test-sycl-moe-gateup-prepack-policy` |
+| `H` | `test-sycl-moe-gateup-prepack-scratch` |
+| `MOCK` | `test-sycl-moe-glu-q8-artifact-policy` |
+| `MOCK` | `test-sycl-moe-glu-q8-fused-store-policy` |
+| `D` | `test-sycl-moe-handle-resolution` |
+| `H` | `test-sycl-moe-identity-hash` |
+| `D` | `test-sycl-moe-q8-scratch` |
+| `D` | `test-sycl-moe-residency-preflight` |
+| `I` | `test-sycl-moe-same-expert-grouping` |
+| `I` | `test-sycl-moe-sequence-graphlet-policy` |
+| `MOCK` | `test-sycl-moe-token-major-metadata` |
+| `I` | `test-sycl-moe-xmx-tiled-materialization` |
+| `D` | `test-sycl-moe-xmx-tiled-single-layout-planner` |
+| `H` | `test-sycl-moe-xmx-tiled-single-layout-policy` |
+| `CANNOT-FAIL` | `test-sycl-onednn-mxfp4-feasibility` |
+| `I` | `test-sycl-onednn-packed-cache` |
+| `I` | `test-sycl-orchestrator` |
+| `MOCK` | `test-sycl-pp-moe-scratch-lifecycle` |
+| `D` | `test-sycl-reset-model-weight-lease-preserve` |
+| `D` | `test-sycl-residency-diagnostics` |
+| `D` | `test-sycl-residency-reservation` |
+| `C` | `test-sycl-retained-handoff-barrier` |
+| `D` | `test-sycl-runtime-alloc` |
+| `F` | `test-sycl-set-rows-owner-routing` |
+| `G` | `test-sycl-tensor-placement` |
+| `G` | `test-sycl-tensor-usage` |
+| `B` | `test-sycl-timeline` |
+| `G` | `test-sycl-transient-alloc-intent-scope` |
+| `H` | `test-sycl-unified-cache` |
+| `H` | `test-sycl-unified-memory-e2e` |
+| `I` | `test-sycl-weight-key-stability` |
+| `H` | `test-sycl-weight-key-uniqueness` |
+| `G` | `test-sycl-xmx-unified-correctness` |
+| `CANNOT-FAIL` | `test-tensor-classification` |
+| `I` | `test-tensor-placement` |
+| `I` | `test-tiered-dispatch` |
+| `D` | `test-unified-cache-bugs` |
+| `D` | `test-unified-cache-concurrent` |
+| `D` | `test-unified-cache-fast-path` |
+| `I` | `test-unified-cache-integrity` |
+| `H` | `test-unified-dispatch-integration` |
+| `XMX-BLOCKED` | `test-unified-kernel` |
+| `XMX-BLOCKED` | `test-unified-kernel-ops` |
+| `CANNOT-FAIL` | `test-unified-kernel-persistent` |
+| `XMX-BLOCKED` | `test-xmx-compute` |
+| `XMX-BLOCKED` | `test-xmx-config` |
+| `XMX-BLOCKED` | `test-xmx-default-enable` |
+| `XMX-BLOCKED` | `test-xmx-esimd-basic` |
+| `XMX-BLOCKED` | `test-xmx-hardware-detect` |
+| `CANNOT-FAIL` | `test-xmx-host-streaming` |
+| `CANNOT-FAIL` | `test-xmx-kernel-config` |
+| `I` | `test-xmx-moe-mxfp4` |
+| `XMX-BLOCKED` | `test-xmx-optimization` |
+| `MOCK` | `test-xmx-quant-loaders` |
+| `MOCK` | `test-xmx-unified-kernel` |
+| `B` | `test-zone-sizing` |
+
+Group keys: `A`–`I` are the execution batches in order; `CANNOT-FAIL` is the
+deletion/repair set that no mutation can redden; `MOCK` reaches no production
+code; `XMX-BLOCKED` does not currently build. The last three are findings,
+not work items — nothing in them is scheduled for Phase B.
