@@ -656,9 +656,10 @@ Thus the source-row decision remains **48 accepted + 16 declined = 64/64**.
 The difference between 48 accepted rows and 51 CTest names is intentional and
 comes only from `test-mmvq-q8-0-streaming-bench.cpp`, whose one executable has
 four required modes. The `sycl-restored` label identifies only the 11
-registrations added by Task 17 — **10** of them at HEAD, after `a4791b7a9`
-dropped `test-sycl-expert-prefetch`; it is not retroactively applied to the 40
-registrations that were already live.
+registrations added by Task 17 — **9** of them at HEAD, after `a4791b7a9`
+dropped `test-sycl-expert-prefetch` and `llama.cpp-u2mz` dropped the bare
+streaming-bench name (see the correction under the restored table below); it is
+not retroactively applied to the 40 registrations that were already live.
 
 ### Restored target/property table
 
@@ -672,30 +673,43 @@ when found.
 | restored target | CTest names | guard | `sycl-restored` | `RUN_SERIAL` names | skip-77 names | manual names |
 |---|---:|---|---:|---:|---:|---:|
 | `test-cpu-gpu-soa-interaction` | 1 | static | 1 | 1 | 0 | 0 |
-| `test-mmvq-q8-0-streaming-bench` | 4 | static | 4 | 0 | 3 | 4 |
+| `test-mmvq-q8-0-streaming-bench` | 3 | static | 3 | 0 | 2 | 3 |
 | `test-mxfp4-xmx-tiled` | 1 | static | 1 | 1 | 1 | 0 |
 | `test-q6k-reorder-dispatch` | 1 | static | 1 | 1 | 0 | 0 |
 | `test-sycl-expert-prefetch` — **removed by `a4791b7a9`** | 0 | — | 0 | 0 | 0 | 0 |
 | `test-sycl-fattn-onednn-descriptors` | 1 | static + oneDNN | 1 | 1 | 1 | 0 |
 | `test-sycl-set-rows-owner-routing` | 1 | static | 1 | 1 | 0 | 0 |
 | `test-unified-dispatch-integration` | 1 | static | 1 | 1 | 1 | 0 |
-| **total at HEAD** (post-`a4791b7a9`) | **10** | **7 targets** | **10** | **6** | **6** | **4** |
+| **total at HEAD** (post-`u2mz` streaming drop) | **9** | **7 targets** | **9** | **6** | **5** | **3** |
+| total after `a4791b7a9`, before that drop | 10 | 7 targets | 10 | 6 | 6 | 4 |
 | total as audited at `fc606640e` | 11 | 8 targets | 11 | 7 | 7 | 4 |
+
+⚠️ **Second forward correction, 2026-08-09 (`llama.cpp-24dl`).** The streaming row was
+`4 / 4 / 0 / 3 / 4` and the HEAD total `10 / 10 / 6 / 6 / 4` until `llama.cpp-u2mz` removed the
+bare `add_test(NAME test-mmvq-q8-0-streaming-bench COMMAND test-mmvq-q8-0-streaming-bench)`
+registration. The reason is recorded in place at
+`ggml/src/ggml-sycl/CMakeLists.txt:3351-3355`: that name carried no `ENVIRONMENT`, so it always
+printed `SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run` and exited 77 — **a registration that could
+never do work**. The three surviving names drive the same executable with the env it needs.
+
+The figures above are machine-derived from the live file (names carrying the `sycl-restored`
+label, grouped by their `COMMAND` target), not hand-counted.
 
 The `test-sycl-expert-prefetch` row carried one `sycl-restored` name, one
 `RUN_SERIAL` and one `SKIP_RETURN_CODE 77`, which is the whole of the
 11→10 / 7→6 / 7→6 delta; `a4791b7a9` deleted its `add_executable`, `add_test`
 and property block together, so nothing else in the table moved.
 
-The four streaming names share one label property call. Their bare benchmark,
-MMQ smoke, and forced-MMQ modes have `SKIP_RETURN_CODE 77`; the cache smoke
-mode is deliberately not included because its configured path has no exit-77
-branch (unavailable cache/device work is a failure there). The other three
-skip-77 registrations match explicit source exits of 77 (four before
-`a4791b7a9`). The six ordinary GPU fixtures are `RUN_SERIAL` (seven before
-`a4791b7a9`); the four opt-in streaming modes instead carry the `manual` label
-as a group. A substring-regex scan of every restored label found zero matches
-for the throttled-sweep denylist `residency|mem-handle|cache`.
+The streaming names share one label property call. The MMQ smoke and forced-MMQ
+modes have `SKIP_RETURN_CODE 77`; the cache smoke mode is deliberately not
+included because its configured path has no exit-77 branch (unavailable
+cache/device work is a failure there), and the bare benchmark mode that was the
+fourth member of this group no longer exists. The other three skip-77
+registrations match explicit source exits of 77 (four before `a4791b7a9`). The
+six ordinary GPU fixtures are `RUN_SERIAL` (seven before `a4791b7a9`); the
+opt-in streaming modes instead carry the `manual` label as a group. A
+substring-regex scan of every restored label found zero matches for the
+throttled-sweep denylist `residency|mem-handle|cache`.
 
 ### Generated CTest evidence and lead handoff
 

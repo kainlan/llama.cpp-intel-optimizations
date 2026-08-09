@@ -2409,7 +2409,7 @@ endif()
 add_test(NAME test-sycl-weight-key-stability COMMAND test-sycl-weight-key-stability)
 set_tests_properties(test-sycl-weight-key-stability PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2463,9 +2463,12 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
+# Two cards, not one: this fixture's own main() defaults the selector to
+# "level_zero:0,1" and its cases materialize across both. Narrowing it to the
+# single validation card the other pins use would change what it tests.
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
     LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2493,7 +2496,7 @@ endif()
 add_test(NAME test-sycl-moe-q8-scratch COMMAND test-sycl-moe-q8-scratch)
 set_tests_properties(test-sycl-moe-q8-scratch PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2521,7 +2524,7 @@ endif()
 add_test(NAME test-sycl-onednn-packed-cache COMMAND test-sycl-onednn-packed-cache)
 set_tests_properties(test-sycl-onednn-packed-cache PROPERTIES
     LABELS "sycl;onednn;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2549,7 +2552,7 @@ endif()
 add_test(NAME test-sycl-weight-key-uniqueness COMMAND test-sycl-weight-key-uniqueness)
 set_tests_properties(test-sycl-weight-key-uniqueness PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2577,7 +2580,7 @@ endif()
 add_test(NAME test-unified-cache-integrity COMMAND test-unified-cache-integrity)
 set_tests_properties(test-unified-cache-integrity PROPERTIES
     LABELS "sycl;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2605,7 +2608,7 @@ endif()
 add_test(NAME test-sycl-fattn-onednn-materialization COMMAND test-sycl-fattn-onednn-materialization)
 set_tests_properties(test-sycl-fattn-onednn-materialization PROPERTIES
     LABELS "sycl;fattn;onednn;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2661,7 +2664,7 @@ endif()
 add_test(NAME test-sycl-kernel-selection COMMAND test-sycl-kernel-selection)
 set_tests_properties(test-sycl-kernel-selection PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2717,7 +2720,7 @@ endif()
 add_test(NAME test-unified-cache-concurrent COMMAND test-unified-cache-concurrent)
 set_tests_properties(test-unified-cache-concurrent PROPERTIES
     LABELS "sycl;hostonly;concurrency;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2745,7 +2748,7 @@ endif()
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 
@@ -2784,7 +2787,7 @@ endif()
 add_test(NAME test-dmmv-q4-0-coalesced COMMAND test-dmmv-q4-0-coalesced)
 set_tests_properties(test-dmmv-q4-0-coalesced PROPERTIES
     LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2812,7 +2815,7 @@ endif()
 add_test(NAME test-dmmv-q6k-coalesced COMMAND test-dmmv-q6k-coalesced)
 set_tests_properties(test-dmmv-q6k-coalesced PROPERTIES
     LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2840,7 +2843,7 @@ endif()
 add_test(NAME test-fattn-thread-local COMMAND test-fattn-thread-local)
 set_tests_properties(test-fattn-thread-local PROPERTIES
     LABELS "sycl;fattn;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2868,7 +2871,7 @@ endif()
 add_test(NAME test-ggml-sycl-soa COMMAND test-ggml-sycl-soa)
 set_tests_properties(test-ggml-sycl-soa PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2896,7 +2899,7 @@ endif()
 add_test(NAME test-layout-bytes COMMAND test-layout-bytes)
 set_tests_properties(test-layout-bytes PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2924,7 +2927,7 @@ endif()
 add_test(NAME test-mmq-q6k-gpu COMMAND test-mmq-q6k-gpu)
 set_tests_properties(test-mmq-q6k-gpu PROPERTIES
     LABELS "sycl;mmq;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2952,7 +2955,7 @@ endif()
 add_test(NAME test-moe-mini-graph COMMAND test-moe-mini-graph)
 set_tests_properties(test-moe-mini-graph PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -2980,7 +2983,7 @@ endif()
 add_test(NAME test-moe-mul-mat-id COMMAND test-moe-mul-mat-id)
 set_tests_properties(test-moe-mul-mat-id PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3008,7 +3011,7 @@ endif()
 add_test(NAME test-moe-mul-mat-id-q4q8 COMMAND test-moe-mul-mat-id-q4q8)
 set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3036,7 +3039,7 @@ endif()
 add_test(NAME test-mul-mat-host-streaming COMMAND test-mul-mat-host-streaming)
 set_tests_properties(test-mul-mat-host-streaming PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3074,7 +3077,7 @@ endif()
 add_test(NAME test-onednn-woq COMMAND test-onednn-woq)
 set_tests_properties(test-onednn-woq PROPERTIES
     LABELS "sycl;onednn;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3102,7 +3105,7 @@ endif()
 add_test(NAME test-q6k-dispatch COMMAND test-q6k-dispatch)
 set_tests_properties(test-q6k-dispatch PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3130,7 +3133,7 @@ endif()
 add_test(NAME test-q8-0-layout-cache-path COMMAND test-q8-0-layout-cache-path)
 set_tests_properties(test-q8-0-layout-cache-path PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3158,7 +3161,7 @@ endif()
 add_test(NAME test-q8-0-layout-cache-path-mmvq COMMAND test-q8-0-layout-cache-path-mmvq)
 set_tests_properties(test-q8-0-layout-cache-path-mmvq PROPERTIES
     LABELS "sycl;layout;mmvq;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3242,7 +3245,7 @@ endif()
 add_test(NAME test-sycl-moe-identity-hash COMMAND test-sycl-moe-identity-hash)
 set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # Exits 77 when the binary was built without GGML_USE_SYCL; without this the
     # skip would be reported as a failure instead of a skip.
     SKIP_RETURN_CODE 77
@@ -3273,7 +3276,7 @@ endif()
 add_test(NAME test-sycl-orchestrator COMMAND test-sycl-orchestrator)
 set_tests_properties(test-sycl-orchestrator PROPERTIES
     LABELS "sycl;orchestrator;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3311,7 +3314,7 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME test-cpu-gpu-soa-interaction COMMAND test-cpu-gpu-soa-interaction)
     set_tests_properties(test-cpu-gpu-soa-interaction PROPERTIES
         LABELS "sycl;sycl-restored;gpu;soa;interaction;restored"
-        ENVIRONMENT "GGML_SYCL_VRAM_ARENA=0;GGML_SYCL_ASYNC_MEM=1"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_VRAM_ARENA=0;GGML_SYCL_ASYNC_MEM=1"
         RUN_SERIAL TRUE
     )
 endif()
@@ -3355,15 +3358,15 @@ if (NOT GGML_BACKEND_DL)
     # same binary with the env it needs, and are the live ones.
     add_test(NAME test-mmvq-q8-0-streaming-smoke COMMAND test-mmvq-q8-0-streaming-bench)
     set_tests_properties(test-mmvq-q8-0-streaming-smoke PROPERTIES
-        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=cache;GGML_SYCL_MMVQ_BENCH_NROWS=256;GGML_SYCL_MMVQ_BENCH_NCOLS=512;GGML_SYCL_MMVQ_BENCH_ITERS=1;GGML_SYCL_MMVQ_BENCH_WARMUP=0;GGML_SYCL_MMVQ_BENCH_SLICE_MB=1;GGML_SYCL_MMVQ_BENCH_BUFFERS=1"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=cache;GGML_SYCL_MMVQ_BENCH_NROWS=256;GGML_SYCL_MMVQ_BENCH_NCOLS=512;GGML_SYCL_MMVQ_BENCH_ITERS=1;GGML_SYCL_MMVQ_BENCH_WARMUP=0;GGML_SYCL_MMVQ_BENCH_SLICE_MB=1;GGML_SYCL_MMVQ_BENCH_BUFFERS=1"
     )
     add_test(NAME test-mmq-q8-0-streaming-smoke COMMAND test-mmvq-q8-0-streaming-bench)
     set_tests_properties(test-mmq-q8-0-streaming-smoke PROPERTIES
-        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=64"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=64"
     )
     add_test(NAME test-mmq-q8-0-streaming-forced COMMAND test-mmvq-q8-0-streaming-bench)
     set_tests_properties(test-mmq-q8-0-streaming-forced PROPERTIES
-        ENVIRONMENT "GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=1"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MMVQ_BENCH=1;GGML_SYCL_MMVQ_BENCH_MODE=mmq;GGML_SYCL_MMVQ_BENCH_MMQ_NROWS=512;GGML_SYCL_MMVQ_BENCH_MMQ_NCOLS=2048;GGML_SYCL_MMVQ_BENCH_MMQ_NTOKENS=4;GGML_SYCL_MMVQ_BENCH_MMQ_ITERS=1;GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP=0;GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB=1"
     )
     set_tests_properties(
         test-mmvq-q8-0-streaming-smoke
@@ -3402,6 +3405,7 @@ if (NOT GGML_BACKEND_DL)
     endif()
     add_test(NAME test-mxfp4-xmx-tiled COMMAND test-mxfp4-xmx-tiled)
     set_tests_properties(test-mxfp4-xmx-tiled PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;xmx;tiled;restored"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
@@ -3430,6 +3434,7 @@ if (NOT GGML_BACKEND_DL)
     endif()
     add_test(NAME test-q6k-reorder-dispatch COMMAND test-q6k-reorder-dispatch)
     set_tests_properties(test-q6k-reorder-dispatch PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;q6k;reorder;dispatch;restored"
         RUN_SERIAL TRUE
     )
@@ -3457,6 +3462,7 @@ if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
     endif()
     add_test(NAME test-sycl-fattn-onednn-descriptors COMMAND test-sycl-fattn-onednn-descriptors)
     set_tests_properties(test-sycl-fattn-onednn-descriptors PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;onednn;fattn;descriptors;restored"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
@@ -3485,6 +3491,7 @@ if (NOT GGML_BACKEND_DL)
     endif()
     add_test(NAME test-sycl-set-rows-owner-routing COMMAND test-sycl-set-rows-owner-routing)
     set_tests_properties(test-sycl-set-rows-owner-routing PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;set-rows;owner-routing;restored"
         RUN_SERIAL TRUE
     )
@@ -3545,6 +3552,7 @@ if (NOT GGML_BACKEND_DL)
     endif()
     add_test(NAME test-unified-dispatch-integration COMMAND test-unified-dispatch-integration)
     set_tests_properties(test-unified-dispatch-integration PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;unified;dispatch;integration;restored"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
@@ -3574,7 +3582,7 @@ endif()
 add_test(NAME test-sycl-unified-cache COMMAND test-sycl-unified-cache)
 set_tests_properties(test-sycl-unified-cache PROPERTIES
     LABELS "sycl;hostonly;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -3684,7 +3692,7 @@ endif()
 add_test(NAME test-tiered-dispatch COMMAND test-tiered-dispatch)
 set_tests_properties(test-tiered-dispatch PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
-    ENVIRONMENT "GGML_SYCL_VRAM_ARENA=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_VRAM_ARENA=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
@@ -3725,7 +3733,7 @@ endif()
 add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
 set_tests_properties(test-xmx-host-streaming PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # 77 = XMX off at build time, no SYCL backend, or a device without XMX
     # INT8/Q4_0. With both options OFF (the default) this test SKIPS -- which is
     # the honest report; it used to exit 0 and read as a pass.
