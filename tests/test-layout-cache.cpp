@@ -886,7 +886,36 @@ static bool test_layout_ptr_eviction_guard(int device_id) {
     return true;
 }
 
-static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
+static const char * usm_alloc_name(sycl::usm::alloc typ) {
+    switch (typ) {
+        case sycl::usm::alloc::host:
+            return "host-pinned";
+        case sycl::usm::alloc::device:
+            return "device";
+        case sycl::usm::alloc::shared:
+            return "shared";
+        default:
+            return "unknown/unregistered";
+    }
+}
+
+// llama.cpp-6qgl: this asserted the OPPOSITE until the oracle was adjudicated
+// stale.  The avoidance it encoded had two lives and both are closed:
+//   - a bypass to unpinned CPU memory for >= 64 MB model-load buffers (which is
+//     why this fixture asks for 128 MB), removed by 73376bdfd -- "Standalone
+//     tests confirm sycl::malloc_host works fine: 10 GB = 834ms, not the
+//     bottleneck", i.e. the WHY was measured and disproved;
+//   - an aligned_alloc + MADV_POPULATE_WRITE path for >= 1 GB, added by
+//     e5f3e19fe for a Level Zero hang and removed the same day by 03dd78bab
+//     once the real cause (a wrong host get_max_size) was fixed: "all host
+//     allocations are <= 3.6 GB and use proper sycl::malloc_host (USM, GPU DMA
+//     accessible)".
+// The product now states the opposite invariant unconditionally:
+// ggml_backend_sycl_host_buffer_type_alloc_buffer sets must_host_pinned = true
+// at ggml-sycl.cpp:35391 with no size and no in_model_load branch (in_model_load
+// is read only at :35372/:35387 to pick the alloc ROLE), and its failure path at
+// :35402-35405 says "All host buffers must be USM-pinned for GPU DMA access".
+static bool test_model_load_host_buffer_is_pinned(int device_id) {
     GGML_UNUSED(device_id);
 
     ggml_sycl_load_txn load{};
@@ -899,7 +928,7 @@ static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
 
     if (buffer == nullptr) {
         (void) ggml_backend_sycl_model_unloaded_token(model);
-        fprintf(stderr, "test_model_load_host_buffer_avoids_pinned: allocation failed\n");
+        fprintf(stderr, "test_model_load_host_buffer_is_pinned: allocation failed\n");
         return false;
     }
 
@@ -908,11 +937,11 @@ static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
     ggml_backend_buffer_free(buffer);
     (void) ggml_backend_sycl_model_unloaded_token(model);
 
-    if (typ == sycl::usm::alloc::host || typ == sycl::usm::alloc::shared) {
+    if (typ != sycl::usm::alloc::host) {
         fprintf(stderr,
-                "test_model_load_host_buffer_avoids_pinned: model-load host buffer is USM %s (alloc type %d); "
-                "expected unregistered host memory\n",
-                typ == sycl::usm::alloc::host ? "host-pinned" : "shared", (int) typ);
+                "test_model_load_host_buffer_is_pinned: model-load host buffer is USM %s (alloc type %d); expected "
+                "host-pinned, which ggml-sycl.cpp:35391 requires unconditionally\n",
+                usm_alloc_name(typ), (int) typ);
         return false;
     }
 
@@ -1029,20 +1058,20 @@ int main() {
     const bool choice    = test_mul_mat_layout_choice(device_id);
     const bool dev_cache = test_device_weight_layout_cache(device_id);
     const bool evict     = test_layout_ptr_eviction_guard(device_id);
-    const bool no_pinned = test_model_load_host_buffer_avoids_pinned(device_id);
+    const bool is_pinned = test_model_load_host_buffer_is_pinned(device_id);
     const bool preload   = test_model_load_preload_caches_weight(device_id);
 
     const struct {
         const char * name;
         bool         ok;
     } results[] = {
-        { "test_layout_selection",                     selection },
-        { "test_aos_drop",                             aos_drop  },
-        { "test_mul_mat_layout_choice",                choice    },
-        { "test_device_weight_layout_cache",           dev_cache },
-        { "test_layout_ptr_eviction_guard",            evict     },
-        { "test_model_load_host_buffer_avoids_pinned", no_pinned },
-        { "test_model_load_preload_caches_weight",     preload   },
+        { "test_layout_selection",                 selection },
+        { "test_aos_drop",                         aos_drop  },
+        { "test_mul_mat_layout_choice",            choice    },
+        { "test_device_weight_layout_cache",       dev_cache },
+        { "test_layout_ptr_eviction_guard",        evict     },
+        { "test_model_load_host_buffer_is_pinned", is_pinned },
+        { "test_model_load_preload_caches_weight", preload   },
     };
 
     bool ok       = true;
