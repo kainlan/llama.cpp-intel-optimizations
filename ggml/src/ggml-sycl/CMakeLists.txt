@@ -776,7 +776,17 @@ endif()
 # =============================================================================
 option(GGML_SYCL_BUILD_XMX_TESTS "Build XMX ESIMD unit tests" OFF)
 
-if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
+# llama.cpp-yg0d: `NOT GGML_BACKEND_DL` is load-bearing. Under
+# -DGGML_BACKEND_DL=ON the ggml-sycl target is a MODULE library, and CMake hard-
+# errors on target_link_libraries(<test> ... ggml-sycl) -- "Target 'ggml-sycl' of
+# type MODULE_LIBRARY may not be linked into another target". Nine of the tests
+# below link it, so the whole block must stand down under DL; otherwise the
+# nightly intel Docker image (.devops/intel.Dockerfile configures
+# -DGGML_BACKEND_DL=ON) dies at configure time. Extending THIS condition rather
+# than nesting a guard inside the body is deliberate -- it hands DL builds to the
+# else() branch, which keeps the DISABLED placeholders and so preserves the
+# visible-absence property that llama.cpp-u2mz established.
+if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)
     message(STATUS "Building XMX ESIMD unit tests")
 
     # Common SYCL compile/link options for tests
@@ -1373,11 +1383,14 @@ else()
         unified-kernel-persistent
     )
         # The guard is `GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL
-        # "INTEL"`, so name both conditions -- on a non-Intel SYCL target the
-        # option alone is not enough.
+        # "INTEL" AND NOT GGML_BACKEND_DL`, so name all three conditions -- on a
+        # non-Intel SYCL target the option alone is not enough, and under
+        # GGML_BACKEND_DL=ON no setting of the other two builds these at all
+        # (ggml-sycl is then a MODULE library that cannot be linked into a test
+        # executable -- llama.cpp-yg0d).
         add_test(NAME ${_xmx_absent_test}
             COMMAND ${CMAKE_COMMAND} -E echo
-                    "not built: needs -DGGML_SYCL_BUILD_XMX_TESTS=ON and GGML_SYCL_TARGET=INTEL")
+                    "not built: needs -DGGML_SYCL_BUILD_XMX_TESTS=ON and GGML_SYCL_TARGET=INTEL and GGML_BACKEND_DL=OFF")
         set_tests_properties(${_xmx_absent_test} PROPERTIES
             DISABLED TRUE
             LABELS "sycl;xmx;not-built")
