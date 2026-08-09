@@ -989,10 +989,14 @@ is the registration Task 16 declined.
 | `test-planner-canary-pp-tg-union` | `level_zero:1` | Canary D0.2. Fork/exec workers build PP-shape (ubatch=max) and TG-shape (ubatch=1) graphs for one model and check the union covers every op either executes. | ⚠️ Its own header states the completeness caveat: if a split aborts, later splits never fire their callbacks, so **an op set captured under abort is partial**. A PASS is only meaningful on a clean run. |
 | `test-planner-canary-direct-load` | `level_zero:1` | Canary D0.4. Deliberately bypasses `llama_model_load_from_file`; `mmap`s the Mistral fixture and moves bytes into a pre-allocated device tensor via one `ggml_backend_tensor_set`. | PASS iff exactly one copy lands the bytes. Lightest of the five — it consumes the model **file** but does not build a llama context. |
 
-⚠️ **The `opencl:cpu` selector on three rows is deliberate and load-bearing.** Their headers
-record why: it sidesteps host-side wedges (`zhzbp` for the prototype, `m09zb` for D0.3) that
-block these proofs on the GPU. Running them on `level_zero:*` does not make them stricter — it
-reintroduces the wedge they were written to route around.
+⚠️ **The `opencl:cpu` selector on three rows is deliberate and load-bearing.** **Two** of them
+record why in their own headers: it sidesteps host-side wedges — `zhzbp` for
+`mini-context-prototype`, `m09zb` for D0.3 (`test-planner-canary-cpy-visibility`) — that block
+these proofs on the GPU. The third, `test-planner-canary-skeleton-determinism`, says nothing
+about the backend at all: it is a thin orchestrator that `execl`s the
+`test-mini-context-prototype` binary, so it **inherits** that selector along with the protocol
+rather than choosing it. Running any of the three on `level_zero:*` does not make them
+stricter — it reintroduces the wedge they were written to route around.
 
 ### The 4 opt-in diagnostic/benchmark rows (`M-OPTIN`)
 
