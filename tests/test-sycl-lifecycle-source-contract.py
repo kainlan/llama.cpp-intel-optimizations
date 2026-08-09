@@ -895,6 +895,17 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "layer-stream teardown releases only the dying model's own working set":
+        # Owner-gated, not a sweep: an unconditional shutdown() here would wipe a
+        # live successor's working set (llama.cpp-vbeb's gate exists to prevent
+        # exactly that), so the guard is the contract, not the call.
+        "ggml_sycl::layer_stream_owner_same(mgr.owner(), dying)" in backend
+        # Non-creating lookup must precede the creating one.
+        and backend.index("ggml_sycl::layer_streaming_active(device)") <
+            backend.index("auto & mgr = ggml_sycl::get_layer_stream_manager(device);")
+        # ...and it must sit inside the EXACT-OWNER teardown path, immediately
+        # before the slot release, not in some later general cleanup.
+        and "mgr.shutdown();\n        }\n        ggml_sycl_release_model_slot_resources(owner);" in backend,
     "pending KV-mask handoff is correlated to its staging load":
         "struct ggml_sycl_pending_kv_layer_mask" in backend
         and "ggml_sycl_kv_layer_mask_identity" in backend

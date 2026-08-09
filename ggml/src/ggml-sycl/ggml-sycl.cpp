@@ -10823,6 +10823,45 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
             // retried, rather than completing a teardown that did not happen.
             return false;
         }
+        // Exact-owner layer-streaming teardown, for the same reason the MoE
+        // release above is exact-owner: the live working set belongs to
+        // whoever is active, so unloading A must not disturb a live B. This
+        // closes the residual llama.cpp-vbeb reported -- the LAST streaming
+        // model has no successor to displace it, so its buffers were held
+        // until the next load or process exit.
+        //
+        // layer_stream_manager::shutdown() is a full release plus owner-forget
+        // and is deliberately owner-BLIND: its premise ("no model left for whom
+        // the working set could be preserved") holds at module shutdown, and
+        // here only behind this check. Calling it unconditionally at every
+        // model teardown would be the load-boundary sweep vbeb's gate exists to
+        // avoid -- it would wipe a live successor's freshly built working set.
+        ggml_sycl::layer_stream_owner dying{};
+        dying.model_id        = owner.model.value;
+        dying.load_txn_id     = owner.load.value;
+        dying.slot            = owner.owner.slot;
+        dying.slot_generation = owner.owner.generation;
+        for (int device = 0; device < ggml_sycl_info().device_count; ++device) {
+            // layer_streaming_active() looks the manager up without creating
+            // one; get_layer_stream_manager() creates on access. Filtering
+            // first keeps a teardown from fabricating a working set on devices
+            // that never streamed. A manager holding an ownership record but no
+            // buffers is left alone: it has nothing to release, and the next
+            // model's arrival displaces the stale record anyway.
+            if (!ggml_sycl::layer_streaming_active(device)) {
+                continue;
+            }
+            auto & mgr = ggml_sycl::get_layer_stream_manager(device);
+            if (!ggml_sycl::layer_stream_owner_same(mgr.owner(), dying)) {
+                continue;
+            }
+            GGML_LOG_INFO(
+                "[LAYER-STREAM] Model teardown: releasing the working set on device %d owned by model %llu "
+                "(load %llu, slot %u/%llu)\n",
+                device, (unsigned long long) dying.model_id, (unsigned long long) dying.load_txn_id, dying.slot,
+                (unsigned long long) dying.slot_generation);
+            mgr.shutdown();
+        }
         ggml_sycl_release_model_slot_resources(owner);
         return true;
     } catch (...) {
