@@ -21128,17 +21128,62 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
     } else if ((tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K ||
                 tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_MXFP4) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
-        // CRITICAL FIX: Reuse existing extra if present (may have been created by
-        // ggml_backend_sycl_register_weight_identity with model_id already set).
-        // Do NOT overwrite it or we lose the model_id for unified cache lookups.
+        // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
+        // model_id for unified cache lookups.
+        //
+        // llama.cpp-yy17: the producer named here used to be
+        // ggml_backend_sycl_register_weight_identity, which is wrong in the one way
+        // that mattered -- that function takes no reference on anything (its own
+        // closing NOTE says it never touches tensor->extra at all), so "reuse
+        // without retain" read as free.  The real producer is
+        // ggml_backend_sycl_register_host_weight_tensor, from the loader
+        // (llama-model-loader.cpp, register_sycl_tensor_metadata) and again from the
+        // head of this function, and it leaves the host-weight registry row holding
+        // the extra's SOLE reference: it retains only when it did NOT create the
+        // extra, so a created one stays at refcount 1.
+        //
+        // ~ggml_backend_sycl_buffer_context releases one refcount per tensor_extras
+        // entry, so an entry pushed without a reference of its own is a second
+        // claimant on that single count.  Both releases then run, in this order,
+        // inside ~llama_model: pimpl.reset() frees the buffers first, taking the
+        // count to zero and deleting the extra, and hooks.unload() ->
+        // ggml_sycl_release_host_weight_extras_for_owner() then decrements freed
+        // memory.  Take our own reference, mirroring the created_extra /
+        // retain_extra_gpu() pattern in ggml_backend_sycl_register_host_weight_tensor.
+        //
+        // Every other tensor_extras.push_back in this file pushes an extra it just
+        // created; this was the only reuse site.  It is also why a repeated
+        // init_tensor on one tensor was unbalanced -- with the retain, N pushes
+        // carry N references.  Gated by tests/test-sycl-tensor-extras-retain-contract.py.
 
         ggml_tensor_extra_gpu * extra;
+        bool                    created_extra = false;
         if (tensor->extra) {
             extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
         } else {
             extra = new ggml_tensor_extra_gpu{};
             ggml_sycl_register_optimize_feature(&extra->optimized_feature);
             tensor->extra = extra;
+            created_extra = true;
+        }
+        if (!created_extra) {
+            retain_extra_gpu(extra);
+            // The fix's own positive control.  An unfixed build is silent here and a
+            // fixed one is silent too unless it says so: the double-release this
+            // prevents is a decrement of freed memory, which usually reads back a
+            // heap-recycled non-zero refcount and returns quietly, so "the run did
+            // not crash" is exactly what the defect looked like.  One-shot, and
+            // through the raw-stderr diag helper because a plain GGML_LOG_WARN sits
+            // below the default verbosity threshold (common/log.cpp) and is
+            // additionally downgraded by test-llama-archs' log callback.
+            static std::atomic<bool> logged_reuse_retain{ false };
+            if (!logged_reuse_retain.exchange(true, std::memory_order_acq_rel)) {
+                ggml_sycl_diag_emit_warn(
+                    "[SYCL] tensor_extras retained reused extra for %s: refcount=%d (buffer context and host-weight "
+                    "registry each hold their own reference)\n",
+                    tensor->name && tensor->name[0] ? tensor->name : "?",
+                    extra->refcount.load(std::memory_order_relaxed));
+            }
         }
         ctx->tensor_extras.push_back({ tensor, extra });  //used to release it when destroy ctx.
         ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
