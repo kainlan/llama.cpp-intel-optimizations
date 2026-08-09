@@ -41,14 +41,27 @@ leaking"). **All seven now have a disposition. None is UNHANDLED.**
 
 ### 1.1 `g_has_placement_plan` is gone, not merely quiet
 
-A tree-wide `search_text` for `g_has_placement_plan` returns **eight
-matches, none of them live source**: three in
-`docs/backend/sycl-cross-model-state-audit.md`, one in
-`docs/backend/sycl-static-storage-inventory.csv`, one in
-`docs/design/sycl-canonical-memory-architecture.md:375`, one in
-`docs/plans/2026-04-19-cache-expert-invariant-investigation.md`, and one
-inside an *example string* in `tests/test-sycl-lifecycle-source-contract.py:109`.
-`cat ggml-sycl.cpp | grep -n` returns zero.
+A tree-wide `search_text` for `g_has_placement_plan` matches these, and
+**none of them is live source** — the full list, not a summary of one:
+
+1. `docs/backend/sycl-cross-model-state-audit.md:515` — prose
+2. `docs/backend/sycl-cross-model-state-audit.md:519` — prose
+3. `docs/backend/sycl-static-storage-inventory.csv:70` — a stale census row
+4. `docs/design/sycl-canonical-memory-architecture.md:375` — a stale citation
+5. `docs/plans/2026-04-19-cache-expert-invariant-investigation.md:90` — prose
+6. `tests/test-sycl-lifecycle-source-contract.py:109` — an *example string*
+   inside the contract's own test data, not a reference to the symbol
+
+`cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -c 'g_has_placement_plan'`
+returns **0**, positive-controlled against two siblings in the same region
+that do still exist: `g_placement_kv_info` → 31, `g_placement_envelope` →
+12. A zero from a probe that cannot fire would prove nothing; these fire.
+
+⚠️ **Re-running that search today returns more than the six above, because
+this document is now one of the matches.** Writing the finding changed the
+answer to the question ([[documenting-a-check-can-break-it]]). Exclude
+`docs/backend/sycl-w1-convergence.md` when re-deriving; the six are the
+pre-existing occurrences.
 
 `git log -S` attributes the removal to the immutable-placement reader
 migration (`c3bfd71c4`, `92b2675f6`, and predecessors). The flag was not
