@@ -13,8 +13,23 @@
 // scoping g_sycl_weight_identities_by_name already uses, and erases an owner's
 // rows in ggml_sycl_erase_weight_identities_for_owner().
 //
-// Mutation control: key the map by bare `std::string(tensor->name)` at either
-// call site. Check 5 (reactivate A) then fails and checks 1-4 and 6 stay green.
+// Mutation control. The two reverts are NOT equivalent, and an earlier version
+// of this comment claimed they were:
+//
+//   * SYMMETRIC -- make ggml_sycl_canonical_checksum_key() return the bare
+//     name, so capture and lookup still agree. The same-owner round trip keeps
+//     working and only the cross-model isolation breaks: check 5 fails, alone.
+//     (Derived, not yet measured on hardware.)
+//   * SINGLE-SITE -- revert only the capture subscript to
+//     `std::string(tensor->name)`, leaving the lookup owner-keyed. Now every
+//     lookup misses, and checks 1, 2, 3 and 4 fail. Measured 2026-08-09.
+//
+// The single-site result is why `row::present` exists. Before it, that revert
+// left checks 5 and 6 -- the two assertions this test is for -- passing on
+// `0 == 0`, so the run reported the map's total failure as four unrelated
+// failures and green on the ownership checks. Both now fail too, which is the
+// honest reading of a build where nothing is recorded.
+//
 // The erase-on-teardown half is not observable from here -- a reused slot
 // carries a new generation, so a missing erase leaks memory rather than
 // answers. That half is the source-contract gate's job, not this test's.
@@ -63,13 +78,25 @@ static ggml_tensor * named(ggml_context * ctx, const char * name) {
     return t;
 }
 
-// Returns 0 when no row is recorded for this tensor under the active owner.
-// 0 is not a reachable FNV-1a value for the payloads below, and every call site
-// that cares distinguishes "absent" from "present" through the bool anyway.
-static uint64_t sum_of(const ggml_tensor * t) {
-    size_t   bytes    = 0;
+// A recorded row, carrying presence separately from the value.
+//
+// `present` is what keeps the equality checks below non-vacuous, and it is here
+// because the first version of this test did NOT have it. Returning a bare 0
+// for "absent" meant checks 5 and 6 compared 0 against 0 and PASSED on a build
+// where every lookup missed -- measured, not hypothesised: reverting only the
+// capture-site key made checks 1-4 fail while the two checks the test exists
+// for reported green. An absent sentinel that ties with itself is invisible to
+// a value-only comparison, so presence is asserted explicitly at every site.
+struct row {
+    bool     present  = false;
     uint64_t checksum = 0;
-    return g_lookup(t, &bytes, &checksum) ? checksum : 0;
+};
+
+static row row_of(const ggml_tensor * t) {
+    row    r{};
+    size_t bytes = 0;
+    r.present    = g_lookup(t, &bytes, &r.checksum) && bytes != 0;
+    return r;
 }
 
 int main() {
@@ -140,16 +167,15 @@ int main() {
     // back through the map -- works. Failing this makes every check below
     // vacuous, so it is asserted before anything about ownership.
     g_capture(solo, payload_a, sizeof(payload_a));
-    const uint64_t solo_a = sum_of(solo);
-    check(solo_a != 0, "check 1 (positive control): a capture is readable under its own owner");
+    check(row_of(solo).present, "check 1 (positive control): a capture is readable under its own owner");
 
     g_capture(shared, payload_a, sizeof(payload_a));
-    const uint64_t shared_a = sum_of(shared);
+    const row shared_a = row_of(shared);
 
     // Check 2 (precondition): model A really did record the shared name. With
     // no row here there would be nothing for model B to overwrite and check 5
     // would prove nothing.
-    check(shared_a != 0, "check 2: model A recorded the shared name (precondition for check 5)");
+    check(shared_a.present, "check 2: model A recorded the shared name (precondition for check 5)");
 
     check(ggml_backend_sycl_model_load_end(load_a, true, &model_a) == GGML_SYCL_LIFECYCLE_OK,
           "model A lifecycle commit");
@@ -162,19 +188,21 @@ int main() {
           "model B plan stage");
 
     // Check 3 (negative control): a name only model B ever captures reads back
-    // correctly. This stays green under the fix AND under its revert -- it
-    // shows the mutation named at the top is scoped to the cross-model case
-    // and does not simply break capture wholesale.
+    // correctly. This stays green under the SYMMETRIC revert -- it shows that
+    // mutation is scoped to the cross-model case and does not break capture
+    // wholesale. It does NOT survive the single-site revert, which breaks
+    // every lookup; that is the point of distinguishing the two.
     g_capture(b_only, payload_b, sizeof(payload_b));
-    check(sum_of(b_only) != 0, "check 3 (negative control): model B's own unique name reads back");
+    check(row_of(b_only).present, "check 3 (negative control): model B's own unique name reads back");
 
     g_capture(shared, payload_b, sizeof(payload_b));
-    const uint64_t shared_b = sum_of(shared);
+    const row shared_b = row_of(shared);
 
     // Check 4: model B's capture of the shared name is B's own data. Under
-    // bare-name keying this also passes -- last write wins -- which is exactly
-    // why check 5 and not this one is the discriminating assertion.
-    check(shared_b != 0 && shared_b != shared_a, "check 4: model B's shared-name capture differs from model A's");
+    // symmetric bare-name keying this also passes -- last write wins -- which
+    // is exactly why check 5 and not this one is the discriminating assertion.
+    check(shared_b.present && shared_b.checksum != shared_a.checksum,
+          "check 4: model B's shared-name capture differs from model A's");
 
     check(ggml_backend_sycl_model_load_end(load_b, true, &model_b) == GGML_SYCL_LIFECYCLE_OK,
           "model B lifecycle commit");
@@ -184,12 +212,19 @@ int main() {
     // name. Under bare-name keying model B's capture destroyed it and this
     // returns B's checksum, which is the false `match=0` the diagnostic then
     // reports against model A's correct weights.
+    // `present &&` is not decoration: without it an absent row compares equal
+    // to another absent row and this reports green on a build recording
+    // nothing at all.
     check(ggml_backend_sycl_activate_model_plan(model_a) == GGML_SYCL_LIFECYCLE_OK, "reactivate exact model A");
-    check(sum_of(shared) == shared_a, "check 5: A->B->reactivate-A reads A's own shared-name checksum, not B's");
+    const row shared_a_again = row_of(shared);
+    check(shared_a_again.present && shared_a_again.checksum == shared_a.checksum,
+          "check 5: A->B->reactivate-A reads A's own shared-name checksum, not B's");
 
     // Check 6: B's row is independent of A's and survived A's reactivation.
     check(ggml_backend_sycl_activate_model_plan(model_b) == GGML_SYCL_LIFECYCLE_OK, "reactivate exact model B");
-    check(sum_of(shared) == shared_b, "check 6: exact B lookup remains independent of A");
+    const row shared_b_again = row_of(shared);
+    check(shared_b_again.present && shared_b_again.checksum == shared_b.checksum,
+          "check 6: exact B lookup remains independent of A");
 
     ggml_free(ctx);
     (void) ggml_backend_sycl_model_unloaded_token(model_b);
