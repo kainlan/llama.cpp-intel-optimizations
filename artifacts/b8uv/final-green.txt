@@ -1,0 +1,18 @@
+[0tkh] layout-selection inputs: device=0 xmx.supported=1 xmx.supports_int8=1 xmx_supported=1
+[0tkh] case=host/auto      buft=host   override=none      entry=yes layout=AOS       on_device=no
+[0tkh] case=host/coalesced buft=host   override=COALESCED entry=yes layout=AOS       on_device=no
+[0tkh] case=dev/auto       buft=device override=none      entry=yes layout=COALESCED on_device=yes
+[0tkh] case=dev/coalesced  buft=device override=COALESCED entry=yes layout=COALESCED on_device=yes
+[0tkh] case=dev/soa        buft=device override=SOA       entry=yes layout=COALESCED on_device=yes
+[0tkh] NOTE: dev/auto already resolved COALESCED with no override, and dev/soa resolved COALESCED -- the override does NOT bind on the device path for a fresh weight, so dev/coalesced measures the DEFAULT policy, not the override (ggml-sycl.cpp:53014 refuses a non-AOS override without matching layout info).
+[doyp] NOTE: the lookup FOUND the ensure_cached_alloc-staged COALESCED entry (ptr=0xfffff1c78d600000) -- the two seams agree on key derivation.
+=== test-layout-cache summary ===
+  test_layout_selection                        PASS
+  test_aos_drop                                PASS
+  test_mul_mat_layout_choice                   PASS
+  test_device_weight_layout_cache              PASS
+  test_layout_ptr_eviction_guard               PASS
+  test_model_load_host_buffer_is_pinned        PASS
+  test_model_load_preload_caches_weight        PASS
+=== 7/7 sub-tests passed ===
+Test Passed.
