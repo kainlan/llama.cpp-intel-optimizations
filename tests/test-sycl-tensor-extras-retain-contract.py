@@ -13,6 +13,20 @@ releases in a fixed order -- pimpl.reset() frees the buffers (refcount 1 -> 0,
 delete), then hooks.unload() -> ggml_sycl_release_host_weight_extras_for_owner()
 decrements the freed object.
 
+HOW OFTEN IT REUSES IS NOT SETTLED, and the first write-up of the fix got this
+wrong.  It claimed the reuse case was "the default path for every quantized
+non-view weight"; a B50 Mistral Q4_0 run then tripped the in-code one-shot
+diagnostic ZERO times while releasing 291 host-weight registry rows.  The
+registration is indeed unconditional per created tensor, but reaching
+ggml_backend_sycl_buffer_init_tensor additionally requires DEVICE-buffer-type
+routing, and with evictable weights on llama also offers the SYCL host buffer
+type, whose buffer comes from ggml_backend_cpu_buffer_from_ptr with only
+get_base/free_buffer/clear overridden -- so a host-routed weight keeps the CPU
+init_tensor and never reaches the site at all.  Treat the site as
+reachable-but-unexercised rather than hot.  None of that weakens the contract
+below: the destructor releases per entry unconditionally, so an unowned entry is
+wrong at any frequency, which is exactly why this gate is structural.
+
 WHY A SOURCE GATE AND NOT A RUNTIME ONE.  The failure is a decrement of freed
 memory.  glibc writes a tcache `next` pointer over offset 0, which is where
 `std::atomic<int> refcount` lives, so the second release usually reads back a

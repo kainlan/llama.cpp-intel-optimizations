@@ -21136,11 +21136,11 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
         // that mattered -- that function takes no reference on anything (its own
         // closing NOTE says it never touches tensor->extra at all), so "reuse
         // without retain" read as free.  The real producer is
-        // ggml_backend_sycl_register_host_weight_tensor, from the loader
-        // (llama-model-loader.cpp, register_sycl_tensor_metadata) and again from the
-        // head of this function, and it leaves the host-weight registry row holding
-        // the extra's SOLE reference: it retains only when it did NOT create the
-        // extra, so a created one stays at refcount 1.
+        // ggml_backend_sycl_register_host_weight_tensor, called per created tensor
+        // from the loader (llama-model-loader.cpp, register_sycl_tensor_metadata).
+        // It leaves the host-weight registry row holding the extra's SOLE reference:
+        // it retains only when it did NOT create the extra, so a created one stays
+        // at refcount 1.
         //
         // ~ggml_backend_sycl_buffer_context releases one refcount per tensor_extras
         // entry, so an entry pushed without a reference of its own is a second
@@ -21155,6 +21155,30 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
         // created; this was the only reuse site.  It is also why a repeated
         // init_tensor on one tensor was unbalanced -- with the retain, N pushes
         // carry N references.  Gated by tests/test-sycl-tensor-extras-retain-contract.py.
+        //
+        // HOW OFTEN THIS BRANCH ACTUALLY REUSES, because the first write-up of this
+        // fix overstated it as "the default path for every quantized non-view
+        // weight" and a device run then measured ZERO reuses on Mistral Q4_0:
+        //
+        //   * The registration above is unconditional per created tensor, so under
+        //     the default ggml_backend_sycl_weights_evictable() every weight gets a
+        //     registry-owned extra -- a B50 Mistral load released 291 registry rows.
+        //   * But reaching THIS function requires the tensor to have been routed to
+        //     the SYCL DEVICE buffer type.  With evictable weights on, llama also
+        //     offers the SYCL host buffer type (llama-model.cpp, the buft_list
+        //     append guarded by weights_evictable()), and that type's buffer is
+        //     built by ggml_backend_cpu_buffer_from_ptr with only get_base/
+        //     free_buffer/clear overridden -- its init_tensor stays the CPU one, so
+        //     a host-routed weight never enters this function at all.
+        //   * So the reuse case needs BOTH halves: evictable registration on (for
+        //     the pre-existing extra) AND device-buffer routing (to get here).
+        //     GGML_SYCL_WEIGHTS_EVICTABLE=0 is therefore the wrong probe -- it gates
+        //     the registration too, and would only produce created_extra again.
+        //
+        // The unbalanced push was still a defect at any frequency, since the
+        // destructor above releases per entry unconditionally.  What is NOT
+        // established is that it fires on an ordinary single-model load; treat it as
+        // reachable-but-unexercised until a run trips the one-shot diagnostic below.
 
         ggml_tensor_extra_gpu * extra;
         bool                    created_extra = false;
