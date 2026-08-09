@@ -112,6 +112,24 @@ class layer_stream_manager {
     // token when nobody does.
     layer_stream_owner owner() const { return owner_gate_.current(); }
 
+    // Release the working set if and only if `owner` still owns it, as one
+    // atomic step. Returns true when it released.
+    //
+    // This exists because the teardown path (llama.cpp-y36c) otherwise has to
+    // ask owner() and then call shutdown(), and those are two operations: a
+    // model load can land between them, take ownership, and have its brand new
+    // working set torn down by the previous model's destructor. The window is
+    // narrow and the lifecycle registry APPEARS to serialise load against
+    // teardown transactions -- but that serialisation is not something this
+    // class can see or assert, so it is not something it should depend on.
+    // Checking and releasing under one lock removes the question instead of
+    // answering it.
+    //
+    // A model that is NOT the current owner releases nothing: its state was
+    // already displaced by whoever owns it now, and tearing down A must never
+    // touch B's working set.
+    bool release_if_owner(const layer_stream_owner & owner);
+
     // Test seam. Installs the buffer bookkeeping a successful allocate_buffers()
     // followed by two layer loads would leave behind, without a queue and
     // without a device, so the owner-displacement path can be driven on a
@@ -162,8 +180,14 @@ class layer_stream_manager {
     // Host pointer registration
     mutable std::mutex host_ptr_mutex_;
 
-    // Which model the whole cluster above belongs to.
+    // Which model the whole cluster above belongs to. owner_transition_mutex_
+    // makes "decide the owner" and "release the outgoing owner's state" one
+    // step: the gate's own mutex protects only the gate's fields, so without
+    // this a load and a teardown can each pass their own check and then both
+    // act. Lock order is owner_transition_mutex_ -> prefetch_mutex_ ->
+    // host_ptr_mutex_; nothing takes them in the other direction.
     layer_stream_owner_gate owner_gate_;
+    std::mutex              owner_transition_mutex_;
 
     // Internal helpers
     int  pick_buffer_for_layer(int layer_id) const;

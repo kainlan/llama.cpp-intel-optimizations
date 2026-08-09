@@ -89,7 +89,26 @@ void layer_stream_manager::release_model_state() {
     }
 }
 
+bool layer_stream_manager::release_if_owner(const layer_stream_owner & owner) {
+    std::lock_guard<std::mutex> lock(owner_transition_mutex_);
+    if (!owner_gate_.is_owner(owner)) {
+        // Already displaced by whoever owns it now. Releasing here would tear
+        // down the CURRENT owner's working set on the previous owner's way out.
+        return false;
+    }
+    GGML_LOG_INFO("[LAYER-STREAM] Owner teardown: releasing the working set of model %llu (load %llu, slot %u/%llu)\n",
+                  (unsigned long long) owner.model_id, (unsigned long long) owner.load_txn_id, owner.slot,
+                  (unsigned long long) owner.slot_generation);
+    owner_gate_.forget();
+    release_model_state();
+    return true;
+}
+
 void layer_stream_manager::adopt_current_owner() {
+    // Held across the release, not just the decision: a teardown that resolves
+    // to the same outgoing owner must not run its release concurrently with
+    // this one.
+    std::lock_guard<std::mutex>          lock(owner_transition_mutex_);
     const layer_stream_transition_result transition = owner_gate_.observe(layer_stream_current_load_owner());
     if (transition.kind != layer_stream_transition::DISPLACE) {
         return;
@@ -223,6 +242,11 @@ void layer_stream_manager::shutdown() {
     // whom the working set could be preserved. release_model_state() alone
     // would leave the gate claiming a dead owner still holds it, and the next
     // model would then be told KEEP instead of ADOPT.
+    //
+    // Unconditional, unlike release_if_owner(): this is module/destructor
+    // teardown, where there is no owner left for whom the state could be
+    // preserved. A caller retiring ONE model must use release_if_owner().
+    std::lock_guard<std::mutex> lock(owner_transition_mutex_);
     release_model_state();
     owner_gate_.forget();
 }

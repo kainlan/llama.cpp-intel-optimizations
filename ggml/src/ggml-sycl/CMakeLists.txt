@@ -4344,10 +4344,15 @@ add_test(NAME sycl-layer-stream-nonstreaming-successor
     COMMAND test-layer-stream-owner-lifecycle --case 1)
 add_test(NAME sycl-layer-stream-reshaped-successor
     COMMAND test-layer-stream-owner-lifecycle --case 2)
+# The teardown path (llama.cpp-y36c's call site): retiring a model that has
+# already been displaced must release nothing.
+add_test(NAME sycl-layer-stream-teardown-owner
+    COMMAND test-layer-stream-owner-lifecycle --case 7)
 set_tests_properties(
     sycl-layer-stream-owner-lifecycle
     sycl-layer-stream-nonstreaming-successor
     sycl-layer-stream-reshaped-successor
+    sycl-layer-stream-teardown-owner
     PROPERTIES
     LABELS "sycl;lifecycle;cross-model;host-only"
     # The selector is pinned even though this test never reaches a device: the

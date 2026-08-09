@@ -56,6 +56,17 @@ PRISTINE_DRAIN = [
 ]
 
 
+def transition_lock_pos(body):
+    """Offset of the owner_transition_mutex_ lock_guard, or None.
+
+    Matched by regex, not literally: clang-format pads the declaration for
+    vertical alignment in some bodies and not others, and a reformat must not be
+    able to turn a satisfied contract into a reported violation.
+    """
+    match = re.search(r"std::lock_guard<std::mutex>\s+lock\(owner_transition_mutex_\);", body)
+    return match.start() if match else None
+
+
 def function_body(text, signature):
     """Return the brace-matched body of the first definition matching `signature`."""
     start = text.find(signature)
@@ -166,6 +177,39 @@ def run(cpp, hpp, owner_hpp, absence_only=False):
     if shutdown:
         presence.append(("shutdown() delegates to the owner function", "release_model_state();" in shutdown))
         presence.append(("shutdown() drops the ownership record", "owner_gate_.forget();" in shutdown))
+
+    # The teardown entry point (llama.cpp-y36c's call site). Its whole value is
+    # that the check and the release are ONE step, so both the guard and the
+    # lock that makes them atomic are contract, not implementation detail.
+    release_if_owner = function_body(cpp, "bool layer_stream_manager::release_if_owner(")
+    presence.append(("release_if_owner() is defined", release_if_owner is not None))
+    if release_if_owner:
+        presence.append(
+            (
+                "release_if_owner() refuses a model that is not the owner",
+                "if (!owner_gate_.is_owner(owner))" in release_if_owner,
+            )
+        )
+        lock_at = transition_lock_pos(release_if_owner)
+        presence.append(
+            (
+                "release_if_owner() takes the transition lock before it checks",
+                lock_at is not None and lock_at < release_if_owner.find("owner_gate_.is_owner(owner)"),
+            )
+        )
+        presence.append(
+            (
+                "release_if_owner() releases under the same lock it checked under",
+                "release_model_state();" in release_if_owner and "owner_gate_.forget();" in release_if_owner,
+            )
+        )
+    if adopt:
+        presence.append(
+            (
+                "adopt_current_owner() holds the transition lock across its release",
+                transition_lock_pos(adopt) is not None,
+            )
+        )
 
     # The gate must fail closed on an unattributed caller, or the fix degrades
     # into a load-boundary sweep any call could trigger.
