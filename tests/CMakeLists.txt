@@ -1586,6 +1586,35 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
+
+    # test-layout-cache: RESTORED per the llama.cpp-b8uv adjudication (see the
+    # file's own header comment). Registered at 3c8f296fd:928-940, wiped by the
+    # registration loss 0igs tracks; not a mock (all 5 entry points reach
+    # production in ggml-sycl.cpp) and not rotted (its 10-arg
+    # ensure_cached_alloc call matches the current signature).
+    # Two controls the 3c8f296fd block lacked, both mandatory:
+    #  - main() setenv()s ONEAPI_DEVICE_SELECTOR to level_zero:0 (the B70
+    #    benchmark card) when unset; the setenv only fires when nothing is set,
+    #    so pinning level_zero:1 here defeats it. Same trap as
+    #    test-unified-cache-bugs.
+    #  - It loads models (OOM-hazard family): RUN_SERIAL, never looped, and
+    #    LABELS avoid the residency/mem-handle/cache denylist substrings per
+    #    rule 2 so the -j 1 throttled sweep can see it. Exits 77 on no-device.
+    add_executable(test-layout-cache test-layout-cache.cpp)
+    target_link_libraries(test-layout-cache PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    target_include_directories(test-layout-cache PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-layout-cache PRIVATE GGML_SYCL_WARP_SIZE=32)
+    target_compile_options(test-layout-cache PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-layout-cache PRIVATE "-fsycl")
+    add_test(NAME test-layout-cache COMMAND $<TARGET_FILE:test-layout-cache>)
+    set_tests_properties(test-layout-cache PROPERTIES
+        LABELS "sycl;layout;model-load;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 # test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
