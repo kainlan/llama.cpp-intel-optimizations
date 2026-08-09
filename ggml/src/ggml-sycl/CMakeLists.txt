@@ -2328,8 +2328,47 @@ foreach(_residency_test
         target_link_libraries(${_residency_test} PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     add_test(NAME ${_residency_test} COMMAND ${_residency_test})
+    # LABELS drop the old "cache;residency;mem-handle" -- see rule 2 above
+    # (llama.cpp-vrko).  This loop was the LAST holdout in this file: every
+    # other block here already follows rule 2, which is why the string reads
+    # like the pre-rule vocabulary it is.
+    #
+    # The three dropped words are the throttled sweep's -LE denylist, so they
+    # excluded all 15 members from the only sweep that would run them -- and
+    # that is how test-sycl-moe-sequence-graphlet-policy's exit(1)-since-birth
+    # state went unnoticed for six weeks.  Rule 2's criterion for carrying them
+    # is membership of the GPU-allocating OOM-hazard family, and none of these
+    # 15 qualifies.  Checked per file, not assumed from the loop's name: no
+    # member calls ggml_backend_sycl_init, ggml_backend_graph_compute,
+    # sycl::malloc*, or constructs a sycl::queue/device.  They operate on
+    # stack-local unified_cache_entry PODs, mem_handle metadata constructors
+    # (from_direct / from_arena_zone / from_weight_lease_snapshot over stack
+    # storage), and -- for most of the moe-* members -- runtime source-text
+    # greps of the repo tree via <fstream>.  The only apparent counter-example
+    # is the sequence-graphlet-policy member's three "sycl::malloc"/
+    # "malloc_device" hits, and all three are string literals it greps FOR
+    # (:485, :1227, :1332), which is the "with strings stripped" caveat in the
+    # ticket.  The u2mz inventory independently classifies that member CPU-ONLY.
+    #
+    # Sweep membership therefore changes: all 15 were excluded from CLAUDE.md's
+    # form-2 throttled sweep and are now included.  That is the point, and it is
+    # safe at the -j 1 that form 2 mandates because none of them allocates.
+    #
+    # Deliberately UNDER-claimed rather than re-topiced.  The 15 are not
+    # homogeneous (11 moe-*, 4 handle/residency-diagnostics) and they share ONE
+    # property line, so any topic word would be false for some member -- the
+    # defect this ticket is about.  "sycl;hostonly;tdd" is true of all 15.
+    # Topic selection stays available by name: ctest -R 'moe-.*-policy' etc.,
+    # which CLAUDE.md already recommends over label filters.
+    #
+    # ⚠️ Consequence for CLAUDE.md's form 3, `ctest -L residency`: after this
+    # change NO registration in the tree carries a "residency" label, so that
+    # command matches zero tests and exits 0 -- a vacuous pass (llama.cpp-5exz's
+    # shape).  "cache" and "mem-handle" still resolve, to
+    # test-unified-cache-unpin-event (tests/CMakeLists.txt:1425), which is a
+    # real device test.  Form 3 needs rewording; raised with the lead.
     set_tests_properties(${_residency_test} PROPERTIES
-        LABELS "sycl;cache;residency;mem-handle;tdd"
+        LABELS "sycl;hostonly;tdd"
         ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         TIMEOUT 120
     )

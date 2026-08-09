@@ -2,6 +2,54 @@
 //
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-layout-cache
+//
+// ⚠️ THIS FILE IS NOT REGISTERED.  No add_executable/add_test anywhere in the
+// tree names it, so the binary above does not exist and nothing here has run
+// since the registration wipe (llama.cpp-b8uv, found during llama.cpp-og9dt).
+//
+// ADJUDICATED: RESTORE, blocked on a build.  Reasoning, so the next reader does
+// not have to redo it:
+//
+//  - It is a wipe casualty, not a never-registered source.  It WAS registered
+//    at 3c8f296fd (tests/CMakeLists.txt:928-940, `if(GGML_SYCL)` +
+//    add_executable + add_test).  The 0igs framework's scope rule is explicit
+//    that this puts it in restoration-review scope, whereas a never-registered
+//    file starts as a delete candidate.  So "delete" is not the default here.
+//  - It is absent from u2mz's 64-source merge-relevant subset, but that subset
+//    was built by a filename-keyword + changed-header filter, and "layout-cache"
+//    matches none of the 21 keyword stems.  It missed the FILTER, not the scope,
+//    so its absence is not a disposition.
+//  - It is not a mock.  Every entry point it drives is production code reached
+//    from ggml-sycl.cpp: ggml_sycl_get_weight_layout_ptr (8 uses),
+//    ggml_backend_sycl_get_weight_cache_key (17), _register_host_weight_tensor
+//    (8), _model_load_begin (4), _register_weight_usage (3).  This is the check
+//    u2mz used to DELETE four sibling tests that drove test-only mirrors; this
+//    one passes it.
+//  - Its APIs have not rotted away: all 11 project symbols it calls still exist
+//    in the current headers, and its 10-argument ensure_cached_alloc() call
+//    still matches that method's current signature exactly.
+//
+// WHY THE RESTORE WAS NOT LANDED WITH THE ADJUDICATION: "all symbols resolve"
+// is not "it compiles", and an add_executable that fails to build breaks the
+// build for every agent sharing this checkout.  Landing it therefore needs a
+// build first, which the adjudicating lane could not run.  It also needs a
+// u2mz-style can-it-fail row, and this is a MODEL-LOADING GPU test
+// (test_model_load_* below), so that row is lead-only per CLAUDE.md's
+// never-loop rule.
+//
+// ⚠️ Two hazards any future registration must handle, both live in this file:
+//   1. main() setenv()s ONEAPI_DEVICE_SELECTOR to level_zero:0 -- the B70
+//      BENCHMARK card -- when nothing is set.  The registration must pin
+//      ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1, or an unattended ctest
+//      perturbs whatever benchmark is running.  This is the same trap
+//      ggml/src/ggml-sycl/CMakeLists.txt documents for test-unified-cache-bugs.
+//   2. It loads models, so it belongs to the OOM-hazard family: run once, never
+//      in a loop, and label it so the throttled sweep can see it (rule 2 --
+//      no "residency"/"mem-handle"/"cache" substring).
+//
+// Do not "fix" this file's contents again without first registering it.  It has
+// already been maintained blind once: 2486ec467 gave it the exit-77 fix below
+// for a run that cannot happen.
 
 #include <cstdio>
 #include <cstdlib>

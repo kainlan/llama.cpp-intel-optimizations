@@ -2896,8 +2896,11 @@ class unified_cache {
     // inside unified-cache.cpp, so the canonical contract's "all allocation
     // flows through unified-cache APIs" holds as written.
     //
-    // Enforcement is the zero-production-caller state itself.  Before adding a
-    // caller, confirm you would be the first outside tests/:
+    // Enforcement is the zero-production-caller state itself, and it is now
+    // mechanical: tests/test-sycl-ensure-cached-alloc-policy.sh runs exactly the
+    // grep below as a registered ctest gate (llama.cpp-kwwv), so a production
+    // caller reddens a test run instead of merely contradicting this comment.
+    // Before adding a caller, confirm you would be the first outside tests/:
     //
     //   grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
     //        --include='*.cpp' --include='*.hpp' --exclude-dir=tests
@@ -3339,9 +3342,20 @@ class unified_cache {
                               direct_expert_entries_;
     mutable std::shared_mutex direct_stage_mutex_;
 
-    // Set to true when any weight has been evicted from device to host.
-    // One-way flag (false → true, never reset). Used by graph replay / persistent TG
-    // to know that baked pointers may reference freed device memory.
+    // Set to true when a cached weight's device allocation is released -- eviction
+    // to host, drop, or async evict.  Used by graph replay / persistent TG to know
+    // that baked pointers may reference freed device memory.
+    //
+    // It is a latch, but NOT a process-lifetime one: reclaim_weight_entries()
+    // clears it, so the flag is scoped to the current weight population rather
+    // than to the cache object.  That clear is sound because every reclaim mode is
+    // a model load/unload boundary -- entries it frees belong to a model whose
+    // graphs are gone, and entries it preserves keep their device pointers.
+    // (llama.cpp-jx51: the clear is unconditional even when entries were
+    // preserved, so a live model that suffered an eviction BEFORE another model's
+    // reclaim has its replay gate re-armed to false while its own baked pointers
+    // are still stale.  Narrow -- it needs two loaded models -- and left as-is;
+    // see the ticket.)
     std::atomic<bool> has_evictions_{ false };
 
     // === Multi-Device Partial Row Cache ===

@@ -469,6 +469,29 @@ if (NOT WIN32)
     )
 endif()
 
+# ensure_cached_alloc() is a TEST-ONLY seam whose enforcement was, until now,
+# the zero-production-caller state itself plus a grep written into
+# unified-cache.hpp's declaration comment -- a convention nothing executed
+# (llama.cpp-kwwv, following llama.cpp-og9dt). This runs that grep.
+#
+# LABELS avoid the throttled sweep's -LE 'residency|mem-handle|cache' denylist
+# (rule 2 in ggml/src/ggml-sycl/CMakeLists.txt): the script greps text, opens no
+# device and allocates nothing, so it must not be filtered out of the sweep --
+# which is the only thing that would ever run it.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-ensure-cached-alloc-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ensure-cached-alloc-policy.sh
+    )
+    set_tests_properties(test-sycl-ensure-cached-alloc-policy PROPERTIES
+        LABELS "sycl;policy;source-contract;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
 if (NOT WIN32)
     # Source assertion, so it is registered here rather than under the SYCL
     # backend's own test guard: the code it checks lives inside
@@ -1618,8 +1641,14 @@ if(GGML_SYCL)
     target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
     install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)
     add_test(NAME test-sycl-fattn-onednn-gates COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-gates>)
+    # SKIP_RETURN_CODE is new (llama.cpp-ay8c), and is the one departure from
+    # "verbatim apart from LABELS" above.  Built without GGML_SYCL_DNNL the
+    # binary's main() is the compile-guard stub, which used to print and return
+    # 0 -- a green pass for a run that evaluated no gate.  It now returns 77 and
+    # ctest reports the run as skipped.
     set_tests_properties(test-sycl-fattn-onednn-gates PROPERTIES
         LABELS "sycl;fattn;onednn;gates"
+        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 endif()

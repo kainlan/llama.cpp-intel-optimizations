@@ -9209,6 +9209,10 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
         }
     }
 
+    // Intentional re-arm, not a stray reset: the flag is scoped to the current
+    // weight population, and this is a model load/unload boundary.  See the
+    // declaration comment in unified-cache.hpp for why that is sound and for the
+    // one case it does not cover (llama.cpp-jx51).
     has_evictions_.store(false, std::memory_order_relaxed);
     evictions_in_flight_.store(0, std::memory_order_relaxed);
     if (trace_reset) {
