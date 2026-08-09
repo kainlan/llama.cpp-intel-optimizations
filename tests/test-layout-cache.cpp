@@ -320,7 +320,6 @@ static bool test_aos_drop(int device_id) {
 
 // What one MUL_MAT fixture observed about its weight after the graph ran.
 struct layout_case_result {
-    bool             ran       = false;  // fixture built and the graph computed
     bool             has_entry = false;  // ggml_sycl_resolve() produced a pointer
     ggml_layout_mode layout    = GGML_LAYOUT_AOS;
     bool             on_device = false;
@@ -429,7 +428,6 @@ static bool run_mul_mat_layout_case(int                  device_id,
 
     if (ok) {
         auto resolved = ggml_sycl_resolve(weight, device_id);
-        out.ran       = true;
         out.has_entry = static_cast<bool>(resolved);
         if (resolved) {
             out.layout    = resolved.layout;
