@@ -122,25 +122,64 @@ static void fill_pattern(std::vector<uint8_t> & data) {
     }
 }
 
-// Splits the two axes the old single "Failed to cache <layout> layout" message
-// conflated: a null return means the layout could not be produced at all, while
-// a false is_cached() means it WAS produced but is not registered under the key
-// the test asserts on.  Those are different bugs and the old message named
-// neither.
-static bool expect_layout_cached(const char *               label,
-                                 ggml_sycl::unified_cache * cache,
-                                 const ggml_sycl_cache_id & key,
-                                 const ggml_tensor *        weight,
-                                 int                        device_id,
-                                 ggml_layout_mode           layout) {
+// llama.cpp-778b / llama.cpp-doyp: ggml_sycl_get_weight_layout_ptr no longer
+// CREATES anything, so the old expect_layout_cached() -- "call it, then assert
+// the entry exists" -- could not pass on either buft.  At 06c735e93, where these
+// fixtures were written, it ended in
+//   cache->ensure_cached_layout(req, {});         // materialize, wait on IN_PROGRESS
+//   if (resolved != GGML_LAYOUT_AOS) { ggml_sycl_drop_non_target_cache_entries(...); }
+// 38c02b099 ("remove ensure_cached_layout from inference hot path -- lock-free
+// cache lookup only") and b8afde8e9 ("replace inference weight resolution
+// ensure_cached_layout with lookup_weight") converted it to a pure lookup over
+// weights staged by S1-PRELOAD; its tail is now literally
+// "Not staged, not streamed -- fall through to host-pinned zero-copy / return
+// nullptr" (ggml-sycl.cpp:29423 the lookup comment, 29455-29458 the tail).
+//
+// The two helpers below assert the seams that replaced it.  Entry CREATION is
+// now ggml_sycl::unified_cache::ensure_cached_alloc -- the sanctioned test-only
+// seam (unified-cache.cpp:14188-14209 "Do not call this from production code";
+// test_layout_ptr_eviction_guard already drives it green on this hardware).
+
+// An unstaged weight has no entry, and asking for one does not conjure one.
+static bool expect_lookup_miss(const char *               label,
+                               ggml_sycl::unified_cache * cache,
+                               const ggml_sycl_cache_id & key,
+                               const ggml_tensor *        weight,
+                               int                        device_id,
+                               ggml_layout_mode           layout) {
     void * ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, layout);
-    if (!ptr) {
-        fprintf(stderr, "%s: ggml_sycl_get_weight_layout_ptr(%s) returned null (layout not produced)\n", label,
+    if (ptr) {
+        fprintf(stderr,
+                "%s: ggml_sycl_get_weight_layout_ptr(%s) returned %p for an UNSTAGED weight -- the lookup-only "
+                "contract (b8afde8e9) is broken, or something staged it first\n",
+                label, layout_name(layout), ptr);
+        return false;
+    }
+    if (cache->is_cached(key, layout)) {
+        fprintf(stderr, "%s: is_cached(key, %s) is true after a lookup miss -- the lookup created an entry\n", label,
                 layout_name(layout));
         return false;
     }
+    return true;
+}
+
+// The positive control for expect_lookup_miss: the cache CAN hold an entry under
+// this key, so the miss above was a real miss and not broken key derivation.
+static bool expect_staged(const char *               label,
+                          ggml_sycl::unified_cache * cache,
+                          const ggml_sycl_cache_id & key,
+                          const void *               src,
+                          size_t                     bytes,
+                          ggml_layout_mode           layout) {
+    bool   needs_fill = false;
+    void * ptr = cache->ensure_cached_alloc(key, src, bytes, bytes, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                            layout, false, &needs_fill);
+    if (!ptr) {
+        fprintf(stderr, "%s: ensure_cached_alloc(%s) returned null (staging failed)\n", label, layout_name(layout));
+        return false;
+    }
     if (!cache->is_cached(key, layout)) {
-        fprintf(stderr, "%s: %s produced at %p but is_cached(key, %s) is false (not registered under the key)\n", label,
+        fprintf(stderr, "%s: %s staged at %p but is_cached(key, %s) is false (not registered under the key)\n", label,
                 layout_name(layout), ptr, layout_name(layout));
         return false;
     }
@@ -300,14 +339,36 @@ static bool test_aos_drop(int device_id) {
         return false;
     }
 
-    if (!expect_layout_cached("test_aos_drop", cache, key, weight, device_id, GGML_LAYOUT_AOS)) {
+    // Step 1 -- LOOKUP-ONLY.  This weight lives in a plain CPU backend buffer and
+    // was never staged, so the lookup must miss and must not conjure an entry.
+    if (!expect_lookup_miss("test_aos_drop", cache, key, weight, device_id, GGML_LAYOUT_AOS)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
         return false;
     }
 
-    if (!expect_layout_cached("test_aos_drop", cache, key, weight, device_id, GGML_LAYOUT_COALESCED)) {
+    // Step 2 -- POSITIVE CONTROL for step 1.  Without it a broken cache key, or a
+    // cache that could hold nothing at all, would satisfy the miss above and the
+    // drop below vacuously.
+    if (!expect_staged("test_aos_drop", cache, key, host_data.data(), weight_bytes, GGML_LAYOUT_AOS)) {
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        ggml_backend_free(cpu_backend);
+        return false;
+    }
+
+    // Step 3 -- THE AoS-DROP INVARIANT, which still exists but has moved.  Its old
+    // home, ggml_sycl_drop_non_target_cache_entries (ggml-sycl.cpp:27009), is now
+    // dead: that file contains its definition and zero calls, while the same grep
+    // finds callers of its siblings drop_all_weight_cache_entries (:29547) and
+    // drop_non_target_expert_entries (:49892).  The drop now falls out of the
+    // cache's own keying: unified_cache_key is {type, id, layer, expert} with
+    // layout NOT a key component (unified-cache.cpp:14237), so staging a second
+    // layout takes the layout-switch branch at :14252-14298 -- unleased entry,
+    // can_replace_cache_entry_locked() true, erase, reallocate.  is_cached() then
+    // reports the entry's single current layout (:5604-5640).
+    if (!expect_staged("test_aos_drop", cache, key, host_data.data(), weight_bytes, GGML_LAYOUT_COALESCED)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
@@ -318,7 +379,9 @@ static bool test_aos_drop(int device_id) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
-        fprintf(stderr, "test_aos_drop: AOS cache entry not dropped after COALESCED cache\n");
+        fprintf(stderr,
+                "test_aos_drop: AOS entry survived the COALESCED layout switch -- both layouts are cached under one "
+                "key, so the entry was duplicated instead of switched\n");
         return false;
     }
 
@@ -629,15 +692,48 @@ static bool test_device_weight_layout_cache(int device_id) {
         return false;
     }
 
-    if (!expect_layout_cached("test_device_weight_layout_cache", cache, key, weight, device_id, GGML_LAYOUT_AOS)) {
+    // Step 1 -- IDENTITY FAST PATH (llama.cpp-doyp).  This is why the old oracle
+    // saw "AOS produced ... but is_cached is false" on the DEVICE buft while the
+    // host buft saw a null: for a device-resident weight, AOS is served by
+    // returning the tensor's OWN pointer and deliberately registering nothing --
+    // ggml-sycl.cpp:29403-29422, "reuse that storage directly instead of creating
+    // a duplicate unified-cache entry.  Duplicating pre-transformed weights can
+    // exhaust VRAM before warmup/decode."  So a false is_cached() here is the
+    // contract, not a key-registration bug.  (The device buft's set_tensor also
+    // clears the key first: ggml_sycl_drop_all_weight_cache_entries at :29547.)
+    void * aos_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_AOS);
+    if (aos_ptr != weight->data) {
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        fprintf(stderr,
+                "test_device_weight_layout_cache: AOS on a device-resident weight resolved to %p, expected the "
+                "tensor's own data pointer %p (the identity fast path at ggml-sycl.cpp:29415-29420 did not fire)\n",
+                aos_ptr, weight->data);
+        return false;
+    }
+    if (cache->is_cached(key, GGML_LAYOUT_AOS)) {
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        fprintf(stderr,
+                "test_device_weight_layout_cache: the identity fast path registered a cache entry for AOS -- it is "
+                "supposed to avoid exactly that duplicate\n");
+        return false;
+    }
+
+    // Step 2/3 -- same staging + layout-switch contract as test_aos_drop, on a
+    // device-resident weight.  See the comments there for where the drop moved.
+    if (!expect_staged("test_device_weight_layout_cache", cache, key, host_data.data(), weight_bytes,
+                       GGML_LAYOUT_AOS)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(backend);
         return false;
     }
 
-    if (!expect_layout_cached("test_device_weight_layout_cache", cache, key, weight, device_id,
-                              GGML_LAYOUT_COALESCED)) {
+    if (!expect_staged("test_device_weight_layout_cache", cache, key, host_data.data(), weight_bytes,
+                       GGML_LAYOUT_COALESCED)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(backend);
@@ -649,9 +745,30 @@ static bool test_device_weight_layout_cache(int device_id) {
         ggml_free(ctx);
         ggml_backend_free(backend);
         fprintf(stderr,
-                "test_device_weight_layout_cache: AOS cache entry not dropped after COALESCED cache for device "
-                "weight\n");
+                "test_device_weight_layout_cache: AOS entry survived the COALESCED layout switch for a device "
+                "weight -- both layouts are cached under one key\n");
         return false;
+    }
+
+    // Probe, never an assertion.  doyp's candidate mechanism (1) was that the
+    // fixture derives its key by an obsolete scheme while production keys off
+    // mem_handle stable identity.  COALESCED skips the AOS-only identity fast
+    // path, so this is the one place the LOOKUP's keying can be compared against
+    // ensure_cached_alloc's.  A miss is not necessarily a defect -- the lookup
+    // also re-derives the layout through ggml_sycl_adjust_layout_for_tensor and
+    // may resolve something other than COALESCED -- so both outcomes are
+    // reported and neither fails the test.
+    void * coalesced_lookup = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_COALESCED);
+    if (coalesced_lookup) {
+        printf(
+            "[doyp] NOTE: the lookup FOUND the ensure_cached_alloc-staged COALESCED entry (ptr=%p) -- the two "
+            "seams agree on key derivation.\n",
+            coalesced_lookup);
+    } else {
+        printf(
+            "[doyp] NOTE: the lookup MISSED the ensure_cached_alloc-staged COALESCED entry that is_cached() can "
+            "see -- either the two seams key differently, or adjust_layout_for_tensor resolved a layout other "
+            "than COALESCED.\n");
     }
 
     ggml_backend_buffer_free(weight_buffer);
