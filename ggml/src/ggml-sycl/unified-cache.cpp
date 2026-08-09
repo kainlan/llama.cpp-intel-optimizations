@@ -12356,11 +12356,25 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             size  = 0;
             return;
         }
-        const sycl::event * ev = owner.valid() ? replacement_barrier() : nullptr;
+        // Two distinct fallbacks reach release_direct_scratch() below, and they
+        // are not the same kind of event -- do not collapse them.
+        if (!owner.valid()) {
+            // A published block with no alloc_handle owner is a programming
+            // bug, not a runtime condition. release_direct_scratch() already
+            // logs and asserts on exactly this; keeping the diagnosis in one
+            // place is worth more than deferring a block we cannot describe.
+            release_direct_scratch(owner, ptr, size, label);
+            return;
+        }
+        const sycl::event * ev = replacement_barrier();
         if (!ev) {
-            // Either the owner is missing (release_direct_scratch asserts on
-            // that, and keeping one place for the diagnosis is worth more than
-            // deferring a block we cannot describe) or the barrier failed.
+            // Barrier submission failed at runtime. Releasing now reopens the
+            // exact race this deferral closes, so it gets the same WARN as the
+            // arena path's equivalent fallback rather than degrading silently.
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] oneDNN scratch replacement barrier unavailable; releasing direct %s block ptr=%p "
+                "immediately -- an in-flight oneDNN primitive may still be reading it\n",
+                label, ptr);
             release_direct_scratch(owner, ptr, size, label);
             return;
         }
@@ -12619,7 +12633,13 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
                 total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
         }
-        arena_grow_cause     = zone_undersized ? "planned zone under-estimated" : "zone fragmented";
+        // The not-undersized label must carry BOTH of its causes. It is the only
+        // form most readers see -- the detailed WARN above fires on just one of
+        // the two paths -- so a bare "zone fragmented" here tells the stale
+        // pre-llama.cpp-ndn9 story and sends the reader hunting for
+        // fragmentation that may not exist.
+        arena_grow_cause =
+            zone_undersized ? "planned zone under-estimated" : "zone fragmented or awaiting a release barrier";
         arena_zone_exhausted = true;
     }
     direct_attempt = true;
