@@ -1943,6 +1943,35 @@ locks are not ownership-checked; subsequent battery runners carry an owner
 token inside the lock dir. **Batch F final: 8 of 11 proven (F1:1 + F2:7),
 3 rows ticketed (7ofo x2, l7rt). Running total: 37 of 117 proven.**
 
+### Proofs battery — executed results (2026-08-09, wave-1 + reached-kernel closeout)
+
+k7b0 Wave 1 fully RED-proven: register_host_ptr adopt-drop fired exactly
+`1a 1b 1c 1d 5a 5c` (5b green — the simulator table byte-exact where three
+hand-traces had failed); unconditional release_if_owner fired exactly `7a-7d`;
+the never-discard KV-mask mutation printed the pre-registered
+`load B consumed load A's abandoned mask (len=4 bytes=1,0,1,0)` byte-exactly.
+(An earlier inverted mutation had already proven the always-discard direction:
+claim 1 red, `len=0`.) vbeb + y36c CLOSED.
+
+Reached-kernel closeout: 7ofo's q8-layout binding PROVEN (the :3705 mutation
+now reds with `Max diff: 7.04e+02 / Result: FAIL` where it survived
+pre-binding); the q6k binding surfaced a REAL latent failure at unmutated
+HEAD (`8192x128: errors=1 max_diff=15.0` — identical with and without the
+planned :1775 mutation, which is null at all executed shapes) → successor
+`llama.cpp-ug4p`, and this batch's q6k row re-points after that RCA. l7rt
+cycle B returned the pre-registered both-pass outcome — **DIRECT is
+numerically correct at production GQA scale; the materialization is
+optimization-not-correctness there; the perf A/B is warranted** (c-bmrl).
+f65p row 1 declined per its pre-registered A=0 branch; row 2 pends one
+cast-fixed cycle (`arithmetic on a pointer to void` broke the first attempt).
+
+Two runner lessons recorded: anchor mutations byte-exactly or assert
+exactly-once (two window-anchors failed loudly and were re-run; a script-flow
+bug let their builds proceed on unmutated source — greens from those runs are
+VOID, and were scored as such, not as survivals); and a passing ctest run
+suppresses the output a pre-registration needs — capture via direct
+invocation where the strings matter.
+
 ## Batch G — `common.hpp` (5 tests, 6 builds, ~2.5 h)
 
 The most widely included backend header — every build here is a full backend
