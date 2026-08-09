@@ -10,6 +10,7 @@
 #include "common.hpp"
 #include "ggml-impl.h"
 #include "mem-ops.hpp"
+#include "model-lifecycle.hpp"
 #include "tensor-types.hpp"
 
 #include <algorithm>
@@ -17,11 +18,106 @@
 
 namespace ggml_sycl {
 
+// The owner is the model whose load transaction is ACTIVE right now. Both of
+// the entry points that consult it run inside a load: build_layer_map() from
+// ggml_backend_sycl_set_tensor_inventory(), register_host_ptr() from
+// buffer_set_tensor()'s weight path. Outside a load the registry answers with a
+// zeroed token, which layer_stream_owner_valid() rejects — an unattributed
+// caller must not be able to claim the working set or displace its owner.
+//
+// Read paths (get_weight_device_ptr, is_active, ensure_layer, prefetch) do NOT
+// consult this. They run during inference, with no transaction open, so it
+// would answer "unattributed" for every one of them. They are safe because
+// displacement has already happened at the incoming model's first
+// register_host_ptr, before any of its graphs can run.
+static layer_stream_owner layer_stream_current_load_owner() {
+    layer_stream_owner owner{};
+    try {
+        const lifecycle::ModelToken token = lifecycle::global_registry().current_active_token();
+        owner.model_id                    = token.model.value;
+        owner.load_txn_id                 = token.load.value;
+        owner.slot                        = token.owner.slot;
+        owner.slot_generation             = token.owner.generation;
+    } catch (...) {
+        return layer_stream_owner{};
+    }
+    return owner;
+}
+
 layer_stream_manager::~layer_stream_manager() {
     shutdown();
 }
 
+void layer_stream_manager::drain_and_invalidate_buffers() {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    if (prefetch_pending_) {
+        // A submitted DMA is still writing into one of the buffers. Whatever
+        // the caller does next — free the buffers, or fill them for a different
+        // model — must not race it.
+        try {
+            prefetch_event_.wait();
+        } catch (...) {
+        }
+    }
+    prefetch_pending_      = false;
+    prefetch_target_layer_ = -1;
+    prefetch_buffer_       = -1;
+    prefetch_event_        = sycl::event();
+    loaded_layers_[0]      = -1;
+    loaded_layers_[1]      = -1;
+}
+
+void layer_stream_manager::release_model_state() {
+    drain_and_invalidate_buffers();
+
+    // Moved out under the lock, destroyed after it. mem_handle's destructor is
+    // the free, and freeing through the unified cache while holding a lock this
+    // class also takes on its copy path is how deadlocks are built.
+    mem_handle released[2];
+    {
+        std::lock_guard<std::mutex> lock(host_ptr_mutex_);
+        for (int i = 0; i < 2; i++) {
+            released[i]        = std::move(buffer_handles_[i]);
+            buffer_handles_[i] = {};
+            buffers_[i]        = nullptr;
+        }
+        buffer_size_ = 0;
+        device_id_   = -1;
+        layers_.clear();
+        name_to_location_.clear();
+        max_layer_size_ = 0;
+    }
+}
+
+void layer_stream_manager::adopt_current_owner() {
+    const layer_stream_transition_result transition = owner_gate_.observe(layer_stream_current_load_owner());
+    if (transition.kind != layer_stream_transition::DISPLACE) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "[LAYER-STREAM] Model load boundary: releasing the working set owned by model %llu (load %llu, slot %u/%llu); "
+        "its weights fall back to the non-streamed path\n",
+        (unsigned long long) transition.displaced.model_id, (unsigned long long) transition.displaced.load_txn_id,
+        transition.displaced.slot, (unsigned long long) transition.displaced.slot_generation);
+    release_model_state();
+}
+
 void layer_stream_manager::build_layer_map(const std::pair<std::string, size_t> * inventory, size_t count) {
+    // A different model reaching here releases the previous owner's buffers and
+    // map before a single entry of its own is written.
+    adopt_current_owner();
+
+    // Even a rebuild by the SAME owner must forget which layers the buffers
+    // hold: the offsets those ids index into are about to be recomputed, so
+    // keeping them would resolve new offsets against old bytes.
+    drain_and_invalidate_buffers();
+
+    // The map is read under host_ptr_mutex_ by register_host_ptr(), so building
+    // it has to hold that lock too. Without it a concurrent registration can
+    // observe a resized-but-unpopulated layers_.
+    std::lock_guard<std::mutex> lock(host_ptr_mutex_);
+
     layers_.clear();
     name_to_location_.clear();
     max_layer_size_ = 0;
@@ -79,6 +175,12 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
         return false;
     }
 
+    // Assigning buffer_handles_[i] below destroys whatever it held, and that
+    // destructor is the free. Anything still writing into the old allocation
+    // has to be finished first — this is the "rebuilds only after pending
+    // prefetch/event/handle work drains" half of the contract.
+    drain_and_invalidate_buffers();
+
     // Round up to 2MB alignment for efficient DMA
     const size_t align = 2 * 1024 * 1024;
     buffer_size_       = ((max_layer_size_ + align - 1) / align) * align;
@@ -99,11 +201,11 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
         if (!resolved || !resolved.on_device) {
             GGML_LOG_ERROR("[LAYER-STREAM] Failed to allocate buffer %d (%.1f MB)\n", i,
                            buffer_size_ / (1024.0 * 1024.0));
-            // Clean up buffer 0 if buffer 1 failed
-            if (i == 1 && buffer_handles_[0].valid()) {
-                buffer_handles_[0] = {};
-                buffers_[0]        = nullptr;
-            }
+            // Release everything, not just the buffer that succeeded. Leaving
+            // the untouched slot behind would leave the PREVIOUS owner's
+            // pointer and handle in place under this owner's map, which is the
+            // exact cross-model resolution this class is being fixed to stop.
+            release_model_state();
             return false;
         }
         buffers_[i]        = resolved.ptr;
@@ -117,27 +219,40 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
 }
 
 void layer_stream_manager::shutdown() {
-    // Wait for any pending prefetch
-    if (prefetch_pending_) {
-        try {
-            prefetch_event_.wait();
-        } catch (...) {
-        }
-        prefetch_pending_ = false;
-    }
+    // Teardown, so the ownership record goes too: there is no model left for
+    // whom the working set could be preserved. release_model_state() alone
+    // would leave the gate claiming a dead owner still holds it, and the next
+    // model would then be told KEEP instead of ADOPT.
+    release_model_state();
+    owner_gate_.forget();
+}
 
-    for (int i = 0; i < 2; i++) {
-        buffer_handles_[i] = {};
-        buffers_[i]        = nullptr;
-        loaded_layers_[i]  = -1;
-    }
-    buffer_size_ = 0;
+void layer_stream_manager::test_install_loaded_buffers(int    device,
+                                                       size_t buffer_size,
+                                                       void * buffer0,
+                                                       int    loaded_layer0,
+                                                       void * buffer1,
+                                                       int    loaded_layer1) {
+    std::lock_guard<std::mutex> lock(host_ptr_mutex_);
+    device_id_        = device;
+    buffer_size_      = buffer_size;
+    buffers_[0]       = buffer0;
+    buffers_[1]       = buffer1;
+    loaded_layers_[0] = loaded_layer0;
+    loaded_layers_[1] = loaded_layer1;
 }
 
 void layer_stream_manager::register_host_ptr(const char * tensor_name, const void * host_ptr, size_t size) {
     if (!tensor_name || !host_ptr) {
         return;
     }
+
+    // Every model's weights reach this on their way through buffer_set_tensor(),
+    // whether or not that model activates streaming. It is therefore the only
+    // point at which a NON-streaming model announces itself to this class, and
+    // so the one that has to release the previous owner's buffers — otherwise
+    // the incoming model resolves its own blk.N.* names into them.
+    adopt_current_owner();
 
     std::lock_guard<std::mutex> lock(host_ptr_mutex_);
     auto                        it = name_to_location_.find(tensor_name);
@@ -334,17 +449,31 @@ void * layer_stream_manager::get_weight_device_ptr(const char * tensor_name) con
         return nullptr;
     }
 
+    // The map can be torn down under a load boundary while inference on the
+    // previous model is still resolving names, so the lookup and the offset
+    // arithmetic have to see one consistent map.
+    std::lock_guard<std::mutex> lock(host_ptr_mutex_);
+
     auto it = name_to_location_.find(tensor_name);
     if (it == name_to_location_.end()) {
         return nullptr;
     }
 
     auto [layer_id, weight_idx] = it->second;
+    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) {
+        return nullptr;
+    }
+    if (weight_idx >= layers_[layer_id].weights.size()) {
+        return nullptr;
+    }
 
     // Find which buffer holds this layer
     int buf = buffer_for_layer(layer_id);
     if (buf < 0) {
         return nullptr;  // Layer not loaded
+    }
+    if (!buffers_[buf]) {
+        return nullptr;
     }
 
     const auto & entry = layers_[layer_id].weights[weight_idx];

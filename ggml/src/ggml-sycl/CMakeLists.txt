@@ -4302,3 +4302,81 @@ if (Python3_Interpreter_FOUND)
 else()
     message(STATUS "ggml-sycl: Python3 not found; AST reset contract test is not registered")
 endif()
+
+# Cross-model survival gate for layer_stream_manager (llama.cpp-vbeb, k7b0
+# child). Drives the real manager and the real lifecycle Registry through two
+# sequential load transactions and asserts the second model inherits nothing
+# from the first. Loads no model, creates no queue, performs no GPU work -- the
+# one seam is test_install_loaded_buffers(), which installs the bookkeeping a
+# successful allocate_buffers() would leave behind.
+#
+# NAME: "sycl-layer-stream-owner-lifecycle" is checked against the exclusions in
+# force, because ctest -R/-E take UNANCHORED regexes. CLAUDE.md's throttled
+# sweep excludes labels matching residency|mem-handle|cache and the name
+# test-backend-ops; .github/workflows/* exclude "test-llama-archs", "tokenizer"
+# and "test-backend-ops". This name and these labels hit none of them.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-layer-stream-owner-lifecycle
+    tests/test-layer-stream-owner-lifecycle.cpp
+)
+target_include_directories(test-layer-stream-owner-lifecycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-layer-stream-owner-lifecycle PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-layer-stream-owner-lifecycle PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-layer-stream-owner-lifecycle PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-layer-stream-owner-lifecycle PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-layer-stream-owner-lifecycle COMMAND test-layer-stream-owner-lifecycle)
+# The two gates the ticket pre-registered, addressable on their own so a
+# mutation can be scored against the case it is supposed to fire.
+add_test(NAME sycl-layer-stream-nonstreaming-successor
+    COMMAND test-layer-stream-owner-lifecycle --case 1)
+add_test(NAME sycl-layer-stream-reshaped-successor
+    COMMAND test-layer-stream-owner-lifecycle --case 2)
+set_tests_properties(
+    sycl-layer-stream-owner-lifecycle
+    sycl-layer-stream-nonstreaming-successor
+    sycl-layer-stream-reshaped-successor
+    PROPERTIES
+    LABELS "sycl;lifecycle;cross-model;host-only"
+    # The selector is pinned even though this test never reaches a device: the
+    # binary links libggml-sycl, and an unpinned process that enumerates the
+    # iGPU is the documented path to a 127 GB Shmem spike (llama.cpp-403s).
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+endif()
+
+# Structural half of the layer-stream ownership gate (llama.cpp-vbeb). The
+# executable above proves the behaviour; this proves the shape the k7b0 house
+# standard requires -- one owner function rather than N scattered clears -- and
+# covers the part of the release that needs a device (the mem_handle drop and
+# the drain that must precede it), which a host-only binary cannot reach.
+# --self-test is not optional: four of these checks are absence-based and pass
+# vacuously on any tree written after the fix, so without a poisoned control
+# their green is not evidence.
+if (Python3_Interpreter_FOUND)
+    add_test(NAME sycl-layer-stream-owner-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layer-stream-owner-contract.py
+            --self-test)
+    set_tests_properties(sycl-layer-stream-owner-contract PROPERTIES
+        LABELS "sycl;lifecycle;cross-model;host-only;source-contract"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+else()
+    message(STATUS "ggml-sycl: Python3 not found; layer-stream ownership contract test is not registered")
+endif()

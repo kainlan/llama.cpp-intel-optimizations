@@ -8,6 +8,7 @@
 #define GGML_SYCL_LAYER_STREAMING_HPP
 
 #include "ggml.h"
+#include "layer-stream-owner.hpp"
 #include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
@@ -31,6 +32,15 @@ namespace ggml_sycl {
 //   4. get_weight_device_ptr(name) — to get device pointer for a specific weight
 //   5. prefetch_next_layer(layer_id+1) — after layer N's first kernel launches
 //   6. shutdown() — cleanup
+//
+// Lifetime (llama.cpp-vbeb): the manager is a per-device singleton, so the
+// state above belongs to whichever model built it. That owner is tracked by
+// layer_stream_owner_gate and the two entry points a model load can reach —
+// build_layer_map() and register_host_ptr() — consult it first. A different
+// model arriving releases the previous owner's whole working set through
+// release_model_state(), which is the single place any of it is cleared. See
+// layer-stream-owner.hpp for why displacement, not preservation, is correct
+// here.
 
 class layer_stream_manager {
   public:
@@ -98,6 +108,23 @@ class layer_stream_manager {
     // encountered during inference.
     void register_host_ptr(const char * tensor_name, const void * host_ptr, size_t size);
 
+    // The model that currently owns this manager's working set, or a zeroed
+    // token when nobody does.
+    layer_stream_owner owner() const { return owner_gate_.current(); }
+
+    // Test seam. Installs the buffer bookkeeping a successful allocate_buffers()
+    // followed by two layer loads would leave behind, without a queue and
+    // without a device, so the owner-displacement path can be driven on a
+    // host-only runner. It allocates nothing: the pointers are opaque non-null
+    // tokens the caller owns and they are never dereferenced. Production code
+    // must not call this — allocate_buffers() is the only real installer.
+    void test_install_loaded_buffers(int    device,
+                                     size_t buffer_size,
+                                     void * buffer0,
+                                     int    loaded_layer0,
+                                     void * buffer1,
+                                     int    loaded_layer1);
+
   private:
     // Per-weight entry within a layer
     struct weight_entry {
@@ -135,9 +162,28 @@ class layer_stream_manager {
     // Host pointer registration
     mutable std::mutex host_ptr_mutex_;
 
+    // Which model the whole cluster above belongs to.
+    layer_stream_owner_gate owner_gate_;
+
     // Internal helpers
     int  pick_buffer_for_layer(int layer_id) const;
     bool load_layer_sync(int layer_id, int buffer_idx, sycl::queue & queue);
+
+    // Return every member above to its pristine value, draining any prefetch
+    // that is still writing into the buffers first. This is the ONLY place
+    // model-scoped state is released; build_layer_map(), allocate_buffers() and
+    // shutdown() all go through it rather than clearing fields themselves.
+    void release_model_state();
+
+    // Read the model whose load transaction is active and apply the gate's
+    // verdict, releasing the outgoing owner's state on DISPLACE. Called at the
+    // top of both entry points a model load can reach.
+    void adopt_current_owner();
+
+    // Drop any pending prefetch and forget which layers a buffer holds, without
+    // releasing the buffers themselves. Used where the buffers survive but
+    // their contents stop being meaningful.
+    void drain_and_invalidate_buffers();
 };
 
 // Global accessor — returns the singleton layer stream manager for a device.
