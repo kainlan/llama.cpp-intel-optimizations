@@ -500,7 +500,25 @@ static bool test_mul_mat_layout_choice(int device_id) {
         ok = false;
     }
 
-    // Contract 2 -- LAYOUT.  A device-buft weight stays on the GPU, so a layout
+    // Contract 2 -- OVERRIDE INERTNESS on the host path.  host_auto is the
+    // control for host_coalesced: if the COALESCED override really has no
+    // authority once the op is CPU-routed, the two must agree on both axes.
+    // This is the adjudication's central claim made empirical, instead of
+    // resting on the call-graph reading alone.
+    if (!host_auto.has_entry) {
+        printf("FAIL host/auto: no cache entry for the weight after mul_mat\n");
+        ok = false;
+    } else if (host_auto.layout != host_coalesced.layout || host_auto.on_device != host_coalesced.on_device) {
+        printf(
+            "FAIL host/auto vs host/coalesced [override-inertness axis]: the COALESCED override changed the host path "
+            "(auto: layout=%s on_device=%s; override: layout=%s on_device=%s) -- the override is NOT inert there, so "
+            "the llama.cpp-0tkh adjudication needs re-opening\n",
+            layout_name(host_auto.layout), host_auto.on_device ? "yes" : "no", layout_name(host_coalesced.layout),
+            host_coalesced.on_device ? "yes" : "no");
+        ok = false;
+    }
+
+    // Contract 3 -- LAYOUT.  A device-buft weight stays on the GPU, so a layout
     // choice is actually made and observable.
     if (!dev_coalesced.has_entry) {
         printf("FAIL dev/coalesced: no cache entry for the weight after mul_mat\n");
