@@ -1,8 +1,13 @@
-# The benchmark invokes private SYCL backend symbols directly. That is valid
-# only when ggml-sycl is a linkable static target; a MODULE backend must be
-# exercised through registry procedures instead. Keep the self-contained
-# source-line probe below available in both configurations.
-if (NOT GGML_BACKEND_DL)
+# sycl-kernel-bench invokes private SYCL backend symbols directly. That is
+# valid only when ggml-sycl is a linkable static target; under GGML_BACKEND_DL
+# those symbols live only inside the loadable MODULE and the link fails, so a
+# MODULE backend must be exercised through registry procedures instead.
+#
+# The whole directory is therefore excluded under GGML_BACKEND_DL by the guard
+# in tools/CMakeLists.txt (llama.cpp-o6tf). This file is only ever processed in
+# a non-DL configure, so nothing below carries its own DL guard. That guard also
+# ends the sycl-mxfp4-source-line-probe target's former availability in both
+# configurations -- deliberately, since it was never proven to link under DL.
 set(TARGET sycl-kernel-bench)
 add_executable(${TARGET}
     main.cpp
@@ -65,7 +70,6 @@ if (GGML_SYCL)
         target_compile_definitions(${TARGET} PRIVATE GGML_SYCL_DNNL=1)
     endif()
 endif()
-endif() # private-symbol static SYCL benchmark
 
 if (GGML_SYCL)
     add_executable(sycl-mxfp4-source-line-probe
