@@ -184,23 +184,32 @@ int main(int argc, char ** argv) {
             return [name](const std::string & base) { return base == name; };
         };
 
-        struct required_check { const char * label; match_fn match; bool found; };
-        required_check checks[] = {
-            { "index.html",           exact("index.html"),           false },
-            { "loading.html",         exact("loading.html"),         false },
-            { "manifest.webmanifest", exact("manifest.webmanifest"), false },
-            { "sw.js",                exact("sw.js"),                false },
-            { "build.json",           exact("build.json"),           false },
-            { "version.json",         exact("version.json"),         false },
+        // "optional" assets degrade a feature when absent but still produce a
+        // working UI, so a bundle missing one is reported and then embedded.
+        // loading.html: its only consumer, the not-ready middleware in
+        // tools/server/server-http.cpp, already falls back to a JSON 503 when
+        // llama_ui_find_asset() returns null. The prebuilt bundles published to
+        // the ggml-org/llama-ui HF bucket stopped shipping it in July 2026, so
+        // requiring it turned an external bundle change into a hard build
+        // failure for every environment that has no npm and falls back to the
+        // bucket (llama.cpp-fdm1).
+        struct asset_check { const char * label; match_fn match; bool optional; bool found; };
+        asset_check checks[] = {
+            { "index.html",           exact("index.html"),           false, false },
+            { "loading.html",         exact("loading.html"),         true,  false },
+            { "manifest.webmanifest", exact("manifest.webmanifest"), false, false },
+            { "sw.js",                exact("sw.js"),                false, false },
+            { "build.json",           exact("build.json"),           false, false },
+            { "version.json",         exact("version.json"),         false, false },
             { "bundle[hash].js",      [](const std::string & b) {
                 return str_starts_with(b, "bundle")  && str_ends_with(b, ".js");
-            }, false },
+            }, false, false },
             { "bundle[hash].css",     [](const std::string & b) {
                 return str_starts_with(b, "bundle")  && str_ends_with(b, ".css");
-            }, false },
+            }, false, false },
             { "workbox[hash].js",     [](const std::string & b) {
                 return str_starts_with(b, "workbox") && str_ends_with(b, ".js");
-            }, false },
+            }, false, false },
         };
 
         for (const auto & a : assets) {
@@ -211,8 +220,12 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<const char *> missing;
+        std::vector<const char *> missing_optional;
         for (const auto & c : checks) {
-            if (!c.found) { missing.push_back(c.label); }
+            if (c.found) {
+                continue;
+            }
+            (c.optional ? missing_optional : missing).push_back(c.label);
         }
         if (!missing.empty()) {
             fprintf(stderr, "\ncurrent asset files:\n");
@@ -223,8 +236,18 @@ int main(int argc, char ** argv) {
             for (const char * m : missing) {
                 fprintf(stderr, "    %s\n", m);
             }
+            for (const char * m : missing_optional) {
+                fprintf(stderr, "    %s (optional)\n", m);
+            }
             fprintf(stderr, "hint: try cleaning your build directory: %s\n", in_dir.c_str());
             return 1;
+        }
+        if (!missing_optional.empty()) {
+            fprintf(stderr, "\nwarning: embedding an incomplete asset set from %s\n", in_dir.c_str());
+            fprintf(stderr, "missing optional asset(s):\n");
+            for (const char * m : missing_optional) {
+                fprintf(stderr, "    %s\n", m);
+            }
         }
     }
 

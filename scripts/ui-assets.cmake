@@ -244,6 +244,13 @@ function(hf_download version out_var out_resolved)
         endif()
 
         message(STATUS "UI: archive verified and extracted")
+        if("${resolved}" STREQUAL "latest" AND NOT "${version}" STREQUAL "")
+            # 'latest' is a floating pointer into the bucket: its contents change
+            # without any commit here, so a bundle that drops an asset breaks the
+            # build with nothing in the history to attribute it to (llama.cpp-fdm1).
+            message(WARNING "UI: version '${version}' is not published; embedding the "
+                            "unpinned 'latest' bundle, whose contents can change at any time")
+        endif()
         set(${out_var}      TRUE          PARENT_SCOPE)
         set(${out_resolved} "${resolved}" PARENT_SCOPE)
         return()
