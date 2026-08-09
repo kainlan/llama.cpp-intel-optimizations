@@ -1614,33 +1614,37 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300
-        # STILL DISABLED after the llama.cpp-0tkh fix, deliberately.
+        # DISABLED REMOVED -- all five of the first restored run's failures are
+        # adjudicated, every one a stale oracle, every fix test-side. No product
+        # change was needed or made by any of them.
         #
-        # 0tkh adjudicated the coalesced-override assertion as a STALE ORACLE
-        # (the layout override is a selection hint; routing to CPU is decided
-        # upstream and never consults it -- see the reasoning in
-        # test-layout-cache.cpp's header) and the fixture is fixed. But the
-        # first restored run failed FIVE of the seven sub-tests, not the one
-        # the ticket recorded:
-        #   test_layout_selection ("expected XMX_TILED, got SOA")        llama.cpp-no1t
-        #   test_aos_drop ("Failed to cache AOS layout")                 llama.cpp-778b
-        #   test_mul_mat_layout_choice (was ..._coalesced)  <- fixed here (0tkh)
-        #   test_device_weight_layout_cache ("...for device weight")     llama.cpp-doyp
-        #   test_model_load_host_buffer_avoids_pinned ("USM alloc type 0") llama.cpp-6qgl
-        # The instrumented run (artifacts/b8uv/0tkh-run.txt, 2026-08-09, 3/7
-        # green, Shmem flat) confirmed the 0tkh verdict empirically: the
-        # override-inertness contract held (host/auto == host/coalesced), and
-        # each remaining failure now names its mechanism -- see the four
-        # tickets above. Any of them may be a real product regression, and
-        # none may be papered over by weakening its oracle. Un-disabling now
-        # would land a red gate; remove DISABLED when all four are resolved.
+        #   test_mul_mat_layout_choice          llama.cpp-0tkh  the override is a
+        #     selection hint; CPU routing is decided upstream and never consults
+        #     it. Confirmed empirically -- host/auto == host/coalesced on both
+        #     axes in artifacts/b8uv/0tkh-run.txt.
+        #   test_layout_selection               llama.cpp-no1t  layout_policy no
+        #     longer returns XMX_TILED on ANY branch; 3c8f296fd moved that to the
+        #     planner (common.hpp:1070) and the MoE branch now yields SOA, or
+        #     COALESCED without XMX (common.hpp:1359-1374).
+        #   test_aos_drop                       llama.cpp-778b  \  one root cause:
+        #   test_device_weight_layout_cache     llama.cpp-doyp  /  38c02b099 and
+        #     b8afde8e9 turned ggml_sycl_get_weight_layout_ptr from a materializer
+        #     into a lookup over S1-PRELOAD-staged weights. The AoS-drop invariant
+        #     survives in the cache's own keying (unified-cache.cpp:14252-14298),
+        #     so the fixtures now drive ensure_cached_alloc, the sanctioned
+        #     test-only entry seam, and assert the identity fast path
+        #     (ggml-sycl.cpp:29403-29422) on the device buft.
+        #   test_model_load_host_buffer_is_pinned  llama.cpp-6qgl  renamed: both
+        #     historical reasons to avoid pinning were retired by 73376bdfd and
+        #     03dd78bab, and must_host_pinned is now unconditional at
+        #     ggml-sycl.cpp:35391.
         #
-        # The fix makes ONE run decisive instead: every sub-test runs, each
-        # failure names its axis, and main() prints a PASS/FAIL roll-up. Remove
-        # DISABLED once that run is green; until then this shows as
-        # "Not Run (Disabled)" in every sweep -- a visible skip, not a fake
-        # green. Evidence: artifacts/b8uv/first-run.txt.
-        DISABLED TRUE
+        # This registration has never yet had a green run -- the previous two were
+        # 1/7 and 3/7. If it reddens, read the PASS/FAIL roll-up main() prints
+        # rather than the first stderr line: every sub-test runs to completion and
+        # each failure names its own mechanism. Do NOT re-DISABLE and do NOT weaken
+        # an oracle; take the named mechanism back to its ticket above.
+        # It loads models, so run it ONCE. Never in a loop.
     )
 endif()
 
