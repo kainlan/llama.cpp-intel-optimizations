@@ -896,16 +896,22 @@ checks = {
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
     "layer-stream teardown releases only the dying model's own working set":
-        # Owner-gated, not a sweep: an unconditional shutdown() here would wipe a
-        # live successor's working set (llama.cpp-vbeb's gate exists to prevent
-        # exactly that), so the guard is the contract, not the call.
-        "ggml_sycl::layer_stream_owner_same(mgr.owner(), dying)" in backend
-        # Non-creating lookup must precede the creating one.
+        # Owner-gated via the ATOMIC primitive. release_if_owner() decides and
+        # releases under one owner_transition_mutex_; the old two-step
+        # (owner() compare, then shutdown()) left a window a concurrent load
+        # could slip through.
+        "ggml_sycl::get_layer_stream_manager(device).release_if_owner(dying)" in backend
+        # The owner-blind form must NOT be how a single model is retired.
+        # Positive-controlled: this clause fires against f8b3f6099, where the
+        # teardown loop still ended in `mgr.shutdown();`.
+        and "mgr.shutdown()" not in backend
+        # Non-creating lookup must precede the creating one (get_layer_stream_manager
+        # try_emplaces, so an unfiltered loop fabricates managers).
         and backend.index("ggml_sycl::layer_streaming_active(device)") <
-            backend.index("auto & mgr = ggml_sycl::get_layer_stream_manager(device);")
+            backend.index("ggml_sycl::get_layer_stream_manager(device).release_if_owner(dying)")
         # ...and it must sit inside the EXACT-OWNER teardown path, immediately
         # before the slot release, not in some later general cleanup.
-        and "mgr.shutdown();\n        }\n        ggml_sycl_release_model_slot_resources(owner);" in backend,
+        and "release_if_owner(dying);\n        }\n        ggml_sycl_release_model_slot_resources(owner);" in backend,
     "pending KV-mask handoff is correlated to its staging load":
         "struct ggml_sycl_pending_kv_layer_mask" in backend
         and "ggml_sycl_kv_layer_mask_identity" in backend

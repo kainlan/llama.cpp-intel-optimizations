@@ -10830,12 +10830,14 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
         // model has no successor to displace it, so its buffers were held
         // until the next load or process exit.
         //
-        // layer_stream_manager::shutdown() is a full release plus owner-forget
-        // and is deliberately owner-BLIND: its premise ("no model left for whom
-        // the working set could be preserved") holds at module shutdown, and
-        // here only behind this check. Calling it unconditionally at every
-        // model teardown would be the load-boundary sweep vbeb's gate exists to
-        // avoid -- it would wipe a live successor's freshly built working set.
+        // release_if_owner() is the owner-gated primitive and the only correct
+        // one here: it decides ownership and releases under a single
+        // owner_transition_mutex_, so a load displacing this owner cannot slip
+        // between the two. shutdown() is the unconditional form and belongs to
+        // module/destructor teardown only -- retiring ONE model through it
+        // would be the load-boundary sweep vbeb's gate exists to avoid, wiping
+        // a live successor's freshly built working set. The release is silent
+        // here because release_if_owner() logs the release itself.
         ggml_sycl::layer_stream_owner dying{};
         dying.model_id        = owner.model.value;
         dying.load_txn_id     = owner.load.value;
@@ -10851,16 +10853,7 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
             if (!ggml_sycl::layer_streaming_active(device)) {
                 continue;
             }
-            auto & mgr = ggml_sycl::get_layer_stream_manager(device);
-            if (!ggml_sycl::layer_stream_owner_same(mgr.owner(), dying)) {
-                continue;
-            }
-            GGML_LOG_INFO(
-                "[LAYER-STREAM] Model teardown: releasing the working set on device %d owned by model %llu "
-                "(load %llu, slot %u/%llu)\n",
-                device, (unsigned long long) dying.model_id, (unsigned long long) dying.load_txn_id, dying.slot,
-                (unsigned long long) dying.slot_generation);
-            mgr.shutdown();
+            ggml_sycl::get_layer_stream_manager(device).release_if_owner(dying);
         }
         ggml_sycl_release_model_slot_resources(owner);
         return true;
