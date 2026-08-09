@@ -1713,7 +1713,7 @@ deliberately; `tests/CMakeLists.txt` is outside the row-repair scope.
 | onednn-woq `:33` | RED `FAILED: expected scales/zp mask=3 got 1/3` → GREEN |
 | xmx-dispatch-gate `:46` | RED `FAILED: threshold <= 1 must accept no batch at all` → GREEN |
 | ggml-backend-reg `:1146` (core ggml) | RED `[sycl-runtime-wrapper] assert failed: failed first publication registry tombstone state != REMOVED` → GREEN |
-| execution-lifecycle `:270` | **SURVIVED — NULL MUTATION** (`llama.cpp-wo98`): both the bare `sycl-lifecycle-event-lease` run AND the targeted `sycl-lifecycle-h13b` pass with the validate_root MISMATCH return disabled (mutation verified compiled+linked). Same class the plan warns about for owner-reset's `:301-307` duplicate guards. Row needs re-pointing. |
+| execution-lifecycle `:270` | **SURVIVED — NULL BY REDUNDANCY, not test drift** (`llama.cpp-wo98`, adjudicated 2026-08-09): both the bare `sycl-lifecycle-event-lease` run AND the targeted `sycl-lifecycle-h13b` pass with the validate_root MISMATCH return disabled (mutation verified compiled+linked). H13b **does** still pass a deliberately wrong root; the second root check at `:276` catches it and returns the same `error::MISMATCH`. Row re-pointed to the guard PAIR — see the B2 row. |
 | sycl-timeline `:468` | RED `second flush must not clobber the first trace file` → GREEN |
 
 Name map: `test-onednn-woq` → 1:1; `test-mmq-xmx-dispatch` →
@@ -1758,9 +1758,60 @@ four is the single best value in the whole plan.
 | `test-onednn-woq` | `onednn-woq.cpp:33` `out.scales_mask = (1<<0)|(1<<1);` → `(1<<0)` | GPU (test 4 only) | PASSFAIL | `FAILED: expected scales/zp mask=3 got 1/3`, rc 1 | 89-line TU — the cheapest backend file in the tree. ⚠️ `test_woq_gemm_q4_0` **fails open in five places** (`SKIP: ...` → `return true`). |
 | `test-mmq-xmx-dispatch` | `xmx-dispatch-gate.hpp:46` `batch >= 1 && batch < threshold` → `batch <= threshold` | GPU-gated, launches nothing | COUNT `Tests run: %d, Passed: %d, Skipped: %d, Failed: %d`; 77 on no device | `FAILED: threshold <= 1 must accept no batch at all`, `Tests run: 5, Passed: 4, ... Failed: 1`, rc 1 | Test target links no `ggml-sycl` at all — build only this target and the mega-TU is untouched. ⚠️ Tests 1/2/4/5 are near-vacuous (they exercise the file's own CPU reference GEMM); test 3 is the only production-bound one, and its header records that test 3 *itself* used to be vacuous (`llama.cpp-cwev`). |
 | `test-sycl-lifecycle-runtime-wrapper` | `ggml/src/ggml-backend-reg.cpp:1146` `case REMOVED: return "REMOVED";` → `"REMOVED_"` | DEVICE-FREE-THREADS in this build | PASSFAIL, `[sycl-runtime-wrapper] <phase>` markers | `[sycl-runtime-wrapper] assert failed: failed first publication registry tombstone state != REMOVED` + `state=REMOVED_ durable_owners=0 lookup_visible=0` + `generic registry lifecycle fixture failed`, rc 1 | ⚠️ **Big time-saver: in the default (non-DL) build this test touches no SYCL code at all** — its whole SYCL half is under `#if defined(GGML_SYCL_RUNTIME_MODULE)`, defined only when `GGML_BACKEND_DL=ON` (default OFF). The mutation lives in core ggml, so it is red in both builds. RUN_SERIAL. |
-| `test-sycl-lifecycle-event-lease` | `execution-lifecycle.cpp:270` in `release_invocation_locked` `if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;` → prefix `false &&` | CPU-ONLY (links only `Threads::Threads`, never includes `sycl/sycl.hpp`) | PASSFAIL — prints **nothing** on success | stderr `H13b release accepted wrong root`, rc 1, under `--case H13b` and under the bare all-cases run | **2-of-11 specificity**: 11 ctest names share this binary and only `sycl-lifecycle-h13b` (+ the unqualified name) goes red — H13b is the only case passing a deliberately wrong root. The binary is already mutation-aware: `test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY` (`execution-lifecycle.cpp:245`) is a compiled-in fault injector that cases M7/M7b assert against. ⚠️ `execution-lifecycle.cpp` is also compiled into `test-sycl-lifecycle-owner-reset` — expect collateral reds there. ⚠️ `g6c()` runs only in the all-cases path; there is **no** `add_test(NAME sycl-lifecycle-g6c ...)`, unlike its siblings. |
+| `test-sycl-lifecycle-event-lease` | **PAIR — both edits, in `release_invocation_locked`.** `execution-lifecycle.cpp:270` `if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;` → prefix `false &&`; **and** `execution-lifecycle.cpp:276` drop the trailing `&& owner.token_root == root` from the device-owner conjunction | CPU-ONLY (links only `Threads::Threads`, never includes `sycl/sycl.hpp`) | PASSFAIL — prints **nothing** on success | stderr `H13b release accepted wrong root`, rc 1, under `--case H13b` and under the bare all-cases run | ⚠️ **`:270` ALONE IS A NULL MUTATION — executed and survived** (`llama.cpp-wo98`). The two sites are duplicate root guards on the same path, so each is individually null and only the pair reddens H13b; `require()` prints the bare message and `std::exit(1)`, so the RED string is that line verbatim. **2-of-11 specificity**: 11 ctest names share this binary and only `sycl-lifecycle-h13b` (+ the unqualified name) goes red — H13b is the only case passing a deliberately wrong root. The binary is already mutation-aware: `test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY` (`execution-lifecycle.cpp:245`) is a compiled-in fault injector that cases M7/M7b assert against. ⚠️ `execution-lifecycle.cpp` is also compiled into `test-sycl-lifecycle-owner-reset` — expect collateral reds there. ⚠️ `g6c()` runs only in the all-cases path; there is **no** `add_test(NAME sycl-lifecycle-g6c ...)`, unlike its siblings. |
 
 ---
+
+### `llama.cpp-wo98` adjudication — why `execution-lifecycle.cpp:270` alone proves nothing
+
+Two hypotheses were open when the mutation survived: a duplicate upstream guard,
+or H13b no longer passing a wrong root. **It is the duplicate guard.** H13b is
+intact — `test-sycl-lifecycle-event-lease.cpp:159` releases context `a`'s
+invocation with context `b`'s root and requires `error::MISMATCH`:
+
+```cpp
+require(reg.release_invocation(a,sa,ea,ga,ia,rb)==error::MISMATCH, "H13b release accepted wrong root");
+```
+
+The redundancy is *downstream*, not upstream: `release_invocation` (`:303-308`)
+adds nothing but the lock, so `release_invocation_locked` checks the root twice.
+
+| site | check | reached in H13b? |
+|---|---|---|
+| `:270` | `validate_root(graph.token_root, root) != error::OK` → `MISMATCH` | yes — first |
+| `:276` | `owner.token_root == root`, last conjunct of the device-owner match → `MISMATCH` at `:277` | yes — when `:270` is disabled |
+
+H13b claims device 2 at `begin_invocation` (`:156`), which writes
+`device_owners_[2].token_root = ra` (`execution-lifecycle.cpp:180`). Releasing
+with `rb` therefore fails the `:276` conjunct and returns the **same**
+`error::MISMATCH`, before the ownership-clearing loop at `:280`. That is why the
+three assertions after `:159` — retained ownership, competing context still
+`DEVICE_BUSY`, later recovery — also stay green.
+
+**`:270` is NOT dead defense, and must not be deleted.** It is the only root
+check on the path where `graph.devices` is empty: the `:272-279` loop then
+iterates zero times, so with `:270` gone a wrong-root release would return `OK`.
+No current case exercises that shape, which is precisely why the guard is worth
+keeping — reported here rather than acted on, per the ticket.
+
+Rejected alternatives, so nobody re-derives them:
+
+- **`:276` alone** — null for the same reason, in mirror image.
+- **`:281` `device_owners_[claimed_device] = {};` → no-op**, which would redden
+  H13b at `:165` (`competing context did not recover after exact release`). One
+  line, but it breaks release for *every* case rather than the wrong-root
+  property the row exists to prove, destroying the 2-of-11 specificity.
+- **`validate_root` itself (`:29`) → always `OK`** — still null here, because
+  `:276` compares tokens with `==` and never calls `validate_root`.
+
+Collateral checked and clear: `release_invocation` is called from exactly one
+test file (this one), and only `:159` passes a wrong root, so correct-root
+callers at `:75`, `:103`, `:124`, `:145` and `:163` still return `OK`.
+`test-sycl-lifecycle-owner-reset` compiles the same TU but calls
+`release_invocation` nowhere. The source-text gate
+`tests/test-sycl-lifecycle-source-contract.py:1036-1050` asserts only that
+`"release_invocation("` and the case names appear — the pair mutation edits
+neither, so it stays green.
 
 ## Batch C — `mem-handle.cpp` (5 tests, 6 builds, ~1.4 h)
 
