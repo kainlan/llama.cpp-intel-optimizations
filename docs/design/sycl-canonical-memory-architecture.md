@@ -370,14 +370,24 @@ completes and shared by its contexts:
 
 | Global / struct | Current location | Correct scope |
 |---|---|---|
-| `g_tensor_inventory` | `ggml-sycl.cpp:6169` | Model-scoped: populated at set_tensor_data, read-only during inference |
-| `g_placement_plan` | `ggml-sycl.cpp:6194` | Model-scoped: computed once, immutable |
-| `g_has_placement_plan` | `ggml-sycl.cpp:6195` | Model-scoped flag |
-| `g_placement_kv_info` | `ggml-sycl.cpp:6178` | Model-scoped: per-layer KV sizing |
-| `g_model_n_layer` | `ggml-sycl.cpp:6177` | Model-scoped |
+| `g_tensor_inventory` | `ggml-sycl.cpp:12335` | Model-scoped: populated at set_tensor_data, read-only during inference |
+| `g_placement_publication` | `ggml-sycl.cpp:2189` | Model-scoped: an immutable published snapshot, not a mutable plan (see below) |
+| `g_placement_kv_info` | `ggml-sycl.cpp:12351` | Model-scoped: per-layer KV sizing |
+| `g_model_n_layer` | `ggml-sycl.cpp:12350` | Model-scoped |
 | `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests |
 | `placement_plan::entries` | `unified-cache.hpp` | Model-scoped |
 | `placement_plan::layer_device`, `expert_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
+
+This table previously listed a mutable `g_placement_plan` and a
+`g_has_placement_plan` validity flag. Both symbols were eliminated by the
+immutable-placement reader migration (`c3bfd71c4`, `92b2675f6`) and have zero
+occurrences in live source; the census no longer carries a row for either.
+Their replacement is not a renamed global. `g_placement_publication` holds a
+`shared_ptr<const lifecycle_plan_snapshot>` published through the C++17 atomic
+`shared_ptr` free functions, so there is no mutable process-global plan at all:
+a builder publishes a fresh immutable snapshot with a release store and every
+reader takes an acquire load. A null pointer, not a separate boolean, is the
+"no plan yet" state — which is why the flag row has no successor.
 
 **Invariant:** No context-level operation (graph compute, KV reset, slot eviction)
 may modify model-scoped globals. A load or reset must preserve weight entries
@@ -1152,13 +1162,22 @@ The target lock inventory and mandatory order is concrete:
 
 | Rank | Exhaustive lifecycle-path target/current lock inventory | Same-rank tie-break |
 |---|---|---|
-| L1 | planned `lifecycle_registry_mutex`; current `g_sycl_model_slot_mutex`, `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
+| L1 | planned `lifecycle_registry_mutex`; current `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `g_onednn_scratch_lock_mutex`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
+
+Two names were dropped from the "current" columns because the locks no longer
+exist: `g_sycl_model_slot_mutex` (was L1) and `g_onednn_scratch_lock_mutex`
+(was L5) each have zero occurrences in live source. The remaining 28 `g_*`
+locks in this table were each confirmed present in the same sweep, so their
+"current" label still holds. Whether L1's planned `lifecycle_registry_mutex`
+should now be recorded as landed — the model-lifecycle registry does carry its
+own `mutex_` — is a foundation-owner classification and is deliberately left
+unchanged here.
 
 This table is exhaustive for locks touched by the lifecycle, graph, cache,
 staging, pool, and event-retention paths in scope. Foundation owner `32dg8.15.12` must update it in the
@@ -1261,7 +1280,9 @@ forbidden. In particular `g_sycl_graph_compute_mutex` must be replaced, not
 nested with per-device execution locks, and `g_cache_rw_mutex` must be dropped
 before a per-cache L4 lock is acquired. Snapshot/revalidate bridges these cases.
 The target **deletes** `g_onednn_scratch_lock_mutex` and
-`g_onednn_scratch_locks`; no global registry or async payload may store a
+`g_onednn_scratch_locks` — both are now gone from live source, so this clause
+records a completed deletion and stands as the standing prohibition rather than
+outstanding work; no global registry or async payload may store a
 `std::unique_lock`/mutex ownership token. Foundation `32dg8.15.12` supplies a logical
 `onednn_scratch_reservation { device, generation, reservation_id }` API. Acquire
 briefly locks that device's surviving keyed `onednn_scratch_mutex_`, validates

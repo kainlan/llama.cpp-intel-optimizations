@@ -1,5 +1,34 @@
 # SYCL cross-model state audit (llama.cpp-k7b0; parser census llama.cpp-1kx3)
 
+## Status: closed by the W1 convergence pass
+
+Every category-(c) suspect this document opened now has a disposition, and none
+is UNHANDLED. **The authority for that result is
+[`sycl-w1-convergence.md`](sycl-w1-convergence.md)** — read the disposition per
+suspect, the cross-lane seam analysis, and the findings there rather than from a
+tally repeated here, because a second copy of those counts is exactly what goes
+stale. Two of its findings are deliberately carried by this census instead of
+being re-litigated:
+
+- **F1** (the layer-stream working set has no module-shutdown drop) is a code
+  gap, not a census gap. It is tracked as `llama.cpp-rb2s` and is in flight; the
+  census records it as dispositioned-pending-rb2s and does not wait on it.
+- **F3** (the KV-tier load-boundary gap) is recorded below as a gap rather than
+  as a census row, because it is not one. `sycl-kv-slice-sizing` case 11
+  (`ggml/src/ggml-sycl/tests/test-kv-slice-sizing.cpp:403`) asserts
+  non-inheritance across a sequential
+  reconfiguration and a one-word `assign`→`resize` revert fires it — but it
+  calls `configure_from_plan()` directly, with no `model_load_begin`/`end`
+  bracket and no lifecycle registry. It therefore proves the **primitive**
+  resets correctly and proves nothing about whether the production load path
+  invokes that reconfiguration at all. Every other repaired subsystem has
+  load-transaction-level coverage; this one has only primitive-level coverage.
+  No static-storage row can express that, which is why it is written here.
+
+When re-deriving any of this by tree-wide search, exclude the convergence doc
+and this file from the results — both quote the symbol names they discuss, and
+§1.1 of the convergence doc warns about precisely that self-match.
+
 ## Reproducible parser-grade static-storage census (llama.cpp-1kx3)
 
 The generated inventory is
@@ -50,7 +79,7 @@ through chains and arrays, so arrays of aliased `const` pointer elements are
 reported immutable.
 The scope walk includes file and named-namespace objects, anonymous-namespace
 objects without the `static` spelling, function-local `static`/`thread_local`
-objects (including `bias_detect_flag`), and class/header static declarations.
+objects, and class/header static declarations.
 Every row includes an initializer-free AST-derived type and top-level binding
 mutability (so `const T *` and containers with const template arguments remain
 mutable, while `T * const` is immutable), scope, synchronization, owner
@@ -59,13 +88,19 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `5793f2ca1089eaf27203ee171c0d73d60a3e4c83`, the
-census emits **1,326 object rows**: 395 explicitly-static non-local objects,
-58 non-local objects with implicit static storage duration, 869 function-local
-static/thread-local objects, and 4 class static declarations. Per-file rows are 1,127
-(`ggml-sycl.cpp`), 148 (`unified-cache.cpp`), 8 (`unified-cache.hpp`), 41
+At audited source commit `bb9b1d154f338a01b6f18fc5e1165c51eb995838`, the
+census emits **1,386 object rows**: 436 explicitly-static non-local objects,
+66 non-local objects with implicit static storage duration, 878 function-local
+static/thread-local objects, and 6 class static declarations. Per-file rows are 1,169
+(`ggml-sycl.cpp`), 163 (`unified-cache.cpp`), 10 (`unified-cache.hpp`), 42
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
+
+Regenerate from a **clean** tree. The census is bound to committed bytes: a
+generation run reads the working tree, so uncommitted edits to any of the five
+inputs produce per-file SHA-256 values that name blobs reachable from nobody's
+git history. When the checkout is dirty, extract the inputs at the audited
+commit into a scratch tree and pass `--repo` at it.
 
 The supplied **371 lexical candidate leads** are reconciled as leads, not as a
 census: their artifact, source SHA, and extraction method were not supplied,
@@ -78,15 +113,20 @@ historical 329 figure because it likewise lacks a source SHA and method.
 
 ### Parse coverage and fail-closed behavior
 
-Tree-sitter reports 41 raw recovery/missing nodes in `ggml-sycl.cpp` and 10 in
-`fattn.cpp`; the other three inputs parse without recovery. The former are
+Tree-sitter reports 43 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
+`fattn.cpp`, and 2 in `unified-cache.hpp`; the remaining two inputs parse
+without recovery. The `ggml-sycl.cpp` sites are
 from nested preprocessor alternatives, declaration-prefix macros
 (`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
-tokens such as `PRId64`; the latter are dispatch macro invocations and a label
-next to a conditional compilation boundary. These are **explicit raw-parser recovery sites**, not silently discarded
-regions. Each of the 51 nodes must receive a structural proof category. In the
-current inputs, 17 are confined to parsed function signature/storage spans and
-31 are in parsed or unambiguously recovered function bodies. Recovered function
+tokens such as `PRId64`; the `fattn.cpp` ones are dispatch macro invocations and a label
+next to a conditional compilation boundary; the `unified-cache.hpp` pair are
+defaulted const-reference parameters, which grammar ABI 15 misparses.
+These are **explicit raw-parser recovery sites**, not silently discarded
+regions. Each of the 55 nodes must receive a structural proof category. In the
+current inputs, 19 are confined to parsed function signature/storage spans,
+31 are in parsed or unambiguously recovered function bodies, and 2 are the
+defaulted const-reference parameter shape, which is proved by an anchored
+spelling match and fails closed on every near miss. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
 top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
@@ -150,25 +190,27 @@ line number; current-input changes are covered by generation and `--check` inste
 
 ### Static high-risk highlights (no behavior changes in this census)
 
-- `ggml-sycl.cpp:79471` `bias_detect_flag` is a function-local
-  `std::once_flag`. Its `call_once` captures MoE expert-bias device pointers
-  and host copies from the first graph that reaches it, making it process-first
-  semantic model state and the highest-risk review target. The inventory does
-  not claim a binding-resolved reset result.
-- `ggml-sycl.cpp:1973-1974` `g_moe_hybrid_init_success[]` and
+- ~~`bias_detect_flag`~~ — **eliminated, no longer a census row.** This was the
+  highest-risk entry: a function-local `std::once_flag` whose `call_once`
+  captured MoE expert-bias device pointers and host copies from the first graph
+  that reached it, making it process-first semantic model state. The flag and
+  the `g_moe_expert_biases` / `g_moe_bias_host_copies` maps it populated all
+  have zero occurrences in live source, so the hazard is structurally gone
+  rather than mitigated.
+- `ggml-sycl.cpp:2171-2172` `g_moe_hybrid_init_success[]` and
   `g_moe_hybrid_init_done` are process-first MoE initialization/activation
   guards. Unscoped lexical access candidates are inventoried, but lifecycle
   reset is deliberately not inferred. They require binding-aware review.
-- `ggml-sycl.cpp:57239` `tl_first_act` is thread-local pinned activation
+- `ggml-sycl.cpp:61567` `tl_first_act` is thread-local pinned activation
   staging. It is reused through `ensure()` as bounded capacity storage and the
   current activation is copied before use. This is capacity retention, not by
   itself semantic cross-model state. Nearby `tl_first_tasks` has lexical
   resize/clear candidates, which require binding confirmation. The inventory
   keeps this distinction visible instead of labeling all TLS reuse a leak.
-- `fattn.cpp:123-124`'s anonymous-namespace mutex and
+- `fattn.cpp:146-147`'s anonymous-namespace mutex and
   `g_packed_k_sidecars` are included despite lacking `static`; its erase and
   lookup lines are recorded only as unscoped lexical candidates.
-  `layer-streaming.cpp:370`'s device-keyed `g_layer_managers` is also included;
+  `layer-streaming.cpp:523`'s device-keyed `g_layer_managers` is also included;
   its retained per-manager model inventory remains a lifecycle-review item,
   not a claimed leak or claimed absence of teardown.
 
@@ -249,7 +291,7 @@ previously-issued identities (`STALE_IDENTITY`).
 The concrete ranks are lifecycle/ID (L1) → per-device execution registry (L2) →
 model/context/session/graph (L3) → all listed cache metadata locks (L4) → all
 listed zone/staging/pool/work locks (L5). The canonical exhaustive table now
-includes `g_onednn_scratch_lock_mutex`, `g_moe_buffers_mutex`,
+includes `g_moe_buffers_mutex`,
 `g_pipeline_copy_queue_mutex`, block-exec `copy_queue_mutex`, and
 `g_backend_context_by_device_mutex`, and
 `ggml_backend_sycl_context::control_host_allocs_mutex`, including their
@@ -449,6 +491,9 @@ structurally impossible.
   acquires another same-rank mutex to store it, and may erase/unlock on another
   thread. Canonical §12.5 supersedes that assessment and requires the map/global
   mutex to be deleted in favor of logical reservation generation/refcount state.
+  That deletion has since landed: both `g_onednn_scratch_locks` and
+  `g_onednn_scratch_lock_mutex` have zero occurrences in live source and no
+  longer appear in the census.
 
 ## Category (c): model-scoped and leaking — found and fixed
 
@@ -512,11 +557,12 @@ because it was cheap and matches the documented anti-pattern exactly.
 
 ### Defense-in-depth (no confirmed live leak found, but structurally strengthened)
 
-`g_placement_kv_info`, `g_has_placement_plan` / `g_placement_plan`,
+`g_placement_kv_info`,
 `g_placement_envelope` / `g_placement_envelope_set`, `g_model_n_layer`,
 `g_moe_n_experts_total` / `_used`, `g_moe_expert_total_bytes`,
-`g_moe_expert_vram_reserve`, and the `g_tensor_inventory*` family (ticket
-suspects `g_placement_kv_info` / `g_has_placement_plan`): traced
+`g_moe_expert_vram_reserve`, and the `g_tensor_inventory*` family (the ticket's
+other suspects, `g_has_placement_plan` / `g_placement_plan`, have since been
+eliminated outright — see `sycl-w1-convergence.md` §1.1): traced
 field-by-field against `populate_inventory_globals()`, the real writer.
 **Every field of every one of these is already overwritten unconditionally
 on the normal path** — this is not the same bug as `g_sycl_weight_usages`
@@ -542,13 +588,13 @@ budget. Listed with the read pattern that would need checking:
 
 | symbol | file | key | risk note |
 |---|---|---|---|
-| `g_moe_layer_seq[GGML_SYCL_MAX_DEVICES]` | ggml-sycl.cpp:1978 | `int` (layer id) | per-device array of maps; stale sequence numbers for a layer id present in both an old and new model would need checking against whatever writes it during load |
-| `g_expert_popularity` | ggml-sycl.cpp:2389 | `int64_t` | popularity/heuristic counter for expert prefetch; likely soft (biases a heuristic, doesn't gate correctness) but not confirmed |
+| `g_moe_layer_seq[GGML_SYCL_MAX_DEVICES]` | ggml-sycl.cpp:2176 | `int` (layer id) | per-device array of maps; stale sequence numbers for a layer id present in both an old and new model would need checking against whatever writes it during load |
+| `g_expert_popularity` | ggml-sycl.cpp:2815 | `int64_t` | popularity/heuristic counter for expert prefetch; likely soft (biases a heuristic, doesn't gate correctness) but not confirmed |
 | ~~`g_sycl_canonical_checksums`~~ | ggml-sycl.cpp:7960 | owner-scoped key | **RESOLVED (llama.cpp-x3ou).** It was category (c): bare-name key, never cleared, so a second model's capture overwrote the first's row and the compare reported `match=0` against byte-correct weights. Diagnostic-only — the sole read is a `GGML_LOG_INFO` line, no compute path reads it — and latent rather than benign, since `compare_remaining` defaults to 1 so the false verdict only surfaces once `GGML_SYCL_UNIFIED_COMPARE_LIMIT` is raised. Now keyed by `ggml_sycl_owner_name_key()` and erased per owner in `ggml_sycl_erase_weight_identities_for_owner()`. Gated by `canonical-checksum-owner-scope` and `canonical-checksum-source-contract` |
-| `g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES]` | ggml-sycl.cpp:9241 | n/a (deque) | uses `pop_front`/`pop_back`, not `clear`/`erase` — the sweep's `.clear(`/`.erase(` grep is a **false positive** here; likely a drained queue, not accumulating state. Re-verify with a positive-controlled probe before trusting either way |
-| `g_moe_layer_ids_cache` | ggml-sycl.cpp:11033 | `int` (layer id), `thread_local` | `thread_local` does not help against a *sequential* single-thread sweep like test-llama-archs |
-| `g_moe_expert_biases` / `g_moe_bias_host_copies` | ggml-sycl.cpp:14138-14140 | `int` (layer id) | per-layer MoE expert bias values; a later non-MoE or differently-shaped model could read a previous model's stale bias data if any downstream check is "does this map contain layer N" rather than "did THIS load populate layer N" |
-| `g_sycl_alloc_trace_entries` | ggml-sycl.cpp:31984 | tensor name | name suggests diagnostic/trace-only; not confirmed |
+| `g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES]` | ggml-sycl.cpp:11482 | n/a (deque) | uses `pop_front`/`pop_back`, not `clear`/`erase` — the sweep's `.clear(`/`.erase(` grep is a **false positive** here; likely a drained queue, not accumulating state. Re-verify with a positive-controlled probe before trusting either way |
+| `g_moe_layer_ids_cache` | ggml-sycl.cpp:14734 | `int` (layer id), `thread_local` | `thread_local` does not help against a *sequential* single-thread sweep like test-llama-archs |
+| ~~`g_moe_expert_biases`~~ / ~~`g_moe_bias_host_copies`~~ | — | — | **MOOT — symbols eliminated.** Both, and the `bias_detect_flag` `once_flag` that populated them, have zero occurrences in live source, so the stale-bias read this row describes is no longer reachable. Closed by removal, not by an audit of the read sites |
+| `g_sycl_alloc_trace_entries` | ggml-sycl.cpp:35988 | tensor name | name suggests diagnostic/trace-only; not confirmed |
 
 Recommended next step: for each row, find the read site(s), confirm whether
 the read is gated by something equivalent to "this model actually wrote
