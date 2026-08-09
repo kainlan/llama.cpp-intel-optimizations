@@ -28,12 +28,42 @@ int main() {
             }                                            \
         } while (0)
 
+static const char * plan_kind_name(ggml_sycl_onednn_fa_layout_kind kind) {
+    switch (kind) {
+        case ggml_sycl_onednn_fa_layout_kind::DIRECT:
+            return "DIRECT";
+        case ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED:
+            return "MATERIALIZE_REQUIRED";
+        case ggml_sycl_onednn_fa_layout_kind::REJECT:
+            return "REJECT";
+    }
+    return "UNKNOWN";
+}
+
 static bool configure_bounded_runtime() {
     // Materialized K/V intentionally enter the unified allocator. This tiny
     // descriptor fixture must not initialize the model-scale full-VRAM arena
     // or its default 2 GiB pinned chunks merely to allocate a few KiB.
     return setenv("GGML_SYCL_VRAM_ARENA", "0", 1) == 0 && setenv("GGML_SYCL_PINNED_CHUNK_MB", "16", 1) == 0;
 }
+
+// SMALL keeps the original descriptor-fixture constants verbatim. PRODUCTION
+// scales the index-proportional terms by the case's own dimensions, because
+// those constants do not transfer: at D=128/n_kv=256 the SMALL formula's
+// -0.005*(t+1) K term reaches -1.28, which drives the logit spread to ~15 and
+// makes softmax dynamic range -- not the K/V strides -- the dominant source of
+// error. A production case that failed for that reason would look exactly like
+// "DIRECT is wrong at scale", which is the question this fixture exists to
+// answer, so the confound has to be designed out rather than tolerated.
+//
+// PRODUCTION's coefficients are chosen so the OUTPUT magnitude lands in the
+// same band as the SMALL cases (~0.01-0.25). That is what lets both profiles
+// share the one 5e-3 absolute tolerance below without it meaning something
+// different for each -- no per-case threshold, no widening.
+enum class fill_profile {
+    SMALL,
+    PRODUCTION,
+};
 
 struct case_shape {
     const char * name;
@@ -44,6 +74,13 @@ struct case_shape {
     int          n_kv;
     int          k_stride;
     int          v_stride;
+    // Causal mask offset: token t is visible to query q when t <= q + kv_offset.
+    // 0 reproduces the original prompt-shaped mask. A production decode step has
+    // a short query block against a long cached context, so n_kv - n_q makes all
+    // n_kv tokens participate; with 0 at n_q=16/n_kv=256, 240 of 256 KV tokens
+    // are fully masked and the extra context length is numerically inert.
+    int          kv_offset;
+    fill_profile profile;
 };
 
 static size_t q_idx(const case_shape & sh, int h, int q, int d) {
@@ -71,10 +108,18 @@ static void fill_inputs(const case_shape &        sh,
                         std::vector<sycl::half> & K,
                         std::vector<sycl::half> & V,
                         std::vector<sycl::half> & mask) {
+    const bool  prod = (sh.profile == fill_profile::PRODUCTION);
+    const float q_h  = prod ? 0.4f / (float) sh.H_q : 0.03f;
+    const float q_q  = prod ? 0.1f / (float) sh.n_q : 0.007f;
+    const float k_h  = prod ? 0.15f / (float) sh.H_kv : 0.02f;
+    const float k_t  = prod ? 0.22f / (float) sh.n_kv : 0.005f;
+    const float v_h  = prod ? 0.11f / (float) sh.H_kv : 0.011f;
+    const float v_t  = prod ? 0.13f / (float) sh.n_kv : 0.013f;
+
     for (int h = 0; h < sh.H_q; ++h) {
         for (int q = 0; q < sh.n_q; ++q) {
             for (int d = 0; d < sh.D; ++d) {
-                const float v = 0.03f * (float) (h + 1) + 0.007f * (float) (q + 1) + 0.001f * (float) ((d % 7) - 3);
+                const float v         = q_h * (float) (h + 1) + q_q * (float) (q + 1) + 0.001f * (float) ((d % 7) - 3);
                 Q[q_idx(sh, h, q, d)] = sycl::half(v);
             }
         }
@@ -82,8 +127,8 @@ static void fill_inputs(const case_shape &        sh,
     for (int h = 0; h < sh.H_kv; ++h) {
         for (int t = 0; t < sh.n_kv; ++t) {
             for (int d = 0; d < sh.D; ++d) {
-                const float k = 0.02f * (float) (h + 1) - 0.005f * (float) (t + 1) + 0.0008f * (float) ((d % 11) - 5);
-                const float v = 0.011f * (float) (h + 1) + 0.013f * (float) (t + 1) + 0.0009f * (float) ((d % 13) - 6);
+                const float k = k_h * (float) (h + 1) - k_t * (float) (t + 1) + 0.0008f * (float) ((d % 11) - 5);
+                const float v = v_h * (float) (h + 1) + v_t * (float) (t + 1) + 0.0009f * (float) ((d % 13) - 6);
                 K[kv_idx(sh.k_stride, sh.n_kv, h, t, d)] = sycl::half(k);
                 V[kv_idx(sh.v_stride, sh.n_kv, h, t, d)] = sycl::half(v);
             }
@@ -91,7 +136,7 @@ static void fill_inputs(const case_shape &        sh,
     }
     for (int q = 0; q < sh.n_q; ++q) {
         for (int t = 0; t < sh.n_kv; ++t) {
-            mask[mask_idx(sh, q, t)] = sycl::half((t <= q) ? 0.0f : -10000.0f);
+            mask[mask_idx(sh, q, t)] = sycl::half((t <= q + sh.kv_offset) ? 0.0f : -10000.0f);
         }
     }
 }
@@ -277,6 +322,16 @@ static bool run_case(ggml_backend_sycl_context & ctx, const case_shape & sh) {
     params.nb33      = params.nb32;
     params.prec      = GGML_PREC_F32;
 
+    // Record the routing decision from the planner itself, not from an
+    // environment-gated log line. ggml_sycl_flash_attn_ext_onednn calls this
+    // same function with these same arguments, so the printed kind is the
+    // branch the execute below takes. GGML_SYCL_FA_DISPATCH_DEBUG=1 prints the
+    // corresponding production line and is the independent cross-check; if the
+    // two ever disagree, that disagreement is the finding.
+    const ggml_sycl_onednn_fa_layout_plan plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(params, sh.H_q, sh.H_kv, params.kv_is_fp8, params.n_seqs > 1);
+    std::printf("%s plan=%s\n", sh.name, plan_kind_name(plan.kind));
+
     const bool executed = ggml_sycl_flash_attn_ext_onednn(ctx, params);
     q->wait_and_throw();
 
@@ -347,10 +402,36 @@ static int run_descriptor_tests() {
             return 1;
         }
         ggml_backend_sycl_context & ctx = owner.context();
-        ok &= run_case(ctx, { "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16 });
-        ok &= run_case(ctx, { "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16 });
-        ok &= run_case(ctx, { "GQA-5D-materialized", 4, 2, 16, 8, 8, 19, 21 });
-        ok &= run_case(ctx, { "MQA-5D-materialized", 4, 1, 16, 8, 8, 19, 21 });
+        // kv_offset=0 + fill_profile::SMALL reproduce these four cases exactly as
+        // they were before those fields existed.
+        ok &= run_case(ctx, { "MHA-4D-direct", 2, 2, 16, 8, 8, 16, 16, 0, fill_profile::SMALL });
+        ok &= run_case(ctx, { "GQA-5D-direct", 4, 2, 16, 8, 8, 16, 16, 0, fill_profile::SMALL });
+        ok &= run_case(ctx, { "GQA-5D-materialized", 4, 2, 16, 8, 8, 19, 21, 0, fill_profile::SMALL });
+        ok &= run_case(ctx, { "MQA-5D-materialized", 4, 1, 16, 8, 8, 19, 21, 0, fill_profile::SMALL });
+
+        // Production-scale GQA (llama.cpp-l7rt). Mistral's decode shape, the one
+        // CLAUDE.md records from a live run as
+        //   [SYCL] fattn: oneDNN MATERIALIZED D=128 ne01=16 ne11=256 H_q=32 H_kv=8
+        //
+        // These two exist to answer whether the nc!=D materialize gate at
+        // fattn-onednn.cpp:182 is a CORRECTNESS requirement or an optimization,
+        // at the shape production actually runs. They are a matched pair and
+        // neither is useful alone:
+        //
+        //   -dense       k_stride == v_stride == D, so the gate does not fire and
+        //                the planner says DIRECT on an UNMUTATED build. This is
+        //                the positive control at scale: it separates "DIRECT is
+        //                wrong for STRIDED K/V" from "DIRECT, or this fixture's
+        //                tolerance, is wrong at D=128/n_kv=256 generally".
+        //                Without it a red -strided result is uninterpretable.
+        //   -strided     k_stride=131, v_stride=133 (coprime with D and with each
+        //                other, so no accidental alignment rescues a stride bug),
+        //                so the gate fires and the planner says
+        //                MATERIALIZE_REQUIRED unmutated. Prefixing `false &&` to
+        //                the :182 predicate is what routes this same case through
+        //                DIRECT, which is the measurement the ticket wants.
+        ok &= run_case(ctx, { "GQA-prod-dense", 32, 8, 128, 16, 256, 128, 128, 240, fill_profile::PRODUCTION });
+        ok &= run_case(ctx, { "GQA-prod-strided", 32, 8, 128, 16, 256, 131, 133, 240, fill_profile::PRODUCTION });
         ctx.stream()->wait_and_throw();
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "FAIL: SYCL exception: %s\n", e.what());
