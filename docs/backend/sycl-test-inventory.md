@@ -1673,7 +1673,7 @@ record of the trap) and `b2b-*.log` (the counting re-run).
 |---|---|
 | moe-control-plan `:188` | RED `FAIL: grovemoe-chexps-family-parses: chunked gate must be a matrix` (both names, matched=2) → GREEN |
 | zone-sizing `:139` | RED `...test-zone-sizing.cpp:145: gpt-oss onednn_eligible must skip the expert family...` → GREEN |
-| dispatch-tuning `:242` | **SURVIVED — stale plan row** (`llama.cpp-bqtu`): the current test has ONE case (unified_matmul mapping) and never reaches the mmvq branch; the pre-registered 3-assertion "mmvq kernel mismatch" oracle no longer exists. Mutation verified compiled+linked (not a void). mmvq winner-parse branch has zero coverage at HEAD. |
+| dispatch-tuning `:242` | **SURVIVED — oracle harvested from the wrong file** (`llama.cpp-bqtu`, resolved 2026-08-09): the registered test had ONE case (unified_matmul mapping) and never reached the mmvq branch. Mutation verified compiled+linked (not a void). **The 3-assertion "mmvq kernel mismatch" oracle was never deleted — it lives in a second, UNREGISTERED file of the same basename** (see the basename-collision note below). Test since extended with two mmvq cases; row re-pointed and awaiting its cycle. |
 | e2e-profile `:135` | RED Subprocess aborted with the exact pre-registered `[SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 ...` line → GREEN |
 | cpu-traits-support `:158` | RED `bounds check failed` → GREEN |
 
@@ -1682,6 +1682,29 @@ Name map additions: `test-moe-control-plan` → `sycl-moe-control-plan`
 `test-sycl-dispatch-tuning` → `sycl-dispatch-tuning`;
 `test-sycl-e2e-profile` → 1:1; `test-sycl-cpu-traits-parity` →
 `sycl-cpu-traits-parity`. Logs: `b2c2-*.log`.
+
+⚠️ **Basename collision — `test-dispatch-tuning.cpp` names TWO different files,
+and the plan row was written against the one nothing runs** (`llama.cpp-bqtu`,
+archaeology 2026-08-09). Commit `e165f526b` added both on the same day:
+
+| path | content | registered? |
+|---|---|---|
+| `ggml/src/ggml-sycl/tests/test-dispatch-tuning.cpp` | the case-macro version | **yes** — `add_executable(test-sycl-dispatch-tuning tests/test-dispatch-tuning.cpp dispatch-tuning.cpp)` at `ggml/src/ggml-sycl/CMakeLists.txt:1454-1464`, `add_test(NAME sycl-dispatch-tuning)` |
+| `tests/test-dispatch-tuning.cpp` (repo root) | the 3-assertion version, `FAILED: mmvq kernel mismatch` / `onednn kernel mismatch` / `mmq kernel mismatch`, `PASS` | **no** — `tests/CMakeLists.txt` never mentions it; it has no target and no `add_test` |
+
+The trap is that the `add_executable` source path `tests/test-dispatch-tuning.cpp`
+is relative to `CMAKE_CURRENT_SOURCE_DIR` (`ggml/src/ggml-sycl/`), so it reads
+like the repo-root file and resolves to the SYCL one. The row's oracle strings
+and its "1 of 3 assertions" were harvested from the orphan; the mutation was
+correct all along and its *expectation* was not. `git log` on the registered file
+shows a single commit — the mmvq assertions were never there to lose, so the
+"deleted `test-kernel-dispatch` mirror" hypothesis in the ticket is also wrong
+(that file was a standalone ESIMD batch-gating mirror with its own enum copies,
+unrelated to winner parsing).
+
+**Follow-up not taken by this lane:** the repo-root orphan is unbuilt and
+unrun — it is either dead code to delete or a registration to add. Left alone
+deliberately; `tests/CMakeLists.txt` is outside the row-repair scope.
 
 ### B2 chunk 3 — executed results (2026-08-09): 4/5 proven, 1 null mutation. BATCH B COMPLETE.
 
@@ -1728,7 +1751,7 @@ four is the single best value in the whole plan.
 | `test-mmvq-launch-geometry` | `mmvq-launch-geometry.hpp:58` `(rows + subgroups_per_workgroup - 1) / n` → `(rows + subgroups_per_workgroup) / n` | CPU-ONLY | COUNT `test-mmvq-launch-geometry: PASS (6 cases)` | `ok: slice-of-one-pads-to-one-workgroup` then `FAIL: already-aligned-shapes-are-unchanged: aligned row count 16 must pad to itself`, rc 1 | Only `mmvq.cpp` includes the header in production, and the test target compiles it directly — so this is standalone. Has a built-in positive control (`the-uniformity-predicate-can-fail`). |
 | `test-moe-control-plan` | `moe-control-plan.cpp:188` drop `&& std::strstr(name, "_chexps") == nullptr` | CPU-ONLY | fixed-count only — `moe control plan: PASS (25 cases)` where 25 is `sizeof(cases)/sizeof(...)`, **not** a running count | `FAIL: grovemoe-chexps-family-parses: chunked gate must be a matrix`, rc 1 | The "25" cannot be diffed for partial breakage — treat as PASSFAIL. `moe_control_reset_all_state()` brackets every ledger case. |
 | `test-zone-sizing` | `zone-sizing.cpp:139` `if (zone_is_moe_expert_tensor(tensor))` → `if (false && ...)` | CPU-ONLY | PASSFAIL, `PASS: zone-sizing structural path-scoped maxima` | `FAIL: tests/test-zone-sizing.cpp:145: gpt-oss onednn_eligible must skip the expert family and fall to the dense attention family`, rc 1 | Sibling predicates keep expert tensors, so they stay green — good specificity. Case 11 exists to distinguish `&&` from `||`; do not "simplify" it. |
-| `test-sycl-dispatch-tuning` | `dispatch-tuning.cpp:242` `return ...MMVQ_COALESCED;` → `MMVQ_SOA` | CPU-ONLY | PASSFAIL, `PASS` | `FAILED: mmvq kernel mismatch`, rc 1 | 1 of 3 assertions. Writes `/tmp/dispatch_tuning_test.json` (tmpfs) and removes it on success. |
+| `test-sycl-dispatch-tuning` | `ggml/src/ggml-sycl/dispatch-tuning.cpp:242` `return ggml_sycl_mul_mat_kernel::MMVQ_COALESCED;` → `return ggml_sycl_mul_mat_kernel::MMVQ_SOA;` | CPU-ONLY | COUNT `[TEST SUMMARY] %d/%d tests passed` | `[TEST] mmvq_coalesced winner maps to MMVQ_COALESCED ... FAILED: winner did not map to MMVQ_COALESCED` then `[TEST SUMMARY] 2/3 tests passed`, rc 1 | ⚠️ **The oracle in this row before 2026-08-09 (`FAILED: mmvq kernel mismatch`, "1 of 3 assertions") belonged to a DIFFERENT, unregistered file** — see the basename-collision note in B2 chunk 2. The registered test is `ggml/src/ggml-sycl/tests/test-dispatch-tuning.cpp`, extended under `llama.cpp-bqtu` from 1 case to **3 cases / 8 `TEST_ASSERT` sites** (173 lines): `unified_matmul`, `mmvq_coalesced`, `mmvq_soa`. **1-of-3 specificity**: the mutation is inside the `winner.find("coalesced")` sub-branch, so `mmvq_soa` (which reaches `:245` via the `soa` sub-branch) and `unified_matmul` (`:238`) both stay green — the summary line discriminates. Each case writes its own `mkstemp` file under `/tmp` (tmpfs) and removes it before asserting. Target compiles `dispatch-tuning.cpp` directly and links `ggml`; no `libggml-sycl` relink. |
 | `test-sycl-e2e-profile` | `e2e-profile.cpp:135` `g_e2e_tg_profile.tokens += 1;` → `+= 0;` | CPU-ONLY | PASSFAIL via `std::abort()` | stderr `test-sycl-e2e-profile: [SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 ...` then **SIGABRT, rc 134** | Failure mode is abort, not exit 1 — do not grep for "FAIL". Chosen so the RED string is quotable; the `GGML_OP_MUL_MAT_ID → MOE` alternative gives only `requirement failed`. |
 | `test-sycl-cpu-traits-parity` | `cpu-traits-support.cpp:158` `index >= 0 && index < GGML_TYPE_COUNT` → `index <= GGML_TYPE_COUNT` | CPU-ONLY | PASSFAIL — prints **nothing** on success | `bounds check failed`, rc 1 | Cheapest in the plan (1 TU, links only ggml-base/ggml-cpu). Despite the name it calls no SYCL symbol. Returns an out-of-bounds pointer but never dereferences it. |
 | `test-sycl-timeline` | `sycl-timeline.cpp:468` drop `|| state.successful_file_flushes > 0` | CPU-ONLY | PASSFAIL via `std::abort()` | `test-sycl-timeline: second flush must not clobber the first trace file`, **rc 134** | ~45 preceding `require()`s stay green. Targets an invariant the source comment states (lines 483–484). |
