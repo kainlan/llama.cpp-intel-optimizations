@@ -55473,8 +55473,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_SYCL_DEBUG("[TG-FAST] MMVQ+reorder failed for %s, falling through\n",
                                 src0->name ? src0->name : "?");
                 trace_fast_path("dispatch-tg-fast-failed", fast_kernel, soa_layout);
-            } else if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
-                // MMVQ with AOS layout
+            } else {
+                // MMVQ with AOS layout.  Unconditional by construction: fast-path
+                // entry above requires src1->ne[1] == 1 and nothing here writes
+                // src1, so the batch-size test this branch used to carry
+                // (ne[1] <= MMVQ_MAX_BATCH_SIZE, which is 8) could never be false
+                // and its DMMV else-branch was unreachable (llama.cpp-cg5r).
+                // Types MMVQ cannot serve are still handled: ggml_sycl_op_mul_mat
+                // below returns false for them and falls through to full dispatch,
+                // where the unified kernel picks DMMV.
                 split_merge_drain();
                 GGML_SYCL_DEBUG("[TG-FAST] batch=1 MMVQ+AOS for %s (type=%d)\n", src0->name ? src0->name : "?",
                                 src0->type);
@@ -55487,19 +55494,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 // MMVQ+AOS failed (e.g. weight unavailable) — fall through to full dispatch
                 GGML_SYCL_DEBUG("[TG-FAST] MMVQ+AOS failed for %s, falling through\n", src0->name ? src0->name : "?");
                 trace_fast_path("dispatch-tg-fast-failed", ggml_sycl_mul_mat_kernel::MMVQ_AOS, GGML_LAYOUT_AOS);
-            } else {
-                // DMMV fallback for types not supported by MMVQ
-                split_merge_drain();
-                const bool use_dmmv = ggml_sycl_supports_dmmv(src0->type) && src0->ne[0] % GGML_SYCL_DMMV_X == 0;
-                if (use_dmmv) {
-                    GGML_SYCL_DEBUG("[TG-FAST] batch=1 DMMV for %s (type=%d)\n", src0->name ? src0->name : "?",
-                                    src0->type);
-                    ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec,
-                                                           GGML_LAYOUT_AOS);
-                    return;
-                }
             }
-            // Neither MMVQ nor DMMV available: fall through to full dispatch
+            // MMVQ unavailable or failed: fall through to full dispatch
         }
     }
 
