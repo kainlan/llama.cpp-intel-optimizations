@@ -1683,6 +1683,27 @@ Name map additions: `test-moe-control-plan` → `sycl-moe-control-plan`
 `test-sycl-e2e-profile` → 1:1; `test-sycl-cpu-traits-parity` →
 `sycl-cpu-traits-parity`. Logs: `b2c2-*.log`.
 
+### B2 chunk 3 — executed results (2026-08-09): 4/5 proven, 1 null mutation. BATCH B COMPLETE.
+
+| row | outcome |
+|---|---|
+| onednn-woq `:33` | RED `FAILED: expected scales/zp mask=3 got 1/3` → GREEN |
+| xmx-dispatch-gate `:46` | RED `FAILED: threshold <= 1 must accept no batch at all` → GREEN |
+| ggml-backend-reg `:1146` (core ggml) | RED `[sycl-runtime-wrapper] assert failed: failed first publication registry tombstone state != REMOVED` → GREEN |
+| execution-lifecycle `:270` | **SURVIVED — NULL MUTATION** (`llama.cpp-wo98`): both the bare `sycl-lifecycle-event-lease` run AND the targeted `sycl-lifecycle-h13b` pass with the validate_root MISMATCH return disabled (mutation verified compiled+linked). Same class the plan warns about for owner-reset's `:301-307` duplicate guards. Row needs re-pointing. |
+| sycl-timeline `:468` | RED `second flush must not clobber the first trace file` → GREEN |
+
+Name map: `test-onednn-woq` → 1:1; `test-mmq-xmx-dispatch` →
+`mmq-xmx-dispatch`; `test-sycl-lifecycle-runtime-wrapper` →
+`sycl-lifecycle-runtime-wrapper`; `test-sycl-lifecycle-event-lease` →
+`sycl-lifecycle-event-lease` (bare, + 10 `--case` names);
+`test-sycl-timeline` → 1:1. Shmem flat (2.98→2.88 GB) across the chunk
+incl. the woq GPU case. Logs: `b2c3-*.log`.
+
+**Batch B final: 17 of 19 rows mutation-proven; 2 rows ticketed
+(`llama.cpp-bqtu` stale oracle, `llama.cpp-wo98` null mutation). Running
+total: 19 of 117 proven.**
+
 None of these relink `libggml-sycl`; the mutated .cpp/.hpp is compiled straight
 into the test binary. Sub-batch by file — the `model-lifecycle.cpp` group of
 four is the single best value in the whole plan.
