@@ -1622,14 +1622,18 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         # test-layout-cache.cpp's header) and the fixture is fixed. But the
         # first restored run failed FIVE of the seven sub-tests, not the one
         # the ticket recorded:
-        #   test_layout_selection ("expected XMX_TILED, got SOA")
-        #   test_aos_drop ("Failed to cache AOS layout")
-        #   test_mul_mat_layout_choice (was ..._coalesced)  <- fixed here
-        #   test_device_weight_layout_cache ("...for device weight")
-        #   test_model_load_host_buffer_avoids_pinned ("USM alloc type 0")
-        # The other four are unadjudicated -- any of them may be a real product
-        # regression, and none may be papered over by weakening its oracle.
-        # Un-disabling now would land a red gate.
+        #   test_layout_selection ("expected XMX_TILED, got SOA")        llama.cpp-no1t
+        #   test_aos_drop ("Failed to cache AOS layout")                 llama.cpp-778b
+        #   test_mul_mat_layout_choice (was ..._coalesced)  <- fixed here (0tkh)
+        #   test_device_weight_layout_cache ("...for device weight")     llama.cpp-doyp
+        #   test_model_load_host_buffer_avoids_pinned ("USM alloc type 0") llama.cpp-6qgl
+        # The instrumented run (artifacts/b8uv/0tkh-run.txt, 2026-08-09, 3/7
+        # green, Shmem flat) confirmed the 0tkh verdict empirically: the
+        # override-inertness contract held (host/auto == host/coalesced), and
+        # each remaining failure now names its mechanism -- see the four
+        # tickets above. Any of them may be a real product regression, and
+        # none may be papered over by weakening its oracle. Un-disabling now
+        # would land a red gate; remove DISABLED when all four are resolved.
         #
         # The fix makes ONE run decisive instead: every sub-test runs, each
         # failure names its axis, and main() prints a PASS/FAIL roll-up. Remove
