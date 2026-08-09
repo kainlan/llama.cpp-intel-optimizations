@@ -1871,6 +1871,23 @@ independent; sequence them in one file-open.
 | `test-moe-mul-mat-id` | `:4102` `get_int_from_table_16(v0, kvalues_mxfp4)` → `(v1, ...)` | GPU | PASSFAIL, per-case `nmse=... max_diff=...` | `MoE MUL_MAT_ID MXFP4 (base): nmse=<large> ...` + `FAIL: ... (nmse>5.0e-04 or max_diff>1.00)`, rc 1 | ⚠️ **Route uncertainty — confirm before building.** The test registers weights on the *host* buffer type, and CLAUDE.md routes host-resident weights to CPU dispatch; if so the live MXFP4 kernel is `ggml_sycl_cpu_expert_mul_mat_batched` in `cpu-dispatch.cpp`, not `mmvq.cpp`. Run once with `GGML_SYCL_DEBUG=1` and read the dispatch line first. ⚠️ Do **not** mutate `kvalues_mxfp4` in `ggml-common.h` — it is shared with the ggml-cpu reference, so both sides move and the test stays green. |
 | `test-q8-0-layout-cache-path-mmvq` | `:21361` pass `src0_dd_i` (AoS base) instead of `soa_base` to `reorder_mul_mat_vec_q8_0_q8_1_sycl` | GPU | PASSFAIL, `Max diff: ... Result: PASS/FAIL` | `Max diff: 2.560000e+02, max rel: 1.000000e+00, min abs: 0.000000` then `Result: FAIL`, rc 1 | The test memsets `weight->data` to zero after caching, so an AoS read yields exactly 0 — unambiguous. The widest-blast mutation here, acceptable because the test's whole premise is "did the SoA pointer get used". Do not simplify the load-transaction bracket (RCA `llama.cpp-43uy`, lines 137–146). |
 
+### Batch E — executed results (2026-08-09): 3/5 proven + both pending proof cycles landed
+
+| row | outcome |
+|---|---|
+| bqtu proof (dispatch-tuning `:242`) | RED `FAILED: winner did not map to MMVQ_COALESCED`, `[TEST SUMMARY] 2/3 tests passed` — 1-of-3 specificity exact. **bqtu CLOSED.** |
+| wo98 proof (exec-lifecycle PAIR `:270`+`:276`) | RED `H13b release accepted wrong root` on both names. **wo98 CLOSED.** |
+| mmvq `:1018` (gateup-prepack) | RED tail `missing direct down-sum compatibility must reject before route selection` (anchor `:185` — compiler drift from `:184`, tail-grep scored) → GREEN. **Proven.** |
+| mmvq `:250` (fused-down-sum, the KEEP-adjudicated row) | RED tail `tile4 down Q8 DPAS tile env must parse` (`:336` anchor as pre-registered) → GREEN. **Proven.** |
+| mmvq `:2751` (mul-mat-id-q4q8) | RED rc 8; base case green (`nmse=4.8e-05`), a later strides case fails — the expected shape for an ids-strides swap → GREEN. **Proven.** |
+| mmvq `:4102` (moe-mul-mat-id) | **SURVIVED** — `llama.cpp-f65p`: the route probe shows MMVQ entered at layout=0, but not that the `:4102` instantiation runs. |
+| mmvq `:21361` (q8-0-layout-cache-path-mmvq) | **SURVIVED** — `llama.cpp-f65p`: aliasing suspected (post-43uy, src0_dd_i may equal soa_base — an identity mutation). |
+
+Shmem 3.11→2.94 GB. Logs: `be-*.log` + `be-probe-mxfp4.log`.
+**Running total: 30 of 117 proven** (A:2 B:17+bqtu-extension proof C:5 E:3 F1:1
++ the two closed proof-cycle rows). Survival tickets open: 7ofo (2), l7rt (1),
+f65p (2).
+
 ## Batch F — remaining single-file backend TUs (11 tests across 9 files, ~4 h)
 
 | test | mutation | runtime | verifiability | expected RED | notes |
