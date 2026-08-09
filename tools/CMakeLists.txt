@@ -51,7 +51,17 @@ else()
         add_subdirectory(cvector-generator)
         add_subdirectory(export-lora)
     endif()
-    if (GGML_SYCL)
+    if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+        # These are SYCL development benchmarks with no role in a
+        # GGML_BACKEND_DL runtime image, and sycl-kernel-bench consumes symbols
+        # internal to the ggml-sycl MODULE (ggml_sycl_info,
+        # ggml_sycl_get_device_id_from_queue, the ggml_sycl::*_bench_launch
+        # family). Under DL those live only inside the loadable plugin, so such
+        # a target configures cleanly and then dies at LINK on dozens of
+        # undefined references -- the nightly Docker intel failure. Guarded as a
+        # whole block rather than per-target so a newly added SYCL tool cannot
+        # silently re-break the nightly, matching the fork test tail in
+        # ggml/src/ggml-sycl/CMakeLists.txt. See llama.cpp-o6tf.
         add_subdirectory(sycl-kernel-bench)
         add_subdirectory(sycl-source-line-probe)
         add_subdirectory(sycl-mxfp4-moe-bench)
