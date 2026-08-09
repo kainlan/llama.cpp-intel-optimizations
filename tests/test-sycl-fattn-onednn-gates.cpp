@@ -44,8 +44,11 @@
 
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
-    std::printf("GGML SYCL oneDNN not enabled; skipping test.\n");
-    return 0;
+    // 77 (ctest SKIP_RETURN_CODE), not 0: no gate was evaluated in this build,
+    // so this must not read as a pass.  A green skip is the exact defect class
+    // this file's own comment is about (llama.cpp-ay8c).
+    std::fprintf(stderr, "SKIP: GGML SYCL oneDNN not enabled; no gate was evaluated.\n");
+    return 77;
 }
 #else
 

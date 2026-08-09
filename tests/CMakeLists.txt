@@ -1618,8 +1618,14 @@ if(GGML_SYCL)
     target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
     install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)
     add_test(NAME test-sycl-fattn-onednn-gates COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-gates>)
+    # SKIP_RETURN_CODE is new (llama.cpp-ay8c), and is the one departure from
+    # "verbatim apart from LABELS" above.  Built without GGML_SYCL_DNNL the
+    # binary's main() is the compile-guard stub, which used to print and return
+    # 0 -- a green pass for a run that evaluated no gate.  It now returns 77 and
+    # ctest reports the run as skipped.
     set_tests_properties(test-sycl-fattn-onednn-gates PROPERTIES
         LABELS "sycl;fattn;onednn;gates"
+        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 endif()
