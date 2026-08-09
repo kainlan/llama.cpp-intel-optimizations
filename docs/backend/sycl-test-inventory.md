@@ -1749,6 +1749,22 @@ four is the single best value in the whole plan.
 | `test-mem-handle-wrong-device` | `:816` `self.ptr == theirs.ptr && size_ == other.size_;` → `size_ == other.size_;` | GPU | COUNT `Tests: %d run, %d passed, %d skipped` | `FAILED: CHUNK_LEASE stable identity must distinguish different ptrs inside the same leased chunk`, `Tests: 6 run, 5 passed, 2 skipped`, rc 1 | ⚠️ The obvious target — the wrong-device guard at `:504` — is a **null mutation under this registration**: ctest pins `level_zero:1`, so `total_gpu_count < 2` and both wrong-device cases `TEST_SKIP`. |
 | `test-sycl-mem-handle-concurrent-resolve` | `:1011` in `operator=(const mem_handle &)` delete `new_entry->in_use_count.fetch_add(1);` | DEVICE-FREE-THREADS | PASSFAIL, one `PASS:` per subtest | `PASS: concurrent resolve() never observes a half-written state` then `FAIL: lease refcounts drifted: entry_a=4294967295 entry_b=4294967295 (expected 1 and 1)`, rc 1 | Deterministic, not race-dependent (the uint32 underflows). Selectable: `./build/bin/test-sycl-mem-handle-concurrent-resolve lease-once`. ⚠️ Do not mutate `take_lease_state_locked`'s `leased_entry_ = nullptr` — `store_lease_state_locked` overwrites it immediately, a silent no-op. |
 
+### Batch C — executed results (2026-08-09): 5/5 GREEN → RED → GREEN
+
+| row | RED observed |
+|---|---|
+| `:786` arena_gen clause | `FAIL: different arena generations must not compare stable-equal` |
+| `:91` guard re-widen (oze0 reintro) | `FAIL: ...parked for command-graph lifetime because ANOTHER thread was recording: count 0 -> 1.` — **the ticket's instance-2 verdict upgraded from code review to executed mutation proof** |
+| `:1227` publishers += 2 | `FAIL: drain did not clear after the publisher handed off its handle` |
+| `:816` ptr equality dropped | `FAILED: CHUNK_LEASE stable identity must distinguish different ptrs inside the same leased chunk` |
+| `:1011` lease refcount dropped | `FAIL: lease refcounts drifted: entry_a=4294367297 ... (expected 1 and 1)` — oracle string exact; the plan's illustrative underflow value (4294967295) differs because the drift magnitude is iteration-dependent, not a fixed constant |
+
+All five targets were byte-exact at their planned lines pre-mutation; the
+`ggml_sycl_graph_recording_active()` symbol for the C2 mutation was confirmed
+declared (common.hpp:285) before the cycle. Shmem flat 2.87→2.94 GB. Name
+map: all 1:1 except `test-mem-handle-wrong-device` → `mem-handle-wrong-device`.
+Logs: `bc-*.log`. **Running total: 24 of 117 proven.**
+
 ## Batch D — `unified-cache.cpp` (14 tests, 15 builds, ~3.5 h) — the largest single-file group
 
 23,238 lines, so each build is at the slow end of `SMALL-TU`. All 14 sites are
