@@ -1019,12 +1019,38 @@ static int test_promoted_default_fast_path_is_fail_closed() {
 }
 
 
+// The two docs/plans/2026-06-24-* decision reports this sub-test and
+// test_default_ready_block_graphlet_safety_contract used to grep were NEVER
+// committed -- `git log --all -- docs/plans/2026-06-24-sycl-moe-aggregation-decision.md
+// docs/plans/2026-06-24-sycl-moe-default-fast-path-decision.md` is empty across
+// all of history, and the test has read them since its own first commit
+// (b08e732cd, a bulk import that carried the test but no docs/plans/ entry).
+// read_required_file() std::exit(1)s on a missing file, so both sub-tests died
+// there on every run they ever had -- llama.cpp-26ak.
+//
+// Adjudication (llama.cpp-26ak): the DECISION those docs recorded is real and
+// is recorded in the production source, so every clause describing a *rule* is
+// re-pointed below at moe_aggregation_selected_decision() -- the authority the
+// doc was only ever restating. Two clauses are NOT re-pointable because they
+// assert a measurement rather than a rule:
+//
+//   * "**Status:** B50 activation evidence recorded" (aggregation doc), and
+//   * the whole default-fast-path report: "FAIL/INSUFFICIENT", "direct replay
+//     alone is insufficient", and the negative guard that nobody upgraded that
+//     verdict to "PASS for current intended default-candidate sequence replay
+//     path".
+//
+// That evidence exists in no commit, no doc, and no tracker comment. Writing a
+// doc containing those strings to satisfy a grep would fabricate a decision
+// nobody made AND make the grep self-satisfying, so both are dropped here and
+// escalated as an owner question on llama.cpp-26ak instead. Do NOT "restore"
+// these checks by authoring the docs from this file's expectations -- if the
+// B50 promotion evidence is recovered, gate it where evidence belongs (the
+// harness in scripts/sycl-b50-gptoss-moe-gates.sh), not on a prose substring.
 static int test_sequence_aggregation_diagnostics_contract() {
-    const std::string sycl             = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
-    const std::string common           = read_required_file("ggml/src/ggml-sycl/common.hpp");
-    const std::string decision         = read_required_file("docs/plans/2026-06-24-sycl-moe-aggregation-decision.md");
-    const std::string promotion_report = read_required_file("docs/plans/2026-06-24-sycl-moe-default-fast-path-decision.md");
-    const std::string harness          = read_required_file("scripts/sycl-b50-gptoss-moe-gates.sh");
+    const std::string sycl    = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
+    const std::string common  = read_required_file("ggml/src/ggml-sycl/common.hpp");
+    const std::string harness = read_required_file("scripts/sycl-b50-gptoss-moe-gates.sh");
 
     CHECK(contains(sycl, "sequence_graphlet_submit_calls"),
           "sequence diagnostics must count ext_oneapi_graph submissions");
@@ -1043,16 +1069,22 @@ static int test_sequence_aggregation_diagnostics_contract() {
           "context must remember last aggregation decision for diagnostics");
     CHECK(contains(common, "moe_aggregation_last_reject"),
           "context must remember last aggregation reject reason for diagnostics");
-    CHECK(contains(decision, "**Status:** B50 activation evidence recorded") &&
-              contains(decision, "`block-graphlet`, `segmented-replay`, `none`") &&
-              contains(decision,
-                       "**Selected value:** `block-graphlet` only when the guarded promotion-candidate activation path also explicitly opts into block graphlets"),
-          "aggregation decision report must record explicit opt-in block-graphlet evidence without promoting production defaults");
-    CHECK(contains(promotion_report, "FAIL/INSUFFICIENT") &&
-              contains(promotion_report, "direct per-node sequence replay only") &&
-              contains(promotion_report, "direct replay alone is insufficient") &&
-              !contains(promotion_report, "PASS for current intended default-candidate sequence replay path"),
-          "default fast-path decision report must not describe direct-only replay as optimized or passing");
+    // Re-pointed from the never-committed aggregation decision doc (see the
+    // block comment above this function): the doc's "`block-graphlet`,
+    // `segmented-replay`, `none`" option list is the accepted-override
+    // enumeration in moe_aggregation_selected_decision(), which is where the
+    // decision is actually in force. Anything outside the triple must fall
+    // through to the invalid-value reject rather than being honoured.
+    const std::string decision_values =
+        required_region(sycl, "static const char * moe_aggregation_selected_decision() {", "namespace ggml_sycl {",
+                        "aggregation decision accepted values");
+    CHECK(contains(decision_values,
+                   "std::strcmp(override_env, \"block-graphlet\") == 0 || "
+                   "std::strcmp(override_env, \"segmented-replay\") == 0 ||") &&
+              contains(decision_values, "std::strcmp(override_env, \"none\") == 0") &&
+              contains(decision_values, "log_override_reject_once(\"invalid-value\")"),
+          "aggregation decision must accept exactly block-graphlet/segmented-replay/none and reject any other override "
+          "value as invalid");
     CHECK(contains(harness, "b50-profile-matrix"),
           "B50 profile matrix mode must exist for grouped MoE comparisons");
     CHECK(contains(harness, "GGML_SYCL_MOE_GROUPED_DECODE=1"),
@@ -1232,11 +1264,35 @@ static int test_aggressive_tg_policy_is_capability_driven_and_default_off() {
     return 0;
 }
 
+// Both markers of the XMX_TILED pair-GLU region were extended -- not removed --
+// by 9402d151e ("feat(sycl): add default-off MXFP4 bundle4 gateup hook",
+// 2026-07-02), which inserted a sibling XMX_TILED_BUNDLE4 branch immediately
+// above this one (llama.cpp-26ak):
+//
+//   begin  if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED)
+//       -> if (!used_direct_xmx && !used_xmx_tiled_dpas && weight_layout == GGML_LAYOUT_XMX_TILED)
+//          (the new BUNDLE4 branch sets used_xmx_tiled_dpas, so the added
+//           clause is what keeps the two branches mutually exclusive)
+//   end    if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas)
+//       -> if ((weight_layout == GGML_LAYOUT_XMX_TILED || weight_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) &&
+//              !used_xmx_tiled_dpas)
+//          (the same fail-closed return, now covering BUNDLE4 too)
+//
+// The region's identity is unchanged -- it is still exactly the XMX_TILED
+// pair-GLU branch, and still the branch that holds the aggressive M4 artifact
+// route asserted below -- so the markers are re-pointed rather than dropped.
+// required_region_flex is used because the new end marker wraps across a line
+// break, which a plain substring marker cannot survive.
+static const char * const XMX_TILED_PAIR_GLU_BEGIN =
+    "if (!used_direct_xmx && !used_xmx_tiled_dpas && weight_layout == GGML_LAYOUT_XMX_TILED) {";
+static const char * const XMX_TILED_PAIR_GLU_END =
+    "if ((weight_layout == GGML_LAYOUT_XMX_TILED || weight_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) &&\n"
+    "        !used_xmx_tiled_dpas) {";
+
 static int test_aggressive_tg_m4_artifact_handoff_contract() {
     const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
-    const std::string xmx_branch = required_region(
-        mmvq, "if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED)",
-        "if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas)", "XMX tiled pair-GLU branch");
+    const std::string xmx_branch =
+        required_region_flex(mmvq, XMX_TILED_PAIR_GLU_BEGIN, XMX_TILED_PAIR_GLU_END, "XMX tiled pair-GLU branch");
     const std::string m2_kernel = required_region(mmvq,
                                                   "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl",
                                                   "template <int Repeat, int GLU_OP>", "M2 kernel region");
@@ -1297,9 +1353,9 @@ static int test_aggressive_tg_m4_artifact_handoff_contract() {
 
 static int test_aggressive_partial_fused_tg_contract() {
     const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
-    const std::string xmx_branch = required_region(
-        mmvq, "if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED)",
-        "if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas)", "XMX tiled pair-GLU branch");
+    // Same 9402d151e marker extension as above -- see XMX_TILED_PAIR_GLU_BEGIN.
+    const std::string xmx_branch =
+        required_region_flex(mmvq, XMX_TILED_PAIR_GLU_BEGIN, XMX_TILED_PAIR_GLU_END, "XMX tiled pair-GLU branch");
     const std::string aggressive_route = required_region(xmx_branch, "if (aggressive_partial_artifact)", "} else {",
                                                          "aggressive fused TG route");
 
@@ -1495,9 +1551,30 @@ static int test_grouped_decode_runtime_uses_device_ids_contract() {
           "grouped decode eligibility must not reuse the PP-only not-pp/env-disabled rejection path");
     CHECK(contains(sycl, "return \"down-host-ids\";"),
           "grouped decode eligibility must reject cleanly before any host-id fallback loop when host ids are null");
-    CHECK(contains(sycl, "const int32_t * pair_ids_host_arg = use_device_grouped_moe_decode ? nullptr : ids_data;"),
+    // 9402d151e composed the host-id suppression flag rather than renaming it
+    // (llama.cpp-26ak): use_device_grouped_moe_decode still exists and still
+    // carries every clause asserted above, but the value that actually nulls
+    // the host ids is now use_device_ids_for_pair_glu, which ORs in a second,
+    // disjoint case for the XMX_TILED_BUNDLE4 branch that commit added (that
+    // branch's bundle4_shape guard requires !ids_host, so it needs device ids
+    // for the same reason grouped decode does).
+    //
+    // The original invariant is preserved, not merely relabelled: the added
+    // disjunct is reachable only when pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4,
+    // and that layout is itself behind the default-off GGML_SYCL_MOE_GATEUP_BUNDLE4
+    // env, so production defaults still suppress host ids only under the full
+    // grouped-decode guard. The composition is pinned below so the disjunction
+    // cannot later widen into a fail-open without failing here.
+    CHECK(contains_normalized(sycl, "const bool use_device_ids_for_pair_glu = use_device_grouped_moe_decode ||") &&
+              contains_normalized(sycl,
+                                  "(full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 && "
+                                  "ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 && "
+                                  "pair.glu_dst->ne[2] <= 1)"),
+          "host-id suppression must remain grouped-decode plus a BUNDLE4-only disjunct that still requires full GPU "
+          "cover, valid device ids, and TG shape");
+    CHECK(contains(sycl, "const int32_t * pair_ids_host_arg = use_device_ids_for_pair_glu ? nullptr : ids_data;"),
           "grouped decode must pass nullptr for host ids to unlock device-side grouping");
-    CHECK(contains(sycl, "[MOE-PAIR] cur=%s reason=grouped-decode-device-ids") &&
+    CHECK(contains(sycl, "[MOE-PAIR] cur=%s reason=pair-glu-device-ids") &&
               contains(sycl, "moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route") &&
               contains(sycl, "xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr") &&
               contains(sycl, "ids_device_nb0 > 0 && ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED") &&
@@ -1505,26 +1582,32 @@ static int test_grouped_decode_runtime_uses_device_ids_contract() {
           "runtime must retain positive device-id activation diagnostics and guard list for path diagnosis");
     // The declaration clause is whitespace-fragile (the real source is
     // "const int64_t   pair_ids_host_count_arg =", alignment-padded) and
-    // fixed here. The second clause still names use_device_grouped_moe_decode,
-    // which the actual gate now composes into use_device_ids_for_pair_glu --
-    // that is content drift, not whitespace, and stays exact/unfixed pending
-    // the escalated adjudication (llama.cpp-pjgz: needs MoE-dispatch domain
-    // context to confirm the broadened condition still satisfies the
-    // original safety invariant before the needle is updated).
+    // fixed here. The second clause was the content drift llama.cpp-pjgz
+    // escalated; llama.cpp-26ak adjudicated it as the same 9402d151e
+    // composition documented above, so it is re-pointed at the composed flag.
     CHECK(contains_normalized(sycl, "const int64_t pair_ids_host_count_arg =") &&
-              contains(sycl, "use_device_grouped_moe_decode ? 0 : static_cast<int64_t>(ids_n_elem);"),
+              contains(sycl, "use_device_ids_for_pair_glu ? 0 : static_cast<int64_t>(ids_n_elem);"),
           "grouped decode must pass zero host id count with nullptr host ids");
     CHECK(contains(sycl, "pair_ids_host_arg") && contains(sycl, "pair_ids_host_count_arg"),
           "runtime call must use guarded host-id arguments");
-    CHECK(!contains(sycl, "if (!use_device_grouped_moe_decode") && !contains(sycl, "return use_device_grouped_moe_decode"),
+    // Both flags are covered: guarding only the inner one would leave the
+    // composed flag -- the one actually consumed at the call site -- free to
+    // grow its own early return.
+    CHECK(!contains(sycl, "if (!use_device_grouped_moe_decode") &&
+              !contains(sycl, "return use_device_grouped_moe_decode") &&
+              !contains(sycl, "if (!use_device_ids_for_pair_glu") &&
+              !contains(sycl, "return use_device_ids_for_pair_glu"),
           "grouped decode guard must not add a direct fail-open/fail-closed return outside existing ok_glu fallback flow");
     return 0;
 }
 
+// Second casualty of the never-committed decision docs -- see the block comment
+// on test_sequence_aggregation_diagnostics_contract for the full adjudication
+// (llama.cpp-26ak). Both doc greps here restated rules that the decision helper
+// itself already carries, and are re-pointed at it below.
 static int test_default_ready_block_graphlet_safety_contract() {
-    const std::string sycl     = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
-    const std::string common   = read_required_file("ggml/src/ggml-sycl/common.hpp");
-    const std::string decision = read_required_file("docs/plans/2026-06-24-sycl-moe-aggregation-decision.md");
+    const std::string sycl   = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
+    const std::string common = read_required_file("ggml/src/ggml-sycl/common.hpp");
 
     const std::string block_region = required_region(sycl, "static uint64_t moe_graph_block_identity_signature",
                                                      "static bool check_graph_compatibility",
@@ -1561,12 +1644,21 @@ static int test_default_ready_block_graphlet_safety_contract() {
               contains(decision_fn, "missing-promotion-candidate") &&
               contains(decision_fn, "missing-explicit-block-graphlets"),
           "aggregation decision must auto-select block graphlets only for guarded promotion candidates with explicit block-graphlet opt-in and otherwise fail closed");
-    CHECK(contains(decision, "Lead-only diagnostic override") &&
-              contains(decision,
-                       "GGML_SYCL_MOE_DEFAULT_FAST_PATH_PROMOTION_CANDIDATE=1 \\\nGGML_SYCL_MOE_BLOCK_GRAPHLETS=1 \\\nGGML_SYCL_MOE_AGGREGATION_DECISION=block-graphlet") &&
-              contains(decision, "runtime auto-selects the evidenced `block-graphlet` substrate") &&
-              contains(decision, "missing-explicit-block-graphlet override values"),
-          "aggregation decision doc must document the guarded explicit block selection and lead-only override");
+    // Re-pointed from the never-committed aggregation decision doc: the doc's
+    // "lead-only diagnostic override" recipe was the env triple that
+    // moe_aggregation_selected_decision() requires before it will honour an
+    // override at all -- the override is rejected outright unless the
+    // promotion-candidate env is set, and a block-graphlet override
+    // additionally needs the explicit block env. That IS the guard the doc
+    // described, checked where it is enforced.
+    const size_t promotion_gate_pos = decision_fn.find("missing-promotion-candidate");
+    const size_t explicit_block_pos = decision_fn.find("missing-explicit-block-graphlets");
+    const size_t accept_pos         = decision_fn.find("return override_env;");
+    CHECK(promotion_gate_pos != std::string::npos && explicit_block_pos != std::string::npos &&
+              accept_pos != std::string::npos && promotion_gate_pos < explicit_block_pos &&
+              explicit_block_pos < accept_pos,
+          "a lead-only GGML_SYCL_MOE_AGGREGATION_DECISION override must be rejected for a missing promotion candidate, "
+          "then for a missing explicit block-graphlet opt-in, before any override value is honoured");
     const std::string before_profile_matrix = harness.substr(0, harness.find("b50-profile-matrix"));
     CHECK(!contains(before_profile_matrix, "GGML_SYCL_MOE_AGGREGATION_DECISION"),
           "promotion-suite/default-candidate harness must not set the aggregation override outside profile-matrix comparisons");
@@ -1603,7 +1695,12 @@ static int test_default_ready_block_graphlet_safety_contract() {
           "context block graph state must carry mode hash");
     CHECK(contains(common, "moe_block_graphs_is_decode") && contains(common, "moe_block_graphs_block_size"),
           "context block graph identity must carry decode flag and block size");
-    CHECK(contains(decision, "Production/default-on aggregation remains `none`"),
+    // Re-pointed from the never-committed aggregation decision doc's
+    // "Production/default-on aggregation remains `none`" line. The helper
+    // states and enforces the same thing: with no override env set, anything
+    // short of the full guarded promotion-candidate flow returns "none".
+    CHECK(contains(decision_fn, "Production/default-on aggregation stays fail-closed") &&
+              contains(decision_fn, "Block graphlets remain an explicit opt-in substrate"),
           "Task 4 must keep production default aggregation fail-closed while activation probes use guarded block graphlets");
     return 0;
 }
