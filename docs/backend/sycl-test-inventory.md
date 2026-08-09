@@ -1667,6 +1667,22 @@ primaries, the siblings' green following from binary identity after the
 restore build. Logs: `b2a-*.log` (first attempt, void rows retained as the
 record of the trap) and `b2b-*.log` (the counting re-run).
 
+### B2 chunk 2 — executed results (2026-08-09): 4/5 proven, 1 stale row
+
+| row | outcome |
+|---|---|
+| moe-control-plan `:188` | RED `FAIL: grovemoe-chexps-family-parses: chunked gate must be a matrix` (both names, matched=2) → GREEN |
+| zone-sizing `:139` | RED `...test-zone-sizing.cpp:145: gpt-oss onednn_eligible must skip the expert family...` → GREEN |
+| dispatch-tuning `:242` | **SURVIVED — stale plan row** (`llama.cpp-bqtu`): the current test has ONE case (unified_matmul mapping) and never reaches the mmvq branch; the pre-registered 3-assertion "mmvq kernel mismatch" oracle no longer exists. Mutation verified compiled+linked (not a void). mmvq winner-parse branch has zero coverage at HEAD. |
+| e2e-profile `:135` | RED Subprocess aborted with the exact pre-registered `[SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 ...` line → GREEN |
+| cpu-traits-support `:158` | RED `bounds check failed` → GREEN |
+
+Name map additions: `test-moe-control-plan` → `sycl-moe-control-plan`
+(+ `-contract`); `test-zone-sizing` → `zone-sizing`;
+`test-sycl-dispatch-tuning` → `sycl-dispatch-tuning`;
+`test-sycl-e2e-profile` → 1:1; `test-sycl-cpu-traits-parity` →
+`sycl-cpu-traits-parity`. Logs: `b2c2-*.log`.
+
 None of these relink `libggml-sycl`; the mutated .cpp/.hpp is compiled straight
 into the test binary. Sub-batch by file — the `model-lifecycle.cpp` group of
 four is the single best value in the whole plan.
