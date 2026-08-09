@@ -1614,13 +1614,28 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300
-        # DISABLED pending llama.cpp-0tkh: the first restored run FAILs
-        # deterministically ("expected coalesced layout choice, got 0",
-        # artifacts/b8uv/first-run.log). The coalesced-override oracle predates
-        # the host-buft -> CPU dispatch routing, so the assertion needs
-        # adjudication (stale oracle vs dropped override) before this can gate.
-        # DISABLED shows as "Not Run (Disabled)" in every sweep -- a visible
-        # skip, not a fake green. Remove with the 0tkh fix.
+        # STILL DISABLED after the llama.cpp-0tkh fix, deliberately.
+        #
+        # 0tkh adjudicated the coalesced-override assertion as a STALE ORACLE
+        # (the layout override is a selection hint; routing to CPU is decided
+        # upstream and never consults it -- see the reasoning in
+        # test-layout-cache.cpp's header) and the fixture is fixed. But the
+        # first restored run failed FIVE of the seven sub-tests, not the one
+        # the ticket recorded:
+        #   test_layout_selection ("expected XMX_TILED, got SOA")
+        #   test_aos_drop ("Failed to cache AOS layout")
+        #   test_mul_mat_layout_choice (was ..._coalesced)  <- fixed here
+        #   test_device_weight_layout_cache ("...for device weight")
+        #   test_model_load_host_buffer_avoids_pinned ("USM alloc type 0")
+        # The other four are unadjudicated -- any of them may be a real product
+        # regression, and none may be papered over by weakening its oracle.
+        # Un-disabling now would land a red gate.
+        #
+        # The fix makes ONE run decisive instead: every sub-test runs, each
+        # failure names its axis, and main() prints a PASS/FAIL roll-up. Remove
+        # DISABLED once that run is green; until then this shows as
+        # "Not Run (Disabled)" in every sweep -- a visible skip, not a fake
+        # green. Evidence: artifacts/b8uv/first-run.txt.
         DISABLED TRUE
     )
 endif()

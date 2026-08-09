@@ -1,58 +1,51 @@
 // Unit tests for SYCL layout selection and unified cache behavior
 //
-// Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-layout-cache
+// Usage (the registration pins level_zero:1; a DIRECT run does not inherit it):
+//   source /opt/intel/oneapi/setvars.sh --force
+//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-layout-cache
 //
-// ⚠️ THIS FILE IS NOT REGISTERED.  No add_executable/add_test anywhere in the
-// tree names it, so the binary above does not exist and nothing here has run
-// since the registration wipe (llama.cpp-b8uv, found during llama.cpp-og9dt).
+// Registered at tests/CMakeLists.txt (restored per llama.cpp-b8uv), currently
+// carrying DISABLED TRUE pending llama.cpp-0tkh -- see that block's comment for
+// the remaining blockers.  It loads models, so it belongs to the OOM-hazard
+// family: run once, never in a loop.
 //
-// ADJUDICATED: RESTORE, blocked on a build.  Reasoning, so the next reader does
-// not have to redo it:
+// ⚠️ ONE HAZARD LIVES IN THIS FILE: main() setenv()s ONEAPI_DEVICE_SELECTOR to
+// level_zero:0 -- the B70 BENCHMARK card -- when nothing is set.  The setenv
+// only fires when the variable is unset, so the registration's pinned
+// level_zero:1 defeats it; a direct run must pin it by hand.
 //
-//  - It is a wipe casualty, not a never-registered source.  It WAS registered
-//    at 3c8f296fd (tests/CMakeLists.txt:928-940, `if(GGML_SYCL)` +
-//    add_executable + add_test).  The 0igs framework's scope rule is explicit
-//    that this puts it in restoration-review scope, whereas a never-registered
-//    file starts as a delete candidate.  So "delete" is not the default here.
-//  - It is absent from u2mz's 64-source merge-relevant subset, but that subset
-//    was built by a filename-keyword + changed-header filter, and "layout-cache"
-//    matches none of the 21 keyword stems.  It missed the FILTER, not the scope,
-//    so its absence is not a disposition.
-//  - It is not a mock.  Every entry point it drives is production code reached
-//    from ggml-sycl.cpp: ggml_sycl_get_weight_layout_ptr (8 uses),
-//    ggml_backend_sycl_get_weight_cache_key (17), _register_host_weight_tensor
-//    (8), _model_load_begin (4), _register_weight_usage (3).  This is the check
-//    u2mz used to DELETE four sibling tests that drove test-only mirrors; this
-//    one passes it.
-//  - Its APIs have not rotted away: all 11 project symbols it calls still exist
-//    in the current headers, and its 10-argument ensure_cached_alloc() call
-//    still matches that method's current signature exactly.
+// ---------------------------------------------------------------------------
+// llama.cpp-0tkh ADJUDICATION: STALE ORACLE, not a dropped override.
 //
-// WHY THE RESTORE WAS NOT LANDED WITH THE ADJUDICATION: "all symbols resolve"
-// is not "it compiles", and an add_executable that fails to build breaks the
-// build for every agent sharing this checkout.  Landing it therefore needs a
-// build first, which the adjudicating lane could not run.  It also needs a
-// u2mz-style can-it-fail row, and this is a MODEL-LOADING GPU test
-// (test_model_load_* below), so that row is lead-only per CLAUDE.md's
-// never-loop rule.
+// The restored test_mul_mat_layout_choice_coalesced allocated its weight in
+// ggml_backend_sycl_host_buffer_type(), forced GGML_LAYOUT_COALESCED via
+// ggml_sycl::test_layout_override_guard, and asserted the resolved entry
+// recorded COALESCED.  It got AOS.  The override is not at fault -- the op
+// never reaches layout selection at all:
 //
-// ⚠️ Two hazards any future registration must handle, both live in this file:
-//   1. main() setenv()s ONEAPI_DEVICE_SELECTOR to level_zero:0 -- the B70
-//      BENCHMARK card -- when nothing is set.  The registration must pin
-//      ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1, or an unattended ctest
-//      perturbs whatever benchmark is running.  This is the same trap
-//      ggml/src/ggml-sycl/CMakeLists.txt documents for test-unified-cache-bugs.
-//   2. It loads models, so it belongs to the OOM-hazard family: run once, never
-//      in a loop, and label it so the throttled sweep can see it (rule 2 --
-//      no "residency"/"mem-handle"/"cache" substring).
+//  - The override is a layout-SELECTION hint with no residency authority.
+//    ggml-sycl-test.hpp:16-17 says exactly that ("temporarily force a layout
+//    during a scoped operation"), test_set/get/clear_layout_override
+//    (ggml-sycl.cpp:8217-8233) are a bare atomic pair, and EVERY consumer is a
+//    selection site: 8821 (reorder gate, reacts to AOS only), 28584
+//    (S1-PRELOAD layout pick), 53083 (UnifiedMatmulOrchestrator::select),
+//    56692 (dispatch-failure path), 61083 (MoE XMX layout gate).  None of them
+//    moves a tensor between host and device.
+//  - Routing is decided upstream and independently.  should_dispatch_to_cpu()
+//    (ggml-sycl.cpp:75918) asks ggml_sycl_mul_mat_weight_resolves_to_host()
+//    (~75874), which tests resolve().on_device, resolve_allocation() and
+//    ggml_backend_buffer_is_host() -- and never consults the override.  A
+//    host-buft weight therefore leaves the SYCL backend before any layout is
+//    chosen, which is the first run's "[SYCL-CPU] MUL_MAT routed to CPU from
+//    resolved-host-handle: weight=attn_q.weight" (artifacts/b8uv/first-run.txt).
 //
-// Do not "fix" this file's contents again without first registering it.  It has
-// already been maintained blind once: 2486ec467 gave it the exit-77 fix below
-// for a run that cannot happen.
+// So the fixture encoded the wrong axis, and the product is behaving as
+// CLAUDE.md describes ("Host-resident weights -> CPU dispatch, not GPU PCIe
+// zero-copy").  The cases below split the two axes apart instead.
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "ggml.h"
@@ -129,8 +122,83 @@ static void fill_pattern(std::vector<uint8_t> & data) {
     }
 }
 
+// Splits the two axes the old single "Failed to cache <layout> layout" message
+// conflated: a null return means the layout could not be produced at all, while
+// a false is_cached() means it WAS produced but is not registered under the key
+// the test asserts on.  Those are different bugs and the old message named
+// neither.
+static bool expect_layout_cached(const char *               label,
+                                 ggml_sycl::unified_cache * cache,
+                                 const ggml_sycl_cache_id & key,
+                                 const ggml_tensor *        weight,
+                                 int                        device_id,
+                                 ggml_layout_mode           layout) {
+    void * ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, layout);
+    if (!ptr) {
+        fprintf(stderr, "%s: ggml_sycl_get_weight_layout_ptr(%s) returned null (layout not produced)\n", label,
+                layout_name(layout));
+        return false;
+    }
+    if (!cache->is_cached(key, layout)) {
+        fprintf(stderr, "%s: %s produced at %p but is_cached(key, %s) is false (not registered under the key)\n", label,
+                layout_name(layout), ptr, layout_name(layout));
+        return false;
+    }
+    return true;
+}
+
+// Conditional counterpart to ggml_sycl::test_layout_override_guard.  The
+// no-override control cases below must run with the override genuinely absent,
+// so the guard cannot simply be constructed and then ignored.
+struct scoped_layout_override {
+    bool active;
+
+    scoped_layout_override(bool active_arg, ggml_layout_mode layout) : active(active_arg) {
+        if (active) {
+            ggml_sycl::test_set_layout_override(layout);
+        }
+    }
+
+    ~scoped_layout_override() {
+        if (active) {
+            ggml_sycl::test_clear_layout_override();
+        }
+    }
+};
+
+struct scoped_env {
+    const char * name;
+    std::string  prev;
+    bool         had_prev;
+
+    scoped_env(const char * name_arg, const char * value) : name(name_arg), had_prev(false) {
+        const char * current = std::getenv(name_arg);
+        if (current) {
+            prev     = current;
+            had_prev = true;
+        }
+        setenv(name_arg, value, 1);
+    }
+
+    ~scoped_env() {
+        if (had_prev) {
+            setenv(name, prev.c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+};
+
 static bool test_layout_selection(int device_id, bool xmx_supported) {
     bool ok = true;
+
+    // The MoE expectation below is derived from the device's XMX capability, so
+    // an "expected XMX_TILED, got SOA" line is ambiguous without the inputs:
+    // print them, so the failure names whether it is a capability axis or a
+    // policy axis.
+    const auto & caps = ggml_sycl_info().devices[device_id].xmx_caps;
+    printf("[0tkh] layout-selection inputs: device=%d xmx.supported=%d xmx.supports_int8=%d xmx_supported=%d\n",
+           device_id, caps.supported ? 1 : 0, caps.supports_int8 ? 1 : 0, xmx_supported ? 1 : 0);
 
     tensor_usage usage = infer_tensor_usage("attn_q.weight");
     ok &= expect_usage("infer_tensor_usage(attn_q.weight)", usage, tensor_usage::ATTENTION_WEIGHT);
@@ -221,21 +289,17 @@ static bool test_aos_drop(int device_id) {
         return false;
     }
 
-    void * aos_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_AOS);
-    if (!aos_ptr || !cache->is_cached(key, GGML_LAYOUT_AOS)) {
+    if (!expect_layout_cached("test_aos_drop", cache, key, weight, device_id, GGML_LAYOUT_AOS)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
-        fprintf(stderr, "Failed to cache AOS layout\n");
         return false;
     }
 
-    void * coalesced_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_COALESCED);
-    if (!coalesced_ptr || !cache->is_cached(key, GGML_LAYOUT_COALESCED)) {
+    if (!expect_layout_cached("test_aos_drop", cache, key, weight, device_id, GGML_LAYOUT_COALESCED)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
-        fprintf(stderr, "Failed to cache COALESCED layout\n");
         return false;
     }
 
@@ -243,7 +307,7 @@ static bool test_aos_drop(int device_id) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(cpu_backend);
-        fprintf(stderr, "AOS cache entry not dropped after COALESCED cache\n");
+        fprintf(stderr, "test_aos_drop: AOS cache entry not dropped after COALESCED cache\n");
         return false;
     }
 
@@ -254,37 +318,48 @@ static bool test_aos_drop(int device_id) {
     return true;
 }
 
-static bool test_mul_mat_layout_choice_coalesced(int device_id) {
+// What one MUL_MAT fixture observed about its weight after the graph ran.
+struct layout_case_result {
+    bool             ran       = false;  // fixture built and the graph computed
+    bool             has_entry = false;  // ggml_sycl_resolve() produced a pointer
+    ggml_layout_mode layout    = GGML_LAYOUT_AOS;
+    bool             on_device = false;
+};
+
+// Runs one MUL_MAT with the weight placed on either the SYCL host buft or the
+// device buft, with the layout override either active or absent, and reports
+// BOTH axes (routing and layout).  Returns false only when the fixture itself
+// could not be built or run -- the oracle lives in the caller, so a single run
+// yields every case's reading instead of stopping at the first disagreement.
+static bool run_mul_mat_layout_case(int                  device_id,
+                                    const char *         label,
+                                    bool                 device_buft,
+                                    bool                 use_override,
+                                    ggml_layout_mode     override_layout,
+                                    layout_case_result & out) {
+    out = layout_case_result();
+
     reset_layout_choices();
 
-    ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
+    scoped_layout_override override_guard(use_override, override_layout);
+    scoped_env             disable_graph("GGML_SYCL_DISABLE_GRAPH", "1");
 
-    const char * prev_disable_graph = std::getenv("GGML_SYCL_DISABLE_GRAPH");
-    setenv("GGML_SYCL_DISABLE_GRAPH", "1", 1);
-
+    // main() already returned 77 when no device exists, so a failure here is a
+    // real anomaly, not a CPU-only runner.
     ggml_backend_t backend = ggml_backend_sycl_init(device_id);
     if (!backend) {
-        printf("SKIP: SYCL backend unavailable\n");
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
-        return true;
+        printf("FAIL %s: ggml_backend_sycl_init(%d) failed\n", label, device_id);
+        return false;
     }
 
     ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
     ggml_backend_buffer_type_t dev_buft  = ggml_backend_get_default_buffer_type(backend);
     if (!host_buft || !dev_buft) {
-        printf("SKIP: buffer types unavailable\n");
+        printf("FAIL %s: buffer types unavailable (host=%p dev=%p)\n", label, (void *) host_buft, (void *) dev_buft);
         ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
-        return true;
+        return false;
     }
+    ggml_backend_buffer_type_t weight_buft = device_buft ? dev_buft : host_buft;
 
     ggml_init_params params = {
         /*.mem_size   =*/ 8 * 1024 * 1024,
@@ -293,13 +368,8 @@ static bool test_mul_mat_layout_choice_coalesced(int device_id) {
     };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        printf("FAIL: ggml_init failed\n");
+        printf("FAIL %s: ggml_init failed\n", label);
         ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
         return false;
     }
 
@@ -314,105 +384,155 @@ static bool test_mul_mat_layout_choice_coalesced(int device_id) {
     ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
     ggml_set_name(output, "layout_choice_output");
 
-    const size_t weight_size = ggml_backend_buft_get_alloc_size(host_buft, weight);
-    const size_t input_size  = ggml_backend_buft_get_alloc_size(dev_buft, input);
-    const size_t output_size = ggml_backend_buft_get_alloc_size(dev_buft, output);
+    ggml_backend_buffer_t weight_buf =
+        ggml_backend_buft_alloc_buffer(weight_buft, ggml_backend_buft_get_alloc_size(weight_buft, weight));
+    ggml_backend_buffer_t input_buf =
+        ggml_backend_buft_alloc_buffer(dev_buft, ggml_backend_buft_get_alloc_size(dev_buft, input));
+    ggml_backend_buffer_t output_buf =
+        ggml_backend_buft_alloc_buffer(dev_buft, ggml_backend_buft_get_alloc_size(dev_buft, output));
 
-    ggml_backend_buffer_t weight_buf = ggml_backend_buft_alloc_buffer(host_buft, weight_size);
-    ggml_backend_buffer_t input_buf  = ggml_backend_buft_alloc_buffer(dev_buft, input_size);
-    ggml_backend_buffer_t output_buf = ggml_backend_buft_alloc_buffer(dev_buft, output_size);
+    bool ok = true;
     if (!weight_buf || !input_buf || !output_buf) {
-        printf("FAIL: buffer allocation failed\n");
-        if (weight_buf) ggml_backend_buffer_free(weight_buf);
-        if (input_buf) ggml_backend_buffer_free(input_buf);
-        if (output_buf) ggml_backend_buffer_free(output_buf);
-        ggml_free(ctx);
-        ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
+        printf("FAIL %s: buffer allocation failed\n", label);
+        ok = false;
+    }
+
+    if (ok) {
+        ggml_backend_buffer_set_usage(weight_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(input_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        ggml_backend_buffer_set_usage(output_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+
+        ggml_backend_tensor_alloc(weight_buf, weight, ggml_backend_buffer_get_base(weight_buf));
+        ggml_backend_tensor_alloc(input_buf, input, ggml_backend_buffer_get_base(input_buf));
+        ggml_backend_tensor_alloc(output_buf, output, ggml_backend_buffer_get_base(output_buf));
+
+        // Only the host-buft fixture registers a host weight; doing it for the
+        // device fixture would re-introduce the host residency this case exists
+        // to avoid.
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev && !device_buft) {
+            ggml_backend_sycl_register_host_weight_tensor(dev, weight);
         }
-        return false;
+
+        std::vector<uint8_t> weight_data(ggml_nbytes(weight), 0);
+        std::vector<float>   input_data(ncols * ntokens, 0.25f);
+        ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
+        ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            printf("FAIL %s: mul_mat graph compute failed\n", label);
+            ok = false;
+        }
     }
 
-    ggml_backend_buffer_set_usage(weight_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_buffer_set_usage(input_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-    ggml_backend_buffer_set_usage(output_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-
-    ggml_backend_tensor_alloc(weight_buf, weight, ggml_backend_buffer_get_base(weight_buf));
-    ggml_backend_tensor_alloc(input_buf, input, ggml_backend_buffer_get_base(input_buf));
-    ggml_backend_tensor_alloc(output_buf, output, ggml_backend_buffer_get_base(output_buf));
-
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev) {
-        ggml_backend_sycl_register_host_weight_tensor(dev, weight);
+    if (ok) {
+        auto resolved = ggml_sycl_resolve(weight, device_id);
+        out.ran       = true;
+        out.has_entry = static_cast<bool>(resolved);
+        if (resolved) {
+            out.layout    = resolved.layout;
+            out.on_device = resolved.on_device;
+        }
+        printf("[0tkh] case=%-14s buft=%-6s override=%-9s entry=%-3s layout=%-9s on_device=%s\n", label,
+               device_buft ? "device" : "host", use_override ? layout_name(override_layout) : "none",
+               out.has_entry ? "yes" : "no", out.has_entry ? layout_name(out.layout) : "-",
+               out.on_device ? "yes" : "no");
     }
 
-    std::vector<uint8_t> weight_data(ggml_nbytes(weight), 0);
-    std::vector<float>   input_data(ncols * ntokens, 0.25f);
-    ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size());
-    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
-
-    ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, output);
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        printf("FAIL: mul_mat graph compute failed\n");
+    if (weight_buf) {
         ggml_backend_buffer_free(weight_buf);
-        ggml_backend_buffer_free(input_buf);
-        ggml_backend_buffer_free(output_buf);
-        ggml_free(ctx);
-        ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
-        return false;
     }
-
-    auto resolved_layout = ggml_sycl_resolve(weight, device_id);
-    layout_mode chosen_layout = resolved_layout ? static_cast<layout_mode>(resolved_layout.layout) : GGML_LAYOUT_AOS;
-    if (!resolved_layout) {
-        printf("FAIL: missing cache entry for weight after mul_mat\n");
-        ggml_backend_buffer_free(weight_buf);
+    if (input_buf) {
         ggml_backend_buffer_free(input_buf);
-        ggml_backend_buffer_free(output_buf);
-        ggml_free(ctx);
-        ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
-        return false;
     }
-    if (chosen_layout != GGML_LAYOUT_COALESCED) {
-        printf("FAIL: expected coalesced layout choice, got %d\n", (int) chosen_layout);
-        ggml_backend_buffer_free(weight_buf);
-        ggml_backend_buffer_free(input_buf);
+    if (output_buf) {
         ggml_backend_buffer_free(output_buf);
-        ggml_free(ctx);
-        ggml_backend_free(backend);
-        if (prev_disable_graph) {
-            setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-        } else {
-            unsetenv("GGML_SYCL_DISABLE_GRAPH");
-        }
-        return false;
     }
-
-    ggml_backend_buffer_free(weight_buf);
-    ggml_backend_buffer_free(input_buf);
-    ggml_backend_buffer_free(output_buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
-    if (prev_disable_graph) {
-        setenv("GGML_SYCL_DISABLE_GRAPH", prev_disable_graph, 1);
-    } else {
-        unsetenv("GGML_SYCL_DISABLE_GRAPH");
+    return ok;
+}
+
+// Drives the four fixtures the 0tkh adjudication separated, plus one probe.
+//
+// The no-override CONTROLS are load-bearing, not decoration.  On a freshly
+// allocated DEVICE weight ggml_sycl_can_use_layout_for_kernel()
+// (ggml-sycl.cpp:53014) has no layout info to match against and falls through
+// to its "AOS only" tail, so the orchestrator's override branch (53083) is
+// refused and the default policy reaches COALESCED for Q4_0 on its own.
+// Without dev/auto printed beside it, dev/coalesced would read as a passing
+// override test while proving nothing about the override.
+static bool test_mul_mat_layout_choice(int device_id) {
+    layout_case_result host_auto;
+    layout_case_result host_coalesced;
+    layout_case_result dev_auto;
+    layout_case_result dev_coalesced;
+    layout_case_result dev_soa;
+
+    bool ran = true;
+    ran &= run_mul_mat_layout_case(device_id, "host/auto", false, false, GGML_LAYOUT_AOS, host_auto);
+    ran &= run_mul_mat_layout_case(device_id, "host/coalesced", false, true, GGML_LAYOUT_COALESCED, host_coalesced);
+    ran &= run_mul_mat_layout_case(device_id, "dev/auto", true, false, GGML_LAYOUT_AOS, dev_auto);
+    ran &= run_mul_mat_layout_case(device_id, "dev/coalesced", true, true, GGML_LAYOUT_COALESCED, dev_coalesced);
+    ran &= run_mul_mat_layout_case(device_id, "dev/soa", true, true, GGML_LAYOUT_SOA, dev_soa);
+    if (!ran) {
+        return false;
     }
-    return true;
+
+    bool ok = true;
+
+    // Contract 1 -- ROUTING.  A host-buft weight resolves to a host handle and
+    // is dispatched to CPU, where AOS is the correct layout.  This is the case
+    // the old oracle mistook for a layout-selection test.
+    if (!host_coalesced.has_entry) {
+        printf("FAIL host/coalesced: no cache entry for the weight after mul_mat\n");
+        ok = false;
+    } else if (host_coalesced.on_device) {
+        printf(
+            "FAIL host/coalesced [routing axis]: expected a host handle (on_device=no), got on_device=yes -- the "
+            "host-buft weight is no longer CPU-routed, so re-adjudicate llama.cpp-0tkh\n");
+        ok = false;
+    } else if (host_coalesced.layout != GGML_LAYOUT_AOS) {
+        printf("FAIL host/coalesced [layout axis]: expected AOS on the CPU-routed host path, got %s\n",
+               layout_name(host_coalesced.layout));
+        ok = false;
+    }
+
+    // Contract 2 -- LAYOUT.  A device-buft weight stays on the GPU, so a layout
+    // choice is actually made and observable.
+    if (!dev_coalesced.has_entry) {
+        printf("FAIL dev/coalesced: no cache entry for the weight after mul_mat\n");
+        ok = false;
+    } else if (!dev_coalesced.on_device) {
+        printf(
+            "FAIL dev/coalesced [routing axis]: weight resolved off-device, so no layout choice was exercised -- the "
+            "device fixture is routing host\n");
+        ok = false;
+    } else if (dev_coalesced.layout != GGML_LAYOUT_COALESCED) {
+        printf("FAIL dev/coalesced [layout axis]: expected COALESCED on the device path, got %s\n",
+               layout_name(dev_coalesced.layout));
+        ok = false;
+    }
+
+    // Probe, never an assertion: does the override bind on the device path at
+    // all?  dev/soa asks for a layout the default policy would not pick, so the
+    // answer discriminates.  Both outcomes are informative, which is why
+    // neither fails the test.
+    if (dev_soa.has_entry && dev_soa.layout == GGML_LAYOUT_SOA) {
+        printf(
+            "[0tkh] NOTE: the override BINDS on the device path (dev/soa resolved SOA), so dev/coalesced is a genuine "
+            "override test.\n");
+    } else if (dev_auto.has_entry && dev_coalesced.has_entry && dev_auto.layout == dev_coalesced.layout) {
+        printf(
+            "[0tkh] NOTE: dev/auto already resolved %s with no override, and dev/soa resolved %s -- the override does "
+            "NOT bind on the device path for a fresh weight, so dev/coalesced measures the DEFAULT policy, not the "
+            "override (ggml-sycl.cpp:53014 refuses a non-AOS override without matching layout info).\n",
+            layout_name(dev_auto.layout), dev_soa.has_entry ? layout_name(dev_soa.layout) : "(no entry)");
+    }
+
+    return ok;
 }
 
 static bool test_device_weight_layout_cache(int device_id) {
@@ -482,21 +602,18 @@ static bool test_device_weight_layout_cache(int device_id) {
         return false;
     }
 
-    void * aos_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_AOS);
-    if (!aos_ptr || !cache->is_cached(key, GGML_LAYOUT_AOS)) {
+    if (!expect_layout_cached("test_device_weight_layout_cache", cache, key, weight, device_id, GGML_LAYOUT_AOS)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(backend);
-        fprintf(stderr, "Failed to cache AOS layout for device weight\n");
         return false;
     }
 
-    void * coalesced_ptr = ggml_sycl_get_weight_layout_ptr(weight, device_id, GGML_LAYOUT_COALESCED);
-    if (!coalesced_ptr || !cache->is_cached(key, GGML_LAYOUT_COALESCED)) {
+    if (!expect_layout_cached("test_device_weight_layout_cache", cache, key, weight, device_id,
+                              GGML_LAYOUT_COALESCED)) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(backend);
-        fprintf(stderr, "Failed to cache COALESCED layout for device weight\n");
         return false;
     }
 
@@ -504,7 +621,9 @@ static bool test_device_weight_layout_cache(int device_id) {
         ggml_backend_buffer_free(weight_buffer);
         ggml_free(ctx);
         ggml_backend_free(backend);
-        fprintf(stderr, "AOS cache entry not dropped after COALESCED cache for device weight\n");
+        fprintf(stderr,
+                "test_device_weight_layout_cache: AOS cache entry not dropped after COALESCED cache for device "
+                "weight\n");
         return false;
     }
 
@@ -646,7 +765,10 @@ static bool test_model_load_host_buffer_avoids_pinned(int device_id) {
     (void) ggml_backend_sycl_model_unloaded_token(model);
 
     if (typ == sycl::usm::alloc::host || typ == sycl::usm::alloc::shared) {
-        fprintf(stderr, "test_model_load_host_buffer_avoids_pinned: got USM alloc type %d\n", (int) typ);
+        fprintf(stderr,
+                "test_model_load_host_buffer_avoids_pinned: model-load host buffer is USM %s (alloc type %d); "
+                "expected unregistered host memory\n",
+                typ == sycl::usm::alloc::host ? "host-pinned" : "shared", (int) typ);
         return false;
     }
 
@@ -725,6 +847,13 @@ static bool test_model_load_preload_caches_weight(int device_id) {
 }
 
 int main() {
+    // The first restored run's evidence (artifacts/b8uv/first-run.txt) had its
+    // stdout FAIL lines flushed at exit, landing them tens of lines away from
+    // the stderr context that explains them.  Unbuffered keeps the two streams
+    // in causal order so one run can be read as a transcript.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
@@ -747,18 +876,44 @@ int main() {
     const bool xmx_supported = info.devices[device_id].xmx_caps.supported &&
                                info.devices[device_id].xmx_caps.supports_int8;
 
-    bool ok = true;
-    ok &= test_layout_selection(device_id, xmx_supported);
-    ok &= test_aos_drop(device_id);
-    ok &= test_mul_mat_layout_choice_coalesced(device_id);
-    ok &= test_device_weight_layout_cache(device_id);
-    ok &= test_layout_ptr_eviction_guard(device_id);
-    ok &= test_model_load_host_buffer_avoids_pinned(device_id);
-    ok &= test_model_load_preload_caches_weight(device_id);
+    // Every sub-test runs even after an earlier one fails, and the summary below
+    // reports all seven verdicts.  The first restored run failed FIVE of them
+    // while the ticket recorded one, because the failures were scattered through
+    // ~90 lines of interleaved backend logging with no roll-up.
+    const bool selection = test_layout_selection(device_id, xmx_supported);
+    const bool aos_drop  = test_aos_drop(device_id);
+    const bool choice    = test_mul_mat_layout_choice(device_id);
+    const bool dev_cache = test_device_weight_layout_cache(device_id);
+    const bool evict     = test_layout_ptr_eviction_guard(device_id);
+    const bool no_pinned = test_model_load_host_buffer_avoids_pinned(device_id);
+    const bool preload   = test_model_load_preload_caches_weight(device_id);
 
-    if (ok) {
-        fprintf(stderr, "layout-cache tests passed.\n");
+    const struct {
+        const char * name;
+        bool         ok;
+    } results[] = {
+        { "test_layout_selection",                     selection },
+        { "test_aos_drop",                             aos_drop  },
+        { "test_mul_mat_layout_choice",                choice    },
+        { "test_device_weight_layout_cache",           dev_cache },
+        { "test_layout_ptr_eviction_guard",            evict     },
+        { "test_model_load_host_buffer_avoids_pinned", no_pinned },
+        { "test_model_load_preload_caches_weight",     preload   },
+    };
+
+    bool ok       = true;
+    int  n_failed = 0;
+    printf("\n=== test-layout-cache summary ===\n");
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); ++i) {
+        printf("  %-44s %s\n", results[i].name, results[i].ok ? "PASS" : "FAIL");
+        if (!results[i].ok) {
+            ok = false;
+            n_failed++;
+        }
     }
+    printf("=== %d/%d sub-tests passed ===\n", (int) (sizeof(results) / sizeof(results[0])) - n_failed,
+           (int) (sizeof(results) / sizeof(results[0])));
+
     return ok ? 0 : 1;
 }
 #endif
