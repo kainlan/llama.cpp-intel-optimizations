@@ -1924,6 +1924,25 @@ ratio-gate / dispatch-line pattern) before its mutation result means
 anything. Remaining Batch F rows with that property should be re-checked
 against `llama.cpp-7ofo` before their slots are spent.
 
+### Batch F2 — executed results (2026-08-09): 7/7 GREEN → RED → GREEN. BATCH F COMPLETE.
+
+| row | RED observed |
+|---|---|
+| fattn `:908` | `Shutdown guard freed buffers unexpectedly (before=4 after=0)` — oracle exact; the plan's illustrative `N-2` delta was wrong in breadth (all 4 freed) |
+| set_rows `:434` | `FAIL: untracked device USM must fail closed...` — **device-reached guard held** (0 SKIPs; the only device-touching case genuinely ran) |
+| cpu-dispatch `:1510` | both pre-registered strings exact (`INT4 output identical to baseline` + `expected 2 INT4-different tasks, got 0`) |
+| mem-ops `:255` | `H2H copy byte 2048 expected 0x11 got 0x00` + `1 mem_ops checks failed` |
+| moe-tile-convert `:153` | `AoS conversion mismatch at byte 279: expected=0 got=1` |
+| convert `:1021` | Test 1 FAIL, siblings green, `1 failure(s)` — the 1-of-8 production-reach specificity exact |
+| mmq `:2007` | `Results: 2 passed, 1 failed` — RED fired but the plan's "all three batches fire together" was wrong: 1 of 3 reddened. Row proven; the breadth claim corrected here. |
+
+All baselines green, restores byte-verified, convergence re-greens 7/7. Shmem
+2.91→3.14 GB. Logs: `bf2-*.log`. ⚠️ Two benign double-release warnings on
+BUILD.lock/GPU.lock during this battery (release found the dir already gone) —
+locks are not ownership-checked; subsequent battery runners carry an owner
+token inside the lock dir. **Batch F final: 8 of 11 proven (F1:1 + F2:7),
+3 rows ticketed (7ofo x2, l7rt). Running total: 37 of 117 proven.**
+
 ## Batch G — `common.hpp` (5 tests, 6 builds, ~2.5 h)
 
 The most widely included backend header — every build here is a full backend
