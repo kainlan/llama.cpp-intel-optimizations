@@ -593,6 +593,12 @@ These are exact declines of the **current sources** from the accepted ordinary
 registration set. Each retains an owner and next action; a future rewritten
 source needs a new acceptance decision.
 
+> The 9 manual-only rows (5 `M-MODEL` + 4 `M-OPTIN`) now have their replacement
+> procedure written up under **"Lead runbook: the 9 manual-only declined rows"**
+> below — exact command, selector, memory sampling, and expected pass/skip shape
+> per row. Read it before running any of them; three do **not** take
+> `level_zero:1` and one needs its own ThreadSanitizer build tree.
+
 | declined source(s) | count | reason / hazard | exact owner and next action |
 |---|---:|---|---|
 | `tests/mini-context-prototype.cpp`; `tests/test-planner-canary-cpy-visibility.cpp`; `tests/test-planner-canary-direct-load.cpp`; `tests/test-planner-canary-pp-tg-union.cpp`; `tests/test-planner-canary-skeleton-determinism.cpp` | 5 | model-loading; no ordinary/parallel CTest registration | `lead` via `llama.cpp-0igs`: retain manual-only, lead-only, serial, once-only safeguarded procedure; any run remains `lead`/`0igs` work, outside Task 19 |
@@ -613,6 +619,23 @@ serial, gated on Task 17 metadata, the `llama.cpp-8u22` mutation-proof gate,
 and Task 19's final clean build plus accepted-set runtime. This is the owner
 decision that removes `llama.cpp-awcp`'s policy blocker while
 preserving the roughly 83-row post-merge assignment to `lead`.
+
+**Deletion actions executed 2026-08-09** (`llama.cpp-0igs`), completing the
+`D-LOCAL` / `D-OBSOLETE` rows above. All six sources are gone from `tests/`:
+
+| commit | sources | verified before removal |
+|---|---|---|
+| `386b7ebb1` | `test-q6k-56block-debug`, `test-q6k-layout-debug`, `test-q6k-variable-reorder`, `test-tile-decomposition` | each has **zero** `#include "..."` of any production header, so nothing it asserts can reach backend code; two say so in their own opening comments ("Simplified Q6_K block for testing", "Inline the helpers for testing") |
+| `54ebd8abe` | `test-expert-cache`, `test-sycl-expert-prefetch` | `ggml/src/ggml-sycl/expert-cache.hpp` does not exist and both include it, so neither compiles. Note `expert-prefetch.hpp` **does** still exist — it is the `expert-cache.hpp` include specifically that is dead |
+
+`test-sycl-prestage-routed-experts` was already deleted earlier by
+`llama.cpp-3ygx` (`b8c665363`). For each of the six, zero references were
+confirmed across both live `CMakeLists.txt` and all of `tests/` immediately
+before removal, with a positive control (the same check reports 11 references
+for `test-cpu-gpu-soa-interaction`) so an absence could not be a probe that
+never fires. Matches under `build-13qq/` are a stale generated build tree —
+evidence these once compiled, not live references. Any rewrite needs a fresh
+Task 16 acceptance decision.
 
 ## Task 17d: final restored-registration audit
 
@@ -919,6 +942,72 @@ gating flag was renamed into a broader flag. Tracked as `llama.cpp-26ak`
 (**open**). Treat a red here as this known wall, not as a new failure — and do
 not "fix" it by writing plausible-looking decision docs, since the two sub-tests
 would then assert against invented content.
+
+## Lead runbook: the 9 manual-only declined rows (`llama.cpp-0igs`)
+
+These are the 5 `M-MODEL` + 4 `M-OPTIN` rows from the Task 16 declined table. Task 16's
+ruling is that **none of them may enter ordinary CTest registration** — not even with hazard
+labels and `RUN_SERIAL`, because a registered test is reachable by a sweep and these are not
+safe to reach that way. What follows is the procedure that replaces registration.
+
+**None of these has a CMake target.** Every one needs a manual build, and the four `M-OPTIN`
+rows carry their own `icpx` line in the source header. **Do not add targets for them** — that
+is the registration Task 16 declined.
+
+### Rules that apply to every row here
+
+- **Lead-only, serial, once-only.** One at a time, never concurrently with any other GPU
+  work, never in a subagent or background task. Take `GPU.lock`.
+- **Never loop one.** Per CLAUDE.md's never-loop rule, the property that matters is "loads a
+  model onto a GPU", and the 5 `M-MODEL` rows all do. A single `test-llama-archs` run peaks
+  at 195–206 GB of 255 GB unpinned; a second run starting before the first releases does not
+  fit. There is no gradual approach — the first overlap is fatal.
+- **Sample memory around every run**, not `free -g`, and let it settle:
+  ```sh
+  grep -E '^(MemAvailable|Shmem):' /proc/meminfo     # before
+  <run the binary>
+  sleep 5; grep -E '^(MemAvailable|Shmem):' /proc/meminfo   # after
+  ```
+  Abort the session if `Shmem` climbs past ~100 GB. A reading taken in the same command as the
+  exiting process is measuring the wrong instant and manufactures a false alarm.
+- **Pin the selector**, but ⚠️ **not all of these want `level_zero:1`** — see the per-row
+  column. Two of them deliberately run on the **CPU** backend, and the two-GPU rows need both
+  cards. A blanket `level_zero:1` would silently change what three of these rows test.
+- **Check the GPU after any crash or forced stop** before trusting a later benchmark:
+  `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|CAT error'`.
+- Model fixtures resolve via `MISTRAL_PATH` / `GPTOSS_PATH`, defaulting to
+  `/models/mistral-7b-v0.1.Q4_0.gguf` and `/models/gpt-oss-20b-mxfp4.gguf`
+  (`tests/test-planner-canary-common.hpp`).
+
+### The 5 model-loading rows (`M-MODEL`)
+
+| row | selector | what it does | expected shape |
+|---|---|---|---|
+| `mini-context-prototype` | **`opencl:cpu`** | Task 5 proof. Fork/execs three workers: `real-A` and `real-B` full weight loads plus a metadata-only (`no_alloc=true`) mini-context. | PASS iff `real-A == real-B` **and** `mini == real-A` for compute-buffer sizes and the FA auto-detect verdict. |
+| `test-planner-canary-skeleton-determinism` | **`opencl:cpu`** | Canary D0.1. A thin orchestrator that fork/execs the prototype above — it **inherits L1's full-weight loads**, so it is the same hazard, not a lighter one. | Same PASS condition as the prototype; it reports the prototype's verdict. |
+| `test-planner-canary-cpy-visibility` | **`opencl:cpu`** | Canary D0.3. One process loads Mistral 7B and runs `graph_reserve` five times, checking `(op_id, op_type, name)` sequences are identical. | PASS iff all five sequences match. The multi-device scenario is gated behind `D0_3_MULTIDEVICE` and is **unavailable on this host** — leave it unset. |
+| `test-planner-canary-pp-tg-union` | `level_zero:1` | Canary D0.2. Fork/exec workers build PP-shape (ubatch=max) and TG-shape (ubatch=1) graphs for one model and check the union covers every op either executes. | ⚠️ Its own header states the completeness caveat: if a split aborts, later splits never fire their callbacks, so **an op set captured under abort is partial**. A PASS is only meaningful on a clean run. |
+| `test-planner-canary-direct-load` | `level_zero:1` | Canary D0.4. Deliberately bypasses `llama_model_load_from_file`; `mmap`s the Mistral fixture and moves bytes into a pre-allocated device tensor via one `ggml_backend_tensor_set`. | PASS iff exactly one copy lands the bytes. Lightest of the five — it consumes the model **file** but does not build a llama context. |
+
+⚠️ **The `opencl:cpu` selector on three rows is deliberate and load-bearing.** Their headers
+record why: it sidesteps host-side wedges (`zhzbp` for the prototype, `m09zb` for D0.3) that
+block these proofs on the GPU. Running them on `level_zero:*` does not make them stricter — it
+reintroduces the wedge they were written to route around.
+
+### The 4 opt-in diagnostic/benchmark rows (`M-OPTIN`)
+
+| row | build + selector | what it measures | expected shape |
+|---|---|---|---|
+| `test-expert-routing-roundtrip` | `icpx -fsycl -O2 -o test-expert-routing-roundtrip tests/test-expert-routing-roundtrip.cpp`; `ONEAPI_DEVICE_SELECTOR='level_zero:0;level_zero:1'` | P4.5 MoE routing across 2 GPUs: GPU0 gating → route → GPU1 expert compute → merge back. | **Exits 77 when two devices are unavailable** (source line 49) — a 77 here is a legitimate skip, not a pass. ⚠️ There is **no P2P between these cards** (different CPU root ports); all traffic host-bounces, so treat any throughput figure as host-bounce, never as peer DMA. |
+| `test-sycl-expert-cache-bandwidth` | `ONEAPI_DEVICE_SELECTOR="level_zero:0,1"` | VRAM read BW, H2D BW, and MMVQ latency, local vs streamed. | Prints numbers; there is no pass/fail oracle — it is a measurement, so it must not be read as a gate. ⚠️ Its header still says **B580**, which is no longer in this machine; the second card is a **B70**. Do not compare its output against any B580-era figure. |
+| `test-moe-expert-placement` | `icpx -fsycl -O2 -pthread -o test-moe-expert-placement tests/test-moe-expert-placement.cpp`; `ONEAPI_DEVICE_SELECTOR=level_zero:0` | Micro-benchmark of static-CPU vs dynamic host↔VRAM expert placement, incl. a DMA break-even point. | Measurement, not a gate — it opens with "Micro-benchmark" framing. ⚠️ It targets `level_zero:0`, the **B70 measurement card**: run it only when no capture or benchmark is in progress, and do not treat its absolute numbers as baselines under this host's permanent ambient load. |
+| `test-sycl-race-conditions` | **needs its own TSan tree**: `cmake -B build-tsan -G Ninja -DGGML_SYCL=ON -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_C_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"` | Spawns many threads calling lazily-initialized SYCL config functions concurrently. | The verdict is **ThreadSanitizer's report**, not the exit status — without proper atomics TSan reports a data race. A green run in a non-TSan build proves nothing, which is why this cannot be an ordinary registration. Build it in a separate tree; do not reconfigure the shared `build/` with sanitizer flags. |
+
+**Why none of these becomes a registration.** Three need a non-default selector, one needs a
+differently-configured build tree, two have no pass/fail oracle at all, and five load models
+under a rule that forbids unattended repetition. Registering any of them would make it
+reachable by a sweep that satisfies none of those preconditions — the failure mode this
+document exists to prevent.
 
 ## `test-q6k-dispatch` — the oracle was the bug (`llama.cpp-2ln5`)
 
