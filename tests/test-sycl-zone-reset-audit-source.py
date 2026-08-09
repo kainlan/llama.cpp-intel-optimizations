@@ -375,9 +375,40 @@ def evaluate(cache, backend, common, header):
         #    reclaimed only at whole-arena teardown. Same shape as the
         #    "hook declared before the early-return" checks above -- the ordering,
         #    not just the presence, is what a future edit can quietly break.
+        #    The anchor moved from the bare zone_free() to the deferred-release
+        #    helper when llama.cpp-ndn9 made the release event-gated; the
+        #    ORDERING contract this check exists for is unchanged.
         'the oneDNN point-release precedes the growth-path re-plan':
-            precedes(reserve_onednn, "zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_)",
+            precedes(reserve_onednn, "defer_published_zone_release(onednn_weights_scratch_",
                     "ensure_planned_arena_zones()"),
+
+        # 6b. llama.cpp-ndn9: releasing a PUBLISHED oneDNN scratch block must
+        #    depend on the EVENT that consumes it, never on the reservation
+        #    refcount and never on nothing at all.
+        #
+        #    onednn_pp_scratch_guard drops its token when its C++ scope ends,
+        #    which is immediately after DnnlGemmWrapper::row_gemm() returns --
+        #    and that ends in an asynchronous primitive.execute(). So
+        #    onednn_scratch_refcount_ is already 0 while the primitive is still
+        #    reading the block, and an immediate zone_free() here hands those
+        #    bytes to the next zone_alloc() underneath live device work. The
+        #    arena case is today shielded only by the backend streams happening
+        #    to be in_order; the direct case (synchronous unified_free()) is not
+        #    shielded by anything.
+        #
+        #    Presence of the deferred calls is checked together with ABSENCE of
+        #    the immediate forms for the two published pointers: a future edit
+        #    that "simplifies" one release back to zone_free() would otherwise
+        #    leave the other deferred call still satisfying a presence-only
+        #    check, and the regression would land silently.
+        'the published oneDNN scratch releases are event-deferred':
+            all(needle in reserve_onednn for needle in
+                ("submit_barrier_all()",
+                 "enqueue_deferred_zone_free(vram_zone_id::ONEDNN,",
+                 "enqueue_deferred_free(ref, *ev)"))
+            and not any(needle in reserve_onednn for needle in
+                ("zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_)",
+                 "zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_)")),
 
         # 7. llama.cpp-37ba (iiff Phase 3 / epic acceptance criterion 1, reconciled):
         #    host_zone_settle()'s SCRATCH/STAGING population no longer needs the bulk
@@ -487,6 +518,17 @@ MUTANTS = {
         [("        arena_attempt             = true;\n",
           "        arena_attempt             = true;\n"
           "        (void) ensure_planned_arena_zones();\n")]),
+    # Reproduces the llama.cpp-ndn9 defect exactly: one published release
+    # "simplified" back to the immediate zone_free() the deferred helper
+    # replaced. Mutating only the weights half is deliberate -- it is the case a
+    # presence-only check would miss, since the activations half would still
+    # carry enqueue_deferred_zone_free().
+    "the published oneDNN scratch releases are event-deferred": (
+        "cache",
+        [("defer_published_zone_release(onednn_weights_scratch_, onednn_weights_scratch_size_);",
+          "zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);\n"
+          "            onednn_weights_scratch_ = nullptr;\n"
+          "            onednn_weights_scratch_size_ = 0;")]),
     # Neuters the epoch_tracked guard's condition rather than deleting the
     # whole block: the anchor is short and comment-length-independent, so it
     # survives a longer or shorter rationale comment on the guard. The effect

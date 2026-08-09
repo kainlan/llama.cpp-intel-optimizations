@@ -176,6 +176,15 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 // a sub-allocation that failed while the zone was large enough (allocator
 // fragmentation — do NOT record it, the predicate was right).
 //
+// Since llama.cpp-ndn9 the second cause has a second source, and it is NOT
+// fragmentation: the superseded reservation's bytes are released behind a
+// barrier rather than immediately, so a growth step transiently occupies
+// old+new. Still not a predicate defect, so it stays out of the under-estimate
+// counter — but it does mean the ONEDNN zone wants headroom for one superseded
+// reservation above the largest single one, and that a run can report
+// zone-large-enough sub-allocation failures without the zone being fragmented
+// at all.
+//
 // The state is process-global and is reached from the multi-threaded SYCL
 // backend, so every entry point below takes a mutex.
 void   zone_sizing_record_underestimate(const char * path, size_t requested_bytes, size_t planned_bytes);

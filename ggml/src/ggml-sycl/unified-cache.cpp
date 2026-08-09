@@ -12286,6 +12286,95 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         size  = 0;
     };
 
+    // --- Replacement releases must outlive the device work reading the old block ---
+    //
+    // Everything below that reclaims a PUBLISHED block -- one an earlier call
+    // already handed to a consumer -- has to depend on the event that consumes
+    // it, not on the reservation refcount (llama.cpp-ndn9).
+    //
+    // The refcount cannot express this. onednn_pp_scratch_guard releases its
+    // token when the guard's C++ scope ends, which is immediately after
+    // DnnlGemmWrapper::row_gemm() returns -- and that call ends in
+    // primitive.execute(stream, args), an ASYNCHRONOUS submit. So
+    // onednn_scratch_refcount_ is already back to 0 while the primitive is still
+    // reading this memory, and gating the replacement on the refcount or on
+    // onednn_scratch_cv_ would close only a host-thread window while leaving the
+    // device window exactly as wide as it is today.
+    //
+    // submit_barrier_all() is the correct dependency: it depends on queue_,
+    // dma_queue_, bcs_queue_ AND compute_queue_, and compute_queue_ is
+    // ctx.stream() (bound at every graph boundary), i.e. the very queue the
+    // oneDNN primitive was submitted on. A barrier on a merely adjacent queue
+    // would prove nothing about the primitive.
+    //
+    // Submitted lazily: a reservation with no published predecessor to release
+    // must not pay for four barrier submissions.
+    bool        replacement_barrier_valid = false;
+    sycl::event replacement_barrier_event;
+
+    auto replacement_barrier = [&]() -> const sycl::event * {
+        if (!replacement_barrier_valid) {
+            try {
+                replacement_barrier_event = submit_barrier_all();
+                replacement_barrier_valid = true;
+            } catch (...) {
+                return nullptr;
+            }
+        }
+        return &replacement_barrier_event;
+    };
+
+    // Reclaim a published ARENA-owned block. The bytes go back to the ONEDNN
+    // TLSF free list only once the barrier completes, so a later zone_alloc
+    // cannot hand them to a second consumer underneath an in-flight primitive.
+    auto defer_published_zone_release = [&](void *& ptr, size_t & size) {
+        if (const sycl::event * ev = replacement_barrier()) {
+            enqueue_deferred_zone_free(vram_zone_id::ONEDNN, ptr, size, *ev);
+        } else {
+            // Barrier submission failed. Releasing immediately is the pre-fix
+            // behaviour and reopens the race, but the alternative is orphaning
+            // the bytes until arena teardown, which is strictly worse and
+            // silent. Say so loudly instead.
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] oneDNN scratch replacement barrier unavailable; releasing arena block ptr=%p "
+                "immediately -- an in-flight oneDNN primitive may still be reading it\n",
+                ptr);
+            zone_free(vram_zone_id::ONEDNN, ptr);
+        }
+        ptr  = nullptr;
+        size = 0;
+    };
+
+    // Reclaim a published DIRECT block. Dropping the mem_handle inline would run
+    // unified_free() synchronously on the calling thread, which is not ordered
+    // against queued work by anything -- unlike the arena case, no in-order
+    // queue property mitigates it. Hand the owner to the deferred-free queue so
+    // the real free happens after the barrier.
+    auto defer_published_direct_release = [&](mem_handle & owner, void *& ptr, size_t & size, const char * label) {
+        if (ptr == nullptr) {
+            owner = {};
+            size  = 0;
+            return;
+        }
+        const sycl::event * ev = owner.valid() ? replacement_barrier() : nullptr;
+        if (!ev) {
+            // Either the owner is missing (release_direct_scratch asserts on
+            // that, and keeping one place for the diagnosis is worth more than
+            // deferring a block we cannot describe) or the barrier failed.
+            release_direct_scratch(owner, ptr, size, label);
+            return;
+        }
+        managed_alloc_ref ref{};
+        ref.ptr    = ptr;
+        ref.size   = size;
+        ref.device = owner.device();
+        ref.owner  = std::move(owner);
+        enqueue_deferred_free(ref, *ev);
+        owner = {};
+        ptr   = nullptr;
+        size  = 0;
+    };
+
     // Set when the ONEDNN zone could not serve this request; the reservation then
     // grows through the unified-cache allocation path instead of failing.
     // arena_grow_cause records WHY, because the two causes are not equivalent — see
@@ -12364,17 +12453,24 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         // A pointer that is NOT currently arena-owned (it grew outside the
         // zone on an earlier call, via allocate_direct_scratch) is left
         // untouched here -- it is already a real mem_handle lease, and the
-        // existing release_direct_scratch() cleanup further down (unchanged)
-        // is what frees it.
+        // defer_published_direct_release() cleanup further down is what frees
+        // it (that used to be an immediate release_direct_scratch(); see
+        // llama.cpp-ndn9 and the paragraph below).
+        //
+        // The release is EVENT-DEFERRED, not immediate (llama.cpp-ndn9). Both
+        // pointers were published to a consumer that submitted an asynchronous
+        // oneDNN primitive over them and then dropped its reservation token at
+        // submission time, so "the reservation is no longer held" does not mean
+        // "the device is finished". Returning these bytes to the TLSF free list
+        // here would let the zone_alloc a few lines below hand them straight to
+        // the next consumer while the previous primitive is still reading them.
+        // The fields are nulled immediately either way -- the reservation is
+        // logically replaced now; only the physical reclaim waits.
         if (onednn_weights_scratch_ && vram_owns(onednn_weights_scratch_)) {
-            zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);
-            onednn_weights_scratch_      = nullptr;
-            onednn_weights_scratch_size_ = 0;
+            defer_published_zone_release(onednn_weights_scratch_, onednn_weights_scratch_size_);
         }
         if (onednn_activations_scratch_ && vram_owns(onednn_activations_scratch_)) {
-            zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_);
-            onednn_activations_scratch_      = nullptr;
-            onednn_activations_scratch_size_ = 0;
+            defer_published_zone_release(onednn_activations_scratch_, onednn_activations_scratch_size_);
         }
 
         // The call site stays, but its reclaiming role has ended (mirroring
@@ -12387,6 +12483,15 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         // zone_boundary_check() to say so truthfully).
         zone_boundary_check(vram_zone_id::ONEDNN);
 
+        // NOTE (llama.cpp-ndn9): the predecessor's bytes are NOT back in the
+        // free list at this point -- their release is gated on a barrier and is
+        // reclaimed by process_deferred_frees() at the next drain. So a growth
+        // step transiently needs old+new, not max(old,new), and the zone_alloc
+        // below can fail against a zone that the capacity arithmetic says is
+        // large enough. That is handled (the request falls through to the
+        // direct path, which is correct, just not arena-backed), but it does
+        // mean the ONEDNN sizing predicate in zone-sizing.hpp now wants
+        // headroom for one superseded reservation on top of the largest one.
         size_t zone_cap = zone_capacity(vram_zone_id::ONEDNN);
 
         // The planned ONEDNN zone is about to be measured against a real
@@ -12446,13 +12551,18 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 // check is needed to tell the two apart anymore.
                 const size_t old_direct_total = (onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0) +
                                                 (onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0);
+                // Published direct leftovers: event-deferred for the same reason
+                // as the arena pair above (llama.cpp-ndn9). unified_free() on a
+                // direct block is a synchronous host-side release with no
+                // ordering against queued work at all, so this case has no
+                // in-order-queue mitigation to fall back on.
                 if (onednn_weights_scratch_) {
-                    release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_,
-                                           onednn_weights_scratch_size_, "weights");
+                    defer_published_direct_release(onednn_weights_scratch_owner_, onednn_weights_scratch_,
+                                                   onednn_weights_scratch_size_, "weights");
                 }
                 if (onednn_activations_scratch_) {
-                    release_direct_scratch(onednn_activations_scratch_owner_, onednn_activations_scratch_,
-                                           onednn_activations_scratch_size_, "activations");
+                    defer_published_direct_release(onednn_activations_scratch_owner_, onednn_activations_scratch_,
+                                                   onednn_activations_scratch_size_, "activations");
                 }
                 if (old_direct_total > 0) {
                     saturating_sub_used(old_direct_total);
@@ -12474,6 +12584,13 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // fields nulled), so there is nothing else live in the zone to
             // touch; any DIRECT predecessor is left exactly as it was, since
             // this attempt never got far enough to replace it.
+            //
+            // Immediate, NOT event-deferred, and that is deliberate: `w` was
+            // allocated by THIS call and never published, so no consumer ever
+            // received it and no device work can reference it. Deferring it
+            // would hold ONEDNN zone bytes hostage to a barrier for no reason.
+            // The event-deferred releases are exactly the ones that replace a
+            // previously published block (llama.cpp-ndn9).
             if (w) {
                 zone_free(vram_zone_id::ONEDNN, w);
             }
@@ -12486,9 +12603,11 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         //     logs the live allocations that blocked the rebuild).
         //   * total_needed <= zone_cap — the zone was large enough but zone_alloc could
         //     not hand out both buffers, so the partial allocation was individually freed
-        //     above. That is fragmentation or allocator rounding, NOT a sizing miss, and
-        //     no re-plan was attempted for it. Counting it as an under-estimate would
-        //     blame the predicate for an allocator condition.
+        //     above. That is fragmentation, allocator rounding, or (since
+        //     llama.cpp-ndn9) a superseded reservation whose barrier has not drained
+        //     yet, so its bytes are still occupied. None of the three is a sizing miss,
+        //     and no re-plan was attempted for any of them. Counting them as an
+        //     under-estimate would blame the predicate for an allocator condition.
         //
         // Either way, grow through the unified-cache allocation path below rather than
         // failing the reservation.
@@ -12496,8 +12615,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         if (!zone_undersized) {
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
-                "(need %.1f MB, zone %.1f MB): the zone is fragmented, not under-sized; "
-                "growing through the unified cache\n",
+                "(need %.1f MB, zone %.1f MB): the zone is fragmented or still holds a superseded "
+                "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
                 total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
         }
         arena_grow_cause     = zone_undersized ? "planned zone under-estimated" : "zone fragmented";
@@ -12538,8 +12657,15 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             GGML_ASSERT(false && "onednn_weights_scratch_ unexpectedly arena-owned at direct-scratch fallback");
         } else {
             old_total += onednn_weights_scratch_size_;
-            release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_, onednn_weights_scratch_size_,
-                                   "weights");
+            // Published: event-deferred (llama.cpp-ndn9). used_ is still debited
+            // below at replacement time rather than at physical reclaim, which
+            // makes the budget transiently optimistic by the size of a block
+            // awaiting its barrier. That accounting choice predates this change
+            // and is left alone deliberately -- moving the debit to the drain
+            // would change budget semantics for every deferred-free population,
+            // not just this one.
+            defer_published_direct_release(onednn_weights_scratch_owner_, onednn_weights_scratch_,
+                                           onednn_weights_scratch_size_, "weights");
         }
     }
     if (onednn_activations_scratch_) {
@@ -12551,8 +12677,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             GGML_ASSERT(false && "onednn_activations_scratch_ unexpectedly arena-owned at direct-scratch fallback");
         } else {
             old_total += onednn_activations_scratch_size_;
-            release_direct_scratch(onednn_activations_scratch_owner_, onednn_activations_scratch_,
-                                   onednn_activations_scratch_size_, "activations");
+            defer_published_direct_release(onednn_activations_scratch_owner_, onednn_activations_scratch_,
+                                           onednn_activations_scratch_size_, "activations");
         }
     }
     if (old_total > 0) {
@@ -12608,6 +12734,9 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         if (!onednn_activations_scratch_) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] Failed to allocate oneDNN activations scratch (%.1f MB)\n",
                             activations_size / (1024.0f * 1024.0f));
+            // Immediate, NOT event-deferred: this weights block was allocated a
+            // few lines above by THIS call and never published to a consumer,
+            // so nothing on the device can be reading it (llama.cpp-ndn9).
             release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_, onednn_weights_scratch_size_,
                                    "weights");
             return finish(false);
