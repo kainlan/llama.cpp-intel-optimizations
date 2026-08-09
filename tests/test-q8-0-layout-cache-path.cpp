@@ -69,6 +69,21 @@ static void compute_reference(const block_q8_0_test * weights, const float * inp
 int main() {
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_SOA);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
+    // This test audits the Q8_0 clause of the DMMV layout gate
+    // (dmmv.cpp, `allow_layout`), so the dispatch has to actually reach
+    // ggml_sycl_dmmv_dispatch. It does not by default: batch is 1, Q8_0 is in
+    // ggml_sycl_supports_reorder_mmvq, and the batch=1 TG fast-path in
+    // ggml-sycl.cpp claims the dispatch and returns UPSTREAM of both
+    // GGML_SYCL_FORCE_DMMV sites and of the override's kernel choice. MMVQ then
+    // reads the same SoA cache entry and produces the same answer, so the gate
+    // passes while nothing in dmmv.cpp executes (llama.cpp-szv8, llama.cpp-7ofo).
+    //
+    // Note the fixture cannot tell the two kernels apart numerically: weights are
+    // all d=1/qs=1 and activations all 1.0, which is a fixed point of q8_1
+    // activation quantization (amax=1 -> q=127 exactly), so MMVQ and DMMV agree
+    // to the bit. Kernel identity here comes from the `[DMMV] dispatch:` line
+    // under GGML_SYCL_DMMV_Q8_DEBUG=1, not from the numbers.
+    setenv("GGML_SYCL_TG_FAST", "0", 1);
     setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);
 
     ggml_backend_sycl_set_unified_cache_budget_pct(90);

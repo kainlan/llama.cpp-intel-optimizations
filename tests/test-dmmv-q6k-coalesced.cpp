@@ -167,6 +167,14 @@ int main() {
 
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
+    // The layout override and GGML_SYCL_FORCE_DMMV both bind DOWNSTREAM of the
+    // batch=1 TG fast-path (ggml-sycl.cpp, "TG fast-path: batch=1, single-device,
+    // quantized -> MMVQ"), which returns before either is consulted. Q6_K is in
+    // ggml_sycl_supports_reorder_mmvq, and every case below has src1->ne[1] == 1,
+    // so without this line every dispatch here goes to MMVQ_COALESCED and no
+    // dmmv.cpp code runs at all -- the same miss llama.cpp-szv8 spent three rounds
+    // on. GGML_SYCL_TG_FAST=0 is that path's documented disable.
+    setenv("GGML_SYCL_TG_FAST", "0", 1);
 
     ggml_backend_t gpu_backend = ggml_backend_sycl_init(0);
     if (!gpu_backend) {
