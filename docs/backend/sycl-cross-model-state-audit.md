@@ -10,9 +10,11 @@ tally repeated here, because a second copy of those counts is exactly what goes
 stale. Two of its findings are deliberately carried by this census instead of
 being re-litigated:
 
-- **F1** (the layer-stream working set has no module-shutdown drop) is a code
-  gap, not a census gap. It is tracked as `llama.cpp-rb2s` and is in flight; the
-  census records it as dispositioned-pending-rb2s and does not wait on it.
+- **F1** (the layer-stream working set has no module-shutdown drop) was a code
+  gap, not a census gap. It was tracked as `llama.cpp-rb2s` and is **closed**:
+  the drop landed in `3b2bcfc43`. Reachability of the underlying defect remains
+  unproven — the fix is gated by a source-contract clause, not by a behavioural
+  test — so the gap is closed structurally rather than observationally.
 - **F3** (the KV-tier load-boundary gap) is recorded below as a gap rather than
   as a census row, because it is not one. `sycl-kv-slice-sizing` case 11
   (`ggml/src/ggml-sycl/tests/test-kv-slice-sizing.cpp:403`) asserts
