@@ -201,6 +201,18 @@ int main() {
         return 1;
     }
 
+    // Printed so a run can settle whether mmvq.cpp's `soa_base = layout_base`
+    // and the `src0_dd_i` handed to ggml_sycl_op_mul_mat_vec_q are the same
+    // pointer on this dispatch. They are, statically: ggml_sycl_op_mul_mat sets
+    // dev[i].src0_dd from the SAME resolve for a device-resident weight whose
+    // layout matches the requested one, ne12 == ne13 == 1 makes the per-batch
+    // offset zero, row_low is 0 on a single device, and the row-slicing branch
+    // is DMMV/Q6_K/output.weight-only. Substituting one for the other is then an
+    // identity, which is why swapping them changes no bytes and no test can see
+    // it (llama.cpp-f65p). Compare this address against the
+    // `[MUL_MAT] src0 device=0 ptr=...` line under GGML_SYCL_DEBUG=1.
+    printf("SoA layout ptr: %p, AoS weight->data: %p\n", (void *) layout_ptr, (void *) weight->data);
+
     std::memset(weight->data, 0, ggml_nbytes(weight));
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
