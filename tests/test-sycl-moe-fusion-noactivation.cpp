@@ -1,3 +1,13 @@
+// Source-text guard: every check here greps the SYCL backend sources as text.
+//
+// LIMITATION -- this test can only see STRING edits. A behavioural regression
+// that leaves the matched text intact is invisible to it, and a literal that
+// no longer appears in its target file goes silently void rather than red
+// (a positive contains() is only as good as its spelling). When a checked
+// construct is renamed, re-point the literal here; when adding a check, count
+// the literal in the target file first so it cannot pass vacuously.
+// See llama.cpp-ax4r: three greps used a struct spelling production never had.
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -159,8 +169,19 @@ static int test_runtime_fusion_remains_opt_in_until_default_promotion() {
     CHECK(contains(mmvq, "mxfp4_moe_down_sum_xmx_direct_final_log_reject") &&
               contains(mmvq, "direct_final_capacity_policy(false)"),
           "runtime direct-final must log stable capacity rejects before early Q8-capacity returns");
-    CHECK(contains(sycl, "direct_final_probe.fused_q8_quarantined") &&
-              contains(sycl, "direct_final_probe.q8_capacity_ok") && contains(sycl, "direct_final_probe.device_xmx_ok"),
+    CHECK(contains(sycl, "direct_final_fused_q8_quarantined") && contains(sycl, "direct_final_q8_capacity_ok") &&
+              contains(sycl, "direct_final_device_xmx_ok"),
+          "ggml-sycl direct-final probe must compute quarantine/capacity/device reasons");
+    const size_t probe_pos = sycl.find("const char * direct_final_probe_reason");
+    CHECK(probe_pos != std::string::npos, "ggml-sycl direct-final probe reason ladder must exist");
+    const size_t probe_quarantined_pos = sycl.find("return \"quarantined\";", probe_pos);
+    const size_t probe_device_pos      = sycl.find("return \"device\";", probe_pos);
+    const size_t probe_capacity_pos    = sycl.find("return \"capacity\";", probe_pos);
+    const size_t probe_metadata_pos    = sycl.find("return \"metadata\";", probe_pos);
+    CHECK(probe_quarantined_pos != std::string::npos && probe_device_pos != std::string::npos &&
+              probe_capacity_pos != std::string::npos && probe_metadata_pos != std::string::npos &&
+              probe_quarantined_pos < probe_metadata_pos && probe_device_pos < probe_metadata_pos &&
+              probe_capacity_pos < probe_metadata_pos,
           "ggml-sycl direct-final probe must preserve quarantine/capacity/device reasons before metadata");
     CHECK(contains(sycl, "ggml_sycl_moe_down_sum_cached_q8_capacity_ok"),
           "ggml-sycl direct-final probe must use the runtime cached-Q8 capacity check");
