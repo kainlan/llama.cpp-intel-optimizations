@@ -912,6 +912,39 @@ checks = {
         # ...and it must sit inside the EXACT-OWNER teardown path, immediately
         # before the slot release, not in some later general cleanup.
         and "release_if_owner(dying);\n        }\n        ggml_sycl_release_model_slot_resources(owner);" in backend,
+    "layer-stream working set is dropped at module shutdown":
+        # The only one of the module-shutdown drops that owns DEVICE memory. A
+        # manager still holding its buffer_handles_ presents live allocations to
+        # shutdown_unified_cache(), which then throws "SYCL unified cache arena
+        # release failed". g_layer_managers is never erased and the static
+        # destructor runs AFTER the cache is gone, so nothing else covers it.
+        # The literal presence checks come first so a deleted drop reports as a
+        # named failure instead of tracebacking out of the whole gate.
+        "ggml_sycl::get_layer_stream_manager(device).shutdown();" in backend
+        and "ggml_sycl_reset_canonical_checksums();" in backend
+        and "ggml_sycl_reset_moe_module_state();" in backend
+        # It must sit BESIDE the other two drops, bracketed between them: after
+        # the checksum drop and before the MoE reset, which the "predictor
+        # ownership reset precedes cache shutdown" clause pins immediately
+        # against shutdown_unified_cache(). Landing it between those two would
+        # break that adjacency instead.
+        and backend.index("ggml_sycl_reset_canonical_checksums();")
+            < backend.index("ggml_sycl::get_layer_stream_manager(device).shutdown();")
+            < backend.index("ggml_sycl_reset_moe_module_state();")
+        # Unconditional shutdown(), not the exact-owner release_if_owner()
+        # above: at module teardown there is no owner left for whom the working
+        # set could be preserved. Behind the non-creating pre-filter, because
+        # get_layer_stream_manager() try_emplaces and an unfiltered loop would
+        # fabricate a working set on every device.
+        and "if (!ggml_sycl::layer_streaming_active(device)) {\n"
+            "            continue;\n"
+            "        }\n"
+            "        ggml_sycl::get_layer_stream_manager(device).shutdown();" in backend
+        # Bounded by the real device count, and the whole loop -- not just its
+        # body -- lands inside that same drop block.
+        and "for (int device = 0; device < ggml_sycl_info().device_count; ++device) {" in
+            backend[backend.index("ggml_sycl_reset_canonical_checksums();"):
+                    backend.index("ggml_sycl_reset_moe_module_state();")],
     "pending KV-mask handoff is correlated to its staging load":
         "struct ggml_sycl_pending_kv_layer_mask" in backend
         and "ggml_sycl_kv_layer_mask_identity" in backend

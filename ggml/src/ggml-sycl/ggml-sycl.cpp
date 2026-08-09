@@ -99857,6 +99857,37 @@ void ggml_backend_sycl_shutdown(void) {
     // nothing, so dropping it has no ordering requirement of its own.
     ggml_sycl_reset_pending_kv_layer_masks();
     ggml_sycl_reset_canonical_checksums();
+    // The layer-stream working set is the only one of these drops that owns
+    // DEVICE memory: a manager still holding its two buffer_handles_ would
+    // present live allocations to the cache teardown below, which then throws
+    // "SYCL unified cache arena release failed". g_layer_managers is never
+    // erased, and its other releases are the model-teardown release_if_owner()
+    // and the static destructor -- the latter runs AFTER the cache is gone, so
+    // it cannot be what covers this.
+    //
+    // shutdown(), not release_if_owner(): this is module teardown, so there is
+    // no owner left for whom the working set could be preserved, and
+    // layer-streaming.cpp's own comment on shutdown() names exactly this
+    // caller. The exact-owner form belongs to retiring ONE model.
+    //
+    // Placed before the MoE reset so that reset stays adjacent to the cache
+    // shutdown it must immediately precede. Its own ordering needs only live
+    // device queues -- release_model_state() waits on a prefetch event
+    // submitted to ggml_sycl_get_device(device).default_queue(), which the
+    // pipeline-copy-queue teardown above does not touch.
+    for (int device = 0; device < ggml_sycl_info().device_count; ++device) {
+        // layer_streaming_active() looks the manager up without creating one;
+        // get_layer_stream_manager() try_emplaces. Filtering first keeps
+        // shutdown from fabricating a working set on devices that never
+        // streamed. It is exact for the hazard: buffers_[0] and
+        // buffer_handles_[0] are set and cleared together, so an inactive
+        // manager holds no allocation. One left holding only a stale ownership
+        // record owns no memory, and its destructor collects it.
+        if (!ggml_sycl::layer_streaming_active(device)) {
+            continue;
+        }
+        ggml_sycl::get_layer_stream_manager(device).shutdown();
+    }
     ggml_sycl_reset_moe_module_state();
     if (!ggml_sycl::shutdown_unified_cache()) {
         throw std::runtime_error("SYCL unified cache arena release failed");
