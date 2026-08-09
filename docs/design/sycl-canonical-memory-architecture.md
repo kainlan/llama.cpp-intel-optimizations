@@ -440,50 +440,91 @@ Keep these cases separate:
   same-device limitation remains: same-device concurrent inference is
   unsupported until context-keyed KV/RUNTIME arena ownership exists.
 
-#### OPEN ADJUDICATION: a replay-active graph holds the device invocation indefinitely (`llama.cpp-u7vj`)
+#### ADJUDICATED (fix pending): unpaired `begin`/`submit` on the graph-mode bypass returns holds the device invocation indefinitely (`llama.cpp-u7vj`)
 
-**Unresolved. Documented here as an open question, not as a decided contract
-rule.** It is P2 and non-blocking, but it is the production-facing half of a
-question the test suite currently sidesteps.
+**Verdict: DEFECT in the caller, not intended exclusivity, and not a property of
+graph replay.** The registry's acquisition and release policy in §12.3 is
+correct and unchanged. What is wrong is that
+`ggml_backend_sycl_graph_compute_unchecked()` acquires a tracked invocation on
+every path but runs the matching `submit`/`release` on only one of them.
 
-Measured at `98deb46ed` with `GGML_SYCL_DISABLE_GRAPH` unset — that is, **replay
-ON, which is the default**: the first context to begin a tracked graph on a
-device holds its invocation indefinitely. `begin_invocation` reuses an open
-invocation for its own context without re-touching `device_owners_`;
-`release_invocation` requires a TERMINAL state (COMPLETE/QUARANTINED) and
-silently no-ops otherwise; and a replay-active graph never reaches TERMINAL.
-Every *other* context's fresh claim on that device is refused `DEVICE_BUSY`
-exactly once, after which the caller typically aborts. (File/line references are
-in the ticket and are pinned to that SHA; treat them as drifting.)
+The invocation is acquired inside `ggml_backend_sycl_graph_compute_impl()` at
+its entry (`ggml_sycl_execution_begin_graph`), i.e. on *every* call that reaches
+`compute_impl_unlocked()`. The matching
+`ggml_sycl_execution_submit_graph()` / `ggml_sycl_execution_release_graph()`
+pair exists only on the function's **normal** exit. Thirteen bypass paths inside
+`ggml_backend_sycl_graph_compute_unchecked()` call `compute_impl_unlocked()`
+and then `return GGML_STATUS_SUCCESS` early, skipping both. On those returns the
+scope guard seals the graph, so it ends at SEALED — never COMPLETE — and
+`release_invocation` correctly refuses a non-terminal graph. Nothing else ever
+clears `device_owners_`.
 
-The discriminator is clean: `test-thread-safety` — 3 models × 4 contexts,
+Consequences, in order of how they present:
+
+- The owning context is unaffected: its next `begin_invocation` takes the reuse
+  branch, which does not re-check `device_owners_`. It therefore keeps working
+  indefinitely and gives no signal.
+- Every *other* context's fresh claim on that device is refused `DEVICE_BUSY`,
+  once, and there is no path by which it later succeeds.
+- Whether the hold is permanent depends on which bypass fired. Paths whose
+  predicate is a stable property of the graph shape (non-FA attention decode
+  capture disabled, `n_nodes < MIN_GRAPH_NODES`, no `ext_oneapi_limited_graph`
+  aspect, MoE segmented-replay disabled) re-fire on every decode and hold until
+  context teardown. Paths that alternate with a normal decode (prompt-phase
+  bypasses) self-heal on the next decode that reaches the normal exit.
+- The eviction bypass belongs in that sticky list, and is the strongest member:
+  its predicate is `unified_cache::has_evictions()`, backed by a latch
+  (`has_evictions_`, `unified-cache.hpp:3345`). Six sites set it; the only site
+  that clears it is the weight-entry reclaim path (`unified-cache.cpp:9212`).
+  Nothing clears it per decode. So the *first* eviction in a process arms this
+  bypass for every subsequent decode — and it is one of the two bypasses that is
+  not graph-gated, so `GGML_SYCL_DISABLE_GRAPH=1` does not steer past it.
+- Teardown always recovers: `ggml_sycl_execution_drain_context_terminal_events()`
+  (`ggml-sycl.cpp:13052-13080`) waits, tries `release_graph`, and falls back to
+  quarantine-then-release. So this leaks ownership *within* a process's
+  lifetime, not across model unload.
+
+Replay is not the mechanism. A replayed graph does reach the normal exit and
+does submit; two of the thirteen bypass returns are not even graph-gated
+(they precede the `use_sycl_graph` decision). `GGML_SYCL_DISABLE_GRAPH=1` helps
+only because it steers past the bypasses that happen to fire in
+`test-thread-safety` — it is not general immunity.
+
+The discriminator remains clean: `test-thread-safety` — 3 models × 4 contexts,
 decodes serialized per device under the lock — fails at 3.4 s with replay on and
-passes at 6.95 s with replay off, both pinned `level_zero:0,1`.
-
-The question to adjudicate is whether winner-holds-forever is **intended
-exclusivity** under this section's record/replay lifetime semantics, or a **gap**:
-
-- If intended, it belongs in this section as a rule, and the refusal message
-  should be made actionable (suggest `GGML_SYCL_DISABLE_GRAPH=1` or context
-  teardown).
-- If a gap, the registry needs a way to retire or suspend a replay-active
-  graph's invocation between decodes — e.g. release at the graph-epoch boundary
-  with revalidation on the next `begin` — without breaking replay correctness.
+passes at 6.95 s with replay off, both pinned `level_zero:0,1` (measured at
+`98deb46ed`).
 
 Why it is not merely academic: **serialized** multi-context on one device
-(create N contexts, decode them one at a time) is a plausible production pattern
-for a process holding several models or contexts, and on the default
-configuration it currently deadlocks-by-refusal — `DEVICE_BUSY` is returned, and
-there is no path by which the second context ever succeeds while the first keeps
-its replay graph active. The blast radius is wider than the device count
-suggests: on current Level Zero multi-GPU runtimes the scheduler-visible device
-set is collapsed to **one** device, so all contexts in a process share device 0's
-registry slot regardless of how many physical GPUs are installed.
+(create N contexts, decode them one at a time) is a real production pattern —
+speculative decoding builds a second `llama_context` for the draft model in the
+same process (`common/speculative.cpp`, `examples/speculative-simple`). On the
+default configuration that second context's first decode is refused. The blast
+radius is wider than the device count suggests: on current Level Zero multi-GPU
+runtimes the scheduler-visible device set is collapsed to **one** device
+(`ggml-sycl.cpp:19865-19879` — `device_map.resize(1)` whenever more than one GPU
+is present and neither `GGML_SYCL_SPLIT_RATIO` nor `GGML_SYCL_TENSOR_SPLIT` is
+set), so all contexts in a process share device 0's registry slot regardless of
+how many physical GPUs are installed.
+
+One related coupling, for whoever touches this mechanism next: in GPU-prefix
+mode the CPU suffix dispatch (`ggml-sycl.cpp:97670` → `:96593`) runs a *second*
+`begin`/`seal` cycle inside a single outer call. That is not a fourteenth bypass
+— prefix mode forces `use_sycl_graph = false`, so the call still reaches the
+normal exit — but it is tolerated only by the same reuse branch that hides the
+defect above, and it would break if `begin_invocation` were ever made to
+re-check `device_owners_` on reuse.
+
+Note this is an ownership-release defect, not a concurrency claim. Fixing it
+does **not** make same-device concurrent inference supported — that still waits
+on context-keyed KV/RUNTIME arena ownership. It restores the *serialized*
+multi-context case, which the contract does not exclude.
 
 Setting `GGML_SYCL_DISABLE_GRAPH=1` in the `test-thread-safety` registration
-(the `llama.cpp-b16a`/`llama.cpp-cnre` disposition) makes the *test* pass. It
-does not answer this question, and the green result in §11.2 must not be read as
-though it did.
+(the `llama.cpp-b16a`/`llama.cpp-cnre` disposition) makes the *test* pass. It is
+a workaround for the defect above, not a statement about it, and the green
+result in §11.2 must not be read as though it were. Once the pairing is fixed,
+the pin is removable and its removal is the regression test.
 
 ---
 
@@ -864,7 +905,7 @@ None of these blocks the epic's closure; all of them are real.
 
 | ticket | state | what it is |
 |---|---|---|
-| `llama.cpp-u7vj` | open, P2 | replay-active graph holds the device invocation — §5.3 |
+| `llama.cpp-u7vj` | adjudicated (defect), fix pending, P2 | unpaired `begin`/`submit` on the graph-mode bypass returns holds the device invocation — §5.3 |
 | `llama.cpp-2498` | open | the one known residual population: a non-default fallback mode not converted to refcounted release |
 | `llama.cpp-26ak` | open | `test-sycl-moe-sequence-graphlet-policy` debt (never-committed decision docs, vanished region markers) |
 | `llama.cpp-ndn9`, `llama.cpp-1z58`, `llama.cpp-yy17`, `llama.cpp-aog4`, `llama.cpp-cpsi` | open | ordinary backlog descendants of the epic |
