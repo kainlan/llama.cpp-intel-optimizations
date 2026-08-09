@@ -411,10 +411,25 @@ structurally impossible.
 - **`g_sycl_named_weight_cache_uuids`** (verified individually, ticket
   suspect): keyed by a signature string built from `name + type + ne +
   nbytes` — a pure function of the tensor's own identity. A stale entry
-  from a different model is either identical (harmless reuse, and in fact
-  the point: the same shape gets the same synthetic uuid across model
-  reloads) or keyed differently (no collision possible). Not model-scoped
-  state at all; correctly never cleared.
+  from a different model is either identical (the same shape gets the same
+  synthetic uuid across model reloads) or keyed differently (no collision
+  possible). Not model-scoped state at all; correctly never cleared.
+
+  ⚠️ **That argument alone does NOT establish safety, and the missing
+  clause is the load-bearing one** (llama.cpp-otry, 2026-08-09). The uuid
+  becomes `id.aux_id` for a weight with no GGUF identity
+  (`ggml-sycl.cpp:12272-12278`). If `aux_id` were the only discriminator,
+  "identical" would be the *harmful* case, not the harmless one: two
+  different models each holding a `blk.0.ffn_gate.weight` of the same type
+  and shape would resolve to one cache entry and read each other's bytes.
+  The actual protection is in `cache_id_equal()`
+  (`unified-cache-key.hpp:57-63`): when `has_gguf == false`, `model_id`
+  **and** `name_hash` both participate in equality, and `cache_id_hash`
+  hashes both on the same branch. Cross-model sharing is therefore
+  impossible regardless of `aux_id`, and the uuid only discriminates
+  *within* one model. Verdict unchanged — but do not re-derive it from the
+  pure-function property alone, because that property is not what makes it
+  safe.
 - **`g_sycl_weight_identities_by_name`** (verified individually, adjacent
   to the above): every real write is `g_sycl_weight_identities_by_name[name]
   = identity;` — unconditional overwrite, not emplace-if-absent. Staleness
