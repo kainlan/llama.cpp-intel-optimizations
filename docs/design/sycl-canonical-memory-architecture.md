@@ -472,9 +472,17 @@ Consequences, in order of how they present:
   aspect, MoE segmented-replay disabled) re-fire on every decode and hold until
   context teardown. Paths that alternate with a normal decode (prompt-phase
   bypasses) self-heal on the next decode that reaches the normal exit.
+- The eviction bypass belongs in that sticky list, and is the strongest member:
+  its predicate is `unified_cache::has_evictions()`, backed by a latch
+  (`has_evictions_`, `unified-cache.hpp:3345`). Six sites set it; the only site
+  that clears it is the weight-entry reclaim path (`unified-cache.cpp:9212`).
+  Nothing clears it per decode. So the *first* eviction in a process arms this
+  bypass for every subsequent decode — and it is one of the two bypasses that is
+  not graph-gated, so `GGML_SYCL_DISABLE_GRAPH=1` does not steer past it.
 - Teardown always recovers: `ggml_sycl_execution_drain_context_terminal_events()`
-  waits, tries `release_graph`, and falls back to quarantine-then-release. So
-  this leaks ownership *within* a process's lifetime, not across model unload.
+  (`ggml-sycl.cpp:13052-13080`) waits, tries `release_graph`, and falls back to
+  quarantine-then-release. So this leaks ownership *within* a process's
+  lifetime, not across model unload.
 
 Replay is not the mechanism. A replayed graph does reach the normal exit and
 does submit; two of the thirteen bypass returns are not even graph-gated
@@ -493,9 +501,19 @@ speculative decoding builds a second `llama_context` for the draft model in the
 same process (`common/speculative.cpp`, `examples/speculative-simple`). On the
 default configuration that second context's first decode is refused. The blast
 radius is wider than the device count suggests: on current Level Zero multi-GPU
-runtimes the scheduler-visible device set is collapsed to **one** device, so all
-contexts in a process share device 0's registry slot regardless of how many
-physical GPUs are installed.
+runtimes the scheduler-visible device set is collapsed to **one** device
+(`ggml-sycl.cpp:19865-19879` — `device_map.resize(1)` whenever more than one GPU
+is present and neither `GGML_SYCL_SPLIT_RATIO` nor `GGML_SYCL_TENSOR_SPLIT` is
+set), so all contexts in a process share device 0's registry slot regardless of
+how many physical GPUs are installed.
+
+One related coupling, for whoever touches this mechanism next: in GPU-prefix
+mode the CPU suffix dispatch (`ggml-sycl.cpp:97670` → `:96593`) runs a *second*
+`begin`/`seal` cycle inside a single outer call. That is not a fourteenth bypass
+— prefix mode forces `use_sycl_graph = false`, so the call still reaches the
+normal exit — but it is tolerated only by the same reuse branch that hides the
+defect above, and it would break if `begin_invocation` were ever made to
+re-check `device_owners_` on reuse.
 
 Note this is an ownership-release defect, not a concurrency claim. Fixing it
 does **not** make same-device concurrent inference supported — that still waits
