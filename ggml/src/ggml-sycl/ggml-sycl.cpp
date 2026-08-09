@@ -11341,12 +11341,31 @@ static ggml_backend_dev_t ggml_sycl_backend_dev_from_device_id(int device_id) {
     return static_cast<size_t>(device_id) < reg_count ? ggml_backend_reg_dev_get(reg, device_id) : nullptr;
 }
 
-static std::mutex                       g_pending_kv_layer_masks_mutex;
-static std::deque<std::vector<uint8_t>> g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES];
-static std::mutex                       g_test_kv_push_mutex;
-static std::condition_variable          g_test_kv_push_cv;
-static bool                             g_test_block_next_kv_push = false;
-static bool                             g_test_kv_push_blocked = false;
+// A staged KV layer mask belongs to exactly one model load, and the device
+// index is not an identity: llama_kv_cache stages the mask and only then calls
+// ggml_backend_alloc_ctx_tensors_from_buft, so an allocation that throws, is
+// skipped, or never reaches the tiered KV buffer type leaves the mask at the
+// front of the per-device queue for the NEXT model to pop (llama.cpp-y36c).
+//
+// Each entry therefore carries the lifecycle owner token that staged it and a
+// unique handoff id. The token is the correlation key: a consumer only accepts
+// an entry staged by its own model/load, so an orphan can never be mistaken for
+// a mask meant for the current allocation. The handoff id lets the producer
+// cancel exactly its own entry when the allocation window closes, which is what
+// keeps the queue at one push / one pop rather than merely refusing bad reads.
+struct ggml_sycl_pending_kv_layer_mask {
+    ggml_sycl::lifecycle::ModelToken owner{};
+    uint64_t                         handoff_id = 0;
+    std::vector<uint8_t>             mask;
+};
+
+static std::mutex                                  g_pending_kv_layer_masks_mutex;
+static std::deque<ggml_sycl_pending_kv_layer_mask> g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES];
+static std::atomic<uint64_t>                       g_pending_kv_handoff_seq{ 0 };
+static std::mutex                                  g_test_kv_push_mutex;
+static std::condition_variable                     g_test_kv_push_cv;
+static bool                                        g_test_block_next_kv_push = false;
+static bool                                        g_test_kv_push_blocked    = false;
 
 static void ggml_backend_sycl_test_block_next_kv_push() {
     sycl_module_mutation_guard module_guard;
@@ -11366,11 +11385,26 @@ static void ggml_backend_sycl_test_release_kv_push() {
     g_test_kv_push_cv.notify_all();
 }
 
-void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
-                                                   const uint8_t *    layer_mask,
-                                                   uint32_t           layer_count) {
+// The identity a KV-mask handoff is correlated against. Producer and consumer
+// must resolve it through the SAME accessor: ggml_sycl_identity_plan_snapshot()
+// reports the bound load candidate during a load and the publication after it,
+// so a push and the allocation it precedes agree by construction, and any load
+// boundary crossed in between makes them disagree -- which is exactly the
+// condition that must invalidate the handoff.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_kv_layer_mask_identity() {
+    return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+}
+
+uint64_t ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
+                                                       const uint8_t *    layer_mask,
+                                                       uint32_t           layer_count) {
     sycl_module_mutation_guard module_guard;
-    if (!module_guard) return;
+    if (!module_guard) return 0;
+    // Read the identity before the fault-injection block point, not after: a
+    // push held across a load boundary still belongs to the load that issued
+    // it, and stamping it with the identity that unblocked it would hand the
+    // next model a mask under its own name.
+    const ggml_sycl::lifecycle::ModelToken owner = ggml_sycl_kv_layer_mask_identity();
     {
         std::unique_lock<std::mutex> lock(g_test_kv_push_mutex);
         if (g_test_block_next_kv_push) {
@@ -11381,12 +11415,46 @@ void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
     }
     const int device = ggml_sycl_device_id_from_backend_dev(dev);
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || layer_mask == nullptr || layer_count == 0) {
+        return 0;
+    }
+
+    ggml_sycl_pending_kv_layer_mask entry;
+    entry.owner      = owner;
+    entry.handoff_id = g_pending_kv_handoff_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    entry.mask.assign(layer_mask, layer_mask + layer_count);
+
+    const uint64_t handoff_id = entry.handoff_id;
+
+    std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
+    g_pending_kv_layer_masks[device].push_back(std::move(entry));
+    return handoff_id;
+}
+
+// Drop a staged mask that was never consumed. The producer calls this once its
+// allocation window has closed, whatever the outcome: after that point any
+// surviving entry is orphaned by definition, so cancelling unconditionally is
+// both correct and the reason the queue cannot accumulate.
+void ggml_backend_sycl_cancel_kv_layer_mask_from_dev(ggml_backend_dev_t dev, uint64_t handoff_id) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return;
+    if (handoff_id == 0) {
+        return;
+    }
+    const int device = ggml_sycl_device_id_from_backend_dev(dev);
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
 
-    std::vector<uint8_t>        mask(layer_mask, layer_mask + layer_count);
     std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
-    g_pending_kv_layer_masks[device].push_back(std::move(mask));
+    auto &                      queue = g_pending_kv_layer_masks[device];
+    for (auto it = queue.begin(); it != queue.end(); ++it) {
+        if (it->handoff_id == handoff_id) {
+            GGML_SYCL_DEBUG("[KV-MASK] cancelled unconsumed handoff %llu on device %d\n",
+                            static_cast<unsigned long long>(handoff_id), device);
+            queue.erase(it);
+            return;
+        }
+    }
 }
 
 static std::vector<uint8_t> ggml_sycl_pop_kv_layer_mask(int device) {
@@ -11394,15 +11462,91 @@ static std::vector<uint8_t> ggml_sycl_pop_kv_layer_mask(int device) {
         return {};
     }
 
+    const ggml_sycl::lifecycle::ModelToken expected = ggml_sycl_kv_layer_mask_identity();
+
     std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
     auto &                      queue = g_pending_kv_layer_masks[device];
-    if (queue.empty()) {
-        return {};
-    }
+    while (!queue.empty()) {
+        ggml_sycl_pending_kv_layer_mask & front = queue.front();
+        if (!ggml_sycl_same_owner(front.owner, expected)) {
+            // Backstop for a producer that never got to cancel (an aborted
+            // load unwinding past its cancellation point). Discard rather than
+            // refuse: a stale entry must not be returned to the wrong owner,
+            // and it must not block the legitimate entry behind it either.
+            GGML_LOG_WARN(
+                "[KV-MASK] discarding orphaned KV layer mask handoff %llu on device %d: staged by "
+                "model=%llu load=%llu slot=%u/%llu, current model=%llu load=%llu slot=%u/%llu\n",
+                static_cast<unsigned long long>(front.handoff_id), device,
+                static_cast<unsigned long long>(front.owner.model.value),
+                static_cast<unsigned long long>(front.owner.load.value), front.owner.owner.slot,
+                static_cast<unsigned long long>(front.owner.owner.generation),
+                static_cast<unsigned long long>(expected.model.value),
+                static_cast<unsigned long long>(expected.load.value), expected.owner.slot,
+                static_cast<unsigned long long>(expected.owner.generation));
+            queue.pop_front();
+            continue;
+        }
 
-    std::vector<uint8_t> mask = std::move(queue.front());
-    queue.pop_front();
-    return mask;
+        std::vector<uint8_t> mask = std::move(front.mask);
+        queue.pop_front();
+        return mask;
+    }
+    return {};
+}
+
+// Test observation of the handoff. Deliberately routed through the very
+// function the tiered KV buffer type calls, so a test scores the real consumer
+// rather than a parallel reimplementation of it.
+extern "C" uint32_t ggml_backend_sycl_test_pop_kv_layer_mask(int device, uint8_t * out, uint32_t capacity) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return 0;
+    const std::vector<uint8_t> mask = ggml_sycl_pop_kv_layer_mask(device);
+    const uint32_t             len  = static_cast<uint32_t>(std::min<size_t>(mask.size(), capacity));
+    if (out != nullptr && len > 0) {
+        std::memcpy(out, mask.data(), len);
+    }
+    return static_cast<uint32_t>(mask.size());
+}
+
+extern "C" uint32_t ggml_backend_sycl_test_pending_kv_layer_mask_count(int device) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return 0;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
+    return static_cast<uint32_t>(g_pending_kv_layer_masks[device].size());
+}
+
+// Exposes the correlation key itself, so a test can assert its own
+// discriminator is live before drawing any conclusion from a pop result. Two
+// loads whose identities compare equal would make the correlation vacuous and
+// the test would then pass or fail for reasons unrelated to the code under it.
+extern "C" void ggml_backend_sycl_test_kv_layer_mask_identity(uint64_t out[4]) {
+    if (out == nullptr) {
+        return;
+    }
+    ggml_sycl::lifecycle::ModelToken owner{};
+    {
+        sycl_module_mutation_guard module_guard;
+        if (module_guard) {
+            owner = ggml_sycl_kv_layer_mask_identity();
+        }
+    }
+    out[0] = owner.model.value;
+    out[1] = owner.load.value;
+    out[2] = owner.owner.slot;
+    out[3] = owner.owner.generation;
+}
+
+// Module shutdown is the one point with no owner left for whom any staged mask
+// could be preserved, so the whole queue is dropped here rather than left to
+// survive an RTLD_NODELETE reload.
+static void ggml_sycl_reset_pending_kv_layer_masks() {
+    std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
+    for (auto & queue : g_pending_kv_layer_masks) {
+        queue.clear();
+    }
 }
 
 static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode mode) {
@@ -99605,6 +99749,10 @@ void ggml_backend_sycl_shutdown(void) {
     // Predictor score handles are unified-cache-owned allocations. Reset all
     // owning MoE handles while the allocation registry and queues are live;
     // only then set the cache shutdown flag and drain the registry.
+    // Ordered before the predictor reset only so that reset stays adjacent to
+    // the cache shutdown it must immediately precede; a staged KV mask owns
+    // nothing, so dropping it has no ordering requirement of its own.
+    ggml_sycl_reset_pending_kv_layer_masks();
     ggml_sycl_reset_moe_module_state();
     if (!ggml_sycl::shutdown_unified_cache()) {
         throw std::runtime_error("SYCL unified cache arena release failed");
@@ -99760,6 +99908,18 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_push_kv_layer_mask_from_dev") == 0) {
         return (void *) ggml_backend_sycl_push_kv_layer_mask_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_cancel_kv_layer_mask_from_dev") == 0) {
+        return (void *) ggml_backend_sycl_cancel_kv_layer_mask_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_pop_kv_layer_mask") == 0) {
+        return (void *) ggml_backend_sycl_test_pop_kv_layer_mask;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_pending_kv_layer_mask_count") == 0) {
+        return (void *) ggml_backend_sycl_test_pending_kv_layer_mask_count;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_kv_layer_mask_identity") == 0) {
+        return (void *) ggml_backend_sycl_test_kv_layer_mask_identity;
     }
     if (strcmp(name, "ggml_backend_sycl_test_block_next_kv_push") == 0) {
         return (void *) ggml_backend_sycl_test_block_next_kv_push;

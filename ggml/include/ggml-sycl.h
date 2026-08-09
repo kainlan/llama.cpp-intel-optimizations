@@ -308,9 +308,20 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 // heterogeneous attention (for example non-SWA and SWA layers); the SYCL
 // unified-cache planner uses this mask instead of inferring membership from
 // byte size.
-GGML_BACKEND_API void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
-                                                                    const uint8_t *    layer_mask,
-                                                                    uint32_t           layer_count);
+//
+// The staged mask is correlated with the model load that staged it, so a mask
+// left behind by an aborted or skipped allocation can never be applied to a
+// different model. Returns a handoff id (0 if nothing was staged) to be passed
+// to ggml_backend_sycl_cancel_kv_layer_mask_from_dev once the allocation window
+// closes; the caller is expected to cancel unconditionally, since a mask that
+// survives its own allocation is orphaned whatever the outcome was.
+GGML_BACKEND_API uint64_t ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
+                                                                        const uint8_t *    layer_mask,
+                                                                        uint32_t           layer_count);
+
+// Drop a mask staged by ggml_backend_sycl_push_kv_layer_mask_from_dev that was
+// never consumed. A no-op when the allocation already consumed it.
+GGML_BACKEND_API void ggml_backend_sycl_cancel_kv_layer_mask_from_dev(ggml_backend_dev_t dev, uint64_t handoff_id);
 
 // Backward-compatible helper for callers that only know n_ctx.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx);

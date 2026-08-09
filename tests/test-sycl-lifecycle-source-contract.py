@@ -30,6 +30,9 @@ saveable_mutating_procs = {
     "ggml_backend_tp_buffer_type": "ggml_backend_sycl_tp_buffer_type",
     "ggml_backend_sycl_kv_buffer_type_from_dev": "ggml_backend_sycl_kv_buffer_type_from_dev",
     "ggml_backend_sycl_push_kv_layer_mask_from_dev": "ggml_backend_sycl_push_kv_layer_mask_from_dev",
+    "ggml_backend_sycl_cancel_kv_layer_mask_from_dev": "ggml_backend_sycl_cancel_kv_layer_mask_from_dev",
+    "ggml_backend_sycl_test_pop_kv_layer_mask": "ggml_backend_sycl_test_pop_kv_layer_mask",
+    "ggml_backend_sycl_test_pending_kv_layer_mask_count": "ggml_backend_sycl_test_pending_kv_layer_mask_count",
     "ggml_backend_sycl_host_compute_buffer_type": "ggml_backend_sycl_host_compute_buffer_type",
     "ggml_backend_sycl_cpu_offload_compute_buffer_type": "ggml_backend_sycl_cpu_offload_compute_buffer_type",
     "ggml_backend_sycl_host_buffer_type": "ggml_backend_sycl_host_buffer_type",
@@ -892,6 +895,20 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "measured_cache_drop" in (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "GGML_SYCL_RENAMED_RUNTIME_MODULE" in (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text(),
+    "pending KV-mask handoff is correlated to its staging load":
+        "struct ggml_sycl_pending_kv_layer_mask" in backend
+        and "ggml_sycl_kv_layer_mask_identity" in backend
+        and "ggml_sycl_same_owner(front.owner, expected)" in backend
+        and "ggml_sycl_reset_pending_kv_layer_masks" in backend
+        and "ggml_backend_sycl_cancel_kv_layer_mask_from_dev" in public
+        and "llama_kv_cache_sycl_mask_handoff" in (root / "src/llama-kv-cache.cpp").read_text()
+        and "cancel_mask(dev, handoff_id)" in (root / "src/llama-kv-cache.cpp").read_text()
+        and "KV-MASK-HANDOFF: load B consumed load A's abandoned mask" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "KV-MASK-HANDOFF: cancelled handoff survived its producer" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        and "loads A and B share a correlation key, so this case proves NOTHING" in
+            (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "hidden publication until independent owner adoption":
         "entry->state = ggml_backend_reg_state::REACTIVATING" in registry_backend
         and "Serialize staging, hidden adoption, and ACTIVE publication" in registry_backend

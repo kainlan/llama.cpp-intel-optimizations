@@ -26,6 +26,10 @@ extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
+extern "C" uint32_t ggml_backend_sycl_test_pop_kv_layer_mask(int device, uint8_t * out, uint32_t capacity);
+extern "C" uint32_t ggml_backend_sycl_test_pending_kv_layer_mask_count(int device);
+extern "C" void     ggml_backend_sycl_test_kv_layer_mask_identity(uint64_t out[4]);
+
 namespace {
 enum class registry_fixture_mode {
     NORMAL, RESOLVER_THROW, SHUTDOWN_THROW, DEFERRED_REGISTER_ON_SHUTDOWN, PREPARE_CROSS_THREAD,
@@ -1067,6 +1071,10 @@ int main() {
     }
     LOAD_SYCL(ggml_backend_sycl_kv_buffer_type_from_dev)
     LOAD_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)
+    LOAD_SYCL(ggml_backend_sycl_cancel_kv_layer_mask_from_dev)
+    LOAD_SYCL(ggml_backend_sycl_test_pop_kv_layer_mask)
+    LOAD_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)
+    LOAD_SYCL(ggml_backend_sycl_test_kv_layer_mask_identity)
     LOAD_SYCL(ggml_backend_sycl_host_compute_buffer_type)
     LOAD_SYCL(ggml_backend_sycl_cpu_offload_compute_buffer_type)
     LOAD_SYCL(ggml_backend_sycl_cpu_offload_available)
@@ -1235,6 +1243,130 @@ int main() {
     }
     if (CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)() != authority_before_cpu_cancels) {
         std::fprintf(stderr, "speculative CPU lifecycle changed placement authority\n");
+        return 1;
+    }
+
+    // KV-MASK-HANDOFF (llama.cpp-y36c): a KV layer mask is staged for exactly
+    // one buffer allocation belonging to exactly one model load. Three claims,
+    // each with its own failure string:
+    //   1. a successful handoff is one push and one pop, and leaves nothing;
+    //   2. a mask abandoned by an aborted load is NOT consumable by the next
+    //      load -- the case the per-device queue alone could not express;
+    //   3. the producer's cancellation closes the window even when the mask was
+    //      never consumed.
+    phase("pending KV-mask handoff is correlated to its staging load");
+    // The DL build does not link ggml-sycl, so the registry has to come from
+    // the loaded module there, exactly as the surrounding phases do it.
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+    ggml_backend_dev_t kv_mask_dev = ggml_backend_reg_dev_get(reg, 0);
+#else
+    ggml_backend_dev_t kv_mask_dev = ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), 0);
+#endif
+    if (!kv_mask_dev) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: no SYCL device to stage a KV layer mask on\n");
+        return 1;
+    }
+    const uint8_t kv_mask_model_a[4] = { 1, 0, 1, 0 };
+    const uint8_t kv_mask_model_b[4] = { 0, 1, 0, 1 };
+
+    ggml_sycl_load_txn kv_load_a{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&kv_load_a) != GGML_SYCL_LIFECYCLE_OK || kv_load_a.id == 0) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: could not begin staging load A\n");
+        return 1;
+    }
+    uint64_t kv_identity_a[4]{};
+    CALL_SYCL(ggml_backend_sycl_test_kv_layer_mask_identity)(kv_identity_a);
+
+    // Claim 1: one push, one pop, nothing left behind.
+    const uint64_t kv_handoff_a =
+        CALL_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)(kv_mask_dev, kv_mask_model_a, 4);
+    if (kv_handoff_a == 0 || CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0) != 1) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: staging load A did not queue exactly one mask (handoff=%llu count=%u)\n",
+                     (unsigned long long) kv_handoff_a,
+                     CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0));
+        return 1;
+    }
+    uint8_t        kv_popped[4]  = { 9, 9, 9, 9 };
+    const uint32_t kv_popped_len = CALL_SYCL(ggml_backend_sycl_test_pop_kv_layer_mask)(0, kv_popped, 4);
+    if (kv_popped_len != 4 || std::memcmp(kv_popped, kv_mask_model_a, 4) != 0 ||
+        CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0) != 0) {
+        std::fprintf(stderr,
+                     "KV-MASK-HANDOFF: same-load handoff did not deliver exactly one mask (len=%u bytes=%u,%u,%u,%u "
+                     "remaining=%u)\n",
+                     kv_popped_len, kv_popped[0], kv_popped[1], kv_popped[2], kv_popped[3],
+                     CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0));
+        return 1;
+    }
+
+    // Claim 2. Stage a mask for load A and then abort A WITHOUT cancelling it:
+    // this is the producer unwinding past its own cancellation point, which is
+    // the fault the correlation key has to survive on its own.
+    if (CALL_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)(kv_mask_dev, kv_mask_model_a, 4) == 0 ||
+        CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0) != 1) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: could not stage the abandoned mask for load A\n");
+        return 1;
+    }
+    const auto kv_abort_a = CALL_SYCL(ggml_backend_sycl_model_load_end)(kv_load_a, false, nullptr);
+    if (kv_abort_a != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && kv_abort_a != GGML_SYCL_LIFECYCLE_POISONED) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: aborting load A returned %d\n", (int) kv_abort_a);
+        return 1;
+    }
+
+    ggml_sycl_load_txn kv_load_b{};
+    if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&kv_load_b) != GGML_SYCL_LIFECYCLE_OK || kv_load_b.id == 0 ||
+        kv_load_b.id == kv_load_a.id) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: could not begin a distinct load B (a=%llu b=%llu)\n",
+                     (unsigned long long) kv_load_a.id, (unsigned long long) kv_load_b.id);
+        return 1;
+    }
+    // Positive control on the discriminator itself: if the two loads resolve to
+    // the same correlation key then the comparison below cannot fail for the
+    // right reason, and a green result would mean nothing. Fail loudly instead.
+    uint64_t kv_identity_b[4]{};
+    CALL_SYCL(ggml_backend_sycl_test_kv_layer_mask_identity)(kv_identity_b);
+    if (std::memcmp(kv_identity_a, kv_identity_b, sizeof(kv_identity_a)) == 0) {
+        std::fprintf(stderr,
+                     "KV-MASK-HANDOFF: loads A and B share a correlation key, so this case proves NOTHING "
+                     "(model=%llu load=%llu slot=%llu/%llu)\n",
+                     (unsigned long long) kv_identity_a[0], (unsigned long long) kv_identity_a[1],
+                     (unsigned long long) kv_identity_a[2], (unsigned long long) kv_identity_a[3]);
+        return 1;
+    }
+
+    uint8_t        kv_b_popped[4]  = { 9, 9, 9, 9 };
+    const uint32_t kv_b_popped_len = CALL_SYCL(ggml_backend_sycl_test_pop_kv_layer_mask)(0, kv_b_popped, 4);
+    if (kv_b_popped_len != 0) {
+        std::fprintf(stderr,
+                     "KV-MASK-HANDOFF: load B consumed load A's abandoned mask (len=%u bytes=%u,%u,%u,%u)\n",
+                     kv_b_popped_len, kv_b_popped[0], kv_b_popped[1], kv_b_popped[2], kv_b_popped[3]);
+        return 1;
+    }
+    if (CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0) != 0) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: load A's orphan survived load B's pop (remaining=%u)\n",
+                     CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0));
+        return 1;
+    }
+
+    // Claim 3: producer-side cancellation, and that cancelling an id that is
+    // already gone is a no-op rather than a second removal.
+    const uint64_t kv_handoff_cancelled =
+        CALL_SYCL(ggml_backend_sycl_push_kv_layer_mask_from_dev)(kv_mask_dev, kv_mask_model_b, 4);
+    if (kv_handoff_cancelled == 0) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: could not stage the mask to be cancelled\n");
+        return 1;
+    }
+    CALL_SYCL(ggml_backend_sycl_cancel_kv_layer_mask_from_dev)(kv_mask_dev, kv_handoff_cancelled);
+    CALL_SYCL(ggml_backend_sycl_cancel_kv_layer_mask_from_dev)(kv_mask_dev, kv_handoff_cancelled);
+    CALL_SYCL(ggml_backend_sycl_cancel_kv_layer_mask_from_dev)(kv_mask_dev, kv_handoff_a);
+    if (CALL_SYCL(ggml_backend_sycl_test_pending_kv_layer_mask_count)(0) != 0 ||
+        CALL_SYCL(ggml_backend_sycl_test_pop_kv_layer_mask)(0, kv_b_popped, 4) != 0) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: cancelled handoff survived its producer\n");
+        return 1;
+    }
+
+    const auto kv_abort_b = CALL_SYCL(ggml_backend_sycl_model_load_end)(kv_load_b, false, nullptr);
+    if (kv_abort_b != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && kv_abort_b != GGML_SYCL_LIFECYCLE_POISONED) {
+        std::fprintf(stderr, "KV-MASK-HANDOFF: aborting load B returned %d\n", (int) kv_abort_b);
         return 1;
     }
 

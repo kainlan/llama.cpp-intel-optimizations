@@ -20,8 +20,28 @@
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 struct llama_kv_cache_sycl_hooks {
-    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)     kv_buft   = nullptr;
-    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev) push_mask = nullptr;
+    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)       kv_buft     = nullptr;
+    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)   push_mask   = nullptr;
+    decltype(&ggml_backend_sycl_cancel_kv_layer_mask_from_dev) cancel_mask = nullptr;
+};
+
+// Fork-local constraint (llama.cpp-y36c): a pushed KV layer mask is staged for
+// exactly one buffer allocation and must not outlive it. The allocation below
+// can throw, and a mask that survives would be applied to whichever model
+// allocates next on that device. This guard closes the handoff window on every
+// exit path, including the throwing one, so the SYCL side never has to guess
+// whether a staged mask is still wanted. It is scoped to the SYCL hook and adds
+// nothing to the non-SYCL path.
+struct llama_kv_cache_sycl_mask_handoff {
+    llama_kv_cache_sycl_hooks hooks;
+    ggml_backend_dev_t        dev        = nullptr;
+    uint64_t                  handoff_id = 0;
+
+    ~llama_kv_cache_sycl_mask_handoff() {
+        if (hooks.cancel_mask && handoff_id != 0) {
+            hooks.cancel_mask(dev, handoff_id);
+        }
+    }
 };
 
 static llama_kv_cache_sycl_hooks llama_kv_cache_sycl_hooks_for(ggml_backend_dev_t dev) {
@@ -37,6 +57,8 @@ static llama_kv_cache_sycl_hooks llama_kv_cache_sycl_hooks_for(ggml_backend_dev_
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_buffer_type_from_dev"));
     hooks.push_mask = reinterpret_cast<decltype(hooks.push_mask)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_push_kv_layer_mask_from_dev"));
+    hooks.cancel_mask = reinterpret_cast<decltype(hooks.cancel_mask)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cancel_kv_layer_mask_from_dev"));
     return hooks;
 }
 
@@ -340,9 +362,15 @@ llama_kv_cache::llama_kv_cache(
             ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
             auto               mask_it  = sycl_kv_layer_masks.find(buft);
             const auto         sycl_hooks = llama_kv_cache_sycl_hooks_for(buft_dev);
+
+            // Lives until the end of this else-block, i.e. past the allocation
+            // below, so the mask is cancelled whether that allocation consumes
+            // it, ignores it, or throws.
+            llama_kv_cache_sycl_mask_handoff sycl_mask_handoff{ sycl_hooks, buft_dev, 0 };
             if (sycl_hooks.kv_buft && sycl_hooks.push_mask && mask_it != sycl_kv_layer_masks.end() &&
                 !mask_it->second.empty()) {
-                sycl_hooks.push_mask(buft_dev, mask_it->second.data(), static_cast<uint32_t>(mask_it->second.size()));
+                sycl_mask_handoff.handoff_id = sycl_hooks.push_mask(buft_dev, mask_it->second.data(),
+                                                                    static_cast<uint32_t>(mask_it->second.size()));
             }
 #endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
