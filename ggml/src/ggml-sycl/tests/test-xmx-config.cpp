@@ -2,18 +2,34 @@
 // Test for XMXConfig struct in unified-kernel.hpp
 // Tests hardware-queried dimensions for ESIMD dpas kernel configuration
 //
-// The project builds Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG",
-// which compiles every bare assert() below out and leaves a program that
-// cannot fail (llama.cpp-u2mz). Must precede <cassert>, which binds assert
-// at include time.
 
 #include "../common.hpp"
 #include "../unified-kernel.hpp"
 
-#undef NDEBUG
-#include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+
+// The project builds Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG",
+// which compiles every bare assert() out and leaves a program that cannot
+// fail (llama.cpp-u2mz). The obvious repair -- `#undef NDEBUG` before
+// <cassert> -- does not compile under -fsycl (llama.cpp-9274): the device
+// pass has already declared __assert_fail with no exception specification
+// (sycl/builtins.hpp:58), so re-reading /usr/include/assert.h with NDEBUG
+// cleared redeclares it __THROW and the two do not match. Hoisting the undef
+// above the SYCL headers instead would re-enable the four bare asserts inside
+// dpct/helper.hpp for this TU alone, while the unified-kernel.cpp.o linked
+// into the same target keeps them compiled out. So check explicitly and never
+// consult NDEBUG at all -- the shape test-zone-sizing.cpp already uses in this
+// directory, with exit() in place of its `return 1` because the checks here
+// sit in void functions.
+#define CHECK(cond, msg)                                                        \
+    do {                                                                        \
+        if (!(cond)) {                                                          \
+            std::fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+            std::exit(1);                                                       \
+        }                                                                       \
+    } while (0)
 
 using namespace ggml_sycl_unified;
 
@@ -24,19 +40,19 @@ void test_default_config() {
     XMXConfig cfg;
 
     // Check default dimensions (Intel Arc defaults)
-    assert(cfg.xmx_m == 8 && "Default M should be 8");
-    assert(cfg.xmx_n == 16 && "Default N should be 16");
-    assert(cfg.xmx_k_fp16 == 16 && "Default K for FP16 should be 16");
-    assert(cfg.xmx_k_int8 == 32 && "Default K for INT8 should be 32");
+    CHECK(cfg.xmx_m == 8, "Default M should be 8");
+    CHECK(cfg.xmx_n == 16, "Default N should be 16");
+    CHECK(cfg.xmx_k_fp16 == 16, "Default K for FP16 should be 16");
+    CHECK(cfg.xmx_k_int8 == 32, "Default K for INT8 should be 32");
 
     // Check default resources
-    assert(cfg.slm_size == 65536 && "Default SLM should be 65536");
-    assert(cfg.nsm > 0 && "Default nsm should be positive");
+    CHECK(cfg.slm_size == 65536, "Default SLM should be 65536");
+    CHECK(cfg.nsm > 0, "Default nsm should be positive");
 
     // Check default capability flags (should be false for default constructed)
-    assert(cfg.supported == false && "Default supported should be false");
-    assert(cfg.supports_int8 == false && "Default supports_int8 should be false");
-    assert(cfg.supports_fp16 == false && "Default supports_fp16 should be false");
+    CHECK(cfg.supported == false, "Default supported should be false");
+    CHECK(cfg.supports_int8 == false, "Default supports_int8 should be false");
+    CHECK(cfg.supports_fp16 == false, "Default supports_fp16 should be false");
 
     std::cout << "PASSED" << std::endl;
 }
@@ -48,10 +64,10 @@ void test_from_device_negative_id() {
     XMXConfig cfg = XMXConfig::from_device(-1);
 
     // Should return default config, not crash
-    assert(cfg.xmx_m == 8 && "Invalid device should return default M=8");
-    assert(cfg.xmx_n == 16 && "Invalid device should return default N=16");
-    assert(cfg.xmx_k_int8 == 32 && "Invalid device should return default K_INT8=32");
-    assert(cfg.slm_size == 65536 && "Invalid device should return default SLM");
+    CHECK(cfg.xmx_m == 8, "Invalid device should return default M=8");
+    CHECK(cfg.xmx_n == 16, "Invalid device should return default N=16");
+    CHECK(cfg.xmx_k_int8 == 32, "Invalid device should return default K_INT8=32");
+    CHECK(cfg.slm_size == 65536, "Invalid device should return default SLM");
 
     std::cout << "PASSED" << std::endl;
 }
@@ -63,9 +79,9 @@ void test_from_device_out_of_range() {
     XMXConfig cfg = XMXConfig::from_device(999);
 
     // Should return default config, not crash
-    assert(cfg.xmx_m == 8 && "Out-of-range device should return default M=8");
-    assert(cfg.xmx_n == 16 && "Out-of-range device should return default N=16");
-    assert(cfg.xmx_k_int8 == 32 && "Out-of-range device should return default K_INT8=32");
+    CHECK(cfg.xmx_m == 8, "Out-of-range device should return default M=8");
+    CHECK(cfg.xmx_n == 16, "Out-of-range device should return default N=16");
+    CHECK(cfg.xmx_k_int8 == 32, "Out-of-range device should return default K_INT8=32");
 
     std::cout << "PASSED" << std::endl;
 }
@@ -111,11 +127,11 @@ void test_from_device_valid() {
 
     // On Arc B580, expect M=8, N=16, K_INT8=32
     // But these should at least be positive
-    assert(cfg.xmx_m > 0 && "M should be positive");
-    assert(cfg.xmx_n > 0 && "N should be positive");
-    assert(cfg.xmx_k_int8 > 0 && "K_INT8 should be positive");
-    assert(cfg.xmx_k_fp16 == 16 && "K_FP16 should always be 16");
-    assert(cfg.slm_size > 0 && "SLM size should be positive");
+    CHECK(cfg.xmx_m > 0, "M should be positive");
+    CHECK(cfg.xmx_n > 0, "N should be positive");
+    CHECK(cfg.xmx_k_int8 > 0, "K_INT8 should be positive");
+    CHECK(cfg.xmx_k_fp16 == 16, "K_FP16 should always be 16");
+    CHECK(cfg.slm_size > 0, "SLM size should be positive");
 
     std::cout << "PASSED (M=" << cfg.xmx_m << ", N=" << cfg.xmx_n << ", K_INT8=" << cfg.xmx_k_int8
               << ", SLM=" << cfg.slm_size << ")" << std::endl;
@@ -135,15 +151,15 @@ void test_capability_helper_predicates() {
     caps.sub_group_sizes[0]   = 16;
     caps.sub_group_sizes[1]   = 32;
 
-    assert(xmx_capabilities_match_int8_tile(caps, 8, 16, 32));
-    assert(!xmx_capabilities_match_int8_tile(caps, 4, 16, 32));
-    assert(xmx_capabilities_support_sub_group(caps, 16));
-    assert(xmx_capabilities_support_sub_group(caps, 32));
-    assert(!xmx_capabilities_support_sub_group(caps, 8));
+    CHECK(xmx_capabilities_match_int8_tile(caps, 8, 16, 32), "advertised 8x16x32 int8 tile should match");
+    CHECK(!xmx_capabilities_match_int8_tile(caps, 4, 16, 32), "M=4 should not match an M=8 tile");
+    CHECK(xmx_capabilities_support_sub_group(caps, 16), "sub-group 16 is advertised");
+    CHECK(xmx_capabilities_support_sub_group(caps, 32), "sub-group 32 is advertised");
+    CHECK(!xmx_capabilities_support_sub_group(caps, 8), "sub-group 8 is not advertised");
 
     caps.sub_group_size_count     = 0;
     caps.preferred_sub_group_size = 16;
-    assert(xmx_capabilities_support_sub_group(caps, 16));
+    CHECK(xmx_capabilities_support_sub_group(caps, 16), "empty size list should fall back to the preferred size");
 
     std::cout << "PASSED" << std::endl;
 }
