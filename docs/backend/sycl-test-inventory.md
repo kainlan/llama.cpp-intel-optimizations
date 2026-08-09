@@ -1887,6 +1887,26 @@ independent; sequence them in one file-open.
 | `test-q6k-reorder-dispatch` | `convert.cpp:1021` `scales_ptr[ib*(QK_K/16)+j] = x[ib].scales[j];` → `= x[ib].scales[0];` | GPU | COUNT `=== All Tests Complete: %d failure(s) ===` + per-subtest `Result: PASS/FAIL` | `=== Test 1: Production Q6_K Reorder Layout Verification ===` / `Result: FAIL`, later subtests still PASS, `1 failure(s)`, rc 1 | ⚠️ **Only 1 of 8 subtests reaches production.** Tests 2/3/5/6/7/8 re-derive the `quants.hpp` offsets and transcribe `vec_dot_q6_K_q8_1_impl_mmvq` inline — mark them MOCK. That is also why this mutation is clean (`failures` accumulates, no early exit). No 77 path: a device-less host prints `FAIL: SYCL error:` and exits 1. |
 | `test-mmq-q6k-gpu` | `mmq.cpp:2007` swap the two scale indices in `sumf_d += d8[i0/4] * (sc[i0/2+0]*sumi_d.x() + sc[i0/2+1]*sumi_d.y())` | GPU | COUNT `Results: %d passed, %d failed` + `Max relative error: %.4f%%` | `FAIL: <N> mismatches in 4096 values (...%)` for batch 2/8/16, `Results: 0 passed, 3 failed`, rc 1 | **Not specific** — the Q6_K MMQ launch macro selects on compute capability, never on ncols, so all three batches fire together. `vec_dot_q6_K_q8_1_impl_mmq` is shared by the AoS/SoA/coalesced kernels. ~200 lines of layout noise precede the verdict; grep `Results:`. |
 
+### Batch F1 — executed results (2026-08-09): 1/4 proven, 3 survivals ticketed
+
+| row | outcome |
+|---|---|
+| dmmv `:3705` (q8-0-layout-cache-path) | **SURVIVED** — `llama.cpp-7ofo`: szv8-class suspected (TG fast-path routes the dispatch to MMVQ; the DMMV allow-list is unreached). Mutation verified compiled+relinked. |
+| dmmv `:1775` (dmmv-q6k-coalesced) | **SURVIVED** — `llama.cpp-7ofo`: the row's own KTRACE warning anticipated this ("or nothing fires"). |
+| fattn-onednn `:182` (descriptors) | **SURVIVED** — `llama.cpp-l7rt`: the nc≠D materialize gate disabled with no numeric consequence observed; three candidate mechanisms ticketed, incl. the product-significant one. |
+| fattn-onednn `:263` (materialization) | RED `FAIL: GQA V source byte offset mismatch` + `SYCL oneDNN FA materialization tests: FAIL` → GREEN. **Proven.** |
+
+All four baselines green; all restores byte-verified; convergence build
+re-greened everything. Shmem 2.87→3.16 GB across the chunk (GPU tests).
+Logs: `bf1-*.log`. **Running total: 25 of 117 proven; survival tickets now
+carry 5 rows (bqtu-fixed, wo98, 7ofo x2, l7rt).**
+
+The survival pattern is now structural, not incidental: every DMMV-family
+row must first prove its test REACHES the kernel it names (the szv8
+ratio-gate / dispatch-line pattern) before its mutation result means
+anything. Remaining Batch F rows with that property should be re-checked
+against `llama.cpp-7ofo` before their slots are spent.
+
 ## Batch G — `common.hpp` (5 tests, 6 builds, ~2.5 h)
 
 The most widely included backend header — every build here is a full backend
