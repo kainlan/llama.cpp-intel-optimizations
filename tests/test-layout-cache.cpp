@@ -208,10 +208,21 @@ static bool test_layout_selection(int device_id, bool xmx_supported) {
 
     usage = infer_tensor_usage("ffn_gate_exps.weight");
     ok &= expect_usage("infer_tensor_usage(ffn_gate_exps.weight)", usage, tensor_usage::MOE_EXPERT_WEIGHT);
-    const ggml_layout_mode expected_xmx = xmx_supported ? GGML_LAYOUT_XMX_TILED : GGML_LAYOUT_SOA;
+    // llama.cpp-no1t: layout_policy no longer returns XMX_TILED for MoE experts
+    // on ANY branch, so the old `xmx_supported ? XMX_TILED : SOA` was stale in
+    // both directions.  The MOE_EXPERT_WEIGHT branch (common.hpp:1359-1374) now
+    // reads: XMX+int8 device -> SOA (":1360-1366", "the conservative GPU MoE
+    // layout ... XMX_TILED is selected only by the tensor-aware planner"),
+    // otherwise MXFP4 -> COALESCED (":1367-1369").  XMX_TILED is the planner's
+    // output (common.hpp:1070), not layout_policy's -- the struct contains no
+    // GGML_LAYOUT_XMX_TILED identifier at all.  3c8f296fd made that change; the
+    // oracle dates from 06c735e93, where the branch really did return XMX_TILED
+    // under GGML_SYCL_XMX_MOE_TILED (which is why main() still sets it -- that
+    // env is inert HERE but still read elsewhere, so it is left alone).
+    const ggml_layout_mode expected_moe = xmx_supported ? GGML_LAYOUT_SOA : GGML_LAYOUT_COALESCED;
     ok &= expect_layout("layout_policy(ffn_gate_exps, MXFP4)",
                         layout_policy::get_with_override(GGML_TYPE_MXFP4, usage, device_id),
-                        expected_xmx);
+                        expected_moe);
 
     usage = infer_tensor_usage("ffn_up.weight");
     ok &= expect_usage("infer_tensor_usage(ffn_up.weight)", usage, tensor_usage::FFN_WEIGHT);
