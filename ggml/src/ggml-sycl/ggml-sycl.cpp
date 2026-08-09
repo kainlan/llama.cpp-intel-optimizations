@@ -95936,6 +95936,37 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     };
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] Lambda created\n");
 
+    // llama.cpp-u7vj: every path reaching compute_impl_unlocked() opens a tracked
+    // invocation inside ggml_backend_sycl_graph_compute_impl(), but the matching
+    // submit lives only on this function's normal exit. Thirteen bypass paths run
+    // the compute and then return early, so the graph ended SEALED -- never
+    // COMPLETE -- and release_invocation() correctly refuses a non-terminal graph.
+    // Nothing then cleared device_owners_, so the owning context kept working via
+    // the reuse branch while every OTHER context's first decode was refused
+    // DEVICE_BUSY for the life of this context.
+    //
+    // Submit only, deliberately not release: these paths return WITHOUT waiting for
+    // the work they just submitted, and dropping device ownership with kernels in
+    // flight is the fault the registry's own M7_SUBMIT_RELEASES_DEVICES_EARLY
+    // mutation models. Marking the invocation COMPLETE is enough -- the release
+    // then happens where it already does for the deferred-decode path, in
+    // ggml_backend_sycl_synchronize(), after the queue wait.
+    struct execution_tail_guard {
+        ggml_backend_sycl_context * ctx;
+        bool                        armed    = true;
+        int                         uncaught = std::uncaught_exceptions();
+
+        ~execution_tail_guard() {
+            // Disarmed: the normal exit below already submitted. Exception in
+            // flight: ggml_backend_sycl_graph_compute()'s handlers quarantine and
+            // release instead, which retains leases on an unproven terminal.
+            if (!armed || std::uncaught_exceptions() > uncaught) {
+                return;
+            }
+            (void) ggml_sycl_execution_submit_graph(ctx);
+        }
+    } execution_tail_guard_{ sycl_ctx };
+
     if (sycl_ctx->active_exec_graph.valid && sycl_ctx->active_exec_graph.key.is_decode != cached_is_decode) {
         sycl_exec_graph_clear_active(
             sycl_ctx, cached_is_decode ? "phase-change-before-tg-layout" : "phase-change-before-pp-layout");
@@ -97770,6 +97801,8 @@ normal_dispatch:
     if (!sycl_ctx->last_graph_event_deferred_decode) {
         (void) ggml_sycl_execution_release_graph(sycl_ctx);
     }
+    // The submit above already ran; keep the u7vj guard from repeating it.
+    execution_tail_guard_.armed = false;
 #ifdef GGML_SYCL_GRAPH
     if (g_moe_direct_graphlet_pending_replays > 0 || g_moe_block_graphlet_pending_replays > 0 ||
         g_moe_sequence_graphlet_pending_replays > 0) {

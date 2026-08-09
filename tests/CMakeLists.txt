@@ -424,27 +424,22 @@ endif()
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
-# GGML_SYCL_DISABLE_GRAPH=1 (llama.cpp-b16a): this test deliberately runs
-# multiple contexts concurrently on the same physical SYCL device -- that
-# boundary is the point of the test (same-device concurrent inference is
-# otherwise unsupported per docs/design/sycl-canonical-memory-architecture.md
-# §5.3/§7.3), serialized only by a per-device lock the test itself adds around
-# each load/init/decode call. With SYCL command-graph record/replay left at
-# its default (ON), the FIRST context to record/replay an executable graph can
-# hold the execution registry's per-device invocation across many decodes
-# without the registry ever seeing it reach a released state --
-# Registry::release_invocation (execution-lifecycle.cpp) requires the graph to
-# reach a terminal COMPLETE/QUARANTINED state first, and a REUSE'd invocation
-# never re-enters the DEVICE_BUSY check that would otherwise catch this. Every
-# other context's first decode is then refused (DEVICE_BUSY) while the first
-# context runs to completion still holding the device. Confirmed by a paired
-# experiment on that ticket: identical pinned run WITHOUT this variable fails
-# every non-first context; WITH it, 100% pass, full generation on every
-# context, same host. This is a test-environment requirement (multi-context-
-# per-device here needs replay off), not a production fix -- production
-# retains default-on graph replay. This file is shared with CUDA/Metal/Vulkan
-# upstream; the variable is SYCL-only and a no-op there.
-set_property(TEST test-thread-safety APPEND PROPERTY ENVIRONMENT "GGML_SYCL_DISABLE_GRAPH=1")
+# NOTE (llama.cpp-u7vj): this test used to pin GGML_SYCL_DISABLE_GRAPH=1 here.
+# That pin was a workaround for a production defect, and the comment justifying
+# it blamed the wrong mechanism -- it read as though graph replay itself held
+# the execution registry's per-device invocation. It did not. The invocation was
+# acquired on every path but submitted on only one: thirteen bypass paths in
+# ggml_backend_sycl_graph_compute_unchecked() ran the compute and returned early,
+# leaving the graph SEALED rather than COMPLETE, so release_invocation() refused
+# it forever and every other context's first decode was refused DEVICE_BUSY. Two
+# of those bypasses were not even graph-gated, so disabling replay was never
+# general immunity -- it only steered past the ones this workload happened to hit.
+#
+# The pairing is fixed in ggml-sycl.cpp (execution_tail_guard), so this test now
+# runs the DEFAULT configuration, and running it unpinned is the regression test
+# for that fix: a regression reappears as "error=DEVICE_BUSY" in the log and a
+# failure of every context after the first. Do not re-add the pin to make a
+# failure go away -- it would hide exactly the defect this test now covers.
 
 llama_build_and_test(test-arg-parser.cpp)
 
