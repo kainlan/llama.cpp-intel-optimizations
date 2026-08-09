@@ -2896,8 +2896,11 @@ class unified_cache {
     // inside unified-cache.cpp, so the canonical contract's "all allocation
     // flows through unified-cache APIs" holds as written.
     //
-    // Enforcement is the zero-production-caller state itself.  Before adding a
-    // caller, confirm you would be the first outside tests/:
+    // Enforcement is the zero-production-caller state itself, and it is now
+    // mechanical: tests/test-sycl-ensure-cached-alloc-policy.sh runs exactly the
+    // grep below as a registered ctest gate (llama.cpp-kwwv), so a production
+    // caller reddens a test run instead of merely contradicting this comment.
+    // Before adding a caller, confirm you would be the first outside tests/:
     //
     //   grep -rnE 'ensure_cached_alloc\(' ggml/src src common tools examples \
     //        --include='*.cpp' --include='*.hpp' --exclude-dir=tests
