@@ -308,6 +308,13 @@ if (BUILD_TESTING)
     add_test(NAME sycl-teardown-sequence-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-teardown-sequence-contract.py)
     set_tests_properties(sycl-teardown-sequence-contract PROPERTIES LABELS "sycl;execution;lifecycle;host;source-contract")
+    # llama.cpp-yy17.  Every ctx->tensor_extras entry must own a refcount, because
+    # ~ggml_backend_sycl_buffer_context releases one per entry.  Deliberately NOT
+    # labelled with any of residency/mem-handle/cache: those are the substrings the
+    # project's full-sweep denylist excludes, and this gate allocates nothing.
+    add_test(NAME sycl-tensor-extras-retain-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-extras-retain-contract.py)
+    set_tests_properties(sycl-tensor-extras-retain-contract PROPERTIES LABELS "sycl;lifecycle;host;source-contract")
     # --self-test re-runs the two absence-based checks against a backend that
     # deliberately contains the construct they forbid; without it those two pass
     # on any tree that never had it.
