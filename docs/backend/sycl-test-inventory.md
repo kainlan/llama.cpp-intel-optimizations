@@ -885,7 +885,7 @@ test's captured log. None is a probe that could not have fired.
 
 | test | printed signal | RCA ticket | ticket status |
 |---|---|---|---|
-| `test-dmmv-q4-0-coalesced` | `errors=88 max_diff=0.427313 max_rel=0.309105 FAIL` | `llama.cpp-szv8` | **in_progress** |
+| `test-dmmv-q4-0-coalesced` | `errors=88 max_diff=0.427313 max_rel=0.309105 FAIL` | `llama.cpp-szv8` | closed |
 | `test-dmmv-q6k-coalesced` | `SYCL error: CHECK_TRY_ERROR(op(...))` at `ggml-sycl.cpp:38688` in `ggml_sycl_op_mul_mat`; subprocess aborted | `llama.cpp-99ke` | closed |
 | `test-ggml-sycl-soa` | same `ggml-sycl.cpp:38688` abort (its own 8 subtests passed first) | `llama.cpp-99ke` | closed |
 | `test-q8-0-layout-cache-path` | `Failed to resolve SoA layout pointer (source=wrong_layout)` | `llama.cpp-43uy` | closed |
@@ -937,16 +937,19 @@ So the live accepted set is **45 names: 44 green + 1 designed skip**.
 `artifacts/task19/task19-names.txt` remains the historical 50-name list for the
 `772798e91` run and is deliberately unedited.
 
-`llama.cpp-szv8` is the one still open. Its own investigation established
-something worth carrying: `test-dmmv-q4-0-coalesced` **did not exercise the
-kernel it names** at the time of this sweep — the readback fell back to the
-tensor's SoA storage (`source=tensor-storage-fallback`), so the numeric rows
-were measuring an unintended path. `szv8c` (`7be63714e`) rewired it through the
-real staging bracket, and the first attributable run then reported
-`source=layout_ptr` with `Coalesced layout check: PASSED` and *near-bit-identical*
-numeric failures (`errors=55 max_rel=0.165479` against the pre-fix
-`55 / 0.165480`). That coincidence is unexplained and is the live question on
-that ticket.
+`llama.cpp-szv8` has since CLOSED (2026-08-08, merged a0026c257, final GREEN at
+0b73dfdad) and the once-"unexplained coincidence" is fully resolved: the
+near-bit-identical failures across allegedly different kernels happened because
+**neither run executed a DMMV kernel at all** — the TG fast-path
+(ggml-sycl.cpp:~55303) claims every batch=1 quantized mul_mat with a non-AoS
+layout and dispatches MMVQ with q8_1 activations upstream of both
+GGML_SYCL_FORCE_DMMV sites. The 12–31% "wrong answer" was MMVQ's by-design
+8-bit-activation accuracy scored against a full-precision oracle; the Q4_0
+coalesced DMMV kernel is exonerated (one-hot probes clean, q8_1-MMVQ host
+oracle matched the GPU to seven significant figures). The test now binds the
+forcing (`GGML_SYCL_TG_FAST=0`) and asserts kernel identity with a
+tolerance-proof 100x ratio gate; its row in this sweep is a genuine green.
+Production-reachability question carried by `llama.cpp-erf1`.
 
 ### Known-failing, and not a regression — separate from the 11 above
 
