@@ -2257,6 +2257,40 @@ set_tests_properties(cross-model-weight-usage PROPERTIES
     TIMEOUT 120
 )
 
+# Owner-scoped canonical-checksum diagnostic (llama.cpp-x3ou). Two LIVE models
+# capture the same tensor name with different data; reactivating the first must
+# read its OWN row. Keying the map by bare name fails check 5 alone. Loads no
+# model and performs no GPU compute -- it drives the lifecycle C API only.
+# The labels deliberately omit cache/residency/mem-handle: the full-sweep
+# command in CLAUDE.md excludes those with -LE, and a gate named after what it
+# guards is no use if the sweep silently drops it.
+add_executable(test-canonical-checksum-owner-scope
+    tests/test-canonical-checksum-owner-scope.cpp
+)
+target_include_directories(test-canonical-checksum-owner-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-canonical-checksum-owner-scope PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-canonical-checksum-owner-scope PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-canonical-checksum-owner-scope PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-canonical-checksum-owner-scope PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-canonical-checksum-owner-scope PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME canonical-checksum-owner-scope COMMAND test-canonical-checksum-owner-scope)
+set_tests_properties(canonical-checksum-owner-scope PROPERTIES
+    LABELS "sycl;cross-model;diagnostic;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
 # Test: ggml_sycl_classify_tensor() (ggml-sycl.cpp) -- the dense/expert/other
 # classifier used for tiered-memory buffer-type routing, distinct from
 # tensor_usage/expert_tensor_role above. Registered at 3c8f296fd with bare
@@ -4296,6 +4330,25 @@ if (Python3_Interpreter_FOUND)
     )
     set_tests_properties(sycl-moe-reset-source-contract PROPERTIES
         LABELS "sycl;moe;host-only;ast;mutation"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+
+    # Structural half of llama.cpp-x3ou, covering what the behavioural gate
+    # above cannot observe: the per-owner teardown erase, its unconditional
+    # placement, the fail-closed empty-key branch, and the expert-split
+    # removal. Checks walk identifier nodes, so the fix's own tombstone
+    # comments cannot trip the checks that forbid those names -- a positive
+    # mutation asserts exactly that.
+    add_test(NAME canonical-checksum-source-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-canonical-checksum-source-contract.py
+            --source ${CMAKE_CURRENT_SOURCE_DIR}/ggml-sycl.cpp
+            --header ${CMAKE_CURRENT_SOURCE_DIR}/../../include/ggml-sycl.h
+            --mutation-matrix
+    )
+    set_tests_properties(canonical-checksum-source-contract PROPERTIES
+        LABELS "sycl;diagnostic;host-only;ast;mutation"
         SKIP_RETURN_CODE 77
         TIMEOUT 120
     )

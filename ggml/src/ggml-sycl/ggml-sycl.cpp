@@ -7950,7 +7950,52 @@ struct ggml_sycl_canonical_checksum_info {
 };
 
 static std::mutex                                                         g_sycl_canonical_checksum_mutex;
+// Owner-scoped: the key is ggml_sycl_owner_name_key(owner, tensor name), never
+// the bare name.  Two models loaded in one process share most of their GGUF
+// tensor names, so a bare-name key let the second model's capture overwrite the
+// first's row, and the compare below then reported match=0 against
+// byte-correct weights -- a false corruption verdict from the check that exists
+// to find corruption.  Rows leave with the rest of an owner's name tables in
+// ggml_sycl_erase_weight_identities_for_owner().
 static std::unordered_map<std::string, ggml_sycl_canonical_checksum_info> g_sycl_canonical_checksums;
+
+// Defined with the weight-identity registry below.
+static std::string ggml_sycl_owner_name_key(ggml_sycl::lifecycle::ModelToken owner, const char * name);
+
+// Owner scope for one tensor's checksum row.  Resolution order is the same as
+// ggml_backend_sycl_get_weight_cache_key(): the tensor's own extra first, the
+// published plan second.  Returns an EMPTY key when neither names an owner;
+// callers must treat that as "no record" and must not fall back to the bare
+// name, which is the process-global bucket this scoping removes.
+static std::string ggml_sycl_canonical_checksum_key(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return {};
+    }
+    const char * name = ggml_get_name(tensor);
+    if (!name || name[0] == '\0') {
+        return {};
+    }
+    ggml_sycl::lifecycle::ModelToken owner{};
+    const ggml_tensor_extra_gpu *    extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+    if (extra && extra->model_id != 0) {
+        const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
+        if (state) {
+            owner = state->token;
+        }
+    }
+    if (owner.model.value == 0) {
+        owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+    }
+    return ggml_sycl_owner_name_key(owner, name);
+}
+
+// Module shutdown is the one point with no owner left for whom a row could be
+// preserved, so the whole table goes rather than surviving an RTLD_NODELETE
+// reload.  Mirrors ggml_sycl_reset_pending_kv_layer_masks().
+static void ggml_sycl_reset_canonical_checksums() {
+    std::lock_guard<std::mutex> lock(g_sycl_canonical_checksum_mutex);
+    g_sycl_canonical_checksums.clear();
+}
 
 static uint64_t ggml_sycl_fnv1a64(const uint8_t * data, size_t len) {
     uint64_t hash = 1469598103934665603ULL;  // FNV offset basis
@@ -7988,26 +8033,58 @@ static void ggml_sycl_maybe_capture_canonical_checksum(const ggml_tensor * tenso
         return;
     }
 
+    const std::string key = ggml_sycl_canonical_checksum_key(tensor);
+    if (key.empty()) {
+        // No owner: record nothing.  Storing under the bare name would rebuild
+        // the cross-model bucket the owner scope exists to remove.
+        return;
+    }
+
     const size_t bytes    = std::min(bytes_limit, size);
     const auto   checksum = ggml_sycl_fnv1a64(static_cast<const uint8_t *>(data), bytes);
     {
         std::lock_guard<std::mutex> lock(g_sycl_canonical_checksum_mutex);
-        g_sycl_canonical_checksums[std::string(tensor->name)] = ggml_sycl_canonical_checksum_info{ bytes, checksum };
+        g_sycl_canonical_checksums[key] = ggml_sycl_canonical_checksum_info{ bytes, checksum };
     }
     GGML_LOG_INFO("[CANONICAL-CHECKSUM] captured tensor=%s bytes=%zu checksum=0x%016llx\n", tensor->name, bytes,
                   (unsigned long long) checksum);
 }
 
-static bool ggml_sycl_get_canonical_checksum(const char * name, ggml_sycl_canonical_checksum_info & out) {
-    if (!name || name[0] == '\0') {
+static bool ggml_sycl_get_canonical_checksum(const ggml_tensor * tensor, ggml_sycl_canonical_checksum_info & out) {
+    const std::string key = ggml_sycl_canonical_checksum_key(tensor);
+    if (key.empty()) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_sycl_canonical_checksum_mutex);
-    auto                        it = g_sycl_canonical_checksums.find(std::string(name));
+    auto                        it = g_sycl_canonical_checksums.find(key);
     if (it == g_sycl_canonical_checksums.end()) {
         return false;
     }
     out = it->second;
+    return true;
+}
+
+// Test-only surface, reached through ggml_backend_sycl_reg_get_proc_address so
+// that proving the owner scope costs no exported ABI symbol and no new header.
+static void ggml_backend_sycl_test_capture_canonical_checksum(const ggml_tensor * tensor,
+                                                              const void *        data,
+                                                              size_t              size) {
+    ggml_sycl_maybe_capture_canonical_checksum(tensor, data, size);
+}
+
+static bool ggml_backend_sycl_test_lookup_canonical_checksum(const ggml_tensor * tensor,
+                                                             size_t *            bytes,
+                                                             uint64_t *          checksum) {
+    ggml_sycl_canonical_checksum_info info{};
+    if (!ggml_sycl_get_canonical_checksum(tensor, info)) {
+        return false;
+    }
+    if (bytes) {
+        *bytes = info.bytes;
+    }
+    if (checksum) {
+        *checksum = info.checksum;
+    }
     return true;
 }
 
@@ -10365,6 +10442,16 @@ static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::Mo
             it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_weight_usages.erase(it) : std::next(it);
         }
     }
+    {
+        // The canonical-checksum diagnostic carries the same owner prefix, so a
+        // later load reusing this slot would otherwise score its own weights
+        // against a dead model's rows.
+        std::lock_guard<std::mutex> lock(g_sycl_canonical_checksum_mutex);
+        for (auto it = g_sycl_canonical_checksums.begin(); it != g_sycl_canonical_checksums.end();) {
+            it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_canonical_checksums.erase(it) :
+                                                                      std::next(it);
+        }
+    }
 }
 
 // Defined next to sycl_exec_graph_clear_active(), whose cleanup it mirrors for
@@ -11643,21 +11730,6 @@ bool ggml_backend_sycl_weights_evictable(void) {
 
     // Auto mode: the cache manages VRAM placement for all weights; eviction is always needed.
     return true;
-}
-
-// --- MoE expert split tracking ---
-// Set by llama-model.cpp when expert tensors are routed to host-pinned buffers.
-// Queried by KV tiering to auto-enable host KV for MoE models.
-static std::atomic<bool> g_moe_expert_split_active{ false };
-
-void ggml_backend_sycl_set_moe_expert_split(int n_expert, int n_expert_used) {
-    (void) n_expert;
-    (void) n_expert_used;
-    g_moe_expert_split_active.store(true, std::memory_order_release);
-}
-
-bool ggml_backend_sycl_query_moe_expert_split(void) {
-    return g_moe_expert_split_active.load(std::memory_order_acquire);
 }
 
 void ggml_backend_sycl_set_unified_cache_budget_pct(int pct) {
@@ -56637,8 +56709,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         }
 
                                         ggml_sycl_canonical_checksum_info canonical{};
-                                        if (ggml_sycl_get_canonical_checksum(src0->name, canonical) &&
-                                            canonical.bytes > 0 && weight_bytes > 0) {
+                                        if (ggml_sycl_get_canonical_checksum(src0, canonical) && canonical.bytes > 0 &&
+                                            weight_bytes > 0) {
                                             const size_t   bytes = std::min(canonical.bytes, weight_bytes);
                                             const uint64_t device_checksum =
                                                 ggml_sycl_fnv1a64(weights_host_bytes.data(), bytes);
@@ -99589,7 +99661,6 @@ static void ggml_sycl_reset_moe_module_state() {
         g_moe_expert_vram_reserve[d] = 0;
     }
     g_moe_multi_gpu_active.store(false, std::memory_order_relaxed);
-    g_moe_expert_split_active.store(false, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);
 }
 
@@ -99785,6 +99856,7 @@ void ggml_backend_sycl_shutdown(void) {
     // the cache shutdown it must immediately precede; a staged KV mask owns
     // nothing, so dropping it has no ordering requirement of its own.
     ggml_sycl_reset_pending_kv_layer_masks();
+    ggml_sycl_reset_canonical_checksums();
     ggml_sycl_reset_moe_module_state();
     if (!ggml_sycl::shutdown_unified_cache()) {
         throw std::runtime_error("SYCL unified cache arena release failed");
@@ -99876,6 +99948,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_arena_free") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_arena_free_guarded;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_capture_canonical_checksum") == 0) {
+        return (void *) ggml_backend_sycl_test_capture_canonical_checksum;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_lookup_canonical_checksum") == 0) {
+        return (void *) ggml_backend_sycl_test_lookup_canonical_checksum;
     }
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_shutdown_clean") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_shutdown_clean_guarded;
