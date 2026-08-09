@@ -246,7 +246,9 @@ if (NOT WIN32)
     set_tests_properties(test-sycl-alloc-policy PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-if (GGML_SYCL)
+# NOT GGML_BACKEND_DL: this test links ggml-sycl, which is a MODULE library in
+# DL builds and cannot be linked into another target (llama.cpp-hab7).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-kernel-profiler.cpp)
     target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-sycl-kernel-profiler PRIVATE ggml-sycl)

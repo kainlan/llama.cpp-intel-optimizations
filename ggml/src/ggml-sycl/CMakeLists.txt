@@ -430,6 +430,19 @@ if (GGML_SYCL_DEVICE_ARCH)
 endif()
 
 # =============================================================================
+# Fork-local test and benchmark targets (llama.cpp-hab7)
+#
+# Everything below registers executables that link ggml-sycl. Under
+# GGML_BACKEND_DL the backend is a MODULE library, and CMake refuses to link a
+# MODULE into any other target, so the whole region has to be skipped in DL
+# builds -- otherwise configure hard-errors. This is what kept the nightly
+# "Publish Docker image" intel leg red; .devops/intel.Dockerfile configures with
+# -DGGML_BACKEND_DL=ON. Bodies are left at their original indentation to keep
+# the diff (and merge conflicts) minimal.
+# =============================================================================
+if (NOT GGML_BACKEND_DL)
+
+# =============================================================================
 # XMX ESIMD Tests
 # =============================================================================
 option(GGML_SYCL_BUILD_XMX_TESTS "Build XMX ESIMD unit tests" OFF)
@@ -1363,3 +1376,5 @@ if (GGML_SYCL_DNNL)
         target_link_libraries(bench-dnnl-ops PRIVATE IntelSYCL::SYCL_CXX)
     endif()
 endif()
+
+endif() # NOT GGML_BACKEND_DL -- fork-local test/bench targets (llama.cpp-hab7)
