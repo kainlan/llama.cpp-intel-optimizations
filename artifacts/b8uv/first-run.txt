@@ -1,0 +1,95 @@
+Test project /Apps/llama.cpp/build
+    Start 338: test-layout-cache
+1/1 Test #338: test-layout-cache ................***Failed    1.69 sec
+[SYCL] Device 0 alloc caps: raw=15488.8 MB, safe=14714.4 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 15.1 GB (min max_mem_alloc_size across 1 active devices)
+layout_policy(ffn_gate_exps, MXFP4): expected layout XMX_TILED, got SOA
+[UNIFIED-CACHE] Capping budget from 16304.0 MB to 16250.2 MB (pre-probe free VRAM)
+[UNIFIED-CACHE] Generic device slack headroom: 576 MB reserved (weight budget=15674.2 MB)
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=16250.2 MB budget=15674.2 MB (100%)
+[VRAM-ARENA] External headroom 630 MB (caller-reserved 630 MB); internal zones runtime=512 MB oneDNN=256 MB scratch=512 MB
+[VRAM-ARENA] Arena 15674.0 MB exceeds raw per-allocation cap 15488.8 MB (safe chunk cap 14714.4 MB); using N-chunk arena
+[VRAM-ARENA] Reserving N-chunk arena: 2 chunks, 15674.0 MB total (per-chunk cap 14714.4 MB)
+[VRAM-ARENA] Reserved 2 chunks, 15674.0 MB total (weight=14266.0, KV=128.0, oneDNN=256.0, runtime=512.0, scratch=512.0 MB)
+[VRAM-ARENA] Active on device 0: 2 chunk(s), 15674.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe392dba00000 + 512.0 MB (offset 15162.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 205.0 GB budget, committed=0.0 GB (chunk=256.0 MB)
+[HOST-ARENA] Created with 205.0 GB budget, committed=0.0 GB (system total=246.9 GB available=213.0 GB reserve=8.0 GB pct=90)
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+Failed to cache AOS layout
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] non-default settings in effect: GGML_SYCL_DISABLE_GRAPH=1
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 1
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|        1.15.39122+12|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+[SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=0)
+[SYCL] Allocated pinned runtime chunk 1 (size=256.0 MB, total=0.3 GB)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[SYCL-CPU] MUL_MAT routed to CPU from resolved-host-handle: weight=attn_q.weight dst=layout_choice_output device=0 cpu_queue=0
+[CACHE-LOOKUP] MISS: model=0 hash=0x38258d8e8f177bfe aux=0x3 layout=0 id_to_key_size=0 entries_size=0
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+Failed to cache AOS layout for device weight
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[CACHE-LOOKUP] MISS: model=0 hash=0x98636f3967a934f7 aux=0x6 layout=0 id_to_key_size=0 entries_size=0
+[SYCL] Host buffer alloc request: 128.0 MB (evictable=1, in_model_load=1)
+[S1-PRELOAD] 0 host-registered weights found for preload
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+[SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
+test_model_load_host_buffer_avoids_pinned: got USM alloc type 0
+[SYCL] Host buffer alloc request: 0.0 MB (evictable=1, in_model_load=1)
+[S1-PRELOAD] 1 host-registered weights found for preload
+[S1-PRELOAD] Resetting weight materialization before applying latest plan
+[S1-PRELOAD] Using unified-cache BCS queue for preload copies
+[S1-PRELOAD] Pinned 1 dense weights in VRAM (0.0 MB)
+[UNIFIED-CACHE] Layout pool sealed on device 0
+[S1-PRELOAD] async bulk: dense cached=1 failed=0 host_placed=0, moe cached=0 failed=0, 0.1 MB in 3 ms (0.0 GB/s)
+[SYCL] model slot 0 released: 1 registry rows, 1 cache entries reclaimed
+[SYCL] model slot 0 released: 1 registry rows, 1 cache entries reclaimed
+FAIL: expected coalesced layout choice, got 0
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+gpu-serial    =   1.69 sec*proc (1 test)
+layout        =   1.69 sec*proc (1 test)
+model-load    =   1.69 sec*proc (1 test)
+sycl          =   1.69 sec*proc (1 test)
+
+Total Test time (real) =   1.71 sec
+
+The following tests FAILED:
+	338 - test-layout-cache (Failed)                        gpu-serial layout model-load sycl
+Errors while running CTest
