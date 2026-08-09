@@ -901,11 +901,41 @@ test's captured log. None is a probe that could not have fired.
 ten of those eleven tests now passing.** The closures are RCA-and-fix closures
 landed at later SHAs (`llama.cpp-sfe9` at `ab6cbe970`, `llama.cpp-mequ`,
 `llama.cpp-n3pw`, `llama.cpp-wmc2`, `llama.cpp-43uy`, `llama.cpp-99ke`,
-`llama.cpp-qvid`), each verified against its own gate. **No re-run of the
-accepted set has been recorded since `772798e91`.** The 38/1/11 split above
-therefore remains the only executed result for this set, and a fresh serial
-sweep is owed before certification claims the set is green. Do not read the
-closed column as a pass column.
+`llama.cpp-qvid`), each verified against its own gate. The owed re-run has now
+been executed — see the next section.
+
+### Re-run at `d5ac9cc50` (2026-08-09): the set IS green
+
+Executed by the lead with the Task 19 runner shape and ONE deliberate change:
+**no global `ONEAPI_DEVICE_SELECTOR` export** — the 38 per-test pins landed by
+`llama.cpp-24dl` (`da1d9c96f`) govern instead. (Task 19's global
+`level_zero:0` export overrode every per-test pin; this run is the first where
+the pins were actually exercised.) Evidence:
+`artifacts/task19/rerun-d5ac9cc50-results.tsv`.
+
+| outcome | count |
+|---|---:|
+| pass (rc 0, matched=1) | 44 |
+| designed skip (77) | 1 — `test-xmx-host-streaming` (its body gates on `GGML_SYCL_XMX_GEMM && GGML_SYCL_MMQ_XMX`, off in the default config; see the registration comment) |
+| fail | **0** |
+| `ZERO_MATCH` (name no longer registered) | 5 — all documented deliberate removals, see below |
+| **total names swept** | **50** |
+
+**Every one of Task 19's 11 failures now passes**, including
+`test-dmmv-q4-0-coalesced` (the szv8 instrument). Elapsed 2 min 51 s; `Shmem`
+flat 2.69→2.72 GB; final `MemAvailable` ~220 GB. The non-vacuity control fired
+correctly on exactly the five removed names:
+
+- `test-mmvq-q8-0-streaming-bench` — bare name dropped by `llama.cpp-u2mz`
+  (see the second forward-correction above).
+- `test-onednn-fallback`, `test-xmx-kernel-config`, `test-xmx-quant-loaders`,
+  `test-xmx-unified-kernel` — deleted by `llama.cpp-u2mz` `059d28670`
+  ("ten decorative tests and one dead registration"); each carries an in-file
+  tombstone comment at its former registration site explaining why.
+
+So the live accepted set is **45 names: 44 green + 1 designed skip**.
+`artifacts/task19/task19-names.txt` remains the historical 50-name list for the
+`772798e91` run and is deliberately unedited.
 
 `llama.cpp-szv8` is the one still open. Its own investigation established
 something worth carrying: `test-dmmv-q4-0-coalesced` **did not exercise the

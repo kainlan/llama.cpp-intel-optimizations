@@ -1,0 +1,59 @@
+# sweep50 sha=d5ac9cc5058be8b3eefd8eeac9c67c8c9f62db69 selector=UNSET(per-test-pins) 2026-08-09T02:01:14-04:00
+test-cold-start	RC0	matched=1	shmem_kb=2694744->2752872
+test-cpu-gpu-soa-interaction	RC0	matched=1	shmem_kb=2752900->2732152
+test-dmmv-q4-0-coalesced	RC0	matched=1	shmem_kb=2732152->2792348
+test-dmmv-q6k-coalesced	RC0	matched=1	shmem_kb=2792348->2880120
+test-fattn-thread-local	RC0	matched=1	shmem_kb=2880120->2859420
+test-ggml-sycl-soa	RC0	matched=1	shmem_kb=2859420->2865216
+test-layout-bytes	RC0	matched=1	shmem_kb=2865216->2879068
+test-mmq-q6k-gpu	RC0	matched=1	shmem_kb=2879068->2886984
+test-mmq-q8-0-streaming-forced	RC0	matched=1	shmem_kb=2886984->2881156
+test-mmq-q8-0-streaming-smoke	RC0	matched=1	shmem_kb=2881156->2868728
+test-mmvq-q8-0-streaming-bench	RC0	matched=0	shmem_kb=2868728->2890520
+test-mmvq-q8-0-streaming-bench	ZERO_MATCH
+test-mmvq-q8-0-streaming-smoke	RC0	matched=1	shmem_kb=2890520->2846544
+test-moe-mini-graph	RC0	matched=1	shmem_kb=2846544->2731740
+test-moe-mul-mat-id	RC0	matched=1	shmem_kb=2731740->2736996
+test-moe-mul-mat-id-q4q8	RC0	matched=1	shmem_kb=2736996->2714416
+test-mul-mat-host-streaming	RC0	matched=1	shmem_kb=2714416->2745664
+test-mxfp4-xmx-tiled	RC0	matched=1	shmem_kb=2745664->2731440
+test-onednn-fallback	RC0	matched=0	shmem_kb=2731924->2741524
+test-onednn-fallback	ZERO_MATCH
+test-onednn-woq	RC0	matched=1	shmem_kb=2741524->2722504
+test-q6k-dispatch	RC0	matched=1	shmem_kb=2722504->2718040
+test-q6k-reorder-dispatch	RC0	matched=1	shmem_kb=2718040->2716220
+test-q8-0-layout-cache-path	RC0	matched=1	shmem_kb=2716220->2711624
+test-q8-0-layout-cache-path-mmvq	RC0	matched=1	shmem_kb=2711624->2730112
+test-sycl-cpu-dispatch	RC0	matched=1	shmem_kb=2730112->2733192
+test-sycl-fattn-onednn-descriptors	RC0	matched=1	shmem_kb=2733192->2711116
+test-sycl-fattn-onednn-materialization	RC0	matched=1	shmem_kb=2711116->2708288
+test-sycl-fattn-xmx-policy	RC0	matched=1	shmem_kb=2708288->2719972
+test-sycl-kernel-selection	RC0	matched=1	shmem_kb=2720580->2710408
+test-sycl-kv-planned-device-materialization	RC0	matched=1	shmem_kb=2710408->2727012
+test-sycl-moe-expert-parallelism	RC0	matched=1	shmem_kb=2727012->2712604
+test-sycl-moe-handle-resolution	RC0	matched=1	shmem_kb=2712604->2742196
+test-sycl-moe-identity-hash	RC0	matched=1	shmem_kb=2742196->2711912
+test-sycl-moe-q8-scratch	RC0	matched=1	shmem_kb=2711912->2710336
+test-sycl-onednn-packed-cache	RC0	matched=1	shmem_kb=2710336->2734828
+test-sycl-orchestrator	RC0	matched=1	shmem_kb=2734828->2715612
+test-sycl-set-rows-owner-routing	RC0	matched=1	shmem_kb=2715612->2710736
+test-sycl-unified-cache	RC0	matched=1	shmem_kb=2710736->2737288
+test-sycl-unified-memory-e2e	RC0	matched=1	shmem_kb=2737288->2721396
+test-sycl-weight-key-stability	RC0	matched=1	shmem_kb=2721396->2709188
+test-sycl-weight-key-uniqueness	RC0	matched=1	shmem_kb=2709188->2733504
+test-sycl-xmx-unified-correctness	RC0	matched=1	shmem_kb=2733504->2720576
+test-tensor-classification	RC0	matched=1	shmem_kb=2720576->2731732
+test-tiered-dispatch	RC0	matched=1	shmem_kb=2731732->2735656
+test-unified-cache-concurrent	RC0	matched=1	shmem_kb=2735656->2718732
+test-unified-cache-integrity	RC0	matched=1	shmem_kb=2718732->2711776
+test-unified-dispatch-integration	RC0	matched=1	shmem_kb=2711776->2736664
+test-xmx-host-streaming	SKIP77(rc=0)	matched=1	shmem_kb=2736664->2714948
+test-xmx-kernel-config	RC0	matched=0	shmem_kb=2714948->2725356
+test-xmx-kernel-config	ZERO_MATCH
+test-xmx-quant-loaders	RC0	matched=0	shmem_kb=2725356->2722944
+test-xmx-quant-loaders	ZERO_MATCH
+test-xmx-unified-kernel	RC0	matched=0	shmem_kb=2722944->2721488
+test-xmx-unified-kernel	ZERO_MATCH
+SWEEP_COMPLETE 2026-08-09T02:04:05-04:00
+MemAvailable:   219786068 kB
+Shmem:           2721488 kB
