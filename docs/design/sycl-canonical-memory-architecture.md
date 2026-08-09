@@ -446,7 +446,11 @@ Keep these cases separate:
 graph replay.** The registry's acquisition and release policy in §12.3 is
 correct and unchanged. What is wrong is that
 `ggml_backend_sycl_graph_compute_unchecked()` acquires a tracked invocation on
-every path but runs the matching `submit`/`release` on only one of them.
+every path that computes, but runs the matching `submit`/`release` on only one
+of them. (Counted precisely: 16 returns sit downstream of the acquire point —
+the normal exit plus 15 early ones. Thirteen of those 15 compute and therefore
+acquire; they are the defect. The remaining two are the persistent-TG returns,
+which never call `compute_impl_unlocked()` and so never acquire.)
 
 The invocation is acquired inside `ggml_backend_sycl_graph_compute_impl()` at
 its entry (`ggml_sycl_execution_begin_graph`), i.e. on *every* call that reaches
