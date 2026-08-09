@@ -1611,6 +1611,27 @@ against their target file; those three were the only zero-hit positives.
 
 ## Batch B — STANDALONE test-target TUs (19 tests, ~1.5 h)
 
+### B1 — executed results (2026-08-09, `llama.cpp-u2mz` Phase B)
+
+All four `model-lifecycle.cpp` rows: **GREEN → RED → GREEN**, each RED with its
+pre-registered string, each restore verified (`git diff` empty, source line
+byte-identical), final full convergence build rc=0 and all four names re-green.
+ctest wraps the binary failure as **rc 8** (the c-hwhw wrap), scored on the
+printed strings per this doc's own rule:
+
+| row | RED string observed | specificity |
+|---|---|---|
+| load-txn `:668` | `rollback was not idempotent` | `sycl-lifecycle-h2-rollback-idempotence` red; **M1/M2/M3 injector tests stayed green** (the row's mandated constraint) |
+| owner-reset `:817` | `H14 repeat teardown is not OK_ALREADY_DEAD` | `sycl-lifecycle-h14` red |
+| wrapper-overlap `:169` | `BUSY reaper/destructor overlap lost wrapper semantics` | its own name red |
+| runtime-host `:100` | `BUSY destructor/reaper overlap lost or duplicated token` | its own name red |
+
+Not run: the other 41/8 sibling names per binary (the plan's full-binary
+specificity claims remain source-derived; the executed check was the targeted
+name + the injector-green constraint). Logs: session b6a72a8d scratchpad
+`b1-*.log`. The final build also refreshed `build/bin`'s fusion-noactivation
+binary to the `3fb01d4ce` oracle fix — green via ctest and direct invocation.
+
 None of these relink `libggml-sycl`; the mutated .cpp/.hpp is compiled straight
 into the test binary. Sub-batch by file — the `model-lifecycle.cpp` group of
 four is the single best value in the whole plan.
