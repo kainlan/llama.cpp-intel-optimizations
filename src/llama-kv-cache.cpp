@@ -37,6 +37,14 @@ struct llama_kv_cache_sycl_mask_handoff {
     ggml_backend_dev_t        dev        = nullptr;
     uint64_t                  handoff_id = 0;
 
+    // Non-copyable (owns a handoff id): a copy would carry the same id and
+    // cancel it twice. That is currently absorbed by the callee -- a second
+    // cancel finds nothing to erase -- but relying on that makes the
+    // single-cancel invariant an accident of the callee rather than a property
+    // of this type. Deleting copy also suppresses the implicit move.
+    llama_kv_cache_sycl_mask_handoff(const llama_kv_cache_sycl_mask_handoff &)             = delete;
+    llama_kv_cache_sycl_mask_handoff & operator=(const llama_kv_cache_sycl_mask_handoff &) = delete;
+
     ~llama_kv_cache_sycl_mask_handoff() {
         if (hooks.cancel_mask && handoff_id != 0) {
             hooks.cancel_mask(dev, handoff_id);
