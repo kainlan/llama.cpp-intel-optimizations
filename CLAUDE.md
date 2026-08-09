@@ -78,8 +78,12 @@ ctest --test-dir build --output-on-failure -j 1 \
       -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
-#    a subagent or background task.
-ctest --test-dir build -L residency --output-on-failure -j 1
+#    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT
+#    'residency': after the llama.cpp-vrko relabel (2026-08-09) zero tests
+#    carry 'residency', so `-L residency` selects nothing and passes vacuously.
+#    Verify the selection is non-empty before trusting the run:
+#    `ctest --test-dir build -N -L 'cache|mem-handle'` must list >= 1 test.
+ctest --test-dir build -L 'cache|mem-handle' --output-on-failure -j 1
 
 # Run a single test by name
 ctest --test-dir build -R <test-name> -V
