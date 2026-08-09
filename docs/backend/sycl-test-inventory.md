@@ -1632,6 +1632,41 @@ name + the injector-green constraint). Logs: session b6a72a8d scratchpad
 `b1-*.log`. The final build also refreshed `build/bin`'s fusion-noactivation
 binary to the `3fb01d4ce` oracle fix — green via ctest and direct invocation.
 
+### B2 chunk 1 — executed results (2026-08-09): 5/5 GREEN → RED → GREEN
+
+All five RED strings byte-matched their pre-registered rows (gpu-arch anchors
+one line later, `:85` — the known compiler/line-drift class):
+
+| row | RED observed |
+|---|---|
+| gpu-arch `:89` | `FAIL: ...test-gpu-arch.cpp:85: B70 name must fall back to ARC_BATTLEMAGE, not ARC_ALCHEMIST` |
+| gpu-arch `:63` | `FAIL: ...test-esimd-dpas-gate.cpp:112: Battlemage architecture must classify as ARC_BATTLEMAGE` |
+| cold-start `:134` | `FAIL: A580 should use tile_m=32` + `Results: 4 passed, 1 failed` |
+| moe-scratch-admission `:79` | `FAIL: over-plan-request-is-refused: ... (allowed=1 reason=allowed)` |
+| mmvq-launch-geometry `:58` | `FAIL: already-aligned-shapes-are-unchanged: aligned row count 16 must pad to itself` |
+
+⚠️ **The first attempt VOIDED four of these rows on this ticket's own first
+trap.** A fresh hand-written runner queried ctest by BINARY name; four of the
+five register under different ctest names, `ctest -R` exited 0 on zero matches,
+and rc=0 on the mutated builds read as "mutation survived" — while nothing ran,
+baselines included. The recompile-and-relink evidence was checked and healthy,
+which made the void look like four decorative tests. Caught by reading one run
+log ("No tests were found!!!"). The re-run runner carries the task19
+`matched=` counter and a ZERO_MATCH tripwire; every future batch runner must
+be adapted from a hardened runner, never written from recall.
+
+**Binary → ctest name map for this chunk** (the plan tables list binary
+names; use these with `-R`): `test-gpu-arch` → `gpu-arch`;
+`test-esimd-dpas-gate` → `esimd-dpas-gate`; `test-cold-start` →
+`test-cold-start` (1:1); `test-moe-scratch-admission` →
+`sycl-moe-scratch-admission` (+ `sycl-pp-moe-scratch-admission-contract`);
+`test-mmvq-launch-geometry` → `sycl-mmvq-launch-geometry`
+(+ `sycl-mmvq-launch-geometry-contract`). The `-contract` siblings ran red
+under mutation with their primaries (matched=2); final re-green executed the
+primaries, the siblings' green following from binary identity after the
+restore build. Logs: `b2a-*.log` (first attempt, void rows retained as the
+record of the trap) and `b2b-*.log` (the counting re-run).
+
 None of these relink `libggml-sycl`; the mutated .cpp/.hpp is compiled straight
 into the test binary. Sub-batch by file — the `model-lifecycle.cpp` group of
 four is the single best value in the whole plan.
