@@ -182,7 +182,11 @@ def test_runtime_bundle4_materializer_is_env_gated_and_fail_closed() -> None:
     assert "XMX tiled bundle4 fill invalid metadata" in metadata_guard
     assert "throw std::runtime_error(\"XMX tiled bundle4 invalid metadata\")" in metadata_guard
 
-    fill = slice_between(sycl, "if (ctx->bundle4)", "const size_t expert_bytes = ctx.bundle4")
+    # c3bfd71c4 reflowed the end marker across two lines ("const size_t expert_bytes
+    # =\n    ctx.bundle4 ? ..."), which is pure clang-format drift -- the statement
+    # is unchanged. Bound the slice on the enclosing function instead of on a line
+    # whose spelling belongs to the formatter (llama.cpp-pp72).
+    fill = slice_between(sycl, "if (ctx->bundle4)", "ggml_sycl_fill_xmx_tiled_host_cpu(void *")
     assert "ggml_sycl_xmx_tiled_bundle4_bytes_for_info" in fill
     assert "XMX tiled bundle4 fill invalid shape/size" in fill
     assert "throw std::runtime_error(\"XMX tiled bundle4 invalid shape/size\")" in fill

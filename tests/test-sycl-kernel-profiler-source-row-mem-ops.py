@@ -105,8 +105,17 @@ def test_mem_ops_fill_submit_is_named_bracketed_and_preserves_deps() -> None:
     assert "__builtin_LINE()" in body
     assert "__builtin_FUNCTION()" in body
     assert "file, line, function" in body
-    assert "ggml_sycl_memcpy_profile_submit" in body
+    # 756da8b63 ("sycl: close packed-K fill and teardown gaps") expanded the
+    # ggml_sycl_memcpy_profile_submit wrapper inline here so the fill's accepted
+    # event is captured before the profiler bookkeeping -- which may throw -- runs.
+    # The direct queue.submit is now the intended shape, so the wrapper needle and
+    # its "no raw submit" companion are re-anchored on the label, the record call
+    # and the order between them, which carry the same property (llama.cpp-pp72).
+    assert "make_memcpy_profile_label(" in body
+    assert "ggml_sycl_kernel_profile_record_event(" in body
     assert "add_deps(cgh, deps)" in body
     assert "cgh.memset(ptr, value, size)" in body
-    assert "queue.submit" not in body
+    assert body.count("queue.submit") == 1  # exactly one submit, and it is the profiled one
+    assert body.index("queue.submit") < body.index("ggml_sycl_kernel_profile_record_event(")
+    assert "catch (...)" in body
     assert "ggml_sycl_profile_record_returned_event" not in body

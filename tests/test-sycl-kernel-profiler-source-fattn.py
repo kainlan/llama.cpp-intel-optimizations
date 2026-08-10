@@ -30,7 +30,15 @@ def test_fattn_major_submits_have_named_profile_labels() -> None:
         "static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update",
         "}  // namespace",
     )
-    assert "ggml_sycl_profile_submit(*stream" in set_rows
+    # e07bfa26c ("sycl: publish packed-K accepted events before profiling") expanded
+    # the ggml_sycl_profile_submit wrapper inline here, so the accepted event can be
+    # handed to the sidecar owner before the profiler bookkeeping -- which may throw
+    # -- runs. The label/record property the wrapper provided is unchanged; it is
+    # now spelled as the explicit label plus record call (llama.cpp-pp72).
+    assert 'profile_label.name' in set_rows
+    assert '"fattn.xmx_pack_k_set_rows"' in set_rows
+    assert "ggml_sycl_kernel_profile_record_event(" in set_rows
+    assert "__builtin_FILE()" in set_rows
     assert "cgh.depends_on(set_rows_event)" in set_rows
     assert ".wait(" not in set_rows
 
@@ -40,7 +48,10 @@ def test_fattn_major_submits_have_named_profile_labels() -> None:
         "static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer",
     )
     assert "fattn.pack" in pack_body
-    assert "ggml_sycl_profile_submit(*stream" in pack_body
+    # Inlined by the same commit, for the same reason as the set_rows helper above.
+    assert "profile_label.name" in pack_body
+    assert "ggml_sycl_kernel_profile_record_event(" in pack_body
+    assert "__builtin_FILE()" in pack_body
     assert "cgh.depends_on(zero_event)" in pack_body
     assert ".wait(" not in pack_body
 

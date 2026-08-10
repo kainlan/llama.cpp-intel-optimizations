@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,7 +9,14 @@ PROBE_MAIN = ROOT / "tools/sycl-source-line-probe/main.cpp"
 
 def test_source_line_probe_is_registered_only_for_sycl_tools() -> None:
     text = TOOLS_CMAKE.read_text(encoding="utf-8")
-    sycl_block = text[text.index("if (GGML_SYCL)") : text.index("endif()", text.index("if (GGML_SYCL)"))]
+    # The guard was narrowed, not removed: bdc576c1c (llama.cpp-o6tf) turned
+    # `if (GGML_SYCL)` into `if (GGML_SYCL AND NOT GGML_BACKEND_DL)`, so a literal
+    # match on the old condition reported the registration as ungated when it had
+    # in fact become MORE restrictive. Match the opening of the condition and let it
+    # keep growing (llama.cpp-pp72).
+    guard = re.search(r"^\s*if \(GGML_SYCL\b[^)]*\)", text, re.MULTILINE)
+    assert guard is not None, "tools/CMakeLists.txt has no GGML_SYCL guard"
+    sycl_block = text[guard.start() : text.index("endif()", guard.start())]
     assert "add_subdirectory(sycl-source-line-probe)" in sycl_block
 
 

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +95,12 @@ def test_compute_impl_guard_records_timeline_scopes_around_bcs_and_dma_drains() 
 
 def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_replay() -> None:
     src = read_source()
-    begin = src.index("const char * ptr_table_reject = nullptr;")
+    # c3bfd71c4 vertically aligned this declaration ("ptr_table_reject        ="),
+    # which is pure clang-format drift -- the declaration itself is unchanged. Match
+    # it without depending on the formatter's column choice (llama.cpp-pp72).
+    decl = re.search(r"const char \* ptr_table_reject\s+= nullptr;", src)
+    assert decl is not None, "moe sequence graphlet ptr_table_reject declaration not found"
+    begin = decl.start()
     invalidate_call = "sycl_ctx->invalidate_moe_sequence_graphs();"
     end = src.index(invalidate_call, begin) + len(invalidate_call)
     sequence_graphlet = src[begin:end]

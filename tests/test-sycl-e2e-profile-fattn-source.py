@@ -54,7 +54,14 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     end = src.index("void ggml_sycl_fattn_xmx_unregister_packed_k_range", begin)
     body = src[begin:end]
     handle = body.index("packed.handle = ggml_sycl::mem_handle::from_owned_alloc")
-    event_update = body.index("packed.ready_event = update_event")
+    # The ready event is published by the submit helper through its accepted-event
+    # out-parameter, not by an assignment after the call: e07bfa26c ("sycl: publish
+    # packed-K accepted events before profiling") moved the publication inside the
+    # helper so the owner sees the accepted event before any bookkeeping that can
+    # throw. That is strictly earlier than the old `packed.ready_event =
+    # update_event`, so the ordering asserted below still holds -- only the text
+    # carrying it moved (llama.cpp-pp72).
+    event_update = body.index("&packed.ready_event)")
     record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV")
     record_gate = body.rindex("if (ggml_sycl::e2e_tg_profile_enabled())", 0, record)
     record_gate_close = matching_brace(body, body.index("{", record_gate))
