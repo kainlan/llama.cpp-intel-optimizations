@@ -2197,6 +2197,58 @@ be vacuous; see Batch H record).
 
 `Shmem` flat across all chunks; trees restored clean after each.
 
+### Post-battery fix round (2026-08-10): the two cannot-fail findings and the coverage-drift pair, resolved
+
+The four tickets the batteries filed were all executed to the u2mz standard in
+the same program push, each with GREEN + RED hardware proofs and full review
+chains (evidence on the tickets):
+
+- **`llama.cpp-fuxy`** — the packed-K #107 baseline red was a born self-deadlock
+  (watchdog 30000 ms), which was *masking* an unreachable 65/64 assertion; both
+  fixed test-side; all five checkpoints green ~1-1.5 s. Byproduct: `llama.cpp-2bnd`.
+- **`llama.cpp-v9ue`** — the mini-graph skip-pass had two causes (FAIL laundered
+  to SKIP rc 0; a structurally unsatisfiable pinned-entry assertion). Fixed with
+  tri-state outcomes + exit-77 skips + a 3-pass warmup/record/replay loop. The
+  `:37606` scale mutation reddens at nmse=3.784722e-03 (1.01⁶ arithmetic held to
+  three figures); `dequantize.hpp:294` is confirmed unreached on this path —
+  that Batch H row's final disposition. Open: `llama.cpp-tott` (exec_graph=0).
+- **`llama.cpp-vexg`** — ⚠️ **RENAME**: `test-sycl-onednn-packed-cache` is now
+  **`test-sycl-onednn-pack-m-propagation`** (ctest #148). The old test's subject
+  machinery no longer exists in production (`ensure_cached_layout` removed at
+  38c02b099/b8afde8e9; zero producers of ONEDNN_PACKED entries — see
+  `llama.cpp-pdit`), and its "AoS evicted" PASS line was unfalsifiable
+  (`is_cached` probes the direct-stage key first; S1-PRELOAD always direct-stages
+  registered host weights as AoS). The retargeted test stages via the sanctioned
+  seam inside a load bracket and asserts pack_m propagation with a
+  mode/data_ptr non-vacuity control; the `:27342`-era pack_m sign-flip reddens
+  byte-exact (`FAIL: expected onednn pack_m=32, got=0`). **Every earlier row in
+  this document naming `test-sycl-onednn-packed-cache` (lines ~93, 166, 263,
+  426, 551, 2135, 2165, 2920) is historical record of the old test and stays
+  verbatim per this doc's append-only rule; this paragraph is the successor
+  record.**
+- **`llama.cpp-ug4p`** — the q6k coalesced kernel is EXONERATED (host
+  transcription predicted all eight GPU max_diffs to ~1.7e-5, twice); the
+  original 8192x128 failure was the forced kernel being DECLINED — bare
+  `"weight"` name → UNKNOWN usage → SOA materialization; the test's dispatch-time
+  override never touched materialization (`get_with_override`'s "override" is an
+  unrelated env knob — the override-binds-on-one-axis class, mechanism named).
+  Rebound via production naming; two-sided kernel-identity gate (layout
+  assertion + controlled log probe, record-not-act so neither masks the other);
+  the tile-stride mutation reddens exactly the four multi-tile cases
+  (errors=8/110/8/27) and the bare-name resurrection fires both refusal
+  findings (`layout_refusal=1 blas_fallback=1`). The sqrt(ncols) tolerance is
+  load-bearing (32768x32 measured 0.728566 > the old fixed 0.5). Byproducts:
+  `llama.cpp-dqbc` (P1→P2: deterministic row-127 corruption on the generic BLAS
+  fallback at nrows=128 — deliberately ticketed before the rebind made it
+  invisible), `llama.cpp-95x2` (unreachable variable-tile machinery).
+
+Grep-probe lesson consolidated from this round: one fallback grep was void
+THREE separate ways before it was valid — INFO-level lines dropped at default
+verbosity in the pre-probe log, the probe itself eating INFO in the post-probe
+log, and the pattern (`fallback graph`) not being a contiguous substring of the
+actual literal (`CPU fallback executing graph`). Scored only after switching to
+an unconditional-WARN positive control (`[SYCL] Device N alloc caps:`).
+
 ---
 
 # REMEDIATION PASS (2026-08-08) — what was executed against the three trailing groups
