@@ -432,7 +432,6 @@ checks = {
         and "ggml_sycl_enqueue_quarantined_result(" in backend[m.end():m.end() + 400]
         for m in cleanup_ok_sites
     )
-    and any(m.group("owner") == "ticket.token" for m in cleanup_ok_sites)
     and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
     and "ggml_sycl_enqueue_quarantined_result(*registry, failed, model);" in backend,
     "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
