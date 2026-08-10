@@ -2138,6 +2138,65 @@ mock can fail. They moved to the mock/deletion bucket.
 | `test-tiered-dispatch` | `tiered-plan-clear.hpp:13` `if (!has_plan \|\| !multi_device)` → `\|\| multi_device` | MEGA (sole includer is `ggml-sycl.cpp:320`) | GPU (3 load-bracket transactions, no GGUF) | COUNT `%d tiered-dispatch check(s) failed` / `All tiered-dispatch checks passed`; returns **77** for both skips | `FAIL: single-device plan was reported as cleared`, `FAIL: single-device plan was cleared`, `FAIL: completed multi-device plan was not cleared`, the three `PASS: <label>` placement lines, `3 tiered-dispatch check(s) failed`, rc 1 | 3 of 5 contract checks fire and the whole (expensive) placement half stays green — a precise count signal. Every alternative target lives in `ggml-sycl.cpp` anyway, so **batch this with the KV-materialization row**. |
 | `test-moe-discovery-owner-state` | `moe-discovery-state.hpp:57` `key.slot < moe_discovery_max_owners && key.slot_generation != 0;` → drop the generation clause | header is MEGA-reaching, **but this test target links only `Threads::Threads`** — `ninja test-moe-discovery-owner-state` rebuilds one file | DEVICE-FREE-THREADS | COUNT `moe discovery owner state: PASS (15 cases)` | `FAIL: invalid-owner-is-inert: a slot with no generation was accepted as an owner identity`, rc 1, PASS line absent | **Build only the test target** and this becomes a Batch-B-class cost. Its fixture is a recording stand-in for the process globals, but the registry under test is production. |
 
+### Batch I — executed results (2026-08-10, `llama.cpp-u2mz` Phase B): 17 proven, 2 coverage-drift VOIDs, 1 cannot-fail, full disposition of all 23 rows
+
+Three chunks, lead-serial. Chunk A (10 CPU/device-free rows) and chunk B
+(8 GPU rows, 7 builds — the kv-planned + tiered-dispatch pairing per this
+table's own note) ran in the `-O1` tree; chunk C (the two nmse rows) in the
+`-O3` `build/` tree. Anchor drift was pervasive post-2dgc (~+430 lines above
+:8000; every site re-located by content before mutation). Logs: session
+scratchpad `bi-*.log` / `bib-*.log` / `bic-*.log`.
+
+**Chunk A — 10/10 RED-fired, every tail byte-exact**, including the three
+file:line cites (`:161`, `:187`, `:939`), the `test-tensor-placement` bare
+assert (`Assertion 'ggml_sycl_classify_tensor("blk.10.ffn_down.weight") == 0'
+failed`, at its actual `:31`), the expert-parallelism `6/7` count, and the
+four header rows (`bias-owner-state`, `worker-reset` — ctest name
+`sycl-moe-worker-reset` — `discovery-owner-state` as a cheap single-target
+build, and `device-uuid-api` — ctest name `sycl-device-uuid-api`).
+
+**Chunk B — 6/8 clean REDs + 1 cannot-fail + 1 covered pairing**: integrity
+(`Failed to cache layout for type=2 idx=0`), kv-planned (`cache_k_l1 smart
+handle for planned device 1 must resolve`), tiered-dispatch (all three FAILs
++ `3 tiered-dispatch check(s) failed`, byte-exact), soa-interaction (reach
+proven FIRST via `--corrupt-post-copy` → rc 1 with both control markers, then
+`Results: 5 passed, 1 failed`), layout-bytes (`expected 340, got 360`),
+kernel-selection (`5/6`), orchestrator (`4/5`).
+⚠️ `test-sycl-onednn-packed-cache` is the row this table called the worst
+false-green in the population, and that warning is now a proven fact:
+rc=0 in BOTH states; direct pinned run ends `SKIP: failed to cache AoS
+layout` rc 0 — the fixture's precondition fails before the subject is ever
+reached, so every historical green was a skip-pass. Filed **`llama.cpp-vexg`**
+(fourth member of the cannot-fail class); the `:27342` mutation re-runs after
+that fix.
+Green-guard note: the guards grepped ctest logs of *passing* runs, which
+`--output-on-failure` leaves empty — they read 0 vacuously. Harmless here
+(the REDs themselves prove reach), but the guard belongs on a direct run or
+LastTest.log, not the ctest capture.
+
+**Chunk C — both registered mutations SURVIVED for coverage-drift reasons;
+filed `llama.cpp-pwvf`**, and neither is harness vacuity:
+`test-mul-mat-host-streaming`'s sliced path is unreached at HEAD (valid
+control: `GGML_SYCL_DEBUG=1 GGML_SYCL_MUL_MAT_STREAM_DEBUG=1` → zero
+`[MUL_MAT_STREAM]` lines; the first control lacked `GGML_SYCL_DEBUG=1` and
+was itself void — the print is a `GGML_SYCL_DEBUG` macro line, exactly the
+empty-probe trap). `rms-norm-mul-add-broadcast` runs all 6 checks live
+(max_err 2.384e-07, both root-cause view-offset cases included) yet passes
+with the `:77829` guard arm bypassed — the guard is redundant belt or fusion
+is declined earlier; the mutation is obsolete either way.
+
+**Non-executed rows, all dispositioned**: `test-cross-model-weight-usage` —
+**satisfied by the x3ou re-proof** (this doc's x3ou section: symmetric-revert
+RED = exactly check 5, `=== 14 checks, 1 failures ===`, on hardware — the
+binary's capacity to fail is proven by a production mutation; no additional
+mega-TU build spent). `test-xmx-moe-mxfp4` — BLOCKED on
+`GGML_SYCL_BUILD_XMX_TESTS` (unchanged). `test-sycl-module-dlopen` — BLOCKED
+on `GGML_BACKEND_DL` (unchanged). `test-moe-mini-graph` MEGA-TU fallback
+(`:37186`-era) — deferred behind **`llama.cpp-v9ue`** (running it today would
+be vacuous; see Batch H record).
+
+`Shmem` flat across all chunks; trees restored clean after each.
+
 ---
 
 # REMEDIATION PASS (2026-08-08) — what was executed against the three trailing groups
