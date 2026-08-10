@@ -152,6 +152,16 @@ static bool test_fast_path_returns_cached_pointer(sycl::queue & q) {
     );
     TEST_ASSERT(cached_ptr != nullptr, "ensure_cached should return non-null pointer");
 
+    // ensure_cached() stages the payload with an ASYNC H2D copy and publishes the
+    // entry immediately, carrying the still-in-flight copy as the entry's
+    // ready_event.  try_get_cached_fast() may miss while a staging copy is in
+    // flight -- it hands back a raw pointer and so cannot carry the event
+    // dependency, and callers re-stage on a miss.  This test asserts the
+    // POST-SETTLEMENT hit, so settle the copy first.  Without this wait the
+    // assertion below is a race that happens to pass at -O1 and fail at -O3
+    // (llama.cpp-pp72).
+    q.wait();
+
     // Now call try_get_cached_fast() - should return the same pointer
     void * fast_ptr = cache.try_get_cached_fast(id, GGML_LAYOUT_AOS);
     TEST_ASSERT(fast_ptr != nullptr, "try_get_cached_fast should return non-null for cached entry");
