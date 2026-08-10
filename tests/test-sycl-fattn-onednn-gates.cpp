@@ -72,9 +72,11 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
@@ -414,34 +416,61 @@ static bool test_materialization_descriptor_rejects_unsupported_layout() {
 //
 // It cannot pass vacuously: not finding the file, or not finding the compile
 // site it anchors on, is a FAIL, not a skip.
+//
+// The locator is the candidate_roots()/join_path() idiom already used by five
+// source-reading tests in this directory (test-sycl-moe-direct-final-scratch-
+// plan.cpp and siblings): LLAMA_CPP_REPO_ROOT override first, then the repo
+// root recovered from this TU's compile-time __FILE__, then cwd guesses last.
+// The __FILE__ anchor is what makes the invocation directory irrelevant, which
+// matters because this target is install()ed and so gets run from arbitrary
+// cwds. One deliberate deviation from the siblings: they std::exit(1) when the
+// file cannot be read, which here would skip the remaining fifteen gates and
+// the summary line, so this returns false through TEST_ASSERT instead.
 // ---------------------------------------------------------------------------
-static std::string find_fattn_onednn_source() {
-    static const char * rel = "ggml/src/ggml-sycl/fattn-onednn.cpp";
-    std::string         prefix;
-    for (int up = 0; up < 8; ++up) {
-        const std::string cand = prefix + rel;
-        std::ifstream     f(cand);
-        if (f.good()) {
-            return cand;
+static std::string join_path(const std::string & root, const char * rel) {
+    if (root.empty() || root == ".") {
+        return rel;
+    }
+    return root.back() == '/' ? root + rel : root + "/" + rel;
+}
+
+static std::vector<std::string> candidate_roots() {
+    std::vector<std::string> roots;
+    if (const char * env = std::getenv("LLAMA_CPP_REPO_ROOT")) {
+        roots.emplace_back(env);
+    }
+    const std::string source_file = __FILE__;
+    const std::string suffix      = "/tests/test-sycl-fattn-onednn-gates.cpp";
+    const size_t      pos         = source_file.rfind(suffix);
+    if (pos != std::string::npos) {
+        roots.emplace_back(source_file.substr(0, pos));
+    }
+    roots.emplace_back(".");
+    roots.emplace_back("..");
+    roots.emplace_back("../..");
+    roots.emplace_back("../../..");
+    return roots;
+}
+
+static std::string read_source_file(const char * rel) {
+    for (const std::string & root : candidate_roots()) {
+        std::ifstream in(join_path(root, rel), std::ios::binary);
+        if (!in.good()) {
+            continue;
         }
-        prefix += "../";
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
     }
     return std::string();
 }
 
 static bool test_source_contract_partition_split_is_refused() {
-    // ctest runs this from the build tree and a manual run from the repo root;
-    // both sit under the checkout, so walking up finds the source.
-    const std::string path = find_fattn_onednn_source();
-    TEST_ASSERT(!path.empty(),
-                "could not locate ggml/src/ggml-sycl/fattn-onednn.cpp from the working directory -- this check must "
-                "not report the contract satisfied when it never read the file");
-
-    std::ifstream     in(path, std::ios::binary);
-    std::stringstream buf;
-    buf << in.rdbuf();
-    const std::string src = buf.str();
-    TEST_ASSERT(src.size() > 1000, "fattn-onednn.cpp read back empty or truncated");
+    const std::string src = read_source_file("ggml/src/ggml-sycl/fattn-onednn.cpp");
+    TEST_ASSERT(!src.empty(),
+                "could not read ggml/src/ggml-sycl/fattn-onednn.cpp from any candidate root -- this check must not "
+                "report the contract satisfied when it never read the file");
+    TEST_ASSERT(src.size() > 1000, "fattn-onednn.cpp read back truncated");
 
     const size_t compile_at = src.find("parts[0].compile(");
     TEST_ASSERT(compile_at != std::string::npos,
