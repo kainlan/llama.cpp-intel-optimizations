@@ -60,12 +60,21 @@
 //
 // A fifth red case, or a different four, is a real finding: it means something
 // other than that one predicate moved.
+//
+// That four-red contract is unchanged by
+// test_source_contract_partition_split_is_refused (llama.cpp-mrld), the one case
+// here that is not a planner call: it reads no environment variable and does not
+// invoke the planner, so it answers the same in all three env states. If it goes
+// red it is a real finding in every state.
 // ---------------------------------------------------------------------------
 
 #include "ggml-sycl/fattn.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
@@ -384,8 +393,76 @@ static bool test_materialization_descriptor_rejects_unsupported_layout() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Source contract: the oneDNN SDPA compile site must refuse a split partition.
+//
+// This is a SOURCE-CONTRACT assertion, not a behavioural one, and the difference
+// matters. build_and_compile_sdpa is static, needs a dnnl::engine and a live
+// SYCL queue, and the partition count is decided by oneDNN's pattern matcher --
+// none of which this host-only binary has. Nor can a test ASK oneDNN to decline
+// fusion: whether the pattern splits depends on the operand layouts the matcher
+// happens to reject, which is exactly the thing nobody has managed to trigger
+// (llama.cpp-mrld was found by reading, not by a failing run). So a behavioural
+// test here would have to fake the split, which would prove only that the fake
+// works. It reads the working-tree source instead, which pins the guard against
+// deletion during a refactor -- the realistic way this fix gets lost.
+//
+// What it therefore does NOT establish: that the LOADED libggml-sycl.so carries
+// the guard. It asserts a property of the checkout at test-run time, not of the
+// artifact. A GPU test that observes the fallback actually happening is the
+// missing piece and needs a shape that provably splits the partition.
+//
+// It cannot pass vacuously: not finding the file, or not finding the compile
+// site it anchors on, is a FAIL, not a skip.
+// ---------------------------------------------------------------------------
+static std::string find_fattn_onednn_source() {
+    static const char * rel = "ggml/src/ggml-sycl/fattn-onednn.cpp";
+    std::string         prefix;
+    for (int up = 0; up < 8; ++up) {
+        const std::string cand = prefix + rel;
+        std::ifstream     f(cand);
+        if (f.good()) {
+            return cand;
+        }
+        prefix += "../";
+    }
+    return std::string();
+}
+
+static bool test_source_contract_partition_split_is_refused() {
+    // ctest runs this from the build tree and a manual run from the repo root;
+    // both sit under the checkout, so walking up finds the source.
+    const std::string path = find_fattn_onednn_source();
+    TEST_ASSERT(!path.empty(),
+                "could not locate ggml/src/ggml-sycl/fattn-onednn.cpp from the working directory -- this check must "
+                "not report the contract satisfied when it never read the file");
+
+    std::ifstream     in(path, std::ios::binary);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    const std::string src = buf.str();
+    TEST_ASSERT(src.size() > 1000, "fattn-onednn.cpp read back empty or truncated");
+
+    const size_t compile_at = src.find("parts[0].compile(");
+    TEST_ASSERT(compile_at != std::string::npos,
+                "no parts[0].compile( site in fattn-onednn.cpp -- this check has lost its anchor and proves nothing");
+    TEST_ASSERT(src.find("parts[0].compile(", compile_at + 1) == std::string::npos,
+                "more than one parts[0].compile( site: the guard asserted below covers only the first");
+
+    const size_t guard_at = src.find("if (parts.size() != 1)");
+    TEST_ASSERT(guard_at != std::string::npos,
+                "no `if (parts.size() != 1)` guard before the oneDNN SDPA compile: if oneDNN declines to fuse the "
+                "pattern, out_ports[0] binds the softmax-probs intermediate into params.dst and overruns it");
+    TEST_ASSERT(guard_at < compile_at, "the partition-count guard must precede parts[0].compile(, not follow it");
+    TEST_ASSERT(src.find("throw", guard_at) < compile_at,
+                "the partition-count guard must fail closed (throw, which the caller turns into a native-FA "
+                "fallback) before the compile -- warning and continuing still binds the wrong tensor");
+    return true;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_source_contract_partition_split_is_refused();
     ok &= test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible();
     ok &= test_gqa_nc_stride_equal_d_remains_onednn_eligible();
     ok &= test_planner_direct_mha_contiguous();

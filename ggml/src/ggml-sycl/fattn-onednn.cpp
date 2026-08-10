@@ -14,6 +14,7 @@
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
+#    include <string>
 
 using namespace dnnl::graph;
 using lt       = logical_tensor;
@@ -775,6 +776,27 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     auto parts = sdpa_graph.get_partitions();
     if (parts.empty() || !parts[0].is_supported()) {
         throw std::runtime_error("oneDNN SDPA: no supported partition");
+    }
+    // Single-partition fusion is a PRECONDITION of the port binding below, not
+    // an optimisation. `in_ports`/`out_ports` describe the whole graph's
+    // boundary and the execute path binds out_ports[0] to params.dst. If oneDNN
+    // declines to fuse the pattern it hands back several partitions, and the
+    // leading one is then only a fragment whose output is an intermediate --
+    // the softmax probabilities, ne11 wide rather than D wide. Binding that to
+    // dst writes far past the end of the destination buffer (~32 MiB into
+    // 8 MiB at Mistral pp512) and oneDNN reports no error, so the failure is a
+    // silent device-memory overwrite. Refuse instead: this throw is caught by
+    // the caller, which negative-caches the shape and returns false so native
+    // FA handles it. Nothing is allocated or compiled before this point, so the
+    // throw path has nothing to release. Kept fail-closed rather than
+    // best-effort because a wrong bind cannot be detected downstream.
+    //
+    // tests/test-sycl-fattn-onednn-gates.cpp pins this guard by source contract
+    // (it cannot build a multi-partition graph host-side) and matches the
+    // condition text literally -- rewording the expression will fail that test.
+    if (parts.size() != 1) {
+        throw std::runtime_error("oneDNN SDPA: pattern split into " + std::to_string(parts.size()) +
+                                 " partitions; single-partition fusion is required");
     }
     // Collect input ports in execution order: Q, K, scale, [mask], V
     std::vector<lt> in_ports;
