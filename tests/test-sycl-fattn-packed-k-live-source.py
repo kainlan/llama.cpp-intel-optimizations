@@ -355,6 +355,10 @@ def replace_in_section(source: str, begin: str, end: str, old: str, new: str, oc
     return source[:start] + body.replace(old, new, occurrence) + source[stop:]
 
 
+# RULE: every CMakeLists.txt mutation added below must route through one of the
+# next two helpers -- never a bare CMAKE.replace(old, new, 1), which picks its
+# target by file position and so silently retargets to an unrelated block, or
+# no-ops entirely, as soon as the occurrence count moves (llama.cpp-2bnd).
 def replace_in_packed_k_block(source: str, old: str, new: str, occurrence: int = 1) -> str:
     """Mutate CMakeLists.txt strictly inside the packed-K registration block.
 
@@ -771,8 +775,9 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     assert v_write_mutated != LIVE
     assert not live_contract(v_write_mutated)
 
-    # Both block-scoped literals below occur more than once file-wide, so each
-    # must be anchored to the packed-K block rather than to the first hit.
+    # A new CMake mutation goes here via replace_in_packed_k_block / replace_unique,
+    # never a bare CMAKE.replace(..., 1) -- see the RULE at those helpers. Both
+    # block-scoped literals below occur more than once file-wide (llama.cpp-2bnd).
     assert not cmake_contract(replace_unique(CMAKE, GUARD, "if (TRUE)"))
     assert not cmake_contract(replace_in_packed_k_block(CMAKE, "endforeach()\nendif()", "endforeach()"))
     assert not cmake_contract(
