@@ -680,6 +680,29 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Source contract for the tracked-execution abort/drain path. It existed
+    # unregistered since the abort work and so had never run in CI; llama.cpp-2dgc
+    # is exactly the defect it is shaped to catch (a begin/submit/release ordering
+    # invariant that no GPU-free test can reach at run time), so it is wired up
+    # here rather than left to be run by hand.
+    #
+    # llama_test_cmd rather than llama_test_pytest: a plain script with top-level
+    # checks, not pytest test_ functions (see llama_test_pytest's doc comment).
+    #
+    # Host-only -- reads sources, builds nothing, loads no model, touches no
+    # device. Labels deliberately avoid residency/mem-handle/cache so the
+    # documented `-LE` throttled sweep still runs it.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-execution-abort-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-execution-abort-source.py
+    )
+    set_tests_properties(test-sycl-execution-abort-source PROPERTIES
+        LABELS "sycl;execution;policy"
+        TIMEOUT 120
+    )
+
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         NAME test-sycl-decode-timeline-profile-script

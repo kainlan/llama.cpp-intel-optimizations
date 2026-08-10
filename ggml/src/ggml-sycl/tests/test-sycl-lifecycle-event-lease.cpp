@@ -105,6 +105,37 @@ static void h8() {
     require(reg.begin_invocation(b,sb,eb,gb,rb,d,1,p,1,37,&ib)==error::OK, "H8 did not recover after event release");
 }
 
+// H8's owner-side companion (llama.cpp-2dgc). H8 covers a COMPETING context
+// after a submit-only exit; this covers the one that shipped broken -- a single
+// context computing twice with no ggml_backend_sycl_synchronize() between, which
+// is what test-llama-archs does. Post-submit the graph is COMPLETE with the
+// invocation still held, and every route out is closed: the owner's OWN next
+// begin_graph is BUSY, and retire_graph is BUSY too while the invocation lives,
+// so nothing short of an explicit release moves it.
+//
+// The backend's fix is exactly the release+retire below, run from the owner's
+// next begin. What this host-only harness cannot observe is the queue wait that
+// precedes the release and makes it legal -- that ordering is covered by
+// tests/test-sycl-execution-abort-source.py and by the on-device probe.
+static void h8b() {
+    Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H8b create failed");
+    require(reg.bind_backend(ctx,2)==error::OK, "H8b bind failed");
+    SessionId s{}; SessionResetEpoch e{}; auto root = root_token(82); require(reg.attach_root(ctx, root, &s, &e)==error::OK, "H8b attach failed");
+    GraphEpoch g{}; GraphEpoch g2{}; InvocationId i{}; InvocationId i2{}; const int d[] = {2}; const int p[] = {39}; snapshot snap{};
+    require(reg.begin_graph(ctx,s,e,root,&g)==error::OK && reg.begin_invocation(ctx,s,e,g,root,d,1,p,1,39,&i)==error::OK, "H8b invoke failed");
+    require(reg.seal_invocation(ctx,s,e,g,i,root)==error::OK, "H8b seal failed");
+    require(reg.submit_invocation(ctx,s,e,g,i,root,39)==error::OK, "H8b submit failed");
+    require(reg.extract(ctx,&snap)==error::OK && snap.graph_state==graph_phase::COMPLETE && snap.invocation.value==i.value && snap.busy_device_count==1,
+            "H8b submit did not leave the owner terminal-but-unreleased");
+    require(reg.begin_graph(ctx,s,e,root,&g2)==error::BUSY, "H8b owner's own next graph was not refused before release");
+    require(reg.retire_graph(ctx,s,e,g,root)==error::BUSY, "H8b retire cleared a still-held invocation");
+    require(reg.release_invocation(ctx,s,e,g,i,root)==error::OK, "H8b release failed");
+    require(reg.extract(ctx,&snap)==error::OK && snap.invocation.value==0 && snap.busy_device_count==0, "H8b release did not drop the execution token");
+    require(reg.retire_graph(ctx,s,e,g,root)==error::OK, "H8b retire failed");
+    require(reg.begin_graph(ctx,s,e,root,&g2)==error::OK && reg.begin_invocation(ctx,s,e,g2,root,d,1,p,1,39,&i2)==error::OK,
+            "H8b owner did not recover after draining its own terminal invocation");
+}
+
 static void h12() {
     Registry reg; error err = error::OK; const auto ctx = reg.create_context(err); require(err == error::OK, "H12 create failed");
     require(reg.bind_backend(ctx,0)==error::OK && reg.bind_backend(ctx,1)==error::OK, "H12 bind failed");
@@ -201,11 +232,12 @@ int main(int argc, char ** argv) {
     else if (std::strcmp(which, "G6c") == 0) g6c();
     else if (std::strcmp(which, "G7") == 0) g7();
     else if (std::strcmp(which, "H8") == 0) h8();
+    else if (std::strcmp(which, "H8b") == 0) h8b();
     else if (std::strcmp(which, "H12") == 0) h12();
     else if (std::strcmp(which, "H12b") == 0) h12b();
     else if (std::strcmp(which, "H13b") == 0) h13b();
     else if (std::strcmp(which, "M7") == 0) m7();
     else if (std::strcmp(which, "M7b") == 0) m7b();
-    else { g5a(); g6(); g6b(); g6c(); g7(); h8(); h12(); h12b(); h13b(); m7(); m7b(); }
+    else { g5a(); g6(); g6b(); g6c(); g7(); h8(); h8b(); h12(); h12b(); h13b(); m7(); m7b(); }
     return 0;
 }

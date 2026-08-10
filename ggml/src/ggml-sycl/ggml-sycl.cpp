@@ -13085,6 +13085,11 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     }
 }
 
+// Defined below ggml_sycl_execution_abort_and_release_graph(), which it calls;
+// declared here for ggml_sycl_execution_begin_graph(). See the definition for
+// why the owner's own begin has to be a drain point (llama.cpp-2dgc).
+static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept;
+
 // out_err (llama.cpp-cnre), when non-null, receives the registry error that
 // caused a `false` return, so a caller can tell a contract-compliant refusal
 // (e.g. DEVICE_BUSY, same-device concurrent inference) apart from a registry
@@ -13100,6 +13105,11 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
     if (!ctx) {
         return false;
     }
+    // Both of these run BEFORE the two lock_guards below on purpose: the drain
+    // waits on a queue, and a queue wait held under either of those mutexes is a
+    // stall hazard (the teardown drain keeps its waits outside all ranked locks
+    // for the same reason).
+    ggml_sycl_execution_drain_own_terminal(ctx);
     ggml_sycl_execution_try_retire_terminal(ctx);
     auto & registry = ggml_sycl::execution::global_registry();
     std::lock_guard<std::mutex> binding_lock(g_execution_backend_binding_mutex);
@@ -13282,6 +13292,75 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
     ggml_sycl_execution_quarantine_graph(ctx);
     (void) ggml_sycl_execution_release_graph(ctx);
     ggml_sycl_execution_clear_graph_tracking(ctx);
+}
+
+// The owner's own next begin as a drain point (llama.cpp-2dgc, RCA c-5ozb).
+//
+// ggml_backend_sycl_graph_compute_unchecked()'s execution_tail_guard submits the
+// tracked invocation on every early exit (llama.cpp-u7vj), and submit
+// deliberately does not release device ownership -- release is deferred to
+// ggml_backend_sycl_synchronize() after its queue wait. A caller that computes
+// back-to-back with no synchronize in between (test-llama-archs does; a
+// llama_decode loop does not) therefore reaches begin_graph with its OWN
+// previous invocation COMPLETE but unreleased, and that state is unreachable
+// from every existing path: the reuse branch in ggml_sycl_execution_begin_graph()
+// admits only OPEN/SEALED, ggml_sycl_execution_try_retire_terminal() bails while
+// invocation != 0, and device_owners_ is still held -- so the owner's fresh
+// begin_invocation() is refused DEVICE_BUSY.
+//
+// Draining it here mirrors ggml_sycl_execution_drain_context_terminal_events():
+// wait first, release second, retire third. The queue wait is what makes the
+// release legal -- releasing a submitted-but-unwaited invocation is exactly the
+// fault the registry's M7_SUBMIT_RELEASES_DEVICES_EARLY mutation models -- so a
+// wait that throws falls through to the abort/quarantine path instead of
+// releasing on an unproven terminal.
+//
+// Scoped to this ctx alone, unlike the teardown drain's whole-context sweep:
+// begin is per-backend, and a sibling backend bound to the same context has not
+// asked to start a graph here.
+static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx) {
+        return;
+    }
+    const auto state = ggml_sycl_take_execution_state_snapshot(ctx);
+    if (state.context_id == 0 || state.graph_epoch == 0 || state.invocation_id == 0) {
+        return;
+    }
+    ggml_sycl::lifecycle::ModelToken owner{};
+    if (!ggml_sycl_execution_current_owner(ctx, owner)) {
+        return;
+    }
+    auto & registry = ggml_sycl::execution::global_registry();
+
+    // token_root is checked for the same reason the reuse branch checks it: an
+    // invocation belonging to some other root is not this caller's to drain, and
+    // leaving it alone keeps the contract-compliant DEVICE_BUSY refusal.
+    ggml_sycl::execution::snapshot snapshot{};
+    if (registry.extract({ state.context_id }, &snapshot) != ggml_sycl::execution::error::OK ||
+        snapshot.invocation.value == 0 || !(snapshot.token_root == owner) ||
+        (snapshot.graph_state != ggml_sycl::execution::graph_phase::COMPLETE &&
+         snapshot.graph_state != ggml_sycl::execution::graph_phase::QUARANTINED)) {
+        return;
+    }
+    bool waited = true;
+    try {
+        if (ctx->last_graph_event.has_value() && ctx->last_graph_event_deferred_decode) {
+            ctx->last_graph_event->wait_and_throw();
+        } else if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
+            stream->wait_and_throw();
+        }
+    } catch (...) {
+        // Enqueue status is now uncertain for this device. Fall through to the
+        // quarantine path, which retains every root/backing lease instead of
+        // releasing on an unproven terminal.
+        waited = false;
+    }
+    ctx->last_graph_event.reset();
+    ctx->last_graph_event_deferred_decode = false;
+    if (!waited || !ggml_sycl_execution_release_graph(ctx)) {
+        ggml_sycl_execution_abort_and_release_graph(ctx);
+    }
+    ggml_sycl_execution_try_retire_terminal(ctx);
 }
 
 // The unlocked terminal wait of the teardown sequence, scoped to one context.
