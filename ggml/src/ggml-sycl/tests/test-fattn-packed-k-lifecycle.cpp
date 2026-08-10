@@ -690,8 +690,16 @@ void run_sidecar_unregister_overlap(ggml_backend_sycl_context & ctx,
     require(ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(fixture.lookup, device, &snapshot) && snapshot.valid(),
             "sidecar snapshot capture failed");
 
+    // Q is zeroed, so every logit is 0 and the decode reduces to the plain mean
+    // of the 64 V rows. Perturbing V[0] to 2.0 behind the gate is what makes the
+    // expected 65/64 reachable AND makes the final value evidence of ordering:
+    // the decode must observe a write that could not land until the gate opened.
+    // Without this the mean is 64/64 = 1.0, which misses the 0.01 window by
+    // 0.015625 -- the assertion fails no matter how production behaves.
+    // run_consumer_checkpoint below carries the same construction; this scenario
+    // inherited its expected constant without the write that produces it.
     const sycl::event gate_event = submit_controlled_gate(dependency_q, &gate);
-    snapshot.ready_event         = gate_event;
+    snapshot.ready_event         = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f));
 
     fattn_params params = tiny_params(qbuf.ptr, fixture.k.ptr, vbuf.ptr, out.ptr);
     require(launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>(
@@ -714,9 +722,13 @@ void run_sidecar_unregister_overlap(ggml_backend_sycl_context & ctx,
     require(!gate.released(), "overlap gate released before the unregister window");
     gate.release();
 
-    const float payload = copy_after(q, snapshot.ready_event, out.ptr);
-    require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
-            "sidecar unregister overlap lost copied owner before final decode event");
+    const float       payload  = copy_after(q, snapshot.ready_event, out.ptr);
+    const float       expected = 65.0f / 64.0f;
+    // Carry the numbers into the message: "wrong value" and "NaN from a freed
+    // buffer" are different defects and the bare string cannot tell them apart.
+    const std::string detail   = "sidecar unregister overlap lost copied owner before final decode event (expected " +
+                               std::to_string(expected) + ", observed " + std::to_string(payload) + ")";
+    require(std::isfinite(payload) && std::fabs(payload - expected) < 0.01f, detail.c_str());
 }
 
 void run_consumer_checkpoint(const std::string & checkpoint,

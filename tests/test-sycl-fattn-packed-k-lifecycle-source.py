@@ -262,6 +262,13 @@ def test_snapshot_consumer_retains_copied_owner_through_unregister_overlap() -> 
     ordered(
         live,
         "ggml_sycl_fattn_xmx_find_packed_k_sidecar_snapshot(fixture.lookup, device, &snapshot)",
+        # The gated V write must precede the launch: it is what makes the
+        # expected 65/64 reachable and what turns the final value into ordering
+        # evidence rather than an unconditionally-failing constant.
+        # Whitespace-robust: `live` is already scoped to the overlap function, so
+        # the bare call is unique here even though run_consumer_checkpoint makes
+        # the identical call against packed.ready_event.
+        "submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f))",
         "launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>",
         "ggml_sycl::retain_handles_until_event({ snapshot.handle }, snapshot.ready_event);",
         "ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));",
