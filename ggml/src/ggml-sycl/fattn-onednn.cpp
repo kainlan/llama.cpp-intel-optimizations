@@ -176,10 +176,24 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     // 5-D (batch,H_kv,N_rep,S,D). The direct GQA/MQA path still requires a
     // contiguous K/V token-D plane. When nc_stride != D, the planner asks the
     // unified-cache-backed materializer for dense f16 K/V before oneDNN execute.
+    //
+    // GGML_SYCL_FA_ONEDNN_MATERIALIZE=0 plans DIRECT for these shapes instead.
+    // It exists so the materialize-vs-direct comparison can be made with ONE
+    // binary and ONE library: the earlier measurement (llama.cpp-l7rt) had to
+    // patch this predicate and load a second libggml-sycl.so through
+    // LD_LIBRARY_PATH, which moved the source AND the loaded object together
+    // and left the teardown abort seen only in that arm unattributable. It is
+    // a diagnostic axis, not a supported configuration -- the direct path is
+    // numerically correct at production shapes but its teardown behaviour is
+    // under investigation, so the default stays ON.
+    static const bool onednn_materialize = []() {
+        const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_MATERIALIZE");
+        return e ? (std::atoi(e) != 0) : true;
+    }();
     const int64_t k_nc_stride = params.nb11 / (int64_t) sizeof(sycl::half);
     const int64_t v_nc_stride = params.nb21 / (int64_t) sizeof(sycl::half);
     const int64_t D           = params.ne00;
-    if ((H_q != H_kv) && (k_nc_stride != D || v_nc_stride != D)) {
+    if (onednn_materialize && (H_q != H_kv) && (k_nc_stride != D || v_nc_stride != D)) {
         return { ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
                  ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH };
     }
