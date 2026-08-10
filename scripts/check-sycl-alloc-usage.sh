@@ -103,7 +103,7 @@ WEIGHT_IDENTITY_POINTER_CACHE_LEGACY_PATTERN='(std::unordered_map<const[[:space:
 HOST_WEIGHT_EXTRAS_POINTER_REGISTRY_LEGACY_PATTERN='(std::unordered_map<ggml_tensor[[:space:]]*\*,[[:space:]]*ggml_tensor_extra_gpu[[:space:]]*\*>[[:space:]]+g_sycl_host_weight_extras\b|g_sycl_host_weight_extras\.emplace\([[:space:]]*tensor[[:space:]]*,)'
 CPU_DISPATCH_HOST_PTR_SPLIT_REGISTRY_LEGACY_PATTERN='(std::unordered_map<std::string,[[:space:]]*const[[:space:]]+void[[:space:]]*\*>[[:space:]]+g_host_ptr_map\b|g_host_ptr_owned_handles\b|g_host_ptr_map\[[^]]+\][[:space:]]*=[[:space:]]*host_ptr|g_host_ptr_map\[[^]]+\][[:space:]]*=[[:space:]]*copy)'
 CPU_DISPATCH_EXPERT_GROUP_POINTER_PATTERN='(std::unordered_map<const[[:space:]]+void[[:space:]]*\*,[[:space:]]*std::vector<int>>[[:space:]]+expert_groups\b|expert_groups\[[^]]*weight_host[^]]*\]\.push_back)'
-STAGING_CACHE_LEGACY_OWNERSHIP_PATTERN='(alloc_handle[[:space:]]+handles\[GGML_SYCL_MAX_DEVICES\]|it->second\.alloc|entry->handles\[|it->second\.handles\[|entry\.second\.handles\[)'
+STAGING_CACHE_LEGACY_OWNERSHIP_PATTERN='(alloc_handle[[:space:]]+handles\[GGML_SYCL_MAX_DEVICES\]|it->second\.alloc\b|entry->handles\[|it->second\.handles\[|entry\.second\.handles\[)'
 MEM_OPS_STAGE_LEGACY_OWNER_PATTERN='(alloc_handle[[:space:]]+stage_alloc|from_owned_alloc\([^\n]*stage_alloc)'
 CPY_HOST_STAGE_LEGACY_OWNER_PATTERN='(alloc_handle[[:space:]]+host_stage_owner|from_owned_alloc\(std::move\(host_stage_owner\))'
 SET_ROWS_HOST_STAGE_LEGACY_OWNER_PATTERN='(alloc_handle[[:space:]]+host_stage_owner|from_owned_alloc\(std::move\(host_stage_owner\))'
@@ -124,7 +124,7 @@ READBACK_FALLBACK_SCOPED_PATTERN='(scoped_unified_alloc[[:space:]]+(fallback_all
 MOE_READBACK_STAGE_SCOPED_PATTERN='(scoped_unified_alloc[[:space:]]+(gate_stage|early_stage|weights_stage)|(^|[^[:alnum:]_])(gate_stage|early_stage|weights_stage)\.as_mem_handle\(\))'
 MOE_PHASE2_D2H_SCOPED_PATTERN='(scoped_unified_alloc[[:space:]]+d2h_staging|d2h_staging\.(allocate|get|as_mem_handle)\()'
 SPLIT_WEIGHT_STAGE_SCOPED_PATTERN='(scoped_unified_alloc[[:space:]]+staging_alloc|staging_alloc\.(allocate|get|as_mem_handle)\()'
-GRAPH_Q8_LEGACY_OWNERSHIP_PATTERN='(alloc_handle[[:space:]]+q8_1_owner|q8_1_owner\.ptr|backing_alloc)'
+GRAPH_Q8_LEGACY_OWNERSHIP_PATTERN='(alloc_handle[[:space:]]+q8_1_owner|q8_1_owner\.ptr|backing_alloc\b)'
 GET_ROWS_HOST_STAGE_SCOPED_PATTERN='(scoped_unified_alloc[[:space:]]+host_stage|host_stage\.as_mem_handle\(\))'
 TP_REDUCE_LEGACY_OWNERSHIP_PATTERN='g_tp_(shared_reduce|host_buf[01])_alloc'
 TP_HOST_STAGING_LEGACY_OWNERSHIP_PATTERN='host_staging\.alloc'
@@ -150,15 +150,25 @@ BACKEND_BUFFER_CONTEXT_LEGACY_OWNER_PATTERN='ggml_sycl::alloc_handle[[:space:]]+
 BACKEND_BUFFER_CONTEXT_DIRECT_ASSIGN_PATTERN='ctx->(managed_alloc[[:space:]]*=|tp_allocs\[[^]]+\][[:space:]]*=)'
 BACKEND_BUFFER_CONTEXT_AS_MEM_HANDLE_PATTERN='(managed_alloc|tp_allocs\[[^]]+\])\.as_mem_handle\('
 BACKEND_BUFFER_CONTEXT_LOOKUP_FREE_PATTERN='(unified_lookup\(dev_ptr|unified_free\(looked_up\))'
-SYCL_POOL_LEGACY_OWNERSHIP_PATTERN='(std::unordered_map<void \*, ggml_sycl::alloc_handle>[[:space:]]+active_handles|ggml_sycl::alloc_handle[[:space:]]+handle;|unified_free\(it->second\)|unified_free\(b\.handle\))'
+# A bare `alloc_handle handle;` member is NOT a legacy marker: it is also how the
+# sanctioned RAII owner adapters hold their handle. The pool is identified by its
+# active_handles map and by freeing through it, which is what the branches below
+# match; the fixture stays RED on those.
+SYCL_POOL_LEGACY_OWNERSHIP_PATTERN='(std::unordered_map<void \*, ggml_sycl::alloc_handle>[[:space:]]+active_handles|unified_free\(it->second\)|unified_free\(b\.handle\))'
 TENSOR_EXTRA_DATA_ALLOC_LEGACY_PATTERN='(data_alloc\[[^]]+\]|ggml_sycl::alloc_handle[[:space:]]+data_alloc\b)'
 HOST_BUFFER_CONTEXT_LEGACY_PATTERN='(ggml_sycl::alloc_handle[[:space:]]+alloc;|ctx->alloc(\.ptr|\b)|unified_free\(ctx->alloc\)|new sycl_host_buf_ctx\{[^}]*alloc)'
-VRAM_POOL_LEGACY_OWNERSHIP_PATTERN='(alloc_handle[[:space:]]+handle;|unified_free\((alloc|it->second)\.handle\)|allocations_\[tensor_id\][[:space:]]*=[[:space:]]*\{[[:space:]]*handle)'
+# See the SYCL pool note above: the bare member declaration is shared with the
+# sanctioned owner adapters. The pool's own free and its allocations_ table are
+# the discriminating idioms.
+VRAM_POOL_LEGACY_OWNERSHIP_PATTERN='(unified_free\((alloc|it->second)\.handle\)|allocations_\[tensor_id\][[:space:]]*=[[:space:]]*\{[[:space:]]*handle)'
 UNIFIED_ALLOCATE_DIRECT_HANDLE_PATTERN='return[[:space:]]+mem_handle::from_direct\(handle\.ptr'
-MANAGED_HOST_PINNED_LEGACY_PATTERN='(auto[[:space:]]+mh[[:space:]]*=[[:space:]]*handle\.as_mem_handle\(\)|\(void\)[[:space:]]+ggml_sycl::unified_free\(handle\)|return[[:space:]]+handle\.as_mem_handle\(\))'
+# `(void) unified_free(handle)` is the correct body of an RAII owner destructor,
+# so it cannot discriminate; the struct is identified by re-exporting its handle
+# as a mem_handle, which the two surviving branches match.
+MANAGED_HOST_PINNED_LEGACY_PATTERN='(auto[[:space:]]+mh[[:space:]]*=[[:space:]]*handle\.as_mem_handle\(\)|return[[:space:]]+handle\.as_mem_handle\(\))'
 ALLOCATE_MANAGED_HOST_PINNED_LEGACY_PATTERN='(out->as_mem_handle\(\)|unified_free\(\*out\)|ggml_sycl::alloc_handle[[:space:]]+(act_owner|out_owner)\{\}|unified_free\((act_owner|out_owner|weight_owner)\))'
 STAGING_BUFFER_POOL_LEGACY_PATTERN='(has_unified_handle|unified_free\(s\.unified_handle\)|new_slot\.unified_handle[[:space:]]*=[[:space:]]*std::move\(unified_handle\))'
-CPU_FALLBACK_HOST_COPY_LEGACY_PATTERN='(entry\.alloc|unified_free\(entry\.alloc\)|fallback_host_copy.*alloc_handle)'
+CPU_FALLBACK_HOST_COPY_LEGACY_PATTERN='(entry\.alloc\b|unified_free\(entry\.alloc\)|fallback_host_copy.*alloc_handle)'
 TIERED_KV_ZONE_H_LEGACY_PATTERN='(alloc_handle[[:space:]]+zone_h|\.zone_h(\.|[[:space:]]*=)|zone_h[[:space:]]*=|unified_free\([^)]*zone_h\)|zone_h\.as_mem_handle\()'
 ONEDNN_SCRATCH_LEGACY_OWNER_PATTERN='(std::shared_ptr<alloc_handle>[[:space:]]+onednn_(weights|activations)_scratch_owner_|onednn_(weights|activations)_scratch_owner_->|unified_free\(\*onednn_(weights|activations)_scratch_owner_|release_direct_scratch[^\n]*std::shared_ptr<alloc_handle>|allocate_direct_scratch[^\n]*std::shared_ptr<alloc_handle>)'
 PERSISTENT_SCRATCH_LEGACY_OWNER_PATTERN='(std::shared_ptr<alloc_handle>[[:space:]]+owner[[:space:]]*=|persistent_scratch_entry[^;{]*std::shared_ptr<alloc_handle>|entry\.owner[[:space:]]*&&[[:space:]]*entry\.owner->ptr|unified_free\(\*entry\.owner\)|entry\.owner\.reset\(\))'
