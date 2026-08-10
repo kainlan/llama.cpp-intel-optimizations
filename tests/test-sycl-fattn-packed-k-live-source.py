@@ -355,6 +355,38 @@ def replace_in_section(source: str, begin: str, end: str, old: str, new: str, oc
     return source[:start] + body.replace(old, new, occurrence) + source[stop:]
 
 
+def replace_in_packed_k_block(source: str, old: str, new: str, occurrence: int = 1) -> str:
+    """Mutate CMakeLists.txt strictly inside the packed-K registration block.
+
+    A file-wide `replace(..., 1)` selects by POSITION, not by structure. The
+    literal `endforeach()\\nendif()` also closes an unrelated XMX not-built
+    block ~175 lines earlier, so the mutation landed there, left the packed-K
+    block intact, and `cmake_contract` stayed True -- the assertion fired
+    while proving nothing about its target (llama.cpp-2bnd). Slicing to the
+    guarded block first makes the target structural, and the no-op assert
+    makes a literal that stops matching a loud failure instead of a fake kill.
+    """
+    block = guarded_cmake_block(source)
+    assert block is not None, "packed-K guarded block not found in CMakeLists.txt"
+    mutated = block.replace(old, new, occurrence)
+    assert mutated != block, f"mutation did not apply inside the packed-K block: {old!r}"
+    start = source.index(block)
+    return source[:start] + mutated + source[start + len(block):]
+
+
+def replace_unique(source: str, old: str, new: str) -> str:
+    """Mutate a literal that must occur exactly once in the whole file.
+
+    The count assert is the guard: a second occurrence appearing anywhere is
+    precisely how the packed-K `endforeach()\\nendif()` mutation silently
+    retargeted, so fail here rather than let `replace(..., 1)` pick by
+    position.
+    """
+    found = source.count(old)
+    assert found == 1, f"expected exactly one occurrence of {old!r}, found {found}"
+    return source.replace(old, new, 1)
+
+
 # The gated V write in run_sidecar_unregister_overlap, matched tolerantly.
 # clang-format owns the alignment of the `=` and the wrapping of the argument
 # list, so any literal spelling of this statement is a formatting hostage: one
@@ -739,7 +771,10 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     assert v_write_mutated != LIVE
     assert not live_contract(v_write_mutated)
 
-    assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
-    assert not cmake_contract(CMAKE.replace("endforeach()\nendif()", "endforeach()", 1))
-    assert not cmake_contract(CMAKE.replace("find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER", 1))
-    assert not cmake_contract(CMAKE.replace(" ${LEVEL_ZERO_LOADER})", ")", 1))
+    # Both block-scoped literals below occur more than once file-wide, so each
+    # must be anchored to the packed-K block rather than to the first hit.
+    assert not cmake_contract(replace_unique(CMAKE, GUARD, "if (TRUE)"))
+    assert not cmake_contract(replace_in_packed_k_block(CMAKE, "endforeach()\nendif()", "endforeach()"))
+    assert not cmake_contract(
+        replace_unique(CMAKE, "find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER"))
+    assert not cmake_contract(replace_in_packed_k_block(CMAKE, " ${LEVEL_ZERO_LOADER})", ")"))
