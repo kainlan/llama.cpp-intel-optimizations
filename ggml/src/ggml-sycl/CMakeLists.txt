@@ -3001,9 +3001,13 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-moe-mini-graph PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-moe-mini-graph COMMAND test-moe-mini-graph)
+# SKIP_RETURN_CODE must land in the same change as the test's exit-77 skip paths
+# (llama.cpp-v9ue): without it ctest scores 77 as a hard failure, turning a
+# legitimate skip on a CPU-only runner into a red test.
 set_tests_properties(test-moe-mini-graph PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture

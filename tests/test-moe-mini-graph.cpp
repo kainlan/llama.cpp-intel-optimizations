@@ -14,12 +14,38 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-quants.h"
 
+// ctest SKIP_RETURN_CODE (house convention, matching the test-sycl-*-policy.sh
+// family). Every skip path in this file exits with this instead of 0 so that a
+// skip is VISIBLE as a skip: llama.cpp-v9ue found that returning 0 from a skip
+// made every historical green indistinguishable from a real comparison.
+#define TEST_EXIT_SKIP 77
+
 #if !defined(GGML_USE_SYCL)
 int main() {
-    fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about the SYCL MoE graph path.\n");
+    return TEST_EXIT_SKIP;
 }
 #else
+
+// Outcome of running the graph on one backend. SKIP and FAIL must stay distinct:
+// llama.cpp-v9ue found that the previous bool return collapsed them, so a real
+// failure in the SYCL leg was reported by main() as "SKIP: SYCL graph path
+// unavailable or disabled" with exit 0, and the CPU-vs-SYCL comparison this test
+// exists for never ran in any run.
+enum class leg_result {
+    OK,
+    SKIP,
+    FAIL,
+};
+
+// The SYCL backend runs a warmup pass the first time it sees a given
+// (phase, n_nodes) pair -- it dispatches per-op, releases the transient graph
+// leases and returns before recording anything (ggml-sycl.cpp, the
+// `warmup_n_nodes != cgraph->n_nodes` branch in graph_compute). A single compute
+// call therefore can never reach the record/replay path. Three passes give
+// warmup, record and replay, so the output compared below is the one the graph
+// path actually produced.
+static const int SYCL_COMPUTE_PASSES = 3;
 
 struct moe_graph_inputs {
     int vocab;
@@ -113,11 +139,12 @@ static void build_inputs(moe_graph_inputs & inputs) {
     }
 }
 
-static bool run_moe_graph_backend(ggml_backend_t backend,
-                                  bool use_host_moe_weights,
-                                  const moe_graph_inputs & inputs,
-                                  bool require_graphs,
-                                  std::vector<float> & output) {
+static leg_result run_moe_graph_backend(ggml_backend_t backend,
+                                        bool use_host_moe_weights,
+                                        const moe_graph_inputs & inputs,
+                                        bool require_graphs,
+                                        int n_passes,
+                                        std::vector<float> & output) {
     const ggml_init_params params = {
         64 * 1024 * 1024,
         nullptr,
@@ -125,7 +152,8 @@ static bool run_moe_graph_backend(ggml_backend_t backend,
     };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        return false;
+        fprintf(stderr, "FAIL: ggml_init failed\n");
+        return leg_result::FAIL;
     }
 
     ggml_tensor * tok_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inputs.n_embd, inputs.vocab);
@@ -179,19 +207,21 @@ static bool run_moe_graph_backend(ggml_backend_t backend,
         !alloc_or_fail(dev_buft, moe_ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
         !alloc_or_fail(moe_buft, moe_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ||
         !alloc_or_fail(dev_buft, moe_out, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+        fprintf(stderr, "FAIL: tensor allocation failed\n");
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
         ggml_free(ctx);
-        return false;
+        return leg_result::FAIL;
     }
     for (ggml_tensor * extra : extra_ops) {
         if (!alloc_or_fail(dev_buft, extra, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+            fprintf(stderr, "FAIL: tensor allocation failed for chained scale node\n");
             for (ggml_backend_buffer_t buf : buffers) {
                 ggml_backend_buffer_free(buf);
             }
             ggml_free(ctx);
-            return false;
+            return leg_result::FAIL;
         }
     }
 
@@ -212,54 +242,56 @@ static bool run_moe_graph_backend(ggml_backend_t backend,
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, final_out);
 
-    if (require_graphs) {
-        if (!ggml_sycl::test_backend_supports_graphs(backend)) {
-            fprintf(stderr, "SKIP: backend does not support graphs\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
-        }
-        if (ggml_sycl::test_backend_graphs_disabled(backend)) {
-            fprintf(stderr, "SKIP: backend graphs disabled by configuration\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
-        }
-    }
-
-    ggml_status status = ggml_backend_graph_compute(backend, graph);
-    if (status != GGML_STATUS_SUCCESS) {
+    auto release = [&]() {
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
         ggml_free(ctx);
-        return false;
+    };
+
+    if (require_graphs) {
+        if (!ggml_sycl::test_backend_supports_graphs(backend)) {
+            fprintf(stderr, "SKIP: backend does not support graphs\n");
+            release();
+            return leg_result::SKIP;
+        }
+        if (ggml_sycl::test_backend_graphs_disabled(backend)) {
+            fprintf(stderr, "SKIP: backend graphs disabled by configuration\n");
+            release();
+            return leg_result::SKIP;
+        }
+    }
+
+    for (int pass = 0; pass < n_passes; ++pass) {
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "FAIL: graph compute returned %d on pass %d/%d\n", (int) status, pass + 1, n_passes);
+            release();
+            return leg_result::FAIL;
+        }
     }
 
     if (require_graphs) {
-        const size_t pinned = ggml_sycl::test_graph_pinned_entry_count(backend);
-        if (pinned == 0) {
-            fprintf(stderr, "FAIL: expected graph-pinned cache entries\n");
-            for (ggml_backend_buffer_t buf : buffers) {
-                ggml_backend_buffer_free(buf);
-            }
-            ggml_free(ctx);
-            return false;
-        }
+        // Observation, not an assertion. This block used to require
+        // test_graph_pinned_entry_count() > 0 and treat zero as a failure --
+        // which main() then reported as a skip, hiding the whole test. That
+        // count is structurally unreachable for this graph: graph_preload_weights
+        // skips device-VRAM weights ("already on GPU") and MoE expert weights, and
+        // those are the only two weights here, so graph_weight_leases is never
+        // populated no matter how the run goes. Print the graph state so a run
+        // says what the backend actually did, and let the CPU-vs-SYCL comparison
+        // in main() be the thing that passes or fails (llama.cpp-v9ue).
+        fprintf(stderr, "MoE mini-graph SYCL state: exec_graph=%d pinned_entries=%zu replays=%llu passes=%d\n",
+                ggml_sycl::test_backend_has_exec_graph(backend) ? 1 : 0,
+                ggml_sycl::test_graph_pinned_entry_count(backend),
+                (unsigned long long) ggml_sycl::test_backend_graph_replay_count(backend), n_passes);
     }
 
     output.resize(static_cast<size_t>(inputs.out_dim) * inputs.n_used * inputs.n_tokens);
     ggml_backend_tensor_get(final_out, output.data(), 0, output.size() * sizeof(float));
 
-    for (ggml_backend_buffer_t buf : buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_free(ctx);
-    return true;
+    release();
+    return leg_result::OK;
 }
 
 int main() {
@@ -268,8 +300,10 @@ int main() {
 
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
-        fprintf(stderr, "SKIP: Could not initialize SYCL backend\n");
-        return 0;
+        fprintf(stderr,
+                "SKIP: could not initialize SYCL backend (no device, or oneAPI not sourced);"
+                " this run proves NOTHING about the SYCL MoE graph path.\n");
+        return TEST_EXIT_SKIP;
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -291,24 +325,30 @@ int main() {
     std::vector<float> cpu_out;
     std::vector<float> sycl_out;
 
-    const bool cpu_ok = run_moe_graph_backend(cpu_backend, false, inputs, false, cpu_out);
-    const bool sycl_ok = run_moe_graph_backend(sycl_backend, true, inputs, true, sycl_out);
+    const leg_result cpu_leg  = run_moe_graph_backend(cpu_backend, false, inputs, false, 1, cpu_out);
+    const leg_result sycl_leg = run_moe_graph_backend(sycl_backend, true, inputs, true, SYCL_COMPUTE_PASSES, sycl_out);
 
     ggml_backend_free(cpu_backend);
     ggml_backend_free(sycl_backend);
 
-    if (!sycl_ok) {
-        fprintf(stderr, "SKIP: SYCL graph path unavailable or disabled\n");
-        if (!cpu_ok) {
-            fprintf(stderr, "FAIL: CPU baseline failed\n");
-            return 1;
-        }
-        return 0;
+    // The CPU leg has no skip path -- it does not ask for graphs -- so anything
+    // other than OK is a failure of the baseline itself.
+    if (cpu_leg != leg_result::OK) {
+        fprintf(stderr, "FAIL: CPU baseline did not produce a result\n");
+        return 1;
     }
 
-    if (!cpu_ok) {
-        fprintf(stderr, "FAIL: backend compute failed (cpu_ok=%d sycl_ok=%d)\n", cpu_ok ? 1 : 0, sycl_ok ? 1 : 0);
+    // A SYCL failure is a failure. Only a genuinely unavailable graph path is a
+    // skip, and it exits 77 so ctest reports it as skipped rather than passed.
+    if (sycl_leg == leg_result::FAIL) {
+        fprintf(stderr, "FAIL: SYCL leg failed (see the FAIL line above)\n");
         return 1;
+    }
+    if (sycl_leg == leg_result::SKIP) {
+        fprintf(stderr,
+                "SKIP: SYCL graph path unavailable or disabled;"
+                " this run proves NOTHING about MoE graph correctness.\n");
+        return TEST_EXIT_SKIP;
     }
 
     if (cpu_out.size() != sycl_out.size()) {
