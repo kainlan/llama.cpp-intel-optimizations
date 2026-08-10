@@ -2030,6 +2030,41 @@ run in the standard `-O3` `build/` tree.
 | `test-sycl-fattn-xmx-policy` | `fattn-xmx-f16.hpp:178` `return XMX_BATCH_KV_LARGE;` → `/ 2` | narrow header (only `fattn.cpp` + a bench + this test) | CPU-ONLY | PASSFAIL, `SYCL fattn policy tests: %s`; per-check `FAIL: <name> got %d want %d` | `FAIL: D128 ncols8 uses larger batch when local memory permits got 24 want 48` then `SYCL fattn policy tests: FAIL`, rc 1 | Fires 1 of ~35; `ok &=` so nothing is masked. Good "some green, some red" demonstration. |
 | `test-dmmv-coalesced-q4-0-oracle` | `dmmv-coalesced-q4-0-layout.hpp:64` `blocks_per_row * DMMV_COALESCED_Q4_0_BLOCK_BYTES` → `* 32` (the literal Q8_0-stride defect the file is named for) | narrow header (convert.cpp + dmmv.cpp + 2 tests) | CPU-ONLY | COUNT — per-check `PASS`/`FAIL` lines + `%d check(s) failed` / `all checks passed` | exactly 4 of 20: `FAIL q8-row-stride-is-twice-the-q4-0-row q8=2048 q4_0=2048`, `... writes-past-the-allocation oob_writes=0`, `... produces-a-different-layout first_bad=-1`, `FAIL device-soa-writer-matches-contract first_bad=...`; `4 check(s) failed`, rc 1 | Round-trip and all 12 oracle checks stay green because writer and reader share the header — that is the point. Built-in positive control (`contract-oracle-catches-corrupted-kernel`): a fully-red run means you over-mutated. |
 
+### Batch H — executed results (2026-08-09/10, `llama.cpp-u2mz` Phase B): 12/14 proven, 1 via Batch A, 1 cannot-fail finding
+
+Split per the `-O1` ruling: nine policy rows in `build-o1/`, the three
+numeric-oracle rows (H8/H11/H14) in the `-O3` `build/` tree. Shared-header
+rows batched per this table's own instructions (one build each for H1+H2+H3,
+H4+H5, H6+H7). Logs: session scratchpad `bh-*.log` / `bh3-*.log`.
+
+Two runner lessons, both caught by the tripwires: (1) the first `-O1` pass's
+`crun` helper ended with the ZERO_MATCH guard (`[ n -eq 0 ] && echo`), so a
+matched run returned 1 and broke the `&&` chains — H2/H3/H5/H7 silently never
+ran. It failed **closed** (missing logs, not fake greens) and all four were
+re-executed in a patch-up with `return 0` and `if`-blocks. (2) Name-map
+additions from `ctest -N` pre-flight: the five packed-K checkpoints register
+as `fattn-packed-k-lifecycle-*` and row H14 as
+`sycl-dmmv-coalesced-q4-0-oracle` — both without the `test-` prefix.
+
+| row | executed | verdict |
+|---|---|---|
+| `test-sycl-unified-memory-e2e` | GREEN → RED → GREEN (`+ used` form) | **clean**. Actual RED is the consistency check rearranged: `FAIL: used (157286400) + available (2304770048) != budget (2147483648)` from `test_memory_tracking_consistency`, `9/10 passed, 1 failed` — the numbers prove `budget_ + used` exactly. `Cache budget pinned:` present (77-guard). |
+| `test-sycl-unified-cache` | GREEN → RED → GREEN | **clean, one of the two predicted messages fired**: `FAIL: available > budget (available=16451280896, budget=16435552256)`, `12/13 passed, 1 failed` vs pre-registered `11/13, 2 failed` — the `available != budget - used` form did not fire (used=0 at that check makes the mutation invisible there). |
+| `test-sycl-moe-xmx-tiled-single-layout-policy` | GREEN → RED → GREEN | **clean, byte-exact** incl. the `:80` cite. |
+| `test-sycl-weight-key-uniqueness` | baseline gate GREEN, then GREEN → RED → GREEN | **clean, byte-exact** (`FAIL: tied weights did not share cache identity`). The 🚨 pre-existing-red concern is retired: baseline green in this tree, consistent with the task19 re-run flip. |
+| `test-sycl-moe-identity-hash` | GREEN → RED → GREEN | **clean, counts corrected**: `Tests run: 7, Passed: 5, Failed: 2` vs pre-registered `4/3` — the "likely 6" third failure did not fire. Final banner byte-exact (`FAILED: the weight cache key no longer implements the n3pw physical-identity ruling.`). |
+| `test-sycl-moe-gateup-prepack-scratch` | GREEN → RED → GREEN | **clean, byte-exact** at `:153` (row said `:152`; one-line drift). |
+| `test-sycl-descriptor-retention` | GREEN → RED → GREEN | **clean, byte-exact** (`FAIL: layout change must reject replay`). |
+| `test-ggml-sycl-soa` (`quants.hpp:59`, `-O3`) | GREEN → RED → GREEN | **clean, failure set differs from prediction**: `Results: 16 passed, 3 failed` (19 subtests, not 24) — Tests 10 (`FAIL: pass1=1 pass2=0`), 12 (`FAIL: Expected -16.0, got -0.006957`), 13 (`FAIL: 1/8 rows incorrect`). The pre-registered byte-level Test 11 **passed** under mutation: writer and reader share `get_d_offset`, so the corruption is self-consistent there — this row's own reasoning, one step further than it predicted. Independent-reference subtests caught it instead. skip-guard 0 → real device run. |
+| `test-unified-dispatch-integration` | GREEN → RED → GREEN | **clean, byte-exact** (`FAILED: should_use_unified(Q8_0) returned true, expected false`, `8/9`). Pinned per the row's iGPU hazard. |
+| `test-q6k-dispatch` (`vecdotq.hpp:105`) | not built | **satisfied by Batch A's `--corrupt-q8-reference` injector** per this row's own escape ("only spend this header build if you want the production-side proof too"). |
+| `test-moe-mini-graph` (`dequantize.hpp:294`, `-O3`) | mutation SURVIVED; green control exposed why | **VOID — the test cannot fail: `llama.cpp-v9ue`**. Direct pinned run at unmutated HEAD ends `SKIP: SYCL graph path unavailable or disabled`, rc 0, no `nmse=` line — the SYCL leg never executes, so every historical green is a skip-pass (the row's own warned trap, proven at baseline). Third member of u2mz's founding cannot-fail class. The MEGA-TU fallback (`ggml-sycl.cpp:37186`) is deferred until v9ue is fixed — it would be equally vacuous today. |
+| `test-fattn-packed-k-lifecycle` (5 ctest names) | GREEN → RED → GREEN ×4; #107 baseline red | **sensitivity proven for all five** — under mutation all five fail in ~0.23 s on the pre-registered host-prologue string (count 5). #105/106/108/109 are clean GREEN→RED→GREEN. ⚠️ `#107 sidecar-unregister-overlap` fails at unmutated baseline in BOTH trees, pinned, ~30.7 s every time (5 observations) — filed **`llama.cpp-fuxy`**; its mutated failure (0.23 s, boundary string) differs from its baseline failure, so the mutation proof stands while the baseline defect is independent. |
+| `test-sycl-fattn-xmx-policy` | GREEN → RED → GREEN | **clean, byte-exact** both lines (`got 24 want 48`). |
+| `sycl-dmmv-coalesced-q4-0-oracle` (`-O3`) | GREEN → RED → GREEN | **clean**: exactly `4 check(s) failed` as pre-registered (stride/oob/layout/device-writer quartet). |
+
+`Shmem` flat throughout both legs. Trees restored clean after each leg.
+
 ## Batch I — MEGA-TU `ggml-sycl.cpp` and headers only it includes (23 tests, 28 builds, ~9 h)
 
 Do this last. Every build here is the 100k-line TU. One row is blocked
