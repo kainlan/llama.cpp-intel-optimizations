@@ -1986,6 +1986,31 @@ building** ([[land-header-changes-first-in-multi-agent-waves]]).
 | `test-sycl-kv-view-resolution` | `:3871` `void * ptr = static_cast<char *>(base_ptr) + view_offs;` → drop `+ view_offs` | **CPU-ONLY** (hint was wrong — mocked topology, host stack "device" pointers) | PASSFAIL, `SYCL KV view resolution tests: PASS/FAIL`, per-subtest `FAIL:` lines | `FAIL: device-1 view should resolve as root device-1 pointer plus view_offs` (192), the permuted/flattened/slow equivalents, then `... FAIL`, rc 1 | Fires ~4 of 20; the 16 routing/ownership subtests stay green, and `ok &= ...` means all 20 run. Its one real-USM subtest is gated behind `GGML_SYCL_TEST_KV_VIEW_RUNTIME=1`, unset by ctest. ⚠️ Do not instead delete the fail-closed clause at `:3866` — it falls through to `..._slow()`, which may also return nullptr, so it can silently produce no RED. |
 | `test-sycl-xmx-unified-correctness` | `:4552` `return resolved.ptr != nullptr && resolved.on_device;` → `&& !resolved.on_device;` | GPU | PASSFAIL; tri-state exit, 77 is a genuine skip | `FAIL: weight 'weight' is not device-resident on device 0 before compute; MUL_MAT would be routed to CPU and the comparison would be CPU-vs-CPU`, rc 1 | ⚠️ **Null-mutation trap stated by the test itself**: it does not assert which GPU kernel variant ran, so mutating `can_use_xmx()` thresholds or any single XMX kernel can silently reroute to a correct non-XMX path and stay green. The residency predicate is the only production property it hard-asserts. |
 
+### Batch G — executed results (2026-08-09, `llama.cpp-u2mz` Phase B): 5/5 RED-fired
+
+Run lead-serial in the **`-O1` scratch tree `build-o1/`** — configured
+identically to `build/` except `CMAKE_{C,CXX}_FLAGS_RELEASE=-O1 -DNDEBUG` —
+per the battery-speedup ruling. Valid for every Batch G row because none
+carries a numeric-tolerance oracle (all five are policy/exact-string
+assertions; G5's GPU oracle is a residency predicate, not arithmetic). No
+mid-battery converge builds; one restore-build + re-green at the end. Logs:
+session scratchpad `bg-*.log`. The whole batch, including the cold `-O1`
+baseline build, completed in well under the ~2.5 h `-O3` estimate.
+
+| row | executed | verdict |
+|---|---|---|
+| `test-sycl-tensor-placement` (`:1502`) | GREEN → RED → GREEN | **clean**. RED fired the pre-registered assertion; actual text prints numeric enum values — `FAIL usage(blk.0.ffn_down_chexps.weight): expected 3, got 0` — where this doc's row said `expected <MOE_EXPERT_WEIGHT>, got <FFN_WEIGHT>`. Same assertion, enum-name → ordinal rendering. |
+| `test-sycl-tensor-usage` (`:1544`) | GREEN → RED → GREEN | **clean, count rotted**. RED is `FAIL: norm expected=8 got=0` then `Tensor usage test: FAIL` — the row pre-registered `expected=5`; the norm fixture count grew to 8 since the row was written ([[derived-counts-rot-when-the-set-changes]]). Mechanism and message shape exact. |
+| `test-sycl-transient-alloc-intent-scope` (`:369`) | GREEN → RED → GREEN | **clean, byte-exact**: both pre-registered lines — `FAIL [this thread recording]: host transient use_pinned_pool is 1, expected 0` and `^ 1 field(s) denied graph-lifetime treatment to a thread that IS recording.` |
+| `test-sycl-kv-view-resolution` (`:3871`) | first pass VOID (ZERO_MATCH); re-run GREEN → RED → GREEN | **clean after name-map fix**. ⚠️ The ctest registration is **`sycl-kv-view-resolution`** — no `test-` prefix — so the battery's `^test-sycl-kv-view-resolution$` matched nothing; the matched=0 tripwire flagged all three runs VOID instead of letting rc=0 read as green. Re-run under the correct name: RED byte-exact (`FAIL: device-1 view should resolve as root device-1 pointer plus view_offs`), **5** FAIL lines vs the row's "~4 of 20". Before Batch H: `ctest -N` every name first — other `sycl-`-prefixed registrations exist. |
+| `test-sycl-xmx-unified-correctness` (`:4552`) | GREEN → RED → GREEN | **clean**. RED fired with a real tensor name — `FAIL: weight 'blk.0.attn_q.weight' is not device-resident on device 0 before compute; MUL_MAT would be routed to CPU and the comparison would be CPU-vs-CPU` — where the row's placeholder said `weight 'weight'`. Ran pinned `level_zero:0,1`; 0 SKIP lines, so the 77-guard confirms the device path was reached, not skipped. |
+
+`Shmem` flat across the battery (3.05 → 2.94 → 3.05 GB). Tree clean after
+final restore. The `-O1` tree is retained for Batches H/D and Batch I's
+policy/lifecycle rows; numeric-oracle rows (e.g. `test-ggml-sycl-soa`,
+`test-moe-mini-graph`, `test-q6k-dispatch`, `test-dmmv-coalesced-q4-0-oracle`)
+run in the standard `-O3` `build/` tree.
+
 ## Batch H — other shared headers (14 tests across 9 headers, ~6 h)
 
 | test | mutation | radius | runtime | verifiability | expected RED | notes |
