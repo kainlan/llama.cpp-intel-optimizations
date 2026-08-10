@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -72,10 +73,40 @@ static double q6k_exact_dot(const block_q6_K * blocks, const float * y, int bloc
     return acc;
 }
 
+// Watches the ggml log for the two warnings that mean the coalesced DMMV kernel
+// did NOT run. Both are GGML_LOG_WARN, so they reach a ggml_log_set callback
+// without any verbosity plumbing. See kernel_ran() for why absence alone is not
+// the whole gate.
+struct dispatch_probe {
+    bool saw_layout_refusal = false;
+    bool saw_blas_fallback  = false;
+
+    void reset() {
+        saw_layout_refusal = false;
+        saw_blas_fallback  = false;
+    }
+};
+
+static dispatch_probe g_probe;
+
+static void dispatch_probe_log(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (text) {
+        if (strstr(text, "not eligible for tensor layout")) {
+            g_probe.saw_layout_refusal = true;
+        }
+        if (strstr(text, "Generic BLAS fallback")) {
+            g_probe.saw_blas_fallback = true;
+        }
+    }
+    if (level >= GGML_LOG_LEVEL_WARN && text) {
+        fputs(text, stderr);
+    }
+}
+
 static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
                                 const void * weight_data, size_t weight_size,
                                 const float * input_data, int n_embd, int n_rows,
-                                std::vector<float> & output) {
+                                std::vector<float> & output, bool require_coalesced = false) {
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
 
     struct ggml_init_params params = {
@@ -89,7 +120,20 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
     }
 
     struct ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_rows);
-    ggml_set_name(weight, "weight");
+    // The name is load-bearing, not cosmetic. The COALESCED layout is chosen at
+    // ggml_backend_tensor_set time by layout_policy::get_optimal(), keyed on
+    // infer_tensor_usage(name) (common.hpp). A bare "weight" infers UNKNOWN,
+    // which falls through to GGML_LAYOUT_SOA -- and a SoA tensor makes the
+    // forced DMMV_COALESCED kernel ineligible, so dispatch silently drops to the
+    // generic BLAS fallback and this test measures something else entirely
+    // (llama.cpp-ug4p). An attn_* name infers ATTENTION_WEIGHT, which is the
+    // production path to COALESCED for Q6_K.
+    //
+    // Note ggml_sycl::test_layout_override_guard does NOT cover this: it binds
+    // in the dispatch-time selectors, while the materialization above consults
+    // layout_policy::get_with_override(), whose "override" is the unrelated
+    // GGML_SYCL_UNIFIED_* env knob.
+    ggml_set_name(weight, "blk.0.attn_q.weight");
 
     struct ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
     ggml_set_name(input, "input");
@@ -123,11 +167,39 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
     ggml_backend_tensor_set(weight, weight_data, 0, weight_size);
     ggml_backend_tensor_set(input, input_data, 0, n_embd * sizeof(float));
 
+    // Positive half of the kernel-identity gate: the weight must actually be in
+    // the coalesced layout after upload. Without this the test can only observe
+    // that nothing complained, which is what let a BLAS-fallback run pass as a
+    // coalesced-kernel run.
+    if (require_coalesced) {
+        const enum ggml_layout_mode mode = weight->layout ? weight->layout->mode : GGML_LAYOUT_AOS;
+        if (mode != GGML_LAYOUT_COALESCED) {
+            printf("  FAIL: weight layout is %d, expected GGML_LAYOUT_COALESCED (%d) -- the coalesced "
+                   "kernel cannot run, so this case would prove nothing\n",
+                   (int) mode, (int) GGML_LAYOUT_COALESCED);
+            ggml_backend_buffer_free(compute_buffer);
+            ggml_backend_buffer_free(weight_buffer);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
     struct ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
 
+    if (require_coalesced) {
+        g_probe.reset();
+    }
     enum ggml_status status = ggml_backend_graph_compute(backend, graph);
     bool success = (status == GGML_STATUS_SUCCESS);
+
+    // Negative half: dispatch must not have declined the kernel or fallen back.
+    if (success && require_coalesced && (g_probe.saw_layout_refusal || g_probe.saw_blas_fallback)) {
+        printf("  FAIL: dispatch did not run the coalesced DMMV kernel (layout_refusal=%d blas_fallback=%d) "
+               "-- results below would come from another path\n",
+               (int) g_probe.saw_layout_refusal, (int) g_probe.saw_blas_fallback);
+        success = false;
+    }
     if (success) {
         output.resize(n_rows);
         ggml_backend_tensor_get(out, output.data(), 0, output.size() * sizeof(float));
@@ -174,7 +246,7 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
     std::vector<float> gpu_out;
     std::vector<float> cpu_out;
     if (!run_mul_mat_backend(gpu_backend, GGML_TYPE_Q6_K, weight_quant.data(), weight_bytes,
-                             input_data.data(), ncols, nrows, gpu_out)) {
+                             input_data.data(), ncols, nrows, gpu_out, /*require_coalesced=*/true)) {
         printf("  FAIL: GPU backend compute failed\n");
         return false;
     }
@@ -258,19 +330,36 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
     // inputs; a bit-identical repeat rules out a race in the materialization.
     std::vector<float> gpu_out2;
     if (run_mul_mat_backend(gpu_backend, GGML_TYPE_Q6_K, weight_quant.data(), weight_bytes,
-                            input_data.data(), ncols, nrows, gpu_out2)) {
-        bool identical = true;
-        for (int i = 0; i < nrows && identical; ++i) {
-            identical = (gpu_out[i] == gpu_out2[i]);
+                            input_data.data(), ncols, nrows, gpu_out2, /*require_coalesced=*/true)) {
+        // The verdict is about the DEFECT, so it is scored on the failing rows
+        // only. Scoring it on all-rows bit-equality made it announce "racy"
+        // while its own detail lines showed the failing row identical in both
+        // runs: any last-bit jitter in a healthy row -- ordinary for a threaded
+        // or tree reduction -- flipped the verdict. Whole-buffer drift is still
+        // reported, as context rather than as the verdict.
+        bool defect_stable = true;
+        for (int i : failing_rows) {
+            if (gpu_out[i] != gpu_out2[i]) {
+                defect_stable = false;
+            }
+            printf("      row %d: run1=%.6f run2=%.6f\n", i, gpu_out[i], gpu_out2[i]);
         }
-        printf("    repeat run: %s\n",
-               identical ? "bit-identical (deterministic defect)"
-                         : "DIFFERS from first run (racy / order-dependent defect)");
-        if (!identical) {
-            for (int i : failing_rows) {
-                printf("      row %d: run1=%.6f run2=%.6f\n", i, gpu_out[i], gpu_out2[i]);
+        printf("    repeat run: failing rows are %s\n",
+               defect_stable ? "bit-identical (deterministic defect)"
+                             : "DIFFERENT (racy / order-dependent defect)");
+
+        int   drifted  = 0;
+        float max_drift = 0.0f;
+        for (int i = 0; i < nrows; ++i) {
+            const float d = fabsf(gpu_out[i] - gpu_out2[i]);
+            if (d != 0.0f) {
+                drifted++;
+            }
+            if (d > max_drift) {
+                max_drift = d;
             }
         }
+        printf("    run-to-run drift across all rows: %d/%d rows differ, max=%.9f\n", drifted, nrows, max_drift);
     }
     return false;
 }
@@ -279,6 +368,8 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
     printf("=== Q6_K DMMV Coalesced Tests ===\n");
+
+    ggml_log_set(dispatch_probe_log, nullptr);
 
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
