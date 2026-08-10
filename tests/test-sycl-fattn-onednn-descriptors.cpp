@@ -412,24 +412,39 @@ static int run_descriptor_tests() {
         // Production-scale GQA (llama.cpp-l7rt). Mistral's decode shape, the one
         // CLAUDE.md records from a live run as
         //   [SYCL] fattn: oneDNN MATERIALIZED D=128 ne01=16 ne11=256 H_q=32 H_kv=8
+        // That capture predates llama.cpp-olpg; the same run today logs DIRECT.
         //
-        // These two exist to answer whether the nc!=D materialize gate at
-        // fattn-onednn.cpp:182 is a CORRECTNESS requirement or an optimization,
-        // at the shape production actually runs. They are a matched pair and
-        // neither is useful alone:
+        // These two exist to answer whether the nc!=D materialize gate in
+        // ggml_sycl_flash_attn_ext_onednn_plan (the KV_NC_STRIDE_MISMATCH
+        // predicate in fattn-onednn.cpp -- deliberately named rather than cited
+        // by line, because the line has already moved twice) is a CORRECTNESS
+        // requirement or an optimization, at the shape production actually runs.
+        // They answered it: an optimization. The owner ruled on 2026-08-10
+        // (llama.cpp-olpg) to ship DIRECT as the default on the strength of it.
         //
-        //   -dense       k_stride == v_stride == D, so the gate does not fire and
-        //                the planner says DIRECT on an UNMUTATED build. This is
+        // They remain a matched pair, and neither is useful alone:
+        //
+        //   -dense       k_stride == v_stride == D, so the predicate cannot fire
+        //                and the planner says DIRECT in EVERY env state. This is
         //                the positive control at scale: it separates "DIRECT is
         //                wrong for STRIDED K/V" from "DIRECT, or this fixture's
         //                tolerance, is wrong at D=128/n_kv=256 generally".
         //                Without it a red -strided result is uninterpretable.
         //   -strided     k_stride=131, v_stride=133 (coprime with D and with each
         //                other, so no accidental alignment rescues a stride bug),
-        //                so the gate fires and the planner says
-        //                MATERIALIZE_REQUIRED unmutated. Prefixing `false &&` to
-        //                the :182 predicate is what routes this same case through
-        //                DIRECT, which is the measurement the ticket wants.
+        //                so it is the case the predicate governs. It now plans
+        //                DIRECT by DEFAULT; GGML_SYCL_FA_ONEDNN_MATERIALIZE=1 is
+        //                the opt-in that restores MATERIALIZE_REQUIRED, and is
+        //                how both arms are still measured from one binary. The
+        //                `false &&` source patch this comment used to describe
+        //                is retired -- that predates the env toggle, and patching
+        //                a second library into the run is what produced l7rt's
+        //                misattributed heap-corruption abort.
+        //
+        // NOTE this fixture asserts NUMERICS ONLY. It prints the plan kind but
+        // never asserts it, so both env states are legitimately green here and a
+        // flipped `plan=` line is not a regression. The plan-kind contract lives
+        // in tests/test-sycl-fattn-onednn-gates.cpp.
         ok &= run_case(ctx, { "GQA-prod-dense", 32, 8, 128, 16, 256, 128, 128, 240, fill_profile::PRODUCTION });
         ok &= run_case(ctx, { "GQA-prod-strided", 32, 8, 128, 16, 256, 131, 133, 240, fill_profile::PRODUCTION });
         ctx.stream()->wait_and_throw();
