@@ -38,34 +38,50 @@
 // well-formed inputs proves the accept path and nothing else.
 //
 // ---------------------------------------------------------------------------
-// IF YOU ARE HERE BECAUSE FOUR CASES FAILED: check the environment first.
+// THREE-STATE CONTRACT: EVERY STATE MUST EXIT rc=0. There are no by-design
+// failures in this file. Any FAIL line, in any state, is a real finding.
 //
-// This binary is the guardian of the nc!=D materialize decision, so
-// GGML_SYCL_FA_ONEDNN_MATERIALIZE=0 (llama.cpp-l7rt) makes it fail BY DESIGN --
-// that variable's whole job is to plan DIRECT for exactly the shapes these
-// cases assert must plan MATERIALIZE_REQUIRED. Failing is the guardian working.
-// Unset, or =1, is the supported default and must pass.
+// Five cases below depend on GGML_SYCL_FA_ONEDNN_MATERIALIZE, because they
+// exercise the nc!=D GQA/MQA shapes that variable routes. They read the state
+// and assert the plan that state owes:
 //
-// The four, and nothing else, should be red:
-//   test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible
-//   test_planner_gqa_mismatch_requires_materialization
-//   test_planner_mqa_mismatch_requires_materialization
-//   test_materialization_descriptor_for_gqa_mismatch
+//   unset -> DIRECT expected               -> PASS
+//   =0    -> DIRECT expected               -> PASS
+//   =1    -> MATERIALIZE_REQUIRED expected -> PASS
 //
-// Expect four FAIL lines, not six. TEST_ASSERT returns on the first FAILING
-// assertion, so in the two planner cases the follow-on `reason ==` assertion --
-// which would also fail, since a DIRECT plan reports reason OK -- never runs.
-// (The descriptor case differs: its first assertion, `ok`, runs and PASSES; it
-// is the second, `desc.required`, that goes red.)
+// ---- Polarity history, because it inverted once ---------------------------
+// The variable arrived with llama.cpp-l7rt defaulting ON, as a measurement axis
+// only, and this header used to say "=0 makes four cases fail BY DESIGN" and
+// name them. That was correct then and is the exact opposite of the contract
+// above now: the owner ruled on 2026-08-10 (llama.cpp-olpg) to ship DIRECT as
+// the default. Unset now means DIRECT; =1 is the opt-in and the surviving A/B
+// axis. Treat any surviving "default ON" text as predating that ruling.
 //
-// A fifth red case, or a different four, is a real finding: it means something
-// other than that one predicate moved.
+// Ending the by-design-red era is the point, not a side effect. A state that is
+// already failing cannot detect anything, so the =0 run used to be worth
+// nothing as a gate. Now the THREE-STATE RUN IS THE MUTATION DETECTOR, and it
+// needs all three to be green-when-correct: =1 catches a planner stuck on
+// DIRECT, unset/=0 catch one stuck on MATERIALIZE_REQUIRED. Either state alone
+// only proves one direction.
 //
-// That four-red contract is unchanged by
-// test_source_contract_partition_split_is_refused (llama.cpp-mrld), the one case
-// here that is not a planner call: it reads no environment variable and does not
-// invoke the planner, so it answers the same in all three env states. If it goes
-// red it is a real finding in every state.
+// ---- Why no case sets the variable itself ---------------------------------
+// The planner latches it into a function-local static on its first call
+// (fattn-onednn.cpp), so it is read ONCE PER PROCESS. A setenv() inside a case
+// cannot move a plan a previous case already latched, and would silently
+// override the state the runner asked for. Each polarity needs its own process
+// -- which is why this is a three-state contract and not one self-contained
+// test.
+//
+// test_nc_stride_axis_moves_plan_iff_materialize_enabled is the in-process
+// substitute. It cannot switch states, but it checks that within the active
+// state the nc-stride axis has exactly the effect that state implies, which is
+// what separates "the predicate answered" from "the predicate is dead and this
+// shape was going to answer that anyway".
+//
+// test_source_contract_partition_split_is_refused (llama.cpp-mrld) is the one
+// case here that is not a planner call: it reads no environment variable and
+// does not invoke the planner, so it answers the same in all three states. If
+// it goes red it is a real finding in every state.
 // ---------------------------------------------------------------------------
 
 #include "ggml-sycl/fattn.hpp"
@@ -95,6 +111,27 @@ int main() {
                 return false;                            \
             }                                            \
         } while (0)
+
+// The shipped default (llama.cpp-olpg, owner ruling 2026-08-10): with the
+// variable unset, the planner plans DIRECT for nc!=D GQA/MQA.
+//
+// This constant is not a convenience. It IS this file's assertion about the
+// product default, written out rather than inferred, so that changing the
+// default in fattn-onednn.cpp without touching this line turns the unset run
+// red. That redness is the feature -- it is how a silent policy change gets
+// caught. If you arrive at a failing unset run, the fix is to establish which
+// side is wrong, NOT to edit this constant until the run goes green; doing that
+// retires the gate while leaving it looking like it still works.
+static constexpr bool k_materialize_default = false;
+
+// Mirrors the planner's own parse (getenv, atoi != 0, else the default above).
+// Keep the two spellings identical: a divergence here does not fail loudly, it
+// just makes every state-dependent case below assert against a state the
+// planner is not in.
+static bool materialize_enabled() {
+    const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_MATERIALIZE");
+    return e ? (std::atoi(e) != 0) : k_materialize_default;
+}
 
 static fattn_params mistral_like_params(int k_nc_stride_elems) {
     fattn_params params{};
@@ -145,10 +182,11 @@ static fattn_params mqa_like_params(int k_nc_stride_elems) {
 }
 
 // ggml_sycl_flash_attn_ext_onednn_eligible is the boolean face of the planner,
-// and it must answer "DIRECT-eligible", not merely "not rejected". A GQA shape
-// with nc_stride != D plans MATERIALIZE_REQUIRED, so the wrapper has to report
-// false: what makes that shape safe is the materializer building dense f16 K/V
-// first, never the direct descriptor.
+// and it must answer "DIRECT-eligible", not merely "not rejected". The two
+// differ on exactly one kind -- MATERIALIZE_REQUIRED, which is not a rejection
+// and is not direct-eligible either -- and whether the nc_stride != D GQA shape
+// lands there is precisely what GGML_SYCL_FA_ONEDNN_MATERIALIZE selects. So
+// this case tracks the state rather than asserting one answer.
 //
 // This case used to wrap the call in setenv("GGML_SYCL_FA_ONEDNN_ALLOW", "1")
 // and assert the shape stayed ineligible *even with* the bypass set. That leg
@@ -163,18 +201,61 @@ static fattn_params mqa_like_params(int k_nc_stride_elems) {
 //
 // That second one is the exact opposite of the vacuous leg described above, and
 // the contrast is the point: the old ALLOW bypass could not change this call's
-// answer, whereas MATERIALIZE=0 changes it every time -- it is the one variable
-// that can turn this assertion red, and doing so is its purpose, not a
-// regression. See the four-red note at the top of this file. So it must not be
-// set here either, for the opposite reason: not because it would do nothing,
-// but because it would assert the negation of what this case is for.
-// The layout property below is the falsifiable part and is what survives.
-static bool test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible() {
+// answer, whereas MATERIALIZE changes it every time. This case still does not
+// set it -- but for a third reason again, now that the default is DIRECT. It
+// reads the state and asserts whichever answer that state owes. Setting it here
+// would pin one polarity and leave the other two states untested, and it would
+// not even take effect, because the planner latches the variable once per
+// process (see the header).
+static bool test_gqa_nc_stride_mismatch_eligibility_follows_materialize_state() {
     fattn_params params   = mistral_like_params(/*k_nc_stride_elems=*/512);
     const bool   eligible = ggml_sycl_flash_attn_ext_onednn_eligible(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                      /*multi_seq=*/false);
 
-    TEST_ASSERT(!eligible, "nc_stride != D GQA plans MATERIALIZE_REQUIRED and must not report direct-eligible");
+    if (materialize_enabled()) {
+        TEST_ASSERT(!eligible,
+                    "MATERIALIZE=1: nc_stride != D GQA plans MATERIALIZE_REQUIRED and must not report "
+                    "direct-eligible");
+        return true;
+    }
+    TEST_ASSERT(eligible, "MATERIALIZE default/=0: nc_stride != D GQA plans DIRECT and must report direct-eligible");
+    return true;
+}
+
+// In-process state-dependence control, and the reason every state can be green
+// without any of them becoming vacuous. A case that asserts only "the active
+// state's expected answer" cannot distinguish the predicate answering from the
+// predicate being dead on a shape that would have answered that way regardless.
+//
+// The discriminator is the nc-stride axis at one fixed GQA shape: with
+// materialization on, the dense and strided variants plan DIFFERENTLY; with it
+// off they plan IDENTICALLY. A predicate stuck in either position therefore
+// fails one of the two states. This is the host-side analogue of llama.cpp-l7rt
+// R0's perfect complement (64 of 64 Mistral dispatches moved), which needed a
+// GPU and two runs to establish the same thing.
+static bool test_nc_stride_axis_moves_plan_iff_materialize_enabled() {
+    fattn_params dense   = mistral_like_params(/*k_nc_stride_elems=*/128);
+    fattn_params strided = mistral_like_params(/*k_nc_stride_elems=*/512);
+
+    const auto plan_dense   = ggml_sycl_flash_attn_ext_onednn_plan(dense, dense.ne02, dense.ne12, dense.kv_is_fp8,
+                                                                   /*multi_seq=*/false);
+    const auto plan_strided = ggml_sycl_flash_attn_ext_onednn_plan(strided, strided.ne02, strided.ne12,
+                                                                   strided.kv_is_fp8, /*multi_seq=*/false);
+
+    // Anchor: if the dense control ever stops planning DIRECT, the comparison
+    // below is between two unknowns and proves nothing either way.
+    TEST_ASSERT(plan_dense.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "the dense-stride anchor must plan DIRECT in every state, or this differential is meaningless");
+
+    if (materialize_enabled()) {
+        TEST_ASSERT(plan_strided.kind != plan_dense.kind,
+                    "MATERIALIZE=1: the nc-stride axis must move the plan; identical kinds mean the materialize "
+                    "predicate never fired");
+        return true;
+    }
+    TEST_ASSERT(plan_strided.kind == plan_dense.kind,
+                "MATERIALIZE default/=0: the nc-stride axis must NOT move the plan; a difference means the "
+                "materialize predicate fired with the toggle off");
     return true;
 }
 
@@ -197,27 +278,45 @@ static bool test_planner_direct_mha_contiguous() {
     return true;
 }
 
-static bool test_planner_gqa_mismatch_requires_materialization() {
+// Both `reason` assertions below are load-bearing in BOTH states, which they
+// were not before the flip: the old file asserted only the materialize reason,
+// and the DIRECT leg's `reason == OK` went unchecked because TEST_ASSERT
+// returned on the kind assertion above it first.
+static bool test_planner_gqa_mismatch_plan_follows_materialize_state() {
     fattn_params params = mistral_like_params(/*k_nc_stride_elems=*/512);
     const auto   plan   = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                /*multi_seq=*/false);
 
-    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
-                "GQA nc_stride != D should require materialization before oneDNN");
-    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH,
-                "GQA materialization reason should identify K/V nc stride mismatch");
+    if (materialize_enabled()) {
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
+                    "MATERIALIZE=1: GQA nc_stride != D should require materialization before oneDNN");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH,
+                    "MATERIALIZE=1: GQA materialization reason should identify K/V nc stride mismatch");
+        return true;
+    }
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "MATERIALIZE default/=0: GQA nc_stride != D should plan DIRECT");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK,
+                "MATERIALIZE default/=0: a DIRECT plan for GQA nc_stride != D should report reason OK");
     return true;
 }
 
-static bool test_planner_mqa_mismatch_requires_materialization() {
+static bool test_planner_mqa_mismatch_plan_follows_materialize_state() {
     fattn_params params = mqa_like_params(/*k_nc_stride_elems=*/512);
     const auto   plan   = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                /*multi_seq=*/false);
 
-    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
-                "MQA nc_stride != D should require materialization before oneDNN");
-    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH,
-                "MQA materialization reason should identify K/V nc stride mismatch");
+    if (materialize_enabled()) {
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
+                    "MATERIALIZE=1: MQA nc_stride != D should require materialization before oneDNN");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH,
+                    "MATERIALIZE=1: MQA materialization reason should identify K/V nc stride mismatch");
+        return true;
+    }
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "MATERIALIZE default/=0: MQA nc_stride != D should plan DIRECT");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK,
+                "MATERIALIZE default/=0: a DIRECT plan for MQA nc_stride != D should report reason OK");
     return true;
 }
 
@@ -350,6 +449,10 @@ static bool test_planner_rejects_paged_layout() {
     return true;
 }
 
+// Only two descriptor fields follow the planner's decision -- `required` and the
+// `bytes_per_tensor` derived from it. Every geometry field is filled the same
+// way whether the plan came back DIRECT or MATERIALIZE_REQUIRED, so those stay
+// unconditional and keep their coverage in all three states.
 static bool test_materialization_descriptor_for_gqa_mismatch() {
     fattn_params                             params = mistral_like_params(/*k_nc_stride_elems=*/512);
     ggml_sycl_onednn_fa_materialization_desc desc{};
@@ -357,13 +460,19 @@ static bool test_materialization_descriptor_for_gqa_mismatch() {
                                                                          /*target_device=*/0, &desc);
 
     TEST_ASSERT(ok, "GQA nc_stride != D should produce a materialization descriptor");
-    TEST_ASSERT(desc.required, "GQA descriptor should mark materialization required");
+    if (materialize_enabled()) {
+        TEST_ASSERT(desc.required, "MATERIALIZE=1: GQA descriptor should mark materialization required");
+        TEST_ASSERT(desc.bytes_per_tensor == (size_t) params.ne12 * params.ne11 * params.ne00 * sizeof(sycl::half),
+                    "MATERIALIZE=1: descriptor should size one dense f16 K/V tensor");
+    } else {
+        TEST_ASSERT(!desc.required, "MATERIALIZE default/=0: a DIRECT plan must not mark materialization required");
+        TEST_ASSERT(desc.bytes_per_tensor == 0,
+                    "MATERIALIZE default/=0: a DIRECT plan must not request materialization bytes");
+    }
     TEST_ASSERT(desc.target_device == 0, "descriptor should preserve target device");
     TEST_ASSERT(desc.D == params.ne00, "descriptor should preserve head dimension");
     TEST_ASSERT(desc.n_kv == params.ne11, "descriptor should preserve KV length");
     TEST_ASSERT(desc.H_kv == params.ne12, "descriptor should preserve KV heads");
-    TEST_ASSERT(desc.bytes_per_tensor == (size_t) params.ne12 * params.ne11 * params.ne00 * sizeof(sycl::half),
-                "descriptor should size one dense f16 K/V tensor");
     TEST_ASSERT(desc.k_target_nb1 == (int64_t) params.ne00 * (int64_t) sizeof(sycl::half),
                 "materialized K token stride must be dense D");
     TEST_ASSERT(desc.v_target_nb1 == (int64_t) params.ne00 * (int64_t) sizeof(sycl::half),
@@ -490,13 +599,22 @@ static bool test_source_contract_partition_split_is_refused() {
 }
 
 int main() {
+    // Name the polarity under test on stdout. A green run says nothing about
+    // the other state, and a log that does not record which one it verified
+    // invites exactly that misreading -- the three-state contract only holds if
+    // someone can tell the three runs apart afterwards.
+    const char * materialize_env = std::getenv("GGML_SYCL_FA_ONEDNN_MATERIALIZE");
+    std::printf("SYCL fattn oneDNN gate tests: GGML_SYCL_FA_ONEDNN_MATERIALIZE=%s -> materialize %s\n",
+                materialize_env ? materialize_env : "<unset>", materialize_enabled() ? "ON" : "OFF");
+
     bool ok = true;
     ok &= test_source_contract_partition_split_is_refused();
-    ok &= test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible();
+    ok &= test_gqa_nc_stride_mismatch_eligibility_follows_materialize_state();
+    ok &= test_nc_stride_axis_moves_plan_iff_materialize_enabled();
     ok &= test_gqa_nc_stride_equal_d_remains_onednn_eligible();
     ok &= test_planner_direct_mha_contiguous();
-    ok &= test_planner_gqa_mismatch_requires_materialization();
-    ok &= test_planner_mqa_mismatch_requires_materialization();
+    ok &= test_planner_gqa_mismatch_plan_follows_materialize_state();
+    ok &= test_planner_mqa_mismatch_plan_follows_materialize_state();
     ok &= test_materialization_descriptor_for_gqa_mismatch();
     ok &= test_materialization_descriptor_direct_mha_noop();
     ok &= test_materialization_descriptor_rejects_unsupported_layout();

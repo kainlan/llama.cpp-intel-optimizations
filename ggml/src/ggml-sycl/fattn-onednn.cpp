@@ -175,30 +175,44 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
 
     // oneDNN Graph SDPA can represent MHA as 4-D (batch,H,S,D) and GQA/MQA as
     // 5-D (batch,H_kv,N_rep,S,D). The direct GQA/MQA path still requires a
-    // contiguous K/V token-D plane. When nc_stride != D, the planner asks the
-    // unified-cache-backed materializer for dense f16 K/V before oneDNN execute.
+    // contiguous K/V token-D plane. When nc_stride != D, the planner can either
+    // ask the unified-cache-backed materializer for dense f16 K/V before the
+    // oneDNN execute, or hand the strided K/V straight to it; which one it does
+    // is the policy decided immediately below.
     //
-    // GGML_SYCL_FA_ONEDNN_MATERIALIZE=0 plans DIRECT for these shapes instead.
-    // It exists so the materialize-vs-direct comparison can be made with ONE
-    // binary and ONE library: the earlier measurement (llama.cpp-l7rt) had to
-    // patch this predicate and load a second libggml-sycl.so through
-    // LD_LIBRARY_PATH, which moved the source AND the loaded object together
-    // and produced a heap-corruption abort that was wrongly attributed to the
-    // direct path. Re-run as a single binary, both arms exit rc=0 with no glibc
-    // diagnostic, so that abort was a harness artifact and there is no known
-    // teardown defect here. DIRECT is numerically correct at production shapes
-    // and measured at worst parity on B50 pp512.
+    // ---- POLARITY: DIRECT is the DEFAULT. Materialization is now the opt-in. --
+    // Unset and GGML_SYCL_FA_ONEDNN_MATERIALIZE=0 plan DIRECT for these shapes;
+    // =1 opts back into the dense f16 K/V repack. THIS IS THE REVERSE OF WHAT
+    // THIS BLOCK SAID BEFORE 2026-08-10 -- the variable was introduced by
+    // llama.cpp-l7rt defaulting ON, purely as a measurement axis, and the owner
+    // ruled on 2026-08-10 (llama.cpp-olpg) to ship DIRECT. Anything you read
+    // elsewhere describing "default ON" predates that ruling.
     //
-    // The default nevertheless stays ON, and deliberately: whether to flip it is
-    // performance-sensitive dispatch policy and an open OWNER decision, not a
-    // call this predicate should make for itself.
+    // The evidence the ruling rests on (llama.cpp-l7rt, closed): DIRECT is
+    // numerically correct at production shapes -- descriptor pair at D=16 and
+    // D=128 within the fixture's unchanged tolerance, and the Mistral digit gate
+    // exact in both states. The "teardown double-free" once recorded against the
+    // direct path was a harness artifact, not a product defect: that measurement
+    // patched this predicate and loaded a second libggml-sycl.so through
+    // LD_LIBRARY_PATH, moving the source AND the loaded object together. Re-run
+    // as a single binary, both arms exit rc=0 with no glibc diagnostic. On B50
+    // pp512, five interleaved pairs put DIRECT at worst at parity, with three
+    // pairs ahead; the magnitude is deliberately not quoted -- the pairs were
+    // anti-correlated, so the direction is what the data supports.
+    //
+    // =1 REMAINS THE A/B AXIS, and that is the reason this predicate survives the
+    // flip rather than being deleted: it is what lets the decision be revisited
+    // from any build with two env-var runs, no patching and no stashed library.
+    // Keep it wired for that reason alone.
     //
     // INVARIANT -- THIS IS THE SINGLE materialize-vs-DIRECT DECISION SITE.
     // Every oneDNN FA dispatch reaches materialization through this predicate
     // and no other; that is what lets one variable cover all traffic, and what
     // makes tests/test-sycl-fattn-onednn-gates.cpp a true guardian of it.
     // Measured, not assumed: flipping this one predicate moved 64 of 64 Mistral
-    // dispatches (llama.cpp-l7rt R0), a perfect complement.
+    // dispatches (llama.cpp-l7rt R0), a perfect complement. That complement is
+    // also what makes the default flip a single-site change -- had a second site
+    // existed, flipping here would have shipped a mixture of both policies.
     //
     // So do NOT add a second, independent materialize decision anywhere else --
     // a shortcut in the dispatch entry, a per-shape override at the cache
@@ -206,9 +220,14 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     // part of the traffic, and an A/B taken through it would silently measure a
     // mixture of both policies while looking exactly like a clean result.
     // Extend THIS predicate instead.
+    //
+    // The `false` below is the shipped default (llama.cpp-olpg). Changing it is
+    // a product decision, not a tuning tweak: tests/test-sycl-fattn-onednn-
+    // gates.cpp pins this polarity from the other side and goes red if the two
+    // disagree.
     static const bool onednn_materialize = []() {
         const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_MATERIALIZE");
-        return e ? (std::atoi(e) != 0) : true;
+        return e ? (std::atoi(e) != 0) : false;
     }();
     const int64_t k_nc_stride = params.nb11 / (int64_t) sizeof(sycl::half);
     const int64_t v_nc_stride = params.nb21 / (int64_t) sizeof(sycl::half);
