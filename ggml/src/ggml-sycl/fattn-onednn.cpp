@@ -182,10 +182,29 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     // binary and ONE library: the earlier measurement (llama.cpp-l7rt) had to
     // patch this predicate and load a second libggml-sycl.so through
     // LD_LIBRARY_PATH, which moved the source AND the loaded object together
-    // and left the teardown abort seen only in that arm unattributable. It is
-    // a diagnostic axis, not a supported configuration -- the direct path is
-    // numerically correct at production shapes but its teardown behaviour is
-    // under investigation, so the default stays ON.
+    // and produced a heap-corruption abort that was wrongly attributed to the
+    // direct path. Re-run as a single binary, both arms exit rc=0 with no glibc
+    // diagnostic, so that abort was a harness artifact and there is no known
+    // teardown defect here. DIRECT is numerically correct at production shapes
+    // and measured at worst parity on B50 pp512.
+    //
+    // The default nevertheless stays ON, and deliberately: whether to flip it is
+    // performance-sensitive dispatch policy and an open OWNER decision, not a
+    // call this predicate should make for itself.
+    //
+    // INVARIANT -- THIS IS THE SINGLE materialize-vs-DIRECT DECISION SITE.
+    // Every oneDNN FA dispatch reaches materialization through this predicate
+    // and no other; that is what lets one variable cover all traffic, and what
+    // makes tests/test-sycl-fattn-onednn-gates.cpp a true guardian of it.
+    // Measured, not assumed: flipping this one predicate moved 64 of 64 Mistral
+    // dispatches (llama.cpp-l7rt R0), a perfect complement.
+    //
+    // So do NOT add a second, independent materialize decision anywhere else --
+    // a shortcut in the dispatch entry, a per-shape override at the cache
+    // lookup, another getenv. A second site would leave the toggle covering only
+    // part of the traffic, and an A/B taken through it would silently measure a
+    // mixture of both policies while looking exactly like a clean result.
+    // Extend THIS predicate instead.
     static const bool onednn_materialize = []() {
         const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_MATERIALIZE");
         return e ? (std::atoi(e) != 0) : true;

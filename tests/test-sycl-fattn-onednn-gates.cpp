@@ -36,6 +36,31 @@
 // The lesson for anyone extending this file: a planner gate is only covered if
 // some case makes the guarded quantity WRONG. A suite of cases that all supply
 // well-formed inputs proves the accept path and nothing else.
+//
+// ---------------------------------------------------------------------------
+// IF YOU ARE HERE BECAUSE FOUR CASES FAILED: check the environment first.
+//
+// This binary is the guardian of the nc!=D materialize decision, so
+// GGML_SYCL_FA_ONEDNN_MATERIALIZE=0 (llama.cpp-l7rt) makes it fail BY DESIGN --
+// that variable's whole job is to plan DIRECT for exactly the shapes these
+// cases assert must plan MATERIALIZE_REQUIRED. Failing is the guardian working.
+// Unset, or =1, is the supported default and must pass.
+//
+// The four, and nothing else, should be red:
+//   test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible
+//   test_planner_gqa_mismatch_requires_materialization
+//   test_planner_mqa_mismatch_requires_materialization
+//   test_materialization_descriptor_for_gqa_mismatch
+//
+// Expect four FAIL lines, not six. TEST_ASSERT returns on the first FAILING
+// assertion, so in the two planner cases the follow-on `reason ==` assertion --
+// which would also fail, since a DIRECT plan reports reason OK -- never runs.
+// (The descriptor case differs: its first assertion, `ok`, runs and PASSES; it
+// is the second, `desc.required`, that goes red.)
+//
+// A fifth red case, or a different four, is a real finding: it means something
+// other than that one predicate moved.
+// ---------------------------------------------------------------------------
 
 #include "ggml-sycl/fattn.hpp"
 
@@ -121,8 +146,17 @@ static fattn_params mqa_like_params(int k_nc_stride_elems) {
 // GGML_SYCL_FA_ONEDNN would be vacuous the same way: that name gates
 // g_sycl_fa_onednn_enabled in fattn.cpp, a file-scope flag the planner cannot
 // see (documented at fattn-onednn.hpp's declaration) and which latches once per
-// process. The planner reads no environment at all except
-// GGML_SYCL_FA_ONEDNN_MIN_NCOLS, itself cached in a function-local static.
+// process. The planner reads exactly two environment variables, each cached in
+// a function-local static: GGML_SYCL_FA_ONEDNN_MIN_NCOLS, and
+// GGML_SYCL_FA_ONEDNN_MATERIALIZE (added by llama.cpp-l7rt).
+//
+// That second one is the exact opposite of the vacuous leg described above, and
+// the contrast is the point: the old ALLOW bypass could not change this call's
+// answer, whereas MATERIALIZE=0 changes it every time -- it is the one variable
+// that can turn this assertion red, and doing so is its purpose, not a
+// regression. See the four-red note at the top of this file. So it must not be
+// set here either, for the opposite reason: not because it would do nothing,
+// but because it would assert the negation of what this case is for.
 // The layout property below is the falsifiable part and is what survives.
 static bool test_gqa_nc_stride_mismatch_is_not_direct_onednn_eligible() {
     fattn_params params   = mistral_like_params(/*k_nc_stride_elems=*/512);
