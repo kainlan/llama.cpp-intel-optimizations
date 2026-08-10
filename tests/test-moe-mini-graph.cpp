@@ -281,6 +281,13 @@ static leg_result run_moe_graph_backend(ggml_backend_t backend,
         // populated no matter how the run goes. Print the graph state so a run
         // says what the backend actually did, and let the CPU-vs-SYCL comparison
         // in main() be the thing that passes or fails (llama.cpp-v9ue).
+        //
+        // exec_graph is likewise reported, NOT asserted, and that is deliberate
+        // rather than an oversight: whether this shape records an executable
+        // graph at all is the open question tracked by llama.cpp-tott. Asserting
+        // it before that is settled would pin the test red on a zero and leave it
+        // unable to score anything else. Promote it to an assertion there, once a
+        // real run has said what the value is.
         fprintf(stderr, "MoE mini-graph SYCL state: exec_graph=%d pinned_entries=%zu replays=%llu passes=%d\n",
                 ggml_sycl::test_backend_has_exec_graph(backend) ? 1 : 0,
                 ggml_sycl::test_graph_pinned_entry_count(backend),
