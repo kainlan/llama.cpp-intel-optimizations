@@ -2550,29 +2550,33 @@ set_tests_properties(test-sycl-moe-q8-scratch PROPERTIES
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
-add_executable(test-sycl-onednn-packed-cache
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-packed-cache.cpp
+add_executable(test-sycl-onednn-pack-m-propagation
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-pack-m-propagation.cpp
 )
-target_include_directories(test-sycl-onednn-packed-cache PRIVATE
+target_include_directories(test-sycl-onednn-pack-m-propagation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${SYCL_INCLUDE_DIR}
 )
-target_compile_options(test-sycl-onednn-packed-cache PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-sycl-onednn-packed-cache PRIVATE "-fsycl")
-target_compile_definitions(test-sycl-onednn-packed-cache PRIVATE
+target_compile_options(test-sycl-onednn-pack-m-propagation PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-onednn-pack-m-propagation PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-onednn-pack-m-propagation PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
-target_link_libraries(test-sycl-onednn-packed-cache PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-sycl-onednn-pack-m-propagation PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-onednn-packed-cache PRIVATE IntelSYCL::SYCL_CXX)
+    target_link_libraries(test-sycl-onednn-pack-m-propagation PRIVATE IntelSYCL::SYCL_CXX)
 endif()
-add_test(NAME test-sycl-onednn-packed-cache COMMAND test-sycl-onednn-packed-cache)
-set_tests_properties(test-sycl-onednn-packed-cache PROPERTIES
+add_test(NAME test-sycl-onednn-pack-m-propagation COMMAND test-sycl-onednn-pack-m-propagation)
+# SKIP_RETURN_CODE must land in the same change as the test's exit-77 skip paths
+# (llama.cpp-vexg): without it ctest scores 77 as a hard failure, turning a
+# legitimate skip on a device-less runner into a red test.
+set_tests_properties(test-sycl-onednn-pack-m-propagation PROPERTIES
     LABELS "sycl;onednn;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
