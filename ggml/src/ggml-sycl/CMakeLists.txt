@@ -2658,9 +2658,19 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-fattn-onednn-materialization PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-sycl-fattn-onednn-materialization COMMAND test-sycl-fattn-onednn-materialization)
+# GGML_SYCL_FA_ONEDNN_MATERIALIZE=1 here is load-bearing, not tuning.  The owner
+# flipped the shipped oneDNN FA default to DIRECT on 2026-08-10 (llama.cpp-olpg),
+# and everything this test is about -- the descriptor's `required` flag, the dense
+# target byte size, and the device K/V repack whose handles must resolve -- exists
+# only in the opt-in state: under DIRECT the planner never returns
+# MATERIALIZE_REQUIRED, materialize_kv no-ops, and the handles are empty by design.
+# So the test is pinned to the state that reaches its subject.
+# It deliberately does NOT assert plan polarity in either direction; that contract
+# belongs to test-sycl-fattn-onednn-gates, which runs all three states.  See
+# llama.cpp-pp72 (cluster C1).
 set_tests_properties(test-sycl-fattn-onednn-materialization PROPERTIES
     LABELS "sycl;fattn;onednn;tdd;0igs-batch1"
-    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_FA_ONEDNN_MATERIALIZE=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture

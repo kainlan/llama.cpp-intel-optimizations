@@ -1,3 +1,29 @@
+// Mechanism tests for the oneDNN FA K/V materializer: the descriptor's `required`
+// flag and dense target size, its source/target byte-offset arithmetic, and the
+// device repack whose handles must resolve on the target device and fail closed on
+// any other.
+//
+// THIS FILE REQUIRES GGML_SYCL_FA_ONEDNN_MATERIALIZE=1, AND ITS ctest REGISTRATION
+// PINS IT (ggml/src/ggml-sycl/CMakeLists.txt).  A bare `./build/bin/test-sycl-
+// fattn-onednn-materialization` with the variable unset reports three FAILs -- the
+// two `should require materialization` lines and `materialized handles must
+// resolve` -- and that is the DEFAULT STATE ANSWERING CORRECTLY, not a defect: the
+// owner shipped DIRECT as the oneDNN FA default on 2026-08-10 (llama.cpp-olpg), so
+// with the variable unset the planner never returns MATERIALIZE_REQUIRED and
+// ggml_sycl_flash_attn_ext_onednn_materialize_kv no-ops by contract.  Run it the
+// way ctest does, or via ctest.  (llama.cpp-pp72, cluster C1.)
+//
+// The pin lives in the registration and NOT in a setenv() here on purpose: the
+// planner latches the variable into a function-local static on its first call, so
+// an in-process setenv would silently override whatever state a runner asked for --
+// the same trap tests/test-sycl-fattn-onednn-gates.cpp documents.  That file, not
+// this one, is the polarity contract-holder; nothing below asserts which plan the
+// default state produces.
+//
+// test_non_monotonic_source_stride_descriptor is state-independent (it asserts the
+// descriptor accepts strided views and computes offsets, never `required`), so it
+// passes in both states and stays a live check under the pin.
+
 #include "ggml-sycl/fattn-onednn.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 
