@@ -1547,29 +1547,6 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx,
                               mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, add_s01, add_s02,
                               add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples, dst_s01, dst_s02, dst_s03,
                               eps, main_stream, ctx.device);
-
-    // Diagnostic (llama.cpp-81gx): print the shapes this fusion claimed plus a checksum of its
-    // output, so a fused run can be diffed against the per-node CPU dump to name the first
-    // site that diverges. Opt-in: it forces a device->host copy per fused node.
-    static const bool fused_add_debug = getenv("GGML_SYCL_FUSED_ADD_DEBUG") != nullptr;
-    if (fused_add_debug) {
-        main_stream->wait();
-        const int64_t      n = ggml_nelements(add_tensor);
-        std::vector<float> h(n);
-        main_stream->memcpy(h.data(), add_dst_dd, n * sizeof(float)).wait();
-        double sum = 0.0, sumsq = 0.0;
-        for (int64_t k = 0; k < n; k++) {
-            sum += h[k];
-            sumsq += double(h[k]) * double(h[k]);
-        }
-        fprintf(stderr,
-                "[FUSED_ADD] dst=%-28s ne=[%ld,%ld,%ld,%ld] src=[%ld,%ld,%ld,%ld] "
-                "mul=[%d,%d,%d,%d] add=[%d,%d,%d,%d] add_cont=%d src_cont=%d sum=%.9g sumsq=%.9g\n",
-                add_tensor->name, (long) add_tensor->ne[0], (long) add_tensor->ne[1], (long) add_tensor->ne[2],
-                (long) add_tensor->ne[3], (long) ne00, (long) ne01, (long) ne02, (long) ne03, mul_ncols, mul_nrows,
-                mul_nchannels, mul_nsamples, add_ncols, add_nrows, add_nchannels, add_nsamples,
-                (int) ggml_is_contiguous(add_src), (int) ggml_is_contiguous(rms_norm_src), sum, sumsq);
-    }
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
