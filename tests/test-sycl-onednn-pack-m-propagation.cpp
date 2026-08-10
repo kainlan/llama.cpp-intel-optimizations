@@ -242,8 +242,11 @@ static int run_pack_m_propagation_test() {
         return GATE_FAIL;
     }
 
-    // Non-vacuity control for the assertion below.  mode/data_ptr are written
-    // ONLY by ggml_sycl_update_layout_from_cache, so checking them first
+    // Non-vacuity control for the assertion below.  Ten-odd sites write
+    // extra->layout.mode, but every other one assigns a hardcoded
+    // AOS/SOA/COALESCED/XMX_TILED/MXFP4_DPAS: only
+    // ggml_sycl_update_layout_from_cache can set it to ONEDNN_PACKED, so a
+    // packed mode here proves that function ran.  Checking it first
     // distinguishes "the propagation ran and produced the wrong pack_m" from
     // "the propagation never ran and pack_m merely retained its seeded value".
     if (weight->layout->mode != GGML_LAYOUT_ONEDNN_PACKED || weight->layout->data_ptr != packed_ptr) {
