@@ -75,8 +75,13 @@ static double q6k_exact_dot(const block_q6_K * blocks, const float * y, int bloc
 
 // Watches the ggml log for the two warnings that mean the coalesced DMMV kernel
 // did NOT run. Both are GGML_LOG_WARN, so they reach a ggml_log_set callback
-// without any verbosity plumbing. See kernel_ran() for why absence alone is not
-// the whole gate.
+// without any verbosity plumbing.
+//
+// This is only half the gate, and the weaker half: silence here means "nothing
+// complained", which is also what a run that dispatched some entirely different
+// kernel produces, since only a refusal or a fallback says anything at all.
+// run_mul_mat_backend() therefore pairs it with a positive assertion that the
+// weight really is in the coalesced layout, and evaluates both.
 struct dispatch_probe {
     bool saw_layout_refusal = false;
     bool saw_blas_fallback  = false;
