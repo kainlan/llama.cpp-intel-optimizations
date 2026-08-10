@@ -13109,6 +13109,13 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
     // waits on a queue, and a queue wait held under either of those mutexes is a
     // stall hazard (the teardown drain keeps its waits outside all ranked locks
     // for the same reason).
+    //
+    // Both calls stay: they cover disjoint states, and neither subsumes the
+    // other. The drain handles a terminal graph whose invocation is still HELD
+    // (submit-only exit, llama.cpp-2dgc) -- it early-returns when
+    // execution_invocation_id == 0. The retire handles a terminal graph whose
+    // invocation was already RELEASED and is merely awaiting retirement, which
+    // is the long-standing post-synchronize path and the only one reaching it.
     ggml_sycl_execution_drain_own_terminal(ctx);
     ggml_sycl_execution_try_retire_terminal(ctx);
     auto & registry = ggml_sycl::execution::global_registry();
@@ -13318,6 +13325,15 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
 // Scoped to this ctx alone, unlike the teardown drain's whole-context sweep:
 // begin is per-backend, and a sibling backend bound to the same context has not
 // asked to start a graph here.
+//
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The wait -> clear the event fields ->
+// release-or-abort -> retire body below is a near-verbatim twin of the lambda in
+// ggml_sycl_execution_drain_context_terminal_events(). The duplication is
+// deliberate (the call sites genuinely differ: one context vs one backend, begin
+// vs teardown, and only teardown clears the executable graph), but the ORDERING
+// is a correctness invariant shared by both. Any change to that ordering, to the
+// unproven-wait fallback, or to which event is waited on must be applied to the
+// other function in the same commit.
 static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx) {
         return;
@@ -13376,6 +13392,14 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
 // ggml_sycl_execution_for_each_bound_backend() pins its snapshot under the
 // binding lock and releases the lock before the callback, so every queue wait
 // and every final handle destruction below happens outside all ranked locks.
+//
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's wait -> clear the event
+// fields -> release-or-abort -> retire body is a near-verbatim twin of
+// ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
+// terminal invocation from the begin path (llama.cpp-2dgc). The duplication is
+// deliberate, but the ORDERING is a correctness invariant shared by both. Any
+// change to that ordering, to the unproven-wait fallback, or to which event is
+// waited on must be applied to the other function in the same commit.
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {
     if (context_id == 0) {
         return;

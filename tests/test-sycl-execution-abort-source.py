@@ -9,15 +9,20 @@ registry_h = (root / "ggml/src/ggml-sycl/execution-lifecycle.hpp").read_text()
 registry_cpp = (root / "ggml/src/ggml-sycl/execution-lifecycle.cpp").read_text()
 
 
-def function_body(source, signature_prefix):
-    """Body of the one definition whose signature starts with signature_prefix.
+def function_body(source, signature_regex):
+    """Body of the one definition whose signature matches signature_regex.
 
     Ordering clauses below must not be scored against the whole file: a
     `wait_and_throw()` anywhere in a 100k-line translation unit would satisfy
     "waits before releasing" no matter what the function under test does. Returns
     "" when the definition is absent, which fails every clause that reads it.
+
+    The anchor is a regex, not a literal, so the vertical-alignment padding this
+    file uses (`ggml_backend_sycl_context *   ctx`) is not load-bearing. Pinning
+    the exact run of spaces would make a routine reformat that collapses it read
+    as a FAIL of the invariants below rather than as the formatting change it is.
     """
-    match = re.search(re.escape(signature_prefix) + r".*?^}\n", source, re.S | re.M)
+    match = re.search(signature_regex + r".*?^}\n", source, re.S | re.M)
     return match.group(0) if match else ""
 
 
@@ -32,14 +37,35 @@ def ordered(body, *needles):
     return True
 
 
+def catch_block(body):
+    """Body of the first `catch (...) {` block, up to its closing brace.
+
+    Scoped deliberately: a clause that merely asserts `waited = false;` appears
+    somewhere after `catch (...)` also passes when the assignment sits AFTER the
+    handler, where it would run unconditionally. Only the statements inside the
+    handler prove the unproven-wait path is the one that clears the flag.
+    """
+    start = body.find("catch (...) {")
+    if start < 0:
+        return ""
+    end = body.find("\n    }", start)
+    return body[start:end] if end > start else ""
+
+
 # llama.cpp-2dgc (RCA c-5ozb): the u7vj tail guard submits on every early exit
 # and deliberately does not release, so a caller that computes twice with no
 # ggml_backend_sycl_synchronize() between reaches begin_graph with its OWN
 # invocation COMPLETE-but-unreleased -- a state no existing path can clear, which
 # refused the owner's next begin DEVICE_BUSY. The begin path is now the drain
 # point for it.
-own_drain_body = function_body(backend, "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {")
-begin_graph_body = function_body(backend, "static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,")
+own_drain_body = function_body(
+    backend,
+    r"static void ggml_sycl_execution_drain_own_terminal\s*\(\s*ggml_backend_sycl_context\s*\*\s*ctx\s*\)\s*noexcept\s*\{",
+)
+begin_graph_body = function_body(
+    backend,
+    r"static bool ggml_sycl_execution_begin_graph\s*\(\s*ggml_backend_sycl_context\s*\*\s*ctx\s*,",
+)
 
 checks = {
     "begin drains the owner's own terminal invocation": bool(own_drain_body)
@@ -63,10 +89,18 @@ checks = {
         "ggml_sycl_execution_try_retire_terminal(ctx);",
     ),
     # An unproven terminal must not be released: a throwing wait routes to the
-    # quarantine path instead.
-    "own-terminal drain quarantines on an unproven wait": "catch (...)" in own_drain_body
-        and "if (!waited || !ggml_sycl_execution_release_graph(ctx)) {" in own_drain_body
-        and "ggml_sycl_execution_abort_and_release_graph(ctx);" in own_drain_body,
+    # quarantine path instead. The handler's assignment is the load-bearing part
+    # and is checked inside the handler -- deleting just `waited = false;` leaves
+    # the function releasing on an unproven terminal, which is the exact fault it
+    # exists to prevent, and every other clause here still passes.
+    "own-terminal drain marks an unproven wait inside the catch":
+        "waited = false;" in catch_block(own_drain_body),
+    "own-terminal drain quarantines on an unproven wait": ordered(
+        own_drain_body,
+        "catch (...)",
+        "if (!waited || !ggml_sycl_execution_release_graph(ctx)) {",
+        "ggml_sycl_execution_abort_and_release_graph(ctx);",
+    ),
     # Only a terminal invocation is drainable, and only this root's own.
     "own-terminal drain admits only this root's terminal invocation": all(
         clause in own_drain_body
