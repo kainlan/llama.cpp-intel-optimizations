@@ -17,6 +17,7 @@ cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 execution = (root / "ggml/src/ggml-sycl/execution-lifecycle.cpp").read_text()
 sycl_cmake = (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
 sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
+tools_cmake = (root / "tools/CMakeLists.txt").read_text()
 
 def function_has_guard(source, name, guard):
     pattern = re.compile(r"(?:^|\n)[^\n;]*\b" + re.escape(name) + r"\s*\([^;]*?\)\s*(?:try\s*)?\{", re.S)
@@ -162,6 +163,35 @@ backend_destructor_body = re.search(
     r"ggml_backend_sycl_context::~ggml_backend_sycl_context\(\) \{.*?^}\n",
     backend, re.S | re.M
 ).group(0)
+# 30d3697da gave ggml_sycl_abort_owner_effects_noexcept() a mandatory diagnostic
+# `site` argument, so every caller is `(<owner expr>, "<site>")`. The clauses
+# below match the tagged form rather than a fixed argument list; requiring a
+# non-empty literal keeps that commit's own contract (every call site tagged)
+# under test instead of pinning one site string.
+abort_owner_effects_call_re = re.compile(
+    r"ggml_sycl_abort_owner_effects_noexcept\(\s*(?P<owner>[A-Za-z_][A-Za-z0-9_.]*)\s*,\s*\"[^\"]+\"\s*\)"
+)
+# Every explicit-abort site that captures the cleanup outcome must feed it to a
+# registry finalize call and enqueue the result for quarantine. Quantifying over
+# the sites (rather than naming one literal line) is deliberate: the abort sites
+# are textually near-identical, so a file-global substring test for one of them
+# is satisfied by any of the others and cannot see a regression at a single site.
+cleanup_ok_sites = [
+    m for m in re.finditer(
+        r"const bool cleanup_ok =\s*" + abort_owner_effects_call_re.pattern + r"\s*;", backend
+    )
+]
+# The DL exclusion for sycl-kernel-bench lives in tools/CMakeLists.txt, not in
+# the tool's own CMakeLists: bdc576c1c guarded the whole SYCL tool block, and
+# 5423506c6 then deleted the now-dead inner `if (NOT GGML_BACKEND_DL)` from
+# tools/sycl-kernel-bench/CMakeLists.txt. The property is unchanged -- the
+# directory is not configured under GGML_BACKEND_DL -- only the site moved.
+sycl_tools_dl_block_match = re.search(
+    r"if \(GGML_SYCL AND NOT GGML_BACKEND_DL\)(.*?)endif\(\)", tools_cmake, re.S
+)
+# Empty when the guard itself is gone, so losing the guard reports as a named
+# RED check rather than an extraction crash.
+sycl_tools_dl_block = sycl_tools_dl_block_match.group(1) if sycl_tools_dl_block_match else ""
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -383,13 +413,26 @@ checks = {
     and "backend->device" not in expected_participants_locked_body,
     "for_each backend callback holds no state lock": "execution_state_mutex" not in for_each_bound_backend_body,
     "rollback guard is noexcept": "~owner_rollback_guard() noexcept" in owner_rollback_guard_body
-    and "ggml_sycl_abort_owner_effects_noexcept(owner)" in owner_rollback_guard_body,
+    and any(m.group("owner") == "owner"
+            for m in abort_owner_effects_call_re.finditer(owner_rollback_guard_body)),
     "rollback cleanup failpoint is guarded and exported": "g_test_fail_next_abort_owner_effects_cleanup" in backend
     and 'strcmp(name, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup")' in backend,
     "rollback cleanup stays nonthrowing and preserves closed reset": "ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw()" in abort_owner_effects_noexcept_body
     and abort_owner_effects_noexcept_body.count("catch (...)") >= 6
     and "ggml_sycl_reset_model_load_scratch_state(true);" in abort_owner_effects_noexcept_body,
-    "explicit abort propagates cleanup failure": "const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token);" in backend
+    # The owner census is exact, in this file's usual style: the three sites are
+    # textually near-identical, so only a census sees an abort issued against the
+    # wrong token at one of them.
+    "explicit abort propagates cleanup failure": sorted(
+        m.group("owner") for m in cleanup_ok_sites
+    ) == ["result.token", "ticket.token", "ticket.token"]
+    and all(
+        re.search(r"registry->finalize_(?:end|cleanup)\([^;]*?cleanup_ok",
+                  backend[m.end():m.end() + 400])
+        and "ggml_sycl_enqueue_quarantined_result(" in backend[m.end():m.end() + 400]
+        for m in cleanup_ok_sites
+    )
+    and any(m.group("owner") == "ticket.token" for m in cleanup_ok_sites)
     and "const auto failed = registry->finalize_end(ticket, cleanup_ok);" in backend
     and "ggml_sycl_enqueue_quarantined_result(*registry, failed, model);" in backend,
     "drain batch stores no backend pointers": "ggml_backend_sycl_context * backend" not in extract_control_host_allocs_body
@@ -587,7 +630,8 @@ checks = {
         "test-sycl-module-dlopen",
         "test-sycl-lifecycle-public-api",
     ))
-    and re.search(r"if \(NOT GGML_BACKEND_DL\)\s+set\(TARGET sycl-kernel-bench\)", sycl_bench_cmake)
+    and "add_subdirectory(sycl-kernel-bench)" in sycl_tools_dl_block
+    and "set(TARGET sycl-kernel-bench)" in sycl_bench_cmake
     and "sycl-mxfp4-source-line-probe" in sycl_bench_cmake,
     "DL unload drains module state before dlclose": "ggml_backend_shutdown" in
         (root / "ggml/src/ggml-backend-reg.cpp").read_text()
