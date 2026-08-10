@@ -265,6 +265,11 @@ def test_snapshot_consumer_retains_copied_owner_through_unregister_overlap() -> 
         "launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 16>",
         "ggml_sycl::retain_handles_until_event({ snapshot.handle }, snapshot.ready_event);",
         "ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));",
+        # The gate release belongs strictly between the unregister and the final
+        # wait. Before the unregister it destroys the overlap; after the wait the
+        # decode chain can never drain and the SYCL watchdog kills the process.
+        "gate.release();",
+        "copy_after(q, snapshot.ready_event, out.ptr)",
     )
     assert "sidecar unregister overlap lost copied owner before final decode event" in live
 

@@ -679,6 +679,9 @@ void run_sidecar_unregister_overlap(ggml_backend_sycl_context & ctx,
     controlled_gate_release_guard gate_guard(gate, dependency_q, q);
 
     q.memset(qbuf.ptr, 0, D * sizeof(sycl::half)).wait_and_throw();
+    // Seed the destination away from the expected 65/64 so a decode that never
+    // executes reads a known-wrong value instead of uninitialized device memory.
+    q.memset(out.ptr, 0, D * sizeof(float)).wait_and_throw();
     std::vector<sycl::half> ones(D * N_KV, sycl::half(1.0f));
     q.memcpy(vbuf.ptr, ones.data(), ones.size() * sizeof(sycl::half)).wait_and_throw();
     require(fixture.update(q, device), "sidecar overlap setup failed");
@@ -699,6 +702,17 @@ void run_sidecar_unregister_overlap(ggml_backend_sycl_context & ctx,
     ggml_sycl_fattn_xmx_unregister_packed_k_range(fixture.k.ptr, fixture.k.count * sizeof(sycl::half));
     require(ggml_sycl_fattn_xmx_find_packed_k_sidecar(fixture.lookup, device) == nullptr,
             "unregister retained sidecar registry entry during overlap");
+
+    // The unregister above landed while the consumer decode was still queued
+    // behind the gate, which is the overlap this checkpoint exists to create.
+    // The gate must be released HERE, before the wait below: the decode chain
+    // depends on it transitively, so waiting first blocks on a gate that only
+    // this scope's destructor would release, and the SYCL watchdog _Exit(1)s
+    // the process at GGML_SYCL_OP_TIMEOUT_MS (30 s default) instead. Releasing
+    // after the unregister is what makes the payload check below evidence that
+    // the retained handle outlived the registry entry.
+    require(!gate.released(), "overlap gate released before the unregister window");
+    gate.release();
 
     const float payload = copy_after(q, snapshot.ready_event, out.ptr);
     require(std::isfinite(payload) && std::fabs(payload - (65.0f / 64.0f)) < 0.01f,
