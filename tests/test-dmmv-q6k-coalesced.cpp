@@ -227,18 +227,20 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
     if (success && require_coalesced) {
         const bool dispatch_ok = !(g_probe.saw_layout_refusal || g_probe.saw_blas_fallback);
         if (!layout_ok) {
-            printf("  FAIL: weight layout is %d, expected GGML_LAYOUT_COALESCED (%d) -- the coalesced "
-                   "kernel cannot run\n",
-                   (int) weight_layout, (int) GGML_LAYOUT_COALESCED);
+            printf(
+                "  FAIL: weight layout is %d, expected GGML_LAYOUT_COALESCED (%d) -- the coalesced "
+                "kernel cannot run\n",
+                (int) weight_layout, (int) GGML_LAYOUT_COALESCED);
         }
         if (!dispatch_ok) {
             printf("  FAIL: dispatch declined the coalesced DMMV kernel (layout_refusal=%d blas_fallback=%d)\n",
                    (int) g_probe.saw_layout_refusal, (int) g_probe.saw_blas_fallback);
         }
         if (!layout_ok || !dispatch_ok) {
-            printf("  kernel-identity gate: layout_ok=%d dispatch_ok=%d -- any numbers below would come "
-                   "from another path\n",
-                   (int) layout_ok, (int) dispatch_ok);
+            printf(
+                "  kernel-identity gate: layout_ok=%d dispatch_ok=%d -- any numbers below would come "
+                "from another path\n",
+                (int) layout_ok, (int) dispatch_ok);
             success = false;
         }
     }
@@ -333,10 +335,11 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
 
     const bool pass = (errors == 0);
     if (verbose || !pass) {
-        printf("  Q6_K coalesced ncols=%d nrows=%d blocks_per_row=%d num_tiles=%d: "
-               "errors=%d max_diff=%.6f max_rel=%.6f %s\n",
-               ncols, nrows, blocks_per_row, q6k_tile_count(blocks_per_row),
-               errors, max_diff, max_rel, pass ? "PASS" : "FAIL");
+        printf(
+            "  Q6_K coalesced ncols=%d nrows=%d blocks_per_row=%d num_tiles=%d: "
+            "errors=%d max_diff=%.6f max_rel=%.6f %s\n",
+            ncols, nrows, blocks_per_row, q6k_tile_count(blocks_per_row), errors, max_diff, max_rel,
+            pass ? "PASS" : "FAIL");
     }
 
     if (pass) {
@@ -350,11 +353,10 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
     // execution defect and needs to be classified, not just counted.
     printf("  --- diagnosis (llama.cpp-ug4p) ---\n");
     for (int i : failing_rows) {
-        const double exact = q6k_exact_dot(weight_quant.data() + (size_t) i * blocks_per_row,
-                                           input_data.data(), blocks_per_row);
-        printf("    row %d: gpu=%.6f cpu=%.6f exact_f64=%.6f | gpu-exact=%.6f cpu-exact=%.6f%s\n",
-               i, gpu_out[i], cpu_out[i], exact,
-               gpu_out[i] - exact, cpu_out[i] - exact,
+        const double exact =
+            q6k_exact_dot(weight_quant.data() + (size_t) i * blocks_per_row, input_data.data(), blocks_per_row);
+        printf("    row %d: gpu=%.6f cpu=%.6f exact_f64=%.6f | gpu-exact=%.6f cpu-exact=%.6f%s\n", i, gpu_out[i],
+               cpu_out[i], exact, gpu_out[i] - exact, cpu_out[i] - exact,
                std::isfinite(gpu_out[i]) ? "" : "  [gpu value is NOT FINITE]");
         if (gpu_out[i] == 0.0f) {
             printf("      gpu value is exactly 0 -- output slot likely never written\n");
@@ -371,8 +373,8 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
     // Deterministic or racy? Re-run the same shape on the GPU with identical
     // inputs; a bit-identical repeat rules out a race in the materialization.
     std::vector<float> gpu_out2;
-    if (run_mul_mat_backend(gpu_backend, GGML_TYPE_Q6_K, weight_quant.data(), weight_bytes,
-                            input_data.data(), ncols, nrows, gpu_out2, /*require_coalesced=*/true)) {
+    if (run_mul_mat_backend(gpu_backend, GGML_TYPE_Q6_K, weight_quant.data(), weight_bytes, input_data.data(), ncols,
+                            nrows, gpu_out2, /*require_coalesced=*/true)) {
         // The verdict is about the DEFECT, so it is scored on the failing rows
         // only. Scoring it on all-rows bit-equality made it announce "racy"
         // while its own detail lines showed the failing row identical in both
@@ -387,10 +389,9 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
             printf("      row %d: run1=%.6f run2=%.6f\n", i, gpu_out[i], gpu_out2[i]);
         }
         printf("    repeat run: failing rows are %s\n",
-               defect_stable ? "bit-identical (deterministic defect)"
-                             : "DIFFERENT (racy / order-dependent defect)");
+               defect_stable ? "bit-identical (deterministic defect)" : "DIFFERENT (racy / order-dependent defect)");
 
-        int   drifted  = 0;
+        int   drifted   = 0;
         float max_drift = 0.0f;
         for (int i = 0; i < nrows; ++i) {
             const float d = fabsf(gpu_out[i] - gpu_out2[i]);
