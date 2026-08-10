@@ -98908,6 +98908,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type == GGML_TYPE_F32;
             }
+        case GGML_OP_REPEAT:
+            {
+                // REPEAT routes through ggml_sycl_op_bin_bcast, whose type chain
+                // implements f32/f16/i32/i16 and ends in GGML_ABORT -- there is no
+                // fallback -- so admitting anything else (bf16) crashes at runtime
+                // rather than deferring to another backend. Keep this list in step
+                // with binbcast.cpp. CUDA declines the same way, and more narrowly
+                // (f32/f16 only), because its bin_bcast omits the integer branches.
+                ggml_type src0_type = op->src[0]->type;
+                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_I32 ||
+                       src0_type == GGML_TYPE_I16;
+            }
         case GGML_OP_CONCAT:
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
@@ -98923,7 +98935,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        case GGML_OP_REPEAT:
             return true;
         case GGML_OP_PAD_REFLECT_1D:
             return ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
