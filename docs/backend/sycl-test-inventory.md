@@ -1861,6 +1861,39 @@ independent; sequence them in one file-open.
 | `test-sycl-moe-xmx-tiled-single-layout-planner` | `:18093-18095` delete the `if (legacy_env) { return std::atoi(legacy_env) != 0; }` branch | CPU-ONLY | PASSFAIL, `single-layout XMX_TILED planner tests passed` | `FAIL: tests/test-sycl-moe-xmx-tiled-single-layout-planner.cpp:84: legacy unsafe PP knob must still be honored with forced prompt XMX`, rc 1 | Fires the last CHECK of the last of 4 subtests. Not a mock: the planner helper delegates to the same `mxfp4_moe_single_gateup_layout_policy` production calls at `:18615`. |
 | `test-sycl-layout-choice` | `:621` in `arena_default_external_headroom` delete the `std::max(..., arena_min_safe_external_headroom(...))` clamp | **CPU-ONLY** (hint was wrong) | 12 `PASS: <policy>` lines, no totals | 11 `PASS:` then `FAIL: arena headroom should raise undersized caller slack to the safe floor, got 592445440 expected 603979776`, rc 1 | Its device half is gated behind `GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND=1`, which ctest never sets — the registered run prints `SKIP: backend layout choice purge requires ...` and returns 0. The `ONEAPI_DEVICE_SELECTOR` in its ENVIRONMENT is vestigial. Fail-fast, so mutate late in the sequence, never in `run_fused_gate_up_role_test`. |
 
+### Batch D — executed results (2026-08-10, `llama.cpp-u2mz` Phase B): 14/14 RED-fired
+
+Run lead-serial: 13 rows in the `-O1` scratch tree `build-o1/`, the
+`streaming-smoke` nmse row in the `-O3` `build/` tree per the numeric-oracle
+rule. Every row GREEN → RED → GREEN with the RED matching its pre-registered
+string; no voids, no survivors, no new baseline reds. Logs: session
+scratchpad `bd-*.log`.
+
+Anchor drift corrected before execution (prove-by-scope-not-line): the
+device-mismatch check moved `:11279→:11283`, the q8-scratch totals line
+moved `:15815→:15985` **and** was reshaped
+(`static_cast<size_t>(shape.graph_op_count) * demand.aligned_bytes_per_buffer`),
+the legacy-env branch moved `:18093→:18263`, the `direct_expert_it` probe
+block is `:5623-5627`, and the streaming copy is now **two** identical call
+sites (`:9530` mmap / `:9533` host) — both mutated `+ offset + 1`, removing
+branch ambiguity. Name maps: `unified-cache-fast-path`, `unified-cache-bugs`,
+`mem-handle-eviction`, `sycl-runtime-alloc`, `sycl-layout-choice`,
+`sycl-reset-model-weight-lease-preserve` all register without the `test-`
+prefix.
+
+All 14 REDs, verbatim tails on file: reservation (`reserved bytes must match
+accepted request`), preflight fragmentation-vs-budget, retired-replacement
+refusal, `allow_mmap_host=false` honor (pinned `level_zero:1` per its row),
+`is_cached` coverage failure + `Unified cache bug tests: FAIL` (single
+mutated run per the never-loop rule; ran once per build state only),
+fast-path `Tests: 2 run, 1 passed`, eviction `Tests: 6 run, 5 passed`,
+`Pinned entries evicted unexpectedly (used_before=4096 used_after=0)`,
+load-boundary preserve, smoke `FAIL: GPU(cache) mismatch (nmse>2.0e-04 or
+max_abs>5.00e-02)`, runtime-alloc `Tests: 27 run, 26 passed`, q8-scratch
+totals, planner `:84` legacy-knob line, and layout-choice with the exact
+pre-registered bytes (`got 592445440 expected 603979776`). `Shmem` flat
+(3.01→3.00 GB), tree clean.
+
 ## Batch E — `mmvq.cpp` (5 tests, 6 builds, ~1.4 h)
 
 | test | mutation (`ggml/src/ggml-sycl/mmvq.cpp:`) | runtime | verifiability | expected RED | notes |
