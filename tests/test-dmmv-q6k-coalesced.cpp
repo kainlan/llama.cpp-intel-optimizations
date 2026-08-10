@@ -195,17 +195,18 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
     // the coalesced layout after upload. Without this the test can only observe
     // that nothing complained, which is what let a BLAS-fallback run pass as a
     // coalesced-kernel run.
+    //
+    // The result is RECORDED, not acted on. Returning here would short-circuit
+    // the negative half and make the two halves untestable in one run: the
+    // refusal and fallback warnings are only emitted if the graph actually
+    // runs, so bailing before compute leaves the probe with nothing to observe.
+    // A mutation that breaks the layout would then look like it exercised only
+    // the layout assertion, when in fact it drives both.
+    enum ggml_layout_mode weight_layout = GGML_LAYOUT_AOS;
+    bool                  layout_ok     = true;
     if (require_coalesced) {
-        const enum ggml_layout_mode mode = weight->layout ? weight->layout->mode : GGML_LAYOUT_AOS;
-        if (mode != GGML_LAYOUT_COALESCED) {
-            printf("  FAIL: weight layout is %d, expected GGML_LAYOUT_COALESCED (%d) -- the coalesced "
-                   "kernel cannot run, so this case would prove nothing\n",
-                   (int) mode, (int) GGML_LAYOUT_COALESCED);
-            ggml_backend_buffer_free(compute_buffer);
-            ggml_backend_buffer_free(weight_buffer);
-            ggml_free(ctx);
-            return false;
-        }
+        weight_layout = weight->layout ? weight->layout->mode : GGML_LAYOUT_AOS;
+        layout_ok     = (weight_layout == GGML_LAYOUT_COALESCED);
     }
 
     struct ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -218,11 +219,23 @@ static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
     bool success = (status == GGML_STATUS_SUCCESS);
 
     // Negative half: dispatch must not have declined the kernel or fallen back.
-    if (success && require_coalesced && (g_probe.saw_layout_refusal || g_probe.saw_blas_fallback)) {
-        printf("  FAIL: dispatch did not run the coalesced DMMV kernel (layout_refusal=%d blas_fallback=%d) "
-               "-- results below would come from another path\n",
-               (int) g_probe.saw_layout_refusal, (int) g_probe.saw_blas_fallback);
-        success = false;
+    if (success && require_coalesced) {
+        const bool dispatch_ok = !(g_probe.saw_layout_refusal || g_probe.saw_blas_fallback);
+        if (!layout_ok) {
+            printf("  FAIL: weight layout is %d, expected GGML_LAYOUT_COALESCED (%d) -- the coalesced "
+                   "kernel cannot run\n",
+                   (int) weight_layout, (int) GGML_LAYOUT_COALESCED);
+        }
+        if (!dispatch_ok) {
+            printf("  FAIL: dispatch declined the coalesced DMMV kernel (layout_refusal=%d blas_fallback=%d)\n",
+                   (int) g_probe.saw_layout_refusal, (int) g_probe.saw_blas_fallback);
+        }
+        if (!layout_ok || !dispatch_ok) {
+            printf("  kernel-identity gate: layout_ok=%d dispatch_ok=%d -- any numbers below would come "
+                   "from another path\n",
+                   (int) layout_ok, (int) dispatch_ok);
+            success = false;
+        }
     }
     if (success) {
         output.resize(n_rows);
