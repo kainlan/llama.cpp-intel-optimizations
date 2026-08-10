@@ -12063,7 +12063,16 @@ bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_
         auto & registry = ggml_sycl::lifecycle::global_registry();
         auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
         if (!effect) {
-            return false;
+            // No load transaction is open, so there is no owner and
+            // ggml_sycl_owner_name_key() below cannot form a key: the row is
+            // unstorable, not rejected.  The mutation-under-exact-load-effect
+            // contract still holds because no mutation happens, and readers
+            // already treat a missing row as "fall back to infer_tensor_usage",
+            // which is the same path they take when they cannot form a key.
+            // Reached whenever weights land on a SYCL buft with no SYCL weight
+            // owner -- notably -ngl 0, where make_cpu_buft_list() hands out the
+            // SYCL pinned-host buft but no SYCL load transaction is opened.
+            return true;
         }
 
         const auto                  owner = effect.owner;
