@@ -355,6 +355,31 @@ def replace_in_section(source: str, begin: str, end: str, old: str, new: str, oc
     return source[:start] + body.replace(old, new, occurrence) + source[stop:]
 
 
+# The gated V write in run_sidecar_unregister_overlap, matched tolerantly.
+# clang-format owns the alignment of the `=` and the wrapping of the argument
+# list, so any literal spelling of this statement is a formatting hostage: one
+# unrelated line inserted above it re-aligns the block and a literal needle then
+# matches nothing, reddening a semantically untouched commit.
+OVERLAP_V_WRITE = re.compile(
+    r"snapshot\.ready_event\s*=\s*submit_half_payload\(\s*dependency_q\s*,\s*gate_event\s*,"
+    r"\s*vbuf\.ptr\s*,\s*sycl::half\(\s*2\.0f\s*\)\s*\)")
+
+
+def overlap_v_write_contract(source: str) -> bool:
+    """The gated V write must live inside run_sidecar_unregister_overlap.
+
+    Scoped to that function as well as anchored on the `snapshot.ready_event`
+    LHS: run_consumer_checkpoint makes the byte-identical call against
+    packed.ready_event, so an unscoped bare-call check would pass vacuously.
+    """
+    try:
+        begin = source.index("void run_sidecar_unregister_overlap")
+        end = source.index("void run_consumer_checkpoint", begin)
+    except ValueError:
+        return False
+    return OVERLAP_V_WRITE.search(source[begin:end]) is not None
+
+
 def live_contract(source: str) -> bool:
     required = (
         "SKIP_UNSUPPORTED = 77",
@@ -391,7 +416,6 @@ def live_contract(source: str) -> bool:
         "mem_fill_test_profile_error_after_submit_count() > retry_fill_before",
         "retry submission blocked on an unreleased dependency event",
         "q.memset(out.ptr, 0, D * sizeof(float)).wait_and_throw()",
-        "snapshot.ready_event         = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f))",
         "overlap gate released before the unregister window",
         "gate.release()",
         "retry_thread.join()",
@@ -442,6 +466,7 @@ def live_contract(source: str) -> bool:
             all(cp in source for cp in CHECKPOINTS) and
             source.count(guard_construction) == 3 and
             exact_guard_construction_contract(source) and
+            overlap_v_write_contract(source) and
             lifecycle_teardown_contract(source) and
             backend_owner_contract(source) and
             baseline_accounting_contract(source) and
@@ -665,7 +690,6 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "before->ready_event = submit_rows_payload",
         "after->ready_event.wait_and_throw()",
         "q.memset(out.ptr, 0, D * sizeof(float)).wait_and_throw()",
-        "snapshot.ready_event         = submit_half_payload(dependency_q, gate_event, vbuf.ptr, sycl::half(2.0f))",
         "overlap gate released before the unregister window",
         "post-submit profiler error hook was not observed exactly once",
         "sidecar post-submit profiler error hook was not observed exactly once",
@@ -704,6 +728,17 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
         "dev.get_backend() != sycl::backend::ext_oneapi_level_zero",
     ):
         assert not live_contract(LIVE.replace(needle, "mutated-proof"))
+
+    # The gated V write is matched by regex, so it must be MUTATED by regex too.
+    # A literal str.replace here would stop matching the moment clang-format
+    # re-aligned the statement, apply no mutation at all, and leave the contract
+    # True -- a spurious red that accuses an untouched commit. Assert the
+    # mutation actually changed the text before scoring it, so a regex that
+    # silently stops matching cannot masquerade as a killed mutation.
+    v_write_mutated = OVERLAP_V_WRITE.sub("snapshot.ready_event = mutated_proof()", LIVE, count=1)
+    assert v_write_mutated != LIVE
+    assert not live_contract(v_write_mutated)
+
     assert not cmake_contract(CMAKE.replace(GUARD, "if (TRUE)", 1))
     assert not cmake_contract(CMAKE.replace("endforeach()\nendif()", "endforeach()", 1))
     assert not cmake_contract(CMAKE.replace("find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER", 1))
