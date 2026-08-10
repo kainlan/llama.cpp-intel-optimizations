@@ -90,17 +90,41 @@ struct dispatch_probe {
 static dispatch_probe g_probe;
 
 static void dispatch_probe_log(enum ggml_log_level level, const char * text, void * /*user_data*/) {
-    if (text) {
-        if (strstr(text, "not eligible for tensor layout")) {
-            g_probe.saw_layout_refusal = true;
-        }
-        if (strstr(text, "Generic BLAS fallback")) {
-            g_probe.saw_blas_fallback = true;
-        }
+    if (!text) {
+        return;
     }
-    if (level >= GGML_LOG_LEVEL_WARN && text) {
-        fputs(text, stderr);
+    if (strstr(text, "not eligible for tensor layout")) {
+        g_probe.saw_layout_refusal = true;
     }
+    if (strstr(text, "Generic BLAS fallback")) {
+        g_probe.saw_blas_fallback = true;
+    }
+    // Forward everything. Installing a callback replaces ggml's default sink, so
+    // filtering here would silently drop the device banner and load lines that
+    // make a gate log readable -- observing the stream must not consume it.
+    GGML_UNUSED(level);
+    fputs(text, stderr);
+}
+
+// Positive control for the probe, run before any case depends on it: a matcher
+// that cannot match returns "clean" forever and is indistinguishable from a
+// dispatch that behaved. Feeds the two literals through and requires both to
+// fire.
+//
+// Limit worth stating plainly: this proves the MATCHER works, not that the
+// backend still emits that text -- it scores my copy of the string against
+// itself. If ggml-sycl.cpp:53020 or :57102 is reworded, this stays green while
+// the negative half goes blind. That is precisely why the gate also has a
+// positive half (the layout-mode assertion), which depends on no log text.
+static bool dispatch_probe_self_test() {
+    g_probe.reset();
+    dispatch_probe_log(GGML_LOG_LEVEL_WARN, "[SYCL] Forced kernel DMMV_COALESCED not eligible for tensor layout\n",
+                       nullptr);
+    dispatch_probe_log(GGML_LOG_LEVEL_WARN, "[MUL_MAT] Generic BLAS fallback for weight (type=14 batch=1)\n", nullptr);
+    const bool ok = g_probe.saw_layout_refusal && g_probe.saw_blas_fallback;
+    g_probe.reset();
+    printf("  probe self-test: %s\n", ok ? "both refusal strings match" : "FAILED -- the dispatch gate is blind");
+    return ok;
 }
 
 static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
@@ -370,6 +394,10 @@ int main() {
     printf("=== Q6_K DMMV Coalesced Tests ===\n");
 
     ggml_log_set(dispatch_probe_log, nullptr);
+    if (!dispatch_probe_self_test()) {
+        printf("=== Summary: FAIL ===\n");
+        return 1;
+    }
 
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_COALESCED);
     setenv("GGML_SYCL_FORCE_DMMV", "1", 1);
