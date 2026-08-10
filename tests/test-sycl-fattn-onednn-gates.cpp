@@ -528,11 +528,18 @@ static bool test_materialization_descriptor_rejects_unsupported_layout() {
 //
 // The locator is the candidate_roots()/join_path() idiom already used by five
 // source-reading tests in this directory (test-sycl-moe-direct-final-scratch-
-// plan.cpp and siblings): LLAMA_CPP_REPO_ROOT override first, then the repo
-// root recovered from this TU's compile-time __FILE__, then cwd guesses last.
-// The __FILE__ anchor is what makes the invocation directory irrelevant, which
-// matters because this target is install()ed and so gets run from arbitrary
-// cwds. One deliberate deviation from the siblings: they std::exit(1) when the
+// plan.cpp, test-sycl-moe-same-expert-grouping.cpp,
+// test-sycl-moe-fused-down-sum-policy.cpp, test-sycl-moe-fusion-noactivation.cpp
+// and test-sycl-moe-sequence-graphlet-policy.cpp): LLAMA_CPP_REPO_ROOT override
+// first, then the repo root recovered from this TU's compile-time __FILE__, then
+// cwd guesses last. The __FILE__ anchor is what makes the invocation directory
+// irrelevant, which matters because this target is install()ed and so gets run
+// from arbitrary cwds. All six copies list the SAME six cwd guesses ("." through
+// "../../../../.."); that depth is behavioural, not cosmetic, since the guesses
+// are what runs when the __FILE__ anchor fails, so a shallower copy stops finding
+// the file from a deeper cwd. Change all six together. Duplicating rather than
+// hoisting into a shared header is the house style here.
+// One deliberate deviation from the siblings: they std::exit(1) when the
 // file cannot be read, which here would skip the remaining fifteen gates and
 // the summary line, so this returns false through TEST_ASSERT instead.
 // ---------------------------------------------------------------------------
@@ -558,6 +565,8 @@ static std::vector<std::string> candidate_roots() {
     roots.emplace_back("..");
     roots.emplace_back("../..");
     roots.emplace_back("../../..");
+    roots.emplace_back("../../../..");
+    roots.emplace_back("../../../../..");
     return roots;
 }
 
