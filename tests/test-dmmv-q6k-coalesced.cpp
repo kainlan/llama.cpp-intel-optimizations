@@ -24,6 +24,54 @@
 constexpr int WARP_SIZE = GGML_SYCL_WARP_SIZE;
 constexpr int MMVQ_COALESCED_TILE_BLOCKS = WARP_SIZE;
 
+// Mirrors tile_count()/the decomposition loops in dmmv.cpp: largest power-of-2
+// tile first, capped at 32 blocks. One warp per tile, so this is also the
+// work-group width the variable-tile kernel launches with.
+static int q6k_tile_count(int blocks_per_row) {
+    int count     = 0;
+    int remaining = blocks_per_row;
+    while (remaining > 0) {
+        int ts = 1;
+        while (ts * 2 <= remaining && ts < MMVQ_COALESCED_TILE_BLOCKS) {
+            ts *= 2;
+        }
+        remaining -= ts;
+        count++;
+    }
+    return count;
+}
+
+// Independent f64 reference: dequantize Q6_K exactly as ggml-quants.c does and
+// dot with the raw f32 activations. Neither backend is consulted, so it can say
+// which of the two is the outlier when they disagree (the GPU consumes f32
+// activations; the CPU backend quantizes them to Q8_K first, and that modelling
+// difference -- not GPU error -- is what the tolerances below absorb).
+static double q6k_exact_dot(const block_q6_K * blocks, const float * y, int blocks_per_row) {
+    double acc = 0.0;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const block_q6_K & blk = blocks[b];
+        const double       d   = ggml_fp16_to_fp32(blk.d);
+        for (int n = 0; n < QK_K; n += 128) {
+            const uint8_t * ql = blk.ql + (n / 128) * 64;
+            const uint8_t * qh = blk.qh + (n / 128) * 32;
+            const int8_t *  sc = blk.scales + (n / 128) * 8;
+            const float *   yy = y + b * QK_K + n;
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = (int8_t) ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = (int8_t) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = (int8_t) ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = (int8_t) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                acc += d * sc[is + 0] * q1 * (double) yy[l];
+                acc += d * sc[is + 2] * q2 * (double) yy[l + 32];
+                acc += d * sc[is + 4] * q3 * (double) yy[l + 64];
+                acc += d * sc[is + 6] * q4 * (double) yy[l + 96];
+            }
+        }
+    }
+    return acc;
+}
+
 static bool run_mul_mat_backend(ggml_backend_t backend, ggml_type weight_type,
                                 const void * weight_data, size_t weight_size,
                                 const float * input_data, int n_embd, int n_rows,
@@ -136,11 +184,27 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
         return false;
     }
 
-    const float abs_tol = 0.5f;
+    // The two backends do not model the activations the same way: the GPU
+    // kernel consumes the raw f32 vector, the CPU backend quantizes it to Q8_K
+    // first. The residual is a random walk over ncols terms, so it grows as
+    // sqrt(ncols) -- measured against q6k_exact_dot on the host, the CPU side
+    // carries essentially all of it (llama.cpp-ug4p):
+    //
+    //   ncols   worst |cpu - exact|   worst |kernel - exact|
+    //    8192   0.35                  8e-6
+    //   16384   0.42                  9e-6
+    //   32768   0.73                  4e-6
+    //
+    // A fixed 0.5 therefore fails a *correct* kernel at 32768 columns. Scale it
+    // with sqrt(ncols) so every shape gets the same ~4 sigma of headroom, and
+    // anchor the constant at the 8192 value so the long-standing gate there is
+    // unchanged.
+    const float abs_tol = 0.5f * sqrtf((float) ncols / 8192.0f);
     const float rel_tol = 0.2f;
     float max_diff = 0.0f;
     float max_rel = 0.0f;
     int errors = 0;
+    std::vector<int> failing_rows;
     for (int i = 0; i < nrows; ++i) {
         float diff = fabsf(gpu_out[i] - cpu_out[i]);
         float denom = fmaxf(1.0f, fabsf(cpu_out[i]));
@@ -149,15 +213,66 @@ static bool run_dmmv_q6k_coalesced_case(ggml_backend_t gpu_backend, ggml_backend
         if (rel > max_rel) max_rel = rel;
         if (diff > abs_tol && rel > rel_tol) {
             errors++;
+            failing_rows.push_back(i);
         }
     }
 
     const bool pass = (errors == 0);
     if (verbose || !pass) {
-        printf("  Q6_K coalesced ncols=%d nrows=%d: errors=%d max_diff=%.6f max_rel=%.6f %s\n",
-               ncols, nrows, errors, max_diff, max_rel, pass ? "PASS" : "FAIL");
+        printf("  Q6_K coalesced ncols=%d nrows=%d blocks_per_row=%d num_tiles=%d: "
+               "errors=%d max_diff=%.6f max_rel=%.6f %s\n",
+               ncols, nrows, blocks_per_row, q6k_tile_count(blocks_per_row),
+               errors, max_diff, max_rel, pass ? "PASS" : "FAIL");
     }
-    return pass;
+
+    if (pass) {
+        return true;
+    }
+
+    // A failure here is worth one full diagnosis: the kernel arithmetic and the
+    // coalesced layout indexing were both machine-checked against q6k_exact_dot
+    // on the host (llama.cpp-ug4p) and reproduce the exact answer to ~1e-5 at
+    // every shape, so a gross on-device disagreement is a data-path or
+    // execution defect and needs to be classified, not just counted.
+    printf("  --- diagnosis (llama.cpp-ug4p) ---\n");
+    for (int i : failing_rows) {
+        const double exact = q6k_exact_dot(weight_quant.data() + (size_t) i * blocks_per_row,
+                                           input_data.data(), blocks_per_row);
+        printf("    row %d: gpu=%.6f cpu=%.6f exact_f64=%.6f | gpu-exact=%.6f cpu-exact=%.6f%s\n",
+               i, gpu_out[i], cpu_out[i], exact,
+               gpu_out[i] - exact, cpu_out[i] - exact,
+               std::isfinite(gpu_out[i]) ? "" : "  [gpu value is NOT FINITE]");
+        if (gpu_out[i] == 0.0f) {
+            printf("      gpu value is exactly 0 -- output slot likely never written\n");
+        }
+        // Index shear: does this row's GPU answer belong to a different row?
+        for (int j = 0; j < nrows; ++j) {
+            if (j != i && fabsf(gpu_out[i] - cpu_out[j]) < 1e-2f) {
+                printf("      gpu[%d] matches cpu[%d] -- row index shear\n", i, j);
+                break;
+            }
+        }
+    }
+
+    // Deterministic or racy? Re-run the same shape on the GPU with identical
+    // inputs; a bit-identical repeat rules out a race in the materialization.
+    std::vector<float> gpu_out2;
+    if (run_mul_mat_backend(gpu_backend, GGML_TYPE_Q6_K, weight_quant.data(), weight_bytes,
+                            input_data.data(), ncols, nrows, gpu_out2)) {
+        bool identical = true;
+        for (int i = 0; i < nrows && identical; ++i) {
+            identical = (gpu_out[i] == gpu_out2[i]);
+        }
+        printf("    repeat run: %s\n",
+               identical ? "bit-identical (deterministic defect)"
+                         : "DIFFERS from first run (racy / order-dependent defect)");
+        if (!identical) {
+            for (int i : failing_rows) {
+                printf("      row %d: run1=%.6f run2=%.6f\n", i, gpu_out[i], gpu_out2[i]);
+            }
+        }
+    }
+    return false;
 }
 
 int main() {
@@ -189,11 +304,20 @@ int main() {
     }
 
     bool ok = true;
+    // Single-tile shapes (blocks_per_row == 32): one warp per row, so the
+    // multi-tile offset arithmetic in the kernel is never exercised.
     ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 8192, 1, true);
     ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 8192, 8, true);
     ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 8192, 32, true);
     ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 8192, 128, true);
-    ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 16384, 8, true);
+    // Multi-tile shapes: these are the only cases that reach the per-warp tile
+    // offset loops and the cross-warp shared-memory reduction. 16384x8 used to
+    // be the sole one, which left the tile-stride arithmetic uncovered at every
+    // other row count (llama.cpp-ug4p).
+    ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 16384, 8, true);    // 2 tiles
+    ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 16384, 128, true);  // 2 tiles, wide
+    ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 24576, 8, true);    // 3 tiles
+    ok &= run_dmmv_q6k_coalesced_case(gpu_backend, cpu_backend, 32768, 32, true);   // 4 tiles
 
     ggml_backend_free(cpu_backend);
     ggml_backend_free(gpu_backend);
