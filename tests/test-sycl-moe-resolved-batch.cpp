@@ -306,7 +306,7 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
     return true;
 }
 
-static bool test_ready_events_survive_all_residencies() {
+static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     int           primary = 31, secondary = 32, host = 33;
     const int32_t ids[] = { 1, 2, 3 };
     auto          batch = ggml_sycl::build_moe_resolved_batch(ids, 3, 3, 0, [&](int32_t id) {
@@ -332,6 +332,21 @@ static bool test_ready_events_survive_all_residencies() {
     CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[0], 0, true, true));
     CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[1], 0, true, true));
     CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[2], 0, false, false));
+
+    // A selected local fast path must fail preflight when the admitted layout differs.
+    auto layout_miss = ggml_sycl::make_moe_batch_local_view(batch.batch, GGML_LAYOUT_SOA);
+    CHECK(!layout_miss && layout_miss.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
+
+    // Same expert ID with a changed stable identity is not groupable.
+    int32_t repeated_ids[] = { 5, 5 };
+    int     identity       = 50;
+    auto    drift          = ggml_sycl::build_moe_resolved_batch(repeated_ids, 2, 2, 0, [&](int32_t) {
+        return route_for(&primary, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS,
+                                     identity++);
+    });
+    CHECK(drift);
+    auto drift_view = ggml_sycl::make_moe_batch_local_view(drift.batch, GGML_LAYOUT_AOS);
+    CHECK(!drift_view && drift_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
     return true;
 }
 
@@ -373,7 +388,8 @@ int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
         !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
-        !test_ready_events_survive_all_residencies() || !test_decode_admission_is_route_mode_independent()) {
+        !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
+        !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");

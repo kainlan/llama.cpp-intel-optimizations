@@ -17,10 +17,14 @@ def tokens(text: str) -> list[str]:
     return TOKEN_RE.findall(text)
 
 
-def has_tokens(text: str, pattern: str) -> bool:
-    haystack, needle = tokens(text), tokens(pattern)
+def contains_tokens(haystack: list[str], pattern: str) -> bool:
+    needle = tokens(pattern)
     width = len(needle)
     return any(haystack[i:i + width] == needle for i in range(len(haystack) - width + 1))
+
+
+def has_tokens(text: str, pattern: str) -> bool:
+    return contains_tokens(tokens(text), pattern)
 
 
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
@@ -105,12 +109,17 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "primary ready dependency": "stream->ext_oneapi_submit_barrier({ route.ready_event })",
         "secondary ready propagation": "entry.has_ready_event = has_ready_event",
         "host ready wait": "if (has_ready_event) { ready_event.wait()",
+        "linear prompt identity map": "retained_prompt_groups[expert] = &operand",
+        "planned local table from batch":
+            "ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, retained_prompt_batch_result.batch",
     }
+    header_tokens = tokens(header)
+    source_tokens = tokens(source)
     for name, pattern in required_header.items():
-        if not has_tokens(header, pattern):
+        if not contains_tokens(header_tokens, pattern):
             failures.append(name)
     for name, pattern in required_source.items():
-        if not has_tokens(source, pattern):
+        if not contains_tokens(source_tokens, pattern):
             failures.append(name)
 
     compute_fallback = source.index("catch (const ggml_sycl_fallback_error &)")
@@ -174,13 +183,22 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     if mmid.count("append_retained_decode_operand(") != 2:
         failures.append("both decode routers share retained dispatch helper")
 
-    prompt_specialized = mmid[mmid.index("cpu_tg_fallthrough:"):admission]
-    for resolver in ("ggml_sycl_resolve_moe_expert_route(",
-                     "ggml_sycl_resolve_moe_expert_route_for_dispatch("):
-        if has_tokens(prompt_specialized, resolver):
-            failures.append(f"prompt specialized path reacquires route: {resolver}")
-    if prompt_specialized.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 0:
-        failures.append("prompt path resnapshots IDs after admission")
+    # Scan prompt admission through the actual function end. The only excluded
+    # range is the explicitly false named multi-role capability gate.
+    pair_start = mmid.index("if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)", prompt_admission)
+    pair_end = mmid.index("cpu_tg_fallthrough:", pair_start)
+    prompt_reachable = mmid[prompt_admission:pair_start] + mmid[pair_end:]
+    forbidden_prompt_ownership = (
+        "ggml_sycl_resolve_moe_expert_route(",
+        "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
+        "moe_fusion_ensure_gpu0_ptrs(",
+        "ggml_sycl_materialize_planned_expert_layout(",
+    )
+    for forbidden in forbidden_prompt_ownership:
+        if has_tokens(prompt_reachable, forbidden):
+            failures.append(f"reachable prompt path reacquires/materializes route: {forbidden}")
+    if prompt_reachable.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
+        failures.append("prompt IDs are copied outside the one admission snapshot")
     if not has_tokens(mmid, "moe_expert_route route = retained_prompt_route_for_occurrence"):
         failures.append("prompt fallback does not derive exact occurrences from batch")
     if mmid.count("retained_prompt_route_for_occurrence(") != 3:
@@ -311,6 +329,24 @@ def test_contract_and_mutation_witnesses() -> None:
         ("drop-host-ready-wait", header,
          source.replace("if (has_ready_event) {\n                ready_event.wait();",
                         "if (false) {\n                ready_event.wait();"), host_test, mem_source),
+        ("reachable-prompt-resolver", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_moe_expert_route("
+                        "src0, ctx.device, 0, GGML_LAYOUT_AOS, false);", 1), host_test, mem_source),
+        ("reachable-prompt-dispatch-resolver", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_moe_expert_route_for_dispatch("
+                        "src0, ctx.device, 0, GGML_LAYOUT_AOS, false);", 1), host_test, mem_source),
+        ("reachable-prompt-reacquire-table", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) moe_fusion_ensure_gpu0_ptrs("
+                        "ctx, src0, nullptr, 0, 0, GGML_LAYOUT_AOS, nullptr, nullptr, true);", 1),
+         host_test, mem_source),
+        ("reachable-prompt-materializer", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_materialize_planned_expert_layout("
+                        "src0, {}, 0, ctx.device, GGML_LAYOUT_AOS, nullptr, true, true);", 1),
+         host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
