@@ -61618,6 +61618,60 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
         }
     }
+    auto retained_prompt_route_for_expert = [&](int expert_id) -> moe_expert_route {
+        moe_expert_route route{};
+        route.requested_layout = retained_prompt_layout;
+        const ggml_sycl::moe_resolved_operand * selected = nullptr;
+        for (const auto & operand : retained_prompt_batch_result.batch.operands) {
+            if (operand.expert_id != expert_id) {
+                continue;
+            }
+            if (selected && (!selected->lease.stable_identity_equal(operand.lease) ||
+                             selected->residency != operand.residency ||
+                             selected->owning_device != operand.owning_device ||
+                             selected->actual_layout != operand.actual_layout)) {
+                route.reason = ggml_sycl::expert_resolve_reason::INVALID_REQUEST;
+                return route;
+            }
+            selected = &operand;
+        }
+        if (!selected) {
+            return route;
+        }
+        const auto resolved = selected->lease.resolve();
+        if (!resolved.ptr || resolved.layout != selected->actual_layout) {
+            route.reason = ggml_sycl::expert_resolve_reason::NOT_FOUND;
+            return route;
+        }
+        route.ptr                      = resolved.ptr;
+        route.owning_device            = selected->owning_device;
+        route.planned_device           = selected->planned_device;
+        route.plan_found               = selected->plan_found;
+        route.planned_device_residency = selected->planned_device >= 0;
+        route.planned_layout           = selected->actual_layout;
+        route.actual_layout            = selected->actual_layout;
+        route.reason                   = ggml_sycl::expert_resolve_reason::FOUND;
+        route.lease                    = selected->lease;
+        route.has_ready_event          = selected->has_ready_event;
+        route.ready_event              = selected->ready_event;
+        switch (selected->residency) {
+            case ggml_sycl::moe_batch_residency::PRIMARY_DEVICE:
+                route.kind = moe_expert_route_kind::LOCAL_DEVICE;
+                route.tier = ggml_sycl::expert_resolve_tier::DEVICE_VRAM;
+                break;
+            case ggml_sycl::moe_batch_residency::SECONDARY_DEVICE:
+                route.kind = moe_expert_route_kind::SECONDARY_DEVICE;
+                route.tier = ggml_sycl::expert_resolve_tier::DEVICE_VRAM;
+                break;
+            case ggml_sycl::moe_batch_residency::HOST:
+                route.kind = moe_expert_route_kind::HOST;
+                route.tier = ggml_sycl::expert_resolve_tier::HOST_PINNED;
+                break;
+            case ggml_sycl::moe_batch_residency::UNAVAILABLE:
+                break;
+        }
+        return route;
+    };
 
     auto        xmx_layout_allowed = [&]() -> bool {
         if (!has_override) {
@@ -68358,9 +68412,9 @@ cpu_tg_fallthrough:
                     auto      it             = seq_map.find(cur_layer_hash);
                     if (it != seq_map.end()) {
                         int                  seq_layer_id = it->second;
-                        // Copy ids to host for recording
-                        std::vector<int32_t> ids_host_fused;
-                        if (ggml_sycl_copy_ids_to_host(ctx, ids, ids_host_fused)) {
+                        // The retained prompt snapshot is also the recording input.
+                        const std::vector<int32_t> & ids_host_fused = prompt_ids_snapshot;
+                        if (!ids_host_fused.empty()) {
                             g_moe_warmup.record(seq_layer_id, ids_host_fused.data(),
                                                 static_cast<int>(ids_host_fused.size()));
                             if (g_moe_warmup.tick_token()) {
@@ -68439,35 +68493,23 @@ cpu_tg_fallthrough:
                     if (g_ggml_sycl_graph_recording) {
                         return false;
                     }
-                    std::vector<int32_t> primary_route_ids;
-                    if (!ggml_sycl_copy_ids_to_host(ctx, ids, primary_route_ids)) {
-                        return false;
-                    }
                     const int64_t expected = ids->ne[0] * ids->ne[1];
-                    if (expected <= 0 || primary_route_ids.size() != static_cast<size_t>(expected)) {
+                    if (expected <= 0 || retained_prompt_batch_result.batch.operands.size() !=
+                                             static_cast<size_t>(expected)) {
                         return false;
                     }
-                    const int64_t n_as_route        = src0->ne[2] > 0 ? src0->ne[2] : 1;
-                    size_t        local_count       = 0;
-                    size_t        secondary_count   = 0;
-                    size_t        host_count        = 0;
-                    size_t        unavailable_count = 0;
-                    for (int64_t ci = 0; ci < expected; ++ci) {
-                        const int32_t eid = primary_route_ids[static_cast<size_t>(ci)];
-                        if (eid < 0 || eid >= n_as_route) {
+                    size_t local_count       = 0;
+                    size_t secondary_count   = 0;
+                    size_t host_count        = 0;
+                    size_t unavailable_count = 0;
+                    for (const auto & operand : retained_prompt_batch_result.batch.operands) {
+                        if (operand.actual_layout != layout) {
                             unavailable_count++;
-                            continue;
-                        }
-                        moe_expert_route route = ggml_sycl_resolve_moe_expert_route_for_dispatch(
-                            src0, ctx.device, eid, layout, /*allow_materialize=*/false);
-                        if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr &&
-                            route.actual_layout == layout) {
+                        } else if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
                             local_count++;
-                            continue;
-                        }
-                        if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
+                        } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
                             secondary_count++;
-                        } else if (route.kind == moe_expert_route_kind::HOST && route.ptr) {
+                        } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
                             host_count++;
                         } else {
                             unavailable_count++;
@@ -68768,7 +68810,7 @@ cpu_tg_fallthrough:
         }
     }
 
-    if (!ids_from_cache) {
+    if (ne12 == 1 && !ids_from_cache) {
         static const bool ids_copy_trace_enabled = [] {
             const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
             return env && std::atoi(env) != 0;
@@ -71350,9 +71392,7 @@ cpu_tg_fallthrough:
                         for (int64_t id = 0; id < n_ids; id++) {
                             const int32_t i02 = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
                             GGML_ASSERT(i02 >= 0 && i02 < n_as);
-                            moe_expert_route route =
-                                ggml_sycl_resolve_moe_expert_route(src0, ctx.device, i02, route_layout,
-                                                                   /*allow_materialize=*/true);
+                            moe_expert_route route = retained_prompt_route_for_expert(i02);
                             if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
                                 route.actual_layout != route_layout) {
                                 all_local_device = false;
@@ -71371,10 +71411,9 @@ cpu_tg_fallthrough:
                     }
 
                     if (all_local_device && !gpu_expert_ids.empty()) {
-                        expert_ptrs_dev = moe_fusion_ensure_gpu0_ptrs(ctx, src0, unique_expert_ids.data(),
-                                                                      unique_expert_ids.size(), layer_id, route_layout,
-                                                                      &expert_ptrs_event, &expert_ptrs_event_set,
-                                                                      /*allow_materialize=*/true);
+                        expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
+                            ctx, src0, retained_prompt_batch_result.batch, layer_id, route_layout,
+                            &expert_ptrs_event, &expert_ptrs_event_set);
                         if (expert_ptrs_dev) {
                             planner_resolved_batch = true;
                             expert_ptrs_source     = "smart_handles";
@@ -71651,16 +71690,7 @@ cpu_tg_fallthrough:
                         layout_mode           expert_route_layout = route_layout;
                         if (use_expert_cache) {
                             if (has_placement_plan) {
-                                moe_expert_route route = ggml_sycl_resolve_moe_expert_route_for_dispatch(
-                                    src0, ctx.device, i02, route_layout, /*allow_materialize=*/false);
-                                if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE ||
-                                    ggml_sycl_moe_route_is_layout_miss(route)) {
-                                    moe_expert_route host_route;
-                                    if (ggml_sycl_try_pp_host_moe_route(src0, ctx.device, i02, expert_size, route,
-                                                                        host_route)) {
-                                        route = std::move(host_route);
-                                    }
-                                }
+                                moe_expert_route route = retained_prompt_route_for_expert(i02);
                                 if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
                                     if (!route.lease.valid()) {
                                         GGML_ABORT(
@@ -71915,9 +71945,7 @@ cpu_tg_fallthrough:
             if (ggml_sycl_moe_row_agg_debug_enabled()) {
                 batch_entries_for_log.reserve(static_cast<size_t>(total_entries));
             }
-            const bool allow_selected_materialize =
-                has_placement_plan && route_layout != GGML_LAYOUT_AOS &&
-                ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout);
+            const bool allow_selected_materialize = false;
 
             const char * reject_reason = nullptr;
             for (int64_t iid1 = 0; iid1 < ids->ne[1] && !reject_reason; iid1++) {
@@ -71927,8 +71955,7 @@ cpu_tg_fallthrough:
                         reject_reason = "expert-id";
                         break;
                     }
-                    moe_expert_route route = ggml_sycl_resolve_moe_expert_route_for_dispatch(
-                        src0, ctx.device, i02, route_layout, allow_selected_materialize);
+                    moe_expert_route route = retained_prompt_route_for_expert(i02);
                     if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr ||
                         route.actual_layout != route_layout || !route.lease.valid()) {
                         reject_reason = ggml_sycl_expert_resolve_reason_name(route.reason);
@@ -72473,7 +72500,6 @@ cpu_tg_fallthrough:
             ready_events.reserve(static_cast<size_t>(n_as));
             size_t max_rows_per_expert = 0;
 
-            const bool allow_selected_expert_materialize = prompt_down_soa_planned_pp;
             for (int64_t i02 = 0; i02 < n_as; ++i02) {
                 const size_t row_begin = row_map_offsets[static_cast<size_t>(i02)];
                 const size_t row_end   = row_map_offsets[static_cast<size_t>(i02) + 1];
@@ -72482,15 +72508,7 @@ cpu_tg_fallthrough:
                     continue;
                 }
 
-                moe_expert_route route = ggml_sycl_resolve_moe_expert_route_for_dispatch(
-                    src0, ctx.device, static_cast<int>(i02), route_layout, allow_selected_expert_materialize);
-                if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
-                    moe_expert_route local_route;
-                    if (ggml_sycl_try_pp_local_moe_route(src0, ctx.device, static_cast<int>(i02), route.actual_layout,
-                                                         route, local_route)) {
-                        route = std::move(local_route);
-                    }
-                }
+                moe_expert_route route = retained_prompt_route_for_expert(static_cast<int>(i02));
                 if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr ||
                     route.actual_layout != GGML_LAYOUT_SOA || !route.lease.valid()) {
                     return reject_batched(ggml_sycl_expert_resolve_reason_name(route.reason), i02);
@@ -73290,61 +73308,25 @@ cpu_tg_fallthrough:
             const void *          expert_ptr = nullptr;
             ggml_sycl::mem_handle expert_gpu_lease{};
 
-            if (use_expert_cache && has_placement_plan) {
-                const auto       route_resolve_start               = moe_profile_state::hrc::now();
-                const bool       allow_selected_expert_materialize = prompt_down_soa_planned_pp;
-                moe_expert_route route                             = ggml_sycl_resolve_moe_expert_route_for_dispatch(
-                    src0, ctx.device, static_cast<int>(i02), route_layout, allow_selected_expert_materialize);
+            if (ne12 != 1) {
+                const auto route_resolve_start = moe_profile_state::hrc::now();
+                moe_expert_route route = retained_prompt_route_for_expert(static_cast<int>(i02));
                 if (pp_local_trace) {
                     pp_local_accum.route_resolve_us +=
                         moe_profile_state::us(route_resolve_start, moe_profile_state::hrc::now());
                 }
                 if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
-                    moe_expert_route local_route;
-                    if (ggml_sycl_try_pp_local_moe_route(src0, ctx.device, static_cast<int>(i02), route.actual_layout,
-                                                         route, local_route)) {
-                        route = std::move(local_route);
-                        ++pp_route_localized;
-                    } else {
-                        const bool queue_ready =
-                            route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                            ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
-                        const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
-                            src0->type, route.actual_layout,
-                            ids->ne[1] > 1 ? moe_route_phase::PROMPT : moe_route_phase::DECODE, src0->ne[0],
-                            src0->ne[1], static_cast<size_t>(num_src1_rows), route.owning_device,
-                            moe_layer_route_residency::DEVICE, ctx.device);
-                        if (!queue_ready || !cap.supported) {
-                            pp_unsupported_device_rows += static_cast<size_t>(num_src1_rows);
-                            moe_expert_route host_route;
-                            if (ggml_sycl_try_pp_host_moe_route(src0, ctx.device, static_cast<int>(i02), expert_size,
-                                                                route, host_route)) {
-                                static std::atomic<int> host_fallback_log{ 0 };
-                                if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-                                    GGML_LOG_WARN(
-                                        "[MOE-ROUTE] planned device expert falling back to host tensor=%s expert=%d "
-                                        "planned_device=%d rows=%lld layout=%s queue_ready=%d supported=%d "
-                                        "kernel=%s reason=%s\n",
-                                        src0->name ? src0->name : "?", (int) i02, route.owning_device,
-                                        (long long) num_src1_rows, ggml_sycl_layout_mode_name(route.actual_layout),
-                                        queue_ready ? 1 : 0, cap.supported ? 1 : 0,
-                                        ggml_sycl::moe_route_kernel_name(cap.kernel),
-                                        cap.reason ? cap.reason : "unknown");
-                                }
-                                route = std::move(host_route);
-                                ++pp_route_host_rerouted;
-                                pp_planned_device_to_host_fallback_rows += static_cast<size_t>(num_src1_rows);
-                            } else {
-                                GGML_ABORT(
-                                    "[MOE-ROUTE] planned secondary PP route is unsupported and no handle-backed "
-                                    "host route is available tensor=%s expert=%d current_device=%d planned_device=%d "
-                                    "rows=%lld layout=%s queue_ready=%d supported=%d kernel=%s reason=%s",
-                                    src0->name ? src0->name : "?", (int) i02, ctx.device, route.owning_device,
-                                    (long long) num_src1_rows, ggml_sycl_layout_mode_name(route.actual_layout),
-                                    queue_ready ? 1 : 0, cap.supported ? 1 : 0,
-                                    ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
-                            }
-                        }
+                    const bool queue_ready =
+                        route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
+                        ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
+                    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+                        src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
+                        static_cast<size_t>(num_src1_rows), route.owning_device,
+                        moe_layer_route_residency::DEVICE, ctx.device);
+                    if (!queue_ready || !cap.supported) {
+                        pp_unsupported_device_rows += static_cast<size_t>(num_src1_rows);
+                        throw ggml_sycl_fallback_error(
+                            "MUL_MAT_ID retained prompt secondary executor refused exact handle");
                     }
                 }
                 if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
@@ -73466,49 +73448,6 @@ cpu_tg_fallthrough:
                 }
             } else if (!use_expert_cache) {
                 expert_ptr = static_cast<const char *>(src0_layout_base) + i02 * expert_size;
-            }
-
-            if (use_expert_cache && !has_placement_plan && !expert_ptr && pp_block >= 0) {
-                moe_expert_route local_route = ggml_sycl_resolve_moe_expert_route(
-                    src0, ctx.device, static_cast<int>(i02), route_layout, /*allow_materialize=*/false);
-                if (local_route.kind == moe_expert_route_kind::LOCAL_DEVICE && local_route.ptr &&
-                    local_route.lease.valid()) {
-                    expert_ptr       = local_route.ptr;
-                    expert_gpu_lease = std::move(local_route.lease);
-                }
-            }
-
-            if (use_expert_cache && pp_multi_gpu && !has_placement_plan && !expert_ptr && pp_block >= 0) {
-                int              target_device = -1;
-                moe_expert_route target_route{};
-                for (int d = 0; d < pp_n_gpus; ++d) {
-                    if (d == ctx.device || !ggml_sycl::get_shared_context_queue(d)) {
-                        continue;
-                    }
-                    moe_expert_route route = ggml_sycl_resolve_moe_expert_route(
-                        src0, ctx.device, static_cast<int>(i02), GGML_LAYOUT_SOA, /*allow_materialize=*/false);
-                    if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.owning_device == d &&
-                        route.ptr && route.lease.valid()) {
-                        target_device = d;
-                        target_route  = std::move(route);
-                        break;
-                    }
-                }
-                if (target_route.ptr && target_device >= 0) {
-                    std::vector<expert_dispatch_entry> & sec_entries =
-                        pp_secondary_entries_by_device[static_cast<size_t>(target_device)];
-                    append_secondary_entries(sec_entries, row_begin, row_end, static_cast<int32_t>(i02),
-                                             target_route.ptr, target_device, target_route.actual_layout,
-                                             &target_route.lease);
-                    if (pp_route_descriptor_debug &&
-                        static_cast<size_t>(target_device) < pp_per_gpu_entries_for_log.size()) {
-                        append_pp_log_entries(pp_per_gpu_entries_for_log[static_cast<size_t>(target_device)], row_begin,
-                                              row_end, static_cast<int32_t>(i02), target_route.ptr, target_device,
-                                              target_route.actual_layout, &target_route.lease);
-                    }
-                    pp_entries_dev1 += static_cast<size_t>(num_src1_rows);
-                    continue;
-                }
             }
 
             // Route to CPU when: the expert cache explicitly places this expert on host

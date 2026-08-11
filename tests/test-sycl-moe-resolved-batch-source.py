@@ -164,6 +164,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     if mmid.count("append_retained_decode_operand(") != 2:
         failures.append("both decode routers share retained dispatch helper")
 
+    prompt_specialized = mmid[mmid.index("cpu_tg_fallthrough:"):admission]
+    for resolver in ("ggml_sycl_resolve_moe_expert_route(",
+                     "ggml_sycl_resolve_moe_expert_route_for_dispatch("):
+        if has_tokens(prompt_specialized, resolver):
+            failures.append(f"prompt specialized path reacquires route: {resolver}")
+    if prompt_specialized.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 0:
+        failures.append("prompt path resnapshots IDs after admission")
+    if not has_tokens(mmid, "moe_expert_route route = retained_prompt_route_for_expert"):
+        failures.append("prompt fallback does not derive routes from batch")
+
     decode_route = mmid[admission:dispatch_gate]
     for forbidden in ("from_chunk_ptr", "from_direct", "is_device_expert_ptr", "src0->data", "route.ptr"):
         if has_tokens(decode_route, forbidden):
