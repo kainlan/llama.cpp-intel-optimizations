@@ -5,10 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace ggml_sycl::execution {
@@ -37,6 +38,8 @@ enum class error {
     NULL_OUTPUT,
     FOREIGN_BACKEND,
     NOT_FOUND,
+    ALLOCATION_FAILED,
+    LOCK_HELD_ALLOCATION,
 };
 
 enum class context_phase { OPEN, DRAINING, RESETTING, CLOSED };
@@ -54,6 +57,11 @@ enum class test_mutation {
     M6c_RESET_SERIAL_OVERFLOW,
     M6e_INVOCATION_ID_OVERFLOW,
     M7_SUBMIT_RELEASES_DEVICES_EARLY,
+    M8a_RECORD_ALLOCATION_FAILURE,
+    M8b_INVOCATION_ALLOCATION_FAILURE,
+    M8c_RETIRE_ALLOCATION_FAILURE,
+    M8d_TERMINAL_ALLOCATION_FAILURE,
+    M9_PERSISTENT_ALLOCATION_UNDER_LOCK,
 };
 
 struct snapshot {
@@ -100,6 +108,23 @@ class RetireTerminal {
   public:
     virtual ~RetireTerminal()    = default;
     virtual void wait() noexcept = 0;
+};
+
+class NoResourcesProof {
+  public:
+    NoResourcesProof() = default;
+
+    bool active() const noexcept { return active_; }
+
+  private:
+    friend class Registry;
+    ContextId             context_{};
+    SessionId             session_{};
+    SessionResetEpoch     reset_epoch_{};
+    GraphEpoch            graph_epoch_{};
+    lifecycle::ModelToken token_root_{};
+    uint64_t              serial_ = 0;
+    bool                  active_ = false;
 };
 
 struct RetireTicket {
@@ -156,11 +181,22 @@ class Registry {
                             GraphEpoch            graph_epoch,
                             InvocationId          invocation,
                             lifecycle::ModelToken root) noexcept;
+    error note_record_resources_published(ContextId             context,
+                                          SessionId             session,
+                                          SessionResetEpoch     reset_epoch,
+                                          GraphEpoch            graph_epoch,
+                                          lifecycle::ModelToken root) noexcept;
     error rollback_record(ContextId             context,
                           SessionId             session,
                           SessionResetEpoch     reset_epoch,
                           GraphEpoch            graph_epoch,
                           lifecycle::ModelToken root) noexcept;
+    error fail_record_no_resources(ContextId             context,
+                                   SessionId             session,
+                                   SessionResetEpoch     reset_epoch,
+                                   GraphEpoch            graph_epoch,
+                                   lifecycle::ModelToken root,
+                                   NoResourcesProof *    proof) noexcept;
     error begin_retire(ContextId             context,
                        SessionId             session,
                        SessionResetEpoch     reset_epoch,
@@ -169,12 +205,7 @@ class Registry {
                        const int *           devices,
                        size_t                device_count,
                        RetireTicket *        ticket) noexcept;
-    error begin_retire_no_resources(ContextId             context,
-                                    SessionId             session,
-                                    SessionResetEpoch     reset_epoch,
-                                    GraphEpoch            graph_epoch,
-                                    lifecycle::ModelToken root,
-                                    RetireTicket *        ticket) noexcept;
+    error begin_retire_no_resources(const NoResourcesProof & proof, RetireTicket * ticket) noexcept;
     error attach_retire_terminal(const RetireTicket &            ticket,
                                  int                             device,
                                  std::shared_ptr<RetireTerminal> terminal) noexcept;
@@ -251,10 +282,12 @@ class Registry {
         GraphEpoch                                               id{};
         epoch_phase                                              state = epoch_phase::RECORDING;
         lifecycle::ModelToken                                    token_root{};
-        std::unordered_set<uint64_t>                             invocations;
+        std::set<uint64_t>                                       invocations;
         uint64_t                                                 retire_serial = 0;
+        uint64_t                                                 no_resources_proof_serial = 0;
+        bool                                                     resources_published       = false;
         std::vector<int>                                         retire_devices;
-        std::unordered_map<int, std::shared_ptr<RetireTerminal>> terminals;
+        std::map<int, std::shared_ptr<RetireTerminal>>           terminals;
     };
 
     struct session_entry {
@@ -263,7 +296,7 @@ class Registry {
         session_phase         state = session_phase::IDLE;
         lifecycle::ModelToken token_root{};
         graph_entry           graph{};
-        std::unordered_map<uint64_t, persistent_epoch_entry> epochs;
+        std::map<uint64_t, persistent_epoch_entry>           epochs;
         GraphEpoch                                           recording_epoch{};
         GraphEpoch                                           active_epoch{};
         uint64_t                                             next_retire_serial  = 1;
@@ -296,10 +329,11 @@ class Registry {
                               SessionResetEpoch     reset_epoch,
                               GraphEpoch            graph_epoch,
                               lifecycle::ModelToken root,
-                              const int *           devices,
-                              size_t                device_count,
+                              std::vector<int>      retire_devices,
                               bool                  no_resources,
+                              uint64_t              proof_serial,
                               RetireTicket *        ticket) noexcept;
+    error persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept;
     error validate_root(const lifecycle::ModelToken & expected, const lifecycle::ModelToken & actual) const noexcept;
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
@@ -319,6 +353,7 @@ class Registry {
     uint64_t                                    next_session_id_ = 1;
     uint64_t                                    next_graph_epoch_ = 1;
     uint64_t                                    next_invocation_id_ = 1;
+    uint64_t                                    next_no_resources_proof_serial_ = 1;
     std::unordered_map<uint64_t, context_entry> contexts_;
     std::array<device_owner, max_devices>       device_owners_{};
 };

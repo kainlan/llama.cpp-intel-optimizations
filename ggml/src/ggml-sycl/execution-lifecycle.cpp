@@ -18,6 +18,16 @@ namespace ggml_sycl::execution {
 
 Registry::Registry(test_mutation mutation) : mutation_(mutation) {}
 
+error Registry::persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept {
+    if (mutation_ == allocation_site) {
+        return error::ALLOCATION_FAILED;
+    }
+    if (mutation_ == test_mutation::M9_PERSISTENT_ALLOCATION_UNDER_LOCK) {
+        return error::LOCK_HELD_ALLOCATION;
+    }
+    return error::OK;
+}
+
 error Registry::next_id(uint64_t & counter, error overflow, bool inject_overflow, uint64_t & out) noexcept {
     if (inject_overflow || counter == 0 || counter == UINT64_MAX) {
         return overflow;
@@ -98,10 +108,22 @@ error Registry::begin_record(ContextId             context,
                              SessionResetEpoch     reset_epoch,
                              lifecycle::ModelToken root,
                              GraphEpoch *          graph_epoch) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!graph_epoch) {
         return error::NULL_OUTPUT;
     }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::map<uint64_t, persistent_epoch_entry> staged;
+    try {
+        staged.emplace(0, persistent_epoch_entry{});
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
+    auto node = staged.extract(staged.begin());
+
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) {
         return error::STALE;
@@ -126,10 +148,10 @@ error Registry::begin_record(ContextId             context,
     if (rc != error::OK) {
         return rc;
     }
-    persistent_epoch_entry epoch;
-    epoch.id         = { value };
-    epoch.token_root = root;
-    owner.epochs.emplace(value, std::move(epoch));
+    node.key()               = value;
+    node.mapped().id         = { value };
+    node.mapped().token_root = root;
+    owner.epochs.insert(std::move(node));
     owner.recording_epoch = { value };
     *graph_epoch          = { value };
     return error::OK;
@@ -180,10 +202,22 @@ error Registry::begin_invocation(ContextId             context,
                                  GraphEpoch            graph_epoch,
                                  lifecycle::ModelToken root,
                                  InvocationId *        invocation) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!invocation) {
         return error::NULL_OUTPUT;
     }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::set<uint64_t> staged;
+    try {
+        staged.insert(0);
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
+    auto node = staged.extract(staged.begin());
+
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) {
         return error::STALE;
@@ -209,7 +243,8 @@ error Registry::begin_invocation(ContextId             context,
     if (rc != error::OK) {
         return rc;
     }
-    epoch.invocations.insert(value);
+    node.value() = value;
+    epoch.invocations.insert(std::move(node));
     *invocation = { value };
     return error::OK;
 }
@@ -242,6 +277,83 @@ error Registry::finish_invocation(ContextId             context,
         return error::STALE;
     }
     epoch.invocations.erase(invocation_it);
+    return error::OK;
+}
+
+error Registry::note_record_resources_published(ContextId             context,
+                                                SessionId             session,
+                                                SessionResetEpoch     reset_epoch,
+                                                GraphEpoch            graph_epoch,
+                                                lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto epoch_it = entry.session.epochs.find(graph_epoch.value);
+    if (epoch_it == entry.session.epochs.end() || !(entry.session.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch.state != epoch_phase::RECORDING) {
+        return error::BUSY;
+    }
+    epoch.resources_published = true;
+    return error::OK;
+}
+
+error Registry::fail_record_no_resources(ContextId             context,
+                                         SessionId             session,
+                                         SessionResetEpoch     reset_epoch,
+                                         GraphEpoch            graph_epoch,
+                                         lifecycle::ModelToken root,
+                                         NoResourcesProof *    proof) noexcept {
+    if (!proof) {
+        return error::NULL_OUTPUT;
+    }
+    *proof = {};
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner    = entry.session;
+    auto   epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch.state != epoch_phase::RECORDING || epoch.resources_published || !epoch.invocations.empty()) {
+        return error::BUSY;
+    }
+    if (next_no_resources_proof_serial_ == 0 || next_no_resources_proof_serial_ == UINT64_MAX) {
+        return error::OVERFLOW;
+    }
+    const uint64_t serial           = next_no_resources_proof_serial_++;
+    epoch.state                     = epoch_phase::RETIRING;
+    epoch.no_resources_proof_serial = serial;
+    owner.recording_epoch           = {};
+    proof->context_                 = context;
+    proof->session_                 = session;
+    proof->reset_epoch_             = reset_epoch;
+    proof->graph_epoch_             = graph_epoch;
+    proof->token_root_              = root;
+    proof->serial_                  = serial;
+    proof->active_                  = true;
     return error::OK;
 }
 
@@ -286,18 +398,41 @@ error Registry::begin_retire(ContextId             context,
                              const int *           devices,
                              size_t                device_count,
                              RetireTicket *        ticket) noexcept {
+    if (!ticket) {
+        return error::NULL_OUTPUT;
+    }
+    *ticket = {};
+    if (!devices || device_count == 0) {
+        return error::MISMATCH;
+    }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8c_RETIRE_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::vector<int> canonical_devices;
+    try {
+        if (!canonicalize_unique_ids(devices, device_count, canonical_devices)) {
+            return error::MISMATCH;
+        }
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    return begin_retire_locked(context, session, reset_epoch, graph_epoch, root, devices, device_count, false, ticket);
+    return begin_retire_locked(context, session, reset_epoch, graph_epoch, root, std::move(canonical_devices), false, 0,
+                               ticket);
 }
 
-error Registry::begin_retire_no_resources(ContextId             context,
-                                          SessionId             session,
-                                          SessionResetEpoch     reset_epoch,
-                                          GraphEpoch            graph_epoch,
-                                          lifecycle::ModelToken root,
-                                          RetireTicket *        ticket) noexcept {
+error Registry::begin_retire_no_resources(const NoResourcesProof & proof, RetireTicket * ticket) noexcept {
+    if (!ticket) {
+        return error::NULL_OUTPUT;
+    }
+    *ticket = {};
+    if (!proof.active_) {
+        return error::STALE;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    return begin_retire_locked(context, session, reset_epoch, graph_epoch, root, nullptr, 0, true, ticket);
+    return begin_retire_locked(proof.context_, proof.session_, proof.reset_epoch_, proof.graph_epoch_,
+                               proof.token_root_, {}, true, proof.serial_, ticket);
 }
 
 error Registry::begin_retire_locked(ContextId             context,
@@ -305,18 +440,10 @@ error Registry::begin_retire_locked(ContextId             context,
                                     SessionResetEpoch     reset_epoch,
                                     GraphEpoch            graph_epoch,
                                     lifecycle::ModelToken root,
-                                    const int *           devices,
-                                    size_t                device_count,
+                                    std::vector<int>      retire_devices,
                                     bool                  no_resources,
+                                    uint64_t              proof_serial,
                                     RetireTicket *        ticket) noexcept {
-    if (!ticket) {
-        return error::NULL_OUTPUT;
-    }
-    *ticket = {};
-    if ((!no_resources && (!devices || device_count == 0)) ||
-        (no_resources && (devices != nullptr || device_count != 0))) {
-        return error::MISMATCH;
-    }
     auto it = contexts_.find(context.value);
     if (context.value == 0 || it == contexts_.end()) {
         return error::STALE;
@@ -337,15 +464,13 @@ error Registry::begin_retire_locked(ContextId             context,
     if ((epoch.state != epoch_phase::ACTIVE && epoch.state != epoch_phase::RETIRING) || epoch.retire_serial != 0) {
         return error::BUSY;
     }
-    if (no_resources && !epoch.invocations.empty()) {
-        return error::BUSY;
-    }
-    std::vector<int> canonical_devices;
-    if (!no_resources) {
-        if (!canonicalize_unique_ids(devices, device_count, canonical_devices)) {
+    if (no_resources) {
+        if (epoch.state != epoch_phase::RETIRING || epoch.resources_published || !epoch.invocations.empty() ||
+            proof_serial == 0 || epoch.no_resources_proof_serial != proof_serial) {
             return error::MISMATCH;
         }
-        for (int device : canonical_devices) {
+    } else {
+        for (int device : retire_devices) {
             if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) {
                 return error::MISMATCH;
             }
@@ -357,7 +482,7 @@ error Registry::begin_retire_locked(ContextId             context,
     const uint64_t serial = owner.next_retire_serial++;
     epoch.state           = epoch_phase::RETIRING;
     epoch.retire_serial   = serial;
-    epoch.retire_devices  = std::move(canonical_devices);
+    epoch.retire_devices  = std::move(retire_devices);
     if (owner.active_epoch == graph_epoch) {
         owner.active_epoch = {};
     }
@@ -371,6 +496,18 @@ error Registry::attach_retire_terminal(const RetireTicket &            ticket,
     if (!terminal) {
         return error::MISMATCH;
     }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8d_TERMINAL_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::map<int, std::shared_ptr<RetireTerminal>> staged;
+    try {
+        staged.emplace(device, terminal);
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
+    auto node = staged.extract(staged.begin());
+
     std::lock_guard<std::mutex> lock(mutex_);
     auto                        context_it = contexts_.find(ticket.context.value);
     if (!ticket.active || ticket.serial == 0 || context_it == contexts_.end()) {
@@ -397,12 +534,13 @@ error Registry::attach_retire_terminal(const RetireTicket &            ticket,
     if (epoch.terminals.find(device) != epoch.terminals.end()) {
         return error::STALE;
     }
-    epoch.terminals.emplace(device, terminal);
+    epoch.terminals.insert(std::move(node));
     return error::OK;
 }
 
 error Registry::finish_retire(const RetireTicket & ticket) noexcept {
-    std::vector<std::shared_ptr<RetireTerminal>> terminals;
+    std::array<std::shared_ptr<RetireTerminal>, max_devices> terminals{};
+    size_t                                                   terminal_count = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        context_it = contexts_.find(ticket.context.value);
@@ -427,16 +565,18 @@ error Registry::finish_retire(const RetireTicket & ticket) noexcept {
         if (!epoch.invocations.empty() || epoch.terminals.size() != epoch.retire_devices.size()) {
             return error::BUSY;
         }
-        terminals.reserve(epoch.retire_devices.size());
         for (int device : epoch.retire_devices) {
-            terminals.push_back(epoch.terminals.at(device));
+            terminals[terminal_count++] = epoch.terminals.at(device);
         }
     }
-    for (const auto & terminal : terminals) {
-        terminal->wait();
+    for (size_t i = 0; i < terminal_count; ++i) {
+        terminals[i]->wait();
     }
 
-    std::vector<std::shared_ptr<RetireTerminal>> released;
+    using terminal_node = std::map<int, std::shared_ptr<RetireTerminal>>::node_type;
+    std::array<terminal_node, max_devices> released_nodes{};
+    size_t                                 released_count = 0;
+    std::vector<int>                       released_devices;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        context_it = contexts_.find(ticket.context.value);
@@ -458,11 +598,10 @@ error Registry::finish_retire(const RetireTicket & ticket) noexcept {
         if (!epoch_it->second.invocations.empty()) {
             return error::BUSY;
         }
-        for (auto & item : epoch_it->second.terminals) {
-            released.push_back(std::move(item.second));
+        while (!epoch_it->second.terminals.empty()) {
+            released_nodes[released_count++] = epoch_it->second.terminals.extract(epoch_it->second.terminals.begin());
         }
-        epoch_it->second.terminals.clear();
-        epoch_it->second.retire_devices.clear();
+        released_devices       = std::move(epoch_it->second.retire_devices);
         epoch_it->second.state = epoch_phase::RETIRED;
     }
     return error::OK;

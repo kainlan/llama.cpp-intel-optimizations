@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <thread>
+#include <vector>
 
 using namespace ggml_sycl::execution;
 using ggml_sycl::lifecycle::LoadTxnId;
@@ -144,16 +145,38 @@ int main() {
 
     // Replacement is legal with an old invocation outstanding. Activation
     // moves old ACTIVE directly to RETIRING; exact old completion remains valid.
-    InvocationId old_outstanding{};
-    require(reg.begin_invocation(context, session, reset, first, root, &old_outstanding) == error::OK,
-            "outstanding old invocation failed");
+    constexpr size_t                concurrent_count = 8;
+    std::vector<InvocationId>       concurrent_invocations(concurrent_count);
+    std::vector<std::future<error>> concurrent_completions;
+    concurrent_completions.reserve(concurrent_count);
+    std::atomic<size_t> concurrent_ready{ 0 };
+    std::atomic<bool>   release_concurrent{ false };
+    for (size_t i = 0; i < concurrent_count; ++i) {
+        concurrent_completions.push_back(std::async(std::launch::async, [&, i] {
+            const auto begin_rc =
+                reg.begin_invocation(context, session, reset, first, root, &concurrent_invocations[i]);
+            if (begin_rc != error::OK) {
+                return begin_rc;
+            }
+            concurrent_ready.fetch_add(1, std::memory_order_release);
+            while (!release_concurrent.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            return reg.finish_invocation(context, session, reset, first, concurrent_invocations[i], root);
+        }));
+    }
+    while (concurrent_ready.load(std::memory_order_acquire) != concurrent_count) {
+        std::this_thread::yield();
+    }
+
     GraphEpoch second{};
     require(reg.begin_record(context, session, reset, root, &second) == error::OK &&
                 reg.activate(context, session, reset, second, root) == error::OK,
-            "replacement activation failed");
+            "concurrent replacement activation failed");
     require(reg.extract_epoch(context, session, reset, first, root, &epoch_snap) == error::OK &&
-                epoch_snap.state == epoch_phase::RETIRING && epoch_snap.live_invocations == 1 && !epoch_snap.is_active,
-            "replacement did not move old ACTIVE directly to RETIRING");
+                epoch_snap.state == epoch_phase::RETIRING && epoch_snap.live_invocations == concurrent_count &&
+                !epoch_snap.is_active,
+            "replacement did not preserve concurrent old invocations");
 
     RetireTicket old_ticket{};
     require(reg.begin_retire(context, session, reset, first, root, devices, 2, &old_ticket) == error::OK,
@@ -168,10 +191,12 @@ int main() {
                                        std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
             "second terminal attach failed");
     require(reg.finish_retire(old_ticket) == error::BUSY, "retirement ignored outstanding old invocation");
-    require(reg.finish_invocation(context, session, reset, first, old_outstanding, root) == error::OK,
-            "exact old invocation completion rejected after replacement");
-    require(reg.finish_invocation(context, session, reset, first, old_outstanding, root) == error::STALE,
-            "stale old invocation completion accepted");
+    release_concurrent.store(true, std::memory_order_release);
+    for (auto & completion : concurrent_completions) {
+        require(completion.get() == error::OK, "exact concurrent old invocation completion rejected");
+    }
+    require(reg.finish_invocation(context, session, reset, first, concurrent_invocations.front(), root) == error::STALE,
+            "stale concurrent old invocation completion accepted");
 
     RetireTicket wrong_context = old_ticket;
     wrong_context.context      = { context.value + 999 };
@@ -189,13 +214,37 @@ int main() {
                 epoch_snap.state == epoch_phase::ACTIVE && epoch_snap.is_active,
             "old completion mutated replacement epoch");
 
-    // Zero-terminal retirement is possible only through the explicit proof API.
-    GraphEpoch   empty_failed_record{};
-    RetireTicket empty_ticket{};
-    require(reg.begin_record(context, session, reset, root, &empty_failed_record) == error::OK &&
-                reg.rollback_record(context, session, reset, empty_failed_record, root) == error::OK &&
-                reg.begin_retire_no_resources(context, session, reset, empty_failed_record, root, &empty_ticket) ==
+    NoResourcesProof active_bypass{};
+    RetireTicket     bypass_ticket{};
+    require(reg.fail_record_no_resources(context, session, reset, second, root, &active_bypass) == error::STALE &&
+                !active_bypass.active() && reg.begin_retire_no_resources(active_bypass, &bypass_ticket) == error::STALE,
+            "ACTIVE epoch obtained a no-resources retirement bypass");
+
+    GraphEpoch       partially_published{};
+    NoResourcesProof partial_proof{};
+    RetireTicket     partial_ticket{};
+    require(reg.begin_record(context, session, reset, root, &partially_published) == error::OK &&
+                reg.note_record_resources_published(context, session, reset, partially_published, root) == error::OK &&
+                reg.fail_record_no_resources(context, session, reset, partially_published, root, &partial_proof) ==
+                    error::BUSY &&
+                !partial_proof.active() &&
+                reg.rollback_record(context, session, reset, partially_published, root) == error::OK &&
+                reg.begin_retire(context, session, reset, partially_published, root, devices, 1, &partial_ticket) ==
                     error::OK &&
+                reg.attach_retire_terminal(
+                    partial_ticket, 0, std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK &&
+                reg.finish_retire(partial_ticket) == error::OK,
+            "partially published failed record bypassed terminal retirement");
+
+    // Zero-terminal retirement requires a proof minted while the failed epoch
+    // is still RECORDING and before resource publication.
+    GraphEpoch       empty_failed_record{};
+    RetireTicket     empty_ticket{};
+    NoResourcesProof empty_proof{};
+    require(reg.begin_record(context, session, reset, root, &empty_failed_record) == error::OK &&
+                reg.fail_record_no_resources(context, session, reset, empty_failed_record, root, &empty_proof) ==
+                    error::OK &&
+                empty_proof.active() && reg.begin_retire_no_resources(empty_proof, &empty_ticket) == error::OK &&
                 reg.finish_retire(empty_ticket) == error::OK &&
                 reg.extract_epoch(context, session, reset, empty_failed_record, root, &epoch_snap) == error::OK &&
                 epoch_snap.state == epoch_phase::RETIRED,
@@ -243,6 +292,93 @@ int main() {
                 invocation_overflow.begin_invocation(invocation_context, invocation_session, invocation_reset,
                                                      invocation_epoch, root, &overflow_invocation) == error::OVERFLOW,
             "invocation id overflow mutation survived");
+
+    Registry          record_allocation_failure(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
+    const ContextId   allocation_context = record_allocation_failure.create_context(err);
+    SessionId         allocation_session{};
+    SessionResetEpoch allocation_reset{};
+    GraphEpoch        allocation_epoch{};
+    require(err == error::OK &&
+                record_allocation_failure.attach_root(allocation_context, root, &allocation_session,
+                                                      &allocation_reset) == error::OK &&
+                record_allocation_failure.begin_record(allocation_context, allocation_session, allocation_reset, root,
+                                                       &allocation_epoch) == error::ALLOCATION_FAILED,
+            "record allocation failure did not return typed status");
+
+    Registry          invocation_allocation_failure(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
+    const ContextId   invocation_allocation_context = invocation_allocation_failure.create_context(err);
+    SessionId         invocation_allocation_session{};
+    SessionResetEpoch invocation_allocation_reset{};
+    GraphEpoch        invocation_allocation_epoch{};
+    InvocationId      allocation_invocation{};
+    require(err == error::OK &&
+                invocation_allocation_failure.attach_root(invocation_allocation_context, root,
+                                                          &invocation_allocation_session,
+                                                          &invocation_allocation_reset) == error::OK &&
+                invocation_allocation_failure.begin_record(invocation_allocation_context, invocation_allocation_session,
+                                                           invocation_allocation_reset, root,
+                                                           &invocation_allocation_epoch) == error::OK &&
+                invocation_allocation_failure.activate(invocation_allocation_context, invocation_allocation_session,
+                                                       invocation_allocation_reset, invocation_allocation_epoch,
+                                                       root) == error::OK &&
+                invocation_allocation_failure.begin_invocation(
+                    invocation_allocation_context, invocation_allocation_session, invocation_allocation_reset,
+                    invocation_allocation_epoch, root, &allocation_invocation) == error::ALLOCATION_FAILED,
+            "invocation allocation failure did not return typed status");
+
+    Registry          retire_allocation_failure(test_mutation::M8c_RETIRE_ALLOCATION_FAILURE);
+    const ContextId   retire_allocation_context = retire_allocation_failure.create_context(err);
+    SessionId         retire_allocation_session{};
+    SessionResetEpoch retire_allocation_reset{};
+    GraphEpoch        retire_allocation_epoch{};
+    RetireTicket      allocation_ticket{};
+    require(
+        err == error::OK && retire_allocation_failure.bind_backend(retire_allocation_context, 0) == error::OK &&
+            retire_allocation_failure.attach_root(retire_allocation_context, root, &retire_allocation_session,
+                                                  &retire_allocation_reset) == error::OK &&
+            retire_allocation_failure.begin_record(retire_allocation_context, retire_allocation_session,
+                                                   retire_allocation_reset, root,
+                                                   &retire_allocation_epoch) == error::OK &&
+            retire_allocation_failure.activate(retire_allocation_context, retire_allocation_session,
+                                               retire_allocation_reset, retire_allocation_epoch, root) == error::OK &&
+            retire_allocation_failure.begin_retire(retire_allocation_context, retire_allocation_session,
+                                                   retire_allocation_reset, retire_allocation_epoch, root, devices, 1,
+                                                   &allocation_ticket) == error::ALLOCATION_FAILED,
+        "retire allocation failure did not return typed status");
+
+    Registry          terminal_allocation_failure(test_mutation::M8d_TERMINAL_ALLOCATION_FAILURE);
+    const ContextId   terminal_allocation_context = terminal_allocation_failure.create_context(err);
+    SessionId         terminal_allocation_session{};
+    SessionResetEpoch terminal_allocation_reset{};
+    GraphEpoch        terminal_allocation_epoch{};
+    require(err == error::OK && terminal_allocation_failure.bind_backend(terminal_allocation_context, 0) == error::OK &&
+                terminal_allocation_failure.attach_root(terminal_allocation_context, root, &terminal_allocation_session,
+                                                        &terminal_allocation_reset) == error::OK &&
+                terminal_allocation_failure.begin_record(terminal_allocation_context, terminal_allocation_session,
+                                                         terminal_allocation_reset, root,
+                                                         &terminal_allocation_epoch) == error::OK &&
+                terminal_allocation_failure.activate(terminal_allocation_context, terminal_allocation_session,
+                                                     terminal_allocation_reset, terminal_allocation_epoch,
+                                                     root) == error::OK &&
+                terminal_allocation_failure.begin_retire(terminal_allocation_context, terminal_allocation_session,
+                                                         terminal_allocation_reset, terminal_allocation_epoch, root,
+                                                         devices, 1, &allocation_ticket) == error::OK &&
+                terminal_allocation_failure.attach_retire_terminal(
+                    allocation_ticket, 0,
+                    std::make_shared<probe_terminal>(terminal_allocation_failure, terminal_allocation_context, waits,
+                                                     destroys)) == error::ALLOCATION_FAILED,
+            "terminal allocation failure did not return typed status");
+
+    Registry          lock_allocation(test_mutation::M9_PERSISTENT_ALLOCATION_UNDER_LOCK);
+    const ContextId   lock_context = lock_allocation.create_context(err);
+    SessionId         lock_session{};
+    SessionResetEpoch lock_reset{};
+    GraphEpoch        lock_epoch{};
+    require(err == error::OK &&
+                lock_allocation.attach_root(lock_context, root, &lock_session, &lock_reset) == error::OK &&
+                lock_allocation.begin_record(lock_context, lock_session, lock_reset, root, &lock_epoch) ==
+                    error::LOCK_HELD_ALLOCATION,
+            "lock-held allocation instrumentation mutation survived");
 
     std::cout << "graph epoch lifecycle: ok\n";
     return 0;
