@@ -98565,6 +98565,47 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 static int  ggml_sycl_extract_planned_layer_id(const ggml_tensor * op);
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device);
 
+// ADD/SUB/MUL/DIV/REPEAT are the five ggml_sycl_op_bin_bcast consumers.  Its
+// kernels index every row as `row[i0]` and turn byte strides into element
+// strides by exact division, which binbcast.cpp:633-649 enforces with
+// GGML_ASSERTs.  There is no fallback behind them, so a node that violates one
+// aborts the process instead of deferring to another backend.
+//
+// Arguments are the tensors as ggml_sycl_op_bin_bcast receives them: for the
+// binary ops that is (op->src[0], op->src[1], op), but for REPEAT it is
+// (op, op->src[0], op) -- REPEAT passes dst in the src0 slot.
+//
+// CUDA needs no such check: its k_bin_bcast takes s00/s10 and indexes
+// `src0_row[i0*s00]` / `src1[i_src1 + i10*s10]` (binbcast.cu:85-90), so it runs
+// permuted sources directly and its supports_op checks types only
+// (ggml-cuda.cu:4876-4882).  Declining here is therefore a real capability gap
+// against CUDA, recorded in llama.cpp-83e4, not merely an assert mismatch.
+static bool ggml_sycl_binbcast_layout_supported(const ggml_tensor * src0,
+                                                const ggml_tensor * src1,
+                                                const ggml_tensor * dst) {
+    if (!src0 || !src1 || !dst) {
+        return false;
+    }
+
+    // nb{0,1,2,3} % sizeof(element) == 0, asserted for all three tensors.
+    auto strides_are_whole_elements = [](const ggml_tensor * t) {
+        const size_t ts = ggml_type_size(t->type);
+        return t->nb[0] % ts == 0 && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
+    };
+
+    if (!strides_are_whole_elements(src0) || !strides_are_whole_elements(src1) || !strides_are_whole_elements(dst)) {
+        return false;
+    }
+
+    // `s0 == 1` (dst) and `s10 == 1` (src1) are asserted outright.  src0's row
+    // stride is dropped on the way into the kernel -- `s00` is GGML_UNUSED and
+    // the row is read as `src0_row[i0]` -- so a permuted src0 is read as if it
+    // were contiguous, which is silently wrong rather than an abort.  Decline
+    // that too: a wrong answer is worse than a CPU fallback.
+    return dst->nb[0] == ggml_type_size(dst->type) && src1->nb[0] == ggml_type_size(src1->type) &&
+           src0->nb[0] == ggml_type_size(src0->type);
+}
+
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     int                                device   = sycl_ctx->device;
@@ -98926,9 +98967,23 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 // with binbcast.cpp. CUDA declines the same way, and more narrowly
                 // (f32/f16 only), because its bin_bcast omits the integer branches.
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_I32 ||
-                       src0_type == GGML_TYPE_I16;
+                if (src0_type != GGML_TYPE_F32 && src0_type != GGML_TYPE_F16 && src0_type != GGML_TYPE_I32 &&
+                    src0_type != GGML_TYPE_I16) {
+                    return false;
+                }
+                // REPEAT hands (dst, src, dst) to bin_bcast, so the stride
+                // preconditions land on dst and on op->src[0].
+                return ggml_sycl_binbcast_layout_supported(op, op->src[0], op);
             }
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            // The other four bin_bcast consumers; see
+            // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
+            // ADD1 (k_add1), ADD_ID and COUNT_EQUAL have their own kernels and
+            // stay in the unconditional group below.
+            return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
@@ -98937,13 +98992,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD:
         case GGML_OP_ADD1:
         case GGML_OP_ADD_ID:
-        case GGML_OP_SUB:
         case GGML_OP_COUNT_EQUAL:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
             return true;
         case GGML_OP_PAD_REFLECT_1D:
             return ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
