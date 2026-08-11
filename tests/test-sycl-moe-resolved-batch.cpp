@@ -258,10 +258,44 @@ static bool test_fail_closed_contract() {
     return true;
 }
 
+static bool test_decode_admission_is_route_mode_independent() {
+    int           local = 13;
+    const int32_t ids[] = { 2, 2 };
+
+    // An all-local placement plan still admits every occurrence into one batch.
+    int  planned_calls  = 0;
+    auto all_local_plan = ggml_sycl::build_moe_resolved_batch(ids, 2, 2, 0, [&](int32_t) {
+        ++planned_calls;
+        return route_for(&local, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS,
+                         13);
+    });
+    CHECK(all_local_plan);
+    CHECK(planned_calls == 2);
+    CHECK(all_local_plan.batch.operands.size() == 2);
+    for (const auto & operand : all_local_plan.batch.operands) {
+        auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true, true);
+        CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
+    }
+
+    // No placement plan/nonhybrid residency follows the same retained contract.
+    int  unplanned_calls = 0;
+    auto no_plan         = ggml_sycl::build_moe_resolved_batch(ids, 2, 2, 0, [&](int32_t) {
+        ++unplanned_calls;
+        auto route =
+            route_for(&local, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 13);
+        route.plan_found = false;
+        return route;
+    });
+    CHECK(no_plan);
+    CHECK(unplanned_calls == 2);
+    CHECK(no_plan.batch.expert_ids == std::vector<int32_t>({ 2, 2 }));
+    return true;
+}
+
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
-        !test_fail_closed_contract()) {
+        !test_fail_closed_contract() || !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");

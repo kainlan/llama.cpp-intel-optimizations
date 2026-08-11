@@ -68987,6 +68987,26 @@ cpu_tg_fallthrough:
             src0_layout_base = src0_layout_ptr;
         }
     }
+    // Decode admits one canonical occurrence batch before any route-mode
+    // selection. Every decode dispatcher below consumes this exact batch; a
+    // missing, stale, or incompatible handle is a graph failure.
+    ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
+    if (ne12 == 1) {
+        ctx.moe_graphs_disabled_once = true;
+        retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+            src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
+            /*allow_materialize=*/false);
+        if (!retained_decode_batch_result) {
+            ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+            GGML_LOG_ERROR("[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
+                           src0->name ? src0->name : "?", retained_decode_batch_result.occurrence,
+                           retained_decode_batch_result.expert_id,
+                           ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
+                           retained_decode_batch_result.source_reason);
+            throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode admission failed");
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // MoE hybrid GPU+CPU dispatch gate.
     // MUST be computed BEFORE update_moe_ptr_table so expert data is staged
@@ -69028,9 +69048,12 @@ cpu_tg_fallthrough:
                                             (plan_has_cpu_experts || plan_has_secondary_experts);
     const bool planner_needs_prompt_route =
         has_placement_plan && placement_planned_moe && prompt_batch && !exact_layout_override;
-    const bool moe_hybrid_with_plan = has_placement_plan ?
-                                          (plan_hybrid || planner_needs_decode_route || planner_needs_prompt_route) :
-                                          moe_hybrid_active;
+    const bool selected_hybrid_route = has_placement_plan ?
+                                           (plan_hybrid || planner_needs_decode_route || planner_needs_prompt_route) :
+                                           moe_hybrid_active;
+    // All decode uses the retained executor, including all-local placement
+    // plans and no-plan/nonhybrid residency. Prompt route selection is unchanged.
+    const bool moe_hybrid_with_plan  = ne12 == 1 || selected_hybrid_route;
     const bool route_host_experts_to_cpu =
         !exact_layout_override && (has_placement_plan ? plan_has_cpu_experts : use_expert_cache);
 
@@ -69074,7 +69097,7 @@ cpu_tg_fallthrough:
         expert_ptrs_host = reinterpret_cast<const void * const *>(expert_ptrs_payload_host.data());
         return true;
     };
-    if (use_expert_cache && !planned_pp_handle_routing) {
+    if (use_expert_cache && ne12 != 1 && !planned_pp_handle_routing) {
         // Stage experts in the requested layout (SOA/Coalesced for MXFP4, AOS otherwise).
         // force_cache_aos=true only when layout is AOS (ensures mmap'd weights get staged).
         bool         need_force_aos      = (route_layout == GGML_LAYOUT_AOS);
@@ -69365,7 +69388,7 @@ cpu_tg_fallthrough:
 
     // Auto-detect: enable CPU expert TG when moe_hybrid is active (with plan awareness)
     // (moe_hybrid_with_plan extends moe_hybrid_active with plan-based host routing)
-    const bool cpu_expert_tg_active = moe_hybrid_with_plan && !prompt_batch && (cpu_tg_val == 1 || cpu_tg_val == -2);
+    const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch && (cpu_tg_val == 1 || cpu_tg_val == -2);
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         fprintf(stderr,
                 "[MOE-STAGE] tensor=%s stage=before-route-mode device=%d ne12=%lld use_cache=%d plan=%d hybrid=%d\n",
@@ -69931,29 +69954,9 @@ cpu_tg_fallthrough:
                 size_t route_unavailable_count     = 0;
                 size_t route_layout_mismatch_count = 0;
 
-                // Graph replay does not retain this occurrence batch yet.
-                // Keep recording disabled until the graph-retention migration.
-                ctx.moe_graphs_disabled_once = true;
-
-                // Decode resolves every selected occurrence exactly once. The
-                // resulting operands (including duplicates) are the sole
-                // routing authority below; pointers are resolved only by the
-                // final CPU/device ABI submitters.
-                auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-                    src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
-                    /*allow_materialize=*/false);
-                if (!decode_batch_result) {
-                    local_extra.moe_expert_id = -1;
-                    ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
-                    GGML_LOG_ERROR(
-                        "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                        src0->name ? src0->name : "?", decode_batch_result.occurrence,
-                        decode_batch_result.expert_id,
-                        ggml_sycl::moe_batch_reject_reason_name(decode_batch_result.reject),
-                        decode_batch_result.source_reason);
-                    throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode batch rejected");
-                }
-                const ggml_sycl::moe_resolved_batch & decode_batch = decode_batch_result.batch;
+                // Admission happened before route selection. Keep using the
+                // single occurrence batch, including repeated expert IDs.
+                const ggml_sycl::moe_resolved_batch & decode_batch = retained_decode_batch_result.batch;
 
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
@@ -70309,25 +70312,7 @@ cpu_tg_fallthrough:
                         ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
                 };
 
-                const bool retained_main_decode = ids->ne[1] == 1;
-                ggml_sycl::moe_resolved_batch_result main_decode_batch_result;
-                if (retained_main_decode) {
-                    ctx.moe_graphs_disabled_once = true;
-                    main_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-                        src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
-                        /*allow_materialize=*/false);
-                    if (!main_decode_batch_result) {
-                        local_extra.moe_expert_id = -1;
-                        ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
-                        GGML_LOG_ERROR(
-                            "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                            src0->name ? src0->name : "?", main_decode_batch_result.occurrence,
-                            main_decode_batch_result.expert_id,
-                            ggml_sycl::moe_batch_reject_reason_name(main_decode_batch_result.reject),
-                            main_decode_batch_result.source_reason);
-                        throw ggml_sycl_fallback_error("MUL_MAT_ID retained main decode batch rejected");
-                    }
-                }
+                const bool retained_main_decode = ne12 == 1;
 
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                     for (int64_t id = 0; id < n_ids; id++) {
@@ -70337,7 +70322,7 @@ cpu_tg_fallthrough:
 
                         if (retained_main_decode) {
                             const auto choice = append_retained_decode_operand(
-                                main_decode_batch_result.batch.operands[occurrence], iid1, id, main_route_stats);
+                                retained_decode_batch_result.batch.operands[occurrence], iid1, id, main_route_stats);
                             if (!choice) {
                                 local_extra.moe_expert_id = -1;
                                 ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);

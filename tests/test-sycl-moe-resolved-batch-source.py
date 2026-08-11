@@ -49,7 +49,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "opaque proof transfer":
             "normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted",
         "canonical lease": "normalized.lease = std::move(route.lease)",
-        "decode batch seam": "auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(",
+        "unconditional decode admission":
+            "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(",
         "metadata executor": "ggml_sycl::choose_moe_batch_executor(",
         "typed capability refusal": "moe_batch_reject_reason::CAPABILITY_UNSUPPORTED",
         "Q1 decode refusal": "type == GGML_TYPE_Q1_0",
@@ -59,12 +60,10 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
         "CPU ready copy": "sycl::event ready = entry.ready_event",
         "CPU ready wait": "ready.wait()",
-        "CPU-TG batch failure propagates":
-            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode batch rejected\")",
+        "admission failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode admission failed\")",
         "CPU-TG executor failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode executor refused route\")",
-        "main batch failure propagates":
-            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode batch rejected\")",
         "main executor failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode executor refused route\")",
         "ready guard suppresses exceptional publish":
@@ -77,6 +76,15 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "decode CPU-TG fast gate": "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)",
         "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
         "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
+        "all-local decode retained gate": "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route",
+        "no-plan decode skips pointer staging":
+            "if (use_expert_cache && ne12 != 1 && !planned_pp_handle_routing)",
+        "CPU-TG retains selected routing semantics":
+            "const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch",
+        "CPU-TG canonical batch consumer":
+            "const ggml_sycl::moe_resolved_batch & decode_batch = retained_decode_batch_result.batch",
+        "main canonical batch consumer":
+            "retained_decode_batch_result.batch.operands[occurrence]",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -120,17 +128,30 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         if has_tokens(host_test, device_fixture):
             failures.append("device-dependent host fixture")
 
-    if source.count("ggml_sycl::ggml_sycl_build_moe_resolved_batch(") < 2:  # CPU-TG + main decode
-        failures.append("both decode routers use retained batch")
-    if source.count("append_retained_decode_operand(") < 2:  # both consumers
+    function_start = source.index("static void ggml_sycl_mul_mat_id(")
+    function_end = source.index("static bool ggml_sycl_compute_forward", function_start)
+    mmid = source[function_start:function_end]
+    admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;")
+    route_mode = mmid.index("const bool selected_hybrid_route", admission)
+    dispatch_gate = mmid.index("if (moe_hybrid_with_plan)")
+
+    # Exact structural contract: ID snapshot precedes exactly one admission;
+    # route-mode selection and every retained dispatch branch follow it.
+    if mmid.count("ggml_sycl::ggml_sycl_build_moe_resolved_batch(") != 1:
+        failures.append("decode has exactly one retained admission")
+    if mmid.index('pp_phase_log("ids-ready"') >= admission:
+        failures.append("decode admission precedes ID snapshot")
+    if not admission < route_mode < dispatch_gate:
+        failures.append("decode route/dispatch precedes admission")
+    if mmid[:admission].count("if (ne12 == 1) {") != 0:
+        failures.append("decode branch exists before admission")
+    if mmid.count("append_retained_decode_operand(") != 2:
         failures.append("both decode routers share retained dispatch helper")
 
-    decode_start = source.index("auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
-    decode_end = source.index("stage=route-build-end", decode_start)
-    decode_route = source[decode_start:decode_end]
+    decode_route = mmid[admission:dispatch_gate]
     for forbidden in ("from_chunk_ptr", "from_direct", "is_device_expert_ptr", "src0->data", "route.ptr"):
         if has_tokens(decode_route, forbidden):
-            failures.append(f"decode raw routing: {forbidden}")
+            failures.append(f"decode raw routing before dispatch: {forbidden}")
 
     production = header + wrapper
     for forbidden in ("sycl::malloc_device", "sycl::malloc_host", "sycl::malloc_shared", "sycl::free(",
@@ -210,6 +231,19 @@ def test_contract_and_mutation_witnesses() -> None:
         ("pointer-table-return", header,
          source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID planned pointer-table admission failed\")",
                         "return"),
+         host_test, mem_source),
+        ("all-local-decode-bypass", header,
+         re.sub(r"const\s+bool\s+moe_hybrid_with_plan\s*=\s*ne12\s*==\s*1\s*\|\|\s*selected_hybrid_route\s*;",
+                "const bool moe_hybrid_with_plan = selected_hybrid_route;", source),
+         host_test, mem_source),
+        ("no-plan-decode-pointer-stage", header,
+         source.replace("if (use_expert_cache && ne12 != 1 && !planned_pp_handle_routing)",
+                        "if (use_expert_cache && !planned_pp_handle_routing)"),
+         host_test, mem_source),
+        ("dispatch-before-admission", header,
+         source.replace("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;",
+                        "if (moe_hybrid_with_plan) { return; }\n"
+                        "    ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;"),
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
