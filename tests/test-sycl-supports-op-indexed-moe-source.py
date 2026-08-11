@@ -3,7 +3,7 @@
 
 import re
 from pathlib import Path
-from typing import Tuple
+from typing import Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -14,6 +14,13 @@ EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 PLANNER_GUARD = "if (ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
 NEXT_EARLY_BRANCH = "if (g_moe_multi_gpu_active.load"
+TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
+TYPE_HELPER_END = FUNCTION_START
+MUL_MAT_TYPES = {
+    "F32", "F16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
+    "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M",
+    "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS",
+}
 
 
 def braced_body(text: str, header: str) -> Tuple[int, int, str]:
@@ -42,6 +49,22 @@ def executable_body(body: str) -> str:
     return re.sub(r"\s+", "", without_comments)
 
 
+def mul_mat_type_policy(text: str) -> Tuple[Set[str], bool]:
+    start = text.index(TYPE_HELPER_START)
+    end = text.index(TYPE_HELPER_END, start)
+    helper = text[start:end]
+    cases = set(re.findall(r"\bcase\s+GGML_TYPE_([A-Z0-9_]+)\s*:", helper))
+    default = re.search(r"\bdefault\s*:\s*return\s+(true|false)\s*;", helper)
+    if default is None:
+        raise ValueError("MUL_MAT type helper has no Boolean default")
+    return cases, default.group(1) == "true"
+
+
+def mul_mat_type_supported(text: str, type_name: str) -> bool:
+    cases, default = mul_mat_type_policy(text)
+    return True if type_name in cases else default
+
+
 def contract(text: str) -> bool:
     try:
         function = supports_function(text)
@@ -49,6 +72,7 @@ def contract(text: str) -> bool:
         next_branch = function.index(NEXT_EARLY_BRANCH, early_close)
         planner = function.index(PLANNER_GUARD)
         switch = function.index(OP_SWITCH)
+        allowed_types, default_type_support = mul_mat_type_policy(text)
     except ValueError:
         return False
 
@@ -56,6 +80,11 @@ def contract(text: str) -> bool:
     mul_mat_start = switch_body.index("case GGML_OP_MUL_MAT:")
     mul_mat_end = switch_body.index("case GGML_OP_OUT_PROD:", mul_mat_start)
     mul_mat_case = switch_body[mul_mat_start:mul_mat_end]
+    type_guard = "if (!ggml_sycl_mul_mat_type_supported(a_type)) {"
+    try:
+        type_guard_start, _, type_guard_body = braced_body(mul_mat_case, type_guard)
+    except ValueError:
+        return False
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
         early < early_close < next_branch < planner < switch
@@ -65,6 +94,11 @@ def contract(text: str) -> bool:
         and later_indexed_case is None
         and len(re.findall(r"\bcase\s+GGML_OP_MUL_MAT\s*:", switch_body)) == 1
         and "op->op == GGML_OP_MUL_MAT" not in mul_mat_case
+        and allowed_types == MUL_MAT_TYPES
+        and not default_type_support
+        and mul_mat_case.count(type_guard) == 1
+        and executable_body(type_guard_body) == "returnfalse;"
+        and type_guard_start < mul_mat_case.rfind("return true;")
     )
 
 
@@ -76,8 +110,45 @@ def replace_in_supports_function(text: str, old: str, new: str) -> str:
     return text[:start] + function.replace(old, new, 1) + text[end:]
 
 
+def replace_in_type_helper(text: str, old: str, new: str) -> str:
+    start = text.index(TYPE_HELPER_START)
+    end = text.index(TYPE_HELPER_END, start)
+    helper = text[start:end]
+    assert helper.count(old) == 1
+    return text[:start] + helper.replace(old, new, 1) + text[end:]
+
+
 def test_indexed_moe_early_return_is_the_only_capability_decision() -> None:
     assert contract(SOURCE)
+
+
+def test_dense_mul_mat_type_policy_fails_closed() -> None:
+    assert mul_mat_type_policy(SOURCE) == (MUL_MAT_TYPES, False)
+    assert not mul_mat_type_supported(SOURCE, "Q1_0")
+    assert not mul_mat_type_supported(SOURCE, "NVFP4")
+    assert not mul_mat_type_supported(SOURCE, "FUTURE_UNKNOWN_TYPE")
+    assert mul_mat_type_supported(SOURCE, "Q8_0")
+    assert mul_mat_type_supported(SOURCE, "MXFP4")
+
+
+def test_dense_mul_mat_type_policy_mutations_are_rejected() -> None:
+    default_open = replace_in_type_helper(SOURCE, "            return false;", "            return true;")
+    assert mul_mat_type_supported(default_open, "Q1_0")
+    assert mul_mat_type_supported(default_open, "NVFP4")
+    assert not contract(default_open)
+
+    for positive in ("Q8_0", "MXFP4"):
+        removed = replace_in_type_helper(SOURCE, f"        case GGML_TYPE_{positive}:\n", "")
+        assert not mul_mat_type_supported(removed, positive)
+        assert not contract(removed)
+
+    unknown_added = replace_in_type_helper(
+        SOURCE,
+        "        case GGML_TYPE_IQ4_XS:\n",
+        "        case GGML_TYPE_IQ4_XS:\n        case GGML_TYPE_COUNT:\n",
+    )
+    assert mul_mat_type_supported(unknown_added, "COUNT")
+    assert not contract(unknown_added)
 
 
 def test_removing_only_early_return_is_rejected() -> None:
@@ -107,6 +178,15 @@ def test_conditioning_return_on_add_id_is_rejected() -> None:
         1,
     )
     assert not contract(replace_in_supports_function(SOURCE, early_body, conditional))
+
+
+def test_altering_mul_mat_id_guard_is_rejected() -> None:
+    altered = replace_in_supports_function(
+        SOURCE,
+        EARLY_GUARD,
+        "if (op->op == GGML_OP_ADD_ID) {",
+    )
+    assert not contract(altered)
 
 
 def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
