@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -129,7 +130,9 @@ struct moe_batch_local_view {
 // the batch and table entries are deduplicated only when expert ID and stable
 // handle identity agree. Conflicting identities fail closed.
 inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
-    moe_batch_local_view out;
+    moe_batch_local_view                out;
+    std::unordered_map<int32_t, size_t> expert_slots;
+    expert_slots.reserve(batch.operands.size());
     for (const moe_resolved_operand & operand : batch.operands) {
         if (operand.residency != moe_batch_residency::PRIMARY_DEVICE || operand.owning_device != batch.submit_device ||
             operand.actual_layout != layout) {
@@ -150,10 +153,9 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
             out.occurrence = operand.occurrence;
             return out;
         }
-        auto existing = std::find(out.expert_ids.begin(), out.expert_ids.end(), operand.expert_id);
-        if (existing != out.expert_ids.end()) {
-            const size_t index = static_cast<size_t>(existing - out.expert_ids.begin());
-            if (!out.leases[index].stable_identity_equal(operand.lease)) {
+        const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
+        if (!inserted) {
+            if (!out.leases[existing->second].stable_identity_equal(operand.lease)) {
                 out.reject     = moe_batch_reject_reason::POINTER_MISMATCH;
                 out.occurrence = operand.occurrence;
                 return out;

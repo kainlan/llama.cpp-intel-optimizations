@@ -27,6 +27,50 @@ def has_tokens(text: str, pattern: str) -> bool:
     return contains_tokens(tokens(text), pattern)
 
 
+def function_definition(text: str, signature: str) -> str:
+    """Return one C++ function using its actual balanced-brace boundary."""
+    start = text.index(signature)
+    brace = text.index("{", start)
+    depth = 0
+    state = "code"
+    i = brace
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line-comment"
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block-comment"
+                i += 1
+            elif ch == '"':
+                state = "string"
+            elif ch == "'":
+                state = "char"
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        elif state == "line-comment":
+            if ch == "\n":
+                state = "code"
+        elif state == "block-comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 1
+        elif state in ("string", "char"):
+            quote = '"' if state == "string" else "'"
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                state = "code"
+        i += 1
+    raise ValueError(f"unclosed function: {signature}")
+
+
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
@@ -69,26 +113,22 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "CPU-TG executor failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode executor refused route\")",
         "main executor failure propagates":
-            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode executor refused route\")",
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained hybrid executor refused route\")",
         "ready guard suppresses exceptional publish":
             "std::uncaught_exceptions() != uncaught_on_entry",
-        "planned pointer-table failure propagates":
-            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID planned pointer-table admission failed\")",
         "ID admission failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID expert ID admission failed\")",
-        "shared retained dispatch helper": "append_retained_decode_operand",
+        "shared retained dispatch helper": "append_retained_operand",
         "decode CPU-TG fast gate": "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)",
         "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
         "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
         "all-local decode retained gate": "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route",
-        "no-plan decode skips pointer staging":
-            "if (use_expert_cache && ne12 != 1 && !planned_pp_handle_routing)",
         "CPU-TG retains selected routing semantics":
             "const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch",
         "CPU-TG canonical batch consumer":
             "const ggml_sycl::moe_resolved_batch & decode_batch = retained_decode_batch_result.batch",
         "main canonical batch consumer":
-            "retained_decode_batch_result.batch.operands[occurrence]",
+            "ne12 == 1 ? retained_decode_batch_result.batch : retained_prompt_batch_result.batch",
         "prompt ID snapshot": "std::vector<int32_t> prompt_ids_snapshot",
         "prompt retained admission": "retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(",
         "prompt graph recording refusal":
@@ -112,6 +152,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "linear prompt identity map": "retained_prompt_groups[expert] = &operand",
         "planned local table from batch":
             "ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, retained_prompt_batch_result.batch",
+        "exact hybrid prompt operand":
+            "main_batch.occurrence(static_cast<size_t>(iid1), static_cast<size_t>(id))",
+        "hybrid completeness refusal":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained hybrid partition is incomplete\")",
+        "decode-only MMVQ composite resolution":
+            "if (ne12 == 1 && !planner_moe_uses_expert_handles)",
+        "decode-only layout composite resolution":
+            "if (ne12 == 1 && !host_weights && !placement_planned_moe)",
+        "decode-only storage composite resolution":
+            "if (ne12 == 1 && !use_expert_cache)",
     }
     header_tokens = tokens(header)
     source_tokens = tokens(source)
@@ -157,9 +207,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         if has_tokens(host_test, device_fixture):
             failures.append("device-dependent host fixture")
 
-    function_start = source.index("static void ggml_sycl_mul_mat_id(")
-    function_end = source.index("static bool ggml_sycl_compute_forward", function_start)
-    mmid = source[function_start:function_end]
+    mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
     prompt_admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;")
     specialized_selection = mmid.index("const bool cpu_tg_candidate", prompt_admission)
     admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;")
@@ -180,8 +228,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         failures.append("decode route/dispatch precedes admission")
     if mmid[prompt_admission:admission].count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
         failures.append("prompt IDs are not snapshotted exactly once")
-    if mmid.count("append_retained_decode_operand(") != 2:
-        failures.append("both decode routers share retained dispatch helper")
+    if mmid.count("append_retained_operand(") != 2:
+        failures.append("decode and hybrid prompt routers share retained dispatch helper")
 
     # Scan prompt admission through the actual function end. The only excluded
     # range is the explicitly false named multi-role capability gate.
@@ -193,12 +241,20 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
         "moe_fusion_ensure_gpu0_ptrs(",
         "ggml_sycl_materialize_planned_expert_layout(",
+        "ggml_sycl_update_moe_ptr_table(",
+        "ggml_sycl_resolve_expert_ptr(",
+        "ggml_sycl_resolve_tensor_ptr(src0",
     )
     for forbidden in forbidden_prompt_ownership:
         if has_tokens(prompt_reachable, forbidden):
             failures.append(f"reachable prompt path reacquires/materializes route: {forbidden}")
     if prompt_reachable.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
         failures.append("prompt IDs are copied outside the one admission snapshot")
+    # Generic tensor resolution for src1/dst is canonical activation/output
+    # resolution. Composite expert-weight resolution is allowed only in the
+    # three explicitly decode-only src0 blocks.
+    if prompt_reachable.count("ggml_sycl_resolve(src0, ctx.device)") != 3:
+        failures.append("expert/composite weight resolution escaped decode-only guards")
     if not has_tokens(mmid, "moe_expert_route route = retained_prompt_route_for_occurrence"):
         failures.append("prompt fallback does not derive exact occurrences from batch")
     if mmid.count("retained_prompt_route_for_occurrence(") != 3:
@@ -293,17 +349,14 @@ def test_contract_and_mutation_witnesses() -> None:
          source.replace("if (ne12 != 1) {\n        if (!pp_cpu_reference_force_router",
                         "{\n        if (!pp_cpu_reference_force_router"),
          host_test, mem_source),
-        ("pointer-table-return", header,
-         source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID planned pointer-table admission failed\")",
-                        "return"),
-         host_test, mem_source),
         ("all-local-decode-bypass", header,
          re.sub(r"const\s+bool\s+moe_hybrid_with_plan\s*=\s*ne12\s*==\s*1\s*\|\|\s*selected_hybrid_route\s*;",
                 "const bool moe_hybrid_with_plan = selected_hybrid_route;", source),
          host_test, mem_source),
-        ("no-plan-decode-pointer-stage", header,
-         source.replace("if (use_expert_cache && ne12 != 1 && !planned_pp_handle_routing)",
-                        "if (use_expert_cache && !planned_pp_handle_routing)"),
+        ("prompt-pointer-stage", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_update_moe_ptr_table("
+                        "ctx, src0, ids, GGML_LAYOUT_AOS, nullptr);", 1),
          host_test, mem_source),
         ("dispatch-before-admission", header,
          source.replace("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;",
@@ -346,6 +399,18 @@ def test_contract_and_mutation_witnesses() -> None:
          source.replace("cpu_tg_fallthrough:",
                         "cpu_tg_fallthrough:\n    (void) ggml_sycl_materialize_planned_expert_layout("
                         "src0, {}, 0, ctx.device, GGML_LAYOUT_AOS, nullptr, true, true);", 1),
+         host_test, mem_source),
+        ("reachable-prompt-expert-ptr", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl::ggml_sycl_resolve_expert_ptr("
+                        "src0, ctx.device, 0);", 1), host_test, mem_source),
+        ("reachable-prompt-composite-resolver", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve(src0, ctx.device);", 1),
+         host_test, mem_source),
+        ("reachable-prompt-weight-resolver", header,
+         source.replace("cpu_tg_fallthrough:",
+                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_tensor_ptr(src0, ctx.device);", 1),
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:

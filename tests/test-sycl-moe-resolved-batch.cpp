@@ -329,9 +329,21 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     for (const auto & operand : batch.batch.operands) {
         CHECK(operand.has_ready_event);
     }
-    CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[0], 0, true, true));
-    CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[1], 0, true, true));
-    CHECK(ggml_sycl::choose_moe_batch_executor(batch.batch.operands[2], 0, false, false));
+    // The all-local fast path rejects this mixed batch. The hybrid fallback must
+    // still partition every exact occurrence instead of publishing an empty dst.
+    auto fast_reject = ggml_sycl::make_moe_batch_local_view(batch.batch, GGML_LAYOUT_AOS);
+    CHECK(!fast_reject && fast_reject.reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
+    size_t primary_count = 0, secondary_count = 0, host_count = 0;
+    for (size_t slot = 0; slot < 3; ++slot) {
+        const auto * operand = batch.batch.occurrence(0, slot);
+        CHECK(operand);
+        const auto choice = ggml_sycl::choose_moe_batch_executor(*operand, 0, true, true);
+        CHECK(choice);
+        primary_count += choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE;
+        secondary_count += choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE;
+        host_count += choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU;
+    }
+    CHECK(primary_count == 1 && secondary_count == 1 && host_count == 1);
 
     // A selected local fast path must fail preflight when the admitted layout differs.
     auto layout_miss = ggml_sycl::make_moe_batch_local_view(batch.batch, GGML_LAYOUT_SOA);
