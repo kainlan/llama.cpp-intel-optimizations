@@ -61863,7 +61863,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // are occurrence-aligned and the current kernel family can consume every
     // role on the submit queue. Mixed/secondary/host bundles remain authoritative
     // for the unfused retained executor rather than leaking into this fast path.
-    const bool prompt_pair_retained_roles_capable = [&]() {
+    const bool prompt_pair_retained_roles_validated = [&]() {
         if (!retained_prompt_roles_result || ne12 <= 1) {
             return false;
         }
@@ -61891,6 +61891,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
                roles.gate.batch.operands.front().actual_layout == roles.up.batch.operands.front().actual_layout;
     }();
+    // Quarantine remains fail-closed: the current pair/GLU submit API returns
+    // only bool + optional event and cannot prove that a false/throw happened
+    // before destination writes, nor atomically install terminal retention and
+    // skip/readiness publication. Keep the retained unfused executor
+    // authoritative until that submit contract exists.
+    const bool prompt_pair_retained_roles_capable = false;
+    (void) prompt_pair_retained_roles_validated;
     const bool prompt_pair_current_node = [&]() {
         if (!retained_prompt_roles_result) {
             return false;
