@@ -474,6 +474,36 @@ static void dequantize_row_mxfp4_sycl(const void * vx, dst_t * y, const int64_t 
         [=](sycl::nd_item<3> item_ct1) { dequantize_block_mxfp4(vx, y, item_ct1); });
 }
 
+static void dequantize_block_nvfp4_fp16(const void *             vx,
+                                        sycl::half *             y,
+                                        const sycl::nd_item<3> & item_ct1) {
+    const int64_t ib  = item_ct1.get_group(2);
+    const int     tid = item_ct1.get_local_id(2);
+    const int     sub = tid / 8;
+    const int     j   = tid % 8;
+
+    const block_nvfp4 & xb = static_cast<const block_nvfp4 *>(vx)[ib];
+    const uint8_t       q  = xb.qs[sub * 8 + j];
+    const float         d  = ggml_sycl_ue4m3_to_fp32(xb.d[sub]);
+    const int64_t       iy = ib * QK_NVFP4 + sub * QK_NVFP4_SUB + j;
+
+    y[iy]     = sycl::half(d * kvalues_mxfp4[q & 0x0f]);
+    y[iy + 8] = sycl::half(d * kvalues_mxfp4[q >> 4]);
+}
+
+static void dequantize_row_nvfp4_fp16_sycl(const void * vx,
+                                           sycl::half * y,
+                                           const int64_t k,
+                                           dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK_NVFP4 == 0);
+    const int64_t nb = k / QK_NVFP4;
+
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, nb * 32), sycl::range<3>(1, 1, 32)),
+        [=](sycl::nd_item<3> item_ct1) { dequantize_block_nvfp4_fp16(vx, y, item_ct1); });
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_nc(const void * __restrict__ vx,
                              dst_t * __restrict__ y,
@@ -1325,6 +1355,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool ful
     const bool use_coalesced = full_tensor && ggml_sycl_layout_is_coalesced(extra);
 
     switch (type) {
+        case GGML_TYPE_Q1_0:
+            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q4_0:
             if (use_coalesced) {
                 return dequantize_row_q4_0_sycl_coalesced;
@@ -1379,6 +1411,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool ful
             return dequantize_row_iq4_nl_sycl;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_sycl;
+        case GGML_TYPE_NVFP4:
+            return dequantize_row_nvfp4_fp16_sycl;
         case GGML_TYPE_F32:
             return convert_unary_sycl<float>;
 #ifdef GGML_SYCL_HAS_BF16
