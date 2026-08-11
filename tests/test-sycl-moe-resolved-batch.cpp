@@ -154,15 +154,14 @@ static bool test_identity_sharing_and_ready_event() {
 }
 
 static bool test_executor_choice_is_residency_and_capability_driven() {
-    int value = 12;
-    auto host = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_AOS,
-                          GGML_LAYOUT_AOS, 12);
-    auto primary = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
-                             GGML_LAYOUT_SOA, 13);
-    auto secondary = route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_SOA,
-                               GGML_LAYOUT_SOA, 14);
-    const int32_t ids[] = { 12 };
-    auto build_one = [&](ggml_sycl::moe_batch_route route) {
+    int  value = 12;
+    auto host  = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 12);
+    auto primary =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 13);
+    auto secondary =
+        route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 14);
+    const int32_t ids[]     = { 12 };
+    auto          build_one = [&](ggml_sycl::moe_batch_route route) {
         return ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
     };
 
@@ -362,6 +361,69 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     return true;
 }
 
+static bool test_retained_role_alignment_and_terminal_transaction() {
+    int           gate_a = 61, gate_b = 62, up_a = 71, up_b = 72, down_a = 81, down_b = 82;
+    const int32_t ids[] = { 4, 4, 9, 4 };
+    auto          build = [&](ggml_sycl::moe_batch_role role) {
+        const ggml_layout_mode layout = role == ggml_sycl::moe_batch_role::GATE ? GGML_LAYOUT_SOA :
+                                                 role == ggml_sycl::moe_batch_role::UP   ? GGML_LAYOUT_XMX_TILED :
+                                                                                           GGML_LAYOUT_AOS;
+        return ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
+            int * ptr      = nullptr;
+            int   identity = 0;
+            if (role == ggml_sycl::moe_batch_role::GATE) {
+                ptr      = id == 4 ? &gate_a : &gate_b;
+                identity = id == 4 ? 61 : 62;
+            } else if (role == ggml_sycl::moe_batch_role::UP) {
+                ptr      = id == 4 ? &up_a : &up_b;
+                identity = id == 4 ? 71 : 72;
+            } else {
+                ptr      = id == 4 ? &down_a : &down_b;
+                identity = id == 4 ? 81 : 82;
+            }
+            return route_for(ptr, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, layout, layout, identity);
+        });
+    };
+    auto gate = build(ggml_sycl::moe_batch_role::GATE);
+    auto up   = build(ggml_sycl::moe_batch_role::UP);
+    auto down = build(ggml_sycl::moe_batch_role::DOWN);
+    CHECK(gate && up && down);
+
+    auto aligned = ggml_sycl::align_moe_retained_role_batches(
+        { ggml_sycl::moe_batch_role::GATE, reinterpret_cast<const ggml_tensor *>(1), gate.batch },
+        { ggml_sycl::moe_batch_role::UP, reinterpret_cast<const ggml_tensor *>(2), up.batch },
+        { ggml_sycl::moe_batch_role::DOWN, reinterpret_cast<const ggml_tensor *>(3), down.batch });
+    CHECK(aligned);
+    CHECK(aligned.bundle.retained_lease_count() == 12);
+    CHECK(aligned.bundle.gate.weight_identity != aligned.bundle.up.weight_identity);
+    CHECK(aligned.bundle.gate.batch.operands[0].actual_layout == GGML_LAYOUT_SOA);
+    CHECK(aligned.bundle.up.batch.operands[0].actual_layout == GGML_LAYOUT_XMX_TILED);
+    CHECK(aligned.bundle.down.batch.operands[0].actual_layout == GGML_LAYOUT_AOS);
+
+    // Duplicate occurrences are valid, but any role-local ID/token/slot drift is not.
+    auto drift_up                   = up.batch;
+    drift_up.operands[2].slot_index = 1;
+    auto drift =
+        ggml_sycl::align_moe_retained_role_batches({ ggml_sycl::moe_batch_role::GATE, nullptr, gate.batch },
+                                                   { ggml_sycl::moe_batch_role::UP, nullptr, std::move(drift_up) },
+                                                   { ggml_sycl::moe_batch_role::DOWN, nullptr, down.batch });
+    CHECK(!drift && drift.reject == ggml_sycl::moe_batch_reject_reason::ROLE_ALIGNMENT_MISMATCH);
+    CHECK(drift.role == ggml_sycl::moe_batch_role::UP && drift.occurrence == 2);
+
+    ggml_sycl::moe_terminal_publication publication;
+    CHECK(publication.fallback_allowed());
+    CHECK(!publication.publish());
+    publication.terminal_submitted();
+    CHECK(!publication.fallback_allowed());
+    CHECK(publication.publish() && publication.published());
+
+    ggml_sycl::moe_retained_terminal_bundle terminal;
+    terminal.roles              = aligned.bundle;
+    terminal.terminal_submitted = true;
+    CHECK(terminal.retained_handle_count() == 12);
+    return true;
+}
+
 static bool test_decode_admission_is_route_mode_independent() {
     int           local = 13;
     const int32_t ids[] = { 2, 2 };
@@ -401,6 +463,7 @@ int main() {
         !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
         !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
+        !test_retained_role_alignment_and_terminal_transaction() ||
         !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }

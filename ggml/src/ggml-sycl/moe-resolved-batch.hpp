@@ -28,6 +28,8 @@ enum class moe_batch_residency : uint8_t {
 enum class moe_batch_reject_reason : uint8_t {
     NONE,
     INVALID_REQUEST,
+    MISSING_ROLE,
+    ROLE_ALIGNMENT_MISMATCH,
     ROUTE_UNAVAILABLE,
     MISSING_HANDLE,
     RAW_COMPAT_HANDLE,
@@ -176,6 +178,169 @@ enum class moe_batch_executor : uint8_t {
     HOST_CPU,
     PRIMARY_DEVICE,
     SECONDARY_DEVICE,
+};
+
+enum class moe_batch_role : uint8_t {
+    GATE,
+    UP,
+    DOWN,
+};
+
+inline const char * moe_batch_role_name(moe_batch_role role) {
+    switch (role) {
+        case moe_batch_role::GATE:
+            return "gate";
+        case moe_batch_role::UP:
+            return "up";
+        case moe_batch_role::DOWN:
+            return "down";
+    }
+    return "unknown";
+}
+
+// Each role is admitted independently. Weight identity and layout deliberately
+// are not alignment keys: gate/up/down are different tensors and may use
+// different kernel layouts. The immutable ID snapshot and exact occurrence
+// coordinates are the cross-role authority.
+struct moe_retained_role_batch {
+    moe_batch_role      role            = moe_batch_role::GATE;
+    const ggml_tensor * weight_identity = nullptr;
+    moe_resolved_batch  batch;
+};
+
+struct moe_retained_role_bundle {
+    moe_retained_role_batch gate{ moe_batch_role::GATE, nullptr, {} };
+    moe_retained_role_batch up{ moe_batch_role::UP, nullptr, {} };
+    moe_retained_role_batch down{ moe_batch_role::DOWN, nullptr, {} };
+
+    const moe_retained_role_batch & for_role(moe_batch_role role) const {
+        switch (role) {
+            case moe_batch_role::GATE:
+                return gate;
+            case moe_batch_role::UP:
+                return up;
+            case moe_batch_role::DOWN:
+                return down;
+        }
+        return gate;
+    }
+
+    size_t retained_lease_count() const {
+        return gate.batch.operands.size() + up.batch.operands.size() + down.batch.operands.size();
+    }
+};
+
+struct moe_retained_role_bundle_result {
+    moe_retained_role_bundle bundle;
+    moe_batch_reject_reason  reject     = moe_batch_reject_reason::NONE;
+    moe_batch_role           role       = moe_batch_role::GATE;
+    size_t                   occurrence = 0;
+
+    explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
+};
+
+inline moe_retained_role_bundle_result align_moe_retained_role_batches(moe_retained_role_batch gate,
+                                                                       moe_retained_role_batch up,
+                                                                       moe_retained_role_batch down) {
+    moe_retained_role_bundle_result out;
+    out.bundle.gate                      = std::move(gate);
+    out.bundle.up                        = std::move(up);
+    out.bundle.down                      = std::move(down);
+    const moe_resolved_batch & authority = out.bundle.gate.batch;
+    if (authority.slots_per_token == 0 || authority.operands.empty()) {
+        out.reject = moe_batch_reject_reason::MISSING_ROLE;
+        out.role   = moe_batch_role::GATE;
+        return out;
+    }
+    for (moe_batch_role role : { moe_batch_role::UP, moe_batch_role::DOWN }) {
+        const moe_resolved_batch & candidate = out.bundle.for_role(role).batch;
+        if (candidate.submit_device != authority.submit_device ||
+            candidate.slots_per_token != authority.slots_per_token ||
+            candidate.expert_ids.size() != authority.expert_ids.size() ||
+            candidate.operands.size() != authority.operands.size()) {
+            out.reject = candidate.operands.empty() ? moe_batch_reject_reason::MISSING_ROLE :
+                                                      moe_batch_reject_reason::ROLE_ALIGNMENT_MISMATCH;
+            out.role   = role;
+            return out;
+        }
+        for (size_t i = 0; i < authority.operands.size(); ++i) {
+            const moe_resolved_operand & expected = authority.operands[i];
+            const moe_resolved_operand & actual   = candidate.operands[i];
+            if (candidate.expert_ids[i] != authority.expert_ids[i] || actual.expert_id != expected.expert_id ||
+                actual.occurrence != expected.occurrence || actual.token_index != expected.token_index ||
+                actual.slot_index != expected.slot_index) {
+                out.reject     = moe_batch_reject_reason::ROLE_ALIGNMENT_MISMATCH;
+                out.role       = role;
+                out.occurrence = i;
+                return out;
+            }
+        }
+    }
+    return out;
+}
+
+// A transient pointer table is an owned submission result, never just a raw
+// ABI pointer. Exact leases and the upload event travel with the table handle.
+struct moe_retained_pointer_table {
+    mem_handle              table_handle;
+    std::vector<mem_handle> role_leases;
+    sycl::event             ready_event;
+    bool                    has_ready_event = false;
+
+    bool valid() const { return table_handle.has_stable_owner_identity() && !role_leases.empty(); }
+
+    const void * const * resolve_abi(int device) const {
+        const resolved_ptr resolved = table_handle.resolve(device);
+        return resolved.ptr && resolved.on_device ? static_cast<const void * const *>(resolved.ptr) : nullptr;
+    }
+};
+
+// The terminal owner is copied into the completion callback/retention sink.
+// Keeping every role, table and intermediate handle here makes early scope exit
+// harmless while gate/up/GLU/down/secondary/scatter work is in flight.
+struct moe_retained_terminal_bundle {
+    moe_retained_role_bundle                roles;
+    std::vector<moe_retained_pointer_table> tables;
+    std::vector<mem_handle>                 intermediates;
+    sycl::event                             terminal_event;
+    bool                                    terminal_submitted = false;
+
+    size_t retained_handle_count() const {
+        size_t count = roles.retained_lease_count() + intermediates.size();
+        for (const auto & table : tables) {
+            count += 1 + table.role_leases.size();
+        }
+        return count;
+    }
+};
+
+// Publication is a one-way transaction. Skip/destination-ready state may be
+// committed only after the terminal submit succeeds. Once writes begin, a
+// failure cannot select an unfused fallback because that could race/duplicate
+// destination writes.
+class moe_terminal_publication {
+  public:
+    void terminal_submitted(bool writes_started = true) {
+        terminal_submitted_ = true;
+        writes_started_     = writes_started;
+    }
+
+    bool publish() {
+        if (!terminal_submitted_) {
+            return false;
+        }
+        published_ = true;
+        return true;
+    }
+
+    bool fallback_allowed() const { return !writes_started_ && !published_; }
+
+    bool published() const { return published_; }
+
+  private:
+    bool terminal_submitted_ = false;
+    bool writes_started_     = false;
+    bool published_          = false;
 };
 
 struct moe_batch_executor_choice {

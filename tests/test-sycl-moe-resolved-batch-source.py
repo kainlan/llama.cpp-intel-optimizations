@@ -88,6 +88,14 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "primary plan": "route.planned_device == route.owning_device",
         "opaque proof use": "route.has_authoritative_planned_alternate() && route.planned_on_device && primary",
         "stable-only sharing": "retained.stable_identity_equal(route.lease)",
+        "retained role aggregate": "struct moe_retained_role_bundle",
+        "role occurrence alignment": "actual.occurrence != expected.occurrence",
+        "role token alignment": "actual.token_index != expected.token_index",
+        "role slot alignment": "actual.slot_index != expected.slot_index",
+        "owned pointer table": "mem_handle table_handle",
+        "exact pointer-table leases": "std::vector<mem_handle> role_leases",
+        "terminal role retention": "moe_retained_role_bundle roles",
+        "transactional fallback": "return !writes_started_ && !published_",
     }
     required_source = {
         "canonical resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
@@ -162,6 +170,14 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "if (ne12 == 1 && !host_weights && !placement_planned_moe)",
         "decode-only storage composite resolution":
             "if (ne12 == 1 && !use_expert_cache)",
+        "independent gate admission": "pair.gate_weight, ctx.device, prompt_ids_snapshot.data()",
+        "independent up admission": "pair.up_weight, ctx.device, prompt_ids_snapshot.data()",
+        "independent down admission": "pair.down_weight, ctx.device, prompt_ids_snapshot.data()",
+        "cross-role alignment": "align_moe_retained_role_batches(",
+        "validated pair capability": "const bool prompt_pair_retained_roles_capable = [&]()",
+        "retained pointer-table result": "ggml_sycl_upload_moe_retained_ptr_table_from_batch(",
+        "transactional terminal publication": "terminal_publication.terminal_submitted(",
+        "transactional skip commit": "terminal_publication.publish()",
     }
     header_tokens = tokens(header)
     source_tokens = tokens(source)
@@ -235,6 +251,13 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     # range is the explicitly false named multi-role capability gate.
     pair_start = mmid.index("if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)", prompt_admission)
     pair_end = mmid.index("cpu_tg_fallthrough:", pair_start)
+    pair_path = mmid[pair_start:pair_end]
+    for forbidden in ("ggml_sycl_resolve_moe_expert_route(",
+                      "ggml_sycl_refresh_moe_ids_cache(",
+                      "moe_fusion_ensure_full_local_ptr_table(",
+                      "moe_fusion_ensure_full_local_ptr_table_from_descriptor("):
+        if has_tokens(pair_path, forbidden):
+            failures.append(f"prompt pair reacquires route/table authority: {forbidden}")
     prompt_reachable = mmid[prompt_admission:pair_start] + mmid[pair_end:]
     forbidden_prompt_ownership = (
         "ggml_sycl_resolve_moe_expert_route(",
@@ -327,6 +350,15 @@ def test_contract_and_mutation_witnesses() -> None:
          source, host_test, mem_source),
         ("drop-secondary-lease-device", header.replace("route.lease.device() != route.owning_device", "false"),
          source, host_test, mem_source),
+        ("drop-role-slot-alignment", header.replace("actual.slot_index != expected.slot_index", "false"),
+         source, host_test, mem_source),
+        ("disable-role-capability", header,
+         source.replace("const bool prompt_pair_retained_roles_capable = [&]()",
+                        "const bool prompt_pair_retained_roles_capable = false; auto disabled_capability = [&]()"),
+         host_test, mem_source),
+        ("publish-before-terminal", header,
+         source.replace("terminal_publication.terminal_submitted(/*writes_started=*/true);", ""),
+         host_test, mem_source),
         ("public-proof", header.replace("  private:\n    // Non-forgeable", "  public:\n    // forged"),
          source, host_test, mem_source),
         ("raw-layout-compare", header,

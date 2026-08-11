@@ -16808,7 +16808,11 @@ struct moe_fusion_state {
     size_t       gate_nb02 = 0;        // Gate expert stride in bytes
     size_t       up_nb02   = 0;        // Up expert stride in bytes
 
-    // Shared state (resolved once on first arrival, reused for up/down)
+    // Shared state (resolved once on first arrival, reused for up/down).
+    // The retained role bundle, not gate_data/up_data, is authoritative for
+    // prompt expert ownership. Raw fields below are host compute ABI views only.
+    ggml_sycl::moe_retained_role_bundle retained_roles;
+    bool                                has_retained_roles = false;
     const float *   act_host = nullptr;        // Activation vector (host-accessible)
     const int32_t * ids_data = nullptr;        // Expert IDs (shared across gate/up/down)
     size_t          n_ids    = 0;              // Number of CPU expert dispatches
@@ -16891,7 +16895,9 @@ struct moe_fusion_state {
         gate_bias_data = nullptr;
         up_bias_data   = nullptr;
         down_bias_data = nullptr;
-        bias_nb        = 0;
+        bias_nb            = 0;
+        retained_roles     = {};
+        has_retained_roles = false;
         cpu_indices.clear();
         sec_indices.clear();
         gpu0_cached_indices.clear();
@@ -23011,6 +23017,10 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "none";
         case moe_batch_reject_reason::INVALID_REQUEST:
             return "invalid_request";
+        case moe_batch_reject_reason::MISSING_ROLE:
+            return "missing_role";
+        case moe_batch_reject_reason::ROLE_ALIGNMENT_MISMATCH:
+            return "role_alignment_mismatch";
         case moe_batch_reject_reason::ROUTE_UNAVAILABLE:
             return "route_unavailable";
         case moe_batch_reject_reason::MISSING_HANDLE:
@@ -48170,6 +48180,33 @@ static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch(ggml_backe
                                                     table_event_out, table_event_set);
 }
 
+static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch(
+    ggml_backend_sycl_context &           ctx,
+    const ggml_tensor *                   src0,
+    const ggml_sycl::moe_resolved_batch & batch,
+    int                                   layer_hash,
+    layout_mode                           layout) {
+    ggml_sycl::moe_retained_pointer_table result;
+    bool                                  event_set = false;
+    const void * const * transient = ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, layer_hash, layout,
+                                                                               &result.ready_event, &event_set);
+    if (!transient) {
+        return {};
+    }
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES ||
+        !extra->moe_expert_ptrs_handle[ctx.device].has_stable_owner_identity()) {
+        return {};
+    }
+    result.table_handle    = extra->moe_expert_ptrs_handle[ctx.device];
+    result.has_ready_event = event_set;
+    result.role_leases.reserve(batch.operands.size());
+    for (const auto & operand : batch.operands) {
+        result.role_leases.push_back(operand.lease);
+    }
+    return result;
+}
+
 // Populate the pointer-table mem_handle for GPU-routed experts in the fusion path.
 // Raw pointers are derived from mem_handles only for this transient kernel ABI.
 static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_context & ctx,
@@ -61588,9 +61625,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Prompt IDs and routes are admitted exactly once, before any specialized
     // executor selection. Graph replay cannot retain these handles yet, so an
     // affected recording is failed and retried as direct execution.
-    std::vector<int32_t>                 prompt_ids_snapshot;
-    ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;
-    layout_mode                          retained_prompt_layout = GGML_LAYOUT_AOS;
+    std::vector<int32_t>                       prompt_ids_snapshot;
+    ggml_sycl::moe_resolved_batch_result       retained_prompt_batch_result;
+    ggml_sycl::moe_retained_role_bundle_result retained_prompt_roles_result;
+    layout_mode                                retained_prompt_layout = GGML_LAYOUT_AOS;
     if (ne12 != 1) {
         ctx.moe_graphs_disabled_once = true;
         if (g_ggml_sycl_graph_recording) {
@@ -61616,6 +61654,44 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                            ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
                            retained_prompt_batch_result.source_reason);
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
+        }
+
+        // Multi-role prompt admission uses the same immutable ID snapshot, but
+        // resolves each tensor independently. Role identities and layouts may
+        // differ; exact expert/token/slot occurrences may not.
+        const int prompt_layer = src0->name ? parse_layer_id_from_name(src0->name) : -1;
+        auto      prompt_pair  = g_moe_gate_up_pairs.find(prompt_layer);
+        if (prompt_pair != g_moe_gate_up_pairs.end()) {
+            const moe_gate_up_pair & pair = prompt_pair->second;
+            if (pair.gate_weight && pair.up_weight && pair.down_weight && pair.ids == ids) {
+                auto role_layout = [&](const ggml_tensor * weight) {
+                    const bool  host   = ggml_sycl_is_host_resident_weight(weight, ctx.stream());
+                    layout_mode layout = has_override ?
+                                             override_layout :
+                                             ggml_sycl_select_moe_planned_graph_layout(weight, ctx.device, host, ne12);
+                    layout             = ggml_sycl_adjust_layout_for_tensor(weight, layout, ctx.device);
+                    return ggml_sycl_moe_layout_for_selected_rows(weight, ctx.device, layout,
+                                                                  prompt_ids_snapshot.size(), has_override, ne12);
+                };
+                const layout_mode gate_layout = role_layout(pair.gate_weight);
+                const layout_mode up_layout   = role_layout(pair.up_weight);
+                const layout_mode down_layout = role_layout(pair.down_weight);
+                auto              gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                    pair.gate_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                    static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false);
+                auto up_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                    pair.up_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                    static_cast<size_t>(ids->ne[0]), up_layout, /*allow_materialize=*/false);
+                auto down_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                    pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                    static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false);
+                if (gate_result && up_result && down_result) {
+                    retained_prompt_roles_result = ggml_sycl::align_moe_retained_role_batches(
+                        { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
+                        { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
+                        { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
+                }
+            }
         }
     }
     auto retained_prompt_route_from_operand =
@@ -61707,12 +61783,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool fusion_down_continuation        = current_fusion != nullptr && current_fusion->phase != MOE_FUSE_IDLE &&
                                           src0->name && strstr(src0->name, "ffn_down") != nullptr;
 
-    // Specialized fusion/pair routing is prompt-only until it can consume the
-    // same retained occurrence batch as decode.
-    // Multi-role prompt pair/fusion paths remain gated until gate, up, and down
-    // each provide an occurrence-preserving retained batch to the executor.
-    const bool prompt_pair_retained_roles_capable = false;
-    const bool cpu_tg_candidate                   = prompt_pair_retained_roles_capable && fusion_down_continuation;
+    // Prompt pair/fusion is admitted only when all independently retained roles
+    // are occurrence-aligned and the current kernel family can consume every
+    // role on the submit queue. Mixed/secondary/host bundles remain authoritative
+    // for the unfused retained executor rather than leaking into this fast path.
+    const bool prompt_pair_retained_roles_capable = [&]() {
+        if (!retained_prompt_roles_result || ne12 <= 1) {
+            return false;
+        }
+        const auto & roles = retained_prompt_roles_result.bundle;
+        const auto & gate  = roles.gate.batch;
+        const auto & up    = roles.up.batch;
+        const auto & down  = roles.down.batch;
+        if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout) ||
+            !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout) ||
+            !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout)) {
+            return false;
+        }
+        const auto supports_role = [&](const ggml_sycl::moe_retained_role_batch & role) {
+            const ggml_tensor * weight = role.weight_identity;
+            const auto &        batch  = role.batch;
+            if (!weight || batch.operands.empty()) {
+                return false;
+            }
+            const auto &               operand = batch.operands.front();
+            const moe_route_capability cap     = ggml_sycl_moe_query_route_capability(
+                weight->type, operand.actual_layout, moe_route_phase::PROMPT, weight->ne[0], weight->ne[1],
+                batch.operands.size(), operand.owning_device, moe_layer_route_residency::DEVICE, ctx.device);
+            return cap.supported && cap.local_device;
+        };
+        return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
+               roles.gate.batch.operands.front().actual_layout == roles.up.batch.operands.front().actual_layout;
+    }();
+    const bool prompt_pair_current_node = [&]() {
+        if (!retained_prompt_roles_result) {
+            return false;
+        }
+        const auto & roles = retained_prompt_roles_result.bundle;
+        return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
+    }();
+    const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
     if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced) {
         // When an EXPERT_STAGING ensure() fails under arena starvation (e.g.
         // test-backend-ops fixture budget, or runtime host-zone fragmentation),
@@ -64785,20 +64895,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
                 trace_secondary_stage("secondary-route-probe-done");
 
-                moe_ids_cache_entry uncached_ids_entry{};
-                auto &              ids_entry = ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, uncached_ids_entry);
-                trace_secondary_stage("ids-refresh-begin");
-                if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, ids_entry) || ids_entry.n_elements != ids_n_elem) {
-                    return reject_secondary("ids-copy");
+                trace_secondary_stage("ids-retained-begin");
+                const auto &    retained_roles = retained_prompt_roles_result.bundle;
+                const int32_t * ids_data       = retained_roles.gate.batch.expert_ids.data();
+                if (!ids_data || retained_roles.gate.batch.expert_ids.size() != ids_n_elem) {
+                    return reject_secondary("ids-retained");
                 }
-                trace_secondary_stage("ids-refresh-done");
-                const int32_t * ids_data = ids_entry.host_ids.data();
-                if (!ids_data) {
-                    return reject_secondary("ids-data");
-                }
-                auto & layer_ids = g_moe_layer_ids_cache[layer];
-                layer_ids.ids_host.assign(ids_data, ids_data + ids_n_elem);
-                ids_data = layer_ids.ids_host.data();
+                trace_secondary_stage("ids-retained-done");
 
                 const int64_t total_experts_i64 = pair.gate_weight->ne[2] > 0 ? pair.gate_weight->ne[2] : 1;
                 if (total_experts_i64 <= 0 || pair.up_weight->ne[2] != pair.gate_weight->ne[2] ||
@@ -64815,43 +64918,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 int target_device = -1;
 
                 auto resolve_role = [&](const ggml_tensor * weight, const char * role, std::vector<void *> & ptrs) {
-                    const int64_t total_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
-                    for (size_t ci = 0; ci < ids_n_elem; ++ci) {
-                        const int32_t eid = ids_data[ci];
-                        if (eid < 0 || eid >= total_experts) {
-                            return false;
-                        }
-                        moe_expert_route route =
-                            ggml_sycl_resolve_moe_expert_route(weight, ctx.device, eid, layer_layout,
-                                                               /*allow_materialize=*/false);
-                        if (route.kind != moe_expert_route_kind::SECONDARY_DEVICE || route.ptr == nullptr ||
-                            route.actual_layout != layer_layout || route.owning_device < 0) {
-                            if (path_trace_enabled != 0) {
-                                static std::atomic<int> route_reject_log{ 0 };
-                                if (route_reject_log.fetch_add(1, std::memory_order_relaxed) < 512) {
-                                    fprintf(stderr,
-                                            "[MOE-SECONDARY-LAYER-ROUTE-REJECT] role=%s tensor=%s layer=%d expert=%d "
-                                            "kind=%s ptr=%p owning=%d planned=%d requested=%s actual=%s reason=%s\n",
-                                            role ? role : "?", weight && weight->name ? weight->name : "?", layer, eid,
-                                            ggml_sycl::ggml_sycl_moe_route_kind_name(route.kind), route.ptr,
-                                            route.owning_device, route.planned_device,
-                                            ggml_sycl_layout_mode_name(route.requested_layout),
-                                            ggml_sycl_layout_mode_name(route.actual_layout),
-                                            ggml_sycl::ggml_sycl_expert_resolve_reason_name(route.reason));
-                                }
-                            }
+                    const auto * retained = weight == retained_roles.gate.weight_identity ? &retained_roles.gate :
+                                            weight == retained_roles.up.weight_identity   ? &retained_roles.up :
+                                            weight == retained_roles.down.weight_identity ? &retained_roles.down :
+                                                                                            nullptr;
+                    if (!retained || retained->batch.operands.size() != ids_n_elem) {
+                        return false;
+                    }
+                    for (const auto & operand : retained->batch.operands) {
+                        if (operand.expert_id < 0 || operand.expert_id >= weight->ne[2] ||
+                            operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
+                            operand.actual_layout != layer_layout || operand.owning_device < 0) {
                             return false;
                         }
                         if (target_device < 0) {
-                            target_device = route.owning_device;
-                        } else if (target_device != route.owning_device) {
+                            target_device = operand.owning_device;
+                        } else if (target_device != operand.owning_device) {
                             return false;
                         }
-                        ptrs[static_cast<size_t>(eid)] = route.ptr;
-                        if (route.lease.valid()) {
-                            retained_handles.push_back(std::move(route.lease));
+                        const auto resolved = operand.lease.resolve(operand.owning_device);
+                        if (!resolved.ptr || !resolved.on_device || resolved.layout != layer_layout) {
+                            return false;
                         }
+                        ptrs[static_cast<size_t>(operand.expert_id)] = resolved.ptr;
+                        retained_handles.push_back(operand.lease);
                     }
+                    (void) role;
                     return true;
                 };
 
@@ -65850,22 +65942,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
 
-                trace_pair_stage("full-local-current-begin");
-                const void * const * all_local_current_ptrs =
-                    current_descriptor_role ?
-                        moe_fusion_ensure_full_local_ptr_table_from_descriptor(ctx, *current_descriptor_role,
-                                                                               layer_hash) :
-                        moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer_hash, pair_layout);
-                trace_pair_stage("full-local-current-done");
-                trace_pair_stage("full-local-partner-begin");
-                const int            partner_layer_hash = moe_cache_layer_id(partner_weight->name);
-                const void * const * all_local_partner_ptrs =
-                    partner_descriptor_role ?
-                        moe_fusion_ensure_full_local_ptr_table_from_descriptor(ctx, *partner_descriptor_role,
-                                                                               partner_layer_hash) :
-                        moe_fusion_ensure_full_local_ptr_table(ctx, partner_weight, partner_layer_hash, pair_layout);
-                trace_pair_stage("full-local-partner-done");
-                const bool all_local_pair_tables = all_local_current_ptrs && all_local_partner_ptrs;
+                // Full static tables are intentionally not authoritative for prompt
+                // fusion. Build transient tables only from the exact admitted role
+                // leases below, even when a full table happens to be cached.
+                const void * const * all_local_current_ptrs = nullptr;
+                const int            partner_layer_hash     = moe_cache_layer_id(partner_weight->name);
+                const void * const * all_local_partner_ptrs = nullptr;
+                const bool           all_local_pair_tables  = false;
                 host_profile_mark(host_profile_full_tables_us);
                 static const bool pp_full_local_fast_reject_enabled = [] {
                     const char * env = std::getenv("GGML_SYCL_MOE_PP_FULL_LOCAL_FAST_REJECT");
@@ -65889,36 +65972,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
 
-                const int32_t * ids_data             = nullptr;
+                const int32_t * ids_data             = retained_prompt_roles_result.bundle.gate.batch.expert_ids.data();
                 auto            ensure_pair_ids_host = [&]() -> bool {
-                    if (ids_data) {
-                        return true;
-                    }
-                    trace_pair_stage("ids-host-begin");
-                    moe_ids_cache_entry uncached_ids_entry{};
-                    auto &              entry = ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, uncached_ids_entry);
-                    if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem ||
-                        entry.host_ids.size() != ids_n_elem) {
-                        return reject_pair("ids-copy");
-                    }
-                    ids_data = entry.host_ids.data();
-                    if (!ids_data) {
+                    if (!ids_data || retained_prompt_roles_result.bundle.gate.batch.expert_ids.size() != ids_n_elem) {
                         return reject_pair("ids-data");
                     }
-                    auto & lentry = g_moe_layer_ids_cache[layer];
-                    lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
-                    ids_data = lentry.ids_host.data();
-                    if (!ids_data) {
-                        return reject_pair("ids-data");
-                    }
-
-                    ggml_sycl_moe_row_agg_log_selected(src0, ctx.device, ids_data, ids_n_elem, n_ids_pair, ids->ne[1],
-                                                                  src0->ne[2], pair_layout, "moe_pair_probe",
-                                                                  /*ids_from_cache=*/false,
-                                                                  /*use_expert_cache=*/true,
-                                                                  /*has_placement_plan=*/false);
                     plan.ids_host = ids_data;
-                    trace_pair_stage("ids-host-done");
                     return true;
                 };
                 if (!all_local_pair_tables || host_ids_required) {
@@ -65962,49 +66021,40 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto build_role_plan = [&](moe_layer_decode_role_plan & role, const ggml_tensor * weight,
                                            const char * side, layout_mode role_layout,
                                            bool allow_materialize_layout = false) -> bool {
-                    const int64_t role_total_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
-                    role.weight                      = weight;
-                    role.layout                      = role_layout;
-                    role.expert_ids.resize(ids_n_elem);
+                    (void) allow_materialize_layout;
+                    const auto &                               bundle = retained_prompt_roles_result.bundle;
+                    const ggml_sycl::moe_retained_role_batch * retained =
+                        weight == bundle.gate.weight_identity ? &bundle.gate :
+                        weight == bundle.up.weight_identity   ? &bundle.up :
+                        weight == bundle.down.weight_identity ? &bundle.down :
+                                                                nullptr;
+                    if (!retained || retained->batch.operands.size() != ids_n_elem) {
+                        return reject_pair(side);
+                    }
+                    role.weight = weight;
+                    role.layout = role_layout;
+                    role.expert_ids.clear();
                     role.handles.clear();
                     role.rows.clear();
                     role.ready_events.clear();
+                    role.expert_ids.reserve(ids_n_elem);
                     role.handles.reserve(ids_n_elem);
                     role.rows.reserve(ids_n_elem);
-                    role.ready_events.reserve(ids_n_elem);
                     std::unordered_set<size_t> ready_handle_hashes;
-                    for (size_t ci = 0; ci < ids_n_elem; ++ci) {
-                        const int32_t eid = ids_data[ci];
-                        if (eid < 0 || eid >= role_total_experts) {
-                            return reject_pair("expert-id");
-                        }
-                        moe_expert_route route =
-                            ggml_sycl_resolve_moe_expert_route(weight, ctx.device, eid, role_layout,
-                                                               /*allow_materialize=*/allow_materialize_layout);
-                        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
-                            route.actual_layout != role_layout) {
-                            log_route_reject(side, weight, eid, route);
-                            return reject_pair(side);
-                        }
-                        ggml_sycl::mem_handle handle   = std::move(route.lease);
-                        auto                  resolved = handle.resolve(ctx.device);
-                        if (!resolved.ptr || !resolved.on_device || resolved.layout != role_layout) {
-                            log_route_reject(side, weight, eid, route);
+                    for (const auto & operand : retained->batch.operands) {
+                        auto resolved = operand.lease.resolve(ctx.device);
+                        if (!resolved.ptr || !resolved.on_device || resolved.layout != role_layout ||
+                            operand.actual_layout != role_layout) {
                             return reject_pair("handle-resolve");
                         }
-                        role.expert_ids[ci] = eid;
-                        role.handles.push_back(std::move(handle));
-                        moe_layer_grouped_route_row row;
-                        row.entry = ci;
-                        if (n_ids_pair > 0) {
-                            row.iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_pair));
-                            row.id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_pair));
-                        }
-                        role.rows.push_back(row);
-                        if (route.has_ready_event) {
-                            const size_t ready_hash = role.handles.back().stable_identity_hash();
-                            if (ready_hash == 0 || ready_handle_hashes.insert(ready_hash).second) {
-                                role.ready_events.push_back(route.ready_event);
+                        role.expert_ids.push_back(operand.expert_id);
+                        role.handles.push_back(operand.lease);
+                        role.rows.push_back({ operand.occurrence, static_cast<int64_t>(operand.token_index),
+                                              static_cast<int64_t>(operand.slot_index) });
+                        if (operand.has_ready_event) {
+                            const size_t hash = operand.lease.stable_identity_hash();
+                            if (hash == 0 || ready_handle_hashes.insert(hash).second) {
+                                role.ready_events.push_back(operand.ready_event);
                             }
                         }
                     }
@@ -66134,19 +66184,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 trace_pair_stage("upload-current-ptrs-begin");
                 const int current_ptr_table_layer_hash =
                     plan.current.weight ? moe_cache_layer_id(plan.current.weight->name) : layer_hash;
-                const void * const * current_ptrs =
-                    all_local_pair_tables ? all_local_current_ptrs :
-                                            moe_fusion_upload_ptrs_from_handles(
-                                                ctx, plan.current, current_ptr_table_layer_hash, pair_layout);
+                const auto & retained_current =
+                    current_is_gate ? retained_prompt_roles_result.bundle.gate : retained_prompt_roles_result.bundle.up;
+                const auto & retained_partner =
+                    current_is_gate ? retained_prompt_roles_result.bundle.up : retained_prompt_roles_result.bundle.gate;
+                auto current_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
+                    ctx, plan.current.weight, retained_current.batch, current_ptr_table_layer_hash, pair_layout);
+                const void * const * current_ptrs = current_table.resolve_abi(ctx.device);
                 trace_pair_stage("upload-current-ptrs-done");
                 trace_pair_stage("upload-partner-ptrs-begin");
-                const void * const * partner_ptrs =
-                    all_local_pair_tables ?
-                        all_local_partner_ptrs :
-                        moe_fusion_upload_ptrs_from_handles(ctx, plan.partner, partner_layer_hash, pair_layout);
+                auto partner_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
+                    ctx, plan.partner.weight, retained_partner.batch, partner_layer_hash, pair_layout);
+                const void * const * partner_ptrs = partner_table.resolve_abi(ctx.device);
                 trace_pair_stage("upload-partner-ptrs-done");
                 if (!current_ptrs || !partner_ptrs) {
                     return reject_pair(!current_ptrs ? "current-ptrs" : "partner-ptrs");
+                }
+                // Seed terminal ownership before the first kernel submit. The
+                // final barrier retention below therefore covers all three role
+                // leases and both pointer-table allocations, not raw ABI views.
+                plan.residency_handles.push_back(current_table.table_handle);
+                plan.residency_handles.push_back(partner_table.table_handle);
+                for (const auto & retained_role :
+                     { &retained_prompt_roles_result.bundle.gate, &retained_prompt_roles_result.bundle.up,
+                       &retained_prompt_roles_result.bundle.down }) {
+                    for (const auto & operand : retained_role->batch.operands) {
+                        plan.residency_handles.push_back(operand.lease);
+                    }
                 }
                 host_profile_mark(host_profile_ptrs_us);
                 if (g_moe_profile_enabled) {
@@ -66166,6 +66230,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
 
+                ggml_sycl::moe_terminal_publication terminal_publication;
                 auto record_pair_profile = [&](int64_t n_gpu_entries) {
                     if (g_moe_profile_enabled) {
                         const int64_t gate_up_entries = static_cast<int64_t>(gate_up_dispatch_entries);
@@ -66325,32 +66390,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 return "down-layout";
                             }
 
-                            if (all_local_pair_tables) {
-                                ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
-                                const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
-                                const moe_layer_persistent_role_descriptor * down_descriptor_role =
-                                    (persistent_descriptor && persistent_descriptor->down.weight == pair.down_weight &&
-                                     persistent_descriptor->down.layout == down_layout) ?
-                                                 &persistent_descriptor->down :
-                                                 nullptr;
-                                const void * const * down_all_local_ptrs =
-                                    down_descriptor_role ? moe_fusion_ensure_full_local_ptr_table_from_descriptor(
-                                                               ctx, *down_descriptor_role, down_layer_hash) :
-                                                                    moe_fusion_ensure_full_local_ptr_table(
-                                                               ctx, pair.down_weight, down_layer_hash, down_layout);
-                                if (down_all_local_ptrs != nullptr) {
-                                    if (ids_data) {
-                                        for (size_t ci = 0; ci < ids_n_elem; ++ci) {
-                                            const int32_t eid = ids_data[ci];
-                                            if (eid < 0 || eid >= pair.down_weight->ne[2]) {
-                                                return "down-expert-id";
-                                            }
-                                        }
-                                    }
-                                    return "eligible";
-                                }
-                            }
-
                             if (!ids_data) {
                                 return "down-host-ids";
                             }
@@ -66359,10 +66398,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 if (eid < 0 || eid >= pair.down_weight->ne[2]) {
                                     return "down-expert-id";
                                 }
-                                moe_expert_route route = ggml_sycl_resolve_moe_expert_route(
-                                    pair.down_weight, ctx.device, eid, down_layout, /*allow_materialize=*/false);
-                                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
-                                    route.actual_layout != down_layout || !route.lease.valid()) {
+                                const auto * operand = retained_prompt_roles_result.bundle.down.batch.occurrence(
+                                    ci / static_cast<size_t>(n_ids_pair), ci % static_cast<size_t>(n_ids_pair));
+                                if (!operand || operand->expert_id != eid ||
+                                    operand->residency != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
+                                    operand->actual_layout != down_layout || !operand->lease.valid()) {
                                     return "down-handles";
                                 }
                             }
@@ -66706,79 +66746,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     size_t local_split_rows     = 0;
                                     size_t secondary_split_rows = 0;
 
-                                    auto valid_down_route = [&](const moe_expert_route & route,
-                                                                layout_mode              requested) -> bool {
-                                        if ((route.kind != moe_expert_route_kind::LOCAL_DEVICE &&
-                                             route.kind != moe_expert_route_kind::SECONDARY_DEVICE) ||
-                                            route.ptr == nullptr || route.actual_layout != requested ||
-                                            !ggml_sycl_moe_mmvq_batched_supports_layout(pair.down_weight->type,
-                                                                                        route.actual_layout)) {
-                                            return false;
-                                        }
-                                        if (!route.lease.valid()) {
-                                            return false;
-                                        }
-                                        const int route_device = route.kind == moe_expert_route_kind::LOCAL_DEVICE ?
-                                                                     ctx.device :
-                                                                     route.owning_device;
-                                        if (route_device < 0 || route_device >= n_devs) {
-                                            return false;
-                                        }
-                                        if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE) {
-                                            return route.actual_layout == GGML_LAYOUT_SOA && route_device >= 0 &&
-                                                   ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
-                                                       route_device);
-                                        }
-                                        return route_device == ctx.device;
-                                    };
-
-                                    auto resolve_down = [&](int32_t eid, moe_expert_route & route) -> bool {
-                                        route = ggml_sycl_resolve_moe_expert_route(pair.down_weight, ctx.device, eid,
-                                                                                   down_layout,
-                                                                                   /*allow_materialize=*/false);
-                                        if (valid_down_route(route, down_layout)) {
-                                            return true;
-                                        }
-                                        if (down_layout != GGML_LAYOUT_SOA) {
-                                            route = ggml_sycl_resolve_moe_expert_route(pair.down_weight, ctx.device,
-                                                                                       eid, GGML_LAYOUT_SOA,
-                                                                                       /*allow_materialize=*/false);
-                                            if (valid_down_route(route, GGML_LAYOUT_SOA)) {
-                                                return true;
-                                            }
-                                        }
+                                    const auto & retained_down = retained_prompt_roles_result.bundle.down.batch;
+                                    if (retained_down.operands.size() != down_entries) {
                                         return false;
-                                    };
-
+                                    }
                                     for (size_t entry = 0; entry < down_entries; ++entry) {
-                                        const int32_t eid = ids_data[entry];
-                                        if (eid < 0 || eid >= pair.down_weight->ne[2]) {
+                                        const int32_t eid     = ids_data[entry];
+                                        const auto &  operand = retained_down.operands[entry];
+                                        if (eid < 0 || eid >= pair.down_weight->ne[2] || operand.expert_id != eid ||
+                                            operand.actual_layout != down_layout || !operand.lease.valid()) {
                                             return false;
                                         }
-                                        moe_expert_route route;
-                                        if (!resolve_down(eid, route)) {
+                                        const int  route_device = operand.owning_device;
+                                        const bool secondary =
+                                            operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE;
+                                        const bool local =
+                                            operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE;
+                                        if ((!local && !secondary) || route_device < 0 || route_device >= n_devs ||
+                                            (secondary && (operand.actual_layout != GGML_LAYOUT_SOA ||
+                                                           !ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                               route_device))) ||
+                                            (local && route_device != ctx.device)) {
                                             return false;
                                         }
-                                        const int route_device = route.kind == moe_expert_route_kind::LOCAL_DEVICE ?
-                                                                     ctx.device :
-                                                                     route.owning_device;
                                         split_down_row row;
                                         row.ci              = entry;
                                         row.expert_id       = eid;
                                         row.iid1            = down_iid1s[entry];
                                         row.id              = down_ids[entry];
-                                        row.handle          = std::move(route.lease);
-                                        row.ready_event     = route.ready_event;
-                                        row.has_ready_event = route.has_ready_event;
-                                        if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE) {
+                                        row.handle          = operand.lease;
+                                        row.ready_event     = operand.ready_event;
+                                        row.has_ready_event = operand.has_ready_event;
+                                        if (secondary) {
                                             split_down_needed = true;
                                             secondary_groups[static_cast<size_t>(route_device)].rows.push_back(
                                                 std::move(row));
                                             ++secondary_split_rows;
                                         } else {
-                                            moe_layer_decode_role_plan & role = local_roles[route.actual_layout];
+                                            moe_layer_decode_role_plan & role = local_roles[operand.actual_layout];
                                             role.weight                       = pair.down_weight;
-                                            role.layout                       = route.actual_layout;
+                                            role.layout                       = operand.actual_layout;
                                             role.expert_ids.push_back(eid);
                                             role.handles.push_back(std::move(row.handle));
                                             moe_layer_grouped_route_row plan_row;
@@ -67085,21 +67092,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 } else if (!split_down_needed) {
                                     const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                     ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
-                                    const moe_layer_persistent_role_descriptor * down_descriptor_role =
-                                        (persistent_descriptor &&
-                                         persistent_descriptor->down.weight == pair.down_weight &&
-                                         persistent_descriptor->down.layout == down_layout) ?
-                                            &persistent_descriptor->down :
-                                            nullptr;
-                                    const void * const * down_all_local_ptrs =
-                                        down_descriptor_role ?
-                                            moe_fusion_ensure_full_local_ptr_table_from_descriptor(
-                                                ctx, *down_descriptor_role, down_layer_hash) :
-                                        all_local_pair_tables ?
-                                            moe_fusion_ensure_full_local_ptr_table(ctx, pair.down_weight,
-                                                                                   down_layer_hash, down_layout) :
-                                            nullptr;
-                                    const bool           down_all_local_table         = down_all_local_ptrs != nullptr;
+                                    const void * const * down_all_local_ptrs          = nullptr;
+                                    const bool           down_all_local_table         = false;
                                     bool                 down_plan_ok                 = true;
                                     bool                 down_use_full_id_table       = down_all_local_table;
                                     bool                 down_id_table_needs_host_ids = false;
@@ -68010,6 +68004,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         pair.gate_bias ? plan.gate_bias.resolved.ptr : nullptr,
                                         pair.up_bias ? plan.up_bias.resolved.ptr : nullptr, ctx.device);
                             }
+                            // The GLU terminal is successful even when the optional
+                            // down continuation declines. Publish all skip/ready state
+                            // in one post-submit phase; exceptions before this point
+                            // leave no skip marker and the retained unfused executor wins.
+                            terminal_publication.terminal_submitted(/*writes_started=*/true);
+                            if (!terminal_publication.publish()) {
+                                throw ggml_sycl_fallback_error("MUL_MAT_ID prompt fusion publication refused");
+                            }
                             ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, dst, ctx.device);
                             ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, partner_dst, ctx.device);
                             if (pair.gate_biased) {
@@ -68079,6 +68081,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ctx, src0, partner_weight, src1, dst, partner_dst, current_ptrs, partner_ptrs, ids_device,
                     gate_up_dispatch_entries, n_ids_pair, ids_device_nb0, ids_device_nb1);
                 if (ok) {
+                    terminal_publication.terminal_submitted(/*writes_started=*/true);
+                    if (!terminal_publication.publish()) {
+                        throw ggml_sycl_fallback_error("MUL_MAT_ID prompt pair publication refused");
+                    }
                     moe_layer_group_profile_record(plan, plan.current, current_is_gate ? "gate" : "up", "mmvq-pair-raw",
                                                    ctx.device);
                     moe_layer_group_profile_record(plan, plan.partner, current_is_gate ? "up" : "gate", "mmvq-pair-raw",
