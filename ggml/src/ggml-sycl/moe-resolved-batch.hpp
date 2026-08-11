@@ -35,6 +35,8 @@ enum class moe_batch_reject_reason : uint8_t {
     LAYOUT_MISMATCH,
     WRONG_DEVICE,
     PLAN_MISMATCH,
+    WRONG_QUEUE,
+    CAPABILITY_UNSUPPORTED,
 };
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);
@@ -98,6 +100,56 @@ struct moe_resolved_batch {
     std::vector<int32_t>              expert_ids;
     std::vector<moe_resolved_operand> operands;
 };
+
+enum class moe_batch_executor : uint8_t {
+    HOST_CPU,
+    PRIMARY_DEVICE,
+    SECONDARY_DEVICE,
+};
+
+struct moe_batch_executor_choice {
+    moe_batch_executor      executor = moe_batch_executor::HOST_CPU;
+    moe_batch_reject_reason reject   = moe_batch_reject_reason::NONE;
+
+    explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
+};
+
+// Executor selection is deliberately metadata-only. Callers supply capability
+// and owning-queue facts; pointer address spaces are never consulted.
+inline moe_batch_executor_choice choose_moe_batch_executor(const moe_resolved_operand & operand,
+                                                           int                          submit_device,
+                                                           bool                         device_capable,
+                                                           bool                         owning_queue_available) {
+    moe_batch_executor_choice out;
+    switch (operand.residency) {
+        case moe_batch_residency::HOST:
+            out.executor = moe_batch_executor::HOST_CPU;
+            return out;
+        case moe_batch_residency::PRIMARY_DEVICE:
+            out.executor = moe_batch_executor::PRIMARY_DEVICE;
+            if (operand.owning_device != submit_device) {
+                out.reject = moe_batch_reject_reason::WRONG_DEVICE;
+            } else if (!device_capable) {
+                out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
+            }
+            return out;
+        case moe_batch_residency::SECONDARY_DEVICE:
+            out.executor = moe_batch_executor::SECONDARY_DEVICE;
+            if (operand.owning_device < 0 || operand.owning_device == submit_device) {
+                out.reject = moe_batch_reject_reason::WRONG_DEVICE;
+            } else if (!owning_queue_available) {
+                out.reject = moe_batch_reject_reason::WRONG_QUEUE;
+            } else if (!device_capable) {
+                out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
+            }
+            return out;
+        case moe_batch_residency::UNAVAILABLE:
+            out.reject = moe_batch_reject_reason::ROUTE_UNAVAILABLE;
+            return out;
+    }
+    out.reject = moe_batch_reject_reason::ROUTE_UNAVAILABLE;
+    return out;
+}
 
 struct moe_resolved_batch_result {
     moe_resolved_batch      batch;

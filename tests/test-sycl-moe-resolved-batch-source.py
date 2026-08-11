@@ -49,6 +49,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "opaque proof transfer":
             "normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted",
         "canonical lease": "normalized.lease = std::move(route.lease)",
+        "decode batch seam": "auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(",
+        "metadata executor": "ggml_sycl::choose_moe_batch_executor(",
+        "typed capability refusal": "moe_batch_reject_reason::CAPABILITY_UNSUPPORTED",
+        "Q1 decode refusal": "type == GGML_TYPE_Q1_0",
+        "NVFP4 decode refusal": "type == GGML_TYPE_NVFP4",
+        "decode-only type refusal": "phase == moe_route_phase::DECODE",
+        "owning queue ready dependency": "target_queue->ext_oneapi_submit_barrier(route_ready_events)",
+        "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
+        "CPU ready copy": "sycl::event ready = entry.ready_event",
+        "CPU ready wait": "ready.wait()",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -82,6 +92,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     for device_fixture in ("from_weight_lease_snapshot", "get_unified_cache_for_device"):
         if has_tokens(host_test, device_fixture):
             failures.append("device-dependent host fixture")
+
+    if source.count("ggml_sycl::ggml_sycl_build_moe_resolved_batch(") < 2:  # CPU-TG + main decode
+        failures.append("both decode routers use retained batch")
+
+    decode_start = source.index("auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
+    decode_end = source.index("if (have_plan_hybrid) {", decode_start)
+    decode_route = source[decode_start:decode_end]
+    for forbidden in ("from_chunk_ptr", "from_direct", "is_device_expert_ptr", "src0->data", "route.ptr"):
+        if has_tokens(decode_route, forbidden):
+            failures.append(f"decode raw routing: {forbidden}")
 
     production = header + wrapper
     for forbidden in ("sycl::malloc_device", "sycl::malloc_host", "sycl::malloc_shared", "sycl::free(",
@@ -127,6 +147,9 @@ def test_contract_and_mutation_witnesses() -> None:
          mem_source + "\nmem_handle test_make_stable_weight_lease() { return {}; }\n"),
         ("device-fixture", header, source,
          host_test.replace("test_make_stable_weight_lease", "mem_handle::from_weight_lease_snapshot"), mem_source),
+        ("decode-resolver-bypass", header,
+         source.replace("ggml_sycl::choose_moe_batch_executor(", "ggml_sycl::moe_batch_executor_choice("),
+         host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"

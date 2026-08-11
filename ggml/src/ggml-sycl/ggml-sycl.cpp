@@ -22462,6 +22462,15 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type      
         return cap;
     }
 
+    // Q1_0/NVFP4 have CPU traits, but no retained-handle decode device
+    // executor yet. Refuse capability before either batched or generic dense
+    // device dispatch can be selected; never stage these routes through CPU.
+    if (phase == moe_route_phase::DECODE && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)) {
+        cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
+        cap.reason        = "decode-device-type-unimplemented";
+        return cap;
+    }
+
     const bool secondary = route_device != submit_device;
     if (secondary) {
         if (phase == moe_route_phase::PROMPT) {
@@ -23020,6 +23029,10 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "wrong_device";
         case moe_batch_reject_reason::PLAN_MISMATCH:
             return "plan_mismatch";
+        case moe_batch_reject_reason::WRONG_QUEUE:
+            return "wrong_queue";
+        case moe_batch_reject_reason::CAPABILITY_UNSUPPORTED:
+            return "capability_unsupported";
     }
     return "unknown";
 }
@@ -59170,6 +59183,8 @@ struct expert_dispatch_entry {
     int                   device_id;  // target device ID (secondary GPU entries only)
     layout_mode           layout = GGML_LAYOUT_AOS;
     ggml_sycl::mem_handle lease{};    // canonical route handle; resolve only at submit/copy ABI boundary
+    bool                  has_ready_event = false;
+    sycl::event           ready_event{};
     bool                  allow_cpu_fallback = true;
     bool                  raw_compat_lease   = false;
 };
@@ -60413,6 +60428,19 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
     if (!target_queue) {
         ggml_sycl_secondary_fallback_or_abort(entries, target_device, ctx, "missing secondary queue", cpu_fallback);
         return;
+    }
+
+    // The owning device queue consumes readiness from the retained operands.
+    // This is intentionally chained here, not waited on the submit queue.
+    std::vector<sycl::event> route_ready_events;
+    route_ready_events.reserve(entries.size());
+    for (const expert_dispatch_entry & entry : entries) {
+        if (entry.has_ready_event) {
+            route_ready_events.push_back(entry.ready_event);
+        }
+    }
+    if (!route_ready_events.empty()) {
+        target_queue->ext_oneapi_submit_barrier(route_ready_events);
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -68014,9 +68042,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 goto cpu_tg_fallthrough;
             }
 
-            if (!cpu_tg_enabled_fast) {
-                goto cpu_tg_fallthrough;
-            }
+            // The legacy inline CPU-TG router (including push_gpu0_fast) cannot
+            // retain one canonical occurrence batch across its temporary task
+            // arrays. Route CPU-TG decode through the main retained-batch
+            // hybrid executor below. Prompt-specialized pair handling above is
+            // intentionally unchanged.
+            goto cpu_tg_fallthrough;
 
             // --- Phase-level profiling (enabled by GGML_SYCL_CPU_TG_PROFILE=1) ---
             static int prof_enabled = -1;
@@ -71069,6 +71100,15 @@ cpu_tg_fallthrough:
                 if (act_deferred_pending) {
                     act_deferred_evt.wait();
                 }
+                // Host CPU traits consume the retained host handle only after
+                // its producer event is complete. The lease then moves into
+                // the future-owned task vector through completion.
+                for (const expert_dispatch_entry & entry : entries) {
+                    if (entry.has_ready_event) {
+                        sycl::event ready = entry.ready_event;
+                        ready.wait();
+                    }
+                }
 
                 // Submit to CPU thread pool — move the tasks vector into
                 // the worker so storage outlives every possible caller action.
@@ -71302,6 +71342,30 @@ cpu_tg_fallthrough:
                         ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
                 };
 
+                // Graph replay does not retain this occurrence batch yet.
+                // Keep recording disabled until the graph-retention migration.
+                ctx.moe_graphs_disabled_once = true;
+
+                // Decode resolves every selected occurrence exactly once. The
+                // resulting operands (including duplicates) are the sole
+                // routing authority below; pointers are resolved only by the
+                // final CPU/device ABI submitters.
+                auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                    src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
+                    /*allow_materialize=*/false);
+                if (!decode_batch_result) {
+                    local_extra.moe_expert_id = -1;
+                    ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                    GGML_LOG_ERROR(
+                        "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
+                        src0->name ? src0->name : "?", decode_batch_result.occurrence,
+                        decode_batch_result.expert_id,
+                        ggml_sycl::moe_batch_reject_reason_name(decode_batch_result.reject),
+                        decode_batch_result.source_reason);
+                    return;
+                }
+                const ggml_sycl::moe_resolved_batch & decode_batch = decode_batch_result.batch;
+
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
                             "[MOE-STAGE] tensor=%s stage=route-build-begin device=%d layout=%s tokens=%lld topk=%lld\n",
@@ -71311,8 +71375,57 @@ cpu_tg_fallthrough:
                 }
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                     for (int64_t id = 0; id < n_ids; id++) {
-                        const int32_t i02 = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
+                        const size_t occurrence = static_cast<size_t>(iid1 * n_ids + id);
+                        const int32_t i02        = ids_host[occurrence];
                         GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                        const ggml_sycl::moe_resolved_operand & operand = decode_batch.operands[occurrence];
+                        const bool queue_available =
+                            operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
+                            (operand.owning_device >= 0 && operand.owning_device < n_gpu_devs &&
+                             ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device));
+                        bool device_capable = true;
+                        if (operand.residency != ggml_sycl::moe_batch_residency::HOST) {
+                            const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+                                src0->type, operand.actual_layout, moe_route_phase::DECODE, src0->ne[0], src0->ne[1],
+                                /*rows=*/1, operand.owning_device, moe_layer_route_residency::DEVICE, ctx.device);
+                            device_capable = cap.supported;
+                        }
+                        const auto choice = ggml_sycl::choose_moe_batch_executor(
+                            operand, ctx.device, device_capable, queue_available);
+                        if (!choice) {
+                            local_extra.moe_expert_id = -1;
+                            ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                            GGML_LOG_ERROR(
+                                "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s\n",
+                                src0->name ? src0->name : "?", occurrence, i02, operand.owning_device,
+                                ggml_sycl::moe_batch_reject_reason_name(choice.reject));
+                            return;
+                        }
+                        if (choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE) {
+                            push_routed_entry(gpu_entries, iid1, id, i02, ctx.device, operand.actual_layout,
+                                              operand.lease, nullptr);
+                            gpu_entries.back().has_ready_event = operand.has_ready_event;
+                            gpu_entries.back().ready_event     = operand.ready_event;
+                            route_dev_counts[static_cast<size_t>(ctx.device)]++;
+                            continue;
+                        }
+                        if (choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE) {
+                            push_routed_entry(per_gpu_entries[operand.owning_device], iid1, id, i02,
+                                              operand.owning_device, operand.actual_layout, operand.lease, nullptr);
+                            per_gpu_entries[operand.owning_device].back().has_ready_event = operand.has_ready_event;
+                            per_gpu_entries[operand.owning_device].back().ready_event     = operand.ready_event;
+                            route_dev_counts[static_cast<size_t>(operand.owning_device)]++;
+                            continue;
+                        }
+                        expert_dispatch_entry retained_host = ggml_sycl_make_expert_dispatch_entry(
+                            iid1, id, i02, ggml_sycl::mem_handle::HOST_DEVICE, operand.actual_layout, operand.lease,
+                            /*allow_cpu_fallback=*/false);
+                        retained_host.has_ready_event = operand.has_ready_event;
+                        retained_host.ready_event     = operand.ready_event;
+                        cpu_entries.push_back(std::move(retained_host));
+                        route_host_count++;
+                        continue;
 
                         if (have_plan_hybrid) {
                             const layout_mode expert_route_layout = planned_route_layout_for_expert(i02, route_layout);
@@ -71784,10 +71897,80 @@ cpu_tg_fallthrough:
                         ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
                 };
 
+                const bool retained_main_decode = ids->ne[1] == 1;
+                ggml_sycl::moe_resolved_batch_result main_decode_batch_result;
+                if (retained_main_decode) {
+                    ctx.moe_graphs_disabled_once = true;
+                    main_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                        src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
+                        /*allow_materialize=*/false);
+                    if (!main_decode_batch_result) {
+                        local_extra.moe_expert_id = -1;
+                        ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                        GGML_LOG_ERROR(
+                            "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
+                            src0->name ? src0->name : "?", main_decode_batch_result.occurrence,
+                            main_decode_batch_result.expert_id,
+                            ggml_sycl::moe_batch_reject_reason_name(main_decode_batch_result.reject),
+                            main_decode_batch_result.source_reason);
+                        return;
+                    }
+                }
+
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                     for (int64_t id = 0; id < n_ids; id++) {
-                        const int32_t i02 = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
+                        const size_t occurrence = static_cast<size_t>(iid1 * n_ids + id);
+                        const int32_t i02        = ids_host[occurrence];
                         GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                        if (retained_main_decode) {
+                            const auto & operand = main_decode_batch_result.batch.operands[occurrence];
+                            const bool queue_available =
+                                operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
+                                (operand.owning_device >= 0 && operand.owning_device < n_gpu_devs &&
+                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device));
+                            bool device_capable = true;
+                            if (operand.residency != ggml_sycl::moe_batch_residency::HOST) {
+                                const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+                                    src0->type, operand.actual_layout, moe_route_phase::DECODE, src0->ne[0],
+                                    src0->ne[1], /*rows=*/1, operand.owning_device,
+                                    moe_layer_route_residency::DEVICE, ctx.device);
+                                device_capable = cap.supported;
+                            }
+                            const auto choice = ggml_sycl::choose_moe_batch_executor(
+                                operand, ctx.device, device_capable, queue_available);
+                            if (!choice) {
+                                local_extra.moe_expert_id = -1;
+                                ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                                GGML_LOG_ERROR(
+                                    "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s\n",
+                                    src0->name ? src0->name : "?", occurrence, i02, operand.owning_device,
+                                    ggml_sycl::moe_batch_reject_reason_name(choice.reject));
+                                return;
+                            }
+                            if (choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE) {
+                                push_routed_entry(gpu_entries, iid1, id, i02, ctx.device, operand.actual_layout,
+                                                  operand.lease, nullptr);
+                                gpu_entries.back().has_ready_event = operand.has_ready_event;
+                                gpu_entries.back().ready_event     = operand.ready_event;
+                                route_dev_counts[static_cast<size_t>(ctx.device)]++;
+                            } else if (choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE) {
+                                push_routed_entry(per_gpu_entries[operand.owning_device], iid1, id, i02,
+                                                  operand.owning_device, operand.actual_layout, operand.lease, nullptr);
+                                per_gpu_entries[operand.owning_device].back().has_ready_event = operand.has_ready_event;
+                                per_gpu_entries[operand.owning_device].back().ready_event     = operand.ready_event;
+                                route_dev_counts[static_cast<size_t>(operand.owning_device)]++;
+                            } else {
+                                expert_dispatch_entry retained_host = ggml_sycl_make_expert_dispatch_entry(
+                                    iid1, id, i02, ggml_sycl::mem_handle::HOST_DEVICE, operand.actual_layout,
+                                    operand.lease, /*allow_cpu_fallback=*/false);
+                                retained_host.has_ready_event = operand.has_ready_event;
+                                retained_host.ready_event     = operand.ready_event;
+                                cpu_entries.push_back(std::move(retained_host));
+                                route_host_count++;
+                            }
+                            continue;
+                        }
 
                         if (have_plan_hybrid) {
                             const layout_mode expert_route_layout = planned_route_layout_for_expert(i02, route_layout);
@@ -72274,6 +72457,11 @@ cpu_tg_fallthrough:
                         if (route_ptrs_event_set) {
                             dispatch_deps.push_back(route_ptrs_event);
                         }
+                        for (const expert_dispatch_entry * entry : layout_entries) {
+                            if (entry->has_ready_event) {
+                                dispatch_deps.push_back(entry->ready_event);
+                            }
+                        }
                         batched_ok = mmvq_moe_batched_dispatch(
                             ctx, src0, src1, dst, expert_ptrs_dev, gpu_expert_ids.data(), gpu_iid1s.data(),
                             gpu_id_slots.data(), static_cast<int>(layout_entries.size()), static_cast<int>(n_as), n_ids,
@@ -72297,6 +72485,15 @@ cpu_tg_fallthrough:
                     }
 
                     if (!batched_ok) {
+                        std::vector<sycl::event> per_entry_ready;
+                        for (const expert_dispatch_entry * entry : layout_entries) {
+                            if (entry->has_ready_event) {
+                                per_entry_ready.push_back(entry->ready_event);
+                            }
+                        }
+                        if (!per_entry_ready.empty()) {
+                            stream->ext_oneapi_submit_barrier(per_entry_ready);
+                        }
                         for (const expert_dispatch_entry * entry_ptr : layout_entries) {
                             const auto &  entry = *entry_ptr;
                             const int64_t i11   = entry.id % ne11;

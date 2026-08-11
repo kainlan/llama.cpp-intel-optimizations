@@ -153,6 +153,44 @@ static bool test_identity_sharing_and_ready_event() {
     return true;
 }
 
+static bool test_executor_choice_is_residency_and_capability_driven() {
+    int value = 12;
+    auto host = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_AOS,
+                          GGML_LAYOUT_AOS, 12);
+    auto primary = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
+                             GGML_LAYOUT_SOA, 13);
+    auto secondary = route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_SOA,
+                               GGML_LAYOUT_SOA, 14);
+    const int32_t ids[] = { 12 };
+    auto build_one = [&](ggml_sycl::moe_batch_route route) {
+        return ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
+    };
+
+    auto host_batch = build_one(host);
+    CHECK(host_batch);
+    auto choice = ggml_sycl::choose_moe_batch_executor(host_batch.batch.operands[0], 0,
+                                                       /*device_capable=*/false,
+                                                       /*owning_queue_available=*/false);
+    CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU);
+
+    auto primary_batch = build_one(primary);
+    CHECK(primary_batch);
+    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, false, true);
+    CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, true, true);
+    CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
+
+    auto secondary_batch = build_one(secondary);
+    CHECK(secondary_batch);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true, false);
+    CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::WRONG_QUEUE);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false, true);
+    CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true, true);
+    CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE);
+    return true;
+}
+
 static bool test_fail_closed_contract() {
     int           value = 7;
     const int32_t ids[] = { 7 };
@@ -222,7 +260,8 @@ static bool test_fail_closed_contract() {
 
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
-        !test_identity_sharing_and_ready_event() || !test_fail_closed_contract()) {
+        !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
+        !test_fail_closed_contract()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");
