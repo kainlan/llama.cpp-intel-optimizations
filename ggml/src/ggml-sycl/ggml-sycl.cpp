@@ -98739,7 +98739,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             }
             break;
         case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
@@ -98747,28 +98746,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 ggml_type a_type = a->type;
-                if (op->op == GGML_OP_MUL_MAT_ID) {
-                    // These types currently fall through to the generic
-                    // per-expert MUL_MAT fallback rather than a validated
-                    // MUL_MAT_ID kernel.  q4_K produces incorrect results and
-                    // the selected-slice path can hang in Level Zero; iq2_xxs
-                    // produces large numeric mismatches.  Do not advertise
-                    // support until a real _id path is implemented.
-                    if (a_type == GGML_TYPE_Q4_K || a_type == GGML_TYPE_IQ2_XXS) {
-                        return false;
-                    }
-                    // Known NaN issues for these quantized types in the MoE host-routing path when n==1.
-                    if ((a_type == GGML_TYPE_Q8_0 || a_type == GGML_TYPE_Q6_K) && (b->ne[1] == 1 || b->ne[2] == 1)) {
-                        return false;
-                    }
-                    // MXFP4 MoE with non-broadcast src1 (ne11 > 1): the per-expert
-                    // dispatch assumes ne11==1 for shared activation optimization.
-                    // This only occurs in test-backend-ops with b=0 and n_used>1;
-                    // real MoE models always have ne11==1 during inference.
-                    if (a_type == GGML_TYPE_MXFP4 && b->ne[1] > 1 && b->ne[2] <= 1) {
-                        return false;
-                    }
-                }
                 if (op->op == GGML_OP_MUL_MAT && ggml_is_quantized(a_type) &&
                     (ggml_is_permuted(a) || !ggml_is_contiguous(a))) {
                     // Quantized kernels decode blocks assuming canonical src0
