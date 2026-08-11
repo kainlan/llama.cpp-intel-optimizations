@@ -98746,21 +98746,21 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 ggml_type a_type = a->type;
-                if (op->op == GGML_OP_MUL_MAT && ggml_is_quantized(a_type) &&
+                if (ggml_is_quantized(a_type) &&
                     (ggml_is_permuted(a) || !ggml_is_contiguous(a))) {
                     // Quantized kernels decode blocks assuming canonical src0
                     // strides.  A permuted/viewed quantized weight tensor needs
                     // CPU fallback or an explicit contiguous materialization.
                     return false;
                 }
-                if (op->op == GGML_OP_MUL_MAT && a_type == GGML_TYPE_Q4_0) {
+                if (a_type == GGML_TYPE_Q4_0) {
                     // Q4_0 kernels currently do not handle broadcasted batch dims or large batch slices reliably.
                     // Treat these shapes as unsupported to avoid incorrect results.
                     if (a->ne[2] != b->ne[2] || a->ne[2] > 2) {
                         return false;
                     }
                 }
-                if (op->op == GGML_OP_MUL_MAT && a_type == GGML_TYPE_Q4_1 && b->ne[1] == 1) {
+                if (a_type == GGML_TYPE_Q4_1 && b->ne[1] == 1) {
                     // Q4_1 small-n path can exceed error tolerance; prefer fallback.
                     return false;
                 }
