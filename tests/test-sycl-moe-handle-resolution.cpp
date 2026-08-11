@@ -192,6 +192,50 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     return true;
 }
 
+static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
+    printf("\n=== Test: canonical owned AoS expert slice lifecycle ===\n");
+
+    constexpr size_t         expert_bytes = 320;  // deliberately padded stride
+    constexpr size_t         expert_count = 3;
+    ggml_sycl::alloc_request req{};
+    req.queue                          = &q;
+    req.device                         = 0;
+    req.size                           = expert_bytes * expert_count;
+    req.intent.role                    = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.constraints.must_device = true;
+
+    ggml_sycl::alloc_handle allocation{};
+    TEST_ASSERT(ggml_sycl::unified_alloc(req, &allocation), "canonical device allocation failed");
+    void * const          base     = allocation.ptr;
+    const uint64_t        alloc_id = allocation.alloc_id;
+    ggml_sycl::mem_handle owner    = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
+    auto                  expert   = owner.slice(expert_bytes, expert_bytes);
+    auto                  resolved = expert.resolve(0);
+    TEST_ASSERT(resolved.ptr == static_cast<char *>(base) + expert_bytes, "padded expert slice pointer mismatch");
+    TEST_ASSERT(resolved.layout == GGML_LAYOUT_AOS && resolved.on_device, "canonical slice metadata mismatch");
+    TEST_ASSERT(expert.size() == expert_bytes && expert.device() == 0, "canonical slice range/device mismatch");
+    TEST_ASSERT(expert.has_stable_owner_identity(), "canonical slice must have allocator identity");
+    TEST_ASSERT(!expert.resolve(1), "wrong-device resolve must fail");
+
+    const size_t          old_identity = expert.stable_identity_hash();
+    ggml_sycl::mem_handle retained     = expert;
+    owner                              = {};
+    expert                             = {};
+    ggml_sycl::alloc_handle lookup{};
+    TEST_ASSERT(ggml_sycl::unified_lookup(base, &lookup) && lookup.alloc_id == alloc_id,
+                "retained expert lease must delay allocation free");
+    retained = {};
+    TEST_ASSERT(!ggml_sycl::unified_lookup(base, &lookup), "last retained lease must release allocation");
+
+    ggml_sycl::alloc_handle replacement{};
+    TEST_ASSERT(ggml_sycl::unified_alloc(req, &replacement), "replacement device allocation failed");
+    auto replacement_owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(replacement), GGML_LAYOUT_AOS);
+    auto replacement_slice = replacement_owner.slice(expert_bytes, expert_bytes);
+    TEST_ASSERT(replacement_slice.stable_identity_hash() != old_identity,
+                "replacement generation must not alias stale lease identity");
+    return true;
+}
+
 static bool test_expert_staging_host_compute_zone_ownership(sycl::queue & q) {
     printf("\n=== Test: EXPERT_STAGING HOST_COMPUTE zone ownership ===\n");
 
@@ -468,6 +512,7 @@ int main() {
     ok &= test_moe_ptr_table_lease_covers_populated_slots();
     ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
     ok &= test_direct_host_and_miss_resolution(*q);
+    ok &= test_canonical_owned_aos_slice_lifecycle(*q);
     ok &= test_expert_staging_host_compute_zone_ownership(*q);
     ok &= test_planner_role_specific_expert_placement();
     ok &= test_q1_nvfp4_recipe_workspace_is_inventory_planned();

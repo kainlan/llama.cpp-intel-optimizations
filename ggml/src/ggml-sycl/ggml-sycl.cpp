@@ -21393,11 +21393,13 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
     return true;
 }
 
+static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * cache, const ggml_sycl_cache_id & key);
+
 // Publish ordinary device-buffer MoE AoS storage as retained allocation views.
 // The backend buffer's allocation-time mem_handle is the sole owner: each
 // expert capability is a checked slice carrying the allocation id, device,
-// exact byte range, layout and shared lifetime.  Resolution therefore never
-// has to reconstruct authority from tensor->data or an allocation registry.
+// exact byte range, layout and shared lifetime. Resolution therefore never
+// reconstructs authority from tensor->data or an allocation registry.
 static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
     if (!ctx || !tensor || tensor->view_src != nullptr || !tensor->extra ||
         ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid() ||
@@ -21426,6 +21428,9 @@ static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffe
         return false;
     }
 
+    // Build and validate every slice before changing discoverable state.
+    std::vector<ggml_sycl::mem_handle> replacement;
+    replacement.reserve(expert_count);
     for (size_t expert = 0; expert < expert_count; ++expert) {
         const size_t          slice_offset  = tensor_offset + expert * expert_size;
         ggml_sycl::mem_handle expert_handle = ctx->managed_handle.slice(slice_offset, expert_size);
@@ -21436,19 +21441,73 @@ static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffe
             !expert_handle.has_stable_owner_identity()) {
             return false;
         }
-        extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS, std::move(expert_handle));
+        replacement.push_back(std::move(expert_handle));
+    }
+
+    // Retain previous records so an exceptional container allocation rolls the
+    // whole publication back rather than leaving a partially installed prefix.
+    std::vector<ggml_tensor_extra_gpu::moe_expert_storage_record> previous(expert_count);
+    std::vector<bool>                                             had_previous(expert_count, false);
+    try {
+        for (size_t expert = 0; expert < expert_count; ++expert) {
+            had_previous[expert] = extra->take_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS,
+                                                                            ctx->device, &previous[expert]);
+        }
+        for (size_t expert = 0; expert < expert_count; ++expert) {
+            extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS,
+                                               std::move(replacement[expert]));
+        }
+    } catch (...) {
+        for (size_t expert = 0; expert < expert_count; ++expert) {
+            extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
+            if (had_previous[expert]) {
+                const sycl::event * ready = previous[expert].has_ready_event ? &previous[expert].ready_event : nullptr;
+                extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS,
+                                                   std::move(previous[expert].handle), ready);
+            }
+        }
+        return false;
     }
     return true;
 }
 
-static void ggml_sycl_forget_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
+// Single invalidation authority for every backend destination mutation.
+// Call after prior queue users are fenced and strictly before the write.
+static void ggml_sycl_invalidate_backend_weight_mutation(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
     if (!ctx || !tensor || !tensor->extra || ggml_sycl_get_tensor_usage(tensor) != tensor_usage::MOE_EXPERT_WEIGHT) {
         return;
     }
     auto *       extra        = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
     const size_t expert_count = tensor->ne[2] > 0 ? static_cast<size_t>(tensor->ne[2]) : 0;
+    bool         withdrew     = false;
     for (size_t expert = 0; expert < expert_count; ++expert) {
-        extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
+        withdrew |= extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
+    }
+    if (!withdrew) {
+        ++extra->moe_expert_storage_generation;
+    }
+    extra->moe_device_table_valid[ctx->device]          = false;
+    extra->moe_full_local_probe_generation[ctx->device] = 0;
+    extra->layout_dirty                                 = true;
+
+    const ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device);
+    if (cache_key.valid) {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            ggml_sycl_drop_all_weight_cache_entries(cache, cache_key);
+        }
+    }
+}
+
+static void ggml_sycl_invalidate_backend_buffer_weights(ggml_backend_sycl_buffer_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    std::unordered_set<ggml_tensor *> seen;
+    for (auto & [tensor, extra] : ctx->tensor_extras) {
+        (void) extra;
+        if (tensor && seen.insert(tensor).second) {
+            ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor);
+        }
     }
 }
 
@@ -30163,6 +30222,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         default:
             break;
     }
+    if (is_weight_buffer) {
+        ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor);
+    }
     // Reset reorder flag when new data is written - data is now in AoS format
     // This is critical for correctness: if tensor was previously reordered to SoA,
     // the new AoS data would be misinterpreted as SoA without this reset
@@ -30172,18 +30234,6 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
         if (is_weight_buffer) {
             extra->layout_dirty = true;
-        }
-    }
-    if (is_weight_buffer) {
-        // A write starts a new content generation.  Withdraw ordinary AoS
-        // capabilities before mutation; a retained resolver copy keeps the old
-        // allocation alive but cannot be rediscovered as current storage.
-        ggml_sycl_forget_backend_aos_expert_handles(ctx, tensor);
-        ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device);
-        if (cache_key.valid) {
-            if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*stream)) {
-                ggml_sycl_drop_all_weight_cache_entries(cache, cache_key);
-            }
         }
     }
     if (is_weight_buffer && offset == 0 && size > 0) {
@@ -31163,12 +31213,17 @@ static bool ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         queue_ptr stream_src = src_ctx->stream;
         size_t    size       = ggml_nbytes(src);
 
+        ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst);
         // Device-to-device copy via host-staged transfer
         // Returns false on OOM or other failure
         if (!dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size)) {
             GGML_LOG_ERROR("SYCL: buffer_cpy_tensor failed: src=%s (%zu bytes) to dst device %d\n", src->name, size,
                            dst_ctx->device);
             return false;  // Signal copy failure to ggml backend
+        }
+        if (size == ggml_nbytes(dst) && dst->extra &&
+            static_cast<ggml_tensor_extra_gpu *>(dst->extra)->layout.mode == GGML_LAYOUT_AOS) {
+            (void) ggml_sycl_publish_backend_aos_expert_handles(dst_ctx, dst);
         }
         return true;
     }
@@ -31185,6 +31240,8 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_sycl_set_device(ctx->device);
 
     queue_ptr stream = ctx->stream;
+    SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_get_device(ctx->device).queues_wait_and_throw()));
+    ggml_sycl_invalidate_backend_buffer_weights(ctx);
 
     // Host-pinned buffers (CPU offload compute): Level Zero GPU queue can't memset
     // host USM pointers (UR_RESULT_ERROR_DEVICE_LOST).  Detect BEFORE touching the
@@ -31299,6 +31356,8 @@ static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     if (tensor->data == nullptr) {
         GGML_ABORT("Error: Tensor data pointer is null.\n");
     }
+    SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_get_device(ctx->device).queues_wait_and_throw()));
+    ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor);
     void * target_ptr  = static_cast<char *>(tensor->data) + offset;
     // Host-pinned buffers: Level Zero GPU queue can't memset host USM pointers.
     bool   is_host_ptr = false;

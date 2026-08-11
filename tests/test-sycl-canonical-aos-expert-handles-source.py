@@ -5,6 +5,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
 
 
 def function(text: str, signature: str) -> str:
@@ -53,8 +54,12 @@ def function(text: str, signature: str) -> str:
 def violations(source: str) -> list[str]:
     failures: list[str] = []
     publish = function(source, "static bool ggml_sycl_publish_backend_aos_expert_handles")
-    forget = function(source, "static void ggml_sycl_forget_backend_aos_expert_handles")
+    invalidate = function(source, "static void ggml_sycl_invalidate_backend_weight_mutation")
+    invalidate_buffer = function(source, "static void ggml_sycl_invalidate_backend_buffer_weights")
     setter = function(source, "static void ggml_backend_sycl_buffer_set_tensor")
+    memsetter = function(source, "static void ggml_backend_sycl_buffer_memset_tensor")
+    copier = function(source, "static bool ggml_backend_sycl_buffer_cpy_tensor")
+    clearer = function(source, "static void ggml_backend_sycl_buffer_clear")
     route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
@@ -70,10 +75,18 @@ def violations(source: str) -> list[str]:
         "exact range": "expert_handle.size() != expert_size" in publish,
         "stable identity": "!expert_handle.has_stable_owner_identity()" in publish,
         "canonical registration": "remember_moe_storage_handle" in publish,
-        "mutation withdrawal": "forget_moe_storage_handle_on_device" in forget,
+        "transaction prebuild": "replacement.reserve(expert_count)" in publish,
+        "transaction rollback": "had_previous" in publish and "catch (...)" in publish,
+        "mutation withdrawal": "forget_moe_storage_handle_on_device" in invalidate,
+        "mutation generation": "moe_expert_storage_generation" in invalidate,
+        "mutation cache invalidation": "ggml_sycl_drop_all_weight_cache_entries" in invalidate,
+        "whole buffer inventory": "ctx->tensor_extras" in invalidate_buffer,
+        "set invalidates": "ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor)" in setter,
+        "memset invalidates": "ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor)" in memsetter,
+        "copy invalidates": "ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst)" in copier,
+        "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
-        "withdraw before publish": "ggml_sycl_forget_backend_aos_expert_handles" in setter and
-                                   setter.find("ggml_sycl_forget_backend_aos_expert_handles") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
+        "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
         "resolver checks registered handles first": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("cache->resolve_expert"),
         "resolver retains canonical lease": "route.lease" in route and "std::move(handle)" in source,
         "resolver propagates ready event": "route.has_ready_event = stored->has_ready_event" in source,
@@ -97,6 +110,20 @@ def test_canonical_backend_aos_expert_handle_contract() -> None:
     assert not violations(source), violations(source)
 
 
+def test_real_sycl_owned_slice_lifecycle_is_registered() -> None:
+    test = function(LIFECYCLE_TEST.read_text(), "static bool test_canonical_owned_aos_slice_lifecycle")
+    for witness in (
+        "unified_alloc(req, &allocation)",
+        "mem_handle::from_owned_alloc",
+        "owner.slice(expert_bytes, expert_bytes)",
+        "expert.resolve(1)",
+        "unified_lookup(base, &lookup)",
+        "retained = {}",
+        "replacement_slice.stable_identity_hash() != old_identity",
+    ):
+        assert witness in test, witness
+
+
 def test_mutations_are_witnessed() -> None:
     source = SOURCE.read_text()
     mutations = [
@@ -107,6 +134,9 @@ def test_mutations_are_witnessed() -> None:
         source.replace("!expert_handle.has_stable_owner_identity()", "false", 1),
         source.replace("is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)",
                        "is_moe_expert && size > 0", 1),
-        source.replace("ggml_sycl_forget_backend_aos_expert_handles(ctx, tensor);", "", 1),
+        source.replace("ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor);", ""),
+        source.replace("ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst);", "", 1),
+        source.replace("ggml_sycl_invalidate_backend_buffer_weights(ctx);", "", 1),
+        source.replace("replacement.reserve(expert_count);", "", 1),
     ]
     assert all(violations(mutated) for mutated in mutations)
