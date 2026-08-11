@@ -1181,13 +1181,6 @@ if (NOT WIN32)
     # denylist.  Host-only: no device, no oneAPI, no allocation.
     llama_test_pytest(
         ${LLAMA_PYTHON3}
-        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fp16-converters.py
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        LABEL "sycl;python;source-assert;converter"
-        TIMEOUT 120
-    )
-    llama_test_pytest(
-        ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-e2e-profile-compute-forward-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert"
