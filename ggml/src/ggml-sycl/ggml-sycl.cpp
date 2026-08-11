@@ -72,14 +72,15 @@
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
 #endif
+#include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
+#include "execution-lifecycle.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
-#include "cpu-traits-support.hpp"
 #include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
@@ -96,9 +97,9 @@
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
+#include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
-#include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -111,7 +112,6 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "model-lifecycle.hpp"
-#include "execution-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
 
@@ -5199,9 +5199,8 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
 
         route.ptr           = resolved.ptr;
         route.owning_device = owning_device;
-        route.planned_alternate_admitted =
-            current_device_planned_alternate && owning_device == current_device &&
-            owning_device != route.planned_device;
+        route.planned_alternate_admitted = current_device_planned_alternate && owning_device == current_device &&
+                                           owning_device != route.planned_device;
         route.actual_layout = resolved.layout;
         route.tier          = resolved.on_device ? expert_resolve_tier::DEVICE_VRAM : expert_resolve_tier::HOST_PINNED;
         route.reason        = expert_resolve_reason::FOUND;
@@ -5222,9 +5221,9 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
 }
 
 static bool ggml_sycl_moe_plan_admits_current_alternate(const ggml_tensor *             tensor,
-                                                         int                             current_device,
-                                                         ggml_layout_mode                requested_layout,
-                                                         const expert_placement_result & placement) {
+                                                        int                             current_device,
+                                                        ggml_layout_mode                requested_layout,
+                                                        const expert_placement_result & placement) {
     if (!tensor || !placement.found() || !placement.on_device || placement.target_device == current_device) {
         return false;
     }
@@ -5271,8 +5270,8 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             if (route.planned_device_residency && route.planned_device >= 0 && route.planned_device != current_device) {
                 (void) ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device);
             }
-            current_device_planned_alternate = ggml_sycl_moe_plan_admits_current_alternate(
-                src0, current_device, requested_layout, placement);
+            current_device_planned_alternate =
+                ggml_sycl_moe_plan_admits_current_alternate(src0, current_device, requested_layout, placement);
         } else {
             route.plan_missing = true;
             route.reason       = expert_resolve_reason::NOT_FOUND;
@@ -5452,9 +5451,9 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
 
             route.ptr             = resolved.ptr;
             route.owning_device   = resolved.owning_device;
-            route.planned_alternate_admitted =
-                current_device_planned_alternate && resolved.owning_device == current_device &&
-                resolved.owning_device != route.planned_device;
+            route.planned_alternate_admitted = current_device_planned_alternate &&
+                                               resolved.owning_device == current_device &&
+                                               resolved.owning_device != route.planned_device;
             route.actual_layout   = resolved.actual_layout;
             route.tier            = resolved.tier;
             route.reason          = resolved.reason;
@@ -22999,17 +22998,28 @@ namespace ggml_sycl {
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
     switch (reason) {
-        case moe_batch_reject_reason::NONE:              return "none";
-        case moe_batch_reject_reason::INVALID_REQUEST:   return "invalid_request";
-        case moe_batch_reject_reason::ROUTE_UNAVAILABLE: return "route_unavailable";
-        case moe_batch_reject_reason::MISSING_HANDLE:    return "missing_handle";
-        case moe_batch_reject_reason::RAW_COMPAT_HANDLE: return "raw_compat_handle";
-        case moe_batch_reject_reason::UNSTABLE_IDENTITY: return "unstable_identity";
-        case moe_batch_reject_reason::STALE_HANDLE:      return "stale_handle";
-        case moe_batch_reject_reason::POINTER_MISMATCH:  return "pointer_mismatch";
-        case moe_batch_reject_reason::LAYOUT_MISMATCH:   return "layout_mismatch";
-        case moe_batch_reject_reason::WRONG_DEVICE:      return "wrong_device";
-        case moe_batch_reject_reason::PLAN_MISMATCH:     return "plan_mismatch";
+        case moe_batch_reject_reason::NONE:
+            return "none";
+        case moe_batch_reject_reason::INVALID_REQUEST:
+            return "invalid_request";
+        case moe_batch_reject_reason::ROUTE_UNAVAILABLE:
+            return "route_unavailable";
+        case moe_batch_reject_reason::MISSING_HANDLE:
+            return "missing_handle";
+        case moe_batch_reject_reason::RAW_COMPAT_HANDLE:
+            return "raw_compat_handle";
+        case moe_batch_reject_reason::UNSTABLE_IDENTITY:
+            return "unstable_identity";
+        case moe_batch_reject_reason::STALE_HANDLE:
+            return "stale_handle";
+        case moe_batch_reject_reason::POINTER_MISMATCH:
+            return "pointer_mismatch";
+        case moe_batch_reject_reason::LAYOUT_MISMATCH:
+            return "layout_mismatch";
+        case moe_batch_reject_reason::WRONG_DEVICE:
+            return "wrong_device";
+        case moe_batch_reject_reason::PLAN_MISMATCH:
+            return "plan_mismatch";
     }
     return "unknown";
 }
@@ -23025,9 +23035,9 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         // This is the single canonical resolver seam for both future decode and
         // prompt consumers.  No raw fallback or residency inference is allowed
         // below this point.
-        moe_expert_route route = ::ggml_sycl_resolve_moe_expert_route_for_dispatch(
-            src0, submit_device, expert_id, requested_layout, allow_materialize);
-        moe_batch_route normalized;
+        moe_expert_route route = ::ggml_sycl_resolve_moe_expert_route_for_dispatch(src0, submit_device, expert_id,
+                                                                                   requested_layout, allow_materialize);
+        moe_batch_route  normalized;
         switch (route.kind) {
             case moe_expert_route_kind::LOCAL_DEVICE:
                 normalized.residency = moe_batch_residency::PRIMARY_DEVICE;
@@ -23042,15 +23052,15 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 normalized.residency = moe_batch_residency::UNAVAILABLE;
                 break;
         }
-        normalized.transient_ptr     = route.ptr;
-        normalized.owning_device     = route.owning_device;
-        normalized.planned_device    = route.planned_device;
-        normalized.plan_found        = route.plan_found;
-        normalized.planned_on_device = route.planned_device_residency;
+        normalized.transient_ptr                    = route.ptr;
+        normalized.owning_device                    = route.owning_device;
+        normalized.planned_device                   = route.planned_device;
+        normalized.plan_found                       = route.plan_found;
+        normalized.planned_on_device                = route.planned_device_residency;
         normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted;
-        normalized.requested_layout  = route.requested_layout;
-        normalized.actual_layout     = route.actual_layout;
-        normalized.has_ready_event   = route.has_ready_event;
+        normalized.requested_layout                 = route.requested_layout;
+        normalized.actual_layout                    = route.actual_layout;
+        normalized.has_ready_event                  = route.has_ready_event;
         if (route.has_ready_event) {
             normalized.ready_event = route.ready_event;
         }
@@ -23061,7 +23071,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
 }
 
 bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) {
-    placement_plan plan;
+    placement_plan  plan;
     placement_entry entry;
     entry.name          = "blk.0.ffn_gate_exps.weight";
     entry.layer_id      = 0;
@@ -23073,8 +23083,7 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     entry.alternate_layouts.push_back({ GGML_LAYOUT_XMX_TILED, 64, 64, 0 });
     plan.entries.push_back(std::move(entry));
     plan.build_index();
-    const expert_placement_result placement =
-        plan.lookup_expert_placement("blk.0.ffn_gate_exps.weight", 6);
+    const expert_placement_result placement = plan.lookup_expert_placement("blk.0.ffn_gate_exps.weight", 6);
 
     const resolved_ptr leased = lease.resolve();
     if (!leased.ptr || !leased.on_device || leased.layout != GGML_LAYOUT_SOA || lease.device() != 0) {
@@ -23082,42 +23091,41 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     }
 
     ggml_tensor tensor{};
-    tensor.type = GGML_TYPE_Q8_0;
-    const bool admitted =
-        ggml_sycl_moe_plan_admits_current_alternate(&tensor, 0, GGML_LAYOUT_SOA, placement);
+    tensor.type         = GGML_TYPE_Q8_0;
+    const bool admitted = ggml_sycl_moe_plan_admits_current_alternate(&tensor, 0, GGML_LAYOUT_SOA, placement);
 
     moe_expert_route canonical;
-    canonical.kind                     = moe_expert_route_kind::LOCAL_DEVICE;
-    canonical.ptr                      = leased.ptr;
-    canonical.owning_device            = 0;
-    canonical.planned_device           = 1;
-    canonical.plan_found               = true;
-    canonical.planned_device_residency = true;
+    canonical.kind                       = moe_expert_route_kind::LOCAL_DEVICE;
+    canonical.ptr                        = leased.ptr;
+    canonical.owning_device              = 0;
+    canonical.planned_device             = 1;
+    canonical.plan_found                 = true;
+    canonical.planned_device_residency   = true;
     canonical.planned_alternate_admitted = admitted;
-    canonical.requested_layout         = GGML_LAYOUT_SOA;
-    canonical.actual_layout            = GGML_LAYOUT_SOA;
-    canonical.lease                    = std::move(lease);
+    canonical.requested_layout           = GGML_LAYOUT_SOA;
+    canonical.actual_layout              = GGML_LAYOUT_SOA;
+    canonical.lease                      = std::move(lease);
 
     moe_batch_route normalized;
-    normalized.residency        = moe_batch_residency::PRIMARY_DEVICE;
-    normalized.transient_ptr    = canonical.ptr;
-    normalized.owning_device    = canonical.owning_device;
-    normalized.planned_device   = canonical.planned_device;
-    normalized.plan_found       = canonical.plan_found;
-    normalized.planned_on_device = canonical.planned_device_residency;
-    normalized.requested_layout = canonical.requested_layout;
-    normalized.actual_layout    = canonical.actual_layout;
-    normalized.lease            = std::move(canonical.lease);
+    normalized.residency                        = moe_batch_residency::PRIMARY_DEVICE;
+    normalized.transient_ptr                    = canonical.ptr;
+    normalized.owning_device                    = canonical.owning_device;
+    normalized.planned_device                   = canonical.planned_device;
+    normalized.plan_found                       = canonical.plan_found;
+    normalized.planned_on_device                = canonical.planned_device_residency;
+    normalized.requested_layout                 = canonical.requested_layout;
+    normalized.actual_layout                    = canonical.actual_layout;
+    normalized.lease                            = std::move(canonical.lease);
     normalized.authoritative_planned_alternate_ = canonical.planned_alternate_admitted;
 
-    const int32_t ids[] = { 6 };
+    const int32_t                   ids[] = { 6 };
     const moe_resolved_batch_result result =
         build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return normalized; });
     return result && result.batch.operands.size() == 1 && result.batch.operands[0].planned_device == 1 &&
            result.batch.operands[0].owning_device == 0;
 }
 
-} // namespace ggml_sycl
+}  // namespace ggml_sycl
 
 static bool ggml_sycl_try_pp_local_moe_route(const ggml_tensor *                 src0,
                                              int                                 current_device,

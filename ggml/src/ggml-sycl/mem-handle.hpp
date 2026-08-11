@@ -355,8 +355,12 @@ class mem_handle {
     void tag_persistent_lease_site(const char * site) const;
 
   private:
-    friend mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id &, int, void *, ggml_layout_mode,
-                                                     bool, std::shared_ptr<void>);
+    friend mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id &,
+                                                    int,
+                                                    void *,
+                                                    ggml_layout_mode,
+                                                    bool,
+                                                    std::shared_ptr<void>);
 
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;
