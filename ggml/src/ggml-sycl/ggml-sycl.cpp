@@ -4632,6 +4632,9 @@ struct moe_expert_route {
     bool                  plan_found               = false;
     bool                  plan_missing             = false;
     bool                  planned_device_residency = false;
+    // Authoritative proof that resolution used an explicit placement-plan
+    // alternate on current_device rather than silently ignoring the primary.
+    bool                  owner_is_planned_alternate = false;
     ggml_layout_mode      planned_layout           = GGML_LAYOUT_AOS;
     ggml_layout_mode      requested_layout         = GGML_LAYOUT_AOS;
     ggml_layout_mode      actual_layout            = GGML_LAYOUT_AOS;
@@ -5196,6 +5199,9 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
 
         route.ptr           = resolved.ptr;
         route.owning_device = owning_device;
+        route.owner_is_planned_alternate =
+            device_planned && current_device_planned_alternate && owning_device == current_device &&
+            owning_device != route.planned_device;
         route.actual_layout = resolved.layout;
         route.tier          = resolved.on_device ? expert_resolve_tier::DEVICE_VRAM : expert_resolve_tier::HOST_PINNED;
         route.reason        = expert_resolve_reason::FOUND;
@@ -5441,6 +5447,9 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
 
             route.ptr             = resolved.ptr;
             route.owning_device   = resolved.owning_device;
+            route.owner_is_planned_alternate =
+                device_planned && current_device_planned_alternate && resolved.owning_device == current_device &&
+                resolved.owning_device != route.planned_device;
             route.actual_layout   = resolved.actual_layout;
             route.tier            = resolved.tier;
             route.reason          = resolved.reason;
@@ -23033,6 +23042,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         normalized.planned_device    = route.planned_device;
         normalized.plan_found        = route.plan_found;
         normalized.planned_on_device = route.planned_device_residency;
+        normalized.owner_is_planned_alternate = route.owner_is_planned_alternate;
         normalized.requested_layout  = route.requested_layout;
         normalized.actual_layout     = route.actual_layout;
         normalized.has_ready_event   = route.has_ready_event;

@@ -46,8 +46,11 @@ struct moe_batch_route {
     void *              transient_ptr    = nullptr;
     int                 owning_device    = -1;
     int                 planned_device   = -2;
-    bool                plan_found       = false;
+    bool                plan_found        = false;
     bool                planned_on_device = false;
+    // Set only by the canonical resolver after it has matched an explicit
+    // planner alternate for the submit device.
+    bool                owner_is_planned_alternate = false;
     ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
     ggml_layout_mode    actual_layout    = GGML_LAYOUT_AOS;
     size_t              byte_offset      = 0;
@@ -130,11 +133,15 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
     }
 
     if (route.plan_found) {
-        const bool plan_matches = route.planned_on_device ?
-                                      (route.planned_device >= 0 && !host &&
-                                       route.planned_device == route.owning_device) :
-                                      (route.planned_device == mem_handle::HOST_DEVICE && host);
-        if (!plan_matches) {
+        const bool primary_plan_matches = route.planned_on_device ?
+                                              (route.planned_device >= 0 && !host &&
+                                               route.planned_device == route.owning_device) :
+                                              (route.planned_device == mem_handle::HOST_DEVICE && host);
+        const bool explicit_alternate_matches =
+            route.owner_is_planned_alternate && route.planned_on_device && primary &&
+            route.owning_device == submit_device && route.planned_device >= 0 &&
+            route.planned_device != route.owning_device;
+        if (!primary_plan_matches && !explicit_alternate_matches) {
             return moe_batch_reject_reason::PLAN_MISMATCH;
         }
     }

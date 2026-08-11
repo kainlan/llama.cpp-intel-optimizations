@@ -13,10 +13,10 @@ static ggml_sycl_cache_id key_for(int id) {
     // Synthetic logical identity: deliberately independent of the backing
     // pointer so the test cannot accidentally bless pointer-derived identity.
     ggml_sycl_cache_id key{};
-    key.valid   = true;
-    key.model_id = 0x4d4f4500;
+    key.valid     = true;
+    key.model_id  = 0x4d4f4500;
     key.name_hash = static_cast<uint64_t>(id);
-    key.aux_id  = static_cast<uint64_t>(id);
+    key.aux_id    = static_cast<uint64_t>(id);
     return key;
 }
 
@@ -61,12 +61,36 @@ static bool test_host_primary_secondary_mixed_and_occurrences() {
     CHECK(result.batch.expert_ids == std::vector<int32_t>({ 1, 2, 1, 3 }));
     CHECK(result.batch.operands.size() == 4);
     CHECK(result.batch.operands[0].occurrence == 0 && result.batch.operands[2].occurrence == 2);
+    CHECK(result.batch.operands[1].token_index == 0 && result.batch.operands[1].slot_index == 1);
     CHECK(result.batch.operands[2].token_index == 1 && result.batch.operands[2].slot_index == 0);
+    CHECK(result.batch.operands[3].token_index == 1 && result.batch.operands[3].slot_index == 1);
     CHECK(result.batch.operands[0].requested_layout == GGML_LAYOUT_SOA);
     CHECK(result.batch.operands[0].actual_layout == GGML_LAYOUT_XMX_TILED);
     CHECK(result.batch.operands[1].residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE);
     CHECK(result.batch.operands[3].residency == ggml_sycl::moe_batch_residency::HOST);
     CHECK(result.batch.operands[0].lease.stable_identity_equal(result.batch.operands[2].lease));
+    return true;
+}
+
+static bool test_explicit_planned_alternate_on_submit_device() {
+    int alternate = 6;
+    const int32_t ids[] = { 6 };
+    auto result = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) {
+        auto route = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
+                               GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
+        route.planned_device             = 1;
+        route.owner_is_planned_alternate = true;
+        return route;
+    });
+    CHECK(result);
+    CHECK(result.batch.operands[0].owning_device == 0);
+    CHECK(result.batch.operands[0].planned_device == 1);
+
+    auto unproved = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
+                              GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
+    unproved.planned_device = 1;
+    CHECK(!ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0,
+                                                [&](int32_t) { return unproved; }));
     return true;
 }
 
@@ -86,6 +110,16 @@ static bool test_identity_sharing_and_ready_event() {
     CHECK(result.batch.operands[0].has_ready_event && result.batch.operands[1].has_ready_event);
     CHECK(result.batch.operands[0].lease.valid() && result.batch.operands[1].lease.valid());
     CHECK(result.batch.operands[0].lease.resolve().ptr == &shared);
+
+    int same_pointer = 5;
+    int identity = 11;
+    auto distinct = ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t) {
+        return route_for(&same_pointer, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
+                         GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, identity++);
+    });
+    CHECK(distinct);
+    CHECK(!distinct.batch.operands[0].lease.stable_identity_equal(distinct.batch.operands[1].lease));
+    CHECK(distinct.batch.operands[0].lease.resolve().ptr == distinct.batch.operands[1].lease.resolve().ptr);
     return true;
 }
 
@@ -114,6 +148,16 @@ static bool test_fail_closed_contract() {
     auto wrong_secondary = route_for(&value, 0, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE,
                                      GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     CHECK(run(wrong_secondary).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
+
+    auto primary_lease_mismatch = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
+                                            GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    primary_lease_mismatch.lease = weight_handle(&value, 1, GGML_LAYOUT_AOS, 7, true);
+    CHECK(run(primary_lease_mismatch).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
+
+    auto secondary_lease_mismatch = route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE,
+                                              GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    secondary_lease_mismatch.lease = weight_handle(&value, 2, GGML_LAYOUT_AOS, 7, true);
+    CHECK(run(secondary_lease_mismatch).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
     auto wrong_host = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST,
                                 GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
@@ -152,6 +196,7 @@ static bool test_fail_closed_contract() {
 
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() ||
+        !test_explicit_planned_alternate_on_submit_device() ||
         !test_identity_sharing_and_ready_event() || !test_fail_closed_contract()) {
         return 1;
     }

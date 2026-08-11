@@ -12,14 +12,18 @@ def violations(header: str, source: str) -> list[str]:
     required_header = {
         "copy IDs once": "out.batch.expert_ids.assign(ids, ids + count);",
         "occurrence preservation": "operand.occurrence       = i;",
-        "token/slot preservation": "operand.token_index      = i / slots_per_token;",
+        "token indexing": "operand.token_index      = i / slots_per_token;",
+        "slot indexing": "operand.slot_index       = i % slots_per_token;",
         "missing lease refusal": "return moe_batch_reject_reason::MISSING_HANDLE;",
         "DIRECT/raw compatibility refusal": "return moe_batch_reject_reason::RAW_COMPAT_HANDLE;",
         "stable owner identity": "route.lease.has_stable_owner_identity()",
         "transient pointer agreement": "resolved.ptr != route.transient_ptr",
         "actual layout agreement": "resolved.layout != route.actual_layout",
         "submit/owner policy": "route.owning_device != submit_device",
+        "primary lease device policy": "route.lease.device() != submit_device",
+        "secondary lease device policy": "route.lease.device() != route.owning_device",
         "planner/owner policy": "route.planned_device == route.owning_device",
+        "explicit alternate proof": "route.owner_is_planned_alternate && route.planned_on_device && primary",
         "ready event propagation": "operand.ready_event = route.ready_event;",
         "typed rejection": "moe_batch_reject_reason  reject",
         "stable-only sharing": "retained.stable_identity_equal(route.lease)",
@@ -28,6 +32,8 @@ def violations(header: str, source: str) -> list[str]:
         "canonical dispatch resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
         "canonical lease move": "normalized.lease         = std::move(route.lease);",
         "source reason propagation": "normalized.source_reason = static_cast<int>(route.reason);",
+        "planned alternate proof propagation":
+            "normalized.owner_is_planned_alternate = route.owner_is_planned_alternate;",
     }
     for name, needle in required_header.items():
         if needle not in header:
@@ -62,14 +68,24 @@ def test_contract_and_mutation_witnesses() -> None:
         "remove-pointer-check": ("header", "resolved.ptr != route.transient_ptr"),
         "remove-layout-check": ("header", "resolved.layout != route.actual_layout"),
         "remove-submit-owner-check": ("header", "route.owning_device != submit_device"),
+        "remove-primary-lease-device-check": ("header", "route.lease.device() != submit_device"),
+        "remove-secondary-lease-device-check": ("header", "route.lease.device() != route.owning_device"),
         "remove-plan-owner-check": ("header", "route.planned_device == route.owning_device"),
+        "remove-explicit-alternate-proof":
+            ("header", "route.owner_is_planned_alternate && route.planned_on_device && primary"),
         "remove-ready-event": ("header", "operand.ready_event = route.ready_event;"),
         "remove-stable-sharing": ("header", "retained.stable_identity_equal(route.lease)"),
         "bypass-canonical-resolver": ("source", "ggml_sycl_resolve_moe_expert_route_for_dispatch("),
         "drop-canonical-lease": ("source", "normalized.lease         = std::move(route.lease);"),
+        "drop-planned-alternate-proof":
+            ("source", "normalized.owner_is_planned_alternate = route.owner_is_planned_alternate;"),
     }
     for name, (which, needle) in mutations.items():
         assert (header if which == "header" else source).count(needle) >= 1, name
         mutant_header = header.replace(needle, "/* MUTATED */") if which == "header" else header
         mutant_source = source.replace(needle, "/* MUTATED */") if which == "source" else source
         assert violations(mutant_header, mutant_source), f"mutation survived: {name}"
+
+    slot_mutant = header.replace("operand.slot_index       = i % slots_per_token;",
+                                 "operand.slot_index       = 0;")
+    assert violations(slot_mutant, source), "mutation survived: force-slot-zero"
