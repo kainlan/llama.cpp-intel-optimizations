@@ -12,9 +12,9 @@ SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
 FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
-PLANNER_GUARD = "if (ggml_sycl_op_is_planned_on_host(op, device)) {"
+ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
+PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
-NEXT_EARLY_BRANCH = "if (g_moe_multi_gpu_active.load"
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
@@ -73,6 +73,8 @@ def decision_clauses(code: str):
             position += 1
         if position >= len(code):
             break
+        if re.match(r"else\b", code[position:]):
+            raise ValueError("else clauses are not valid decision-contract syntax")
         if re.match(r"if\b", code[position:]):
             condition_open = code.index("(", position + 2)
             condition_close = matching_delimiter(code, condition_open, "(", ")")
@@ -92,8 +94,12 @@ def decision_clauses(code: str):
             continue
         statement_end = code.index(";", position)
         statement = re.sub(r"\s+", "", code[position:statement_end])
+        if not statement:
+            raise ValueError("empty statement is not valid decision-contract syntax")
         if statement.startswith("return"):
             decisions.append(("return", statement[len("return") :]))
+        else:
+            decisions.append(("statement", statement))
         position = statement_end + 1
     return decisions
 
@@ -101,11 +107,15 @@ def decision_clauses(code: str):
 def expected_pre_guard_decisions():
     reject = (("return", "false"),)
     return [
+        ("statement", "structggml_tensor*a=op->src[0]"),
+        ("statement", "structggml_tensor*b=op->src[1]"),
         ("if", "a->ne[3]!=b->ne[3]", reject),
+        ("statement", "ggml_typea_type=a->type"),
         ("if", "ggml_is_quantized(a_type)&&(ggml_is_permuted(a)||!ggml_is_contiguous(a))", reject),
         ("if", "a_type==GGML_TYPE_Q4_0", (("if", "a->ne[2]!=b->ne[2]||a->ne[2]>2", reject),)),
         ("if", "a_type==GGML_TYPE_Q4_1&&b->ne[1]==1", reject),
         ("if", "a_type==GGML_TYPE_IQ4_NL||a_type==GGML_TYPE_IQ4_XS||a_type==GGML_TYPE_IQ3_XXS||a_type==GGML_TYPE_IQ3_S||a_type==GGML_TYPE_IQ2_XXS||a_type==GGML_TYPE_IQ2_XS||a_type==GGML_TYPE_IQ2_S||a_type==GGML_TYPE_IQ1_S||a_type==GGML_TYPE_IQ1_M", (("if", "b->ne[1]==1&&ggml_nrows(b)>1", reject),)),
+        ("statement", "ggml_typesrc0_type=op->src[0]->type"),
         ("if", "src0_type==GGML_TYPE_BF16", reject),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),
         ("if", "!ggml_is_permuted(a)&&ggml_is_permuted(b)&&b->ne[2]>1&&b->ne[3]>1&&a->ne[0]>128&&a->ne[2]==1&&src0_type==GGML_TYPE_F16", reject),
@@ -144,30 +154,36 @@ def contract(text: str) -> bool:
     try:
         function = supports_function(text)
         early, early_close, early_body = braced_body(function, EARLY_GUARD)
-        next_branch = function.index(NEXT_EARLY_BRANCH, early_close)
-        planner = function.index(PLANNER_GUARD)
+        router_flag = function.index(ROUTER_FLAG, early_close)
+        planner, planner_close, planner_body = braced_body(function, PLANNER_GUARD)
         switch = function.index(OP_SWITCH)
         allowed_types, default_type_support = mul_mat_type_policy(text)
         _, _, type_helper_body = braced_body(text, TYPE_HELPER_START)
-    except ValueError:
+
+        switch_body = function[switch:]
+        mul_mat_start = switch_body.index("case GGML_OP_MUL_MAT:")
+        mul_mat_end = switch_body.index("case GGML_OP_OUT_PROD:", mul_mat_start)
+        mul_mat_case = switch_body[mul_mat_start:mul_mat_end]
+        case_body_open = mul_mat_case.index("{")
+        type_guard = "if (!ggml_sycl_mul_mat_type_supported(a_type)) {"
+        type_guard_start, _, type_guard_body = braced_body(mul_mat_case, type_guard)
+        pre_guard_decisions = decision_clauses(mul_mat_case[case_body_open + 1 : type_guard_start])
+    except (IndexError, ValueError):
         return False
 
-    switch_body = function[switch:]
-    mul_mat_start = switch_body.index("case GGML_OP_MUL_MAT:")
-    mul_mat_end = switch_body.index("case GGML_OP_OUT_PROD:", mul_mat_start)
-    mul_mat_case = switch_body[mul_mat_start:mul_mat_end]
-    case_body_open = mul_mat_case.index("{")
-    type_guard = "if (!ggml_sycl_mul_mat_type_supported(a_type)) {"
-    try:
-        type_guard_start, _, type_guard_body = braced_body(mul_mat_case, type_guard)
-    except ValueError:
-        return False
+    router_residency_exception = executable_body(function[early_close + 1 : planner])
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
-        early < early_close < next_branch < planner < switch
+        early < early_close < router_flag < planner < planner_close < switch
         and executable_body(early_body) == "returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
+        and router_residency_exception ==
+            "constboolis_multi_gpu_router_logits="
+            "g_moe_multi_gpu_active.load(std::memory_order_acquire)&&"
+            "ggml_sycl_op_is_moe_router_logits_matmul(op);"
+        and executable_body(planner_body).endswith("returnfalse;")
+        and "returntrue;" not in executable_body(planner_body)
         and later_indexed_case is None
         and len(re.findall(r"\bcase\s+GGML_OP_MUL_MAT\s*:", switch_body)) == 1
         and "op->op == GGML_OP_MUL_MAT" not in mul_mat_case
@@ -175,12 +191,22 @@ def contract(text: str) -> bool:
         and not default_type_support
         and helper_labels_flow_to_shared_true(type_helper_body)
         and mul_mat_case.count(type_guard) == 1
-        and Counter(decision_clauses(mul_mat_case[case_body_open + 1 : type_guard_start])) ==
-            Counter(expected_pre_guard_decisions())
+        and Counter(pre_guard_decisions) == Counter(expected_pre_guard_decisions())
         and executable_body(type_guard_body) == "returnfalse;"
         and executable_body(mul_mat_case[type_guard_start:]) ==
             "if(!ggml_sycl_mul_mat_type_supported(a_type)){returnfalse;}returntrue;}"
     )
+
+
+def modeled_router_mul_mat_support(text: str, type_name: str, planned_on_host: bool) -> bool:
+    """Host-only model of the validated router path after the source contract is locked."""
+    if not contract(text):
+        return False
+    # Router logits bypass only this planner-residency rejection, then enter MUL_MAT.
+    is_multi_gpu_router_logits = True
+    if planned_on_host and not is_multi_gpu_router_logits:
+        return False
+    return mul_mat_type_supported(text, type_name)
 
 
 def replace_in_supports_function(text: str, old: str, new: str) -> str:
@@ -201,6 +227,44 @@ def replace_in_type_helper(text: str, old: str, new: str) -> str:
 
 def test_indexed_moe_early_return_is_the_only_capability_decision() -> None:
     assert contract(SOURCE)
+
+
+def test_router_logits_bypass_only_planner_then_obey_dense_type_policy() -> None:
+    assert not modeled_router_mul_mat_support(SOURCE, "FUTURE_UNKNOWN_TYPE", planned_on_host=True)
+    assert not modeled_router_mul_mat_support(SOURCE, "NVFP4", planned_on_host=True)
+    for supported in ("F32", "Q8_0", "MXFP4"):
+        assert modeled_router_mul_mat_support(SOURCE, supported, planned_on_host=True)
+        assert modeled_router_mul_mat_support(SOURCE, supported, planned_on_host=False)
+
+
+def test_router_logits_control_flow_mutations_are_rejected() -> None:
+    declaration = (
+        "    const bool is_multi_gpu_router_logits =\n"
+        "        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "ggml_sycl_op_is_moe_router_logits_matmul(op);\n\n"
+    )
+    old_early_success = (
+        "    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "ggml_sycl_op_is_moe_router_logits_matmul(op)) {\n"
+        "        return true;\n"
+        "    }\n\n"
+    )
+    assert not contract(replace_in_supports_function(SOURCE, declaration, old_early_success))
+
+    no_exception = replace_in_supports_function(
+        SOURCE,
+        PLANNER_GUARD,
+        "if (ggml_sycl_op_is_planned_on_host(op, device)) {",
+    )
+    assert not contract(no_exception)
+
+    all_ops_bypass_planner = replace_in_supports_function(
+        SOURCE,
+        "const bool is_multi_gpu_router_logits =\n        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "ggml_sycl_op_is_moe_router_logits_matmul(op);",
+        "const bool is_multi_gpu_router_logits = true;",
+    )
+    assert not contract(all_ops_bypass_planner)
 
 
 def test_dense_mul_mat_type_policy_fails_closed() -> None:
@@ -252,6 +316,19 @@ def test_dense_mul_mat_type_policy_mutations_are_rejected() -> None:
     for injected in pre_guard_mutations:
         mutated = replace_in_supports_function(SOURCE, type_guard, injected + type_guard)
         assert not contract(mutated)
+
+
+def test_decision_parser_rejects_else_and_unknown_statements() -> None:
+    first_rejection = (
+        "                if (a->ne[3] != b->ne[3]) {\n"
+        "                    return false;\n"
+        "                }"
+    )
+    else_success = first_rejection + " else { return true; }"
+    assert not contract(replace_in_supports_function(SOURCE, first_rejection, else_success))
+
+    unknown_statement = first_rejection + "\n                audit_router_shape();"
+    assert not contract(replace_in_supports_function(SOURCE, first_rejection, unknown_statement))
 
 
 def test_removing_only_early_return_is_rejected() -> None:

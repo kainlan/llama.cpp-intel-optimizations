@@ -98677,15 +98677,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         // planner placed some backing table in host-pinned memory.
         return true;
     }
-    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op)) {
-        // Explicit multi-GPU MoE keeps routing tensors in the SYCL/unified-cache
-        // domain.  CPU routing is a single-device host-placement optimization;
-        // cross-device expert dispatch needs device-produced top-k IDs and
-        // logits to stay ordered with the smart handles that consume them.
-        return true;
-    }
+    // Explicit multi-GPU MoE keeps routing tensors in the SYCL/unified-cache
+    // domain.  CPU routing is a single-device host-placement optimization;
+    // cross-device expert dispatch needs device-produced top-k IDs and logits
+    // to stay ordered with the smart handles that consume them.  This exception
+    // applies only to planner residency; normal MUL_MAT validation still applies.
+    const bool is_multi_gpu_router_logits =
+        g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op);
 
-    if (ggml_sycl_op_is_planned_on_host(op, device)) {
+    if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
                         op && op->name[0] != '\0' ? op->name : "(unnamed)", ggml_op_name(op->op),
                         ggml_sycl_extract_planned_layer_id(op));
