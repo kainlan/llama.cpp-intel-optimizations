@@ -48,7 +48,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                 const ggml_tensor *         src1,
                                 const ggml_tensor *         ids,
                                 ggml_tensor *               dst,
-                                const layout_mode *         forced_layout = nullptr);
+                                const layout_mode *         forced_layout        = nullptr,
+                                const void * const *        retained_expert_ptrs = nullptr,
+                                const sycl::event *         retained_table_event = nullptr);
 
 #ifdef GGML_SYCL_GRAPH
 // Pre-allocate Q8_1 buffers for MoE graph recording

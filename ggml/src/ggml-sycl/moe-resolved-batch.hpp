@@ -7,6 +7,7 @@
 
 #include "mem-handle.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -99,7 +100,75 @@ struct moe_resolved_batch {
     size_t                            slots_per_token = 0;
     std::vector<int32_t>              expert_ids;
     std::vector<moe_resolved_operand> operands;
+
+    // Returns the retained operand for an exact token/slot occurrence.  Prompt
+    // executors must not look the expert up again: this occurrence is the
+    // routing and ownership authority for the submit.
+    const moe_resolved_operand * occurrence(size_t token_index, size_t slot_index) const {
+        if (slots_per_token == 0 || slot_index >= slots_per_token) {
+            return nullptr;
+        }
+        const size_t index = token_index * slots_per_token + slot_index;
+        return index < operands.size() ? &operands[index] : nullptr;
+    }
 };
+
+struct moe_batch_local_view {
+    std::vector<int32_t>     expert_ids;
+    std::vector<void *>      expert_ptrs;
+    std::vector<mem_handle>  leases;
+    std::vector<sycl::event> ready_events;
+    moe_batch_reject_reason  reject     = moe_batch_reject_reason::NONE;
+    size_t                   occurrence = 0;
+
+    explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
+};
+
+// Metadata-only local-executor preflight. Pointer payloads are derived from
+// the retained handles at submit time; repeated occurrences are preserved in
+// the batch and table entries are deduplicated only when expert ID and stable
+// handle identity agree. Conflicting identities fail closed.
+inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+    moe_batch_local_view out;
+    for (const moe_resolved_operand & operand : batch.operands) {
+        if (operand.residency != moe_batch_residency::PRIMARY_DEVICE || operand.owning_device != batch.submit_device ||
+            operand.actual_layout != layout) {
+            out.reject     = operand.actual_layout != layout ? moe_batch_reject_reason::LAYOUT_MISMATCH :
+                                                               moe_batch_reject_reason::WRONG_DEVICE;
+            out.occurrence = operand.occurrence;
+            return out;
+        }
+        resolved_ptr resolved = operand.lease.resolve(batch.submit_device);
+        if (!resolved.ptr) {
+            out.reject     = moe_batch_reject_reason::STALE_HANDLE;
+            out.occurrence = operand.occurrence;
+            return out;
+        }
+        if (!resolved.on_device || resolved.layout != layout) {
+            out.reject     = resolved.layout != layout ? moe_batch_reject_reason::LAYOUT_MISMATCH :
+                                                         moe_batch_reject_reason::WRONG_DEVICE;
+            out.occurrence = operand.occurrence;
+            return out;
+        }
+        auto existing = std::find(out.expert_ids.begin(), out.expert_ids.end(), operand.expert_id);
+        if (existing != out.expert_ids.end()) {
+            const size_t index = static_cast<size_t>(existing - out.expert_ids.begin());
+            if (!out.leases[index].stable_identity_equal(operand.lease)) {
+                out.reject     = moe_batch_reject_reason::POINTER_MISMATCH;
+                out.occurrence = operand.occurrence;
+                return out;
+            }
+        } else {
+            out.expert_ids.push_back(operand.expert_id);
+            out.expert_ptrs.push_back(resolved.ptr);
+            out.leases.push_back(operand.lease);
+        }
+        if (operand.has_ready_event) {
+            out.ready_events.push_back(operand.ready_event);
+        }
+    }
+    return out;
+}
 
 enum class moe_batch_executor : uint8_t {
     HOST_CPU,

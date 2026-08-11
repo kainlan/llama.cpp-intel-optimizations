@@ -85,6 +85,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "const ggml_sycl::moe_resolved_batch & decode_batch = retained_decode_batch_result.batch",
         "main canonical batch consumer":
             "retained_decode_batch_result.batch.operands[occurrence]",
+        "prompt ID snapshot": "std::vector<int32_t> prompt_ids_snapshot",
+        "prompt retained admission": "retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(",
+        "prompt graph recording refusal":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt batch cannot enter graph sink\")",
+        "prompt admission failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt admission failed\")",
+        "batch-only transient table": "ggml_sycl_upload_moe_ptr_table_from_batch(",
+        "grouped prompt occurrence lookup": "prompt_batch.occurrence(iid1, id)",
+        "XMX retained executor API": "const ggml_sycl::moe_resolved_batch & batch",
+        "MMVQ retained pointer submit": "retained_ptrs, retained_table_event_set",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -131,20 +141,26 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     function_start = source.index("static void ggml_sycl_mul_mat_id(")
     function_end = source.index("static bool ggml_sycl_compute_forward", function_start)
     mmid = source[function_start:function_end]
+    prompt_admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;")
+    specialized_selection = mmid.index("const bool cpu_tg_candidate", prompt_admission)
     admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;")
     route_mode = mmid.index("const bool selected_hybrid_route", admission)
     dispatch_gate = mmid.index("if (moe_hybrid_with_plan)")
 
-    # Exact structural contract: ID snapshot precedes exactly one admission;
-    # route-mode selection and every retained dispatch branch follow it.
-    if mmid.count("ggml_sycl::ggml_sycl_build_moe_resolved_batch(") != 1:
+    # Prompt and decode each have one occurrence admission. Prompt admission is
+    # before every specialized selector; decode remains before route mode.
+    if mmid.count("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(") != 1:
+        failures.append("prompt has exactly one retained admission")
+    if mmid.count("retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(") != 1:
         failures.append("decode has exactly one retained admission")
+    if not prompt_admission < specialized_selection < admission:
+        failures.append("prompt specialized selection precedes admission")
     if mmid.index('pp_phase_log("ids-ready"') >= admission:
         failures.append("decode admission precedes ID snapshot")
     if not admission < route_mode < dispatch_gate:
         failures.append("decode route/dispatch precedes admission")
-    if mmid[:admission].count("if (ne12 == 1) {") != 0:
-        failures.append("decode branch exists before admission")
+    if mmid[prompt_admission:admission].count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
+        failures.append("prompt IDs are not snapshotted exactly once")
     if mmid.count("append_retained_decode_operand(") != 2:
         failures.append("both decode routers share retained dispatch helper")
 

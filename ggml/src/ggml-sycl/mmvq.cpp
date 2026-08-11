@@ -20060,7 +20060,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                 const ggml_tensor *         src1,
                                 const ggml_tensor *         ids,
                                 ggml_tensor *               dst,
-                                const layout_mode *         forced_layout) {
+                                const layout_mode *         forced_layout,
+                                const void * const *        retained_expert_ptrs,
+                                const sycl::event *         retained_table_event) {
     GGML_SYCL_DEBUG("[MMVQ-ENTRY] src0=%s type=%d forced_layout=%d\n", src0->name ? src0->name : "?", src0->type,
                     forced_layout ? (int) *forced_layout : -1);
     // Early batch size check — route large PP batches to the per-expert batched
@@ -20181,7 +20183,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     // MXFP4 MoE supports SoA/Coalesced layouts via unified cache staging + device ptr tables.
     // Enable ptr_table when host weights need staging OR when MoE reorder dispatch
     // needs the expert cache to produce reordered per-expert data from AOS base tensor.
-    const bool use_ptr_table = host_weights || mxfp4_moe_reorder_dispatch;
+    const bool use_ptr_table = retained_expert_ptrs || host_weights || mxfp4_moe_reorder_dispatch;
     if (mxfp4_moe_reorder_dispatch) {
         GGML_SYCL_DEBUG("[MMVQ] MXFP4 MoE reorder dispatch: layout=%d use_ptr_table=1 for %s\n", (int) layout,
                         src0->name ? src0->name : "?");
@@ -20278,12 +20280,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     ggml_sycl::mem_handle src1_handle =
         mxfp4_moe_tensor_mem_handle(src1, ctx.device, const_cast<float *>(src1_d), GGML_LAYOUT_AOS, true);
 
-    const void * const * expert_ptrs = nullptr;
+    const void * const * expert_ptrs = retained_expert_ptrs;
     std::vector<void *>  expert_ptr_payload;
-    sycl::event          table_event;
-    bool                 has_table_event            = false;
+    sycl::event          table_event                = retained_table_event ? *retained_table_event : sycl::event{};
+    bool                 has_table_event            = retained_table_event != nullptr;
     bool                 ptr_table_full_device_view = false;
-    if (use_ptr_table) {
+    if (use_ptr_table && !retained_expert_ptrs) {
         if (g_ggml_sycl_graph_recording) {
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
                 expert_ptrs = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));

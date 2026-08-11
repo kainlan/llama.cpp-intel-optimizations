@@ -258,6 +258,41 @@ static bool test_fail_closed_contract() {
     return true;
 }
 
+static bool test_prompt_local_view_uses_exact_retained_handles() {
+    int           first  = 21;
+    int           second = 22;
+    const int32_t ids[]  = { 3, 3, 4, 3 };
+    auto          result = ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
+        return route_for(id == 3 ? &first : &second, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
+                         GGML_LAYOUT_SOA, id);
+    });
+    CHECK(result);
+    CHECK(result.batch.occurrence(0, 0) == &result.batch.operands[0]);
+    CHECK(result.batch.occurrence(1, 1) == &result.batch.operands[3]);
+    CHECK(result.batch.occurrence(2, 0) == nullptr);
+
+    auto view = ggml_sycl::make_moe_batch_local_view(result.batch, GGML_LAYOUT_SOA);
+    CHECK(view);
+    CHECK(view.expert_ids == std::vector<int32_t>({ 3, 4 }));
+    CHECK(view.expert_ptrs == std::vector<void *>({ &first, &second }));
+    CHECK(view.leases.size() == 2);
+    CHECK(view.leases[0].stable_identity_equal(result.batch.operands[0].lease));
+    CHECK(view.leases[1].stable_identity_equal(result.batch.operands[2].lease));
+
+    auto wrong_layout = ggml_sycl::make_moe_batch_local_view(result.batch, GGML_LAYOUT_AOS);
+    CHECK(!wrong_layout && wrong_layout.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
+
+    int  identity    = 30;
+    auto conflicting = ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
+        return route_for(id == 3 ? &first : &second, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
+                         GGML_LAYOUT_SOA, identity++);
+    });
+    CHECK(conflicting);
+    auto conflict_view = ggml_sycl::make_moe_batch_local_view(conflicting.batch, GGML_LAYOUT_SOA);
+    CHECK(!conflict_view && conflict_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
+    return true;
+}
+
 static bool test_decode_admission_is_route_mode_independent() {
     int           local = 13;
     const int32_t ids[] = { 2, 2 };
@@ -295,7 +330,8 @@ static bool test_decode_admission_is_route_mode_independent() {
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
-        !test_fail_closed_contract() || !test_decode_admission_is_route_mode_independent()) {
+        !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
+        !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");

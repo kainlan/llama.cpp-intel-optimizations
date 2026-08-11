@@ -48147,6 +48147,29 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
 }
 
+static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch(ggml_backend_sycl_context &           ctx,
+                                                                      const ggml_tensor *                   src0,
+                                                                      const ggml_sycl::moe_resolved_batch & batch,
+                                                                      int                                   layer_hash,
+                                                                      layout_mode                           layout,
+                                                                      sycl::event * table_event_out = nullptr,
+                                                                      bool *        table_event_set = nullptr) {
+    const ggml_sycl::moe_batch_local_view view = ggml_sycl::make_moe_batch_local_view(batch, layout);
+    if (!view) {
+        return nullptr;
+    }
+    std::vector<moe_layer_transient_ptr_table_slot> slots;
+    slots.reserve(view.expert_ids.size());
+    for (size_t i = 0; i < view.expert_ids.size(); ++i) {
+        moe_layer_transient_ptr_table_slot slot;
+        slot.expert_id = view.expert_ids[i];
+        slot.handle    = view.leases[i];
+        slots.push_back(std::move(slot));
+    }
+    return ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, slots, layer_hash, layout, &view.ready_events,
+                                                    table_event_out, table_event_set);
+}
+
 // Populate the pointer-table mem_handle for GPU-routed experts in the fusion path.
 // Raw pointers are derived from mem_handles only for this transient kernel ABI.
 static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_context & ctx,
@@ -57420,57 +57443,46 @@ struct mmid_row_mapping {
 struct fused_moe_route_validation {
     bool                               ok     = false;
     const char *                       reason = "not-validated";
+    const void *                       contiguous_base = nullptr;
     std::vector<ggml_sycl::mem_handle> leases;
     std::vector<sycl::event>           ready_events;
 };
 
-static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(ggml_backend_sycl_context & ctx,
-                                                                      const ggml_tensor *         src0,
-                                                                      const ggml_tensor *         ids,
+static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(const ggml_tensor *                   src0,
+                                                                      const ggml_sycl::moe_resolved_batch & batch,
                                                                       layout_mode                 layout) {
     fused_moe_route_validation validation;
-    if (!src0 || !ids) {
+    if (!src0 || batch.operands.empty()) {
         validation.reason = "invalid-request";
         return validation;
     }
-
-    std::vector<int32_t> ids_host_vec;
-    if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host_vec)) {
-        validation.reason = "ids-host-copy";
-        return validation;
-    }
-
-    std::vector<uint8_t> checked(static_cast<size_t>(std::max<int64_t>(src0->ne[2], 0)), 0);
-    for (int32_t expert_id : ids_host_vec) {
-        if (expert_id < 0 || expert_id >= src0->ne[2]) {
-            validation.reason = "expert-id-range";
+    // The legacy fused ABI takes one contiguous base. Only admit retained
+    // handles that prove that exact base+expert-stride address contract.
+    for (const auto & operand : batch.operands) {
+        if (operand.expert_id < 0 || operand.expert_id >= src0->ne[2] ||
+            operand.residency != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE || operand.actual_layout != layout) {
+            validation.reason = "non-local-or-layout";
             return validation;
         }
-        if (checked[static_cast<size_t>(expert_id)] != 0) {
-            continue;
-        }
-        checked[static_cast<size_t>(expert_id)] = 1;
-
-        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, ctx.device, expert_id, layout,
-                                                                    /*allow_materialize=*/false);
-        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr) {
-            validation.reason = "non-local-route";
+        const auto resolved = operand.lease.resolve(batch.submit_device);
+        if (!resolved.ptr) {
+            validation.reason = "stale-handle";
             return validation;
         }
-        if (route.actual_layout != layout) {
-            validation.reason = "layout-mismatch";
+        const auto * candidate_base =
+            static_cast<const char *>(resolved.ptr) - static_cast<size_t>(operand.expert_id) * src0->nb[2];
+        if (validation.contiguous_base && validation.contiguous_base != candidate_base) {
+            validation.reason = "non-contiguous-handles";
             return validation;
         }
-        if (route.has_ready_event) {
-            validation.ready_events.push_back(route.ready_event);
-        }
-        if (route.lease.valid()) {
-            validation.leases.push_back(std::move(route.lease));
+        validation.contiguous_base = candidate_base;
+        validation.leases.push_back(operand.lease);
+        if (operand.has_ready_event) {
+            validation.ready_events.push_back(operand.ready_event);
         }
     }
-
-    validation.ok     = true;
-    validation.reason = "ok";
+    validation.ok     = validation.contiguous_base != nullptr;
+    validation.reason = validation.ok ? "ok" : "empty";
     return validation;
 }
 
@@ -57554,11 +57566,11 @@ static void init_moe_debug() {
 // Try fused MoE ESIMD kernel for batched prefill (ne12 > 1)
 // Returns true if handled, false to fall back to other implementations
 static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
-
                                        const ggml_tensor * src0,
                                        const ggml_tensor * src1,
                                        const ggml_tensor * ids,
-                                       ggml_tensor *       dst) {
+                                       ggml_tensor *                         dst,
+                                       const ggml_sycl::moe_resolved_batch & batch) {
 #if SYCL_ESIMD_MOE_AVAILABLE
     static bool fused_moe_disabled = (std::getenv("GGML_SYCL_DISABLE_FUSED_MOE") != nullptr);
 
@@ -57637,31 +57649,9 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
     const layout_mode use_layout =
         (src0->type == GGML_TYPE_MXFP4 && layout == GGML_LAYOUT_SOA) ? GGML_LAYOUT_SOA : GGML_LAYOUT_AOS;
 
-    auto resolved_fused = ggml_sycl_resolve(src0, ctx.device);
-    // Fused kernel only supports AOS and MXFP4 SOA — reject incompatible layouts
-    if (resolved_fused && resolved_fused.layout != use_layout) {
-        if (use_layout == GGML_LAYOUT_AOS) {
-            // Need AOS but cache returned reordered — cannot use
-            resolved_fused = {};
-        } else if (resolved_fused.layout != GGML_LAYOUT_SOA) {
-            // Need SOA but got something else (e.g. COALESCED)
-            resolved_fused = {};
-        }
-    }
-    const void * src0_weight_ptr = resolved_fused.ptr;
-    if (!src0_weight_ptr) {
-        GGML_SYCL_DEBUG("[MoE FUSED] No device layout ptr for %s (host_weights=%d, layout=%d)\n", src0->name,
-                        (int) host_weights, (int) use_layout);
-        return false;
-    }
-    if (ggml_sycl_get_alloc_type(src0_weight_ptr) != sycl::usm::alloc::device) {
-        GGML_SYCL_DEBUG("[MoE FUSED] Full tensor layout for %s is not device USM, falling back\n", src0->name);
-        return false;
-    }
-
-    // Verify that all routed experts are device-resident before committing to
-    // the fused kernel, which uses contiguous base+stride addressing.
-    fused_moe_route_validation fused_routes = ggml_sycl_validate_fused_moe_routes(ctx, src0, ids, use_layout);
+    // Verify the exact admitted handles before committing to the contiguous
+    // fused ABI. No composite tensor resolve or second route acquisition occurs.
+    fused_moe_route_validation fused_routes = ggml_sycl_validate_fused_moe_routes(src0, batch, use_layout);
     if (!fused_routes.ok) {
         GGML_SYCL_DEBUG("[MoE FUSED] Route validation failed for %s: %s\n", src0->name ? src0->name : "?",
                         fused_routes.reason);
@@ -57670,6 +57660,7 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
     if (!fused_routes.ready_events.empty()) {
         stream->ext_oneapi_submit_barrier(fused_routes.ready_events);
     }
+    const void * src0_weight_ptr = fused_routes.contiguous_base;
 
     // Calculate parameters
     const int64_t num_experts = ne02;        // Number of experts
@@ -57941,8 +57932,8 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
                                const ggml_tensor *         src0,
                                const ggml_tensor *         src1,
                                const ggml_tensor *         ids,
-
-                               ggml_tensor * dst) {
+                               ggml_tensor *                         dst,
+                               const ggml_sycl::moe_resolved_batch & batch) {
     GGML_SYCL_DEBUG("[XMX-DEBUG] try_xmx_sorted_moe called: src0->type=%d\n", src0->type);
 #if SYCL_XMX_MOE_AVAILABLE
     auto reject_xmx = [&](const char * reason) -> bool {
@@ -58021,6 +58012,10 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         GGML_SYCL_DEBUG("[XMX MoE] Required layout %d unavailable for %s\n", (int) target_layout, src0->name);
         return reject_xmx("layout-unavailable");
     }
+    const ggml_sycl::moe_batch_local_view retained_xmx_view = ggml_sycl::make_moe_batch_local_view(batch, layout);
+    if (!retained_xmx_view) {
+        return reject_xmx("retained-batch-layout-or-residency");
+    }
     const bool   is_soa       = (layout == GGML_LAYOUT_SOA);
     const bool   is_coalesced = (layout == GGML_LAYOUT_COALESCED);
     const bool   is_tiled     = (layout == GGML_LAYOUT_XMX_TILED);
@@ -58096,16 +58091,10 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
     if (g_ggml_sycl_graph_recording && ids->buffer && ggml_backend_buffer_is_host(ids->buffer)) {
         stream->ext_oneapi_submit_barrier({ ids_copy_event });
     }
-    void * src0_layout_ptr = nullptr;
-
-    if (!host_weights) {
-        auto resolved_xmx = ggml_sycl_resolve(src0, ctx.device);
-        // XMX MoE requires an exact layout match (SOA or XMX_TILED)
-        if (resolved_xmx && resolved_xmx.layout == layout) {
-            src0_layout_ptr = resolved_xmx.ptr;
-        }
-    }
-    const bool           use_ptr_table = (src0_layout_ptr == nullptr);
+    // XMX receives only the transient pointer table derived from the admitted
+    // batch. A composite tensor resolve is not an ownership authority.
+    void *               src0_layout_ptr = nullptr;
+    const bool           use_ptr_table   = true;
     std::vector<void *>  expert_ptrs_payload;
     const void * const * expert_ptrs_host   = nullptr;
     const void * const * expert_ptrs_device = nullptr;
@@ -58116,15 +58105,13 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
             // force_cache_aos=host_weights ensures experts are staged to GPU memory even for AoS layout.
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels.
             // XMX kernels cannot consume host-routed experts, so selected experts must be staged instead of skipped.
-            if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event,
-                                                moe_ptr_table_coverage::SELECTED_IDS, nullptr, false,
-                                                /*force_cache_aos=*/host_weights,
-                                                /*skip_cpu_routed_experts=*/false,
-                                                /*exact_layout_required=*/false)) {
-                GGML_SYCL_DEBUG("[XMX MoE] Failed to update expert pointer table for %s\n", src0->name);
-                return reject_xmx("ptr-table-update");
+            bool table_event_set = false;
+            if (!ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, moe_cache_layer_id(src0->name), layout,
+                                                           &table_event, &table_event_set)) {
+                GGML_SYCL_DEBUG("[XMX MoE] Failed to upload retained expert pointer table for %s\n", src0->name);
+                return reject_xmx("retained-ptr-table-upload");
             }
-            has_table_event = true;
+            has_table_event = table_event_set;
         }
         if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES &&
             ggml_sycl_build_moe_ptr_payload_from_handles(
@@ -58158,21 +58145,8 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
     bool ptr_table_selected_device = true;
 
     if (use_ptr_table && expert_ptrs_host) {
-        std::vector<int32_t> selected_ids;
-        bool                 have_selected_ids = false;
-        if (!g_ggml_sycl_graph_recording) {
-            const int blk_id = parse_layer_id_from_name(src0->name ? src0->name : "");
-            if (blk_id >= 0) {
-                auto it = g_moe_layer_ids_cache.find(blk_id);
-                if (it != g_moe_layer_ids_cache.end() && !it->second.ids_host.empty()) {
-                    selected_ids      = it->second.ids_host;
-                    have_selected_ids = true;
-                }
-            }
-            if (!have_selected_ids) {
-                have_selected_ids = ggml_sycl_copy_ids_to_host(ctx, ids, selected_ids);
-            }
-        }
+        const std::vector<int32_t> & selected_ids      = batch.expert_ids;
+        const bool                   have_selected_ids = !selected_ids.empty();
 
         if (have_selected_ids) {
             const size_t         ptr_count     = expert_ptrs_payload.size();
@@ -58719,6 +58693,12 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         }
 
         cleanup_all();
+        std::vector<ggml_sycl::mem_handle> retained;
+        retained.reserve(batch.operands.size());
+        for (const auto & operand : batch.operands) {
+            retained.push_back(operand.lease);
+        }
+        ggml_sycl::retain_handles_until_event(std::move(retained), stream->ext_oneapi_submit_barrier());
         GGML_SYCL_DEBUG("[XMX MoE] XMX sorted kernel completed\n");
         return true;
     };
@@ -61604,6 +61584,41 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     layout_mode override_layout    = GGML_LAYOUT_AOS;
     const bool  has_override       = ggml_sycl_layout_override_active(override_layout);
+
+    // Prompt IDs and routes are admitted exactly once, before any specialized
+    // executor selection. Graph replay cannot retain these handles yet, so an
+    // affected recording is failed and retried as direct execution.
+    std::vector<int32_t>                 prompt_ids_snapshot;
+    ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;
+    layout_mode                          retained_prompt_layout = GGML_LAYOUT_AOS;
+    if (ne12 != 1) {
+        ctx.moe_graphs_disabled_once = true;
+        if (g_ggml_sycl_graph_recording) {
+            throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");
+        }
+        if (!ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)) {
+            throw ggml_sycl_fallback_error("MUL_MAT_ID prompt expert ID admission failed");
+        }
+        const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+        retained_prompt_layout =
+            has_override ? override_layout :
+                           ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, prompt_host_weights, ne12);
+        retained_prompt_layout       = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
+        retained_prompt_layout       = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, retained_prompt_layout,
+                                                                              prompt_ids_snapshot.size(), has_override, ne12);
+        retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+            src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
+            retained_prompt_layout, /*allow_materialize=*/false);
+        if (!retained_prompt_batch_result) {
+            GGML_LOG_ERROR("[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
+                           src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
+                           retained_prompt_batch_result.expert_id,
+                           ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
+                           retained_prompt_batch_result.source_reason);
+            throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
+        }
+    }
+
     auto        xmx_layout_allowed = [&]() -> bool {
         if (!has_override) {
             return true;
@@ -61625,7 +61640,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     // Specialized fusion/pair routing is prompt-only until it can consume the
     // same retained occurrence batch as decode.
-    const bool cpu_tg_candidate = fusion_down_continuation;
+    // Multi-role prompt pair/fusion paths must fail closed until each role can
+    // provide a retained batch; they may not independently reacquire partners.
+    const bool cpu_tg_candidate = false && fusion_down_continuation;
     if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced) {
         // When an EXPERT_STAGING ensure() fails under arena starvation (e.g.
         // test-backend-ops fixture budget, or runtime host-zone fragmentation),
@@ -68116,27 +68133,15 @@ cpu_tg_fallthrough:
         }
         const auto & caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
 
-        const int            layer_id     = parse_layer_id_from_name(src0->name ? src0->name : "");
         const int            layer_hash   = moe_cache_layer_id(src0->name);
         const int64_t        expected_ids = total_entries;
-        std::vector<int32_t> ids_local;
-        const int32_t *      ids_host             = nullptr;
-        bool                 ids_from_layer_cache = false;
-        if (layer_id >= 0) {
-            auto cache_it = g_moe_layer_ids_cache.find(layer_id);
-            if (cache_it != g_moe_layer_ids_cache.end() &&
-                cache_it->second.ids_host.size() == static_cast<size_t>(expected_ids)) {
-                ids_host             = cache_it->second.ids_host.data();
-                ids_from_layer_cache = true;
-            }
-        }
-        if (!ids_host) {
-            if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_local) ||
-                ids_local.size() != static_cast<size_t>(expected_ids)) {
+        const auto &  prompt_batch = retained_prompt_batch_result.batch;
+        if (prompt_batch.expert_ids.size() != static_cast<size_t>(expected_ids) ||
+            prompt_batch.slots_per_token != static_cast<size_t>(n_ids_local) ||
+            retained_prompt_layout != route_layout) {
                 return false;
             }
-            ids_host = ids_local.data();
-        }
+        const int32_t * ids_host = prompt_batch.expert_ids.data();
 
         std::vector<int32_t> counts(static_cast<size_t>(n_as_local), 0);
         for (int64_t ci = 0; ci < expected_ids; ++ci) {
@@ -68183,10 +68188,10 @@ cpu_tg_fallthrough:
                     return false;
                 }
 
-                moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, ctx.device, eid, route_layout,
-                                                                            /*allow_materialize=*/false);
-                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
-                    route.actual_layout != route_layout) {
+                const ggml_sycl::moe_resolved_operand * operand = prompt_batch.occurrence(iid1, id);
+                if (!operand || operand->expert_id != eid ||
+                    operand->residency != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
+                    operand->actual_layout != route_layout) {
                     return false;
                 }
 
@@ -68203,9 +68208,8 @@ cpu_tg_fallthrough:
 
         sycl::event          table_event;
         bool                 table_event_set = false;
-        const void * const * expert_ptrs_dev =
-            moe_fusion_ensure_gpu0_ptrs(ctx, src0, unique_expert_ids.data(), unique_expert_ids.size(), layer_hash,
-                                        route_layout, &table_event, &table_event_set);
+        const void * const * expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
+            ctx, src0, prompt_batch, layer_hash, route_layout, &table_event, &table_event_set);
         if (!expert_ptrs_dev) {
             return false;
         }
@@ -68222,7 +68226,7 @@ cpu_tg_fallthrough:
                         "layout=%s entries=%zu unique=%zu total=%lld tokens=%lld topk=%lld ids_cache=%d ptr_table=%p\n",
                         src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(route_layout), gpu_expert_ids.size(),
                         unique_expert_ids.size(), (long long) total_entries, (long long) n_tokens_local,
-                        (long long) n_ids_local, ids_from_layer_cache ? 1 : 0, (const void *) expert_ptrs_dev);
+                        (long long) n_ids_local, 1, (const void *) expert_ptrs_dev);
             }
         }
 
@@ -68236,6 +68240,12 @@ cpu_tg_fallthrough:
             ids_device, ids_device ? ids_nb0 : 0, ids_device ? ids_nb1 : 0, ids_host, expected_ids, nullptr, nullptr,
             dispatch_deps.empty() ? nullptr : &dispatch_deps);
         if (ok) {
+            std::vector<ggml_sycl::mem_handle> retained;
+            retained.reserve(prompt_batch.operands.size());
+            for (const auto & operand : prompt_batch.operands) {
+                retained.push_back(operand.lease);
+            }
+            ggml_sycl::retain_handles_until_event(std::move(retained), ctx.stream()->ext_oneapi_submit_barrier());
             record_moe_gpu_path("smart_i8_grouped_down", route_layout, total_entries);
         }
         return ok;
@@ -68314,7 +68324,8 @@ cpu_tg_fallthrough:
         if (!pp_cpu_reference_force_router && try_mxfp4_i8_grouped_down()) {
             return;
         }
-        if (!pp_cpu_reference_force_router && xmx_layout_allowed() && try_xmx_sorted_moe(ctx, src0, src1, ids, dst)) {
+        if (!pp_cpu_reference_force_router && xmx_layout_allowed() &&
+            try_xmx_sorted_moe(ctx, src0, src1, ids, dst, retained_prompt_batch_result.batch)) {
             GGML_SYCL_DEBUG("[MoE] XMX sorted dispatch successful for type %d\n", src0->type);
             if (g_moe_pp_profile_enabled) {
                 g_moe_profile.moe_dispatch_path(0, 0, 1, 0);
@@ -68332,7 +68343,7 @@ cpu_tg_fallthrough:
         // Fused ESIMD kernel for batched prefill (ne12 > 1)
         if (!pp_cpu_reference_force_router && planner_composite_moe_resolve_allowed &&
             (!has_override || override_layout == GGML_LAYOUT_AOS) &&
-            ggml_sycl_mul_mat_id_fused(ctx, src0, src1, ids, dst)) {
+            ggml_sycl_mul_mat_id_fused(ctx, src0, src1, ids, dst, retained_prompt_batch_result.batch)) {
             GGML_SYCL_DEBUG("[MoE] Fused ESIMD dispatch successful for type %d\n", src0->type);
             if (g_moe_pp_profile_enabled) {
                 g_moe_profile.moe_dispatch_path(0, 1, 0, 0);
@@ -68539,8 +68550,30 @@ cpu_tg_fallthrough:
                     }
                 }
             }
-            GGML_SYCL_DEBUG("[MoE] Trying MMVQ with layout=%d for %s\n", (int) layout, src0->name ? src0->name : "?");
-            bool result = ggml_sycl_mul_mat_id_vec_q(ctx, src0, src1, ids, dst, &layout);
+            if (layout != retained_prompt_layout ||
+                !ggml_sycl::make_moe_batch_local_view(retained_prompt_batch_result.batch, layout)) {
+                return false;
+            }
+            sycl::event          retained_table_event;
+            bool                 retained_table_event_set = false;
+            const void * const * retained_ptrs            = ggml_sycl_upload_moe_ptr_table_from_batch(
+                ctx, src0, retained_prompt_batch_result.batch, moe_cache_layer_id(src0->name), layout,
+                &retained_table_event, &retained_table_event_set);
+            if (!retained_ptrs) {
+                return false;
+            }
+            GGML_SYCL_DEBUG("[MoE] Trying retained MMVQ with layout=%d for %s\n", (int) layout,
+                            src0->name ? src0->name : "?");
+            bool result = ggml_sycl_mul_mat_id_vec_q(ctx, src0, src1, ids, dst, &layout, retained_ptrs,
+                                                     retained_table_event_set ? &retained_table_event : nullptr);
+            if (result) {
+                std::vector<ggml_sycl::mem_handle> retained;
+                retained.reserve(retained_prompt_batch_result.batch.operands.size());
+                for (const auto & operand : retained_prompt_batch_result.batch.operands) {
+                    retained.push_back(operand.lease);
+                }
+                ggml_sycl::retain_handles_until_event(std::move(retained), ctx.stream()->ext_oneapi_submit_barrier());
+            }
             GGML_SYCL_DEBUG("[MoE] MMVQ layout=%d returned %s\n", (int) layout, result ? "true" : "false");
             return result;
         };
@@ -68683,7 +68716,7 @@ cpu_tg_fallthrough:
     const queue_ptr      stream = ctx.stream();
     const int64_t        n_as   = ne02;
     const int64_t        n_ids  = ids->ne[0];
-    std::vector<int32_t> ids_host;
+    std::vector<int32_t> ids_host = ne12 != 1 ? prompt_ids_snapshot : std::vector<int32_t>{};
 
     // Task 1E: Batch IDs D2H across GATE/UP/DOWN sub-ops.
     // Within a MoE block, GATE/UP/DOWN share the same expert IDs.
@@ -68691,7 +68724,7 @@ cpu_tg_fallthrough:
     const int    blk_layer_id   = parse_layer_id_from_name(src0->name ? src0->name : "");
     const bool   is_gate_subop  = src0->name && strstr(src0->name, "ffn_gate");
     const size_t expected_ids   = static_cast<size_t>(ids->ne[1] * n_ids);
-    bool         ids_from_cache = false;
+    bool         ids_from_cache = ne12 != 1;
     const bool   pp_phase_trace = ggml_sycl_moe_pp_phase_trace_enabled() && ne12 > 1;
     const auto   pp_phase_start = moe_profile_state::hrc::now();
     auto         pp_phase_last  = pp_phase_start;
