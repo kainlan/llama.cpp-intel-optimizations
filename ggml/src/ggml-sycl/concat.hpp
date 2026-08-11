@@ -17,4 +17,9 @@
 
 void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
+// True for exactly the element types ggml_sycl_op_concat instantiates a kernel
+// for; everything else hits its trailing GGML_ASSERT(false).  Defined in
+// concat.cpp so it sees the same GGML_SYCL_HAS_BF16 state as that switch.
+bool ggml_sycl_concat_type_supported(ggml_type type);
+
 #endif // GGML_SYCL_CONCAT_HPP

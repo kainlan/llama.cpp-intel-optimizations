@@ -192,6 +192,35 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
     }
 }
 
+// Mirror of the type switch in ggml_sycl_op_concat below, for
+// ggml_backend_sycl_device_supports_op.  It lives HERE, in the same translation
+// unit, on purpose: GGML_SYCL_HAS_BF16 is defined per-TU (convert.cpp:14-19 is
+// the only #define in the tree, and nothing concat.cpp includes pulls it in), so
+// a copy of this switch written in ggml-sycl.cpp could disagree with the one
+// that actually runs.  Compiled side by side, the two cannot drift.
+//
+// Anything outside this set reaches the trailing `GGML_ASSERT(false)` and aborts
+// the process rather than deferring to another backend.  CUDA implements the
+// quantized cases (ggml-cuda.cu:4809-4831 admits any quantized type whose
+// sources are contiguous and block-aligned), so declining them is a real SYCL
+// capability gap, recorded on llama.cpp-oin0 -- not merely an assert mismatch.
+bool ggml_sycl_concat_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+#ifdef GGML_SYCL_HAS_BF16
+        case GGML_TYPE_BF16:
+#endif
+        case GGML_TYPE_I32:
+        case GGML_TYPE_I16:
+        case GGML_TYPE_I64:
+        case GGML_TYPE_I8:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
 
     switch (dst.type()) {

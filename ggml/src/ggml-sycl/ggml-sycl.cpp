@@ -98606,6 +98606,30 @@ static bool ggml_sycl_binbcast_layout_supported(const ggml_tensor * src0,
            src0->nb[0] == ggml_type_size(src0->type);
 }
 
+// The norm-family kernels take a row at a time: they add a strided
+// row/channel/sample offset and then read the row as `x[col]`.  So they DO
+// handle strided rows, but the innermost stride must be exactly one element,
+// which norm.cpp:1298 (NORM) and norm.cpp:1348 (RMS_NORM) assert outright --
+// with no fallback behind them, so a permuted src0 aborts the process instead
+// of deferring to another backend.  The row/channel/sample byte strides are
+// turned into element strides by exact division (norm.cpp:1299-1301,
+// 1349-1351); that division is NOT asserted, so a stride that is not a whole
+// number of elements is silently truncated.
+//
+// CUDA gates the same three ops on ggml_is_contiguous_rows(src[0])
+// (ggml-cuda.cu:4854-4857), which for a non-blocked type is exactly this
+// nb[0] == type_size condition -- and its own kernels assert nb00 == ts0
+// (norm.cu:451, 494).  Declining here therefore MATCHES CUDA rather than
+// falling behind it: the noncontig_rows cases in test-backend-ops are
+// `not supported` on CUDA too.
+static bool ggml_sycl_norm_rows_supported(const ggml_tensor * t) {
+    if (!t) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(t->type);
+    return t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
+}
+
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     int                                device   = sycl_ctx->device;
@@ -98985,6 +99009,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // stay in the unconditional group below.
             return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
+            // Layout is genuinely handled: concat.cpp:119-153 has a fully
+            // stride-aware kernel for the non-contiguous case.  TYPE is not --
+            // concat.cpp's switch instantiates one kernel per element type and
+            // aborts on the rest, while this case admitted every type.  See
+            // ggml_sycl_concat_type_supported (concat.cpp) for why the check
+            // lives in that translation unit.  All three tensors go through one
+            // template instantiation chosen from dst's type, so they must agree.
+            return ggml_sycl_concat_type_supported(op->type) && op->src[0]->type == op->type &&
+                   op->src[1]->type == op->type;
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
         case GGML_OP_NONE:
@@ -99012,14 +99045,61 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
 #endif
         case GGML_OP_NORM:
-            return true;
-        case GGML_OP_L2_NORM:
-        case GGML_OP_GROUP_NORM:
-            return ggml_is_contiguous(op->src[0]);
+            // norm_f32_sycl asserts ncols % WARP_SIZE == 0 (norm.cpp:877) and
+            // ggml_sycl_op_norm asserts src0->nb[0] == type size (norm.cpp:1298);
+            // neither was gated here, so both aborted the process.  The kernel
+            // also writes dst through a PACKED offset (norm.cpp:55-59, 92) while
+            // reading src0 strided, so a non-contiguous dst is silently
+            // mis-addressed rather than caught.  CUDA's kernel has the same
+            // packed-dst write (norm.cu:16) and does not gate on it; declining it
+            // is deliberately stricter than CUDA -- a wrong answer is worse than
+            // a CPU fallback -- and it declines nothing test-backend-ops builds.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[0]->ne[0] % WARP_SIZE) == 0 && ggml_sycl_norm_rows_supported(op->src[0]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_RMS_NORM:
-            return ((op->src[0]->ne[0] % WARP_SIZE) == 0);
+            // Same shape as NORM: rms_norm_f32_sycl asserts ncols % WARP_SIZE
+            // (norm.cpp:960), ggml_sycl_op_rms_norm asserts nb[0] (norm.cpp:1348),
+            // and rms_norm_f32 writes dst packed (norm.cpp:209-213, 245).  This
+            // case is also what protects the three fused entry points, each of
+            // which is only reachable once the RMS_NORM node itself was admitted
+            // here: norm.cpp:1406 and :1488 assert the same nb[0] on
+            // rms_norm_src, and :1825 asserts it on the RMS_NORM output.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[0]->ne[0] % WARP_SIZE) == 0 && ggml_sycl_norm_rows_supported(op->src[0]) &&
+                   ggml_is_contiguous(op);
+        case GGML_OP_L2_NORM:
+            // l2_norm_f32 indexes BOTH tensors as `x[row*ncols + col]`
+            // (norm.cpp:832, 860) -- no stride ever reaches it -- so src0 and dst
+            // must be fully contiguous, not merely contiguous-rows.
+            // l2_norm_f32_sycl additionally asserts ncols % WARP_SIZE
+            // (norm.cpp:1254), which was ungated.  CUDA gates L2_NORM on
+            // ggml_is_contiguous_rows (ggml-cuda.cu:4854-4857) because its kernel
+            // does take strides; needing full contiguity is a real SYCL
+            // capability gap, recorded on llama.cpp-oin0.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   (op->src[0]->ne[0] % WARP_SIZE) == 0;
+        case GGML_OP_GROUP_NORM:
+            // group_norm_f32 walks a flat range `x[j]` / `dst[j]` over
+            // ne0*ne1*ne2 (norm.cpp:117-118, 148-150, 180-181) with no strides at
+            // all, so both tensors must be fully contiguous; dst was ungated.
+            // The launcher passes only ne0*ne1*ne2 elements, so batches beyond
+            // src0.ne[3] == 1 would be left unread and unwritten. Matches CUDA
+            // on src0 contiguity (ggml-cuda.cu:4938-4942).
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[3] == 1 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_RMS_NORM_BACK:
-            return ((op->src[0]->ne[0] % WARP_SIZE) == 0);
+            // norm.cpp:1581-1583 assert nb[0] == type size on all three of
+            // g (src[0]), x (src[1]) and dst; rows are strided through
+            // xs1/gs1/ds1, so strided rows are genuinely handled.  The
+            // ne[0] % WARP_SIZE clause is pre-existing and stricter than the
+            // kernel needs (its work-group loop handles any D); it is kept rather
+            // than widened, which would newly admit shapes nobody has run.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && (op->src[0]->ne[0] % WARP_SIZE) == 0 &&
+                   ggml_sycl_norm_rows_supported(op->src[0]) && ggml_sycl_norm_rows_supported(op->src[1]) &&
+                   ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
             return true;
@@ -99056,9 +99136,27 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // = 256 * 32 * 8 = 64KB (well within typical 128KB SLM limit)
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 && op->ne[0] <= SYCL_TOPK_MAX_K;
         case GGML_OP_POOL_2D:
+            return true;
 
         case GGML_OP_ACC:
-            return true;
+            // ggml_sycl_op_acc asserts F32 on both sources and dst, and
+            // GGML_ASSERT(dst.ne(3) == 1) -- "just 3D tensors supported"
+            // (element_wise.cpp:977-980).  None of that was gated here, so a 4D
+            // ACC aborted the process.  acc_f32 then walks dst and src0 flat
+            // (`dst[i] = x[i] + ...`) and reads src1 at
+            // `y[ox + oy*ne10 + oz*ne10*ne11]` (element_wise.cpp:53-63) -- an
+            // index built only from src1's ne, never its nb -- so a strided src1
+            // is silently mis-addressed rather than caught.  That case is real:
+            // test-backend-ops.cpp:9257-9259 build b as an offset view.
+            //
+            // The launcher also passes only src1.ne[0..2] to acc_f32_sycl, so a
+            // src1 batch dimension above one would be ignored even when dst is
+            // 3D. CUDA has no ne[3] restriction (ggml-cuda.cu:4925-4928 gates
+            // only on contiguity, and acc.cu handles 4D), so declining 4D here is
+            // a real SYCL capability gap, recorded on llama.cpp-oin0.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->ne[3] == 1 && op->src[1]->ne[3] == 1 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
 
         case GGML_OP_PAD:
             // TODO: add circular padding support for syscl, see https://github.com/ggml-org/llama.cpp/pull/16985
