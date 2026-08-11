@@ -239,6 +239,31 @@ static bool test_expert_staging_host_compute_zone_ownership(sycl::queue & q) {
     return true;
 }
 
+static bool test_q1_nvfp4_recipe_workspace_is_inventory_planned() {
+    printf("\n=== Test: Q1/NVFP4 recipe workspace inventory planning ===\n");
+    std::vector<ggml_sycl::placement_tensor_info> inventory;
+    for (ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+        ggml_sycl::placement_tensor_info item;
+        item.name = type == GGML_TYPE_Q1_0 ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_up_exps.weight";
+        item.type = type;
+        item.ne[0] = type == GGML_TYPE_Q1_0 ? 128 : 64;
+        item.ne[1] = 64;
+        item.ne[2] = 1;
+        item.ne[3] = 1;
+        item.size = ggml_row_size(type, item.ne[0]) * static_cast<size_t>(item.ne[1]);
+        inventory.push_back(item);
+    }
+    const std::vector<ggml_sycl::device_budget> devices = { { 0, 1, 1 } };
+    ggml_sycl::placement_kv_info kv{};
+    kv.n_ctx = 32;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::HYBRID,
+                                                     kv, nullptr, 1);
+    TEST_ASSERT(plan.moe_host_recipe_workspace_bytes > 0, "Q1/NVFP4 workspace must be inventory-planned");
+    TEST_ASSERT(plan.host_zone_scratch_bytes >= plan.moe_host_recipe_workspace_bytes,
+                "host SCRATCH must include immutable recipe workspace");
+    return true;
+}
+
 static bool test_planner_role_specific_expert_placement() {
     printf("\n=== Test: planner role-specific expert placement ===\n");
 
@@ -445,6 +470,7 @@ int main() {
     ok &= test_direct_host_and_miss_resolution(*q);
     ok &= test_expert_staging_host_compute_zone_ownership(*q);
     ok &= test_planner_role_specific_expert_placement();
+    ok &= test_q1_nvfp4_recipe_workspace_is_inventory_planned();
 
     printf("\nSYCL MoE handle resolution tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

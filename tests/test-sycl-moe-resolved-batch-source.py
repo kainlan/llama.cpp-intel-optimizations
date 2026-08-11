@@ -8,6 +8,8 @@ HEADER = ROOT / "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 HOST_TEST = ROOT / "tests/test-sycl-moe-resolved-batch.cpp"
 MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
+CPU_DISPATCH_SOURCE = ROOT / "ggml/src/ggml-sycl/cpu-dispatch.cpp"
+UNIFIED_CACHE_SOURCE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|::|&&|\|\||!=|==|<=|>=|->|[{}()[\].,;:%=*<>!&+-]")
 
@@ -128,6 +130,13 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "typed capability refusal": "moe_batch_reject_reason::CAPABILITY_UNSUPPORTED",
         "Q1 decode refusal": "type == GGML_TYPE_Q1_0",
         "NVFP4 decode refusal": "type == GGML_TYPE_NVFP4",
+        "unconditional Q1/NVFP4 device refusal":
+            "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)",
+        "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
+        "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
+        "inventory planned host recipe workspace": "plan.moe_host_recipe_workspace_bytes",
+        "host scratch includes recipe workspace":
+            "plan.moe_cpu_expert_staging_bytes + plan.moe_host_recipe_workspace_bytes",
         "phase-specific recipe admission": "rows > 1 ? moe_route_phase::PROMPT : moe_route_phase::DECODE",
         "owning queue ready dependency": "target_queue->ext_oneapi_submit_barrier(route_ready_events)",
         "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
@@ -384,7 +393,7 @@ def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
 
 def test_contract_and_mutation_witnesses() -> None:
     header = HEADER.read_text()
-    source = SOURCE.read_text()
+    source = SOURCE.read_text() + "\n" + CPU_DISPATCH_SOURCE.read_text() + "\n" + UNIFIED_CACHE_SOURCE.read_text()
     host_test = HOST_TEST.read_text()
     mem_source = MEM_HANDLE_SOURCE.read_text()
     assert not violations(header, source, host_test, mem_source)
@@ -438,6 +447,12 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test.replace("test_make_stable_weight_lease", "mem_handle::from_weight_lease_snapshot"), mem_source),
         ("decode-resolver-bypass", header,
          source.replace("ggml_sycl::choose_moe_batch_executor(", "ggml_sycl::moe_batch_executor_choice("),
+         host_test, mem_source),
+        ("drop-production-host-recipe-executor", header,
+         source.replace("ggml_sycl_cpu_moe_host_aos_execute(task, &reject)", "false"),
+         host_test, mem_source),
+        ("enable-Q1-device-route", header,
+         source.replace("if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)", "if (false)", 1),
          host_test, mem_source),
         ("refusal-return", header,
          source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained", "return; // MUL_MAT_ID retained"),

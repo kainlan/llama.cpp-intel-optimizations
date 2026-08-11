@@ -8,6 +8,7 @@
 
 #include "alloc-registry.hpp"
 #include "common.hpp"
+#include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
@@ -17,6 +18,7 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
+#include "moe-resolved-batch.hpp"
 #include "sycl-timeline.hpp"
 #include "zone-sizing.hpp"
 
@@ -569,7 +571,6 @@ static std::atomic<bool>     g_sycl_shutting_down{ false };  // Set during shutd
 static std::atomic<size_t>   g_runtime_reserved_host_bytes{};
 static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_category::COUNT)]{};
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
-static std::atomic<size_t>   g_planned_moe_host_recipe_workspace_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -777,24 +778,6 @@ static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_pp{ 0 };
 static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_tg{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_d2h{ 0 };
-
-void unified_cache_set_planned_moe_host_recipe_workspace_bytes(int device_id, size_t bytes) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
-    }
-    g_planned_moe_host_recipe_workspace_bytes[device_id].store(bytes, std::memory_order_release);
-}
-
-size_t unified_cache_get_planned_moe_host_recipe_workspace_bytes(int device_id) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
-    }
-    return g_planned_moe_host_recipe_workspace_bytes[device_id].load(std::memory_order_acquire);
-}
-
-bool unified_cache_admit_moe_host_recipe_workspace(int device_id, size_t requested_bytes) {
-    return requested_bytes <= unified_cache_get_planned_moe_host_recipe_workspace_bytes(device_id);
-}
 
 void unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
@@ -20653,6 +20636,31 @@ static void populate_host_zone_sizing(placement_plan &                          
         }
         plan.moe_cpu_expert_staging_bytes = max_moe_tensor_bytes;
 
+        // Immutable Q1_0/NVFP4 host recipes reserve one occurrence workspace
+        // for every top-k slot in the maximum admitted micro-batch. Derive K/N
+        // and the activation vec-dot row size from the inventory, never from a
+        // resolver-time request.
+        plan.moe_host_recipe_workspace_bytes = 0;
+        for (const auto & item : tensor_inventory) {
+            if ((item.type != GGML_TYPE_Q1_0 && item.type != GGML_TYPE_NVFP4) || !item.has_shape() ||
+                expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+                continue;
+            }
+            const auto * traits = ggml_sycl_get_type_traits_cpu(item.type);
+            if (!traits || !traits->vec_dot || item.ne[0] <= 0 || item.ne[1] <= 0) {
+                continue;
+            }
+            moe_route_request request{ moe_route_phase::PROMPT, item.ne[0], item.ne[1],
+                                       static_cast<size_t>(std::max(n_expert_used, 1)) * MOE_GPU_UBATCH_MAX,
+                                       item.type, std::max(plan.device_id, 0) };
+            moe_workspace_recipe workspace;
+            if (plan_moe_host_workspace(request, ggml_row_size(traits->vec_dot_type, item.ne[0]),
+                                        sizeof(size_t) * 4, &workspace)) {
+                plan.moe_host_recipe_workspace_bytes =
+                    std::max(plan.moe_host_recipe_workspace_bytes, workspace.total_bytes);
+            }
+        }
+
         GGML_LOG_INFO(
             "[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_expert_used=%d n_moe_layers=%d "
             "max_batch=%zu control_ids=%.2f MB host-pinned, expert_ptrs=%.2f MB VRAM (%zu tables x %zu B, exact=%d), "
@@ -20666,7 +20674,8 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.moe_routing_ids_bytes        = 0;
         plan.moe_expert_ptrs_bytes        = 0;
         plan.moe_control_pool_bytes       = 0;
-        plan.moe_cpu_expert_staging_bytes = 0;
+        plan.moe_cpu_expert_staging_bytes    = 0;
+        plan.moe_host_recipe_workspace_bytes = 0;
 
         // A dense model is a VALID zero requirement, not an unknown one: it has
         // no expert tensors to route, so its RUNTIME zone owes nothing.
@@ -20900,7 +20909,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.host_zone_scratch_bytes = std::max<size_t>(
         k_min_zone_bytes, plan.max_tensor_bytes + k_scratch_headroom + plan.onednn_reorder_bytes +
                               plan.moe_q8_workspace_bytes + plan.moe_cpu_expert_staging_bytes +
-                              plan.moe_vram_runtime_bytes + plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes +
+                              plan.moe_host_recipe_workspace_bytes + plan.moe_vram_runtime_bytes + plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes +
                               plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes);
 }
 

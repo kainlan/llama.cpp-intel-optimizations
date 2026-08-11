@@ -1,11 +1,28 @@
 // Host-only contract tests for the retained MoE route-batch foundation.
+#include "ggml-sycl/cpu-traits-support.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
+struct cpu_moe_host_aos_task {
+    ggml_sycl::moe_execution_recipe recipe;
+    size_t                          admitted_recipe_signature = 0;
+    ggml_sycl::mem_handle           weight_lease;
+    const float *                   activations = nullptr;
+    float *                         output = nullptr;
+    void *                          workspace = nullptr;
+    size_t                          workspace_bytes = 0;
+    ggml_sycl::mem_handle           workspace_lease;
+    size_t                          execution_rows = 0;
+};
+
+bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
+                                        ggml_sycl::moe_batch_reject_reason * reject = nullptr);
 
 #define CHECK(c)                                                 \
     do {                                                         \
@@ -184,19 +201,19 @@ static bool test_executor_choice_is_residency_and_capability_driven() {
     auto host_batch = build_one(host);
     CHECK(host_batch);
     auto choice = ggml_sycl::choose_moe_batch_executor(host_batch.batch.operands[0], 0,
-                                                       /*owning_queue_available=*/false);
+                                                       /*owning_queue_available=*/false, 0);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU);
 
     auto primary_batch = build_one(primary);
     CHECK(primary_batch);
-    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, true);
+    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, true, 0);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
 
     auto secondary_batch = build_one(secondary);
     CHECK(secondary_batch);
-    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false, 0);
     CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::WRONG_QUEUE);
-    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true, 0);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE);
     return true;
 }
@@ -347,7 +364,7 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     for (size_t slot = 0; slot < 3; ++slot) {
         const auto * operand = batch.batch.occurrence(0, slot);
         CHECK(operand);
-        const auto choice = ggml_sycl::choose_moe_batch_executor(*operand, 0, true);
+        const auto choice = ggml_sycl::choose_moe_batch_executor(*operand, 0, true, 0);
         CHECK(choice);
         primary_count += choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE;
         secondary_count += choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE;
@@ -488,13 +505,65 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             device.recipe.request = request;
             auto device_batch     = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return device; });
             CHECK(device_batch);
-            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true);
+            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true, 0);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
         }
     }
     moe_workspace_recipe overflow;
     CHECK(!plan_moe_host_workspace({ moe_route_phase::PROMPT, INT64_MAX, INT64_MAX, SIZE_MAX, GGML_TYPE_Q1_0, 0 },
                                    SIZE_MAX, SIZE_MAX, &overflow));
+    return true;
+}
+
+static bool test_numerical_q1_nvfp4_host_executor() {
+    using namespace ggml_sycl;
+    int identity = 200;
+    for (ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+        const int64_t K = type == GGML_TYPE_Q1_0 ? 128 : 64;
+        const int64_t N = 2;
+        const auto * traits = ggml_sycl_get_type_traits_cpu(type);
+        CHECK(traits && traits->vec_dot);
+        for (moe_route_phase phase : { moe_route_phase::DECODE, moe_route_phase::PROMPT }) {
+            const size_t rows = phase == moe_route_phase::DECODE ? 1 : 3;
+            std::vector<uint8_t> weights(ggml_row_size(type, K) * N, 0);
+            std::vector<float> activations(rows * K);
+            for (size_t i = 0; i < activations.size(); ++i) activations[i] = float(int(i % 13) - 6) / 7.0f;
+            std::vector<float> output(rows * N, 99.0f);
+            auto route = route_for(weights.data(), -1, moe_batch_residency::HOST, GGML_LAYOUT_AOS,
+                                   GGML_LAYOUT_AOS, identity++);
+            route.recipe.request = { phase, K, N, rows, type, 0 };
+            CHECK(plan_moe_host_workspace(route.recipe.request, ggml_row_size(traits->vec_dot_type, K),
+                                          sizeof(size_t) * 4, &route.recipe.workspace));
+            const int32_t ids[] = { 1 };
+            auto admitted = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
+            CHECK(admitted);
+            const size_t bytes = route.recipe.workspace.total_bytes;
+            std::vector<uint8_t> storage(bytes + 128);
+            void * raw = storage.data();
+            size_t available = storage.size();
+            void * aligned = std::align(route.recipe.workspace.alignment, bytes, raw, available);
+            CHECK(aligned);
+            cpu_moe_host_aos_task task;
+            task.recipe = admitted.batch.operands[0].recipe;
+            task.admitted_recipe_signature = admitted.batch.operands[0].admitted_recipe_signature;
+            task.weight_lease = admitted.batch.operands[0].lease;
+            task.activations = activations.data();
+            task.output = output.data();
+            task.workspace = aligned;
+            task.workspace_bytes = bytes;
+            task.workspace_lease = weight_handle(aligned, 0, GGML_LAYOUT_AOS, identity++, false);
+            moe_batch_reject_reason reject;
+            CHECK(ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
+            for (float value : output) CHECK(std::isfinite(value) && value == 0.0f);
+            task.workspace_bytes = bytes - 1;
+            CHECK(!ggml_sycl_cpu_moe_host_aos_execute(task, &reject) &&
+                  reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
+            task.workspace_bytes = bytes;
+            task.workspace = static_cast<uint8_t *>(aligned) + 1;
+            task.workspace_lease = weight_handle(task.workspace, 0, GGML_LAYOUT_AOS, identity++, false);
+            CHECK(!ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
+        }
+    }
     return true;
 }
 
@@ -513,7 +582,7 @@ static bool test_decode_admission_is_route_mode_independent() {
     CHECK(planned_calls == 2);
     CHECK(all_local_plan.batch.operands.size() == 2);
     for (const auto & operand : all_local_plan.batch.operands) {
-        auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true);
+        auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true, 0);
         CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
     }
 
@@ -538,7 +607,7 @@ int main() {
         !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
-        !test_decode_admission_is_route_mode_independent()) {
+        !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     std::puts("PASS: retained MoE route-batch host contract");

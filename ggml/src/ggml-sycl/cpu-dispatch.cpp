@@ -816,6 +816,8 @@ void ggml_sycl_cpu_vec_dot_batched(const cpu_vec_dot_batch_item * items, int n_i
 // ---------------------------------------------------------------------------
 
 void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
+    GGML_ASSERT(task.type != GGML_TYPE_Q1_0 && task.type != GGML_TYPE_NVFP4 &&
+                "Q1_0/NVFP4 MoE must use its admitted host recipe");
     if (task.N <= 0 || task.K <= 0 || !task.weight_host || !task.act_host || !task.output_host) {
         return;
     }
@@ -859,7 +861,12 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
 bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
                                         ggml_sycl::moe_batch_reject_reason * reject) {
     using namespace ggml_sycl;
-    if (!task.activations || !task.output || !task.workspace ||
+    const resolved_ptr workspace_resolved = task.workspace_lease.resolve(mem_handle::HOST_DEVICE);
+    if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr || workspace_resolved.on_device ||
+        workspace_resolved.ptr != task.workspace || task.recipe.request.K > INT_MAX ||
+        task.recipe.request.N > INT_MAX || task.recipe.request.K <= 0 || task.recipe.request.N <= 0 ||
+        task.recipe.workspace.alignment == 0 ||
+        (reinterpret_cast<uintptr_t>(task.workspace) & (task.recipe.workspace.alignment - 1)) != 0 ||
         !validate_moe_execution_recipe(task.recipe, task.admitted_recipe_signature, task.weight_lease,
                                        moe_batch_residency::HOST, task.recipe.request.submit, true,
                                        task.workspace_bytes, reject)) {
@@ -897,7 +904,11 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
 
     const int K = static_cast<int>(task.recipe.request.K);
     const int N = static_cast<int>(task.recipe.request.N);
-    const size_t rows = task.recipe.request.rows;
+    const size_t rows = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
+    if (rows == 0 || rows > task.recipe.request.rows) {
+        if (reject) *reject = moe_batch_reject_reason::RECIPE_MISMATCH;
+        return false;
+    }
     const size_t qrow = ggml_row_size(traits->vec_dot_type, K);
     const size_t wrow = ggml_row_size(task.recipe.request.type, K);
     for (size_t m = 0; m < rows; ++m) {
@@ -910,12 +921,16 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
             output[m * N + n] = dot;
         }
     }
-    std::memcpy(task.output, output, ws.output_f32_bytes);
+    std::memcpy(task.output, output, rows * static_cast<size_t>(N) * sizeof(float));
     if (reject) *reject = moe_batch_reject_reason::NONE;
     return true;
 }
 
 void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
+    for (int i = 0; tasks && i < n_tasks; ++i) {
+        GGML_ASSERT(tasks[i].type != GGML_TYPE_Q1_0 && tasks[i].type != GGML_TYPE_NVFP4 &&
+                    "Q1_0/NVFP4 MoE must use its admitted host recipe");
+    }
     if (n_tasks <= 0 || !tasks) {
         return;
     }

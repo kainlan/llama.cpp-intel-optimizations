@@ -23109,15 +23109,6 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     normalized.recipe.valid = plan_moe_host_workspace(
                         normalized.recipe.request, ggml_row_size(traits->vec_dot_type, src0->ne[0]),
                         sizeof(size_t) * 4, &normalized.recipe.workspace);
-                    if (normalized.recipe.valid) {
-                        const size_t planned = unified_cache_get_planned_moe_host_recipe_workspace_bytes(submit_device);
-                        if (planned < normalized.recipe.workspace.total_bytes) {
-                            unified_cache_set_planned_moe_host_recipe_workspace_bytes(
-                                submit_device, normalized.recipe.workspace.total_bytes);
-                        }
-                        normalized.recipe.valid = unified_cache_admit_moe_host_recipe_workspace(
-                            submit_device, normalized.recipe.workspace.total_bytes);
-                    }
                 }
             }
         } else if (normalized.residency != moe_batch_residency::UNAVAILABLE) {
@@ -59286,6 +59277,7 @@ struct expert_dispatch_entry {
     sycl::event           ready_event{};
     bool                  allow_cpu_fallback = true;
     bool                  raw_compat_lease   = false;
+    ggml_sycl::moe_admitted_recipe_ticket admitted_recipe_ticket{};
 };
 
 static expert_dispatch_entry ggml_sycl_make_secondary_expert_dispatch_entry(int64_t               iid1,
@@ -63497,7 +63489,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl::mem_handle shared_act_handle;
 
             const bool multi_gpu = g_moe_multi_gpu_active.load(std::memory_order_acquire);
-            if (ne11 == 1 && (cpu_expert_tg_active || multi_gpu)) {
+            if (ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
+                (cpu_expert_tg_active || multi_gpu)) {
                 static thread_local managed_host_pinned_buffer s_act_staging;
                 const size_t                                   needed = static_cast<size_t>(K) * sizeof(float);
                 if (s_act_staging.ensure(*stream, ctx.device, needed, ggml_sycl::alloc_role::EXPERT_STAGING,
@@ -63528,6 +63521,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 const size_t n_cpu = entries.size();
+                const bool immutable_host_recipe =
+                    src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
+                if (immutable_host_recipe) {
+                    for (const expert_dispatch_entry & entry : entries) {
+                        if (!entry.admitted_recipe_ticket.valid() ||
+                            entry.admitted_recipe_ticket.recipe().kernel != moe_route_kernel::HOST_CPU) {
+                            throw ggml_sycl_fallback_error("MUL_MAT_ID Q1/NVFP4 host entry missing admitted recipe");
+                        }
+                    }
+                }
 
                 // Allocate pinned host buffers for activation D2H and CPU output
                 float *               out_pinned = nullptr;
@@ -63537,7 +63540,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl::mem_handle act_owner;
 
                 auto & pool = g_pinned_buffer_pools[ctx.device];
-                if (pool.is_initialized()) {
+                if (pool.is_initialized() && !immutable_host_recipe) {
                     auto bp    = pool.acquire(n_cpu);
                     act_pinned = bp.act;
                     out_pinned = bp.out;
@@ -63648,7 +63651,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // for the in-flight worker lifetime.
                 GGML_ASSERT(use_expert_cache && "CPU dispatch requires host-accessible weights");
                 std::vector<cpu_expert_task> batch_tasks;
-                batch_tasks.reserve(n_cpu);
+                std::vector<cpu_moe_host_aos_task> recipe_tasks;
+                ggml_sycl::mem_handle recipe_workspace_owner;
+                void * recipe_workspace = nullptr;
+                size_t recipe_workspace_bytes = 0;
+                if (immutable_host_recipe) {
+                    recipe_workspace_bytes = entries.front().admitted_recipe_ticket.recipe().workspace.total_bytes;
+                    auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
+                    const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;
+                    if (!plan_owner || recipe_workspace_bytes == 0 ||
+                        recipe_workspace_bytes > plan_owner->moe_host_recipe_workspace_bytes ||
+                        !allocate_managed_host_pinned(*stream, ctx.device, recipe_workspace_bytes,
+                                                     ggml_sycl::alloc_role::EXPERT_STAGING,
+                                                     ggml_sycl::runtime_category::HOST_COMPUTE,
+                                                     "moe_q1_nvfp4_recipe_workspace", &recipe_workspace_owner, true)) {
+                        throw ggml_sycl_fallback_error("MUL_MAT_ID Q1/NVFP4 planned workspace unavailable");
+                    }
+                    recipe_workspace = recipe_workspace_owner.resolve().ptr;
+                    recipe_tasks.reserve(n_cpu);
+                } else {
+                    batch_tasks.reserve(n_cpu);
+                }
                 for (size_t ci = 0; ci < n_cpu; ci++) {
                     const auto &          entry       = entries[ci];
                     const void *          host_weight = nullptr;
@@ -63689,6 +63712,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         continue;
                     }
 
+                    if (immutable_host_recipe) {
+                        cpu_moe_host_aos_task task;
+                        task.recipe                    = entry.admitted_recipe_ticket.recipe();
+                        task.admitted_recipe_signature = entry.admitted_recipe_ticket.signature();
+                        task.weight_lease              = std::move(host_lease);
+                        task.activations               = cpu_expert_tg_active ?
+                                                             (act_on_host ? shared_act_host : act_pinned) :
+                                                             act_pinned + ci * static_cast<size_t>(K);
+                        task.output                    = out_pinned + ci * static_cast<size_t>(N);
+                        task.workspace                 = recipe_workspace;
+                        task.workspace_bytes           = recipe_workspace_bytes;
+                        task.workspace_lease           = recipe_workspace_owner;
+                        task.execution_rows            = 1;
+                        recipe_tasks.push_back(std::move(task));
+                        continue;
+                    }
+
                     cpu_expert_task t;
                     t.weight_host  = host_weight;
                     // When cpu_expert_tg_active, all tasks share the single
@@ -63725,7 +63765,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // Submit to CPU thread pool — move the tasks vector into
                 // the worker so storage outlives every possible caller action.
                 auto & cpu_pool = g_cpu_expert_pools[ctx.device];
-                if (cpu_pool.is_active()) {
+                if (immutable_host_recipe) {
+                    result.future = std::async(
+                        std::launch::async,
+                        [tasks = std::move(recipe_tasks), workspace_owner = std::move(recipe_workspace_owner)]() mutable {
+                            GGML_UNUSED(workspace_owner);
+                            for (const cpu_moe_host_aos_task & task : tasks) {
+                                ggml_sycl::moe_batch_reject_reason reject;
+                                if (!ggml_sycl_cpu_moe_host_aos_execute(task, &reject)) {
+                                    throw std::runtime_error(ggml_sycl::moe_batch_reject_reason_name(reject));
+                                }
+                            }
+                        });
+                } else if (cpu_pool.is_active()) {
                     result.future = cpu_pool.submit_batch(std::move(batch_tasks));
                 } else {
                     result.future = std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
@@ -63907,7 +63959,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                                 src0->type, operand.actual_layout, phase, src0->ne[0],
                                                                 src0->ne[1], rows, operand.owning_device,
                                                                 moe_layer_route_residency::DEVICE, ctx.device);
-                const auto choice = ggml_sycl::choose_moe_batch_executor(operand, ctx.device, queue_available);
+                const auto choice = ggml_sycl::choose_moe_batch_executor(
+                    operand, ctx.device, queue_available, operand.recipe.workspace.total_bytes);
                 if (!choice) {
                     GGML_LOG_ERROR(
                         "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s "
@@ -63925,8 +63978,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU ? ggml_sycl::mem_handle::HOST_DEVICE :
                                                                                  operand.owning_device,
                     operand.actual_layout, operand.lease, /*allow_cpu_fallback=*/false);
-                entry.has_ready_event = operand.has_ready_event;
-                entry.ready_event     = operand.ready_event;
+                entry.has_ready_event          = operand.has_ready_event;
+                entry.ready_event              = operand.ready_event;
+                entry.admitted_recipe_ticket = ggml_sycl::make_moe_admitted_recipe_ticket(operand);
                 if (choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU) {
                     cpu_entries.push_back(std::move(entry));
                     stats.host_count++;

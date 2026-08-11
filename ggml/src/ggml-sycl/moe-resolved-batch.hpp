@@ -179,6 +179,26 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
     if (!recipe.valid) {
         return refuse(moe_batch_reject_reason::RECIPE_MISSING);
     }
+    const size_t alignment = recipe.workspace.alignment;
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0 || recipe.request.rows == 0) {
+        return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
+    }
+    if (recipe.kind == moe_batch_executor::HOST_CPU &&
+        (recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4)) {
+        moe_workspace_recipe expected;
+        if (recipe.workspace.activation_q8_bytes % recipe.request.rows != 0 ||
+            recipe.workspace.descriptor_bytes % recipe.request.rows != 0 ||
+            !plan_moe_host_workspace(recipe.request,
+                                     recipe.workspace.activation_q8_bytes / recipe.request.rows,
+                                     recipe.workspace.descriptor_bytes / recipe.request.rows, &expected) ||
+            expected.alignment != recipe.workspace.alignment || expected.activation_f32_bytes != recipe.workspace.activation_f32_bytes ||
+            expected.activation_q8_bytes != recipe.workspace.activation_q8_bytes ||
+            expected.output_f32_bytes != recipe.workspace.output_f32_bytes ||
+            expected.descriptor_bytes != recipe.workspace.descriptor_bytes ||
+            expected.total_bytes != recipe.workspace.total_bytes) {
+            return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
+        }
+    }
     if (moe_execution_recipe_signature(recipe) != admitted_signature || recipe.request.submit != submit_device) {
         return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
     }
@@ -273,6 +293,33 @@ struct moe_resolved_operand {
     moe_execution_recipe recipe;
     size_t               admitted_recipe_signature = 0;
 };
+
+// Opaque execution authority created only from an admitted operand. Runtime
+// partitions may copy this ticket, but cannot construct or rewrite its recipe.
+class moe_admitted_recipe_ticket {
+  public:
+    bool valid() const { return valid_; }
+    const moe_execution_recipe & recipe() const { return recipe_; }
+    size_t signature() const { return signature_; }
+
+  private:
+    moe_execution_recipe recipe_{};
+    size_t               signature_ = 0;
+    bool                 valid_     = false;
+
+    friend moe_admitted_recipe_ticket make_moe_admitted_recipe_ticket(const moe_resolved_operand & operand);
+};
+
+inline moe_admitted_recipe_ticket make_moe_admitted_recipe_ticket(const moe_resolved_operand & operand) {
+    moe_admitted_recipe_ticket ticket;
+    if (operand.recipe.valid &&
+        operand.admitted_recipe_signature == moe_execution_recipe_signature(operand.recipe)) {
+        ticket.recipe_    = operand.recipe;
+        ticket.signature_ = operand.admitted_recipe_signature;
+        ticket.valid_     = true;
+    }
+    return ticket;
+}
 
 struct moe_resolved_batch {
     int                               submit_device   = -1;
@@ -497,7 +544,7 @@ struct moe_batch_executor_choice {
 inline moe_batch_executor_choice choose_moe_batch_executor(const moe_resolved_operand & operand,
                                                            int                          submit_device,
                                                            bool                         owning_queue_available,
-                                                           size_t reserved_workspace_bytes = SIZE_MAX) {
+                                                           size_t reserved_workspace_bytes) {
     moe_batch_executor_choice out;
     if (!validate_moe_execution_recipe(operand.recipe, operand.admitted_recipe_signature, operand.lease,
                                        operand.residency, submit_device, owning_queue_available,

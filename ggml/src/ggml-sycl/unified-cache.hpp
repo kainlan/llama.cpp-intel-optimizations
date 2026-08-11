@@ -544,6 +544,7 @@ struct placement_plan {
     // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
+    size_t   moe_host_recipe_workspace_bytes     = 0;  // Zone: SCRATCH (host pinned)
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
@@ -1178,11 +1179,6 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts = 0);
-
-// Hard cap for dynamic host workspace used by immutable Q1_0/NVFP4 recipes.
-void   unified_cache_set_planned_moe_host_recipe_workspace_bytes(int device_id, size_t bytes);
-size_t unified_cache_get_planned_moe_host_recipe_workspace_bytes(int device_id);
-bool   unified_cache_admit_moe_host_recipe_workspace(int device_id, size_t requested_bytes);
 
 void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);

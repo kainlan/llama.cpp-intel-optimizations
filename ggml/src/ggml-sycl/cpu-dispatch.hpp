@@ -144,6 +144,8 @@ struct cpu_moe_host_aos_task {
     float *                         output = nullptr;       // [rows, N]
     void *                          workspace = nullptr;
     size_t                          workspace_bytes = 0;
+    ggml_sycl::mem_handle           workspace_lease;
+    size_t                          execution_rows  = 0;  // 0 means all admitted rows
 };
 
 bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
