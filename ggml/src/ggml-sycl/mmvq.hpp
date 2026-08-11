@@ -453,6 +453,48 @@ sycl::event mmvq_submit_mxfp4_soa(sycl::queue &                    q,
                                   int                              row_low,
                                   const std::vector<sycl::event> * deps = nullptr);
 
+// Direct AoS primitives for Q1_0/NVFP4. These are intentionally not wired into
+// the backend capability/router policy: callers own all pointers and lifetime,
+// and must pass GGML_LAYOUT_AOS. Returns false without submitting for an
+// unsupported type/layout/shape.
+bool mmvq_submit_q1_nvfp4_aos(sycl::queue &                    q,
+                              ggml_type                        weight_type,
+                              ggml_layout_mode                 weight_layout,
+                              const void *                     weights,
+                              const void *                     y_q8_1,
+                              float *                          dst,
+                              int                              ncols,
+                              int                              nrows,
+                              int                              total_nrows,
+                              int                              row_low,
+                              const std::vector<sycl::event> * deps      = nullptr,
+                              sycl::event *                    event_out = nullptr);
+
+// MMVQ-ID counterpart. expert_ptrs_device is indexed by ids_device values, or
+// by linear batch when ids_device is null. ids uses byte strides [id][token].
+// Q8 rows use [id % ne11][token], and output uses [id][token] byte strides.
+bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
+                                 ggml_type                        weight_type,
+                                 ggml_layout_mode                 weight_layout,
+                                 const void * const *             expert_ptrs_device,
+                                 const void *                     y_q8_1,
+                                 const int32_t *                  ids_device,
+                                 float *                          dst,
+                                 int                              ncols,
+                                 int                              nrows_per_expert,
+                                 int                              total_batches,
+                                 int                              n_ids,
+                                 int                              n_tokens,
+                                 int                              ne11,
+                                 int64_t                          ids_nb0,
+                                 int64_t                          ids_nb1,
+                                 int64_t                          q8_nb11,
+                                 int64_t                          q8_nb12,
+                                 int64_t                          dst_nb1,
+                                 int64_t                          dst_nb2,
+                                 const std::vector<sycl::event> * deps      = nullptr,
+                                 sycl::event *                    event_out = nullptr);
+
 sycl::event mmvq_submit_mxfp4_soa_batched(sycl::queue &                    q,
                                           const void * const *             expert_ptrs_device,
                                           const void *                     y_q8_soa,
