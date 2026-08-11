@@ -22,7 +22,7 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key,
                                          ggml_layout_mode           layout,
                                          bool                       on_device,
                                          std::shared_ptr<void>      storage_owner);
-bool test_moe_resolved_batch_accepts_actual_planned_alternate();
+bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease);
 
 // Test-only layout override hooks (no env handling inside the library).
 // Use the guard in tests to temporarily force a layout during a scoped operation.

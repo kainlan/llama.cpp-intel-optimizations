@@ -67,7 +67,7 @@ struct moe_batch_route {
 
     friend moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *, int, const int32_t *,
                                                                         size_t, size_t, ggml_layout_mode, bool);
-    friend bool test_moe_resolved_batch_accepts_actual_planned_alternate();
+    friend bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle);
 };
 
 struct moe_resolved_operand {

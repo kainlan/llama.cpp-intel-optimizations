@@ -23077,7 +23077,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
     });
 }
 
-bool test_moe_resolved_batch_accepts_actual_planned_alternate() {
+bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) {
     placement_plan plan;
     placement_entry entry;
     entry.name          = "blk.0.ffn_gate_exps.weight";
@@ -23093,24 +23093,21 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate() {
     const expert_placement_result placement =
         plan.lookup_expert_placement("blk.0.ffn_gate_exps.weight", 6);
 
-    int                 storage = 0;
-    ggml_sycl_cache_id  key{};
-    key.valid     = true;
-    key.model_id  = 0x4d4f4500;
-    key.name_hash = 6;
-    key.aux_id    = 6;
+    const resolved_ptr leased = lease.resolve();
+    if (!leased.ptr || !leased.on_device || leased.layout != GGML_LAYOUT_SOA || lease.device() != 0) {
+        return false;
+    }
 
     moe_expert_route canonical;
     canonical.kind                     = moe_expert_route_kind::LOCAL_DEVICE;
-    canonical.ptr                      = &storage;
+    canonical.ptr                      = leased.ptr;
     canonical.owning_device            = 0;
     canonical.planned_device           = 1;
     canonical.plan_found               = true;
     canonical.planned_device_residency = true;
     canonical.requested_layout         = GGML_LAYOUT_SOA;
     canonical.actual_layout            = GGML_LAYOUT_SOA;
-    canonical.lease = test_make_stable_weight_lease(key, 0, &storage, GGML_LAYOUT_SOA, true,
-                                                     std::make_shared<int>(6));
+    canonical.lease                    = std::move(lease);
 
     moe_batch_route normalized;
     normalized.residency        = moe_batch_residency::PRIMARY_DEVICE;

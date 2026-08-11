@@ -6,9 +6,10 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 HOST_TEST = ROOT / "tests/test-sycl-moe-resolved-batch.cpp"
+MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 
 
-def violations(header: str, source: str, host_test: str) -> list[str]:
+def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
         "copy IDs once": "out.batch.expert_ids.assign(ids, ids + count);",
@@ -53,8 +54,11 @@ def violations(header: str, source: str, host_test: str) -> list[str]:
         failures.append("public/caller-writable alternate authorization")
     if "from_weight_lease_snapshot" in host_test or "get_unified_cache_for_device" in host_test:
         failures.append("device-dependent host fixture")
-    if "test_make_stable_weight_lease" not in host_test:
-        failures.append("zero-device stable lease fixture")
+    fixture_signature = "mem_handle test_make_stable_weight_lease("
+    if fixture_signature not in host_test:
+        failures.append("test target defines zero-device stable lease fixture")
+    if "test_make_stable_weight_lease" in mem_handle_source:
+        failures.append("production library defines/exports test lease factory")
 
     wrapper_start = source.index("moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch")
     wrapper_end = source.index("static bool ggml_sycl_try_pp_local_moe_route", wrapper_start)
@@ -70,7 +74,9 @@ def test_contract_and_mutation_witnesses() -> None:
     header = HEADER.read_text()
     source = SOURCE.read_text()
     host_test = HOST_TEST.read_text()
-    assert not violations(header, source, host_test), violations(header, source, host_test)
+    mem_handle_source = MEM_HANDLE_SOURCE.read_text()
+    assert not violations(header, source, host_test, mem_handle_source), violations(
+        header, source, host_test, mem_handle_source)
 
     # Every load-bearing source invariant has an explicit RED witness.  Mutants
     # are in-memory only; the repository is never modified by this test.
@@ -99,19 +105,23 @@ def test_contract_and_mutation_witnesses() -> None:
         assert (header if which == "header" else source).count(needle) >= 1, name
         mutant_header = header.replace(needle, "/* MUTATED */") if which == "header" else header
         mutant_source = source.replace(needle, "/* MUTATED */") if which == "source" else source
-        assert violations(mutant_header, mutant_source, host_test), f"mutation survived: {name}"
+        assert violations(mutant_header, mutant_source, host_test, mem_handle_source), f"mutation survived: {name}"
 
     slot_mutant = header.replace("operand.slot_index       = i % slots_per_token;",
                                  "operand.slot_index       = 0;")
-    assert violations(slot_mutant, source, host_test), "mutation survived: force-slot-zero"
+    assert violations(slot_mutant, source, host_test, mem_handle_source), "mutation survived: force-slot-zero"
 
     public_proof = header.replace("  private:\n    // Non-forgeable", "  public:\n    // FORGED")
-    assert violations(public_proof, source, host_test), "mutation survived: make-proof-public"
+    assert violations(public_proof, source, host_test, mem_handle_source), "mutation survived: make-proof-public"
 
     writable_proof = header.replace("bool authoritative_planned_alternate_ = false;",
                                     "bool owner_is_planned_alternate = false;")
-    assert violations(writable_proof, source, host_test), "mutation survived: caller-writable-proof"
+    assert violations(writable_proof, source, host_test, mem_handle_source), "mutation survived: caller-writable-proof"
 
     device_fixture = host_test.replace("test_make_stable_weight_lease",
                                        "mem_handle::from_weight_lease_snapshot")
-    assert violations(header, source, device_fixture), "mutation survived: device-dependent-fixture"
+    assert violations(header, source, device_fixture, mem_handle_source), "mutation survived: device-dependent-fixture"
+
+    production_factory = mem_handle_source + "\nmem_handle test_make_stable_weight_lease(/* MUTATED */) {}\n"
+    assert violations(header, source, host_test, production_factory), \
+        "mutation survived: production-exports-test-factory"

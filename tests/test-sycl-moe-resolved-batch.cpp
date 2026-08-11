@@ -9,6 +9,28 @@
 
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL:%d: %s\n", __LINE__, #c); return false; } } while (0)
 
+namespace ggml_sycl {
+
+// Test-target-only stable lease. This friend-backed definition deliberately
+// does not exist in libggml-sycl and never probes device/cache state.
+mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
+                                         int                        device,
+                                         void *                     ptr,
+                                         ggml_layout_mode           layout,
+                                         bool                       on_device,
+                                         std::shared_ptr<void>      storage_owner) {
+    mem_handle h;
+    h.kind_   = mem_handle_kind::WEIGHT;
+    h.device_ = device;
+    h.key_    = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
+    h.gen_    = cache_generation();
+    h.cached_ = { ptr, layout, on_device };
+    h.leased_storage_owner_ = std::move(storage_owner);
+    return h;
+}
+
+} // namespace ggml_sycl
+
 static ggml_sycl_cache_id key_for(int id) {
     // Synthetic logical identity: deliberately independent of the backing
     // pointer so the test cannot accidentally bless pointer-derived identity.
@@ -74,9 +96,10 @@ static bool test_host_primary_secondary_mixed_and_occurrences() {
 static bool test_explicit_planned_alternate_on_submit_device() {
     // The positive path crosses the canonical production normalizer and an
     // actual placement_plan entry; this generic route cannot self-authorize.
-    CHECK(ggml_sycl::test_moe_resolved_batch_accepts_actual_planned_alternate());
-
     int alternate = 6;
+    CHECK(ggml_sycl::test_moe_resolved_batch_accepts_actual_planned_alternate(
+        weight_handle(&alternate, 0, GGML_LAYOUT_SOA, 6, true)));
+
     const int32_t ids[] = { 6 };
     auto unproved = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
                               GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
