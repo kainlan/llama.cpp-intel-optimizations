@@ -173,6 +173,8 @@ def contract(text: str) -> bool:
         case_body_open = mul_mat_case.index("{")
         type_guard = "if (!ggml_sycl_mul_mat_type_supported(a_type)) {"
         type_guard_start, _, type_guard_body = braced_body(mul_mat_case, type_guard)
+        planner_decisions = decision_clauses(planner_body)
+        planner_control_decisions = tuple(decision for decision in planner_decisions if decision[0] != "statement")
         pre_guard_decisions = decision_clauses(mul_mat_case[case_body_open + 1 : type_guard_start])
     except (IndexError, ValueError):
         return False
@@ -189,8 +191,7 @@ def contract(text: str) -> bool:
             "constboolis_multi_gpu_router_logits="
             "g_moe_multi_gpu_active.load(std::memory_order_acquire)&&"
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
-        and executable_body(planner_body).endswith("returnfalse;")
-        and "returntrue;" not in executable_body(planner_body)
+        and planner_control_decisions == (("return", "false"),)
         and executable_body(function[planner_close + 1 : switch]) == ""
         and later_indexed_case is None
         and len(re.findall(r"\bcase\s+GGML_OP_MUL_MAT\s*:", switch_body)) == 1
@@ -262,6 +263,21 @@ def test_no_early_success_can_bypass_indexed_or_switch_validation() -> None:
         planner_guard + "\n    return true;",
     )
     assert not contract(after_planner_guard)
+
+
+def test_planner_guard_rejects_non_boolean_spelled_early_successes() -> None:
+    function = supports_function(SOURCE)
+    _, _, planner_body = braced_body(function, PLANNER_GUARD)
+    assert planner_body.count("return false;") == 1
+
+    for early_success in ("return 1;", "return static_cast<bool>(1);"):
+        mutated_body = planner_body.replace(
+            "return false;",
+            early_success + "\n        return false;",
+            1,
+        )
+        mutated = replace_in_supports_function(SOURCE, planner_body, mutated_body)
+        assert not contract(mutated)
 
 
 def test_router_logits_control_flow_mutations_are_rejected() -> None:
