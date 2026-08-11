@@ -21393,6 +21393,65 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
     return true;
 }
 
+// Publish ordinary device-buffer MoE AoS storage as retained allocation views.
+// The backend buffer's allocation-time mem_handle is the sole owner: each
+// expert capability is a checked slice carrying the allocation id, device,
+// exact byte range, layout and shared lifetime.  Resolution therefore never
+// has to reconstruct authority from tensor->data or an allocation registry.
+static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
+    if (!ctx || !tensor || tensor->view_src != nullptr || !tensor->extra ||
+        ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid() ||
+        ggml_sycl_get_tensor_usage(tensor) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return false;
+    }
+
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+    if (extra->layout.mode != GGML_LAYOUT_AOS || tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
+        return false;
+    }
+
+    const uintptr_t allocation_begin = reinterpret_cast<uintptr_t>(ctx->managed_meta.ptr);
+    const uintptr_t tensor_begin     = reinterpret_cast<uintptr_t>(tensor->data);
+    if (tensor_begin < allocation_begin) {
+        return false;
+    }
+    const size_t tensor_offset = static_cast<size_t>(tensor_begin - allocation_begin);
+    const size_t expert_size   = static_cast<size_t>(tensor->nb[2]);
+    const size_t expert_count  = static_cast<size_t>(tensor->ne[2]);
+    if (expert_count > SIZE_MAX / expert_size) {
+        return false;
+    }
+    const size_t tensor_span = expert_count * expert_size;
+    if (tensor_offset > ctx->managed_meta.size || tensor_span > ctx->managed_meta.size - tensor_offset) {
+        return false;
+    }
+
+    for (size_t expert = 0; expert < expert_count; ++expert) {
+        const size_t          slice_offset  = tensor_offset + expert * expert_size;
+        ggml_sycl::mem_handle expert_handle = ctx->managed_handle.slice(slice_offset, expert_size);
+        const auto            resolved      = expert_handle.resolve(ctx->device);
+        const void *          expected      = reinterpret_cast<const void *>(tensor_begin + expert * expert_size);
+        if (!resolved.ptr || !resolved.on_device || resolved.layout != GGML_LAYOUT_AOS ||
+            expert_handle.device() != ctx->device || expert_handle.size() != expert_size || resolved.ptr != expected ||
+            !expert_handle.has_stable_owner_identity()) {
+            return false;
+        }
+        extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS, std::move(expert_handle));
+    }
+    return true;
+}
+
+static void ggml_sycl_forget_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
+    if (!ctx || !tensor || !tensor->extra || ggml_sycl_get_tensor_usage(tensor) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return;
+    }
+    auto *       extra        = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+    const size_t expert_count = tensor->ne[2] > 0 ? static_cast<size_t>(tensor->ne[2]) : 0;
+    for (size_t expert = 0; expert < expert_count; ++expert) {
+        extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
+    }
+}
+
 static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor, "\n").c_str());
@@ -30116,6 +30175,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         }
     }
     if (is_weight_buffer) {
+        // A write starts a new content generation.  Withdraw ordinary AoS
+        // capabilities before mutation; a retained resolver copy keeps the old
+        // allocation alive but cannot be rediscovered as current storage.
+        ggml_sycl_forget_backend_aos_expert_handles(ctx, tensor);
         ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device);
         if (cache_key.valid) {
             if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*stream)) {
@@ -30550,23 +30613,15 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                           extra->layout.device_id == ctx->device && !buffer_is_host_pinned;
     const bool should_materialize =
         (adjusted_layout != GGML_LAYOUT_AOS) && !is_moe_expert && !buffer_is_host_pinned && !has_direct_device_layout;
-    // Register AOS as the layout choice for MoE expert weights so layout
-    // assertions pass during inference.  Expert cache handles SOA on-demand.
-    if (is_weight_buffer && is_moe_expert) {
-        ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device);
-        if (cache_key.valid) {
-            // Register the full MoE tensor's device pointer as a DENSE_WEIGHT AOS
-            // entry in the unified cache so resolve_weight() can find it directly.
-            // This is only for device-resident tensors (not host-pinned).
-            // The entry is non-owning (pool_allocated=false) so the cache won't
-            // free the pointer — it's owned by the ggml buffer.
-            if (!buffer_is_host_pinned && tensor->data) {
-                auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-                if (cache) {
-                    cache->register_ready(cache_key, const_cast<void *>(tensor->data), GGML_LAYOUT_AOS,
-                                          ggml_nbytes(tensor), ggml_sycl::cache_entry_type::DENSE_WEIGHT);
-                }
-            }
+    // A complete ordinary AoS upload is the registration boundary.  Publish
+    // per-expert retained slices from the backend allocation-time owner instead
+    // of inserting a non-owning raw pointer into cache metadata.  Partial writes
+    // remain undiscoverable until a later complete upload establishes readiness.
+    if (is_weight_buffer && is_moe_expert && offset == 0 && size == ggml_nbytes(tensor) && !do_cpu_reorder &&
+        !has_preconverted_tiled && !buffer_is_host_pinned) {
+        if (!ggml_sycl_publish_backend_aos_expert_handles(ctx, tensor)) {
+            GGML_LOG_WARN("[MOE-AOS] failed to publish canonical backend allocation handles for %s on device %d\n",
+                          tensor->name ? tensor->name : "?", ctx->device);
         }
     }
     if (is_weight_buffer && should_materialize && !has_preconverted_tiled) {
