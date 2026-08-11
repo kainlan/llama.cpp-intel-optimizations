@@ -15,6 +15,11 @@ EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
 PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
+EXPECTED_PRE_INDEXED_GUARD_PREFIX = (
+    "ggml_backend_sycl_device_context*sycl_ctx="
+    "(ggml_backend_sycl_device_context*)dev->context;"
+    "intdevice=sycl_ctx->device;"
+)
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
@@ -153,6 +158,7 @@ def mul_mat_type_supported(text: str, type_name: str) -> bool:
 def contract(text: str) -> bool:
     try:
         function = supports_function(text)
+        function_body_open = function.index("{")
         early, early_close, early_body = braced_body(function, EARLY_GUARD)
         router_flag = function.index(ROUTER_FLAG, early_close)
         planner, planner_close, planner_body = braced_body(function, PLANNER_GUARD)
@@ -174,7 +180,8 @@ def contract(text: str) -> bool:
     router_residency_exception = executable_body(function[early_close + 1 : planner])
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
-        early < early_close < router_flag < planner < planner_close < switch
+        function_body_open < early < early_close < router_flag < planner < planner_close < switch
+        and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
         and executable_body(early_body) == "returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
@@ -184,6 +191,7 @@ def contract(text: str) -> bool:
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
         and executable_body(planner_body).endswith("returnfalse;")
         and "returntrue;" not in executable_body(planner_body)
+        and executable_body(function[planner_close + 1 : switch]) == ""
         and later_indexed_case is None
         and len(re.findall(r"\bcase\s+GGML_OP_MUL_MAT\s*:", switch_body)) == 1
         and "op->op == GGML_OP_MUL_MAT" not in mul_mat_case
@@ -235,6 +243,25 @@ def test_router_logits_bypass_only_planner_then_obey_dense_type_policy() -> None
     for supported in ("F32", "Q8_0", "MXFP4"):
         assert modeled_router_mul_mat_support(SOURCE, supported, planned_on_host=True)
         assert modeled_router_mul_mat_support(SOURCE, supported, planned_on_host=False)
+
+
+def test_no_early_success_can_bypass_indexed_or_switch_validation() -> None:
+    before_indexed_guard = replace_in_supports_function(
+        SOURCE,
+        EARLY_GUARD,
+        "return true;\n    " + EARLY_GUARD,
+    )
+    assert not contract(before_indexed_guard)
+
+    function = supports_function(SOURCE)
+    planner, planner_close, _ = braced_body(function, PLANNER_GUARD)
+    planner_guard = function[planner : planner_close + 1]
+    after_planner_guard = replace_in_supports_function(
+        SOURCE,
+        planner_guard,
+        planner_guard + "\n    return true;",
+    )
+    assert not contract(after_planner_guard)
 
 
 def test_router_logits_control_flow_mutations_are_rejected() -> None:
