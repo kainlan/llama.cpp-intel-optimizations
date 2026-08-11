@@ -3319,6 +3319,36 @@ set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Device-free: constructs canonical WEIGHT snapshots over stack storage and
+# exercises only route validation/retention.  No queue or backend is opened.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-moe-resolved-batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-resolved-batch.cpp
+)
+target_include_directories(test-sycl-moe-resolved-batch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-resolved-batch PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-resolved-batch PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-moe-resolved-batch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-resolved-batch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-moe-resolved-batch COMMAND test-sycl-moe-resolved-batch)
+set_tests_properties(test-sycl-moe-resolved-batch PROPERTIES
+    LABELS "sycl;moe;host;retained-route"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+endif()
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-orchestrator
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-orchestrator.cpp

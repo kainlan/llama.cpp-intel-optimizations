@@ -97,6 +97,7 @@
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
+#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
@@ -22979,6 +22980,72 @@ static ggml_sycl::moe_expert_route ggml_sycl_resolve_moe_expert_route_for_dispat
     }
     return route;
 }
+
+namespace ggml_sycl {
+
+const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
+    switch (reason) {
+        case moe_batch_reject_reason::NONE:              return "none";
+        case moe_batch_reject_reason::INVALID_REQUEST:   return "invalid_request";
+        case moe_batch_reject_reason::ROUTE_UNAVAILABLE: return "route_unavailable";
+        case moe_batch_reject_reason::MISSING_HANDLE:    return "missing_handle";
+        case moe_batch_reject_reason::RAW_COMPAT_HANDLE: return "raw_compat_handle";
+        case moe_batch_reject_reason::UNSTABLE_IDENTITY: return "unstable_identity";
+        case moe_batch_reject_reason::STALE_HANDLE:      return "stale_handle";
+        case moe_batch_reject_reason::POINTER_MISMATCH:  return "pointer_mismatch";
+        case moe_batch_reject_reason::LAYOUT_MISMATCH:   return "layout_mismatch";
+        case moe_batch_reject_reason::WRONG_DEVICE:      return "wrong_device";
+        case moe_batch_reject_reason::PLAN_MISMATCH:     return "plan_mismatch";
+    }
+    return "unknown";
+}
+
+moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,
+                                                             int                 submit_device,
+                                                             const int32_t *     ids,
+                                                             size_t              count,
+                                                             size_t              slots_per_token,
+                                                             ggml_layout_mode    requested_layout,
+                                                             bool                allow_materialize) {
+    return build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
+        // This is the single canonical resolver seam for both future decode and
+        // prompt consumers.  No raw fallback or residency inference is allowed
+        // below this point.
+        moe_expert_route route = ::ggml_sycl_resolve_moe_expert_route_for_dispatch(
+            src0, submit_device, expert_id, requested_layout, allow_materialize);
+        moe_batch_route normalized;
+        switch (route.kind) {
+            case moe_expert_route_kind::LOCAL_DEVICE:
+                normalized.residency = moe_batch_residency::PRIMARY_DEVICE;
+                break;
+            case moe_expert_route_kind::SECONDARY_DEVICE:
+                normalized.residency = moe_batch_residency::SECONDARY_DEVICE;
+                break;
+            case moe_expert_route_kind::HOST:
+                normalized.residency = moe_batch_residency::HOST;
+                break;
+            case moe_expert_route_kind::UNAVAILABLE:
+                normalized.residency = moe_batch_residency::UNAVAILABLE;
+                break;
+        }
+        normalized.transient_ptr     = route.ptr;
+        normalized.owning_device     = route.owning_device;
+        normalized.planned_device    = route.planned_device;
+        normalized.plan_found        = route.plan_found;
+        normalized.planned_on_device = route.planned_device_residency;
+        normalized.requested_layout  = route.requested_layout;
+        normalized.actual_layout     = route.actual_layout;
+        normalized.has_ready_event   = route.has_ready_event;
+        if (route.has_ready_event) {
+            normalized.ready_event = route.ready_event;
+        }
+        normalized.lease         = std::move(route.lease);
+        normalized.source_reason = static_cast<int>(route.reason);
+        return normalized;
+    });
+}
+
+} // namespace ggml_sycl
 
 static bool ggml_sycl_try_pp_local_moe_route(const ggml_tensor *                 src0,
                                              int                                 current_device,
