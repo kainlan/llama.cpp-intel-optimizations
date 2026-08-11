@@ -39,6 +39,8 @@ enum class moe_batch_reject_reason : uint8_t {
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);
 
+struct moe_resolved_batch_result;
+
 // Normalized mirror of the existing canonical moe_expert_route.  transient_ptr
 // is checked while building and is never retained in the resulting batch.
 struct moe_batch_route {
@@ -48,9 +50,6 @@ struct moe_batch_route {
     int                 planned_device   = -2;
     bool                plan_found        = false;
     bool                planned_on_device = false;
-    // Set only by the canonical resolver after it has matched an explicit
-    // planner alternate for the submit device.
-    bool                owner_is_planned_alternate = false;
     ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
     ggml_layout_mode    actual_layout    = GGML_LAYOUT_AOS;
     size_t              byte_offset      = 0;
@@ -58,6 +57,17 @@ struct moe_batch_route {
     sycl::event         ready_event;
     mem_handle          lease;
     int                 source_reason    = 0;
+
+    bool has_authoritative_planned_alternate() const { return authoritative_planned_alternate_; }
+
+  private:
+    // Non-forgeable outside the production canonical wrapper. Generic
+    // normalized-route callers can only construct the default (false) proof.
+    bool authoritative_planned_alternate_ = false;
+
+    friend moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *, int, const int32_t *,
+                                                                        size_t, size_t, ggml_layout_mode, bool);
+    friend bool test_moe_resolved_batch_accepts_actual_planned_alternate();
 };
 
 struct moe_resolved_operand {
@@ -138,7 +148,7 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
                                                route.planned_device == route.owning_device) :
                                               (route.planned_device == mem_handle::HOST_DEVICE && host);
         const bool explicit_alternate_matches =
-            route.owner_is_planned_alternate && route.planned_on_device && primary &&
+            route.has_authoritative_planned_alternate() && route.planned_on_device && primary &&
             route.owning_device == submit_device && route.planned_device >= 0 &&
             route.planned_device != route.owning_device;
         if (!primary_plan_matches && !explicit_alternate_matches) {

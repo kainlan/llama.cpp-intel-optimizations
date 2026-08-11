@@ -290,6 +290,22 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     return h;
 }
 
+mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
+                                         int                        device,
+                                         void *                     ptr,
+                                         ggml_layout_mode           layout,
+                                         bool                       on_device,
+                                         std::shared_ptr<void>      storage_owner) {
+    mem_handle h;
+    h.kind_   = mem_handle_kind::WEIGHT;
+    h.device_ = device;
+    h.key_    = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
+    h.gen_    = cache_generation();
+    h.cached_ = { ptr, layout, on_device };
+    h.leased_storage_owner_ = std::move(storage_owner);
+    return h;
+}
+
 mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) {
     unified_cache_key key;
     key.type      = cache_entry_type::DENSE_WEIGHT;

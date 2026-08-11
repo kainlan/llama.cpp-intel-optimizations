@@ -22,9 +22,8 @@ static ggml_sycl_cache_id key_for(int id) {
 
 static ggml_sycl::mem_handle weight_handle(void * ptr, int owner, ggml_layout_mode layout, int identity,
                                            bool on_device) {
-    return ggml_sycl::mem_handle::from_weight_lease_snapshot(
-        key_for(identity), owner, ptr, layout, on_device, nullptr, std::make_shared<int>(identity), false,
-        sycl::event{});
+    return ggml_sycl::test_make_stable_weight_lease(key_for(identity), owner, ptr, layout, on_device,
+                                                    std::make_shared<int>(identity));
 }
 
 static ggml_sycl::moe_batch_route route_for(void * ptr, int owner, ggml_sycl::moe_batch_residency residency,
@@ -73,19 +72,12 @@ static bool test_host_primary_secondary_mixed_and_occurrences() {
 }
 
 static bool test_explicit_planned_alternate_on_submit_device() {
+    // The positive path crosses the canonical production normalizer and an
+    // actual placement_plan entry; this generic route cannot self-authorize.
+    CHECK(ggml_sycl::test_moe_resolved_batch_accepts_actual_planned_alternate());
+
     int alternate = 6;
     const int32_t ids[] = { 6 };
-    auto result = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) {
-        auto route = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                               GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
-        route.planned_device             = 1;
-        route.owner_is_planned_alternate = true;
-        return route;
-    });
-    CHECK(result);
-    CHECK(result.batch.operands[0].owning_device == 0);
-    CHECK(result.batch.operands[0].planned_device == 1);
-
     auto unproved = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
                               GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
     unproved.planned_device = 1;
