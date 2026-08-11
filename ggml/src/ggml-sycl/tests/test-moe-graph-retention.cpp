@@ -1,10 +1,13 @@
+#define GGML_SYCL_RETENTION_TESTING 1
 #include "../moe-graph-retention.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -67,34 +70,40 @@ class test_terminal final : public device_terminal {
     graph_retention_registry * registry_;
 };
 
-class test_drain_authority final : public queue_quiescence_authority {
-  private:
-    class drain_operation final : public operation {
-      public:
-        drain_operation(std::atomic<bool> & ready, std::atomic<bool> & succeeds, std::atomic<unsigned> & waits) :
-            ready_(ready),
-            succeeds_(succeeds),
-            waits_(waits) {}
-
-        bool ready() const noexcept override { return ready_.load(std::memory_order_acquire); }
-
-        bool wait_and_confirm() noexcept override {
-            waits_.fetch_add(1, std::memory_order_relaxed);
-            return succeeds_.load(std::memory_order_acquire);
-        }
-      private:
-        std::atomic<bool> &     ready_;
-        std::atomic<bool> &     succeeds_;
-        std::atomic<unsigned> & waits_;
-    };
-
+class blocking_terminal final : public device_terminal {
   public:
-    std::shared_ptr<queue_quiescence_proof> request_drain(std::atomic<bool> &     ready,
-                                                          std::atomic<bool> &     succeeds,
-                                                          std::atomic<unsigned> & waits) {
-        return seal(std::make_shared<drain_operation>(ready, succeeds, waits));
+    blocking_terminal(std::atomic<bool> & entered, std::atomic<bool> & release) :
+        entered_(entered),
+        release_(release) {}
+
+    bool ready() const noexcept override { return true; }
+
+    void wait() noexcept override {
+        entered_.store(true, std::memory_order_release);
+        while (!release_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
     }
+  private:
+    std::atomic<bool> & entered_;
+    std::atomic<bool> & release_;
 };
+
+struct drain_state {
+    std::atomic<bool> *     ready;
+    std::atomic<bool> *     succeeds;
+    std::atomic<unsigned> * waits;
+};
+
+static bool drain_ready_callback(const void * opaque) noexcept {
+    return static_cast<const drain_state *>(opaque)->ready->load(std::memory_order_acquire);
+}
+
+static bool drain_wait_callback(void * opaque) noexcept {
+    auto * state = static_cast<drain_state *>(opaque);
+    state->waits->fetch_add(1, std::memory_order_relaxed);
+    return state->succeeds->load(std::memory_order_acquire);
+}
 
 struct lock_probe {
     lock_probe(graph_retention_registry & registry, std::atomic<unsigned> & drops) : registry(registry), drops(drops) {}
@@ -108,10 +117,18 @@ struct lock_probe {
     std::atomic<unsigned> &    drops;
 };
 
+static retained_allocation_owner owner_capability(uint64_t                            allocation,
+                                                  const std::shared_ptr<const void> & handle,
+                                                  int                                 device     = 0,
+                                                  uint64_t                            generation = 1,
+                                                  size_t                              extent     = 4096) {
+    return retained_allocation_test_factory::mint(allocation, generation, device, extent, handle);
+}
+
 static mmid_batch_binding binding(uint64_t allocation, const std::shared_ptr<const void> & handle, int device = 0) {
     return {
-        { allocation, 9, device, 16, 64, 1 },
-        { allocation, handle }
+        { allocation, 1, 9, device, 16, 64, 1 },
+        owner_capability(allocation, handle, device)
     };
 }
 
@@ -130,9 +147,7 @@ static void require_bad_identity(mmid_operand_identity identity, uint64_t owner_
     auto                     owner = std::make_shared<int>(99);
     std::atomic<bool>        ready{ true };
     std::atomic<unsigned>    waits{ 0 };
-    require(tx.add_batch({
-                identity, { owner_id, owner }
-    }) == retention_error::OK &&
+    require(tx.add_batch({ identity, owner_capability(owner_id, owner) }) == retention_error::OK &&
                 tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
                 tx.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
             "bad identity setup failed");
@@ -155,10 +170,7 @@ int main() {
                 first.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
                 first.set_terminal(0, std::make_shared<test_terminal>(ready, waits, &retention)) == retention_error::OK,
             "first resources failed");
-    auto table = graph_private_table_owner::create(first_key, 501, 77, 0,
-                                                   {
-                                                       { 101, raw_handle }
-    });
+    auto table = graph_private_table_owner::create(first_key, 501, 77, 0, { owner_capability(101, raw_handle) });
     require(first.add_table({ 501, 77, 0, table }) == retention_error::OK, "first table failed");
     first.mark_finalized();
     require(first.commit() == retention_error::OK, "first commit failed");
@@ -174,7 +186,7 @@ int main() {
     raw_handle.reset();
     table.reset();
     snap.reset();
-    first_binding.owner.handle.reset();
+    first_binding = binding(999, std::make_shared<int>(999));
     require(!weak_operand.expired() && !weak_table.expired(), "installed owners dropped early");
 
     auto       replacement       = begin_tx(f);
@@ -187,6 +199,16 @@ int main() {
     replacement.mark_finalized();
     require(replacement.commit() == retention_error::OK && retention.active(f.context) == replacement_key,
             "replacement visibility failed");
+    published_graph_token replacement_token;
+    InvocationId          managed_invocation{};
+    require(retention.acquire_published_token(replacement_key, &replacement_token) == retention_error::OK &&
+                retention.begin_invocation(replacement_token, &managed_invocation) == retention_error::OK &&
+                f.execution.finish_invocation(f.context, f.session, f.reset, replacement_key.epoch, managed_invocation,
+                                              token()) == error::OK,
+            "published-token invocation handshake failed");
+    published_graph_token forged_token;
+    require(retention.begin_invocation(forged_token, &managed_invocation) == retention_error::STALE,
+            "forged publication token admitted invocation");
     require(retention.retire_exact(first_key) == retention_error::OK && retention.active(f.context) == replacement_key,
             "old exact retirement cleared replacement");
     epoch_snapshot epoch{};
@@ -207,6 +229,19 @@ int main() {
                 incomplete.rollback() == retention_error::OK,
             "incomplete transaction could not be repaired/retired");
 
+    graph_retention_registry extra_registry;
+    fixture                  extra_fixture(extra_registry);
+    auto                     extra       = begin_tx(extra_fixture);
+    auto                     extra_owner = std::make_shared<int>(90);
+    require(extra.add_batch(binding(190, extra_owner)) == retention_error::OK &&
+                extra.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                extra.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK &&
+                extra.set_terminal(1, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
+            "extra terminal setup failed");
+    extra.mark_finalized();
+    require(extra.commit() == retention_error::INCOMPLETE_TERMINALS,
+            "terminal superset accepted instead of exact device set");
+
     // UNKNOWN cannot use a ready event as proof. Failed drain remains retained
     // and retryable; successful queue quiescence permits exact retirement.
     auto       unknown     = begin_tx(f);
@@ -219,8 +254,9 @@ int main() {
     std::atomic<bool>     drain_ready{ true };
     std::atomic<bool>     drain_succeeds{ false };
     std::atomic<unsigned> drain_waits{ 0 };
-    test_drain_authority  drain_authority;
-    require(unknown.set_quiescence_proof(1, drain_authority.request_drain(drain_ready, drain_succeeds, drain_waits)) ==
+    auto drain_state_owner = std::make_shared<drain_state>(drain_state{ &drain_ready, &drain_succeeds, &drain_waits });
+    require(unknown.set_quiescence_proof(
+                1, queue_quiescence_test_factory::mint(drain_state_owner, drain_ready_callback, drain_wait_callback)) ==
                     retention_error::OK &&
                 unknown.commit() == retention_error::PENDING,
             "failed drain did not retain quarantine");
@@ -247,8 +283,8 @@ int main() {
             "prepare failure dropped owner or exposed active");
     require(prepare_tx.commit() == retention_error::OK, "prepare failure was not retryable");
 
-    // Publish failure occurs after lifecycle activation but before retention
-    // visibility. Retry publishes the already-activated intact owner.
+    // Publish failure immediately retires the activated epoch; it can never
+    // issue a managed invocation without a publication token.
     graph_retention_registry publish_fault(retention_fault::PUBLISH_ONCE);
     fixture                  pubf(publish_fault);
     auto                     publish_tx    = begin_tx(pubf);
@@ -260,10 +296,17 @@ int main() {
             "publish fault setup failed");
     publish_owner.reset();
     publish_tx.mark_finalized();
-    require(publish_tx.commit() == retention_error::BUSY && !publish_weak.expired() &&
+    require(publish_tx.commit() == retention_error::BUSY && publish_weak.expired() &&
                 publish_fault.active(pubf.context).epoch.value == 0,
-            "two-phase publish leaked active visibility or owner");
-    require(publish_tx.commit() == retention_error::OK, "publish failure was not retryable");
+            "publish failure leaked active visibility or retained owner after exact retirement");
+    published_graph_token unpublished_token;
+    require(publish_fault.acquire_published_token(publish_tx.key(), &unpublished_token) == retention_error::STALE,
+            "publish failure minted an invocation token");
+    epoch_snapshot publish_epoch{};
+    require(pubf.execution.extract_epoch(pubf.context, pubf.session, pubf.reset, publish_tx.key().epoch, token(),
+                                         &publish_epoch) == error::OK &&
+                publish_epoch.state == epoch_phase::RETIRED,
+            "publish failure left lifecycle ACTIVE without retention visibility");
 
     // Lifecycle activation failure leaves the prepared owner quarantined and
     // intact; exact rollback remains possible without external visibility.
@@ -281,34 +324,27 @@ int main() {
     require(
         af.execution.rollback_record(af.context, af.session, af.reset, activation_tx.key().epoch, token()) == error::OK,
         "activation failure injection failed");
-    require(activation_tx.commit() == retention_error::LIFECYCLE_ERROR && !activation_weak.expired() &&
+    require(activation_tx.commit() == retention_error::LIFECYCLE_ERROR && activation_weak.expired() &&
                 activation_failure.active(af.context).epoch.value == 0,
-            "activation failure dropped owner or leaked visibility");
-    const auto activation_rollback = activation_tx.rollback();
-    require(activation_rollback == retention_error::OK && activation_weak.expired(),
-            "activation failure quarantine could not retire exactly");
+            "activation failure did not retire exactly or leaked visibility");
 
     // Shared-table conflict quarantines an intact retryable transaction.
     auto table_a = begin_tx(f);
     auto a_owner = std::make_shared<int>(12);
-    auto a_table = graph_private_table_owner::create(table_a.key(), 777, 1, 0,
-                                                     {
-                                                         { 301, a_owner }
-    });
+    auto a_table = graph_private_table_owner::create(table_a.key(), 777, 1, 0, { owner_capability(301, a_owner) });
     require(table_a.add_table({ 777, 1, 0, a_table }) == retention_error::OK &&
                 table_a.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
                 table_a.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
             "table A setup failed");
     table_a.mark_finalized();
     require(table_a.commit() == retention_error::OK, "table A commit failed");
+    require(retention.begin_invocation(replacement_token, &managed_invocation) == retention_error::STALE,
+            "stale replacement publication token admitted invocation");
 
     auto               table_b = begin_tx(f);
     auto               b_owner = std::make_shared<int>(13);
     std::weak_ptr<int> b_weak  = b_owner;
-    auto               b_table = graph_private_table_owner::create(table_b.key(), 777, 1, 0,
-                                                                   {
-                                                         { 302, b_owner }
-    });
+    auto b_table = graph_private_table_owner::create(table_b.key(), 777, 1, 0, { owner_capability(302, b_owner) });
     require(table_b.add_table({ 777, 1, 0, b_table }) == retention_error::OK &&
                 table_b.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
                 table_b.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
@@ -341,10 +377,13 @@ int main() {
 
     // Every durable identity component is validated, including range overflow
     // and correlation with the typed allocation owner.
-    const mmid_operand_identity valid_identity{ 501, 9, 0, 16, 64, 1 };
+    const mmid_operand_identity valid_identity{ 501, 1, 9, 0, 16, 64, 1 };
     auto                        invalid = valid_identity;
     invalid.layout_id                   = 0;
     require_bad_identity(invalid, 501, "zero layout accepted");
+    invalid            = valid_identity;
+    invalid.generation = 2;
+    require_bad_identity(invalid, 501, "cross-generation owner accepted");
     invalid        = valid_identity;
     invalid.device = static_cast<int>(execution::max_devices);
     require_bad_identity(invalid, 501, "invalid device accepted");
@@ -355,6 +394,10 @@ int main() {
     invalid.byte_offset = std::numeric_limits<size_t>::max();
     invalid.byte_size   = 2;
     require_bad_identity(invalid, 501, "overflowing range accepted");
+    invalid             = valid_identity;
+    invalid.byte_offset = 4080;
+    invalid.byte_size   = 32;
+    require_bad_identity(invalid, 501, "range outside canonical owner extent accepted");
     invalid            = valid_identity;
     invalid.occurrence = 0;
     require_bad_identity(invalid, 501, "zero occurrence accepted");
@@ -382,6 +425,39 @@ int main() {
     for (auto & reader : readers) {
         reader.join();
     }
+
+    auto              two_retire = begin_tx(f);
+    auto              two_owner  = std::make_shared<int>(902);
+    std::atomic<bool> retire_entered{ false };
+    std::atomic<bool> retire_release{ false };
+    require(two_retire.add_batch(binding(902, two_owner)) == retention_error::OK &&
+                two_retire.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                two_retire.set_terminal(0, std::make_shared<blocking_terminal>(retire_entered, retire_release)) ==
+                    retention_error::OK,
+            "two-retirer setup failed");
+    two_retire.mark_finalized();
+    require(two_retire.commit() == retention_error::OK, "two-retirer commit failed");
+    retention_error first_retire = retention_error::STALE;
+    std::thread     retire_thread([&] { first_retire = retention.retire_exact(two_retire.key()); });
+    while (!retire_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    retention_error   second_retire = retention_error::OK;
+    std::atomic<bool> second_started{ false };
+    std::thread       second_retire_thread([&] {
+        second_started.store(true, std::memory_order_release);
+        second_retire = retention.retire_exact(two_retire.key());
+    });
+    while (!second_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    retire_release.store(true, std::memory_order_release);
+    retire_thread.join();
+    second_retire_thread.join();
+    require(first_retire == retention_error::OK && second_retire == retention_error::STALE &&
+                retention.retire_exact(two_retire.key()) == retention_error::STALE,
+            "single retirer did not serialize waiting stale followers");
 
     // Last-owner destruction and terminal waits both re-enter registry unlocked.
     std::atomic<unsigned> drops{ 0 };
