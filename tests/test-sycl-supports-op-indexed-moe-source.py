@@ -36,6 +36,12 @@ def supports_function(text: str) -> str:
     return text[start:end]
 
 
+def executable_body(body: str) -> str:
+    without_block_comments = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+    without_comments = re.sub(r"//[^\n]*", "", without_block_comments)
+    return re.sub(r"\s+", "", without_comments)
+
+
 def contract(text: str) -> bool:
     try:
         function = supports_function(text)
@@ -53,7 +59,7 @@ def contract(text: str) -> bool:
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
         early < early_close < next_branch < planner < switch
-        and early_body.count("return true;") == 1
+        and executable_body(early_body) == "returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and later_indexed_case is None
@@ -89,6 +95,18 @@ def test_moving_return_immediately_outside_guard_is_rejected() -> None:
     assert early_body.count("return true;") == 1
     moved = guard.replace("return true;", "", 1) + "\n    return true;"
     assert not contract(replace_in_supports_function(SOURCE, guard, moved))
+
+
+def test_conditioning_return_on_add_id_is_rejected() -> None:
+    function = supports_function(SOURCE)
+    _, _, early_body = braced_body(function, EARLY_GUARD)
+    assert early_body.count("return true;") == 1
+    conditional = early_body.replace(
+        "return true;",
+        "if (op->op == GGML_OP_ADD_ID) { return true; }",
+        1,
+    )
+    assert not contract(replace_in_supports_function(SOURCE, early_body, conditional))
 
 
 def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:

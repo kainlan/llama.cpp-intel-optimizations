@@ -98777,7 +98777,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     // FIXME: keep a list of supported types to avoid breaking the backend when a new type is added
                     return false;
                 }
-                // Note: MXFP4 is supported via MMVQ kernel in mmvq.cpp for MUL_MAT_ID
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) && a->ne[2] > 1 && a->ne[3] > 1 &&
                     src0_type == GGML_TYPE_F16) {
