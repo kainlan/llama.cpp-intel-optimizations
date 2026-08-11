@@ -1,9 +1,12 @@
 #include "execution-lifecycle.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <thread>
 
 using namespace ggml_sycl::execution;
 using ggml_sycl::lifecycle::LoadTxnId;
@@ -25,6 +28,31 @@ static ModelToken root_token(uint64_t value) {
         SlotToken{ 1, value + 200 }
     };
 }
+
+struct delayed_terminal final : RetireTerminal {
+    delayed_terminal(Registry &          registry,
+                     ContextId           owner,
+                     std::atomic<bool> & wait_started,
+                     std::atomic<bool> & release_wait) :
+        reg(registry),
+        context(owner),
+        started(wait_started),
+        release(release_wait) {}
+
+    void wait() noexcept override {
+        snapshot snap{};
+        require(reg.extract(context, &snap) == error::OK, "delayed terminal wait ran under registry lock");
+        started.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
+    Registry &          reg;
+    ContextId           context;
+    std::atomic<bool> & started;
+    std::atomic<bool> & release;
+};
 
 struct probe_terminal final : RetireTerminal {
     probe_terminal(Registry &              registry,
@@ -79,26 +107,57 @@ int main() {
                 reg.finish_invocation(context, session, reset, first, invocation2, root) == error::OK,
             "one epoch did not survive two invocations");
 
-    GraphEpoch rolled_back{};
-    require(reg.begin_record(context, session, reset, root, &rolled_back) == error::OK &&
-                reg.rollback_record(context, session, reset, rolled_back, root) == error::OK,
-            "rollback before activation failed");
+    const int      devices[] = { 0, 1 };
     epoch_snapshot epoch_snap{};
-    require(reg.extract_epoch(context, session, reset, rolled_back, root, &epoch_snap) == error::STALE,
-            "rolled-back record remained visible");
 
+    // A failed recording remains RETIRING while its retained asynchronous work
+    // drains. It is never erased directly by rollback_record().
+    GraphEpoch failed_record{};
+    require(reg.begin_record(context, session, reset, root, &failed_record) == error::OK &&
+                reg.rollback_record(context, session, reset, failed_record, root) == error::OK &&
+                reg.extract_epoch(context, session, reset, failed_record, root, &epoch_snap) == error::OK &&
+                epoch_snap.state == epoch_phase::RETIRING,
+            "failed record did not enter authoritative RETIRING phase");
+    RetireTicket failed_ticket{};
+    require(reg.begin_retire(context, session, reset, failed_record, root, devices, 1, &failed_ticket) == error::OK,
+            "failed record retire ticket failed");
+    std::atomic<bool> delayed_started{ false };
+    std::atomic<bool> delayed_release{ false };
+    require(reg.attach_retire_terminal(
+                failed_ticket, 0, std::make_shared<delayed_terminal>(reg, context, delayed_started, delayed_release)) ==
+                error::OK,
+            "failed record retained terminal attach failed");
+    auto delayed_finish = std::async(std::launch::async, [&] { return reg.finish_retire(failed_ticket); });
+    while (!delayed_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    require(delayed_finish.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout,
+            "failed record terminal was not retained");
+    require(reg.extract_epoch(context, session, reset, first, root, &epoch_snap) == error::OK &&
+                epoch_snap.state == epoch_phase::ACTIVE && epoch_snap.is_active,
+            "failed-record retirement disturbed active epoch");
+    delayed_release.store(true, std::memory_order_release);
+    require(delayed_finish.get() == error::OK &&
+                reg.extract_epoch(context, session, reset, failed_record, root, &epoch_snap) == error::OK &&
+                epoch_snap.state == epoch_phase::RETIRED,
+            "failed record did not reach authoritative RETIRED phase");
+
+    // Replacement is legal with an old invocation outstanding. Activation
+    // moves old ACTIVE directly to RETIRING; exact old completion remains valid.
+    InvocationId old_outstanding{};
+    require(reg.begin_invocation(context, session, reset, first, root, &old_outstanding) == error::OK,
+            "outstanding old invocation failed");
     GraphEpoch second{};
     require(reg.begin_record(context, session, reset, root, &second) == error::OK &&
                 reg.activate(context, session, reset, second, root) == error::OK,
             "replacement activation failed");
     require(reg.extract_epoch(context, session, reset, first, root, &epoch_snap) == error::OK &&
-                epoch_snap.state == epoch_phase::REPLACED && !epoch_snap.is_active,
-            "replacement destroyed or retained old active epoch");
+                epoch_snap.state == epoch_phase::RETIRING && epoch_snap.live_invocations == 1 && !epoch_snap.is_active,
+            "replacement did not move old ACTIVE directly to RETIRING");
 
-    const int    devices[] = { 0, 1 };
     RetireTicket old_ticket{};
     require(reg.begin_retire(context, session, reset, first, root, devices, 2, &old_ticket) == error::OK,
-            "old epoch begin retire failed");
+            "old epoch begin retire with outstanding invocation failed");
     std::atomic<unsigned> waits{ 0 };
     std::atomic<unsigned> destroys{ 0 };
     require(reg.attach_retire_terminal(old_ticket, 0,
@@ -108,6 +167,11 @@ int main() {
     require(reg.attach_retire_terminal(old_ticket, 1,
                                        std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
             "second terminal attach failed");
+    require(reg.finish_retire(old_ticket) == error::BUSY, "retirement ignored outstanding old invocation");
+    require(reg.finish_invocation(context, session, reset, first, old_outstanding, root) == error::OK,
+            "exact old invocation completion rejected after replacement");
+    require(reg.finish_invocation(context, session, reset, first, old_outstanding, root) == error::STALE,
+            "stale old invocation completion accepted");
 
     RetireTicket wrong_context = old_ticket;
     wrong_context.context      = { context.value + 999 };
@@ -118,9 +182,24 @@ int main() {
     require(reg.finish_retire(old_ticket) == error::OK && waits.load() == 2 && destroys.load() == 2,
             "exact retire did not wait for and release every terminal");
     require(reg.finish_retire(old_ticket) == error::STALE, "stale retire ticket mutated replacement state");
+    require(reg.extract_epoch(context, session, reset, first, root, &epoch_snap) == error::OK &&
+                epoch_snap.state == epoch_phase::RETIRED,
+            "old epoch did not reach authoritative RETIRED phase");
     require(reg.extract_epoch(context, session, reset, second, root, &epoch_snap) == error::OK &&
                 epoch_snap.state == epoch_phase::ACTIVE && epoch_snap.is_active,
             "old completion mutated replacement epoch");
+
+    // Zero-terminal retirement is possible only through the explicit proof API.
+    GraphEpoch   empty_failed_record{};
+    RetireTicket empty_ticket{};
+    require(reg.begin_record(context, session, reset, root, &empty_failed_record) == error::OK &&
+                reg.rollback_record(context, session, reset, empty_failed_record, root) == error::OK &&
+                reg.begin_retire_no_resources(context, session, reset, empty_failed_record, root, &empty_ticket) ==
+                    error::OK &&
+                reg.finish_retire(empty_ticket) == error::OK &&
+                reg.extract_epoch(context, session, reset, empty_failed_record, root, &epoch_snap) == error::OK &&
+                epoch_snap.state == epoch_phase::RETIRED,
+            "explicit no-retained-resources retirement failed");
 
     RetireTicket second_ticket{};
     require(reg.begin_retire(context, session, reset, second, root, devices, 2, &second_ticket) == error::OK &&

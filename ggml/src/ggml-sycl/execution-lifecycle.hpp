@@ -42,7 +42,7 @@ enum class error {
 enum class context_phase { OPEN, DRAINING, RESETTING, CLOSED };
 enum class session_phase { IDLE, OPEN, RESETTING, DRAINING, CLOSED };
 enum class graph_phase { IDLE, OPEN, SEALED, COMPLETE, QUARANTINED, RETIRED };
-enum class epoch_phase { RECORDING, ACTIVE, REPLACED, RETIRING };
+enum class epoch_phase { RECORDING, ACTIVE, RETIRING, RETIRED };
 enum class token_root_phase { OPEN, SEALED, COMPLETE, QUARANTINED };
 
 enum class test_mutation {
@@ -169,6 +169,12 @@ class Registry {
                        const int *           devices,
                        size_t                device_count,
                        RetireTicket *        ticket) noexcept;
+    error begin_retire_no_resources(ContextId             context,
+                                    SessionId             session,
+                                    SessionResetEpoch     reset_epoch,
+                                    GraphEpoch            graph_epoch,
+                                    lifecycle::ModelToken root,
+                                    RetireTicket *        ticket) noexcept;
     error attach_retire_terminal(const RetireTicket &            ticket,
                                  int                             device,
                                  std::shared_ptr<RetireTerminal> terminal) noexcept;
@@ -285,9 +291,19 @@ class Registry {
     };
 
     error next_id(uint64_t & counter, error overflow, bool inject_overflow, uint64_t & out) noexcept;
+    error begin_retire_locked(ContextId             context,
+                              SessionId             session,
+                              SessionResetEpoch     reset_epoch,
+                              GraphEpoch            graph_epoch,
+                              lifecycle::ModelToken root,
+                              const int *           devices,
+                              size_t                device_count,
+                              bool                  no_resources,
+                              RetireTicket *        ticket) noexcept;
     error validate_root(const lifecycle::ModelToken & expected, const lifecycle::ModelToken & actual) const noexcept;
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
+    bool  persistent_epochs_live(const session_entry & session) const noexcept;
     error abort_graph_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                              lifecycle::ModelToken root) noexcept;
     error submit_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
