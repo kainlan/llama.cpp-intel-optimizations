@@ -69,6 +69,14 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode executor refused route\")",
         "ready guard suppresses exceptional publish":
             "std::uncaught_exceptions() != uncaught_on_entry",
+        "planned pointer-table failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID planned pointer-table admission failed\")",
+        "ID admission failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID expert ID admission failed\")",
+        "shared retained dispatch helper": "append_retained_decode_operand",
+        "decode CPU-TG fast gate": "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)",
+        "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
+        "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -114,9 +122,11 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
 
     if source.count("ggml_sycl::ggml_sycl_build_moe_resolved_batch(") < 2:  # CPU-TG + main decode
         failures.append("both decode routers use retained batch")
+    if source.count("append_retained_decode_operand(") < 2:  # both consumers
+        failures.append("both decode routers share retained dispatch helper")
 
     decode_start = source.index("auto decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
-    decode_end = source.index("if (have_plan_hybrid) {", decode_start)
+    decode_end = source.index("stage=route-build-end", decode_start)
     decode_route = source[decode_start:decode_end]
     for forbidden in ("from_chunk_ptr", "from_direct", "is_device_expert_ptr", "src0->data", "route.ptr"):
         if has_tokens(decode_route, forbidden):
@@ -133,7 +143,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
     # Behavioral model of the production exception chain: MMID ready guard
     # observes unwinding, compute_forward rethrows, and graph boundary fails.
-    for refusal in ("batch_rejected", "wrong_queue", "q1_capability", "nvfp4_capability"):
+    for refusal in ("batch_rejected", "wrong_queue", "q1_capability", "nvfp4_capability",
+                    "planned_pointer_table_missing"):
         published = False
         graph_success = True
         unwinding = False
@@ -191,6 +202,14 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test, mem_source),
         ("refusal-return", header,
          source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained", "return; // MUL_MAT_ID retained"),
+         host_test, mem_source),
+        ("fast-path-before-admission", header,
+         source.replace("if (ne12 != 1) {\n        if (!pp_cpu_reference_force_router",
+                        "{\n        if (!pp_cpu_reference_force_router"),
+         host_test, mem_source),
+        ("pointer-table-return", header,
+         source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID planned pointer-table admission failed\")",
+                        "return"),
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
