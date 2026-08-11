@@ -8,6 +8,10 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#if !defined(_WIN32)
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
 
 struct cpu_moe_host_aos_task {
     ggml_sycl::moe_execution_recipe recipe;
@@ -562,6 +566,35 @@ static bool test_numerical_q1_nvfp4_host_executor() {
             task.workspace = static_cast<uint8_t *>(aligned) + 1;
             task.workspace_lease = weight_handle(task.workspace, 0, GGML_LAYOUT_AOS, identity++, false);
             CHECK(!ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
+
+#if !defined(_WIN32)
+            if (phase == moe_route_phase::PROMPT) {
+                const long page_size = sysconf(_SC_PAGESIZE);
+                CHECK(page_size > 0 && static_cast<size_t>(page_size) >= static_cast<size_t>(K) * sizeof(float));
+                void * mapping = mmap(nullptr, static_cast<size_t>(page_size) * 2, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                CHECK(mapping != MAP_FAILED);
+                CHECK(mprotect(static_cast<uint8_t *>(mapping) + page_size, static_cast<size_t>(page_size),
+                               PROT_NONE) == 0);
+                float * one_row = reinterpret_cast<float *>(static_cast<uint8_t *>(mapping) + page_size -
+                                                            static_cast<size_t>(K) * sizeof(float));
+                for (int64_t k = 0; k < K; ++k) {
+                    one_row[k] = float(k % 11) / 5.0f;
+                }
+                std::vector<float> one_output(N, 7.0f);
+                task.activations     = one_row;
+                task.output          = one_output.data();
+                task.execution_rows  = 1;
+                task.workspace       = aligned;
+                task.workspace_bytes = bytes;
+                task.workspace_lease = weight_handle(aligned, 0, GGML_LAYOUT_AOS, identity++, false);
+                CHECK(ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
+                for (float value : one_output) {
+                    CHECK(std::isfinite(value) && value == 0.0f);
+                }
+                CHECK(munmap(mapping, static_cast<size_t>(page_size) * 2) == 0);
+            }
+#endif
         }
     }
     return true;

@@ -134,6 +134,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)",
         "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
         "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
+        "execution-row bounded activation copy":
+            "std::memcpy(act, task.activations, rows * static_cast<size_t>(K) * sizeof(float))",
         "inventory planned host recipe workspace": "plan.moe_host_recipe_workspace_bytes",
         "host scratch includes recipe workspace":
             "plan.moe_cpu_expert_staging_bytes + plan.moe_host_recipe_workspace_bytes",
@@ -450,6 +452,10 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test, mem_source),
         ("drop-production-host-recipe-executor", header,
          source.replace("ggml_sycl_cpu_moe_host_aos_execute(task, &reject)", "false"),
+         host_test, mem_source),
+        ("restore-full-admitted-activation-copy", header,
+         source.replace("std::memcpy(act, task.activations, rows * static_cast<size_t>(K) * sizeof(float))",
+                        "std::memcpy(act, task.activations, ws.activation_f32_bytes)"),
          host_test, mem_source),
         ("enable-Q1-device-route", header,
          source.replace("if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)", "if (false)", 1),

@@ -888,6 +888,15 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         if (reject) *reject = moe_batch_reject_reason::STALE_HANDLE;
         return false;
     }
+    const int    K    = static_cast<int>(task.recipe.request.K);
+    const int    N    = static_cast<int>(task.recipe.request.N);
+    const size_t rows = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
+    if (rows == 0 || rows > task.recipe.request.rows) {
+        if (reject) {
+            *reject = moe_batch_reject_reason::RECIPE_MISMATCH;
+        }
+        return false;
+    }
     const auto & ws = task.recipe.workspace;
     auto align_up = [&](size_t value) { return (value + ws.alignment - 1) & ~(ws.alignment - 1); };
     uint8_t * base = static_cast<uint8_t *>(task.workspace);
@@ -899,16 +908,9 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
     float * output = reinterpret_cast<float *>(base + off);
     off = align_up(off + ws.output_f32_bytes);
     void * descriptors = base + off;
-    std::memcpy(act, task.activations, ws.activation_f32_bytes);
+    std::memcpy(act, task.activations, rows * static_cast<size_t>(K) * sizeof(float));
     std::memset(descriptors, 0, ws.descriptor_bytes);
 
-    const int K = static_cast<int>(task.recipe.request.K);
-    const int N = static_cast<int>(task.recipe.request.N);
-    const size_t rows = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
-    if (rows == 0 || rows > task.recipe.request.rows) {
-        if (reject) *reject = moe_batch_reject_reason::RECIPE_MISMATCH;
-        return false;
-    }
     const size_t qrow = ggml_row_size(traits->vec_dot_type, K);
     const size_t wrow = ggml_row_size(task.recipe.request.type, K);
     for (size_t m = 0; m < rows; ++m) {
