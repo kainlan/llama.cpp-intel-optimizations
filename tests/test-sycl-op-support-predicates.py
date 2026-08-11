@@ -41,19 +41,29 @@ def _concat_case_sets(text: str) -> Tuple[Set[str], Set[str]]:
     return set(re.findall(case_pattern, helper)), set(re.findall(case_pattern, dispatch))
 
 
-def test_pool_2d_does_not_inherit_acc_restrictions() -> None:
-    _assert_expression(_case(_supports_source(), "POOL_2D", "ACC"), "true")
+def _evaluate_rope_predicate(expression: str, out_of_place: bool, contiguous: bool) -> bool:
+    python_expression = expression
+    python_expression = python_expression.replace("op->view_src!=nullptr", str(not out_of_place))
+    python_expression = python_expression.replace("op->view_src==nullptr", str(out_of_place))
+    python_expression = python_expression.replace("ggml_is_contiguous(op)", str(contiguous))
+    python_expression = python_expression.replace("||", " or ").replace("&&", " and ")
+    assert re.fullmatch(r"[() TrueFalsenotandor]+", python_expression), python_expression
+    return bool(eval(python_expression, {"__builtins__": {}}, {}))
 
 
-def test_rope_predicate_and_inplace_inventory_counts() -> None:
-    source = _supports_source()
-    _assert_expression(
-        _case(source, "ROPE", "IM2COL"),
-        "op->view_src == nullptr || ggml_is_contiguous(op)",
-    )
+def _assert_rope_contract(full_source: str) -> None:
+    source = _supports_source(full_source)
+    rope_expression = _normalized_return(_case(source, "ROPE", "IM2COL"))
+    for out_of_place in (False, True):
+        for contiguous in (False, True):
+            actual = _evaluate_rope_predicate(rope_expression, out_of_place, contiguous)
+            expected = out_of_place or contiguous
+            assert actual == expected, (out_of_place, contiguous, rope_expression)
+    assert rope_expression == "op->view_src==nullptr||ggml_is_contiguous(op)"
     _assert_expression(_case(source, "IM2COL", "UPSCALE"), "true")
 
-    inventory = BACKEND_OPS_SOURCE.read_text(encoding="utf-8")
+
+def _assert_rope_inventory_contract(inventory: str) -> None:
     start = inventory.index("// single inplace test per type/mode/ff")
     end = inventory.index("for (int v :", start)
     block = inventory[start:end]
@@ -66,13 +76,13 @@ def test_rope_predicate_and_inplace_inventory_counts() -> None:
     types = loop_values("ggml_type type")
     modes = loop_values("int mode")
     factors = loop_values("bool ff")
-    inplace_views = [
-        int(match.group(1))
-        for line in block.splitlines()
-        if "new test_rope" in line
-        for match in [re.search(r"ff,\s*([01]),\s*true,\s*true\)", line)]
-        if match is not None
-    ]
+    discovered_rows = re.findall(r"test_cases\.emplace_back\(new test_rope\((.*?)\)\);", block, re.DOTALL)
+    parsed_views = []
+    for row in discovered_rows:
+        match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
+        assert match is not None, f"unparsed inplace ROPE inventory row: {row!r}"
+        parsed_views.append(int(match.group(1)))
+    assert len(parsed_views) == len(discovered_rows)
 
     assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
     assert modes == [
@@ -83,17 +93,29 @@ def test_rope_predicate_and_inplace_inventory_counts() -> None:
         "GGML_ROPE_TYPE_VISION",
     ]
     assert factors == ["false", "true"]
-    assert inplace_views == [0, 1, 1]
+    assert parsed_views == [0, 1, 1]
 
     multiplicity = len(types) * len(modes) * len(factors)
-    decisions = [view == 0 for view in inplace_views for _ in range(multiplicity)]
-    assert decisions.count(False) == 40  # non-contiguous in-place: decline
-    assert decisions.count(True) == 20   # contiguous in-place: preserve
+    decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]
+    assert decisions.count(False) == 40
+    assert decisions.count(True) == 20
 
-    rope_supported = lambda out_of_place, contiguous: out_of_place or contiguous
-    assert rope_supported(True, False)   # out-of-place is admitted regardless of dst layout
-    assert rope_supported(False, True)   # contiguous in-place control
-    assert not rope_supported(False, False)
+
+def _contract_rejects(oracle, source: str) -> bool:
+    try:
+        oracle(source)
+    except AssertionError:
+        return True
+    return False
+
+
+def test_pool_2d_does_not_inherit_acc_restrictions() -> None:
+    _assert_expression(_case(_supports_source(), "POOL_2D", "ACC"), "true")
+
+
+def test_rope_predicate_and_inplace_inventory_counts() -> None:
+    _assert_rope_contract(SUPPORT_SOURCE.read_text(encoding="utf-8"))
+    _assert_rope_inventory_contract(BACKEND_OPS_SOURCE.read_text(encoding="utf-8"))
 
 
 def test_norm_family_predicates_match_complete_kernel_contracts() -> None:
@@ -168,12 +190,28 @@ def test_concat_support_helper_and_dispatch_case_sets_are_identical() -> None:
 
 
 def test_review_mutations_are_detected() -> None:
-    support = _supports_source()
-    rope = _case(support, "ROPE", "IM2COL")
-    expected_rope = _normalized_return(rope)
-    mutated_rope = rope.replace(" || ", " && ", 1)
-    assert _normalized_return(mutated_rope) != expected_rope
+    full_support = SUPPORT_SOURCE.read_text(encoding="utf-8")
+    support_start = full_support.index("static bool ggml_backend_sycl_device_supports_op")
+    rope_start = full_support.index("case GGML_OP_ROPE:", support_start)
+    rope_end = full_support.index("case GGML_OP_IM2COL:", rope_start)
+    rope_case = full_support[rope_start:rope_end]
+    for old, new in ((" == nullptr", " != nullptr"), (" || ", " && ")):
+        assert old in rope_case
+        mutated_case = rope_case.replace(old, new, 1)
+        mutated_source = full_support[:rope_start] + mutated_case + full_support[rope_end:]
+        assert _contract_rejects(_assert_rope_contract, mutated_source)
 
+    inventory = BACKEND_OPS_SOURCE.read_text(encoding="utf-8")
+    inventory_start = inventory.index("// single inplace test per type/mode/ff")
+    row_start = inventory.index("test_cases.emplace_back(new test_rope", inventory_start)
+    row_end = inventory.index("\n", row_start)
+    row = inventory[row_start:row_end]
+    injected_row = row.replace("ff, 0, true, true", "ff, 2, true, true")
+    assert injected_row != row
+    mutated_inventory = inventory[:row_end] + "\n" + injected_row + inventory[row_end:]
+    assert _contract_rejects(_assert_rope_inventory_contract, mutated_inventory)
+
+    support = _supports_source(full_support)
     group = _case(support, "GROUP_NORM", "RMS_NORM_BACK")
     expected_group = _normalized_return(group)
     mutated_group = group.replace(" && ", " || ", 1)
