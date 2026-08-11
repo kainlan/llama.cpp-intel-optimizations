@@ -76,7 +76,6 @@ struct moe_workspace_recipe {
     size_t output_f32_bytes     = 0;
     size_t descriptor_bytes     = 0;
     size_t total_bytes          = 0;
-    size_t chunk_rows           = 0;
 };
 
 struct moe_execution_recipe {
@@ -132,53 +131,7 @@ inline bool plan_moe_host_workspace(const moe_route_request & request,
         return false;
     }
     plan.total_bytes = total;
-    plan.chunk_rows = request.rows;
     *out             = plan;
-    return true;
-}
-
-// Device recipes are deliberately bounded: prompt execution reuses one chunk
-// of AoS Q8_1/output/descriptor scratch instead of reserving the whole prompt.
-inline bool plan_moe_q1_nvfp4_device_workspace(const moe_route_request & request,
-                                                size_t                    q8_row_bytes,
-                                                size_t                    max_chunk_rows,
-                                                moe_workspace_recipe *    out) {
-    if (!out || (request.type != GGML_TYPE_Q1_0 && request.type != GGML_TYPE_NVFP4) ||
-        request.K <= 0 || request.N <= 0 || request.rows == 0 || q8_row_bytes == 0 || max_chunk_rows == 0) {
-        return false;
-    }
-    const int64_t block_k = request.type == GGML_TYPE_Q1_0 ? 128 : 64;
-    if (request.K % block_k != 0 || request.K > INT32_MAX || request.N > INT32_MAX) {
-        return false;
-    }
-    moe_workspace_recipe plan;
-    plan.chunk_rows = std::min(request.rows, max_chunk_rows);
-    auto checked_mul = [](size_t a, size_t b, size_t * value) {
-        if (a != 0 && b > SIZE_MAX / a) return false;
-        *value = a * b;
-        return true;
-    };
-    if (!checked_mul(plan.chunk_rows, q8_row_bytes, &plan.activation_q8_bytes) ||
-        !checked_mul(plan.chunk_rows, static_cast<size_t>(request.N), &plan.output_f32_bytes) ||
-        !checked_mul(plan.output_f32_bytes, sizeof(float), &plan.output_f32_bytes) ||
-        !checked_mul(plan.chunk_rows, sizeof(void *) + sizeof(int32_t), &plan.descriptor_bytes)) {
-        return false;
-    }
-    auto aligned_add = [&](size_t bytes, size_t * total) {
-        const size_t mask = plan.alignment - 1;
-        if (*total > SIZE_MAX - mask) return false;
-        const size_t aligned = (*total + mask) & ~mask;
-        if (bytes > SIZE_MAX - aligned) return false;
-        *total = aligned + bytes;
-        return true;
-    };
-    size_t total = 0;
-    if (!aligned_add(plan.activation_q8_bytes, &total) || !aligned_add(plan.output_f32_bytes, &total) ||
-        !aligned_add(plan.descriptor_bytes, &total)) {
-        return false;
-    }
-    plan.total_bytes = total;
-    *out = plan;
     return true;
 }
 
@@ -206,7 +159,6 @@ inline size_t moe_execution_recipe_signature(const moe_execution_recipe & recipe
     mix(recipe.workspace.output_f32_bytes);
     mix(recipe.workspace.descriptor_bytes);
     mix(recipe.workspace.total_bytes);
-    mix(recipe.workspace.chunk_rows);
     return h;
 }
 
@@ -243,7 +195,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
             expected.activation_q8_bytes != recipe.workspace.activation_q8_bytes ||
             expected.output_f32_bytes != recipe.workspace.output_f32_bytes ||
             expected.descriptor_bytes != recipe.workspace.descriptor_bytes ||
-            expected.total_bytes != recipe.workspace.total_bytes || expected.chunk_rows != recipe.workspace.chunk_rows) {
+            expected.total_bytes != recipe.workspace.total_bytes) {
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     }
@@ -266,28 +218,8 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     } else {
-        const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4;
-        if (direct_q1_nvfp4) {
-            moe_workspace_recipe expected;
-            if (recipe.kernel != moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS || recipe.layout != GGML_LAYOUT_AOS ||
-                recipe.workspace.chunk_rows == 0 ||
-                !plan_moe_q1_nvfp4_device_workspace(recipe.request,
-                                                     recipe.workspace.activation_q8_bytes /
-                                                         recipe.workspace.chunk_rows,
-                                                     recipe.workspace.chunk_rows, &expected) ||
-                expected.activation_q8_bytes != recipe.workspace.activation_q8_bytes ||
-                expected.output_f32_bytes != recipe.workspace.output_f32_bytes ||
-                expected.descriptor_bytes != recipe.workspace.descriptor_bytes ||
-                expected.total_bytes != recipe.workspace.total_bytes ||
-                expected.chunk_rows != recipe.workspace.chunk_rows) {
-                return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
-            }
-            if ((recipe.kind == moe_batch_executor::PRIMARY_DEVICE &&
-                 (recipe.queue != moe_recipe_queue::SUBMIT || recipe.transfer != moe_recipe_transfer::NONE)) ||
-                (recipe.kind == moe_batch_executor::SECONDARY_DEVICE &&
-                 (recipe.queue != moe_recipe_queue::OWNER || recipe.transfer != moe_recipe_transfer::HOST_BOUNCE))) {
-                return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
-            }
+        if (recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4) {
+            return refuse(moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
         }
         if (recipe.kind == moe_batch_executor::PRIMARY_DEVICE &&
             (residency != moe_batch_residency::PRIMARY_DEVICE || recipe.owner_device != submit_device)) {

@@ -22243,8 +22243,6 @@ static bool ggml_sycl_layout_supports_soa(ggml_type type) {
 
 static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mode layout) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return layout == GGML_LAYOUT_AOS;
@@ -22259,9 +22257,6 @@ static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mo
 
 static bool ggml_sycl_moe_secondary_dispatch_supports_layout(ggml_type type, layout_mode layout) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_NVFP4:
-            return layout == GGML_LAYOUT_AOS;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_MXFP4:
@@ -22467,34 +22462,12 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type      
         return cap;
     }
 
-    // Reviewed direct primitives consume the canonical AoS expert allocation in
-    // place. Admission is shape/layout/owner complete; no converter or weight
-    // migration may be selected after this point.
+    // Q1_0/NVFP4 have CPU traits, but no retained-handle decode device
+    // executor yet. Refuse capability before either batched or generic dense
+    // device dispatch can be selected; never stage these routes through CPU.
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
-        const int64_t block_k = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
-        if (phase != moe_route_phase::DECODE) {
-            // Primary prompt dispatch still allocates a whole-batch Q8 artifact;
-            // do not advertise the bounded recipe until chunk execution owns it.
-            cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
-            cap.reason        = "q1-nvfp4-direct-prompt-chunking-pending";
-            return cap;
-        }
-        if (layout != GGML_LAYOUT_AOS) {
-            cap.reject_reason = moe_layer_reject_reason::LAYOUT;
-            cap.reason        = "q1-nvfp4-direct-requires-aos";
-            return cap;
-        }
-        if (K % block_k != 0 || K > INT_MAX || N > INT_MAX) {
-            cap.reject_reason = moe_layer_reject_reason::SHAPE;
-            cap.reason        = "q1-nvfp4-direct-invalid-block-shape";
-            return cap;
-        }
-        cap.supported             = true;
-        cap.kernel                = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
-        cap.requires_host_staging = route_device != submit_device;
-        cap.reject_reason         = moe_layer_reject_reason::NONE;
-        cap.reason                = route_device == submit_device ? "local-q1-nvfp4-aos" :
-                                                                    "secondary-q1-nvfp4-aos-owner-queue";
+        cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
+        cap.reason        = "device-type-stage2-unimplemented";
         return cap;
     }
 
@@ -23152,13 +23125,6 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 normalized.recipe.transfer = cap.requires_host_staging ? moe_recipe_transfer::HOST_BOUNCE :
                                                                         moe_recipe_transfer::NONE;
                 normalized.recipe.valid = true;
-                if (cap.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {
-                    constexpr size_t max_prompt_chunk_rows = 32;
-                    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_1, src0->ne[0]);
-                    normalized.recipe.valid = plan_moe_q1_nvfp4_device_workspace(
-                        normalized.recipe.request, q8_row_bytes, max_prompt_chunk_rows,
-                        &normalized.recipe.workspace);
-                }
             }
         }
         return normalized;
@@ -60867,8 +60833,6 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         }
         resolved_weight_ptrs[i] = resolved_ptr;
         switch (ctx.src0->type) {
-            case GGML_TYPE_Q1_0:
-            case GGML_TYPE_NVFP4:
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_MXFP4:
@@ -61206,13 +61170,9 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         // Phase 3: Quantize + GEMM kernels on secondary queue.
         std::vector<sycl::event> slot_output_events(chunk_sz);
         sycl::event              shared_q8_event;
-        const bool direct_aos = ctx.src0->type == GGML_TYPE_Q1_0 || ctx.src0->type == GGML_TYPE_NVFP4;
         if (chunk_shared_activation) {
             const float * q_src = act_staging_target[0];
-            shared_q8_event = direct_aos ?
-                quantize_row_q8_1_sycl<quantize_q8_1>(q_src, static_cast<char *>(dev_q8_1[0]), K, 1,
-                                                       GGML_PAD(K, QK8_1), target_queue) :
-                mmvq_submit_quantize_q8_1_soa(*target_queue, q_src, dev_q8_1[0], static_cast<int>(K));
+            shared_q8_event     = mmvq_submit_quantize_q8_1_soa(*target_queue, q_src, dev_q8_1[0], static_cast<int>(K));
         }
         for (size_t ci = 0; ci < chunk_sz; ci++) {
             const auto & entry = entries[gpu_indices[chunk_start + ci]];
@@ -61220,26 +61180,14 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 
             sycl::event q8_event = shared_q8_event;
             if (!chunk_shared_activation) {
-                q8_event = direct_aos ?
-                    quantize_row_q8_1_sycl<quantize_q8_1>(act_staging_target[slot],
-                                                           static_cast<char *>(dev_q8_1[slot]), K, 1,
-                                                           GGML_PAD(K, QK8_1), target_queue) :
-                    mmvq_submit_quantize_q8_1_soa(*target_queue, act_staging_target[slot], dev_q8_1[slot],
-                                                  static_cast<int>(K));
+                q8_event = mmvq_submit_quantize_q8_1_soa(*target_queue, act_staging_target[slot], dev_q8_1[slot],
+                                                         static_cast<int>(K));
             }
 
             void *                   q8_src     = chunk_shared_activation ? dev_q8_1[0] : dev_q8_1[slot];
             void *                   weight_ptr = resolved_weight_ptrs[gpu_indices[chunk_start + ci]];
             std::vector<sycl::event> mmvq_deps{ q8_event };
             switch (ctx.src0->type) {
-                case GGML_TYPE_Q1_0:
-                case GGML_TYPE_NVFP4:
-                    if (!mmvq_submit_q1_nvfp4_aos(*target_queue, ctx.src0->type, entry.layout, weight_ptr,
-                                                  q8_src, dev_out[slot], static_cast<int>(K), static_cast<int>(N),
-                                                  static_cast<int>(N), 0, &mmvq_deps, &slot_output_events[ci])) {
-                        GGML_ABORT("[MOE-ROUTE] admitted secondary Q1/NVFP4 recipe drifted before submit");
-                    }
-                    break;
                 case GGML_TYPE_Q4_0:
                     slot_output_events[ci] =
                         mmvq_submit_q4_0_soa(*target_queue, weight_ptr, q8_src, dev_out[slot], static_cast<int>(K),
@@ -64735,12 +64683,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         have_plan_hybrid && ggml_sycl_placement_plan_moe_needs_other_device(plan_hybrid, ctx.device);
                     const bool cohesive_hidden_plan =
                         hidden_secondary_execution && have_plan_hybrid && !cross_device_plan;
-                    const bool direct_q1_nvfp4_aos =
-                        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
-                        dispatch_layout == GGML_LAYOUT_AOS;
                     const bool planner_batched_ptr_table_safe =
-                        direct_q1_nvfp4_aos ||
-                        (!cross_device_plan && (ggml_sycl_routable_device_count() <= 1 || cohesive_hidden_plan));
+                        !cross_device_plan && (ggml_sycl_routable_device_count() <= 1 || cohesive_hidden_plan);
                     if (!route_slots.empty() && planner_batched_ptr_table_safe) {
                         expert_ptrs_dev =
                             ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, route_slots, layer_id, dispatch_layout,
@@ -64801,9 +64745,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
 
-                    if (!batched_ok && direct_q1_nvfp4_aos) {
-                        GGML_ABORT("[MOE-ROUTE] admitted primary Q1/NVFP4 direct recipe failed before submit");
-                    }
                     if (!batched_ok) {
                         std::vector<sycl::event> per_entry_ready;
                         for (const expert_dispatch_entry * entry : layout_entries) {

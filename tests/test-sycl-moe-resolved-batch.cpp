@@ -507,40 +507,10 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             auto device =
                 route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 91);
             device.recipe.request = request;
-            device.recipe.kernel = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
-            CHECK(plan_moe_q1_nvfp4_device_workspace(request, 272, 4, &device.recipe.workspace));
-            auto device_batch = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return device; });
+            auto device_batch     = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return device; });
             CHECK(device_batch);
-            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
-                                               device.recipe.workspace.total_bytes);
-            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
-            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
-                                               device.recipe.workspace.total_bytes - 1);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
-
-            auto secondary =
-                route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
-            secondary.recipe.request = request;
-            secondary.recipe.kind = moe_batch_executor::SECONDARY_DEVICE;
-            secondary.recipe.kernel = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
-            secondary.recipe.queue = moe_recipe_queue::OWNER;
-            secondary.recipe.transfer = moe_recipe_transfer::HOST_BOUNCE;
-            secondary.recipe.owner_device = 1;
-            secondary.recipe.workspace = device.recipe.workspace;
-            auto secondary_batch = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return secondary; });
-            CHECK(secondary_batch);
-            choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true,
-                                               secondary.recipe.workspace.total_bytes);
-            CHECK(choice && choice.executor == moe_batch_executor::SECONDARY_DEVICE);
-            choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false,
-                                               secondary.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WRONG_QUEUE);
-
-            auto soa = device_batch.batch.operands[0];
-            soa.recipe.layout = GGML_LAYOUT_SOA;
-            soa.admitted_recipe_signature = moe_execution_recipe_signature(soa.recipe);
-            choice = choose_moe_batch_executor(soa, 0, true, soa.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::LAYOUT_MISMATCH);
+            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true, 0);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
         }
     }
     moe_workspace_recipe overflow;

@@ -596,7 +596,6 @@ enum class moe_route_kernel : uint8_t {
     XMX_TILED     = 4,
     MXFP4_I8      = 5,
     MXFP4_DPAS    = 6,
-    DEVICE_MMVQ_Q1_NVFP4_AOS = 7,
 };
 
 inline const char * moe_route_kernel_name(moe_route_kernel kernel) {
@@ -615,8 +614,6 @@ inline const char * moe_route_kernel_name(moe_route_kernel kernel) {
             return "mxfp4-i8";
         case moe_route_kernel::MXFP4_DPAS:
             return "mxfp4-dpas";
-        case moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS:
-            return "device-mmvq-q1-nvfp4-aos";
     }
     return "unknown";
 }
