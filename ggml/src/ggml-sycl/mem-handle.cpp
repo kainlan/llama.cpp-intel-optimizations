@@ -6,6 +6,7 @@
 #include <chrono>
 
 #include "common.hpp"
+#include "moe-graph-retention.hpp"
 #include "pinned-pool.hpp"    // pinned_chunk_pool chunk-lease API (dyhdl)
 #include "unified-cache.hpp"  // get_unified_cache_for_device, unified_cache
 
@@ -435,6 +436,78 @@ mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     h.offset_ += byte_offset;
     h.size_ = byte_size;
     return h;
+}
+
+std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integration::retain(
+    const mem_handle & handle) noexcept {
+    try {
+        uint64_t allocation_id = 0;
+        uint64_t generation    = 0;
+        int      device        = mem_handle::HOST_DEVICE;
+        size_t   extent        = 0;
+        {
+            mem_handle_lock_guard guard(handle.lock_);
+            if (!handle.cached_.ptr) {
+                return std::nullopt;
+            }
+            device = handle.device_;
+            if (handle.owned_alloc_) {
+                allocation_id = handle.owned_alloc_->alloc_id;
+                generation    = handle.owned_alloc_->epoch_id ? handle.owned_alloc_->epoch_id : 1;
+                device        = handle.owned_alloc_->device;
+                extent        = handle.owned_alloc_->size;
+            } else if (handle.kind_ == mem_handle_kind::WEIGHT && handle.key_.id.valid) {
+                allocation_id = static_cast<uint64_t>(handle.stable_identity_hash_locked());
+                generation    = handle.gen_ ? handle.gen_ : 1;
+                extent        = handle.key_.id.nbytes;
+            } else if (handle.is_arena()) {
+                allocation_id = static_cast<uint64_t>(handle.stable_identity_hash_locked());
+                generation    = handle.arena_gen_;
+                extent        = handle.size_;
+            } else {
+                // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
+                // not carry an exact allocation identity/range.
+                return std::nullopt;
+            }
+        }
+        if (allocation_id == 0 || generation == 0 || device < 0 ||
+            device >= static_cast<int>(execution::max_devices) || extent == 0) {
+            return std::nullopt;
+        }
+        auto retained_handle = std::make_shared<mem_handle>(handle);
+        std::shared_ptr<const void> owner = retained_handle;
+        return retained_allocation_owner(allocation_id, generation, device, extent, std::move(owner));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<moe::mmid_batch_binding> moe::canonical_allocation_integration::bind(
+    const mem_handle & handle, uint64_t layout_id, uint32_t occurrence) noexcept {
+    if (layout_id == 0 || occurrence == 0) {
+        return std::nullopt;
+    }
+    auto owner = retain(handle);
+    if (!owner) {
+        return std::nullopt;
+    }
+    size_t byte_offset = 0;
+    size_t byte_size   = 0;
+    {
+        mem_handle_lock_guard guard(handle.lock_);
+        byte_offset = handle.offset_;
+        byte_size   = handle.size_;
+        if (handle.kind_ == mem_handle_kind::WEIGHT) {
+            byte_offset = 0;
+            byte_size   = handle.key_.id.nbytes;
+        }
+    }
+    if (byte_size == 0 || byte_offset > owner->extent() || byte_size > owner->extent() - byte_offset) {
+        return std::nullopt;
+    }
+    return mmid_batch_binding{ { owner->allocation_id(), owner->generation(), layout_id, owner->device(), byte_offset,
+                                 byte_size, occurrence },
+                               std::move(*owner) };
 }
 
 void mem_handle::set_ready_event(const sycl::event & event) {

@@ -17,6 +17,9 @@
 #include <vector>
 
 namespace ggml_sycl {
+namespace moe {
+class canonical_allocation_integration;
+}
 
 // === Generation counter ===
 // Single global atomic, bumped on eviction/promotion/flush (~0-3 times per
@@ -355,6 +358,7 @@ class mem_handle {
     void tag_persistent_lease_site(const char * site) const;
 
   private:
+    friend class moe::canonical_allocation_integration;
     friend mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id &,
                                                     int,
                                                     void *,

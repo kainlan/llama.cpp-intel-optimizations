@@ -189,6 +189,19 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-m7 COMMAND test-sycl-lifecycle-event-lease --case M7)
     add_test(NAME sycl-lifecycle-m7b COMMAND test-sycl-lifecycle-event-lease --case M7b)
     set_tests_properties(sycl-lifecycle-event-lease sycl-lifecycle-g5a sycl-lifecycle-g6 sycl-lifecycle-g6b sycl-lifecycle-g7 sycl-lifecycle-h8 sycl-lifecycle-h8b sycl-lifecycle-h12 sycl-lifecycle-h12b sycl-lifecycle-h13b sycl-lifecycle-m7 sycl-lifecycle-m7b PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    add_executable(test-sycl-moe-graph-retention
+        tests/test-moe-graph-retention.cpp
+        moe-graph-retention.cpp
+        execution-lifecycle.cpp
+        model-lifecycle.cpp)
+    target_include_directories(test-sycl-moe-graph-retention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-moe-graph-retention PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-moe-graph-retention PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-moe-graph-retention COMMAND test-sycl-moe-graph-retention)
+    set_tests_properties(sycl-moe-graph-retention PROPERTIES
+        LABELS "sycl;moe;graph-epoch;host;tsan-capable")
+
     add_executable(test-sycl-graph-epoch-lifecycle
         tests/test-graph-epoch-lifecycle.cpp
         execution-lifecycle.cpp)

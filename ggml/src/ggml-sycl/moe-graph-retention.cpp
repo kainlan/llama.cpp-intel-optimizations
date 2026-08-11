@@ -84,6 +84,9 @@ std::set<int> graph_retention_record::required_devices() const {
     for (const auto & table : tables) {
         result.insert(table.device);
     }
+    for (const auto & owner : generic_owners) {
+        result.insert(owner.device());
+    }
     for (const auto & submission : submissions) {
         if (submission.second != submit_outcome::NOT_SUBMITTED) {
             result.insert(submission.first);
@@ -502,6 +505,30 @@ retention_error graph_retention_registry::begin_invocation(const published_graph
                retention_error::LIFECYCLE_ERROR;
 }
 
+retention_error graph_retention_registry::finish_invocation(const published_graph_token & token,
+                                                            execution::InvocationId       invocation) noexcept {
+    execution::Registry *        execution_registry = nullptr;
+    execution::SessionId         session{};
+    execution::SessionResetEpoch reset{};
+    lifecycle::ModelToken        root{};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto                  it = records_.find(token.key_);
+        if (!token.valid() || invocation.value == 0 || it == records_.end() ||
+            it->second->publication_serial != token.serial_) {
+            return retention_error::STALE;
+        }
+        execution_registry = it->second->lifecycle_registry;
+        session            = it->second->session;
+        reset              = it->second->reset_epoch;
+        root               = it->second->root;
+    }
+    return execution_registry->finish_invocation(token.key_.context, session, reset, token.key_.epoch, invocation,
+                                                 root) == execution::error::OK ?
+               retention_error::OK :
+               retention_error::LIFECYCLE_ERROR;
+}
+
 std::shared_ptr<const graph_retention_record> graph_retention_registry::snapshot(graph_owner_key key) const noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -521,6 +548,11 @@ graph_owner_key graph_retention_registry::active(execution::ContextId context) c
 size_t graph_retention_registry::size() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return records_.size();
+}
+
+graph_retention_registry & global_graph_retention_registry() {
+    static graph_retention_registry registry;
+    return registry;
 }
 
 retention_error graph_recording_transaction::begin(graph_retention_registry &    retention,

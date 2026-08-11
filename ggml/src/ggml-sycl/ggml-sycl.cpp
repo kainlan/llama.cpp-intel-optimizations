@@ -72003,6 +72003,13 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
     const char **                        out_reject_reason            = nullptr,
     std::string *                        out_reject_detail            = nullptr);
 static void moe_graph_mark_fused_pair_skips_for_node(const ggml_tensor * node, int device);
+static bool moe_graph_retention_publish(ggml_backend_sycl_context * ctx);
+static bool moe_graph_retention_begin_replay(ggml_backend_sycl_context * ctx,
+                                             ggml_sycl::execution::InvocationId * invocation);
+static bool moe_graph_retention_finish_replay(ggml_backend_sycl_context * ctx,
+                                              ggml_sycl::execution::InvocationId invocation);
+static void moe_graph_retention_fail_replay(ggml_backend_sycl_context * ctx,
+                                            ggml_sycl::execution::InvocationId invocation);
 static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context * sycl_ctx,
                                                      ggml_cgraph *               cgraph,
                                                      int                         node_idx,
@@ -77923,8 +77930,14 @@ gpu_dispatch:
                                 sycl_ctx->moe_direct_dispatch_graphs.push_back(
                                     { i, direct_graph_hash, direct_identity_hash, std::move(retained_handles),
                                       std::move(recorded) });
-                                g_graph_diag_counters.direct_graphlet_record.fetch_add(1, std::memory_order_relaxed);
-                                exec_graph = sycl_ctx->moe_direct_dispatch_graphs.back().exec_graph.get();
+                                if (!moe_graph_retention_publish(sycl_ctx)) {
+                                    sycl_ctx->invalidate_moe_direct_dispatch_graphs();
+                                    sycl_ctx->moe_direct_dispatch_graphs_disabled = true;
+                                    exec_graph = nullptr;
+                                } else {
+                                    g_graph_diag_counters.direct_graphlet_record.fetch_add(1, std::memory_order_relaxed);
+                                    exec_graph = sycl_ctx->moe_direct_dispatch_graphs.back().exec_graph.get();
+                                }
                                 if (ggml_sycl_graph_diag_enabled() &&
                                     sycl_ctx->moe_direct_dispatch_graphs.size() <= 8) {
                                     fprintf(
@@ -77939,7 +77952,19 @@ gpu_dispatch:
                             if (ggml_sycl_graph_diag_enabled()) {
                                 t_graphlet_submit_start = std::chrono::high_resolution_clock::now();
                             }
-                            sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                            ggml_sycl::execution::InvocationId retained_invocation{};
+                            if (!moe_graph_retention_begin_replay(sycl_ctx, &retained_invocation)) {
+                                throw std::runtime_error("MMID direct graphlet publication is not invokable");
+                            }
+                            try {
+                                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                                if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
+                                    throw std::runtime_error("MMID direct graphlet terminal publication failed");
+                                }
+                            } catch (...) {
+                                moe_graph_retention_fail_replay(sycl_ctx, retained_invocation);
+                                throw;
+                            }
                             if (ggml_sycl_graph_diag_enabled()) {
                                 const auto t_graphlet_submit_end = std::chrono::high_resolution_clock::now();
                                 ggml_sycl_graph_diag_add_ns(
@@ -80109,6 +80134,207 @@ static const sycl_ex::command_graph<sycl_ex::graph_state::executable> * moe_grap
     return nullptr;
 }
 
+class moe_sycl_event_terminal final : public ggml_sycl::moe::device_terminal {
+  public:
+    bool ready() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!event_.has_value()) {
+            return true;
+        }
+        try {
+            return event_->get_info<sycl::info::event::command_execution_status>() ==
+                   sycl::info::event_command_status::complete;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void wait() noexcept override {
+        std::optional<sycl::event> event;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            event = event_;
+        }
+        try {
+            if (event) {
+                event->wait_and_throw();
+            }
+        } catch (...) {
+        }
+    }
+
+    void arm(sycl::event event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        event_ = std::move(event);
+    }
+
+  private:
+    mutable std::mutex         mutex_;
+    std::optional<sycl::event> event_;
+};
+
+static void moe_graph_retention_reset(ggml_backend_sycl_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->moe_retention_epoch = {};
+    ctx->moe_retention_token = {};
+    ctx->moe_retention_terminals.clear();
+}
+
+static bool moe_graph_retention_retire_exact(ggml_backend_sycl_context * ctx) {
+    if (!ctx || ctx->moe_retention_epoch.epoch.value == 0) {
+        return true;
+    }
+    try {
+        // These exact queue/device drains are the only production path that
+        // discharge an uncertain graph submission before owner retirement.
+        for (const auto & [device, _] : ctx->moe_retention_terminals) {
+            ctx->stream(device, 0)->wait_and_throw();
+        }
+    } catch (...) {
+        return false;
+    }
+    const auto rc = ggml_sycl::moe::global_graph_retention_registry().retire_exact(ctx->moe_retention_epoch);
+    if (rc != ggml_sycl::moe::retention_error::OK && rc != ggml_sycl::moe::retention_error::STALE) {
+        return false;
+    }
+    moe_graph_retention_reset(ctx);
+    return true;
+}
+
+bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept {
+    try {
+        return moe_graph_retention_retire_exact(ctx);
+    } catch (...) {
+        return false;
+    }
+}
+
+static void moe_graph_retention_collect_handles(const ggml_backend_sycl_context * ctx,
+                                                std::vector<ggml_sycl::mem_handle> & handles) {
+    for (const auto & entry : ctx->moe_direct_dispatch_graphs) {
+        handles.insert(handles.end(), entry.retained_handles.begin(), entry.retained_handles.end());
+    }
+    for (const auto & entry : ctx->moe_dispatch_graphs) {
+        handles.insert(handles.end(), entry.retained_handles.begin(), entry.retained_handles.end());
+    }
+    for (const auto & entry : ctx->moe_sequence_graphs) {
+        handles.insert(handles.end(), entry.retained_handles.begin(), entry.retained_handles.end());
+    }
+    for (const auto & entry : ctx->moe_block_graphs) {
+        handles.insert(handles.end(), entry.retained_handles.begin(), entry.retained_handles.end());
+    }
+}
+
+static bool moe_graph_retention_publish(ggml_backend_sycl_context * ctx) {
+    if (!ctx || ctx->execution_context_id == 0 || ctx->execution_session_id == 0 ||
+        ctx->execution_reset_epoch == 0 || !moe_graph_retention_retire_exact(ctx)) {
+        return false;
+    }
+    ggml_sycl::lifecycle::ModelToken root{};
+    if (!ggml_sycl_execution_current_owner(ctx, root)) {
+        return false;
+    }
+    std::vector<ggml_sycl::mem_handle> handles;
+    moe_graph_retention_collect_handles(ctx, handles);
+    if (handles.empty()) {
+        return false;
+    }
+
+    auto & registry = ggml_sycl::moe::global_graph_retention_registry();
+    ggml_sycl::moe::graph_recording_transaction tx;
+    if (ggml_sycl::moe::graph_recording_transaction::begin(
+            registry, ggml_sycl::execution::global_registry(), { ctx->execution_context_id },
+            { ctx->execution_session_id }, { ctx->execution_reset_epoch }, root, &tx) !=
+        ggml_sycl::moe::retention_error::OK) {
+        return false;
+    }
+    std::set<std::tuple<uint64_t, uint64_t, int>> seen;
+    std::set<int>                                 devices;
+    for (const auto & handle : handles) {
+        auto owner = ggml_sycl::moe::canonical_allocation_integration::retain(handle);
+        if (!owner) {
+            return false;
+        }
+        devices.insert(owner->device());
+        if (seen.emplace(owner->allocation_id(), owner->generation(), owner->device()).second &&
+            tx.add_owner(*owner) != ggml_sycl::moe::retention_error::OK) {
+            return false;
+        }
+    }
+    devices.insert(ctx->device);
+    std::map<int, std::shared_ptr<ggml_sycl::moe::device_terminal>> terminals;
+    if (tx.note_submission(ctx->device, ggml_sycl::moe::submit_outcome::SUBMITTED) !=
+        ggml_sycl::moe::retention_error::OK) {
+        return false;
+    }
+    for (int device : devices) {
+        auto terminal = std::make_shared<moe_sycl_event_terminal>();
+        if (tx.set_terminal(device, terminal) != ggml_sycl::moe::retention_error::OK) {
+            return false;
+        }
+        terminals.emplace(device, std::move(terminal));
+    }
+    tx.mark_finalized();
+    if (tx.commit() != ggml_sycl::moe::retention_error::OK) {
+        return false;
+    }
+    const auto key = registry.active({ ctx->execution_context_id });
+    ggml_sycl::moe::published_graph_token token;
+    if (registry.acquire_published_token(key, &token) != ggml_sycl::moe::retention_error::OK) {
+        (void) registry.retire_exact(key);
+        return false;
+    }
+    ctx->moe_retention_epoch     = key;
+    ctx->moe_retention_token     = token;
+    ctx->moe_retention_terminals = std::move(terminals);
+    return true;
+}
+
+static bool moe_graph_retention_begin_replay(ggml_backend_sycl_context * ctx,
+                                             ggml_sycl::execution::InvocationId * invocation) {
+    return ctx && invocation && ctx->moe_retention_token.valid() &&
+           ggml_sycl::moe::global_graph_retention_registry().begin_invocation(ctx->moe_retention_token, invocation) ==
+               ggml_sycl::moe::retention_error::OK;
+}
+
+static bool moe_graph_retention_finish_replay(ggml_backend_sycl_context *        ctx,
+                                              ggml_sycl::execution::InvocationId invocation) {
+    if (!ctx || ctx->moe_retention_terminals.empty()) {
+        return false;
+    }
+    try {
+        for (const auto & [device, terminal] : ctx->moe_retention_terminals) {
+            const sycl::event event = ctx->stream(device, 0)->ext_oneapi_submit_barrier();
+            std::static_pointer_cast<moe_sycl_event_terminal>(terminal)->arm(event);
+        }
+    } catch (...) {
+        return false;
+    }
+    return ggml_sycl::moe::global_graph_retention_registry().finish_invocation(ctx->moe_retention_token, invocation) ==
+           ggml_sycl::moe::retention_error::OK;
+}
+
+static void moe_graph_retention_fail_replay(ggml_backend_sycl_context *        ctx,
+                                            ggml_sycl::execution::InvocationId invocation) {
+    if (!ctx || invocation.value == 0) {
+        return;
+    }
+    try {
+        // Submission status is unknown after a graph API exception. Only a
+        // successful drain of this exact queue/device permits invocation
+        // completion and retirement.
+        for (const auto & [device, _] : ctx->moe_retention_terminals) {
+            ctx->stream(device, 0)->wait_and_throw();
+        }
+    } catch (...) {
+        return;
+    }
+    (void) ggml_sycl::moe::global_graph_retention_registry().finish_invocation(ctx->moe_retention_token, invocation);
+    (void) moe_graph_retention_retire_exact(ctx);
+}
+
 static bool moe_graph_sequence_record_reject_is_incomplete_capture(const char * record_reject) {
     return record_reject && std::strncmp(record_reject, "skip-incomplete-", 16) == 0;
 }
@@ -80408,6 +80634,11 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
             graph.exec_graph       = std::move(recorded);
             sycl_ctx->moe_sequence_graphs.push_back(std::move(graph));
             sycl_ctx->moe_sequence_graphs_valid = true;
+            if (!moe_graph_retention_publish(sycl_ctx)) {
+                sycl_ctx->invalidate_moe_sequence_graphs();
+                sycl_ctx->moe_sequence_graphs_disabled = true;
+                return false;
+            }
             g_graph_diag_counters.sequence_graphlet_record.fetch_add(1, std::memory_order_relaxed);
             exec_graph = sycl_ctx->moe_sequence_graphs.back().exec_graph.get();
             if (ggml_sycl_graph_diag_enabled()) {
@@ -80424,11 +80655,23 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         if (sequence_timing) {
             submit_start = std::chrono::high_resolution_clock::now();
         }
-        if (timeline_graphlet_spans) {
-            GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay", graphlet_timeline_metadata.c_str());
-            sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
-        } else {
-            sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+        ggml_sycl::execution::InvocationId retained_invocation{};
+        if (!moe_graph_retention_begin_replay(sycl_ctx, &retained_invocation)) {
+            throw std::runtime_error("MMID graph retention publication is not invokable");
+        }
+        try {
+            if (timeline_graphlet_spans) {
+                GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay", graphlet_timeline_metadata.c_str());
+                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+            } else {
+                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+            }
+            if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
+                throw std::runtime_error("MMID graph retention terminal publication failed");
+            }
+        } catch (...) {
+            moe_graph_retention_fail_replay(sycl_ctx, retained_invocation);
+            throw;
         }
         g_graph_diag_counters.sequence_graphlet_submit_calls.fetch_add(1, std::memory_order_relaxed);
         if (ggml_sycl_graph_diag_enabled()) {
@@ -80729,6 +80972,10 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
     sycl_ctx->moe_segments_n_nodes   = cgraph->n_nodes;
     sycl_ctx->moe_segments_is_decode = is_decode_phase;
     sycl_ctx->moe_segments_valid     = true;
+    if (!sycl_ctx->moe_dispatch_graphs.empty() && !moe_graph_retention_publish(sycl_ctx)) {
+        sycl_ctx->invalidate_moe_segments();
+        return false;
+    }
 
     int total_segment_nodes = 0;
     int graphed_segments    = 0;
@@ -80943,7 +81190,19 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                     GGML_SYCL_DEBUG("[SYCL-SEG-MOE] Replayed sequence MoE graphlet at node %d\n", node_idx);
                 } else if (const auto * moe_graph =
                                moe_graph_find_moe_dispatch_graph(sycl_ctx, cgraph, node_idx, replay_graph_hash)) {
-                    stream->ext_oneapi_graph(*moe_graph);
+                    ggml_sycl::execution::InvocationId retained_invocation{};
+                    if (!moe_graph_retention_begin_replay(sycl_ctx, &retained_invocation)) {
+                        throw std::runtime_error("MMID segmented graph publication is not invokable");
+                    }
+                    try {
+                        stream->ext_oneapi_graph(*moe_graph);
+                        if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
+                            throw std::runtime_error("MMID segmented graph terminal publication failed");
+                        }
+                    } catch (...) {
+                        moe_graph_retention_fail_replay(sycl_ctx, retained_invocation);
+                        throw;
+                    }
                     moe_graph_mark_fused_pair_skips_for_node(node, sycl_ctx->device);
                     GGML_SYCL_DEBUG("[SYCL-SEG-MOE] Replayed descriptor MoE graph at node %d\n", node_idx);
                 } else {
@@ -81183,6 +81442,21 @@ static void moe_graph_replay_block_graphs(ggml_backend_sycl_context * sycl_ctx, 
     GGML_ASSERT(sycl_ctx && cgraph);
     queue_ptr stream = sycl_ctx->stream();
     GGML_ASSERT(stream);
+    ggml_sycl::execution::InvocationId retained_invocation{};
+    if (!moe_graph_retention_begin_replay(sycl_ctx, &retained_invocation)) {
+        throw std::runtime_error("MMID block graph publication is not invokable");
+    }
+    bool retained_finished = false;
+    struct retained_block_invocation_guard {
+        ggml_backend_sycl_context *        ctx;
+        ggml_sycl::execution::InvocationId invocation;
+        bool *                             finished;
+        ~retained_block_invocation_guard() {
+            if (!*finished) {
+                moe_graph_retention_fail_replay(ctx, invocation);
+            }
+        }
+    } retained_guard{ sycl_ctx, retained_invocation, &retained_finished };
 
     ggml_sycl_moe_precomputed_skip_new_graph();
 
@@ -81227,6 +81501,10 @@ static void moe_graph_replay_block_graphs(ggml_backend_sycl_context * sycl_ctx, 
         next_direct_node = block.end_node;
     }
     dispatch_direct_gap(next_direct_node, cgraph->n_nodes);
+    if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
+        throw std::runtime_error("MMID block graph terminal publication failed");
+    }
+    retained_finished = true;
 }
 
 static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
@@ -81533,6 +81811,11 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
     sycl_ctx->moe_block_graphs_block_size          = block_size;
     sycl_ctx->moe_block_graphs_dispatch_identities = std::move(dispatch_identities);
     sycl_ctx->moe_block_graphs_valid               = !sycl_ctx->moe_block_graphs.empty();
+    if (sycl_ctx->moe_block_graphs_valid && !moe_graph_retention_publish(sycl_ctx)) {
+        sycl_ctx->invalidate_moe_block_graphs();
+        sycl_ctx->moe_block_graphs_disabled = true;
+        return false;
+    }
     GGML_LOG_INFO("[SYCL-MOE-BLOCK-GRAPHLET] recorded %zu block graphlets for %zu MoE dispatches (block_size=%d)\n",
                   sycl_ctx->moe_block_graphs.size(), moe_indices.size(), block_size);
     return sycl_ctx->moe_block_graphs_valid;

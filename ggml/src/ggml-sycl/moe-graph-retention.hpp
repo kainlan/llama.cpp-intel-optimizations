@@ -8,9 +8,14 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+namespace ggml_sycl {
+class mem_handle;
+}
 
 namespace ggml_sycl::moe {
 
@@ -83,6 +88,17 @@ bool operator==(const mmid_operand_identity & lhs, const mmid_operand_identity &
 struct mmid_batch_binding {
     mmid_operand_identity     identity{};
     retained_allocation_owner owner;
+};
+
+class canonical_allocation_integration final {
+  public:
+    // Mint retention capabilities only from a smart handle's allocator/cache
+    // identity. Raw DIRECT handles and caller-provided identity labels are
+    // deliberately rejected.
+    static std::optional<retained_allocation_owner> retain(const ggml_sycl::mem_handle & handle) noexcept;
+    static std::optional<mmid_batch_binding> bind(const ggml_sycl::mem_handle & handle,
+                                                  uint64_t                       layout_id,
+                                                  uint32_t                       occurrence) noexcept;
 };
 
 class graph_private_table_owner {
@@ -189,6 +205,8 @@ class graph_retention_registry {
     retention_error acquire_published_token(graph_owner_key key, published_graph_token * out) const noexcept;
     retention_error begin_invocation(const published_graph_token & token,
                                      execution::InvocationId *     invocation) noexcept;
+    retention_error finish_invocation(const published_graph_token & token,
+                                      execution::InvocationId       invocation) noexcept;
     std::shared_ptr<const graph_retention_record> snapshot(graph_owner_key key) const noexcept;
     graph_owner_key                               active(execution::ContextId context) const noexcept;
     size_t                                        size() const noexcept;
@@ -211,6 +229,8 @@ class graph_retention_registry {
     std::unordered_map<uint64_t, graph_owner_key>                      table_owners_;
     friend class graph_recording_transaction;
 };
+
+graph_retention_registry & global_graph_retention_registry();
 
 class graph_recording_transaction {
   public:

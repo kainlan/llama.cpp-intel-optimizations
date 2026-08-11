@@ -20,6 +20,7 @@
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
@@ -50,6 +51,7 @@
 #include <exception>
 
 struct ggml_backend_sycl_context;
+bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
 
 namespace ggml_sycl {
 class L2PrefetchManager;  // Forward declaration for l2-prefetch.hpp
@@ -4945,6 +4947,13 @@ struct ggml_backend_sycl_context {
     bool     graph_recording_dispatch = false;  // Context-scoped guard while compute_impl records a command graph
     uint64_t test_graph_replay_count  = 0;
 
+    // One published retention epoch owns every MMID graphlet currently cached
+    // by this backend context. Re-recording publishes a replacement only after
+    // the previous exact epoch has drained and retired.
+    ggml_sycl::moe::graph_owner_key       moe_retention_epoch{};
+    ggml_sycl::moe::published_graph_token moe_retention_token{};
+    std::map<int, std::shared_ptr<ggml_sycl::moe::device_terminal>> moe_retention_terminals;
+
     // === Segmented graph replay for MoE models ===
     // Instead of re-recording the entire graph every token (expensive), we split
     // the compute graph into segments of consecutive non-MoE ops and record each
@@ -5053,6 +5062,10 @@ struct ggml_backend_sycl_context {
     const char *                    moe_default_fast_path_quarantine_reason = nullptr;
 
     void invalidate_moe_segments() {
+        if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_graphs_disabled = true;
+            return;
+        }
         moe_segments.clear();
         moe_dispatch_graphs.clear();
         moe_node_indices.clear();
@@ -5061,6 +5074,10 @@ struct ggml_backend_sycl_context {
     }
 
     void invalidate_moe_direct_dispatch_graphs() {
+        if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_direct_dispatch_graphs_disabled = true;
+            return;
+        }
         moe_direct_dispatch_graphs.clear();
         moe_direct_dispatch_graphs_n_nodes   = 0;
         moe_direct_dispatch_graphs_hash      = 0;
@@ -5069,6 +5086,10 @@ struct ggml_backend_sycl_context {
     }
 
     void invalidate_moe_block_graphs() {
+        if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_block_graphs_disabled = true;
+            return;
+        }
         moe_block_graphs.clear();
         moe_block_graphs_n_nodes    = 0;
         moe_block_graphs_hash       = 0;
@@ -5080,6 +5101,10 @@ struct ggml_backend_sycl_context {
     }
 
     void invalidate_moe_sequence_graphs() {
+        if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_sequence_graphs_disabled = true;
+            return;
+        }
         moe_sequence_graphs.clear();
         moe_sequence_graph_failed_nodes.clear();
         moe_sequence_graph_ineligible_nodes.clear();

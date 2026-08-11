@@ -203,8 +203,7 @@ int main() {
     InvocationId          managed_invocation{};
     require(retention.acquire_published_token(replacement_key, &replacement_token) == retention_error::OK &&
                 retention.begin_invocation(replacement_token, &managed_invocation) == retention_error::OK &&
-                f.execution.finish_invocation(f.context, f.session, f.reset, replacement_key.epoch, managed_invocation,
-                                              token()) == error::OK,
+                retention.finish_invocation(replacement_token, managed_invocation) == retention_error::OK,
             "published-token invocation handshake failed");
     published_graph_token forged_token;
     require(retention.begin_invocation(forged_token, &managed_invocation) == retention_error::STALE,
@@ -241,6 +240,24 @@ int main() {
     extra.mark_finalized();
     require(extra.commit() == retention_error::INCOMPLETE_TERMINALS,
             "terminal superset accepted instead of exact device set");
+
+    // Generic workspace/intermediate owners contribute their canonical device
+    // to the exact terminal set, including secondary devices.
+    graph_retention_registry mixed_registry;
+    fixture                  mixed_fixture(mixed_registry);
+    auto                     mixed       = begin_tx(mixed_fixture);
+    auto                     mixed_owner = std::make_shared<int>(91);
+    require(mixed.add_batch(binding(191, mixed_owner, 0)) == retention_error::OK &&
+                mixed.add_owner(owner_capability(192, mixed_owner, 1)) == retention_error::OK &&
+                mixed.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                mixed.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
+            "mixed-device owner setup failed");
+    mixed.mark_finalized();
+    require(mixed.commit() == retention_error::INCOMPLETE_TERMINALS,
+            "secondary generic owner did not require its exact terminal");
+    require(mixed.set_terminal(1, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK &&
+                mixed.commit() == retention_error::OK && mixed_registry.retire_exact(mixed.key()) == retention_error::OK,
+            "mixed primary/secondary owner retirement failed");
 
     // UNKNOWN cannot use a ready event as proof. Failed drain remains retained
     // and retryable; successful queue quiescence permits exact retirement.
