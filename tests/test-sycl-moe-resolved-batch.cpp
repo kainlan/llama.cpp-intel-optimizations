@@ -400,6 +400,21 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     auto down = build(ggml_sycl::moe_batch_role::DOWN);
     CHECK(gate && up && down);
 
+    ggml_sycl::moe_retained_role_bundle_result absent_pair;
+    CHECK(!absent_pair && absent_pair.reject == ggml_sycl::moe_batch_reject_reason::MISSING_ROLE);
+    auto missing_gate = ggml_sycl::align_moe_retained_role_batches(
+        { ggml_sycl::moe_batch_role::GATE, nullptr, {} }, { ggml_sycl::moe_batch_role::UP, nullptr, up.batch },
+        { ggml_sycl::moe_batch_role::DOWN, nullptr, down.batch });
+    auto missing_up = ggml_sycl::align_moe_retained_role_batches(
+        { ggml_sycl::moe_batch_role::GATE, nullptr, gate.batch }, { ggml_sycl::moe_batch_role::UP, nullptr, {} },
+        { ggml_sycl::moe_batch_role::DOWN, nullptr, down.batch });
+    auto missing_down = ggml_sycl::align_moe_retained_role_batches(
+        { ggml_sycl::moe_batch_role::GATE, nullptr, gate.batch }, { ggml_sycl::moe_batch_role::UP, nullptr, up.batch },
+        { ggml_sycl::moe_batch_role::DOWN, nullptr, {} });
+    CHECK(!missing_gate && missing_gate.role == ggml_sycl::moe_batch_role::GATE);
+    CHECK(!missing_up && missing_up.role == ggml_sycl::moe_batch_role::UP);
+    CHECK(!missing_down && missing_down.role == ggml_sycl::moe_batch_role::DOWN);
+
     auto aligned = ggml_sycl::align_moe_retained_role_batches(
         { ggml_sycl::moe_batch_role::GATE, reinterpret_cast<const ggml_tensor *>(1), gate.batch },
         { ggml_sycl::moe_batch_role::UP, reinterpret_cast<const ggml_tensor *>(2), up.batch },
@@ -421,17 +436,20 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     CHECK(!drift && drift.reject == ggml_sycl::moe_batch_reject_reason::ROLE_ALIGNMENT_MISMATCH);
     CHECK(drift.role == ggml_sycl::moe_batch_role::UP && drift.occurrence == 2);
 
-    ggml_sycl::moe_terminal_publication publication;
-    CHECK(publication.fallback_allowed());
-    CHECK(!publication.publish());
-    publication.terminal_submitted();
-    CHECK(!publication.fallback_allowed());
-    CHECK(publication.publish() && publication.published());
+    ggml_sycl::moe_retained_pointer_table down_table;
+    down_table.table_handle = weight_handle(&down_a, 0, GGML_LAYOUT_AOS, 180, true);
+    for (const auto & operand : down.batch.operands) {
+        down_table.role_leases.push_back(operand.lease);
+    }
+    down_table.has_ready_event = true;
+    CHECK(down_table.valid() && down_table.role_leases.size() == 4);
 
     ggml_sycl::moe_retained_terminal_bundle terminal;
-    terminal.roles              = aligned.bundle;
+    terminal.roles = aligned.bundle;
+    terminal.tables.push_back(std::move(down_table));
+    terminal.intermediates.push_back(gate.batch.operands.front().lease);
     terminal.terminal_submitted = true;
-    CHECK(terminal.retained_handle_count() == 12);
+    CHECK(terminal.retained_handle_count() == 18);
     return true;
 }
 

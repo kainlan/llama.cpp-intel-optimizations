@@ -17,14 +17,30 @@ def tokens(text: str) -> list[str]:
     return TOKEN_RE.findall(text)
 
 
-def contains_tokens(haystack: list[str], pattern: str) -> bool:
+def token_sequence_index(haystack: list[str], pattern: str, start: int = 0) -> int:
     needle = tokens(pattern)
     width = len(needle)
-    return any(haystack[i:i + width] == needle for i in range(len(haystack) - width + 1))
+    for i in range(start, len(haystack) - width + 1):
+        if haystack[i:i + width] == needle:
+            return i
+    raise ValueError(f"token sequence not found: {pattern}")
+
+
+def contains_tokens(haystack: list[str], pattern: str) -> bool:
+    try:
+        token_sequence_index(haystack, pattern)
+        return True
+    except ValueError:
+        return False
 
 
 def has_tokens(text: str, pattern: str) -> bool:
     return contains_tokens(tokens(text), pattern)
+
+
+def inject_before_pair_end(source: str, code: str, count: int = 1) -> str:
+    marker = "auto record_moe_gpu_path"
+    return source.replace(marker, code + "\n    " + marker, count)
 
 
 def function_definition(text: str, signature: str) -> str:
@@ -95,7 +111,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "owned pointer table": "mem_handle table_handle",
         "exact pointer-table leases": "std::vector<mem_handle> role_leases",
         "terminal role retention": "moe_retained_role_bundle roles",
-        "transactional fallback": "return !writes_started_ && !published_",
+        "role result defaults closed": "reject = moe_batch_reject_reason::MISSING_ROLE",
+        "role alignment opens explicitly": "out.reject = moe_batch_reject_reason::NONE",
     }
     required_source = {
         "canonical resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
@@ -111,7 +128,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "typed capability refusal": "moe_batch_reject_reason::CAPABILITY_UNSUPPORTED",
         "Q1 decode refusal": "type == GGML_TYPE_Q1_0",
         "NVFP4 decode refusal": "type == GGML_TYPE_NVFP4",
-        "decode-only type refusal": "phase == moe_route_phase::DECODE",
+        "phase-specific recipe admission": "rows > 1 ? moe_route_phase::PROMPT : moe_route_phase::DECODE",
         "owning queue ready dependency": "target_queue->ext_oneapi_submit_barrier(route_ready_events)",
         "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
         "CPU ready copy": "sycl::event ready = entry.ready_event",
@@ -153,7 +170,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "selected prompt miss failure":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID selected prompt expert unresolved before submit\")",
         "prompt cache overwrite gate": "if (ne12 == 1 && blk_layer_id >= 0 && !is_gate_subop)",
-        "named pair capability gate": "prompt_pair_retained_roles_capable && fusion_down_continuation",
+        "named pair capability gate": "prompt_pair_retained_roles_capable && prompt_pair_current_node",
         "primary ready dependency": "stream->ext_oneapi_submit_barrier({ route.ready_event })",
         "secondary ready propagation": "entry.has_ready_event = has_ready_event",
         "host ready wait": "if (has_ready_event) { ready_event.wait()",
@@ -176,8 +193,11 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "cross-role alignment": "align_moe_retained_role_batches(",
         "validated pair capability": "const bool prompt_pair_retained_roles_capable = [&]()",
         "retained pointer-table result": "ggml_sycl_upload_moe_retained_ptr_table_from_batch(",
-        "transactional terminal publication": "terminal_publication.terminal_submitted(",
-        "transactional skip commit": "terminal_publication.publish()",
+        "actual terminal owner": "ggml_sycl_retain_moe_terminal_bundle(std::move(terminal))",
+        "transactional terminal publication": "terminal.terminal_submitted = true",
+        "transactional skip commit": "entry.set->insert(std::move(entry.node))",
+        "down table preflight": "if (gate_ptrs && up_ptrs && down_table.valid())",
+        "post-write failure waits": "terminal_event.wait()",
     }
     header_tokens = tokens(header)
     source_tokens = tokens(source)
@@ -196,6 +216,12 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     boundary_end = source.index("return GGML_STATUS_FAILED", boundary_fallback)
     if boundary_end < boundary_fallback:
         failures.append("graph boundary reports MMID refusal")
+
+    role_result_start = header.index("struct moe_retained_role_bundle_result")
+    role_result_end = header.index("align_moe_retained_role_batches", role_result_start)
+    if not has_tokens(header[role_result_start:role_result_end],
+                      "reject = moe_batch_reject_reason::MISSING_ROLE"):
+        failures.append("role result default-open")
 
     route_start = header.index("struct moe_batch_route")
     route_end = header.index("struct moe_resolved_operand", route_start)
@@ -224,11 +250,18 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             failures.append("device-dependent host fixture")
 
     mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
-    prompt_admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;")
-    specialized_selection = mmid.index("const bool cpu_tg_candidate", prompt_admission)
-    admission = mmid.index("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;")
-    route_mode = mmid.index("const bool selected_hybrid_route", admission)
-    dispatch_gate = mmid.index("if (moe_hybrid_with_plan)")
+    mmid_tokens = tokens(mmid)
+    prompt_admission_tokens = token_sequence_index(
+        mmid_tokens, "ggml_sycl::moe_resolved_batch_result retained_prompt_batch_result;")
+    specialized_selection_tokens = token_sequence_index(
+        mmid_tokens, "const bool cpu_tg_candidate", prompt_admission_tokens)
+    admission_tokens = token_sequence_index(
+        mmid_tokens, "ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;", specialized_selection_tokens)
+    route_mode_tokens = token_sequence_index(mmid_tokens, "const bool selected_hybrid_route", admission_tokens)
+    dispatch_gate_tokens = token_sequence_index(mmid_tokens, "if (moe_hybrid_with_plan)", route_mode_tokens)
+    prompt_admission = mmid.index("retained_prompt_batch_result")
+    admission = mmid.index("retained_decode_batch_result", prompt_admission)
+    dispatch_gate = mmid.index("if (moe_hybrid_with_plan)", admission)
 
     # Prompt and decode each have one occurrence admission. Prompt admission is
     # before every specialized selector; decode remains before route mode.
@@ -236,28 +269,50 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         failures.append("prompt has exactly one retained admission")
     if mmid.count("retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(") != 1:
         failures.append("decode has exactly one retained admission")
-    if not prompt_admission < specialized_selection < admission:
+    if not prompt_admission_tokens < specialized_selection_tokens < admission_tokens:
         failures.append("prompt specialized selection precedes admission")
     if mmid.index('pp_phase_log("ids-ready"') >= admission:
         failures.append("decode admission precedes ID snapshot")
-    if not admission < route_mode < dispatch_gate:
+    if not admission_tokens < route_mode_tokens < dispatch_gate_tokens or contains_tokens(
+            mmid_tokens[specialized_selection_tokens:admission_tokens], "if (moe_hybrid_with_plan)"):
         failures.append("decode route/dispatch precedes admission")
     if mmid[prompt_admission:admission].count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
         failures.append("prompt IDs are not snapshotted exactly once")
     if mmid.count("append_retained_operand(") != 2:
         failures.append("decode and hybrid prompt routers share retained dispatch helper")
 
-    # Scan prompt admission through the actual function end. The only excluded
-    # range is the explicitly false named multi-role capability gate.
-    pair_start = mmid.index("if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)", prompt_admission)
-    pair_end = mmid.index("cpu_tg_fallthrough:", pair_start)
-    pair_path = mmid[pair_start:pair_end]
+    # Token-wise boundaries prevent comments, formatting, or a dead nested block
+    # from hiding authority reacquisition in the complete active pair path.
+    pair_start_tokens = token_sequence_index(
+        mmid_tokens, "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)", prompt_admission_tokens)
+    pair_end_tokens = token_sequence_index(mmid_tokens, "auto record_moe_gpu_path", pair_start_tokens)
+    pair_path_tokens = mmid_tokens[pair_start_tokens:pair_end_tokens]
+    down_table_tokens = token_sequence_index(pair_path_tokens, "auto down_table")
+    write_submit_tokens = token_sequence_index(
+        pair_path_tokens, "submitted = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(")
+    skip_commit_tokens = token_sequence_index(pair_path_tokens, "entry.set->insert(std::move(entry.node))")
+    ready_publish_tokens = token_sequence_index(
+        pair_path_tokens, "ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, terminal_event)")
+    if not down_table_tokens < write_submit_tokens < skip_commit_tokens < ready_publish_tokens:
+        failures.append("down preflight or transactional publication ordering")
+    if contains_tokens(pair_path_tokens, "g_moe_precomputed_down_layer_skip") or contains_tokens(
+            pair_path_tokens, "ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst"):
+        failures.append("optional down was skipped after GLU-only success")
     for forbidden in ("ggml_sycl_resolve_moe_expert_route(",
+                      "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
+                      "ggml_sycl::ggml_sycl_resolve_expert_ptr(",
+                      "ggml_sycl_resolve(src0, ctx.device)",
+                      "ggml_sycl_resolve_tensor_ptr(src0, ctx.device)",
                       "ggml_sycl_refresh_moe_ids_cache(",
                       "moe_fusion_ensure_full_local_ptr_table(",
-                      "moe_fusion_ensure_full_local_ptr_table_from_descriptor("):
-        if has_tokens(pair_path, forbidden):
-            failures.append(f"prompt pair reacquires route/table authority: {forbidden}")
+                      "moe_fusion_ensure_full_local_ptr_table_from_descriptor(",
+                      "moe_fusion_ensure_gpu0_ptrs(", "moe_fusion_upload_ptrs_from_handles(",
+                      "ggml_sycl_update_moe_ptr_table(", "ggml_sycl_materialize_planned_expert_layout(",
+                      "src0_host_storage", "moe_layer_decode_role_plan"):
+        if contains_tokens(pair_path_tokens, forbidden):
+            failures.append(f"prompt pair reacquires route/table/raw authority: {forbidden}")
+    pair_start = mmid.index("if (cpu_tg_candidate", prompt_admission)
+    pair_end = mmid.index("auto record_moe_gpu_path", pair_start)
     prompt_reachable = mmid[prompt_admission:pair_start] + mmid[pair_end:]
     forbidden_prompt_ownership = (
         "ggml_sycl_resolve_moe_expert_route(",
@@ -352,12 +407,21 @@ def test_contract_and_mutation_witnesses() -> None:
          source, host_test, mem_source),
         ("drop-role-slot-alignment", header.replace("actual.slot_index != expected.slot_index", "false"),
          source, host_test, mem_source),
+        ("role-result-default-open", header.replace(
+            "moe_batch_reject_reason  reject     = moe_batch_reject_reason::MISSING_ROLE;",
+            "moe_batch_reject_reason  reject     = moe_batch_reject_reason::NONE;"),
+         source, host_test, mem_source),
+        ("drop-role-alignment-open", header.replace(
+            "out.reject = moe_batch_reject_reason::NONE;", ""), source, host_test, mem_source),
+        ("drop-down-table-preflight", header,
+         source.replace("gate_ptrs && up_ptrs && down_table.valid()", "gate_ptrs && up_ptrs"),
+         host_test, mem_source),
         ("disable-role-capability", header,
          source.replace("const bool prompt_pair_retained_roles_capable = [&]()",
                         "const bool prompt_pair_retained_roles_capable = false; auto disabled_capability = [&]()"),
          host_test, mem_source),
         ("publish-before-terminal", header,
-         source.replace("terminal_publication.terminal_submitted(/*writes_started=*/true);", ""),
+         source.replace("terminal.terminal_submitted = true;", "terminal.terminal_submitted = false;"),
          host_test, mem_source),
         ("public-proof", header.replace("  private:\n    // Non-forgeable", "  public:\n    // forged"),
          source, host_test, mem_source),
@@ -386,14 +450,19 @@ def test_contract_and_mutation_witnesses() -> None:
                 "const bool moe_hybrid_with_plan = selected_hybrid_route;", source),
          host_test, mem_source),
         ("prompt-pointer-stage", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_update_moe_ptr_table("
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_update_moe_ptr_table("
                         "ctx, src0, ids, GGML_LAYOUT_AOS, nullptr);", 1),
          host_test, mem_source),
+        ("optional-down-partial-skip", header,
+         inject_before_pair_end(source,
+                        "ggml_sycl_moe_precomputed_skip_insert("
+                        "g_moe_precomputed_mmid_skip, pair.down_dst, ctx.device);", 1),
+         host_test, mem_source),
         ("dispatch-before-admission", header,
-         source.replace("ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;",
-                        "if (moe_hybrid_with_plan) { return; }\n"
-                        "    ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;"),
+         re.sub(r"ggml_sycl::moe_resolved_batch_result\s+retained_decode_batch_result\s*;",
+                "if (moe_hybrid_with_plan) { return; }\n"
+                "    ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;", source),
          host_test, mem_source),
         ("selected-miss-continue", header,
          source.replace('throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert unresolved before submit")',
@@ -415,34 +484,34 @@ def test_contract_and_mutation_witnesses() -> None:
          source.replace("if (has_ready_event) {\n                ready_event.wait();",
                         "if (false) {\n                ready_event.wait();"), host_test, mem_source),
         ("reachable-prompt-resolver", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_moe_expert_route("
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_resolve_moe_expert_route("
                         "src0, ctx.device, 0, GGML_LAYOUT_AOS, false);", 1), host_test, mem_source),
         ("reachable-prompt-dispatch-resolver", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_moe_expert_route_for_dispatch("
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_resolve_moe_expert_route_for_dispatch("
                         "src0, ctx.device, 0, GGML_LAYOUT_AOS, false);", 1), host_test, mem_source),
         ("reachable-prompt-reacquire-table", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) moe_fusion_ensure_gpu0_ptrs("
+         inject_before_pair_end(source,
+                        "(void) moe_fusion_ensure_gpu0_ptrs("
                         "ctx, src0, nullptr, 0, 0, GGML_LAYOUT_AOS, nullptr, nullptr, true);", 1),
          host_test, mem_source),
         ("reachable-prompt-materializer", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_materialize_planned_expert_layout("
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_materialize_planned_expert_layout("
                         "src0, {}, 0, ctx.device, GGML_LAYOUT_AOS, nullptr, true, true);", 1),
          host_test, mem_source),
         ("reachable-prompt-expert-ptr", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl::ggml_sycl_resolve_expert_ptr("
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl::ggml_sycl_resolve_expert_ptr("
                         "src0, ctx.device, 0);", 1), host_test, mem_source),
         ("reachable-prompt-composite-resolver", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve(src0, ctx.device);", 1),
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_resolve(src0, ctx.device);", 1),
          host_test, mem_source),
         ("reachable-prompt-weight-resolver", header,
-         source.replace("cpu_tg_fallthrough:",
-                        "cpu_tg_fallthrough:\n    (void) ggml_sycl_resolve_tensor_ptr(src0, ctx.device);", 1),
+         inject_before_pair_end(source,
+                        "(void) ggml_sycl_resolve_tensor_ptr(src0, ctx.device);", 1),
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:

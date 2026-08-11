@@ -402,7 +402,7 @@ struct moe_retained_role_bundle {
 
 struct moe_retained_role_bundle_result {
     moe_retained_role_bundle bundle;
-    moe_batch_reject_reason  reject     = moe_batch_reject_reason::NONE;
+    moe_batch_reject_reason  reject     = moe_batch_reject_reason::MISSING_ROLE;
     moe_batch_role           role       = moe_batch_role::GATE;
     size_t                   occurrence = 0;
 
@@ -446,6 +446,7 @@ inline moe_retained_role_bundle_result align_moe_retained_role_batches(moe_retai
             }
         }
     }
+    out.reject = moe_batch_reject_reason::NONE;
     return out;
 }
 
@@ -482,35 +483,6 @@ struct moe_retained_terminal_bundle {
         }
         return count;
     }
-};
-
-// Publication is a one-way transaction. Skip/destination-ready state may be
-// committed only after the terminal submit succeeds. Once writes begin, a
-// failure cannot select an unfused fallback because that could race/duplicate
-// destination writes.
-class moe_terminal_publication {
-  public:
-    void terminal_submitted(bool writes_started = true) {
-        terminal_submitted_ = true;
-        writes_started_     = writes_started;
-    }
-
-    bool publish() {
-        if (!terminal_submitted_) {
-            return false;
-        }
-        published_ = true;
-        return true;
-    }
-
-    bool fallback_allowed() const { return !writes_started_ && !published_; }
-
-    bool published() const { return published_; }
-
-  private:
-    bool terminal_submitted_ = false;
-    bool writes_started_     = false;
-    bool published_          = false;
 };
 
 struct moe_batch_executor_choice {
