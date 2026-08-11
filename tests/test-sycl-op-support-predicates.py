@@ -2,8 +2,9 @@
 """Host-only regression checks for SYCL supports_op/kernel contracts."""
 
 import re
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT_SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -109,6 +110,152 @@ def _contract_rejects(oracle, source: str) -> bool:
     return False
 
 
+_ODD_STRIDE_COMMENT = "// oneMKL/oneDNN currently miscomputes the padded, odd-row-stride F16 x F32 batched path"
+_ODD_STRIDE_NEXT_GUARD = "if (!ggml_sycl_mul_mat_type_supported(a_type))"
+_ODD_STRIDE_EXPRESSION = """
+    !ggml_is_transposed(a) && !ggml_is_transposed(b) && a_type == GGML_TYPE_F16 &&
+    b->type == GGML_TYPE_F32 && b->ne[1] == 1 && b->ne[3] > 1 && b->ne[3] == a->ne[3] &&
+    b->ne[2] > a->ne[2] && !ggml_is_contiguous_rows(a) && !ggml_is_contiguous_rows(b) &&
+    (((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||
+     ((b->nb[1] / ggml_type_size(b->type)) & 1) != 0)
+"""
+
+
+def _odd_stride_guard(full_source: str) -> str:
+    mul_mat = _case(_supports_source(full_source), "MUL_MAT", "OUT_PROD")
+    comment = mul_mat.index(_ODD_STRIDE_COMMENT)
+    guard = mul_mat.index("if (", comment)
+    guard_end = mul_mat.index("return false;", guard)
+    next_guard = mul_mat.index(_ODD_STRIDE_NEXT_GUARD, guard_end)
+    assert guard < guard_end < next_guard, "odd-stride rejection must precede the final dense type guard"
+    return mul_mat[guard:guard_end]
+
+
+def _assert_odd_stride_source_contract(full_source: str) -> None:
+    guard = _odd_stride_guard(full_source)
+    match = re.fullmatch(r"if\s*\((.*)\)\s*\{\s*", guard, re.DOTALL)
+    assert match is not None, "odd-stride rejection is not a single fail-closed if"
+    assert re.sub(r"\s+", "", match.group(1)) == re.sub(r"\s+", "", _ODD_STRIDE_EXPRESSION)
+
+
+@dataclass(frozen=True)
+class _MulMatShape:
+    op: str = "MUL_MAT"
+    a_type: str = "F16"
+    b_type: str = "F32"
+    a_transposed: bool = False
+    b_transposed: bool = False
+    m: int = 128
+    n: int = 1
+    k: int = 1057
+    k_v: int = 2113
+    a_ne2: int = 1
+    b_ne2: int = 4
+    a_ne3: int = 3
+    b_ne3: int = 3
+    a_contiguous_rows: bool = False
+    b_contiguous_rows: bool = False
+    a_row_stride_elements: int = 2113
+    b_row_stride_elements: int = 2113
+    bs0: int = 1
+
+
+_MODEL_CLAUSES: Dict[str, Callable[[_MulMatShape], bool]] = {
+    "regular_mul_mat": lambda s: s.op == "MUL_MAT",
+    "src0_f16": lambda s: s.a_type == "F16",
+    "src1_f32": lambda s: s.b_type == "F32",
+    "src0_not_transposed": lambda s: not s.a_transposed,
+    "src1_not_transposed": lambda s: not s.b_transposed,
+    "src1_single_row": lambda s: s.n == 1,
+    "multi_dim3": lambda s: s.b_ne3 > 1,
+    "matching_dim3": lambda s: s.b_ne3 == s.a_ne3,
+    "dim2_broadcast": lambda s: s.b_ne2 > s.a_ne2,
+    "src0_padded_rows": lambda s: not s.a_contiguous_rows,
+    "src1_padded_rows": lambda s: not s.b_contiguous_rows,
+    "odd_element_row_stride": lambda s: (
+        (s.a_row_stride_elements & 1) != 0 or (s.b_row_stride_elements & 1) != 0
+    ),
+}
+
+
+def _decline_odd_stride(shape: _MulMatShape, omitted: Optional[Set[str]] = None) -> bool:
+    omitted = omitted or set()
+    return all(predicate(shape) for name, predicate in _MODEL_CLAUSES.items() if name not in omitted)
+
+
+def _failure_shapes() -> List[_MulMatShape]:
+    return [_MulMatShape(m=m, bs0=bs0, a_ne2=bs0, b_ne2=bs0 * 4) for m in (128, 129) for bs0 in (1, 2, 4, 8)]
+
+
+def _adjacent_controls() -> List[Tuple[str, _MulMatShape]]:
+    base = _MulMatShape()
+    return [
+        (
+            "even element row stride",
+            replace(base, k_v=2114, a_row_stride_elements=2114, b_row_stride_elements=2114),
+        ),
+        ("dim3=1", replace(base, a_ne3=1, b_ne3=1)),
+        ("no dim2 broadcast", replace(base, b_ne2=base.a_ne2)),
+        ("F32 equivalent", replace(base, a_type="F32")),
+        ("MUL_MAT_ID", replace(base, op="MUL_MAT_ID")),
+        ("src1 ne1>1", replace(base, n=2)),
+        ("contiguous rows", replace(base, a_contiguous_rows=True, b_contiguous_rows=True)),
+        ("transposed src0", replace(base, a_transposed=True)),
+    ]
+
+
+def _clause_witnesses() -> Dict[str, _MulMatShape]:
+    base = _MulMatShape()
+    return {
+        "regular_mul_mat": replace(base, op="MUL_MAT_ID"),
+        "src0_f16": replace(base, a_type="F32"),
+        "src1_f32": replace(base, b_type="F16"),
+        "src0_not_transposed": replace(base, a_transposed=True),
+        "src1_not_transposed": replace(base, b_transposed=True),
+        "src1_single_row": replace(base, n=2),
+        "multi_dim3": replace(base, a_ne3=1, b_ne3=1),
+        "matching_dim3": replace(base, b_ne3=4),
+        "dim2_broadcast": replace(base, b_ne2=base.a_ne2),
+        "src0_padded_rows": replace(base, a_contiguous_rows=True),
+        "src1_padded_rows": replace(base, b_contiguous_rows=True),
+        "odd_element_row_stride": replace(base, a_row_stride_elements=2114, b_row_stride_elements=2114),
+    }
+
+
+def test_f16_odd_stride_mul_mat_source_contract_and_decision_census() -> None:
+    _assert_odd_stride_source_contract(SUPPORT_SOURCE.read_text(encoding="utf-8"))
+    failures = _failure_shapes()
+    controls = _adjacent_controls()
+    assert len(failures) == 8 and all(_decline_odd_stride(shape) for shape in failures)
+    assert {
+        (
+            shape.a_type,
+            shape.b_type,
+            shape.n,
+            shape.k,
+            shape.k_v,
+            shape.a_ne3,
+            shape.b_ne2 // shape.a_ne2,
+            shape.m,
+            shape.bs0,
+        )
+        for shape in failures
+    } == {
+        ("F16", "F32", 1, 1057, 2113, 3, 4, m, bs0)
+        for m in (128, 129)
+        for bs0 in (1, 2, 4, 8)
+    }
+    assert len(controls) == 8 and all(not _decline_odd_stride(shape) for _, shape in controls)
+
+
+def test_f16_odd_stride_mul_mat_model_rejects_removed_conjunctions() -> None:
+    witnesses = _clause_witnesses()
+    assert witnesses.keys() == _MODEL_CLAUSES.keys()
+    for clause, witness in witnesses.items():
+        assert not _decline_odd_stride(witness), clause
+        assert _decline_odd_stride(witness, {clause}), f"removing {clause} was not observable"
+
+
 def test_pool_2d_does_not_inherit_acc_restrictions() -> None:
     _assert_expression(_case(_supports_source(), "POOL_2D", "ACC"), "true")
 
@@ -191,6 +338,31 @@ def test_concat_support_helper_and_dispatch_case_sets_are_identical() -> None:
 
 def test_review_mutations_are_detected() -> None:
     full_support = SUPPORT_SOURCE.read_text(encoding="utf-8")
+    odd_stride_guard = _odd_stride_guard(full_support)
+    odd_stride_start = full_support.index(odd_stride_guard)
+    broadening_mutations = (
+        ("!ggml_is_transposed(a)", "true"),
+        ("!ggml_is_transposed(b)", "true"),
+        ("a_type == GGML_TYPE_F16", "a_type != GGML_TYPE_BF16"),
+        ("b->type == GGML_TYPE_F32", "b->type != GGML_TYPE_F16"),
+        ("b->ne[1] == 1", "b->ne[1] >= 1"),
+        ("b->ne[3] > 1", "b->ne[3] >= 1"),
+        ("b->ne[3] == a->ne[3]", "b->ne[3] >= a->ne[3]"),
+        ("b->ne[2] > a->ne[2]", "b->ne[2] >= a->ne[2]"),
+        ("!ggml_is_contiguous_rows(a)", "true"),
+        ("!ggml_is_contiguous_rows(b)", "true"),
+        ("(((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||", "(true ||"),
+    )
+    for old, new in broadening_mutations:
+        assert odd_stride_guard.count(old) == 1, old
+        mutated_guard = odd_stride_guard.replace(old, new, 1)
+        mutated_source = (
+            full_support[:odd_stride_start]
+            + mutated_guard
+            + full_support[odd_stride_start + len(odd_stride_guard) :]
+        )
+        assert _contract_rejects(_assert_odd_stride_source_contract, mutated_source), old
+
     support_start = full_support.index("static bool ggml_backend_sycl_device_supports_op")
     rope_start = full_support.index("case GGML_OP_ROPE:", support_start)
     rope_end = full_support.index("case GGML_OP_IM2COL:", rope_start)

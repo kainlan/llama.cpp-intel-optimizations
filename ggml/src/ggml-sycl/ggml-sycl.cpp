@@ -98817,6 +98817,17 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     a->ne[2] == 1 && src0_type == GGML_TYPE_F16) {
                     return false;
                 }
+                // oneMKL/oneDNN currently miscomputes the padded, odd-row-stride F16 x F32 batched path when
+                // dim 2 is broadcast across multiple dim-3 slices.  Keep this rejection structural: the observed
+                // failures span adjacent matrix sizes and dim-2 batch counts, while even row strides and each
+                // non-broadcast control remain valid.
+                if (!ggml_is_transposed(a) && !ggml_is_transposed(b) && a_type == GGML_TYPE_F16 &&
+                    b->type == GGML_TYPE_F32 && b->ne[1] == 1 && b->ne[3] > 1 && b->ne[3] == a->ne[3] &&
+                    b->ne[2] > a->ne[2] && !ggml_is_contiguous_rows(a) && !ggml_is_contiguous_rows(b) &&
+                    (((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||
+                     ((b->nb[1] / ggml_type_size(b->type)) & 1) != 0)) {
+                    return false;
+                }
                 if (!ggml_sycl_mul_mat_type_supported(a_type)) {
                     return false;
                 }
