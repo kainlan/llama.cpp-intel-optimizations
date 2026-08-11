@@ -12,6 +12,7 @@
 #define GGML_SYCL_CPU_DISPATCH_HPP
 
 #include "common.hpp"
+#include "moe-resolved-batch.hpp"
 
 // Dispatch a single ggml operation to the CPU SYCL device.
 // Returns true if handled, false if the op is unsupported on CPU.
@@ -131,6 +132,22 @@ struct cpu_expert_task {
 // Uses the existing TBB thread pool for parallel row computation.
 // Supports any quantized type with vec_dot (Q4_0, Q8_0, Q6_K, etc.).
 void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task);
+
+// Stage-1 host AoS executor. All dynamic storage is supplied by the admitted
+// recipe's unified-cache workspace reservation; this path never touches the
+// legacy fixed thread_local dispatch buffers.
+struct cpu_moe_host_aos_task {
+    ggml_sycl::moe_execution_recipe recipe;
+    size_t                          admitted_recipe_signature = 0;
+    ggml_sycl::mem_handle           weight_lease;
+    const float *                   activations = nullptr;  // [rows, K]
+    float *                         output = nullptr;       // [rows, N]
+    void *                          workspace = nullptr;
+    size_t                          workspace_bytes = 0;
+};
+
+bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
+                                        ggml_sycl::moe_batch_reject_reason * reject = nullptr);
 
 // Compute multiple experts concurrently on the CPU thread pool.
 // Deduplicates activation quantization: tasks sharing the same act_host pointer

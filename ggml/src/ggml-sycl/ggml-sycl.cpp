@@ -22471,9 +22471,9 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type      
     // Q1_0/NVFP4 have CPU traits, but no retained-handle decode device
     // executor yet. Refuse capability before either batched or generic dense
     // device dispatch can be selected; never stage these routes through CPU.
-    if (phase == moe_route_phase::DECODE && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)) {
+    if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
         cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
-        cap.reason        = "decode-device-type-unimplemented";
+        cap.reason        = "device-type-stage2-unimplemented";
         return cap;
     }
 
@@ -23043,6 +23043,12 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "wrong_queue";
         case moe_batch_reject_reason::CAPABILITY_UNSUPPORTED:
             return "capability_unsupported";
+        case moe_batch_reject_reason::RECIPE_MISSING:
+            return "recipe_missing";
+        case moe_batch_reject_reason::RECIPE_MISMATCH:
+            return "recipe_mismatch";
+        case moe_batch_reject_reason::WORKSPACE_UNDERSIZED:
+            return "workspace_undersized";
     }
     return "unknown";
 }
@@ -23089,6 +23095,44 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         }
         normalized.lease         = std::move(route.lease);
         normalized.source_reason = static_cast<int>(route.reason);
+
+        const size_t rows = slots_per_token == 0 ? 0 : count / slots_per_token;
+        normalized.recipe.request = { rows > 1 ? moe_route_phase::PROMPT : moe_route_phase::DECODE,
+                                      src0 ? src0->ne[0] : 0, src0 ? src0->ne[1] : 0, rows,
+                                      src0 ? src0->type : GGML_TYPE_COUNT, submit_device };
+        normalized.recipe.layout       = normalized.actual_layout;
+        normalized.recipe.owner_device = normalized.owning_device;
+        if (normalized.residency == moe_batch_residency::HOST) {
+            const auto * traits = src0 ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
+            const auto * vdt = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
+            if (normalized.actual_layout == GGML_LAYOUT_AOS && traits && traits->vec_dot && vdt && vdt->from_float) {
+                normalized.recipe.kind     = moe_batch_executor::HOST_CPU;
+                normalized.recipe.kernel   = moe_route_kernel::HOST_CPU;
+                normalized.recipe.queue    = moe_recipe_queue::NONE;
+                normalized.recipe.transfer = moe_recipe_transfer::HOST_ACTIVATION;
+                normalized.recipe.valid    = true;
+                if (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) {
+                    normalized.recipe.valid = plan_moe_host_workspace(
+                        normalized.recipe.request, ggml_row_size(traits->vec_dot_type, src0->ne[0]),
+                        sizeof(size_t) * 4, &normalized.recipe.workspace);
+                }
+            }
+        } else if (normalized.residency != moe_batch_residency::UNAVAILABLE) {
+            const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+                src0->type, normalized.actual_layout, normalized.recipe.request.phase, src0->ne[0], src0->ne[1], rows,
+                normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device);
+            if (cap.supported) {
+                normalized.recipe.kind = normalized.residency == moe_batch_residency::PRIMARY_DEVICE ?
+                                             moe_batch_executor::PRIMARY_DEVICE :
+                                             moe_batch_executor::SECONDARY_DEVICE;
+                normalized.recipe.kernel = cap.kernel;
+                normalized.recipe.queue = normalized.residency == moe_batch_residency::PRIMARY_DEVICE ?
+                                              moe_recipe_queue::SUBMIT : moe_recipe_queue::OWNER;
+                normalized.recipe.transfer = cap.requires_host_staging ? moe_recipe_transfer::HOST_BOUNCE :
+                                                                        moe_recipe_transfer::NONE;
+                normalized.recipe.valid = true;
+            }
+        }
         return normalized;
     });
 }
@@ -23140,6 +23184,13 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     normalized.actual_layout                    = canonical.actual_layout;
     normalized.lease                            = std::move(canonical.lease);
     normalized.authoritative_planned_alternate_ = canonical.planned_alternate_admitted;
+    normalized.recipe.valid                = true;
+    normalized.recipe.request              = { moe_route_phase::DECODE, 32, 32, 1, GGML_TYPE_Q8_0, 0 };
+    normalized.recipe.kind                 = moe_batch_executor::PRIMARY_DEVICE;
+    normalized.recipe.kernel               = moe_route_kernel::MMVQ_COMPAT;
+    normalized.recipe.queue                = moe_recipe_queue::SUBMIT;
+    normalized.recipe.layout               = GGML_LAYOUT_SOA;
+    normalized.recipe.owner_device         = 0;
 
     const int32_t                   ids[] = { 6 };
     const moe_resolved_batch_result result =
@@ -69910,16 +69961,13 @@ cpu_tg_fallthrough:
                     operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
                     (operand.owning_device >= 0 && operand.owning_device < n_gpu_devs &&
                      ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device));
-                moe_route_capability capability{};
-                bool                 device_capable = true;
-                if (operand.residency != ggml_sycl::moe_batch_residency::HOST) {
-                    capability = ggml_sycl_moe_query_route_capability(
-                        src0->type, operand.actual_layout, phase, src0->ne[0], src0->ne[1], rows, operand.owning_device,
-                        moe_layer_route_residency::DEVICE, ctx.device);
-                    device_capable = capability.supported;
-                }
-                const auto choice =
-                    ggml_sycl::choose_moe_batch_executor(operand, ctx.device, device_capable, queue_available);
+                const moe_route_capability capability = operand.residency == ggml_sycl::moe_batch_residency::HOST ?
+                                                            moe_route_capability{} :
+                                                            ggml_sycl_moe_query_route_capability(
+                                                                src0->type, operand.actual_layout, phase, src0->ne[0],
+                                                                src0->ne[1], rows, operand.owning_device,
+                                                                moe_layer_route_residency::DEVICE, ctx.device);
+                const auto choice = ggml_sycl::choose_moe_batch_executor(operand, ctx.device, queue_available);
                 if (!choice) {
                     GGML_LOG_ERROR(
                         "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s "

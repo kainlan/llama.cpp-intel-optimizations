@@ -1179,6 +1179,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts = 0);
 
+// Hard cap for dynamic host workspace used by immutable Q1_0/NVFP4 recipes.
+void   unified_cache_set_planned_moe_host_recipe_workspace_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_host_recipe_workspace_bytes(int device_id);
+bool   unified_cache_admit_moe_host_recipe_workspace(int device_id, size_t requested_bytes);
+
 void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);

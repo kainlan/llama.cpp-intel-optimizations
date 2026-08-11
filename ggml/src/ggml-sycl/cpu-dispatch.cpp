@@ -856,6 +856,65 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
     }
 }
 
+bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
+                                        ggml_sycl::moe_batch_reject_reason * reject) {
+    using namespace ggml_sycl;
+    if (!task.activations || !task.output || !task.workspace ||
+        !validate_moe_execution_recipe(task.recipe, task.admitted_recipe_signature, task.weight_lease,
+                                       moe_batch_residency::HOST, task.recipe.request.submit, true,
+                                       task.workspace_bytes, reject)) {
+        return false;
+    }
+    if ((task.recipe.request.type != GGML_TYPE_Q1_0 && task.recipe.request.type != GGML_TYPE_NVFP4) ||
+        task.recipe.layout != GGML_LAYOUT_AOS) {
+        if (reject) *reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
+        return false;
+    }
+    const auto * traits = ggml_sycl_get_type_traits_cpu(task.recipe.request.type);
+    const auto * vdt = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
+    if (!traits || !traits->vec_dot || !vdt || !vdt->from_float) {
+        if (reject) *reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
+        return false;
+    }
+    const resolved_ptr weight = task.weight_lease.resolve(mem_handle::HOST_DEVICE);
+    if (!weight.ptr || weight.on_device || weight.layout != GGML_LAYOUT_AOS) {
+        if (reject) *reject = moe_batch_reject_reason::STALE_HANDLE;
+        return false;
+    }
+    const auto & ws = task.recipe.workspace;
+    auto align_up = [&](size_t value) { return (value + ws.alignment - 1) & ~(ws.alignment - 1); };
+    uint8_t * base = static_cast<uint8_t *>(task.workspace);
+    size_t off = 0;
+    float * act = reinterpret_cast<float *>(base + off);
+    off = align_up(off + ws.activation_f32_bytes);
+    uint8_t * quant = base + off;
+    off = align_up(off + ws.activation_q8_bytes);
+    float * output = reinterpret_cast<float *>(base + off);
+    off = align_up(off + ws.output_f32_bytes);
+    void * descriptors = base + off;
+    std::memcpy(act, task.activations, ws.activation_f32_bytes);
+    std::memset(descriptors, 0, ws.descriptor_bytes);
+
+    const int K = static_cast<int>(task.recipe.request.K);
+    const int N = static_cast<int>(task.recipe.request.N);
+    const size_t rows = task.recipe.request.rows;
+    const size_t qrow = ggml_row_size(traits->vec_dot_type, K);
+    const size_t wrow = ggml_row_size(task.recipe.request.type, K);
+    for (size_t m = 0; m < rows; ++m) {
+        uint8_t * q = quant + m * qrow;
+        vdt->from_float(act + m * K, q, K);
+        for (int n = 0; n < N; ++n) {
+            float dot = 0.0f;
+            const void * row = static_cast<const uint8_t *>(weight.ptr) + static_cast<size_t>(n) * wrow;
+            traits->vec_dot(K, &dot, sizeof(float), row, 0, q, 0, 1);
+            output[m * N + n] = dot;
+        }
+    }
+    std::memcpy(task.output, output, ws.output_f32_bytes);
+    if (reject) *reject = moe_batch_reject_reason::NONE;
+    return true;
+}
+
 void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
     if (n_tasks <= 0 || !tasks) {
         return;

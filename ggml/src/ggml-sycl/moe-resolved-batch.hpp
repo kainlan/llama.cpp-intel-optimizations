@@ -6,6 +6,7 @@
 #pragma once
 
 #include "mem-handle.hpp"
+#include "moe-layer-plan.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -41,28 +42,201 @@ enum class moe_batch_reject_reason : uint8_t {
     PLAN_MISMATCH,
     WRONG_QUEUE,
     CAPABILITY_UNSUPPORTED,
+    RECIPE_MISSING,
+    RECIPE_MISMATCH,
+    WORKSPACE_UNDERSIZED,
 };
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);
 
 struct moe_resolved_batch_result;
 
+enum class moe_batch_executor : uint8_t {
+    HOST_CPU,
+    PRIMARY_DEVICE,
+    SECONDARY_DEVICE,
+};
+
+struct moe_route_request {
+    moe_route_phase phase  = moe_route_phase::DECODE;
+    int64_t         K      = 0;
+    int64_t         N      = 0;
+    size_t          rows   = 0;
+    ggml_type       type   = GGML_TYPE_COUNT;
+    int             submit = -1;
+};
+
+enum class moe_recipe_queue : uint8_t { NONE, SUBMIT, OWNER };
+enum class moe_recipe_transfer : uint8_t { NONE, HOST_ACTIVATION, PEER_DIRECT, HOST_BOUNCE };
+
+struct moe_workspace_recipe {
+    size_t alignment            = 64;
+    size_t activation_f32_bytes = 0;
+    size_t activation_q8_bytes  = 0;
+    size_t output_f32_bytes     = 0;
+    size_t descriptor_bytes     = 0;
+    size_t total_bytes          = 0;
+};
+
+struct moe_execution_recipe {
+    moe_batch_executor   kind     = moe_batch_executor::HOST_CPU;
+    moe_route_kernel     kernel   = moe_route_kernel::NONE;
+    moe_recipe_queue     queue    = moe_recipe_queue::NONE;
+    moe_recipe_transfer  transfer = moe_recipe_transfer::NONE;
+    moe_route_request    request{};
+    moe_workspace_recipe workspace{};
+    ggml_layout_mode     layout       = GGML_LAYOUT_AOS;
+    int                  owner_device = mem_handle::HOST_DEVICE;
+    bool                 valid        = false;
+};
+
+inline bool plan_moe_host_workspace(const moe_route_request & request,
+                                    size_t                    q8_row_bytes,
+                                    size_t                    descriptor_stride,
+                                    moe_workspace_recipe *    out) {
+    if (!out || request.K <= 0 || request.N <= 0 || request.rows == 0 || q8_row_bytes == 0) {
+        return false;
+    }
+    moe_workspace_recipe plan;
+    auto                 checked_mul = [](size_t a, size_t b, size_t * value) {
+        if (a != 0 && b > SIZE_MAX / a) {
+            return false;
+        }
+        *value = a * b;
+        return true;
+    };
+    auto checked_align_add = [&](size_t bytes, size_t * total) {
+        const size_t mask = plan.alignment - 1;
+        if (*total > SIZE_MAX - mask) {
+            return false;
+        }
+        const size_t aligned = (*total + mask) & ~mask;
+        if (bytes > SIZE_MAX - aligned) {
+            return false;
+        }
+        *total = aligned + bytes;
+        return true;
+    };
+    if (!checked_mul(request.rows, static_cast<size_t>(request.K), &plan.activation_f32_bytes) ||
+        !checked_mul(plan.activation_f32_bytes, sizeof(float), &plan.activation_f32_bytes) ||
+        !checked_mul(request.rows, q8_row_bytes, &plan.activation_q8_bytes) ||
+        !checked_mul(request.rows, static_cast<size_t>(request.N), &plan.output_f32_bytes) ||
+        !checked_mul(plan.output_f32_bytes, sizeof(float), &plan.output_f32_bytes) ||
+        !checked_mul(request.rows, descriptor_stride, &plan.descriptor_bytes)) {
+        return false;
+    }
+    size_t total = 0;
+    if (!checked_align_add(plan.activation_f32_bytes, &total) || !checked_align_add(plan.activation_q8_bytes, &total) ||
+        !checked_align_add(plan.output_f32_bytes, &total) || !checked_align_add(plan.descriptor_bytes, &total)) {
+        return false;
+    }
+    plan.total_bytes = total;
+    *out             = plan;
+    return true;
+}
+
+inline size_t moe_execution_recipe_signature(const moe_execution_recipe & recipe) {
+    size_t h   = 1469598103934665603ULL;
+    auto   mix = [&](size_t value) {
+        h = (h ^ value) * 1099511628211ULL;
+    };
+    mix(static_cast<size_t>(recipe.valid));
+    mix(static_cast<size_t>(recipe.kind));
+    mix(static_cast<size_t>(recipe.kernel));
+    mix(static_cast<size_t>(recipe.queue));
+    mix(static_cast<size_t>(recipe.transfer));
+    mix(static_cast<size_t>(recipe.request.phase));
+    mix(static_cast<size_t>(recipe.request.K));
+    mix(static_cast<size_t>(recipe.request.N));
+    mix(recipe.request.rows);
+    mix(static_cast<size_t>(recipe.request.type));
+    mix(static_cast<size_t>(recipe.request.submit));
+    mix(static_cast<size_t>(recipe.layout));
+    mix(static_cast<size_t>(recipe.owner_device));
+    mix(recipe.workspace.alignment);
+    mix(recipe.workspace.activation_f32_bytes);
+    mix(recipe.workspace.activation_q8_bytes);
+    mix(recipe.workspace.output_f32_bytes);
+    mix(recipe.workspace.descriptor_bytes);
+    mix(recipe.workspace.total_bytes);
+    return h;
+}
+
+inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
+                                          size_t                       admitted_signature,
+                                          const mem_handle &           lease,
+                                          moe_batch_residency          residency,
+                                          int                          submit_device,
+                                          bool                         owning_queue_available,
+                                          size_t                       reserved_workspace_bytes,
+                                          moe_batch_reject_reason *    reject) {
+    auto refuse = [&](moe_batch_reject_reason why) {
+        if (reject) {
+            *reject = why;
+        }
+        return false;
+    };
+    if (!recipe.valid) {
+        return refuse(moe_batch_reject_reason::RECIPE_MISSING);
+    }
+    if (moe_execution_recipe_signature(recipe) != admitted_signature || recipe.request.submit != submit_device) {
+        return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
+    }
+    const resolved_ptr resolved = lease.resolve();
+    if (!resolved.ptr) {
+        return refuse(moe_batch_reject_reason::STALE_HANDLE);
+    }
+    if (resolved.layout != recipe.layout) {
+        return refuse(moe_batch_reject_reason::LAYOUT_MISMATCH);
+    }
+    if (reserved_workspace_bytes < recipe.workspace.total_bytes) {
+        return refuse(moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
+    }
+    if (recipe.kind == moe_batch_executor::HOST_CPU) {
+        if (residency != moe_batch_residency::HOST || recipe.kernel != moe_route_kernel::HOST_CPU ||
+            recipe.layout != GGML_LAYOUT_AOS || recipe.owner_device != mem_handle::HOST_DEVICE || resolved.on_device) {
+            return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
+        }
+    } else {
+        if (recipe.request.type == GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4) {
+            return refuse(moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+        }
+        if (recipe.kind == moe_batch_executor::PRIMARY_DEVICE &&
+            (residency != moe_batch_residency::PRIMARY_DEVICE || recipe.owner_device != submit_device)) {
+            return refuse(moe_batch_reject_reason::WRONG_DEVICE);
+        }
+        if (recipe.kind == moe_batch_executor::SECONDARY_DEVICE &&
+            (residency != moe_batch_residency::SECONDARY_DEVICE || recipe.owner_device == submit_device ||
+             recipe.queue != moe_recipe_queue::OWNER)) {
+            return refuse(moe_batch_reject_reason::WRONG_DEVICE);
+        }
+        if (recipe.queue == moe_recipe_queue::OWNER && !owning_queue_available) {
+            return refuse(moe_batch_reject_reason::WRONG_QUEUE);
+        }
+    }
+    if (reject) {
+        *reject = moe_batch_reject_reason::NONE;
+    }
+    return true;
+}
+
 // Normalized mirror of the existing canonical moe_expert_route.  transient_ptr
 // is checked while building and is never retained in the resulting batch.
 struct moe_batch_route {
-    moe_batch_residency residency         = moe_batch_residency::UNAVAILABLE;
-    void *              transient_ptr     = nullptr;
-    int                 owning_device     = -1;
-    int                 planned_device    = -2;
-    bool                plan_found        = false;
-    bool                planned_on_device = false;
-    ggml_layout_mode    requested_layout  = GGML_LAYOUT_AOS;
-    ggml_layout_mode    actual_layout     = GGML_LAYOUT_AOS;
-    size_t              byte_offset       = 0;
-    bool                has_ready_event   = false;
-    sycl::event         ready_event;
-    mem_handle          lease;
-    int                 source_reason = 0;
+    moe_batch_residency  residency         = moe_batch_residency::UNAVAILABLE;
+    void *               transient_ptr     = nullptr;
+    int                  owning_device     = -1;
+    int                  planned_device    = -2;
+    bool                 plan_found        = false;
+    bool                 planned_on_device = false;
+    ggml_layout_mode     requested_layout  = GGML_LAYOUT_AOS;
+    ggml_layout_mode     actual_layout     = GGML_LAYOUT_AOS;
+    size_t               byte_offset       = 0;
+    bool                 has_ready_event   = false;
+    sycl::event          ready_event;
+    mem_handle           lease;
+    moe_execution_recipe recipe;
+    int                  source_reason = 0;
 
     bool has_authoritative_planned_alternate() const { return authoritative_planned_alternate_; }
 
@@ -82,20 +256,22 @@ struct moe_batch_route {
 };
 
 struct moe_resolved_operand {
-    int32_t             expert_id        = -1;
-    size_t              occurrence       = 0;
-    size_t              token_index      = 0;
-    size_t              slot_index       = 0;
-    moe_batch_residency residency        = moe_batch_residency::UNAVAILABLE;
-    int                 owning_device    = -1;
-    int                 planned_device   = -2;
-    bool                plan_found       = false;
-    ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
-    ggml_layout_mode    actual_layout    = GGML_LAYOUT_AOS;
-    size_t              byte_offset      = 0;
-    bool                has_ready_event  = false;
-    sycl::event         ready_event;
-    mem_handle          lease;
+    int32_t              expert_id        = -1;
+    size_t               occurrence       = 0;
+    size_t               token_index      = 0;
+    size_t               slot_index       = 0;
+    moe_batch_residency  residency        = moe_batch_residency::UNAVAILABLE;
+    int                  owning_device    = -1;
+    int                  planned_device   = -2;
+    bool                 plan_found       = false;
+    ggml_layout_mode     requested_layout = GGML_LAYOUT_AOS;
+    ggml_layout_mode     actual_layout    = GGML_LAYOUT_AOS;
+    size_t               byte_offset      = 0;
+    bool                 has_ready_event  = false;
+    sycl::event          ready_event;
+    mem_handle           lease;
+    moe_execution_recipe recipe;
+    size_t               admitted_recipe_signature = 0;
 };
 
 struct moe_resolved_batch {
@@ -173,12 +349,6 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
     }
     return out;
 }
-
-enum class moe_batch_executor : uint8_t {
-    HOST_CPU,
-    PRIMARY_DEVICE,
-    SECONDARY_DEVICE,
-};
 
 enum class moe_batch_role : uint8_t {
     GATE,
@@ -354,36 +524,15 @@ struct moe_batch_executor_choice {
 // and owning-queue facts; pointer address spaces are never consulted.
 inline moe_batch_executor_choice choose_moe_batch_executor(const moe_resolved_operand & operand,
                                                            int                          submit_device,
-                                                           bool                         device_capable,
-                                                           bool                         owning_queue_available) {
+                                                           bool                         owning_queue_available,
+                                                           size_t reserved_workspace_bytes = SIZE_MAX) {
     moe_batch_executor_choice out;
-    switch (operand.residency) {
-        case moe_batch_residency::HOST:
-            out.executor = moe_batch_executor::HOST_CPU;
-            return out;
-        case moe_batch_residency::PRIMARY_DEVICE:
-            out.executor = moe_batch_executor::PRIMARY_DEVICE;
-            if (operand.owning_device != submit_device) {
-                out.reject = moe_batch_reject_reason::WRONG_DEVICE;
-            } else if (!device_capable) {
-                out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
-            }
-            return out;
-        case moe_batch_residency::SECONDARY_DEVICE:
-            out.executor = moe_batch_executor::SECONDARY_DEVICE;
-            if (operand.owning_device < 0 || operand.owning_device == submit_device) {
-                out.reject = moe_batch_reject_reason::WRONG_DEVICE;
-            } else if (!owning_queue_available) {
-                out.reject = moe_batch_reject_reason::WRONG_QUEUE;
-            } else if (!device_capable) {
-                out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
-            }
-            return out;
-        case moe_batch_residency::UNAVAILABLE:
-            out.reject = moe_batch_reject_reason::ROUTE_UNAVAILABLE;
-            return out;
+    if (!validate_moe_execution_recipe(operand.recipe, operand.admitted_recipe_signature, operand.lease,
+                                       operand.residency, submit_device, owning_queue_available,
+                                       reserved_workspace_bytes, &out.reject)) {
+        return out;
     }
-    out.reject = moe_batch_reject_reason::ROUTE_UNAVAILABLE;
+    out.executor = operand.recipe.kind;
     return out;
 }
 
@@ -518,7 +667,16 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
         if (route.has_ready_event) {
             operand.ready_event = route.ready_event;
         }
-        operand.lease = route.lease;
+        operand.lease                     = route.lease;
+        operand.recipe                    = route.recipe;
+        operand.admitted_recipe_signature = moe_execution_recipe_signature(route.recipe);
+        if (!route.recipe.valid) {
+            out.reject     = moe_batch_reject_reason::RECIPE_MISSING;
+            out.occurrence = i;
+            out.expert_id  = expert_id;
+            out.batch.operands.clear();
+            return out;
+        }
         out.batch.operands.push_back(std::move(operand));
     }
     return out;

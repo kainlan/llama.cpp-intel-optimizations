@@ -74,6 +74,22 @@ static ggml_sycl::moe_batch_route route_for(void *                         ptr,
     route.planned_device    = route.planned_on_device ? owner : ggml_sycl::mem_handle::HOST_DEVICE;
     route.lease =
         weight_handle(ptr, owner < 0 ? 0 : owner, actual, identity, residency != ggml_sycl::moe_batch_residency::HOST);
+    route.recipe.valid        = true;
+    route.recipe.request      = { ggml_sycl::moe_route_phase::DECODE, 32, 32, 1, GGML_TYPE_Q4_0, 0 };
+    route.recipe.layout       = actual;
+    route.recipe.owner_device = owner;
+    route.recipe.kind =
+        residency == ggml_sycl::moe_batch_residency::HOST           ? ggml_sycl::moe_batch_executor::HOST_CPU :
+        residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ? ggml_sycl::moe_batch_executor::PRIMARY_DEVICE :
+                                                                      ggml_sycl::moe_batch_executor::SECONDARY_DEVICE;
+    route.recipe.kernel   = residency == ggml_sycl::moe_batch_residency::HOST ? ggml_sycl::moe_route_kernel::HOST_CPU :
+                                                                                ggml_sycl::moe_route_kernel::MMVQ_COMPAT;
+    route.recipe.queue    = residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ?
+                                ggml_sycl::moe_recipe_queue::OWNER :
+                                ggml_sycl::moe_recipe_queue::SUBMIT;
+    route.recipe.transfer = residency == ggml_sycl::moe_batch_residency::HOST ?
+                                ggml_sycl::moe_recipe_transfer::HOST_ACTIVATION :
+                                ggml_sycl::moe_recipe_transfer::NONE;
     return route;
 }
 
@@ -168,24 +184,19 @@ static bool test_executor_choice_is_residency_and_capability_driven() {
     auto host_batch = build_one(host);
     CHECK(host_batch);
     auto choice = ggml_sycl::choose_moe_batch_executor(host_batch.batch.operands[0], 0,
-                                                       /*device_capable=*/false,
                                                        /*owning_queue_available=*/false);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU);
 
     auto primary_batch = build_one(primary);
     CHECK(primary_batch);
-    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, false, true);
-    CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
-    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, true, true);
+    choice = ggml_sycl::choose_moe_batch_executor(primary_batch.batch.operands[0], 0, true);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
 
     auto secondary_batch = build_one(secondary);
     CHECK(secondary_batch);
-    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true, false);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false);
     CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::WRONG_QUEUE);
-    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false, true);
-    CHECK(!choice && choice.reject == ggml_sycl::moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
-    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true, true);
+    choice = ggml_sycl::choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true);
     CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE);
     return true;
 }
@@ -336,7 +347,7 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     for (size_t slot = 0; slot < 3; ++slot) {
         const auto * operand = batch.batch.occurrence(0, slot);
         CHECK(operand);
-        const auto choice = ggml_sycl::choose_moe_batch_executor(*operand, 0, true, true);
+        const auto choice = ggml_sycl::choose_moe_batch_executor(*operand, 0, true);
         CHECK(choice);
         primary_count += choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE;
         secondary_count += choice.executor == ggml_sycl::moe_batch_executor::SECONDARY_DEVICE;
@@ -424,6 +435,51 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     return true;
 }
 
+static bool test_recipe_matrix_workspace_and_immutability() {
+    using namespace ggml_sycl;
+    for (ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+        for (moe_route_phase phase : { moe_route_phase::DECODE, moe_route_phase::PROMPT }) {
+            const size_t         rows = phase == moe_route_phase::DECODE ? 1 : 7;
+            moe_route_request    request{ phase, 256, 96, rows, type, 0 };
+            moe_workspace_recipe ws;
+            CHECK(plan_moe_host_workspace(request, 272, 4 * sizeof(size_t), &ws));
+            CHECK(ws.activation_f32_bytes == rows * 256 * sizeof(float));
+            CHECK(ws.activation_q8_bytes == rows * 272);
+            CHECK(ws.output_f32_bytes == rows * 96 * sizeof(float));
+            CHECK(ws.descriptor_bytes == rows * 4 * sizeof(size_t));
+            CHECK(ws.total_bytes >=
+                  ws.activation_f32_bytes + ws.activation_q8_bytes + ws.output_f32_bytes + ws.descriptor_bytes);
+
+            int  value = 90;
+            auto host  = route_for(&value, -1, moe_batch_residency::HOST, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 90);
+            host.recipe.request    = request;
+            host.recipe.workspace  = ws;
+            const int32_t ids[]    = { 9 };
+            auto          admitted = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return host; });
+            CHECK(admitted);
+            CHECK(choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes));
+            auto mutated = admitted.batch.operands[0];
+            mutated.recipe.request.rows++;
+            auto choice = choose_moe_batch_executor(mutated, 0, false, ws.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
+            choice = choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes - 1);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
+
+            auto device =
+                route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 91);
+            device.recipe.request = request;
+            auto device_batch     = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return device; });
+            CHECK(device_batch);
+            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+        }
+    }
+    moe_workspace_recipe overflow;
+    CHECK(!plan_moe_host_workspace({ moe_route_phase::PROMPT, INT64_MAX, INT64_MAX, SIZE_MAX, GGML_TYPE_Q1_0, 0 },
+                                   SIZE_MAX, SIZE_MAX, &overflow));
+    return true;
+}
+
 static bool test_decode_admission_is_route_mode_independent() {
     int           local = 13;
     const int32_t ids[] = { 2, 2 };
@@ -439,7 +495,7 @@ static bool test_decode_admission_is_route_mode_independent() {
     CHECK(planned_calls == 2);
     CHECK(all_local_plan.batch.operands.size() == 2);
     for (const auto & operand : all_local_plan.batch.operands) {
-        auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true, true);
+        auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true);
         CHECK(choice && choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE);
     }
 
@@ -463,7 +519,7 @@ int main() {
         !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
         !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
-        !test_retained_role_alignment_and_terminal_transaction() ||
+        !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
         !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }

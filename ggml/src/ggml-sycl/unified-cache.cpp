@@ -569,6 +569,7 @@ static std::atomic<bool>     g_sycl_shutting_down{ false };  // Set during shutd
 static std::atomic<size_t>   g_runtime_reserved_host_bytes{};
 static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_category::COUNT)]{};
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
+static std::atomic<size_t>   g_planned_moe_host_recipe_workspace_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -776,6 +777,24 @@ static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_pp{ 0 };
 static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_tg{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_d2h{ 0 };
+
+void unified_cache_set_planned_moe_host_recipe_workspace_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_moe_host_recipe_workspace_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_moe_host_recipe_workspace_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_moe_host_recipe_workspace_bytes[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_admit_moe_host_recipe_workspace(int device_id, size_t requested_bytes) {
+    return requested_bytes <= unified_cache_get_planned_moe_host_recipe_workspace_bytes(device_id);
+}
 
 void unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
