@@ -27,9 +27,14 @@ static ModelToken root_token(uint64_t value) {
 }
 
 struct probe_terminal final : RetireTerminal {
-    probe_terminal(Registry & registry, ContextId owner, std::atomic<unsigned> & wait_count,
+    probe_terminal(Registry &              registry,
+                   ContextId               owner,
+                   std::atomic<unsigned> & wait_count,
                    std::atomic<unsigned> & destroy_count) :
-        reg(registry), context(owner), waits(wait_count), destroys(destroy_count) {}
+        reg(registry),
+        context(owner),
+        waits(wait_count),
+        destroys(destroy_count) {}
 
     ~probe_terminal() override {
         snapshot snap{};
@@ -96,19 +101,19 @@ int main() {
             "old epoch begin retire failed");
     std::atomic<unsigned> waits{ 0 };
     std::atomic<unsigned> destroys{ 0 };
-    require(reg.attach_retire_terminal(
-                old_ticket, 0, std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
-        "first terminal attach failed");
+    require(reg.attach_retire_terminal(old_ticket, 0,
+                                       std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
+            "first terminal attach failed");
     require(reg.finish_retire(old_ticket) == error::BUSY, "partial multi-device terminal set was released");
-    require(reg.attach_retire_terminal(
-                old_ticket, 1, std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
-        "second terminal attach failed");
+    require(reg.attach_retire_terminal(old_ticket, 1,
+                                       std::make_shared<probe_terminal>(reg, context, waits, destroys)) == error::OK,
+            "second terminal attach failed");
 
     RetireTicket wrong_context = old_ticket;
     wrong_context.context      = { context.value + 999 };
     require(reg.finish_retire(wrong_context) == error::STALE, "wrong-context retire accepted");
     RetireTicket wrong_root = old_ticket;
-    wrong_root.token_root = root_token(99);
+    wrong_root.token_root   = root_token(99);
     require(reg.finish_retire(wrong_root) == error::MISMATCH, "wrong-root retire accepted");
     require(reg.finish_retire(old_ticket) == error::OK && waits.load() == 2 && destroys.load() == 2,
             "exact retire did not wait for and release every terminal");
@@ -132,29 +137,30 @@ int main() {
                 reg.finish_reset(reset_ticket, &next_reset) == error::OK && next_reset.value == reset.value + 1,
             "owner reset after epoch release failed");
 
-    Registry graph_overflow(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW);
-    const ContextId overflow_context = graph_overflow.create_context(err);
-    SessionId overflow_session{};
+    Registry          graph_overflow(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW);
+    const ContextId   overflow_context = graph_overflow.create_context(err);
+    SessionId         overflow_session{};
     SessionResetEpoch overflow_reset{};
-    GraphEpoch overflow_epoch{};
+    GraphEpoch        overflow_epoch{};
     require(err == error::OK &&
                 graph_overflow.attach_root(overflow_context, root, &overflow_session, &overflow_reset) == error::OK &&
-                graph_overflow.begin_record(overflow_context, overflow_session, overflow_reset, root, &overflow_epoch) ==
-                    error::OVERFLOW,
+                graph_overflow.begin_record(overflow_context, overflow_session, overflow_reset, root,
+                                            &overflow_epoch) == error::OVERFLOW,
             "graph epoch overflow mutation survived");
 
-    Registry invocation_overflow(test_mutation::M6e_INVOCATION_ID_OVERFLOW);
-    const ContextId invocation_context = invocation_overflow.create_context(err);
-    SessionId invocation_session{};
+    Registry          invocation_overflow(test_mutation::M6e_INVOCATION_ID_OVERFLOW);
+    const ContextId   invocation_context = invocation_overflow.create_context(err);
+    SessionId         invocation_session{};
     SessionResetEpoch invocation_reset{};
-    GraphEpoch invocation_epoch{};
-    InvocationId overflow_invocation{};
-    require(err == error::OK && invocation_overflow.attach_root(
-                                    invocation_context, root, &invocation_session, &invocation_reset) == error::OK &&
-                invocation_overflow.begin_record(
-                    invocation_context, invocation_session, invocation_reset, root, &invocation_epoch) == error::OK &&
-                invocation_overflow.activate(
-                    invocation_context, invocation_session, invocation_reset, invocation_epoch, root) == error::OK &&
+    GraphEpoch        invocation_epoch{};
+    InvocationId      overflow_invocation{};
+    require(err == error::OK &&
+                invocation_overflow.attach_root(invocation_context, root, &invocation_session, &invocation_reset) ==
+                    error::OK &&
+                invocation_overflow.begin_record(invocation_context, invocation_session, invocation_reset, root,
+                                                 &invocation_epoch) == error::OK &&
+                invocation_overflow.activate(invocation_context, invocation_session, invocation_reset, invocation_epoch,
+                                             root) == error::OK &&
                 invocation_overflow.begin_invocation(invocation_context, invocation_session, invocation_reset,
                                                      invocation_epoch, root, &overflow_invocation) == error::OVERFLOW,
             "invocation id overflow mutation survived");

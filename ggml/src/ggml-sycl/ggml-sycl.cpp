@@ -57450,7 +57450,7 @@ struct fused_moe_route_validation {
 
 static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(const ggml_tensor *                   src0,
                                                                       const ggml_sycl::moe_resolved_batch & batch,
-                                                                      layout_mode                 layout) {
+                                                                      layout_mode                           layout) {
     fused_moe_route_validation validation;
     if (!src0 || batch.operands.empty()) {
         validation.reason = "invalid-request";
@@ -57565,10 +57565,10 @@ static void init_moe_debug() {
 
 // Try fused MoE ESIMD kernel for batched prefill (ne12 > 1)
 // Returns true if handled, false to fall back to other implementations
-static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
-                                       const ggml_tensor * src0,
-                                       const ggml_tensor * src1,
-                                       const ggml_tensor * ids,
+static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context &           ctx,
+                                       const ggml_tensor *                   src0,
+                                       const ggml_tensor *                   src1,
+                                       const ggml_tensor *                   ids,
                                        ggml_tensor *                         dst,
                                        const ggml_sycl::moe_resolved_batch & batch) {
 #if SYCL_ESIMD_MOE_AVAILABLE
@@ -57928,10 +57928,10 @@ static bool ggml_sycl_xmx_moe_ensure_runtime_buffers(ggml_backend_sycl_context &
     return true;
 }
 #endif
-static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
-                               const ggml_tensor *         src0,
-                               const ggml_tensor *         src1,
-                               const ggml_tensor *         ids,
+static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
+                               const ggml_tensor *                   src0,
+                               const ggml_tensor *                   src1,
+                               const ggml_tensor *                   ids,
                                ggml_tensor *                         dst,
                                const ggml_sycl::moe_resolved_batch & batch) {
     GGML_SYCL_DEBUG("[XMX-DEBUG] try_xmx_sorted_moe called: src0->type=%d\n", src0->type);
@@ -61625,7 +61625,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
         moe_expert_route route{};
         route.requested_layout = retained_prompt_layout;
-        const auto resolved = selected->lease.resolve();
+        const auto resolved    = selected->lease.resolve();
         if (!resolved.ptr || resolved.layout != selected->actual_layout) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt occurrence became unresolved");
         }
@@ -68205,12 +68205,12 @@ cpu_tg_fallthrough:
 
         const int            layer_hash   = moe_cache_layer_id(src0->name);
         const int64_t        expected_ids = total_entries;
-        const auto &  prompt_batch = retained_prompt_batch_result.batch;
+        const auto &         prompt_batch = retained_prompt_batch_result.batch;
         if (prompt_batch.expert_ids.size() != static_cast<size_t>(expected_ids) ||
             prompt_batch.slots_per_token != static_cast<size_t>(n_ids_local) ||
             retained_prompt_layout != route_layout) {
-                return false;
-            }
+            return false;
+        }
         const int32_t * ids_host = prompt_batch.expert_ids.data();
 
         std::vector<int32_t> counts(static_cast<size_t>(n_as_local), 0);
@@ -68510,8 +68510,8 @@ cpu_tg_fallthrough:
                         return false;
                     }
                     const int64_t expected = ids->ne[0] * ids->ne[1];
-                    if (expected <= 0 || retained_prompt_batch_result.batch.operands.size() !=
-                                             static_cast<size_t>(expected)) {
+                    if (expected <= 0 ||
+                        retained_prompt_batch_result.batch.operands.size() != static_cast<size_t>(expected)) {
                         return false;
                     }
                     size_t local_count       = 0;
@@ -71167,8 +71167,8 @@ cpu_tg_fallthrough:
 
                     if (all_local_device && !gpu_expert_ids.empty()) {
                         expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
-                            ctx, src0, retained_prompt_batch_result.batch, layer_id, route_layout,
-                            &expert_ptrs_event, &expert_ptrs_event_set);
+                            ctx, src0, retained_prompt_batch_result.batch, layer_id, route_layout, &expert_ptrs_event,
+                            &expert_ptrs_event_set);
                         if (expert_ptrs_dev) {
                             planner_resolved_batch = true;
                             expert_ptrs_source     = "smart_handles";
@@ -72938,7 +72938,7 @@ cpu_tg_fallthrough:
             ggml_sycl::mem_handle expert_gpu_lease{};
 
             if (ne12 != 1) {
-                const auto route_resolve_start = moe_profile_state::hrc::now();
+                const auto       route_resolve_start = moe_profile_state::hrc::now();
                 moe_expert_route route               = retained_prompt_group_route_for_expert(static_cast<int>(i02));
                 if (pp_local_trace) {
                     pp_local_accum.route_resolve_us +=
@@ -72950,8 +72950,8 @@ cpu_tg_fallthrough:
                         ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
                     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                         src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
-                        static_cast<size_t>(num_src1_rows), route.owning_device,
-                        moe_layer_route_residency::DEVICE, ctx.device);
+                        static_cast<size_t>(num_src1_rows), route.owning_device, moe_layer_route_residency::DEVICE,
+                        ctx.device);
                     if (!queue_ready || !cap.supported) {
                         pp_unsupported_device_rows += static_cast<size_t>(num_src1_rows);
                         throw ggml_sycl_fallback_error(

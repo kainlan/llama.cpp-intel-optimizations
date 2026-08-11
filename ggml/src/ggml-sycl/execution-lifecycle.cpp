@@ -477,7 +477,10 @@ error Registry::begin_graph(ContextId context, SessionId session, SessionResetEp
     if (session_rc != error::OK) return session_rc;
     if (entry.session.state != session_phase::OPEN || validate_root(entry.session.token_root, root) != error::OK) return error::MISMATCH;
     const auto & graph = entry.session.graph;
-    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED || graph_terminal_unretired(graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED ||
+        graph_terminal_unretired(graph)) {
+        return error::BUSY;
+    }
     uint64_t graph_value = 0;
     const auto rc = next_id(next_graph_epoch_, error::OVERFLOW, mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, graph_value);
     if (rc != error::OK) return rc;
@@ -782,10 +785,15 @@ error Registry::begin_drain(ContextId context, DrainTicket * ticket) noexcept {
     auto it = contexts_.find(context.value);
     if (!ticket) return error::NULL_OUTPUT;
     *ticket = {};
-    if (context.value == 0 || it == contexts_.end()) return error::STALE;
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
     auto & entry = it->second;
     if (entry.state != context_phase::OPEN || entry.active_drain_serial != 0) return error::BUSY;
-    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN ||
+        entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) {
+        return error::BUSY;
+    }
     if (mutation_ == test_mutation::M6b_DRAIN_SERIAL_OVERFLOW || entry.next_drain_serial == 0 || entry.next_drain_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.next_drain_serial++;
     entry.active_drain_serial = serial;
@@ -876,7 +884,9 @@ error Registry::close_context_if_idle(ContextId context) noexcept {
         if (owner.context == context && owner.invocation.value != 0) return error::DEVICE_BUSY;
     }
     auto & graph = entry.session.graph;
-    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED) return error::BUSY;
+    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED) {
+        return error::BUSY;
+    }
     if (graph_terminal_unretired(graph)) {
         graph.state = graph_phase::RETIRED;
         graph.invocation = {};
@@ -885,10 +895,12 @@ error Registry::close_context_if_idle(ContextId context) noexcept {
     return error::OK;
 }
 
-error Registry::begin_reset(ContextId context, SessionId session, SessionResetEpoch expected_epoch,
-                            ResetTicket * ticket) noexcept {
+error Registry::begin_reset(ContextId         context,
+                            SessionId         session,
+                            SessionResetEpoch expected_epoch,
+                            ResetTicket *     ticket) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = contexts_.find(context.value);
+    auto                        it = contexts_.find(context.value);
     if (!ticket) return error::NULL_OUTPUT;
     *ticket = {};
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
@@ -896,7 +908,10 @@ error Registry::begin_reset(ContextId context, SessionId session, SessionResetEp
     if (entry.state != context_phase::OPEN || entry.session.state != session_phase::OPEN || entry.session.active_reset_serial != 0) return error::BUSY;
     const auto session_rc = validate_session(entry, session, expected_epoch);
     if (session_rc != error::OK) return session_rc;
-    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN ||
+        entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) {
+        return error::BUSY;
+    }
     if (mutation_ == test_mutation::M6c_RESET_SERIAL_OVERFLOW || entry.session.next_reset_serial == 0 || entry.session.next_reset_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.session.next_reset_serial++;
     entry.session.active_reset_serial = serial;

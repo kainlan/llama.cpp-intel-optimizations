@@ -98,27 +98,27 @@ struct ResetTicket {
 // while locked, waits after unlocking, then revalidates the exact ticket.
 class RetireTerminal {
   public:
-    virtual ~RetireTerminal() = default;
+    virtual ~RetireTerminal()    = default;
     virtual void wait() noexcept = 0;
 };
 
 struct RetireTicket {
-    ContextId         context{};
-    SessionId         session{};
-    SessionResetEpoch reset_epoch{};
-    GraphEpoch        graph_epoch{};
+    ContextId             context{};
+    SessionId             session{};
+    SessionResetEpoch     reset_epoch{};
+    GraphEpoch            graph_epoch{};
     lifecycle::ModelToken token_root{};
-    uint64_t          serial = 0;
-    bool              active = false;
+    uint64_t              serial = 0;
+    bool                  active = false;
 };
 
 struct epoch_snapshot {
-    GraphEpoch   graph_epoch{};
-    epoch_phase  state = epoch_phase::RECORDING;
-    uint32_t     live_invocations = 0;
-    uint32_t     required_terminals = 0;
-    uint32_t     attached_terminals = 0;
-    bool         is_active = false;
+    GraphEpoch  graph_epoch{};
+    epoch_phase state              = epoch_phase::RECORDING;
+    uint32_t    live_invocations   = 0;
+    uint32_t    required_terminals = 0;
+    uint32_t    attached_terminals = 0;
+    bool        is_active          = false;
 };
 
 class Registry {
@@ -134,27 +134,51 @@ class Registry {
     // deliberately separate: one activated GraphEpoch can issue many unique
     // InvocationIds. Replacement does not destroy the old epoch; it remains
     // owner-addressable until its exact retire ticket is finished.
-    error begin_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                       lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept;
-    error activate(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                   GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
-    error begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                           GraphEpoch graph_epoch, lifecycle::ModelToken root,
-                           InvocationId * invocation) noexcept;
-    error finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                            GraphEpoch graph_epoch, InvocationId invocation,
+    error begin_record(ContextId             context,
+                       SessionId             session,
+                       SessionResetEpoch     reset_epoch,
+                       lifecycle::ModelToken root,
+                       GraphEpoch *          graph_epoch) noexcept;
+    error activate(ContextId             context,
+                   SessionId             session,
+                   SessionResetEpoch     reset_epoch,
+                   GraphEpoch            graph_epoch,
+                   lifecycle::ModelToken root) noexcept;
+    error begin_invocation(ContextId             context,
+                           SessionId             session,
+                           SessionResetEpoch     reset_epoch,
+                           GraphEpoch            graph_epoch,
+                           lifecycle::ModelToken root,
+                           InvocationId *        invocation) noexcept;
+    error finish_invocation(ContextId             context,
+                            SessionId             session,
+                            SessionResetEpoch     reset_epoch,
+                            GraphEpoch            graph_epoch,
+                            InvocationId          invocation,
                             lifecycle::ModelToken root) noexcept;
-    error rollback_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                          GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
-    error begin_retire(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                       GraphEpoch graph_epoch, lifecycle::ModelToken root,
-                       const int * devices, size_t device_count, RetireTicket * ticket) noexcept;
-    error attach_retire_terminal(const RetireTicket & ticket, int device,
+    error rollback_record(ContextId             context,
+                          SessionId             session,
+                          SessionResetEpoch     reset_epoch,
+                          GraphEpoch            graph_epoch,
+                          lifecycle::ModelToken root) noexcept;
+    error begin_retire(ContextId             context,
+                       SessionId             session,
+                       SessionResetEpoch     reset_epoch,
+                       GraphEpoch            graph_epoch,
+                       lifecycle::ModelToken root,
+                       const int *           devices,
+                       size_t                device_count,
+                       RetireTicket *        ticket) noexcept;
+    error attach_retire_terminal(const RetireTicket &            ticket,
+                                 int                             device,
                                  std::shared_ptr<RetireTerminal> terminal) noexcept;
     error finish_retire(const RetireTicket & ticket) noexcept;
-    error extract_epoch(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
-                        GraphEpoch graph_epoch, lifecycle::ModelToken root,
-                        epoch_snapshot * out) const noexcept;
+    error extract_epoch(ContextId             context,
+                        SessionId             session,
+                        SessionResetEpoch     reset_epoch,
+                        GraphEpoch            graph_epoch,
+                        lifecycle::ModelToken root,
+                        epoch_snapshot *      out) const noexcept;
 
     // Compatibility adapter used by the current backend until ea0b migrates it.
     error begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
@@ -194,8 +218,10 @@ class Registry {
     error close_context_if_idle(ContextId context) noexcept;
     error unbind_backend(ContextId context, int device) noexcept;
 
-    error begin_reset(ContextId context, SessionId session, SessionResetEpoch expected_epoch,
-                      ResetTicket * ticket) noexcept;
+    error begin_reset(ContextId         context,
+                      SessionId         session,
+                      SessionResetEpoch expected_epoch,
+                      ResetTicket *     ticket) noexcept;
     error finish_reset(const ResetTicket & ticket, SessionResetEpoch * next_epoch) noexcept;
 
     error extract(ContextId context, snapshot * out) const noexcept;
@@ -207,21 +233,21 @@ class Registry {
         token_root_phase            token_root_state = token_root_phase::OPEN;
         lifecycle::ModelToken       token_root{};
         InvocationId                invocation{};
-        std::vector<int> devices;
-        std::vector<int> participants;
-        std::vector<bool> participant_joined;
-        std::vector<bool> participant_completed;
+        std::vector<int>            devices;
+        std::vector<int>            participants;
+        std::vector<bool>           participant_joined;
+        std::vector<bool>           participant_completed;
         uint32_t         pending_participant_count = 0;
         bool             any_quarantined = false;
     };
 
     struct persistent_epoch_entry {
-        GraphEpoch id{};
-        epoch_phase state = epoch_phase::RECORDING;
-        lifecycle::ModelToken token_root{};
-        std::unordered_set<uint64_t> invocations;
-        uint64_t retire_serial = 0;
-        std::vector<int> retire_devices;
+        GraphEpoch                                               id{};
+        epoch_phase                                              state = epoch_phase::RECORDING;
+        lifecycle::ModelToken                                    token_root{};
+        std::unordered_set<uint64_t>                             invocations;
+        uint64_t                                                 retire_serial = 0;
+        std::vector<int>                                         retire_devices;
         std::unordered_map<int, std::shared_ptr<RetireTerminal>> terminals;
     };
 
@@ -232,9 +258,9 @@ class Registry {
         lifecycle::ModelToken token_root{};
         graph_entry           graph{};
         std::unordered_map<uint64_t, persistent_epoch_entry> epochs;
-        GraphEpoch            recording_epoch{};
-        GraphEpoch            active_epoch{};
-        uint64_t              next_retire_serial = 1;
+        GraphEpoch                                           recording_epoch{};
+        GraphEpoch                                           active_epoch{};
+        uint64_t                                             next_retire_serial  = 1;
         uint64_t              next_reset_serial = 1;
         uint64_t              active_reset_serial = 0;
     };
