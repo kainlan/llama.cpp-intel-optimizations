@@ -115,7 +115,8 @@ _ODD_STRIDE_NEXT_GUARD = "if (!ggml_sycl_mul_mat_type_supported(a_type))"
 _ODD_STRIDE_EXPRESSION = """
     !ggml_is_transposed(a) && !ggml_is_transposed(b) && a_type == GGML_TYPE_F16 &&
     b->type == GGML_TYPE_F32 && b->ne[1] == 1 && b->ne[3] > 1 && b->ne[3] == a->ne[3] &&
-    b->ne[2] > a->ne[2] && !ggml_is_contiguous_rows(a) && !ggml_is_contiguous_rows(b) &&
+    b->ne[2] > a->ne[2] && a->nb[1] > ggml_row_size(a_type, a->ne[0]) &&
+    b->nb[1] > ggml_row_size(b->type, b->ne[0]) &&
     (((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||
      ((b->nb[1] / ggml_type_size(b->type)) & 1) != 0)
 """
@@ -153,11 +154,22 @@ class _MulMatShape:
     b_ne2: int = 4
     a_ne3: int = 3
     b_ne3: int = 3
-    a_contiguous_rows: bool = False
-    b_contiguous_rows: bool = False
-    a_row_stride_elements: int = 2113
-    b_row_stride_elements: int = 2113
+    a_nb0: int = 2
+    b_nb0: int = 4
+    a_nb1: int = 2 * 2113
+    b_nb1: int = 4 * 2113
     bs0: int = 1
+
+
+def _type_size(type_name: str) -> int:
+    return {"F16": 2, "F32": 4}[type_name]
+
+
+def _contiguous_rows_helper(shape: _MulMatShape, source: str) -> bool:
+    # This mirrors ggml_is_contiguous_rows: padded nb[1] is deliberately irrelevant.
+    nb0 = shape.a_nb0 if source == "a" else shape.b_nb0
+    type_name = shape.a_type if source == "a" else shape.b_type
+    return nb0 == _type_size(type_name)
 
 
 _MODEL_CLAUSES: Dict[str, Callable[[_MulMatShape], bool]] = {
@@ -170,10 +182,10 @@ _MODEL_CLAUSES: Dict[str, Callable[[_MulMatShape], bool]] = {
     "multi_dim3": lambda s: s.b_ne3 > 1,
     "matching_dim3": lambda s: s.b_ne3 == s.a_ne3,
     "dim2_broadcast": lambda s: s.b_ne2 > s.a_ne2,
-    "src0_padded_rows": lambda s: not s.a_contiguous_rows,
-    "src1_padded_rows": lambda s: not s.b_contiguous_rows,
+    "src0_padded_rows": lambda s: s.a_nb1 > _type_size(s.a_type) * s.k,
+    "src1_padded_rows": lambda s: s.b_nb1 > _type_size(s.b_type) * s.k,
     "odd_element_row_stride": lambda s: (
-        (s.a_row_stride_elements & 1) != 0 or (s.b_row_stride_elements & 1) != 0
+        ((s.a_nb1 // _type_size(s.a_type)) & 1) != 0 or ((s.b_nb1 // _type_size(s.b_type)) & 1) != 0
     ),
 }
 
@@ -190,16 +202,13 @@ def _failure_shapes() -> List[_MulMatShape]:
 def _adjacent_controls() -> List[Tuple[str, _MulMatShape]]:
     base = _MulMatShape()
     return [
-        (
-            "even element row stride",
-            replace(base, k_v=2114, a_row_stride_elements=2114, b_row_stride_elements=2114),
-        ),
+        ("even element row stride", replace(base, k_v=2114, a_nb1=2 * 2114, b_nb1=4 * 2114)),
         ("dim3=1", replace(base, a_ne3=1, b_ne3=1)),
         ("no dim2 broadcast", replace(base, b_ne2=base.a_ne2)),
-        ("F32 equivalent", replace(base, a_type="F32")),
+        ("F32 equivalent", replace(base, a_type="F32", a_nb0=4, a_nb1=4 * base.k_v)),
         ("MUL_MAT_ID", replace(base, op="MUL_MAT_ID")),
         ("src1 ne1>1", replace(base, n=2)),
-        ("contiguous rows", replace(base, a_contiguous_rows=True, b_contiguous_rows=True)),
+        ("unpadded rows", replace(base, a_nb1=2 * base.k, b_nb1=4 * base.k)),
         ("transposed src0", replace(base, a_transposed=True)),
     ]
 
@@ -208,17 +217,17 @@ def _clause_witnesses() -> Dict[str, _MulMatShape]:
     base = _MulMatShape()
     return {
         "regular_mul_mat": replace(base, op="MUL_MAT_ID"),
-        "src0_f16": replace(base, a_type="F32"),
-        "src1_f32": replace(base, b_type="F16"),
+        "src0_f16": replace(base, a_type="F32", a_nb0=4, a_nb1=4 * 2113),
+        "src1_f32": replace(base, b_type="F16", b_nb0=2, b_nb1=2 * 2113),
         "src0_not_transposed": replace(base, a_transposed=True),
         "src1_not_transposed": replace(base, b_transposed=True),
         "src1_single_row": replace(base, n=2),
         "multi_dim3": replace(base, a_ne3=1, b_ne3=1),
         "matching_dim3": replace(base, b_ne3=4),
         "dim2_broadcast": replace(base, b_ne2=base.a_ne2),
-        "src0_padded_rows": replace(base, a_contiguous_rows=True),
-        "src1_padded_rows": replace(base, b_contiguous_rows=True),
-        "odd_element_row_stride": replace(base, a_row_stride_elements=2114, b_row_stride_elements=2114),
+        "src0_padded_rows": replace(base, a_nb1=2 * base.k),
+        "src1_padded_rows": replace(base, b_nb1=4 * base.k),
+        "odd_element_row_stride": replace(base, a_nb1=2 * 2114, b_nb1=4 * 2114),
     }
 
 
@@ -227,6 +236,14 @@ def test_f16_odd_stride_mul_mat_source_contract_and_decision_census() -> None:
     failures = _failure_shapes()
     controls = _adjacent_controls()
     assert len(failures) == 8 and all(_decline_odd_stride(shape) for shape in failures)
+    assert all(shape.a_nb0 == _type_size(shape.a_type) for shape in failures)
+    assert all(shape.b_nb0 == _type_size(shape.b_type) for shape in failures)
+    assert all(shape.a_nb1 == _type_size(shape.a_type) * shape.k_v for shape in failures)
+    assert all(shape.b_nb1 == _type_size(shape.b_type) * shape.k_v for shape in failures)
+    assert all(shape.a_nb1 > _type_size(shape.a_type) * shape.k for shape in failures)
+    assert all(shape.b_nb1 > _type_size(shape.b_type) * shape.k for shape in failures)
+    assert all(_contiguous_rows_helper(shape, "a") for shape in failures)
+    assert all(_contiguous_rows_helper(shape, "b") for shape in failures)
     assert {
         (
             shape.a_type,
@@ -349,8 +366,10 @@ def test_review_mutations_are_detected() -> None:
         ("b->ne[3] > 1", "b->ne[3] >= 1"),
         ("b->ne[3] == a->ne[3]", "b->ne[3] >= a->ne[3]"),
         ("b->ne[2] > a->ne[2]", "b->ne[2] >= a->ne[2]"),
-        ("!ggml_is_contiguous_rows(a)", "true"),
-        ("!ggml_is_contiguous_rows(b)", "true"),
+        ("a->nb[1] > ggml_row_size(a_type, a->ne[0])", "true"),
+        ("b->nb[1] > ggml_row_size(b->type, b->ne[0])", "true"),
+        ("a->nb[1] > ggml_row_size(a_type, a->ne[0])", "!ggml_is_contiguous_rows(a)"),
+        ("b->nb[1] > ggml_row_size(b->type, b->ne[0])", "!ggml_is_contiguous_rows(b)"),
         ("(((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||", "(true ||"),
     )
     for old, new in broadening_mutations:

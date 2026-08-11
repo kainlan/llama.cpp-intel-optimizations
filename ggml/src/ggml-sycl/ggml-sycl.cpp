@@ -98823,7 +98823,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 // non-broadcast control remain valid.
                 if (!ggml_is_transposed(a) && !ggml_is_transposed(b) && a_type == GGML_TYPE_F16 &&
                     b->type == GGML_TYPE_F32 && b->ne[1] == 1 && b->ne[3] > 1 && b->ne[3] == a->ne[3] &&
-                    b->ne[2] > a->ne[2] && !ggml_is_contiguous_rows(a) && !ggml_is_contiguous_rows(b) &&
+                    b->ne[2] > a->ne[2] && a->nb[1] > ggml_row_size(a_type, a->ne[0]) &&
+                    b->nb[1] > ggml_row_size(b->type, b->ne[0]) &&
                     (((a->nb[1] / ggml_type_size(a_type)) & 1) != 0 ||
                      ((b->nb[1] / ggml_type_size(b->type)) & 1) != 0)) {
                     return false;
