@@ -7,7 +7,13 @@
 #include <unordered_map>
 #include <vector>
 
-#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL:%d: %s\n", __LINE__, #c); return false; } } while (0)
+#define CHECK(c)                                                 \
+    do {                                                         \
+        if (!(c)) {                                              \
+            std::fprintf(stderr, "FAIL:%d: %s\n", __LINE__, #c); \
+            return false;                                        \
+        }                                                        \
+    } while (0)
 
 namespace ggml_sycl {
 
@@ -20,16 +26,16 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
                                          bool                       on_device,
                                          std::shared_ptr<void>      storage_owner) {
     mem_handle h;
-    h.kind_   = mem_handle_kind::WEIGHT;
-    h.device_ = device;
-    h.key_    = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
-    h.gen_    = cache_generation();
-    h.cached_ = { ptr, layout, on_device };
+    h.kind_                 = mem_handle_kind::WEIGHT;
+    h.device_               = device;
+    h.key_                  = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
+    h.gen_                  = cache_generation();
+    h.cached_               = { ptr, layout, on_device, false, sycl::event{} };
     h.leased_storage_owner_ = std::move(storage_owner);
     return h;
 }
 
-} // namespace ggml_sycl
+}  // namespace ggml_sycl
 
 static ggml_sycl_cache_id key_for(int id) {
     // Synthetic logical identity: deliberately independent of the backing
@@ -42,14 +48,21 @@ static ggml_sycl_cache_id key_for(int id) {
     return key;
 }
 
-static ggml_sycl::mem_handle weight_handle(void * ptr, int owner, ggml_layout_mode layout, int identity,
-                                           bool on_device) {
+static ggml_sycl::mem_handle weight_handle(void *           ptr,
+                                           int              owner,
+                                           ggml_layout_mode layout,
+                                           int              identity,
+                                           bool             on_device) {
     return ggml_sycl::test_make_stable_weight_lease(key_for(identity), owner, ptr, layout, on_device,
                                                     std::make_shared<int>(identity));
 }
 
-static ggml_sycl::moe_batch_route route_for(void * ptr, int owner, ggml_sycl::moe_batch_residency residency,
-                                            ggml_layout_mode requested, ggml_layout_mode actual, int identity) {
+static ggml_sycl::moe_batch_route route_for(void *                         ptr,
+                                            int                            owner,
+                                            ggml_sycl::moe_batch_residency residency,
+                                            ggml_layout_mode               requested,
+                                            ggml_layout_mode               actual,
+                                            int                            identity) {
     ggml_sycl::moe_batch_route route;
     route.residency         = residency;
     route.transient_ptr     = ptr;
@@ -59,26 +72,29 @@ static ggml_sycl::moe_batch_route route_for(void * ptr, int owner, ggml_sycl::mo
     route.plan_found        = true;
     route.planned_on_device = residency != ggml_sycl::moe_batch_residency::HOST;
     route.planned_device    = route.planned_on_device ? owner : ggml_sycl::mem_handle::HOST_DEVICE;
-    route.lease             = weight_handle(ptr, owner < 0 ? 0 : owner, actual, identity,
-                                            residency != ggml_sycl::moe_batch_residency::HOST);
+    route.lease =
+        weight_handle(ptr, owner < 0 ? 0 : owner, actual, identity, residency != ggml_sycl::moe_batch_residency::HOST);
     return route;
 }
 
 static bool test_host_primary_secondary_mixed_and_occurrences() {
-    int primary = 1, secondary = 2, host = 3;
-    const int32_t ids[] = { 1, 2, 1, 3 };
-    int calls = 0;
-    auto result = ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
+    int           primary = 1, secondary = 2, host = 3;
+    const int32_t ids[]  = { 1, 2, 1, 3 };
+    int           calls  = 0;
+    auto          result = ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
         ++calls;
-        if (id == 1) return route_for(&primary, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                      GGML_LAYOUT_SOA, GGML_LAYOUT_XMX_TILED, 1);
-        if (id == 2) return route_for(&secondary, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE,
-                                      GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 2);
-        return route_for(&host, -1, ggml_sycl::moe_batch_residency::HOST,
-                         GGML_LAYOUT_SOA, GGML_LAYOUT_AOS, 3);
+        if (id == 1) {
+            return route_for(&primary, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
+                                      GGML_LAYOUT_XMX_TILED, 1);
+        }
+        if (id == 2) {
+            return route_for(&secondary, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_SOA,
+                                      GGML_LAYOUT_SOA, 2);
+        }
+        return route_for(&host, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS, 3);
     });
     CHECK(result);
-    CHECK(calls == 4); // repeated occurrences resolve independently and remain semantic entries
+    CHECK(calls == 4);  // repeated occurrences resolve independently and remain semantic entries
     CHECK(result.batch.expert_ids == std::vector<int32_t>({ 1, 2, 1, 3 }));
     CHECK(result.batch.operands.size() == 4);
     CHECK(result.batch.operands[0].occurrence == 0 && result.batch.operands[2].occurrence == 2);
@@ -101,22 +117,21 @@ static bool test_explicit_planned_alternate_on_submit_device() {
         weight_handle(&alternate, 0, GGML_LAYOUT_SOA, 6, true)));
 
     const int32_t ids[] = { 6 };
-    auto unproved = route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                              GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
+    auto          unproved =
+        route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
     unproved.planned_device = 1;
-    CHECK(!ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0,
-                                                [&](int32_t) { return unproved; }));
+    CHECK(!ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return unproved; }));
     return true;
 }
 
 static bool test_identity_sharing_and_ready_event() {
-    int shared = 4;
-    const int32_t ids[] = { 4, 5 };
-    auto result = ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t) {
-        auto route = route_for(&shared, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                               GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 9);
+    int           shared = 4;
+    const int32_t ids[]  = { 4, 5 };
+    auto          result = ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t) {
+        auto route =
+            route_for(&shared, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 9);
         route.has_ready_event = true;
-        route.ready_event = sycl::event{};
+        route.ready_event     = sycl::event{};
         return route;
     });
     CHECK(result);
@@ -126,11 +141,11 @@ static bool test_identity_sharing_and_ready_event() {
     CHECK(result.batch.operands[0].lease.valid() && result.batch.operands[1].lease.valid());
     CHECK(result.batch.operands[0].lease.resolve().ptr == &shared);
 
-    int same_pointer = 5;
-    int identity = 11;
-    auto distinct = ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t) {
-        return route_for(&same_pointer, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                         GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, identity++);
+    int  same_pointer = 5;
+    int  identity     = 11;
+    auto distinct     = ggml_sycl::build_moe_resolved_batch(ids, 2, 1, 0, [&](int32_t) {
+        return route_for(&same_pointer, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS,
+                             GGML_LAYOUT_AOS, identity++);
     });
     CHECK(distinct);
     CHECK(!distinct.batch.operands[0].lease.stable_identity_equal(distinct.batch.operands[1].lease));
@@ -139,79 +154,74 @@ static bool test_identity_sharing_and_ready_event() {
 }
 
 static bool test_fail_closed_contract() {
-    int value = 7;
+    int           value = 7;
     const int32_t ids[] = { 7 };
-    auto run = [&](ggml_sycl::moe_batch_route route) {
-        return ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0,
-                                                   [&](int32_t) { return route; });
+    auto          run   = [&](ggml_sycl::moe_batch_route route) {
+        return ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
     };
 
-    auto missing = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                             GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto missing =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     missing.lease = {};
     CHECK(run(missing).reject == ggml_sycl::moe_batch_reject_reason::MISSING_HANDLE);
 
-    auto raw = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                         GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto raw =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     raw.lease = ggml_sycl::mem_handle::from_direct(&value, GGML_LAYOUT_AOS, true, 0);
     CHECK(run(raw).reject == ggml_sycl::moe_batch_reject_reason::RAW_COMPAT_HANDLE);
 
-    auto wrong_device = route_for(&value, 1, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                  GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto wrong_device =
+        route_for(&value, 1, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     CHECK(run(wrong_device).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
-    auto wrong_secondary = route_for(&value, 0, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE,
-                                     GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto wrong_secondary =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     CHECK(run(wrong_secondary).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
-    auto primary_lease_mismatch = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                            GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto primary_lease_mismatch =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     primary_lease_mismatch.lease = weight_handle(&value, 1, GGML_LAYOUT_AOS, 7, true);
     CHECK(run(primary_lease_mismatch).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
-    auto secondary_lease_mismatch = route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE,
-                                              GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto secondary_lease_mismatch =
+        route_for(&value, 1, ggml_sycl::moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     secondary_lease_mismatch.lease = weight_handle(&value, 2, GGML_LAYOUT_AOS, 7, true);
     CHECK(run(secondary_lease_mismatch).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
-    auto wrong_host = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST,
-                                GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto wrong_host = route_for(&value, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     wrong_host.owning_device = 0;
     CHECK(run(wrong_host).reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
 
-    auto wrong_layout = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                  GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto wrong_layout =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     wrong_layout.actual_layout = GGML_LAYOUT_SOA;
     CHECK(run(wrong_layout).reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
 
-    auto unavailable = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                 GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto unavailable =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     unavailable.residency = ggml_sycl::moe_batch_residency::UNAVAILABLE;
     CHECK(run(unavailable).reject == ggml_sycl::moe_batch_reject_reason::ROUTE_UNAVAILABLE);
 
-    auto wrong_plan = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    auto wrong_plan =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
     wrong_plan.planned_device = 1;
     CHECK(run(wrong_plan).reject == ggml_sycl::moe_batch_reject_reason::PLAN_MISMATCH);
 
-    auto pointer_mismatch = route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
-                                      GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
-    int other = 8;
+    auto pointer_mismatch =
+        route_for(&value, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 7);
+    int other                      = 8;
     pointer_mismatch.transient_ptr = &other;
     CHECK(run(pointer_mismatch).reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
 
-    CHECK(ggml_sycl::build_moe_resolved_batch(nullptr, 1, 1, 0,
-                                               [&](int32_t) { return missing; }).reject ==
+    CHECK(ggml_sycl::build_moe_resolved_batch(nullptr, 1, 1, 0, [&](int32_t) { return missing; }).reject ==
           ggml_sycl::moe_batch_reject_reason::INVALID_REQUEST);
-    CHECK(ggml_sycl::build_moe_resolved_batch(ids, 1, 0, 0,
-                                               [&](int32_t) { return missing; }).reject ==
+    CHECK(ggml_sycl::build_moe_resolved_batch(ids, 1, 0, 0, [&](int32_t) { return missing; }).reject ==
           ggml_sycl::moe_batch_reject_reason::INVALID_REQUEST);
     return true;
 }
 
 int main() {
-    if (!test_host_primary_secondary_mixed_and_occurrences() ||
-        !test_explicit_planned_alternate_on_submit_device() ||
+    if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_identity_sharing_and_ready_event() || !test_fail_closed_contract()) {
         return 1;
     }

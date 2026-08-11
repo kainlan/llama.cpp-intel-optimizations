@@ -44,19 +44,19 @@ struct moe_resolved_batch_result;
 // Normalized mirror of the existing canonical moe_expert_route.  transient_ptr
 // is checked while building and is never retained in the resulting batch.
 struct moe_batch_route {
-    moe_batch_residency residency        = moe_batch_residency::UNAVAILABLE;
-    void *              transient_ptr    = nullptr;
-    int                 owning_device    = -1;
-    int                 planned_device   = -2;
+    moe_batch_residency residency         = moe_batch_residency::UNAVAILABLE;
+    void *              transient_ptr     = nullptr;
+    int                 owning_device     = -1;
+    int                 planned_device    = -2;
     bool                plan_found        = false;
     bool                planned_on_device = false;
-    ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
-    ggml_layout_mode    actual_layout    = GGML_LAYOUT_AOS;
-    size_t              byte_offset      = 0;
-    bool                has_ready_event  = false;
+    ggml_layout_mode    requested_layout  = GGML_LAYOUT_AOS;
+    ggml_layout_mode    actual_layout     = GGML_LAYOUT_AOS;
+    size_t              byte_offset       = 0;
+    bool                has_ready_event   = false;
     sycl::event         ready_event;
     mem_handle          lease;
-    int                 source_reason    = 0;
+    int                 source_reason = 0;
 
     bool has_authoritative_planned_alternate() const { return authoritative_planned_alternate_; }
 
@@ -65,41 +65,46 @@ struct moe_batch_route {
     // normalized-route callers can only construct the default (false) proof.
     bool authoritative_planned_alternate_ = false;
 
-    friend moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *, int, const int32_t *,
-                                                                        size_t, size_t, ggml_layout_mode, bool);
-    friend bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle);
+    friend moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *,
+                                                                        int,
+                                                                        const int32_t *,
+                                                                        size_t,
+                                                                        size_t,
+                                                                        ggml_layout_mode,
+                                                                        bool);
+    friend bool                      test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle);
 };
 
 struct moe_resolved_operand {
-    int32_t             expert_id       = -1;
-    size_t              occurrence      = 0;
-    size_t              token_index     = 0;
-    size_t              slot_index      = 0;
-    moe_batch_residency residency       = moe_batch_residency::UNAVAILABLE;
-    int                 owning_device   = -1;
-    int                 planned_device  = -2;
-    bool                plan_found      = false;
+    int32_t             expert_id        = -1;
+    size_t              occurrence       = 0;
+    size_t              token_index      = 0;
+    size_t              slot_index       = 0;
+    moe_batch_residency residency        = moe_batch_residency::UNAVAILABLE;
+    int                 owning_device    = -1;
+    int                 planned_device   = -2;
+    bool                plan_found       = false;
     ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
-    ggml_layout_mode    actual_layout   = GGML_LAYOUT_AOS;
-    size_t              byte_offset     = 0;
-    bool                has_ready_event = false;
+    ggml_layout_mode    actual_layout    = GGML_LAYOUT_AOS;
+    size_t              byte_offset      = 0;
+    bool                has_ready_event  = false;
     sycl::event         ready_event;
     mem_handle          lease;
 };
 
 struct moe_resolved_batch {
-    int                               submit_device = -1;
+    int                               submit_device   = -1;
     size_t                            slots_per_token = 0;
     std::vector<int32_t>              expert_ids;
     std::vector<moe_resolved_operand> operands;
 };
 
 struct moe_resolved_batch_result {
-    moe_resolved_batch       batch;
-    moe_batch_reject_reason  reject       = moe_batch_reject_reason::NONE;
-    size_t                   occurrence   = 0;
-    int32_t                  expert_id     = -1;
-    int                      source_reason = 0;
+    moe_resolved_batch      batch;
+    moe_batch_reject_reason reject        = moe_batch_reject_reason::NONE;
+    size_t                  occurrence    = 0;
+    int32_t                 expert_id     = -1;
+    int                     source_reason = 0;
 
     explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
 };
@@ -131,11 +136,11 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
         return moe_batch_reject_reason::LAYOUT_MISMATCH;
     }
 
-    const bool primary = route.residency == moe_batch_residency::PRIMARY_DEVICE;
+    const bool primary   = route.residency == moe_batch_residency::PRIMARY_DEVICE;
     const bool secondary = route.residency == moe_batch_residency::SECONDARY_DEVICE;
-    const bool host = route.residency == moe_batch_residency::HOST;
-    if ((primary && (!resolved.on_device || route.owning_device != submit_device ||
-                     route.lease.device() != submit_device)) ||
+    const bool host      = route.residency == moe_batch_residency::HOST;
+    if ((primary &&
+         (!resolved.on_device || route.owning_device != submit_device || route.lease.device() != submit_device)) ||
         (secondary && (!resolved.on_device || route.owning_device < 0 || route.owning_device == submit_device ||
                        route.lease.device() != route.owning_device)) ||
         (host && (resolved.on_device || route.owning_device != mem_handle::HOST_DEVICE))) {
@@ -143,14 +148,14 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
     }
 
     if (route.plan_found) {
-        const bool primary_plan_matches = route.planned_on_device ?
-                                              (route.planned_device >= 0 && !host &&
-                                               route.planned_device == route.owning_device) :
-                                              (route.planned_device == mem_handle::HOST_DEVICE && host);
-        const bool explicit_alternate_matches =
-            route.has_authoritative_planned_alternate() && route.planned_on_device && primary &&
-            route.owning_device == submit_device && route.planned_device >= 0 &&
-            route.planned_device != route.owning_device;
+        const bool primary_plan_matches =
+            route.planned_on_device ?
+                (route.planned_device >= 0 && !host && route.planned_device == route.owning_device) :
+                (route.planned_device == mem_handle::HOST_DEVICE && host);
+        const bool explicit_alternate_matches = route.has_authoritative_planned_alternate() &&
+                                                route.planned_on_device && primary &&
+                                                route.owning_device == submit_device && route.planned_device >= 0 &&
+                                                route.planned_device != route.owning_device;
         if (!primary_plan_matches && !explicit_alternate_matches) {
             return moe_batch_reject_reason::PLAN_MISMATCH;
         }
@@ -158,19 +163,19 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
     return moe_batch_reject_reason::NONE;
 }
 
-} // namespace detail
+}  // namespace detail
 
 // Every occurrence is resolved and produces one operand with its original
 // token and slot.  Retained handles may be canonicalized only by stable owner
 // identity; expert IDs and raw pointers are never identity keys.
 template <typename Resolver>
 moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
-                                                    size_t          count,
-                                                    size_t          slots_per_token,
-                                                    int             submit_device,
-                                                    Resolver &&     resolver) {
+                                                   size_t          count,
+                                                   size_t          slots_per_token,
+                                                   int             submit_device,
+                                                   Resolver &&     resolver) {
     moe_resolved_batch_result out;
-    out.batch.submit_device  = submit_device;
+    out.batch.submit_device   = submit_device;
     out.batch.slots_per_token = slots_per_token;
     if ((count != 0 && ids == nullptr) || slots_per_token == 0 || submit_device < 0) {
         out.reject = moe_batch_reject_reason::INVALID_REQUEST;
@@ -185,9 +190,9 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
     std::vector<mem_handle> canonical_leases;
 
     for (size_t i = 0; i < count; ++i) {
-        const int32_t   expert_id = out.batch.expert_ids[i];
-        moe_batch_route route     = resolver(expert_id);
-        const moe_batch_reject_reason reject = detail::validate_moe_batch_route(route, submit_device);
+        const int32_t                 expert_id = out.batch.expert_ids[i];
+        moe_batch_route               route     = resolver(expert_id);
+        const moe_batch_reject_reason reject    = detail::validate_moe_batch_route(route, submit_device);
         if (reject != moe_batch_reject_reason::NONE) {
             out.reject        = reject;
             out.occurrence    = i;
@@ -239,4 +244,4 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                                                              ggml_layout_mode    requested_layout,
                                                              bool                allow_materialize = false);
 
-} // namespace ggml_sycl
+}  // namespace ggml_sycl

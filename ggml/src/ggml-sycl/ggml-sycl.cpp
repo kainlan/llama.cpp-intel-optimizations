@@ -4632,6 +4632,9 @@ struct moe_expert_route {
     bool                  plan_found               = false;
     bool                  plan_missing             = false;
     bool                  planned_device_residency = false;
+    // TU-internal authorization produced only by the canonical resolver's
+    // exact adjusted-layout alternate decision.
+    bool                  planned_alternate_admitted = false;
     ggml_layout_mode      planned_layout           = GGML_LAYOUT_AOS;
     ggml_layout_mode      requested_layout         = GGML_LAYOUT_AOS;
     ggml_layout_mode      actual_layout            = GGML_LAYOUT_AOS;
@@ -5196,6 +5199,9 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
 
         route.ptr           = resolved.ptr;
         route.owning_device = owning_device;
+        route.planned_alternate_admitted =
+            current_device_planned_alternate && owning_device == current_device &&
+            owning_device != route.planned_device;
         route.actual_layout = resolved.layout;
         route.tier          = resolved.on_device ? expert_resolve_tier::DEVICE_VRAM : expert_resolve_tier::HOST_PINNED;
         route.reason        = expert_resolve_reason::FOUND;
@@ -5211,6 +5217,23 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
             route.kind = moe_expert_route_kind::HOST;
         }
         return true;
+    }
+    return false;
+}
+
+static bool ggml_sycl_moe_plan_admits_current_alternate(const ggml_tensor *             tensor,
+                                                         int                             current_device,
+                                                         ggml_layout_mode                requested_layout,
+                                                         const expert_placement_result & placement) {
+    if (!tensor || !placement.found() || !placement.on_device || placement.target_device == current_device) {
+        return false;
+    }
+    for (const placement_alternate_layout & alt : placement.alternate_layouts) {
+        const int target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
+        if (target == current_device &&
+            ggml_sycl_adjust_layout_for_tensor(tensor, alt.layout, current_device) == requested_layout) {
+            return true;
+        }
     }
     return false;
 }
@@ -5248,20 +5271,8 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             if (route.planned_device_residency && route.planned_device >= 0 && route.planned_device != current_device) {
                 (void) ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device);
             }
-            if (route.planned_device_residency && current_device >= 0 && current_device != route.planned_device) {
-                for (const ggml_sycl::placement_alternate_layout & alt : placement.alternate_layouts) {
-                    const int alt_target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
-                    if (alt_target != current_device) {
-                        continue;
-                    }
-                    const ggml_layout_mode alt_layout =
-                        ggml_sycl_adjust_layout_for_tensor(src0, alt.layout, current_device);
-                    if (alt_layout == requested_layout) {
-                        current_device_planned_alternate = true;
-                        break;
-                    }
-                }
-            }
+            current_device_planned_alternate = ggml_sycl_moe_plan_admits_current_alternate(
+                src0, current_device, requested_layout, placement);
         } else {
             route.plan_missing = true;
             route.reason       = expert_resolve_reason::NOT_FOUND;
@@ -5441,6 +5452,9 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
 
             route.ptr             = resolved.ptr;
             route.owning_device   = resolved.owning_device;
+            route.planned_alternate_admitted =
+                current_device_planned_alternate && resolved.owning_device == current_device &&
+                resolved.owning_device != route.planned_device;
             route.actual_layout   = resolved.actual_layout;
             route.tier            = resolved.tier;
             route.reason          = resolved.reason;
@@ -22983,36 +22997,6 @@ static ggml_sycl::moe_expert_route ggml_sycl_resolve_moe_expert_route_for_dispat
 
 namespace ggml_sycl {
 
-static bool moe_canonical_route_matches_explicit_alternate(const expert_placement_result & placement,
-                                                           int                             submit_device,
-                                                           const moe_expert_route &        route) {
-    if (!placement.found() || !placement.on_device || placement.target_device != route.planned_device ||
-        route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.owning_device != submit_device ||
-        route.planned_device == submit_device || !route.plan_found || !route.planned_device_residency) {
-        return false;
-    }
-    for (const placement_alternate_layout & alt : placement.alternate_layouts) {
-        const int target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
-        if (target == submit_device && alt.layout == route.requested_layout) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool moe_canonical_route_has_authoritative_alternate(const ggml_tensor *       src0,
-                                                            int                       submit_device,
-                                                            int                       expert_id,
-                                                            const moe_expert_route & route) {
-    unified_cache * cache = get_unified_cache_for_device(submit_device);
-    if (!cache || !src0 || !src0->name || src0->name[0] == '\0') {
-        return false;
-    }
-    const expert_placement_result placement =
-        ggml_sycl_cache_plan_owner(cache)->lookup_expert_placement(std::string(src0->name), expert_id);
-    return moe_canonical_route_matches_explicit_alternate(placement, submit_device, route);
-}
-
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
     switch (reason) {
         case moe_batch_reject_reason::NONE:              return "none";
@@ -23063,8 +23047,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         normalized.planned_device    = route.planned_device;
         normalized.plan_found        = route.plan_found;
         normalized.planned_on_device = route.planned_device_residency;
-        normalized.authoritative_planned_alternate_ =
-            moe_canonical_route_has_authoritative_alternate(src0, submit_device, expert_id, route);
+        normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted;
         normalized.requested_layout  = route.requested_layout;
         normalized.actual_layout     = route.actual_layout;
         normalized.has_ready_event   = route.has_ready_event;
@@ -23087,7 +23070,7 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     entry.layout        = GGML_LAYOUT_SOA;
     entry.on_device     = true;
     entry.target_device = 1;
-    entry.alternate_layouts.push_back({ GGML_LAYOUT_SOA, 64, 64, 0 });
+    entry.alternate_layouts.push_back({ GGML_LAYOUT_XMX_TILED, 64, 64, 0 });
     plan.entries.push_back(std::move(entry));
     plan.build_index();
     const expert_placement_result placement =
@@ -23098,6 +23081,11 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
         return false;
     }
 
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_Q8_0;
+    const bool admitted =
+        ggml_sycl_moe_plan_admits_current_alternate(&tensor, 0, GGML_LAYOUT_SOA, placement);
+
     moe_expert_route canonical;
     canonical.kind                     = moe_expert_route_kind::LOCAL_DEVICE;
     canonical.ptr                      = leased.ptr;
@@ -23105,6 +23093,7 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     canonical.planned_device           = 1;
     canonical.plan_found               = true;
     canonical.planned_device_residency = true;
+    canonical.planned_alternate_admitted = admitted;
     canonical.requested_layout         = GGML_LAYOUT_SOA;
     canonical.actual_layout            = GGML_LAYOUT_SOA;
     canonical.lease                    = std::move(lease);
@@ -23119,8 +23108,7 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     normalized.requested_layout = canonical.requested_layout;
     normalized.actual_layout    = canonical.actual_layout;
     normalized.lease            = std::move(canonical.lease);
-    normalized.authoritative_planned_alternate_ =
-        moe_canonical_route_matches_explicit_alternate(placement, 0, canonical);
+    normalized.authoritative_planned_alternate_ = canonical.planned_alternate_admitted;
 
     const int32_t ids[] = { 6 };
     const moe_resolved_batch_result result =

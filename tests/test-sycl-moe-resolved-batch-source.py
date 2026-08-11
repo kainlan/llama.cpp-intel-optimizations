@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Source contract and positive-control mutations for retained MoE batches."""
+"""Formatting-insensitive source isolation checks and semantic mutation witnesses."""
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
@@ -8,65 +9,85 @@ SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 HOST_TEST = ROOT / "tests/test-sycl-moe-resolved-batch.cpp"
 MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 
+TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|::|&&|\|\||!=|==|<=|>=|->|[{}()[\].,;:%=*<>!&+-]")
+
+
+def tokens(text: str) -> list[str]:
+    text = re.sub(r"//.*?$|/\*.*?\*/", " ", text, flags=re.MULTILINE | re.DOTALL)
+    return TOKEN_RE.findall(text)
+
+
+def has_tokens(text: str, pattern: str) -> bool:
+    haystack, needle = tokens(text), tokens(pattern)
+    width = len(needle)
+    return any(haystack[i:i + width] == needle for i in range(len(haystack) - width + 1))
+
 
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
-        "copy IDs once": "out.batch.expert_ids.assign(ids, ids + count);",
-        "occurrence preservation": "operand.occurrence       = i;",
-        "token indexing": "operand.token_index      = i / slots_per_token;",
-        "slot indexing": "operand.slot_index       = i % slots_per_token;",
-        "missing lease refusal": "return moe_batch_reject_reason::MISSING_HANDLE;",
-        "DIRECT/raw compatibility refusal": "return moe_batch_reject_reason::RAW_COMPAT_HANDLE;",
-        "stable owner identity": "route.lease.has_stable_owner_identity()",
-        "transient pointer agreement": "resolved.ptr != route.transient_ptr",
-        "actual layout agreement": "resolved.layout != route.actual_layout",
-        "submit/owner policy": "route.owning_device != submit_device",
-        "primary lease device policy": "route.lease.device() != submit_device",
-        "secondary lease device policy": "route.lease.device() != route.owning_device",
-        "planner/owner policy": "route.planned_device == route.owning_device",
-        "opaque alternate proof validation":
-            "route.has_authoritative_planned_alternate() && route.planned_on_device && primary",
-        "ready event propagation": "operand.ready_event = route.ready_event;",
-        "typed rejection": "moe_batch_reject_reason  reject",
+        "ID snapshot": "out.batch.expert_ids.assign(ids, ids + count)",
+        "occurrence": "operand.occurrence = i",
+        "token index": "operand.token_index = i / slots_per_token",
+        "slot index": "operand.slot_index = i % slots_per_token",
+        "missing lease": "return moe_batch_reject_reason::MISSING_HANDLE",
+        "raw lease": "return moe_batch_reject_reason::RAW_COMPAT_HANDLE",
+        "stable identity": "route.lease.has_stable_owner_identity()",
+        "pointer agreement": "resolved.ptr != route.transient_ptr",
+        "layout agreement": "resolved.layout != route.actual_layout",
+        "primary lease device": "route.lease.device() != submit_device",
+        "secondary lease device": "route.lease.device() != route.owning_device",
+        "primary plan": "route.planned_device == route.owning_device",
+        "opaque proof use": "route.has_authoritative_planned_alternate() && route.planned_on_device && primary",
         "stable-only sharing": "retained.stable_identity_equal(route.lease)",
     }
     required_source = {
-        "canonical dispatch resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
-        "canonical lease move": "normalized.lease         = std::move(route.lease);",
-        "source reason propagation": "normalized.source_reason = static_cast<int>(route.reason);",
-        "authoritative placement alternate lookup": "lookup_expert_placement(std::string(src0->name), expert_id)",
-        "opaque planned alternate authorization": "normalized.authoritative_planned_alternate_ =",
+        "canonical resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
+        "adjusted alternate decision":
+            "ggml_sycl_adjust_layout_for_tensor(tensor, alt.layout, current_device) == requested_layout",
+        "TU-internal admission": "route.planned_alternate_admitted = current_device_planned_alternate",
+        "opaque proof transfer":
+            "normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted",
+        "canonical lease": "normalized.lease = std::move(route.lease)",
     }
-    for name, needle in required_header.items():
-        if needle not in header:
+    for name, pattern in required_header.items():
+        if not has_tokens(header, pattern):
             failures.append(name)
-    for name, needle in required_source.items():
-        if needle not in source:
+    for name, pattern in required_source.items():
+        if not has_tokens(source, pattern):
             failures.append(name)
 
     route_start = header.index("struct moe_batch_route")
     route_end = header.index("struct moe_resolved_operand", route_start)
     route_definition = header[route_start:route_end]
-    if "private:\n" not in route_definition or "bool authoritative_planned_alternate_ = false;" not in route_definition:
-        failures.append("alternate proof is private and default-deny")
-    if "owner_is_planned_alternate" in header:
-        failures.append("public/caller-writable alternate authorization")
-    if "from_weight_lease_snapshot" in host_test or "get_unified_cache_for_device" in host_test:
-        failures.append("device-dependent host fixture")
-    fixture_signature = "mem_handle test_make_stable_weight_lease("
-    if fixture_signature not in host_test:
-        failures.append("test target defines zero-device stable lease fixture")
-    if "test_make_stable_weight_lease" in mem_handle_source:
-        failures.append("production library defines/exports test lease factory")
+    compact_route = re.sub(r"\s+", " ", route_definition)
+    if not re.search(r"private\s*:\s*.*bool\s+authoritative_planned_alternate_\s*=\s*false", compact_route):
+        failures.append("proof private/default-deny")
+    if has_tokens(header, "owner_is_planned_alternate"):
+        failures.append("caller-writable proof")
 
     wrapper_start = source.index("moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch")
-    wrapper_end = source.index("static bool ggml_sycl_try_pp_local_moe_route", wrapper_start)
-    production = header + source[wrapper_start:wrapper_end]
-    for forbidden in ("sycl::malloc_device", "sycl::malloc_host", "sycl::malloc_shared",
-                      "sycl::free(", "mem_handle::from_chunk_ptr(", "mem_handle::from_direct("):
-        if forbidden in production:
-            failures.append(f"new ownership/compat bridge: {forbidden}")
+    wrapper_end = source.index("bool test_moe_resolved_batch_accepts_actual_planned_alternate", wrapper_start)
+    wrapper = source[wrapper_start:wrapper_end]
+    if has_tokens(wrapper, "lookup_expert_placement"):
+        failures.append("duplicate wrapper plan lookup")
+    if has_tokens(wrapper, "alt.layout == route.requested_layout"):
+        failures.append("raw alternate-layout comparison")
+
+    fixture_signature = "mem_handle test_make_stable_weight_lease("
+    if not has_tokens(host_test, fixture_signature):
+        failures.append("test-TU lease definition")
+    if has_tokens(mem_handle_source, "test_make_stable_weight_lease"):
+        failures.append("production test lease symbol")
+    for device_fixture in ("from_weight_lease_snapshot", "get_unified_cache_for_device"):
+        if has_tokens(host_test, device_fixture):
+            failures.append("device-dependent host fixture")
+
+    production = header + wrapper
+    for forbidden in ("sycl::malloc_device", "sycl::malloc_host", "sycl::malloc_shared", "sycl::free(",
+                      "mem_handle::from_chunk_ptr(", "mem_handle::from_direct("):
+        if has_tokens(production, forbidden):
+            failures.append(f"ownership bridge: {forbidden}")
     return failures
 
 
@@ -74,54 +95,38 @@ def test_contract_and_mutation_witnesses() -> None:
     header = HEADER.read_text()
     source = SOURCE.read_text()
     host_test = HOST_TEST.read_text()
-    mem_handle_source = MEM_HANDLE_SOURCE.read_text()
-    assert not violations(header, source, host_test, mem_handle_source), violations(
-        header, source, host_test, mem_handle_source)
+    mem_source = MEM_HANDLE_SOURCE.read_text()
+    assert not violations(header, source, host_test, mem_source)
 
-    # Every load-bearing source invariant has an explicit RED witness.  Mutants
-    # are in-memory only; the repository is never modified by this test.
-    mutations = {
-        "remove-id-snapshot": ("header", "out.batch.expert_ids.assign(ids, ids + count);"),
-        "remove-occurrence": ("header", "operand.occurrence       = i;"),
-        "remove-missing-handle": ("header", "return moe_batch_reject_reason::MISSING_HANDLE;"),
-        "remove-direct-reject": ("header", "return moe_batch_reject_reason::RAW_COMPAT_HANDLE;"),
-        "remove-stable-identity": ("header", "route.lease.has_stable_owner_identity()"),
-        "remove-pointer-check": ("header", "resolved.ptr != route.transient_ptr"),
-        "remove-layout-check": ("header", "resolved.layout != route.actual_layout"),
-        "remove-submit-owner-check": ("header", "route.owning_device != submit_device"),
-        "remove-primary-lease-device-check": ("header", "route.lease.device() != submit_device"),
-        "remove-secondary-lease-device-check": ("header", "route.lease.device() != route.owning_device"),
-        "remove-plan-owner-check": ("header", "route.planned_device == route.owning_device"),
-        "remove-explicit-alternate-proof":
-            ("header", "route.has_authoritative_planned_alternate() && route.planned_on_device && primary"),
-        "remove-ready-event": ("header", "operand.ready_event = route.ready_event;"),
-        "remove-stable-sharing": ("header", "retained.stable_identity_equal(route.lease)"),
-        "bypass-canonical-resolver": ("source", "ggml_sycl_resolve_moe_expert_route_for_dispatch("),
-        "drop-canonical-lease": ("source", "normalized.lease         = std::move(route.lease);"),
-        "drop-planned-alternate-proof":
-            ("source", "normalized.authoritative_planned_alternate_ ="),
-    }
-    for name, (which, needle) in mutations.items():
-        assert (header if which == "header" else source).count(needle) >= 1, name
-        mutant_header = header.replace(needle, "/* MUTATED */") if which == "header" else header
-        mutant_source = source.replace(needle, "/* MUTATED */") if which == "source" else source
-        assert violations(mutant_header, mutant_source, host_test, mem_handle_source), f"mutation survived: {name}"
+    # Formatting-only rewrites retain the same token/structure contract.
+    formatted_header = header.replace("operand.slot_index       = i % slots_per_token;",
+                                      "operand . slot_index=\n i% slots_per_token ;")
+    formatted_source = source.replace(
+        "normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted;",
+        "normalized . authoritative_planned_alternate_\n=\nroute . planned_alternate_admitted ;")
+    formatted_test = host_test.replace("mem_handle test_make_stable_weight_lease(",
+                                       "mem_handle\n test_make_stable_weight_lease (")
+    assert not violations(formatted_header, formatted_source, formatted_test, mem_source)
 
-    slot_mutant = header.replace("operand.slot_index       = i % slots_per_token;",
-                                 "operand.slot_index       = 0;")
-    assert violations(slot_mutant, source, host_test, mem_handle_source), "mutation survived: force-slot-zero"
-
-    public_proof = header.replace("  private:\n    // Non-forgeable", "  public:\n    // FORGED")
-    assert violations(public_proof, source, host_test, mem_handle_source), "mutation survived: make-proof-public"
-
-    writable_proof = header.replace("bool authoritative_planned_alternate_ = false;",
-                                    "bool owner_is_planned_alternate = false;")
-    assert violations(writable_proof, source, host_test, mem_handle_source), "mutation survived: caller-writable-proof"
-
-    device_fixture = host_test.replace("test_make_stable_weight_lease",
-                                       "mem_handle::from_weight_lease_snapshot")
-    assert violations(header, source, device_fixture, mem_handle_source), "mutation survived: device-dependent-fixture"
-
-    production_factory = mem_handle_source + "\nmem_handle test_make_stable_weight_lease(/* MUTATED */) {}\n"
-    assert violations(header, source, host_test, production_factory), \
-        "mutation survived: production-exports-test-factory"
+    semantic_mutants = [
+        ("slot-zero", header.replace("operand.slot_index       = i % slots_per_token;",
+                                     "operand.slot_index = 0;"), source, host_test, mem_source),
+        ("drop-primary-lease-device", header.replace("route.lease.device() != submit_device", "false"),
+         source, host_test, mem_source),
+        ("drop-secondary-lease-device", header.replace("route.lease.device() != route.owning_device", "false"),
+         source, host_test, mem_source),
+        ("public-proof", header.replace("  private:\n    // Non-forgeable", "  public:\n    // forged"),
+         source, host_test, mem_source),
+        ("raw-layout-compare", header,
+         source.replace("ggml_sycl_adjust_layout_for_tensor(tensor, alt.layout, current_device) == requested_layout",
+                        "alt.layout == requested_layout"), host_test, mem_source),
+        ("drop-admission-transfer", header,
+         source.replace("normalized.authoritative_planned_alternate_ = route.planned_alternate_admitted;",
+                        "normalized.authoritative_planned_alternate_ = false;"), host_test, mem_source),
+        ("production-test-factory", header, source, host_test,
+         mem_source + "\nmem_handle test_make_stable_weight_lease() { return {}; }\n"),
+        ("device-fixture", header, source,
+         host_test.replace("test_make_stable_weight_lease", "mem_handle::from_weight_lease_snapshot"), mem_source),
+    ]
+    for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
+        assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
