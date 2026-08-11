@@ -289,24 +289,36 @@ int main() {
     fixture                  pubf(publish_fault);
     auto                     publish_tx    = begin_tx(pubf);
     auto                     publish_owner = std::make_shared<int>(11);
-    std::weak_ptr<int>       publish_weak  = publish_owner;
-    require(publish_tx.add_batch(binding(202, publish_owner)) == retention_error::OK &&
-                publish_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
-                publish_tx.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
-            "publish fault setup failed");
+    std::atomic<bool>        publish_ready{ false };
+    std::weak_ptr<int>       publish_weak = publish_owner;
+    require(
+        publish_tx.add_batch(binding(202, publish_owner)) == retention_error::OK &&
+            publish_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+            publish_tx.set_terminal(0, std::make_shared<test_terminal>(publish_ready, waits)) == retention_error::OK,
+        "publish fault setup failed");
     publish_owner.reset();
     publish_tx.mark_finalized();
-    require(publish_tx.commit() == retention_error::BUSY && publish_weak.expired() &&
+    require(publish_tx.commit() == retention_error::PENDING && !publish_weak.expired() &&
                 publish_fault.active(pubf.context).epoch.value == 0,
-            "publish failure leaked active visibility or retained owner after exact retirement");
+            "delayed publish failure did not retain pending owner without visibility");
     published_graph_token unpublished_token;
-    require(publish_fault.acquire_published_token(publish_tx.key(), &unpublished_token) == retention_error::STALE,
-            "publish failure minted an invocation token");
+    InvocationId          unpublished_invocation{};
+    require(publish_fault.acquire_published_token(publish_tx.key(), &unpublished_token) == retention_error::STALE &&
+                publish_fault.begin_invocation(unpublished_token, &unpublished_invocation) == retention_error::STALE,
+            "publish failure admitted token invocation");
     epoch_snapshot publish_epoch{};
     require(pubf.execution.extract_epoch(pubf.context, pubf.session, pubf.reset, publish_tx.key().epoch, token(),
                                          &publish_epoch) == error::OK &&
+                publish_epoch.state == epoch_phase::RETIRING &&
+                pubf.execution.begin_invocation(pubf.context, pubf.session, pubf.reset, publish_tx.key().epoch, token(),
+                                                &unpublished_invocation) == error::BUSY,
+            "pending publish failure left raw lifecycle invocation ACTIVE");
+    publish_ready.store(true, std::memory_order_release);
+    require(publish_tx.commit() == retention_error::OK && publish_weak.expired() &&
+                pubf.execution.extract_epoch(pubf.context, pubf.session, pubf.reset, publish_tx.key().epoch, token(),
+                                             &publish_epoch) == error::OK &&
                 publish_epoch.state == epoch_phase::RETIRED,
-            "publish failure left lifecycle ACTIVE without retention visibility");
+            "released publish failure did not complete exact retirement");
 
     // Lifecycle activation failure leaves the prepared owner quarantined and
     // intact; exact rollback remains possible without external visibility.

@@ -250,6 +250,7 @@ class graph_recording_transaction {
     graph_retention_record     record_{};
     bool                       resources_published_ = false;
     bool                       activated_           = false;
+    bool                       retirement_pending_  = false;
     bool                       finalized_           = false;
     bool                       finished_            = true;
 };

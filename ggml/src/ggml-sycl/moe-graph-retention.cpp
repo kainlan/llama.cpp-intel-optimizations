@@ -321,20 +321,6 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
     if (valid != retention_error::OK) {
         return done(valid);
     }
-    for (const auto & terminal : record->terminals) {
-        if (!terminal.second->ready()) {
-            return done(retention_error::PENDING);
-        }
-    }
-    for (const auto & submission : record->submissions) {
-        if (submission.second == submit_outcome::UNKNOWN) {
-            const auto & proof = record->quiescence_proofs.at(submission.first);
-            if (!proof->ready() || !proof->wait_and_confirm()) {
-                return done(retention_error::PENDING);
-            }
-        }
-    }
-
     execution::epoch_snapshot epoch{};
     auto lifecycle_rc = record->lifecycle_registry->extract_epoch(key.context, record->session, record->reset_epoch,
                                                                   key.epoch, record->root, &epoch);
@@ -382,6 +368,23 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
         record->retire_ticket = ticket;
         record->phase         = retention_phase::RETIRING;
     }
+
+    // The lifecycle epoch is now authoritatively RETIRING. Readiness and
+    // quiescence may delay completion, but can never leave it invokable ACTIVE.
+    for (const auto & terminal : record->terminals) {
+        if (!terminal.second->ready()) {
+            return done(retention_error::PENDING);
+        }
+    }
+    for (const auto & submission : record->submissions) {
+        if (submission.second == submit_outcome::UNKNOWN) {
+            const auto & proof = record->quiescence_proofs.at(submission.first);
+            if (!proof->ready() || !proof->wait_and_confirm()) {
+                return done(retention_error::PENDING);
+            }
+        }
+    }
+
     for (const auto & terminal : record->terminals) {
         bool attached = false;
         {
@@ -569,6 +572,7 @@ void graph_recording_transaction::move_from(graph_recording_transaction && other
     record_              = std::move(other.record_);
     resources_published_ = other.resources_published_;
     activated_           = other.activated_;
+    retirement_pending_  = other.retirement_pending_;
     finalized_           = other.finalized_;
     finished_            = other.finished_;
     other.finished_      = true;
@@ -701,6 +705,14 @@ retention_error graph_recording_transaction::commit() noexcept {
     if (!finalized_) {
         return retention_error::NOT_FINALIZED;
     }
+    if (retirement_pending_) {
+        const auto retire_rc = retention_->retire_exact(record_.key);
+        if (retire_rc == retention_error::OK) {
+            finished_ = true;
+            release_local_owners();
+        }
+        return retire_rc;
+    }
     if (record_.quarantined()) {
         return rollback();
     }
@@ -714,6 +726,7 @@ retention_error graph_recording_transaction::commit() noexcept {
         if (lifecycle_->activate(record_.key.context, record_.session, record_.reset_epoch, record_.key.epoch,
                                  record_.root) != execution::error::OK) {
             retention_->quarantine(record_);
+            retirement_pending_  = true;
             const auto retire_rc = retention_->retire_exact(record_.key);
             if (retire_rc == retention_error::OK) {
                 finished_ = true;
@@ -726,6 +739,7 @@ retention_error graph_recording_transaction::commit() noexcept {
     const auto publish_rc = retention_->publish_active(record_.key);
     if (publish_rc != retention_error::OK) {
         retention_->quarantine(record_);
+        retirement_pending_  = true;
         const auto retire_rc = retention_->retire_exact(record_.key);
         if (retire_rc == retention_error::OK) {
             finished_ = true;
