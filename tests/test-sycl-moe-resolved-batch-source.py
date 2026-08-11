@@ -95,6 +95,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "grouped prompt occurrence lookup": "prompt_batch.occurrence(iid1, id)",
         "XMX retained executor API": "const ggml_sycl::moe_resolved_batch & batch",
         "MMVQ retained pointer submit": "retained_ptrs, retained_table_event_set",
+        "exact prompt occurrence fallback": "retained_prompt_batch_result.batch.occurrence(token_index, slot_index)",
+        "repeated identity conflict refusal":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID repeated prompt expert has conflicting retained occurrences\")",
+        "selected prompt miss failure":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID selected prompt expert unresolved before submit\")",
+        "prompt cache overwrite gate": "if (ne12 == 1 && blk_layer_id >= 0 && !is_gate_subop)",
+        "named pair capability gate": "prompt_pair_retained_roles_capable && fusion_down_continuation",
+        "primary ready dependency": "stream->ext_oneapi_submit_barrier({ route.ready_event })",
+        "secondary ready propagation": "entry.has_ready_event = has_ready_event",
+        "host ready wait": "if (has_ready_event) { ready_event.wait()",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -171,8 +181,19 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             failures.append(f"prompt specialized path reacquires route: {resolver}")
     if prompt_specialized.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 0:
         failures.append("prompt path resnapshots IDs after admission")
-    if not has_tokens(mmid, "moe_expert_route route = retained_prompt_route_for_expert"):
-        failures.append("prompt fallback does not derive routes from batch")
+    if not has_tokens(mmid, "moe_expert_route route = retained_prompt_route_for_occurrence"):
+        failures.append("prompt fallback does not derive exact occurrences from batch")
+    if mmid.count("retained_prompt_route_for_occurrence(") != 3:
+        failures.append("prompt occurrence consumers collapsed routing identity")
+    if has_tokens(mmid, "false && fusion_down_continuation"):
+        failures.append("prompt pair path uses anonymous dead expression")
+    cache_gate = mmid.find("if (ne12 == 1 && blk_layer_id >= 0 && !is_gate_subop)")
+    if cache_gate < 0:
+        failures.append("prompt IDs can be overwritten from layer cache")
+    else:
+        cache_end = mmid.index("if (ne12 == 1 && !ids_from_cache)", cache_gate)
+        if not has_tokens(mmid[cache_gate:cache_end], "ids_host = cache_it->second.ids_host"):
+            failures.append("decode cache reuse is not isolated behind prompt guard")
 
     decode_route = mmid[admission:dispatch_gate]
     for forbidden in ("from_chunk_ptr", "from_direct", "is_device_expert_ptr", "src0->data", "route.ptr"):
@@ -271,6 +292,25 @@ def test_contract_and_mutation_witnesses() -> None:
                         "if (moe_hybrid_with_plan) { return; }\n"
                         "    ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;"),
          host_test, mem_source),
+        ("selected-miss-continue", header,
+         source.replace('throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert unresolved before submit")',
+                        "continue"), host_test, mem_source),
+        ("prompt-cache-overwrite", header,
+         source.replace("if (ne12 == 1 && blk_layer_id >= 0 && !is_gate_subop)",
+                        "if (blk_layer_id >= 0 && !is_gate_subop)"), host_test, mem_source),
+        ("collapse-prompt-occurrence", header,
+         source.replace("retained_prompt_route_for_occurrence(static_cast<size_t>(iid1)",
+                        "retained_prompt_group_route_for_expert(static_cast<size_t>(iid1)", 1),
+         host_test, mem_source),
+        ("drop-primary-ready", header,
+         source.replace("stream->ext_oneapi_submit_barrier({ route.ready_event });", "(void) route.ready_event;"),
+         host_test, mem_source),
+        ("drop-secondary-ready", header,
+         source.replace("entry.has_ready_event = has_ready_event;", "entry.has_ready_event = false;"),
+         host_test, mem_source),
+        ("drop-host-ready-wait", header,
+         source.replace("if (has_ready_event) {\n                ready_event.wait();",
+                        "if (false) {\n                ready_event.wait();"), host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
