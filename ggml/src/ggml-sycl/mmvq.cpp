@@ -16122,6 +16122,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
     // Only handle quantized types with _id kernels
     switch (src0->type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             if (layout != GGML_LAYOUT_AOS) {
@@ -16468,6 +16470,20 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     sycl::event kernel_event;
     bool        have_kernel_event = false;
     switch (src0->type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_NVFP4:
+            if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
+                ne00 > INT_MAX || ne01 > INT_MAX ||
+                !mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer,
+                                              dispatch_ids, dst_d, static_cast<int>(ne00),
+                                              static_cast<int>(ne01), static_cast<int>(total_batches),
+                                              static_cast<int>(n_ids), static_cast<int>(num_tokens),
+                                              static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12,
+                                              nb1, nb2, &kernel_deps, &kernel_event)) {
+                return false;
+            }
+            have_kernel_event = true;
+            break;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q4_0_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
                                           dispatch_ptrs,     // expert pointer table or compact row list
