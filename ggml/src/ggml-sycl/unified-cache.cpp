@@ -20356,6 +20356,74 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
     return zone_inventory;
 }
 
+static void plan_moe_mmid_workspaces(placement_plan &                           plan,
+                                     const std::vector<placement_tensor_info> & tensor_inventory,
+                                     int                                        n_expert_used) {
+    plan.moe_mmid_workspaces.clear();
+    plan.moe_mmid_device_pool_bytes = 0;
+    plan.moe_mmid_host_pool_bytes   = 0;
+    plan.moe_mmid_workspace_valid   = true;
+    if (n_expert_used <= 0) {
+        return;
+    }
+
+    std::map<int, moe_mmid_workspace_geometry> maxima;
+    for (const placement_tensor_info & item : tensor_inventory) {
+        if (!item.has_shape() || expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN ||
+            item.ne[0] <= 0 || item.ne[1] <= 0) {
+            continue;
+        }
+        std::unordered_set<int> owners;
+        for (const placement_entry & entry : plan.entries) {
+            if (entry.name == item.name && entry.expert_id >= 0 && entry.on_device && entry.target_device >= 0) {
+                owners.insert(entry.target_device);
+            }
+        }
+        for (int owner : owners) {
+            moe_mmid_shape shape;
+            shape.ne10  = static_cast<size_t>(item.ne[0]);
+            shape.ne01  = static_cast<size_t>(item.ne[1]);
+            shape.ne11  = static_cast<size_t>(n_expert_used);
+            shape.top_k = static_cast<size_t>(n_expert_used);
+            const uint32_t ubatch = item.planner_n_ubatch != 0 ? item.planner_n_ubatch : plan.planner_n_ubatch;
+            const uint32_t seqmax = item.planner_n_seq_max != 0 ? item.planner_n_seq_max : plan.planner_n_seq_max;
+            if (ubatch == 0 || seqmax == 0 || static_cast<size_t>(seqmax) > SIZE_MAX / static_cast<size_t>(ubatch)) {
+                plan.moe_mmid_workspace_valid = false;
+                continue;
+            }
+            shape.c = static_cast<size_t>(ubatch) * static_cast<size_t>(seqmax);
+            moe_mmid_workspace_geometry candidate;
+            const bool secondary = plan.device_id < 0 || owner != plan.device_id;
+            if (!moe_mmid_plan_workspace(shape, secondary, &candidate) ||
+                !moe_mmid_component_max(&maxima[owner], candidate)) {
+                plan.moe_mmid_workspace_valid = false;
+            }
+        }
+    }
+
+    for (const auto & owner : maxima) {
+        moe_mmid_owner_workspace_plan workspace;
+        workspace.owner_device = owner.first;
+        workspace.slot         = owner.second;
+        workspace.valid = moe_mmid_checked_pool_bytes(workspace.slot, workspace.depth,
+                                                       &workspace.device_pool_bytes, &workspace.host_pool_bytes);
+        if (!workspace.valid || workspace.device_pool_bytes > SIZE_MAX - plan.moe_mmid_device_pool_bytes ||
+            workspace.host_pool_bytes > SIZE_MAX - plan.moe_mmid_host_pool_bytes) {
+            plan.moe_mmid_workspace_valid = false;
+            continue;
+        }
+        plan.moe_mmid_device_pool_bytes += workspace.device_pool_bytes;
+        plan.moe_mmid_host_pool_bytes += workspace.host_pool_bytes;
+        plan.moe_mmid_workspaces.push_back(workspace);
+    }
+    if (!plan.moe_mmid_workspace_valid) {
+        // Fixed depth is a hard admission contract: never clamp or publish a partial pool.
+        plan.moe_mmid_workspaces.clear();
+        plan.moe_mmid_device_pool_bytes = 0;
+        plan.moe_mmid_host_pool_bytes   = 0;
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -20367,6 +20435,7 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     plan.max_tensor_bytes       = 0;
     plan.max_staging_pair_bytes = 0;
+    plan_moe_mmid_workspaces(plan, tensor_inventory, n_expert_used);
     for (const auto & item : tensor_inventory) {
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
@@ -20781,6 +20850,15 @@ static void populate_host_zone_sizing(placement_plan &                          
     // picks the pool when the exact layout was computed and the coarse table
     // figure when it was not -- never the sum, which would double-count.
     plan.moe_vram_runtime_bytes = std::max(plan.moe_expert_ptrs_bytes, plan.moe_control_pool_bytes);
+    if (plan.moe_mmid_workspace_valid &&
+        plan.moe_mmid_device_pool_bytes <= SIZE_MAX - plan.moe_vram_runtime_bytes) {
+        plan.moe_vram_runtime_bytes += plan.moe_mmid_device_pool_bytes;
+    } else if (plan.moe_mmid_device_pool_bytes != 0) {
+        plan.moe_mmid_workspace_valid = false;
+        plan.moe_mmid_workspaces.clear();
+        plan.moe_mmid_device_pool_bytes = 0;
+        plan.moe_mmid_host_pool_bytes = 0;
+    }
 
     // 7. DMA staging pool: device-resident double-buffer for host→device weight streaming.
     //    Two slices, each sized to the largest tensor the weight stream can actually carry.
@@ -20893,7 +20971,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     const size_t s1_preload_staging_bytes = s1_per_inflight_bytes * s1_in_flight;
     plan.host_zone_staging_bytes =
         std::max<size_t>(k_min_zone_bytes, s1_preload_staging_bytes + k_tp_staging_headroom + plan.expert_bias_bytes +
-                                               plan.moe_routing_ids_bytes + plan.tp_staging_buffer_bytes);
+                                               plan.moe_routing_ids_bytes + plan.tp_staging_buffer_bytes +
+                                               plan.moe_mmid_host_pool_bytes);
     GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
                   s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
     // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
@@ -20967,6 +21046,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.kv_per_swa_layer                    = kv_info.kv_bytes_per_swa_layer();
     plan.swa_layer_mask                      = kv_info.swa_layer_mask;
     plan.planner_n_ctx                       = kv_info.n_ctx;
+    plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_seq_max                   = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
     plan.pp_pipeline_scratch_bytes           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id);
     plan.pp_moe_onednn_weight_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
@@ -22258,6 +22339,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.kv_per_swa_layer         = kv_info.kv_bytes_per_swa_layer();
     plan.swa_layer_mask           = kv_info.swa_layer_mask;
     plan.planner_n_ctx            = kv_info.n_ctx;
+    plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_seq_max        = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =

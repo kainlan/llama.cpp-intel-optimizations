@@ -12,6 +12,7 @@
 #include "ggml-sycl.h"
 #include "mem-handle.hpp"
 #include "moe-control-plan.hpp"
+#include "moe-mmid-workspace.hpp"
 #include "moe-scratch-admission.hpp"
 #include "pinned-pool.hpp"
 #include "residency-plan.hpp"
@@ -416,6 +417,9 @@ struct placement_tensor_info {
     size_t      size              = 0;
     ggml_type   type              = GGML_TYPE_COUNT;
     int64_t     ne[GGML_MAX_DIMS] = {};
+    // Declared capacities copied into the immutable inventory; never live values.
+    uint32_t    planner_n_ubatch  = 0;
+    uint32_t    planner_n_seq_max = 0;
 
     placement_tensor_info() = default;
 
@@ -506,6 +510,15 @@ struct placement_kv_info {
     }
 };
 
+struct moe_mmid_owner_workspace_plan {
+    int                         owner_device = -1;
+    uint32_t                    depth        = MOE_MMID_WORKSPACE_DEPTH;
+    bool                        valid        = false;
+    moe_mmid_workspace_geometry slot;
+    size_t                      device_pool_bytes = 0;
+    size_t                      host_pool_bytes   = 0;
+};
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -523,7 +536,15 @@ struct placement_plan {
     size_t                       kv_per_swa_layer = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     uint32_t                     planner_n_ctx            = 0;
+    uint32_t                     planner_n_ubatch         = 0;
+    uint32_t                     planner_n_seq_max        = 0;
     bool                         planner_n_ctx_is_runtime = false;
+    // Component-wise maxima by actual device owner. Materialization consumes
+    // these values later; allocation handles never belong in this plan.
+    std::vector<moe_mmid_owner_workspace_plan> moe_mmid_workspaces;
+    size_t                       moe_mmid_device_pool_bytes = 0;
+    size_t                       moe_mmid_host_pool_bytes   = 0;
+    bool                         moe_mmid_workspace_valid   = true;
     // True when XMX_TILED gate/up primaries were rewritten to PP-safe SOA
     // because the prompt path cannot consume tiled. Decode should then
     // rematerialize XMX_TILED through the phase-layout machinery.
