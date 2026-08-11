@@ -21951,7 +21951,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  const std::vector<sycl::event> * deps,
                                  sycl::event *                    event_out) {
     if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !y_q8_1 || !dst || ncols <= 0 ||
-        nrows_per_expert <= 0 || n_ids <= 0 || n_tokens <= 0 || total_batches != n_ids * n_tokens || ne11 <= 0 ||
+        nrows_per_expert <= 0 || !mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens) || ne11 <= 0 ||
         q8_nb11 <= 0 || q8_nb12 <= 0 || dst_nb1 <= 0 || dst_nb2 <= 0 ||
         (ids_device && (ids_nb0 <= 0 || ids_nb1 <= 0))) {
         return false;

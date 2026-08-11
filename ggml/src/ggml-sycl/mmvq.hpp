@@ -13,7 +13,21 @@
 #ifndef GGML_SYCL_MMVQ_HPP
 #define GGML_SYCL_MMVQ_HPP
 
-#include "common.hpp"
+#if defined(GGML_SYCL_MMVQ_VALIDATION_STANDALONE)
+#    include <cstdint>
+#else
+#    include "common.hpp"
+#endif
+
+inline bool mmvq_q1_nvfp4_aos_id_batch_shape_valid(int total_batches, int n_ids, int n_tokens) {
+    if (total_batches <= 0 || n_ids <= 0 || n_tokens <= 0) {
+        return false;
+    }
+    const int64_t expected_batches = static_cast<int64_t>(n_ids) * static_cast<int64_t>(n_tokens);
+    return static_cast<int64_t>(total_batches) == expected_batches;
+}
+
+#if !defined(GGML_SYCL_MMVQ_VALIDATION_STANDALONE)
 
 void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
                                 const ggml_tensor *         src0,
@@ -456,7 +470,9 @@ sycl::event mmvq_submit_mxfp4_soa(sycl::queue &                    q,
 // Direct AoS primitives for Q1_0/NVFP4. These are intentionally not wired into
 // the backend capability/router policy: callers own all pointers and lifetime,
 // and must pass GGML_LAYOUT_AOS. Returns false without submitting for an
-// unsupported type/layout/shape.
+// unsupported type/layout/shape. All input/output buffers must remain alive and
+// accessible to q through completion of the event written to event_out. If
+// event_out is null, the caller must wait/synchronize q before releasing them.
 bool mmvq_submit_q1_nvfp4_aos(sycl::queue &                    q,
                               ggml_type                        weight_type,
                               ggml_layout_mode                 weight_layout,
@@ -471,8 +487,12 @@ bool mmvq_submit_q1_nvfp4_aos(sycl::queue &                    q,
                               sycl::event *                    event_out = nullptr);
 
 // MMVQ-ID counterpart. expert_ptrs_device is indexed by ids_device values, or
-// by linear batch when ids_device is null. ids uses byte strides [id][token].
-// Q8 rows use [id % ne11][token], and output uses [id][token] byte strides.
+// by linear batch when ids_device is null. Every ID must be a valid pointer-table
+// index and every selected table target must be non-null. ids uses byte strides
+// [id][token]. Q8 rows use [id % ne11][token], and output uses [id][token] byte
+// strides. The table, its targets, IDs, Q8 input, and output must remain alive
+// and accessible to q through completion. If event_out is null, the caller must
+// wait/synchronize q before releasing them.
 bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  ggml_type                        weight_type,
                                  ggml_layout_mode                 weight_layout,
@@ -585,6 +605,8 @@ inline void test_moe_down_sum_direct_final_reduce_reference(const float * weight
     }
 }
 }  // namespace ggml_sycl
-#endif
+#    endif
+
+#endif  // !GGML_SYCL_MMVQ_VALIDATION_STANDALONE
 
 #endif  // GGML_SYCL_MMVQ_HPP

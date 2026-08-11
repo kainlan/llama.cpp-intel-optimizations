@@ -1,8 +1,12 @@
 // Standalone CPU/source oracle for the unadvertised Q1_0/NVFP4 AoS MMVQ slice.
 // Build: c++ -std=c++17 -O2 test-q1-nvfp4-direct-mmvq.cpp -o /tmp/test-q1-nvfp4-direct-mmvq
 // Run from the repository root: /tmp/test-q1-nvfp4-direct-mmvq
+#define GGML_SYCL_MMVQ_VALIDATION_STANDALONE
+#include "../mmvq.hpp"
+
 #include <array>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -179,17 +183,36 @@ std::string slurp(const char * path) {
     return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
 }
 
+void batch_shape_rejection_tests() {
+    int        submissions     = 0;
+    const auto submit_if_valid = [&](int total_batches, int n_ids, int n_tokens) {
+        if (mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens)) {
+            ++submissions;
+        }
+    };
+
+    assert(mmvq_q1_nvfp4_aos_id_batch_shape_valid(4, 2, 2));
+    submit_if_valid(-2, INT_MAX, 2);           // wrapped INT_MAX*2
+    submit_if_valid(0, 65536, 65536);          // wrapped 2^32
+    submit_if_valid(605032704, 70000, 70000);  // wrapped 4.9e9
+    assert(submissions == 0 && "invalid batch products must reject before queue submission");
+}
+
 void source_contract_tests() {
     const std::string cpp = slurp("ggml/src/ggml-sycl/mmvq.cpp");
     const std::string hpp = slurp("ggml/src/ggml-sycl/mmvq.hpp");
-    for (const char * needle :
-         { "bool mmvq_submit_q1_nvfp4_aos(", "bool mmvq_submit_q1_nvfp4_aos_id(",
-           "case GGML_TYPE_Q1_0:", "case GGML_TYPE_NVFP4:", "vec_dot_q1_0_q8_1>", "vec_dot_nvfp4_q8_1>",
-           "weight_layout != GGML_LAYOUT_AOS", "row_low * blocks_per_row", "total_batches != n_ids * n_tokens" }) {
+    for (const char * needle : { "bool mmvq_submit_q1_nvfp4_aos(", "bool mmvq_submit_q1_nvfp4_aos_id(",
+                                 "case GGML_TYPE_Q1_0:", "case GGML_TYPE_NVFP4:", "vec_dot_q1_0_q8_1>",
+                                 "vec_dot_nvfp4_q8_1>", "weight_layout != GGML_LAYOUT_AOS", "row_low * blocks_per_row",
+                                 "mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens)" }) {
         assert(cpp.find(needle) != std::string::npos);
     }
     assert(hpp.find("bool mmvq_submit_q1_nvfp4_aos(") != std::string::npos);
     assert(hpp.find("bool mmvq_submit_q1_nvfp4_aos_id(") != std::string::npos);
+    const size_t id_api         = cpp.find("bool mmvq_submit_q1_nvfp4_aos_id(");
+    const size_t validation     = cpp.find("mmvq_q1_nvfp4_aos_id_batch_shape_valid", id_api);
+    const size_t event_creation = cpp.find("sycl::event event;", id_api);
+    assert(id_api != std::string::npos && validation < event_creation);  // reject before any launch is selected
     // This slice must remain local: no route capability or central policy edit.
     const std::string policy = slurp("ggml/src/ggml-sycl/ggml-sycl.cpp");
     assert(policy.find("mmvq_submit_q1_nvfp4_aos") == std::string::npos);
@@ -198,6 +221,7 @@ void source_contract_tests() {
 
 int main() {
     numerical_tests();
+    batch_shape_rejection_tests();
     source_contract_tests();
     std::cout << "Q1_0/NVFP4 direct AoS MMVQ CPU/source oracle: PASS\n";
 }

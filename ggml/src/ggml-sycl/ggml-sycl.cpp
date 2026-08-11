@@ -23115,6 +23115,15 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     normalized.recipe.valid = plan_moe_host_workspace(
                         normalized.recipe.request, ggml_row_size(traits->vec_dot_type, src0->ne[0]),
                         sizeof(size_t) * 4, &normalized.recipe.workspace);
+                    if (normalized.recipe.valid) {
+                        const size_t planned = unified_cache_get_planned_moe_host_recipe_workspace_bytes(submit_device);
+                        if (planned < normalized.recipe.workspace.total_bytes) {
+                            unified_cache_set_planned_moe_host_recipe_workspace_bytes(
+                                submit_device, normalized.recipe.workspace.total_bytes);
+                        }
+                        normalized.recipe.valid = unified_cache_admit_moe_host_recipe_workspace(
+                            submit_device, normalized.recipe.workspace.total_bytes);
+                    }
                 }
             }
         } else if (normalized.residency != moe_batch_residency::UNAVAILABLE) {
