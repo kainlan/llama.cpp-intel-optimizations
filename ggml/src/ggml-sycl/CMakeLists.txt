@@ -106,6 +106,18 @@ target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
 # contains no SYCL headers, device calls, or GPU fixture dependency.
 if (BUILD_TESTING)
+    # Transactional fused-submit state machine is host-only and requires no SYCL device.
+    add_executable(test-sycl-moe-fused-transaction
+        tests/test-moe-fused-transaction.cpp
+        moe-fused-transaction.cpp)
+    target_include_directories(test-sycl-moe-fused-transaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    find_package(Threads REQUIRED)
+    target_link_libraries(test-sycl-moe-fused-transaction PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-moe-fused-transaction PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-moe-fused-transaction COMMAND test-sycl-moe-fused-transaction)
+    set_tests_properties(sycl-moe-fused-transaction PROPERTIES LABELS "sycl;moe;host;tsan-capable")
+
     if (NOT GGML_BACKEND_DL)
         add_executable(test-sycl-cpu-traits-parity
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-traits-parity.cpp

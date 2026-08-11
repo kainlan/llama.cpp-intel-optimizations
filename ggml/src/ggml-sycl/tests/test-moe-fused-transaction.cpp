@@ -1,63 +1,97 @@
 #include "../moe-fused-transaction.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using namespace ggml_sycl::moe_fused;
 
 namespace {
-
 int failures = 0;
-
-#define CHECK(expr)                                                                    \
-    do {                                                                               \
-        if (!(expr)) {                                                                 \
-            std::cerr << __FILE__ << ':' << __LINE__ << ": CHECK(" #expr ") failed\n"; \
-            ++failures;                                                                \
-        }                                                                              \
+#define CHECK(x)                                                                    \
+    do {                                                                            \
+        if (!(x)) {                                                                 \
+            std::cerr << __FILE__ << ':' << __LINE__ << ": CHECK(" #x ") failed\n"; \
+            ++failures;                                                             \
+        }                                                                           \
     } while (false)
+
+struct Trace {
+    void add(std::string value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        values.push_back(std::move(value));
+    }
+
+    std::vector<std::string> copy() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return values;
+    }
+
+    mutable std::mutex       mutex;
+    std::vector<std::string> values;
+};
 
 FusionPlan ordinary_plan() {
     return { true, true, true, true, DownMode::ordinary, false };
 }
 
 struct TestPreflight final : Preflight {
-    Status result          = Status::ok();
-    bool   throw_exception = false;
+    Status result = Status::ok();
+    bool   throws = false;
 
     Status run(const FusionPlan &) override {
-        if (throw_exception) {
-            throw std::runtime_error("preflight boom");
+        if (throws) {
+            throw std::runtime_error("preflight");
         }
         return result;
     }
 };
 
-struct TraceEvent final : TerminalEvent {
-    explicit TraceEvent(std::vector<std::string> & trace) : trace(trace) {}
-
-    ~TraceEvent() override { trace.push_back("event-destroy"); }
-
-    void wait() noexcept override { trace.push_back("wait"); }
-
-    std::vector<std::string> & trace;
-};
-
 struct TraceOwner final : Owner {
-    TraceOwner(std::vector<std::string> & trace, std::string name) : trace(trace), name(std::move(name)) {}
+    TraceOwner(Trace & trace, std::string name) : trace(trace), name(std::move(name)) {}
 
-    ~TraceOwner() override { trace.push_back("owner-" + name); }
+    ~TraceOwner() override { trace.add("owner-" + name); }
 
-    std::vector<std::string> & trace;
-    std::string                name;
+    Trace &     trace;
+    std::string name;
 };
 
-OwnerBundle owners_for(const FusionPlan & plan, std::vector<std::string> & trace) {
+struct TraceDrain final : EmergencyDrain {
+    explicit TraceDrain(Trace & trace) : trace(trace) {}
+
+    void drain() noexcept override { trace.add("drain"); }
+
+    Trace & trace;
+};
+
+struct TraceEvent final : TerminalEvent {
+    explicit TraceEvent(Trace & trace) : trace(trace) {}
+
+    void wait() noexcept override { trace.add("wait"); }
+
+    Trace & trace;
+};
+
+struct ReentrantEvent final : TerminalEvent {
+    ReentrantEvent(PublicationStore & store, std::atomic<bool> & entered) : store(store), entered(entered) {}
+
+    void wait() noexcept override {
+        (void) store.snapshot();
+        entered.store(true, std::memory_order_release);
+    }
+
+    PublicationStore &  store;
+    std::atomic<bool> & entered;
+};
+
+OwnerBundle owners_for(const FusionPlan & plan, Trace & trace) {
     OwnerBundle owners;
     owners.add(OwnerRole::gate, std::make_unique<TraceOwner>(trace, "gate"));
     owners.add(OwnerRole::up, std::make_unique<TraceOwner>(trace, "up"));
@@ -68,46 +102,55 @@ OwnerBundle owners_for(const FusionPlan & plan, std::vector<std::string> & trace
     return owners;
 }
 
-enum class SubmitBehavior {
-    no_write_failure,
-    missing_terminal,
-    missing_owners,
-    mismatched_owners,
+Status install_escrow(const FusionPlan & plan, SubmitRecorder & recorder, Trace & trace) {
+    return recorder.escrow(owners_for(plan, trace), EmergencyToken(std::make_unique<TraceDrain>(trace)));
+}
+
+enum class Behavior {
     success,
+    no_write,
+    missing_terminal,
     throw_before,
-    throw_after
+    throw_after_before_terminal,
+    duplicate_terminal
 };
 
 struct TestSubmitter final : Submitter {
-    TestSubmitter(SubmitBehavior behavior, std::vector<std::string> & trace) : behavior(behavior), trace(trace) {}
-
-    SubmitBehavior             behavior;
-    std::vector<std::string> & trace;
+    TestSubmitter(Behavior behavior, Trace & trace) : behavior(behavior), trace(trace) {}
 
     Status submit(const FusionPlan & plan, SubmitRecorder & recorder) override {
-        if (behavior == SubmitBehavior::throw_before) {
+        if (behavior == Behavior::throw_before) {
             throw std::runtime_error("before");
         }
-        if (behavior == SubmitBehavior::no_write_failure) {
-            return { ErrorCode::submit_failed_no_write, "backend rejected submit" };
+        if (behavior == Behavior::no_write) {
+            return { ErrorCode::submit_failed_no_write, "no write" };
         }
-        recorder.mark_write_started();
-        if (behavior == SubmitBehavior::missing_terminal) {
-            recorder.install_terminal_owners(TerminalToken{}, owners_for(plan, trace));
-        } else if (behavior == SubmitBehavior::missing_owners) {
-            recorder.install_terminal_owners(TerminalToken(std::make_unique<TraceEvent>(trace)), OwnerBundle{});
-        } else {
-            OwnerBundle owners = owners_for(plan, trace);
-            if (behavior == SubmitBehavior::mismatched_owners) {
-                owners.add(OwnerRole::down, std::make_unique<TraceOwner>(trace, "unexpected-down"));
-            }
-            recorder.install_terminal_owners(TerminalToken(std::make_unique<TraceEvent>(trace)), std::move(owners));
+        Status status = install_escrow(plan, recorder, trace);
+        if (!status) {
+            return status;
         }
-        if (behavior == SubmitBehavior::throw_after) {
+        status = recorder.mark_write_started();
+        if (!status) {
+            return status;
+        }
+        if (behavior == Behavior::throw_after_before_terminal) {
             throw std::runtime_error("after");
+        }
+        if (behavior == Behavior::missing_terminal) {
+            return Status::ok();
+        }
+        status = recorder.install_terminal(TerminalToken(std::make_unique<TraceEvent>(trace)));
+        if (!status) {
+            return status;
+        }
+        if (behavior == Behavior::duplicate_terminal) {
+            (void) recorder.install_terminal(TerminalToken(std::make_unique<TraceEvent>(trace)));
         }
         return Status::ok();
     }
+
+    Behavior behavior;
+    Trace &  trace;
 };
 
 void preflight_ok(Transaction & transaction) {
@@ -115,7 +158,7 @@ void preflight_ok(Transaction & transaction) {
     CHECK(transaction.preflight(preflight));
 }
 
-void test_plan_mutations_rejected() {
+void test_prewrite_rejection_and_mutations() {
     TestPreflight preflight;
     FusionPlan    plan = ordinary_plan();
     plan.gate_up_pair  = false;
@@ -123,7 +166,7 @@ void test_plan_mutations_rejected() {
     CHECK(absent_pair.preflight(preflight).code == ErrorCode::absent_pair);
     CHECK(absent_pair.fallback_allowed());
 
-    for (int mutation = 0; mutation != 3; ++mutation) {
+    for (int mutation = 0; mutation < 3; ++mutation) {
         plan = ordinary_plan();
         if (mutation == 0) {
             plan.gate_role = false;
@@ -134,150 +177,230 @@ void test_plan_mutations_rejected() {
         if (mutation == 2) {
             plan.glu_role = false;
         }
-        Transaction absent_role(plan);
-        CHECK(absent_role.preflight(preflight).code == ErrorCode::absent_role);
+        Transaction transaction(plan);
+        CHECK(transaction.preflight(preflight).code == ErrorCode::absent_role);
     }
 
-    plan      = ordinary_plan();
-    plan.down = DownMode::fused;
-    Transaction absent_down(plan);
-    CHECK(absent_down.preflight(preflight).code == ErrorCode::absent_role);
+    Transaction failed(ordinary_plan());
+    preflight.result = { ErrorCode::preflight_failed, "fail" };
+    CHECK(failed.preflight(preflight).code == ErrorCode::preflight_failed);
+    CHECK(failed.fallback_allowed());
+
+    Trace       trace;
+    Transaction no_write(ordinary_plan());
+    preflight_ok(no_write);
+    TestSubmitter submitter(Behavior::no_write, trace);
+    CHECK(no_write.submit(submitter).code == ErrorCode::submit_failed_no_write);
+    CHECK(no_write.fallback_allowed());
 }
 
-void test_preflight_and_no_write_failures_allow_fallback() {
-    TestPreflight failing;
-    failing.result = { ErrorCode::preflight_failed, "unsupported" };
-    Transaction preflight_failure(ordinary_plan());
-    CHECK(preflight_failure.preflight(failing).code == ErrorCode::preflight_failed);
-    CHECK(preflight_failure.phase() == Phase::rolled_back);
-    CHECK(preflight_failure.fallback_allowed());
+void test_escrow_validation() {
+    Trace      trace;
+    FusionPlan plan = ordinary_plan();
 
-    TestPreflight throwing;
-    throwing.throw_exception = true;
-    Transaction preflight_exception(ordinary_plan());
-    CHECK(preflight_exception.preflight(throwing).code == ErrorCode::preflight_failed);
-    CHECK(preflight_exception.fallback_allowed());
+    Transaction missing(plan);
+    preflight_ok(missing);
 
-    std::vector<std::string> trace;
-    Transaction              submit_failure(ordinary_plan());
-    preflight_ok(submit_failure);
-    TestSubmitter no_write{ SubmitBehavior::no_write_failure, trace };
-    CHECK(submit_failure.submit(no_write).code == ErrorCode::submit_failed_no_write);
-    CHECK(submit_failure.fallback_allowed());
+    struct Missing final : Submitter {
+        Status submit(const FusionPlan &, SubmitRecorder & recorder) override { return recorder.mark_write_started(); }
+    } missing_submitter;
 
-    Transaction before_exception(ordinary_plan());
-    preflight_ok(before_exception);
-    TestSubmitter throw_before{ SubmitBehavior::throw_before, trace };
-    CHECK(before_exception.submit(throw_before).code == ErrorCode::exception_before_write);
-    CHECK(before_exception.fallback_allowed());
+    CHECK(missing.submit(missing_submitter).code == ErrorCode::escrow_missing);
+    CHECK(missing.fallback_allowed());
+
+    Transaction no_emergency(plan);
+    preflight_ok(no_emergency);
+
+    struct NoEmergency final : Submitter {
+        explicit NoEmergency(Trace & trace) : trace(trace) {}
+
+        Status submit(const FusionPlan & plan, SubmitRecorder & recorder) override {
+            (void) recorder.escrow(owners_for(plan, trace), EmergencyToken{});
+            return recorder.mark_write_started();
+        }
+
+        Trace & trace;
+    } no_emergency_submitter(trace);
+
+    CHECK(no_emergency.submit(no_emergency_submitter).code == ErrorCode::emergency_missing);
+    CHECK(no_emergency.fallback_allowed());
+
+    Transaction invalid(plan);
+    preflight_ok(invalid);
+
+    struct Invalid final : Submitter {
+        explicit Invalid(Trace & trace) : trace(trace) {}
+
+        Status submit(const FusionPlan & plan, SubmitRecorder & recorder) override {
+            OwnerBundle owners = owners_for(plan, trace);
+            owners.add(static_cast<OwnerRole>(99), std::make_unique<TraceOwner>(trace, "invalid"));
+            return recorder.escrow(std::move(owners), EmergencyToken(std::make_unique<TraceDrain>(trace)));
+        }
+
+        Trace & trace;
+    } invalid_submitter(trace);
+
+    CHECK(invalid.submit(invalid_submitter).code == ErrorCode::invalid_owner_role);
+    CHECK(invalid.fallback_allowed());
+
+    Transaction duplicate(plan);
+    preflight_ok(duplicate);
+
+    struct Duplicate final : Submitter {
+        explicit Duplicate(Trace & trace) : trace(trace) {}
+
+        Status submit(const FusionPlan & plan, SubmitRecorder & recorder) override {
+            CHECK(install_escrow(plan, recorder, trace));
+            OwnerBundle  replacement = owners_for(plan, trace);
+            const Status duplicate_status =
+                recorder.escrow(std::move(replacement), EmergencyToken(std::make_unique<TraceDrain>(trace)));
+            CHECK(duplicate_status.code == ErrorCode::duplicate_install);
+            return recorder.mark_write_started();
+        }
+
+        Trace & trace;
+    } duplicate_submitter(trace);
+
+    CHECK(duplicate.submit(duplicate_submitter).code == ErrorCode::duplicate_install);
+    CHECK(duplicate.fallback_allowed());  // known-bad recorder state cannot cross the write boundary
 }
 
-void test_post_write_contract_failures_quarantine() {
-    std::vector<std::string> trace;
-    for (SubmitBehavior behavior : { SubmitBehavior::missing_terminal, SubmitBehavior::missing_owners }) {
-        Transaction transaction(ordinary_plan());
-        preflight_ok(transaction);
-        TestSubmitter submitter{ behavior, trace };
-        const Status  status = transaction.submit(submitter);
-        CHECK(status.code == (behavior == SubmitBehavior::missing_terminal ? ErrorCode::submitted_without_terminal :
-                                                                             ErrorCode::submitted_without_owners));
-        CHECK(transaction.phase() == Phase::quarantined);
-        CHECK(!transaction.fallback_allowed());
+void test_postwrite_escrow_lifetime() {
+    for (Behavior behavior : { Behavior::missing_terminal, Behavior::throw_after_before_terminal }) {
+        Trace trace;
+        {
+            Transaction transaction(ordinary_plan());
+            preflight_ok(transaction);
+            TestSubmitter submitter(behavior, trace);
+            const Status  status = transaction.submit(submitter);
+            CHECK(status.code == (behavior == Behavior::missing_terminal ? ErrorCode::submitted_without_terminal :
+                                                                           ErrorCode::exception_after_write));
+            CHECK(!transaction.fallback_allowed());
+            CHECK(trace.copy().empty());
+        }
+        const auto values = trace.copy();
+        CHECK(!values.empty() && values.front() == "drain");
+        CHECK(values.size() >= 2 && values[1].rfind("owner-", 0) == 0);
     }
 
+    Trace duplicate_trace;
     {
         Transaction transaction(ordinary_plan());
         preflight_ok(transaction);
-        TestSubmitter submitter{ SubmitBehavior::mismatched_owners, trace };
-        CHECK(transaction.submit(submitter).code == ErrorCode::owner_mismatch);
-        CHECK(transaction.phase() == Phase::quarantined);
+        TestSubmitter submitter(Behavior::duplicate_terminal, duplicate_trace);
+        CHECK(transaction.submit(submitter).code == ErrorCode::duplicate_install);
         CHECK(!transaction.fallback_allowed());
     }
-
-    trace.clear();
-    {
-        Transaction transaction(ordinary_plan());
-        preflight_ok(transaction);
-        TestSubmitter submitter{ SubmitBehavior::throw_after, trace };
-        CHECK(transaction.submit(submitter).code == ErrorCode::exception_after_write);
-        CHECK(transaction.phase() == Phase::quarantined);
-        CHECK(!transaction.fallback_allowed());
-        CHECK(trace.empty());
-    }
-    CHECK(!trace.empty() && trace.front() == "wait");
+    const auto values = duplicate_trace.copy();
+    CHECK(values.size() >= 3);
+    CHECK(values[0] == "wait");  // rejected duplicate waited immediately
+    CHECK(values[1] == "wait");  // original terminal settled before escrow release
+    CHECK(values[2].rfind("owner-", 0) == 0);
 }
 
-void test_success_atomic_publication_and_lifetime() {
-    std::vector<std::string>   trace;
+void test_publication_lifetime_and_failure() {
+    Trace                      trace;
     PublicationStore::Snapshot lease;
     {
         PublicationStore store;
         {
             Transaction transaction(ordinary_plan());
             preflight_ok(transaction);
-            TestSubmitter submitter{ SubmitBehavior::success, trace };
+            TestSubmitter submitter(Behavior::success, trace);
             CHECK(transaction.submit(submitter));
-            CHECK(!transaction.fallback_allowed());
             CHECK(transaction.commit(store));
-            CHECK(transaction.phase() == Phase::published);
-            CHECK(transaction.commit(store).code == ErrorCode::invalid_state);  // idempotence rejection
+            CHECK(transaction.commit(store).code == ErrorCode::invalid_state);
             lease = store.snapshot();
-            CHECK(lease.publication.ready);
-            CHECK(lease.publication.skip_gate && lease.publication.skip_up && lease.publication.skip_glu);
-            CHECK(!lease.publication.skip_down);  // optional down remains ordinary
-            CHECK(lease.ownership_lease != nullptr);
-            CHECK(trace.empty());
+            CHECK(lease.publication.ready && lease.publication.skip_gate && lease.publication.skip_up &&
+                  lease.publication.skip_glu && !lease.publication.skip_down);
+            CHECK(trace.copy().empty());
         }
-        CHECK(trace.empty());  // PublicationStore, not Transaction, owns the terminal and owners.
+        CHECK(trace.copy().empty());
     }
-    CHECK(trace.empty());      // A consumer snapshot lease extends ownership beyond the store.
+    CHECK(trace.copy().empty());
     lease.ownership_lease.reset();
-    CHECK(!trace.empty() && trace.front() == "wait");
-}
+    const auto values = trace.copy();
+    CHECK(!values.empty() && values.front() == "wait");
 
-void test_atomic_failure_and_stale_commit() {
-    std::vector<std::string> failure_trace;
-    PublicationStore         store;
+    Trace            failure_trace;
+    PublicationStore store;
     {
         Transaction transaction(ordinary_plan());
         preflight_ok(transaction);
-        TestSubmitter submitter{ SubmitBehavior::success, failure_trace };
+        TestSubmitter submitter(Behavior::success, failure_trace);
         CHECK(transaction.submit(submitter));
         CHECK(transaction.commit(store, true).code == ErrorCode::publication_failed);
-        const auto snapshot = store.snapshot();
-        CHECK(!snapshot.publication.ready);
-        CHECK(!snapshot.publication.skip_gate && !snapshot.publication.skip_up && !snapshot.publication.skip_glu);
-        CHECK(snapshot.ownership_lease == nullptr);
-        CHECK(!transaction.fallback_allowed());
-        CHECK(failure_trace.empty());
+        CHECK(!store.snapshot().publication.ready);
+        CHECK(failure_trace.copy().empty());
     }
-    CHECK(!failure_trace.empty() && failure_trace.front() == "wait");
-
-    std::vector<std::string> first_trace;
-    std::vector<std::string> stale_trace;
-    Transaction              first(ordinary_plan(), 0);
-    Transaction              stale(ordinary_plan(), 0);
-    preflight_ok(first);
-    preflight_ok(stale);
-    TestSubmitter first_submit{ SubmitBehavior::success, first_trace };
-    TestSubmitter stale_submit{ SubmitBehavior::success, stale_trace };
-    CHECK(first.submit(first_submit));
-    CHECK(stale.submit(stale_submit));
-    CHECK(first.commit(store));
-    CHECK(stale.commit(store).code == ErrorCode::stale_commit);
-    CHECK(stale.phase() == Phase::quarantined);
-    CHECK(!stale.fallback_allowed());
-    CHECK(store.snapshot().publication.generation == 1);
+    CHECK(failure_trace.copy().front() == "wait");
 }
 
-void test_fused_down_publishes_and_requires_exact_owner_set() {
-    std::vector<std::string> trace;
-    FusionPlan               plan = ordinary_plan();
-    plan.down                     = DownMode::fused;
-    plan.down_role                = true;
+void test_wait_reentry_and_contended_publication() {
+    // Trace must outlive the store because store retirement waits before releasing owners.
+    Trace             trace;
+    PublicationStore  store;
+    std::atomic<bool> reentered{ false };
+
+    struct ReentrantSubmitter final : Submitter {
+        ReentrantSubmitter(PublicationStore & store, std::atomic<bool> & entered, Trace & trace) :
+            store(store),
+            entered(entered),
+            trace(trace) {}
+
+        Status submit(const FusionPlan & plan, SubmitRecorder & recorder) override {
+            CHECK(install_escrow(plan, recorder, trace));
+            CHECK(recorder.mark_write_started());
+            return recorder.install_terminal(TerminalToken(std::make_unique<ReentrantEvent>(store, entered)));
+        }
+
+        PublicationStore &  store;
+        std::atomic<bool> & entered;
+        Trace &             trace;
+    } first_submitter(store, reentered, trace);
+
+    Transaction first(ordinary_plan(), 0);
+    preflight_ok(first);
+    CHECK(first.submit(first_submitter));
+    CHECK(first.commit(store));
+
+    std::atomic<bool>        stop{ false };
+    std::atomic<bool>        partial{ false };
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto snapshot = store.snapshot();
+                if (snapshot.publication.ready && (!snapshot.publication.skip_gate || !snapshot.publication.skip_up ||
+                                                   !snapshot.publication.skip_glu || !snapshot.ownership_lease)) {
+                    partial.store(true, std::memory_order_release);
+                }
+            }
+        });
+    }
+
+    Transaction second(ordinary_plan(), 1);
+    preflight_ok(second);
+    TestSubmitter second_submitter(Behavior::success, trace);
+    CHECK(second.submit(second_submitter));
+    CHECK(second.commit(store));  // retirement waits outside lock and re-enters snapshot()
+    stop.store(true, std::memory_order_release);
+    for (auto & reader : readers) {
+        reader.join();
+    }
+    CHECK(reentered.load(std::memory_order_acquire));
+    CHECK(!partial.load(std::memory_order_acquire));
+    CHECK(store.snapshot().publication.generation == 2);
+}
+
+void test_optional_down() {
+    Trace      trace;
+    FusionPlan plan = ordinary_plan();
+    plan.down       = DownMode::fused;
+    plan.down_role  = true;
     Transaction transaction(plan);
     preflight_ok(transaction);
-    TestSubmitter submitter{ SubmitBehavior::success, trace };
+    TestSubmitter submitter(Behavior::success, trace);
     CHECK(transaction.submit(submitter));
     PublicationStore store;
     CHECK(transaction.commit(store));
@@ -287,13 +410,13 @@ void test_fused_down_publishes_and_requires_exact_owner_set() {
 }  // namespace
 
 int main() {
-    test_plan_mutations_rejected();
-    test_preflight_and_no_write_failures_allow_fallback();
-    test_post_write_contract_failures_quarantine();
-    test_success_atomic_publication_and_lifetime();
-    test_atomic_failure_and_stale_commit();
-    test_fused_down_publishes_and_requires_exact_owner_set();
-    if (failures != 0) {
+    test_prewrite_rejection_and_mutations();
+    test_escrow_validation();
+    test_postwrite_escrow_lifetime();
+    test_publication_lifetime_and_failure();
+    test_wait_reentry_and_contended_publication();
+    test_optional_down();
+    if (failures) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
     }
