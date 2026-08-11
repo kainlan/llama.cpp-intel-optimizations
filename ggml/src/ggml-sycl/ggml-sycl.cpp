@@ -71362,7 +71362,7 @@ cpu_tg_fallthrough:
                         decode_batch_result.expert_id,
                         ggml_sycl::moe_batch_reject_reason_name(decode_batch_result.reject),
                         decode_batch_result.source_reason);
-                    return;
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode batch rejected");
                 }
                 const ggml_sycl::moe_resolved_batch & decode_batch = decode_batch_result.batch;
 
@@ -71400,7 +71400,7 @@ cpu_tg_fallthrough:
                                 "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s\n",
                                 src0->name ? src0->name : "?", occurrence, i02, operand.owning_device,
                                 ggml_sycl::moe_batch_reject_reason_name(choice.reject));
-                            return;
+                            throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode executor refused route");
                         }
                         if (choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE) {
                             push_routed_entry(gpu_entries, iid1, id, i02, ctx.device, operand.actual_layout,
@@ -71913,7 +71913,7 @@ cpu_tg_fallthrough:
                             main_decode_batch_result.expert_id,
                             ggml_sycl::moe_batch_reject_reason_name(main_decode_batch_result.reject),
                             main_decode_batch_result.source_reason);
-                        return;
+                        throw ggml_sycl_fallback_error("MUL_MAT_ID retained main decode batch rejected");
                     }
                 }
 
@@ -71946,7 +71946,7 @@ cpu_tg_fallthrough:
                                     "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s\n",
                                     src0->name ? src0->name : "?", occurrence, i02, operand.owning_device,
                                     ggml_sycl::moe_batch_reject_reason_name(choice.reject));
-                                return;
+                                throw ggml_sycl_fallback_error("MUL_MAT_ID retained main decode executor refused route");
                             }
                             if (choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE) {
                                 push_routed_entry(gpu_entries, iid1, id, i02, ctx.device, operand.actual_layout,

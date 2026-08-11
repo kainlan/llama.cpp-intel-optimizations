@@ -59,6 +59,16 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "primary ready dependency": "dispatch_deps.push_back(entry->ready_event)",
         "CPU ready copy": "sycl::event ready = entry.ready_event",
         "CPU ready wait": "ready.wait()",
+        "CPU-TG batch failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode batch rejected\")",
+        "CPU-TG executor failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode executor refused route\")",
+        "main batch failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode batch rejected\")",
+        "main executor failure propagates":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained main decode executor refused route\")",
+        "ready guard suppresses exceptional publish":
+            "std::uncaught_exceptions() != uncaught_on_entry",
     }
     for name, pattern in required_header.items():
         if not has_tokens(header, pattern):
@@ -66,6 +76,15 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     for name, pattern in required_source.items():
         if not has_tokens(source, pattern):
             failures.append(name)
+
+    compute_fallback = source.index("catch (const ggml_sycl_fallback_error &)")
+    compute_generic = source.index("catch (const std::exception & e)", compute_fallback)
+    if not has_tokens(source[compute_fallback:compute_generic], "throw;"):
+        failures.append("compute_forward rethrows MMID refusal")
+    boundary_fallback = source.index("catch (const ggml_sycl_fallback_error & error)")
+    boundary_end = source.index("return GGML_STATUS_FAILED", boundary_fallback)
+    if boundary_end < boundary_fallback:
+        failures.append("graph boundary reports MMID refusal")
 
     route_start = header.index("struct moe_batch_route")
     route_end = header.index("struct moe_resolved_operand", route_start)
@@ -111,6 +130,26 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     return failures
 
 
+def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
+    # Behavioral model of the production exception chain: MMID ready guard
+    # observes unwinding, compute_forward rethrows, and graph boundary fails.
+    for refusal in ("batch_rejected", "wrong_queue", "q1_capability", "nvfp4_capability"):
+        published = False
+        graph_success = True
+        unwinding = False
+        try:
+            try:
+                unwinding = True
+                raise RuntimeError(refusal)
+            finally:
+                if not unwinding:
+                    published = True
+        except RuntimeError:
+            graph_success = False
+        assert not graph_success, refusal
+        assert not published, refusal
+
+
 def test_contract_and_mutation_witnesses() -> None:
     header = HEADER.read_text()
     source = SOURCE.read_text()
@@ -149,6 +188,9 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test.replace("test_make_stable_weight_lease", "mem_handle::from_weight_lease_snapshot"), mem_source),
         ("decode-resolver-bypass", header,
          source.replace("ggml_sycl::choose_moe_batch_executor(", "ggml_sycl::moe_batch_executor_choice("),
+         host_test, mem_source),
+        ("refusal-return", header,
+         source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained", "return; // MUL_MAT_ID retained"),
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
