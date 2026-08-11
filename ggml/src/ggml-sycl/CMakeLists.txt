@@ -177,6 +177,15 @@ if (BUILD_TESTING)
     add_test(NAME sycl-lifecycle-m7 COMMAND test-sycl-lifecycle-event-lease --case M7)
     add_test(NAME sycl-lifecycle-m7b COMMAND test-sycl-lifecycle-event-lease --case M7b)
     set_tests_properties(sycl-lifecycle-event-lease sycl-lifecycle-g5a sycl-lifecycle-g6 sycl-lifecycle-g6b sycl-lifecycle-g7 sycl-lifecycle-h8 sycl-lifecycle-h8b sycl-lifecycle-h12 sycl-lifecycle-h12b sycl-lifecycle-h13b sycl-lifecycle-m7 sycl-lifecycle-m7b PROPERTIES LABELS "sycl;execution;lifecycle;host;tsan-capable")
+    add_executable(test-sycl-graph-epoch-lifecycle
+        tests/test-graph-epoch-lifecycle.cpp
+        execution-lifecycle.cpp)
+    target_include_directories(test-sycl-graph-epoch-lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-sycl-graph-epoch-lifecycle PRIVATE Threads::Threads)
+    set_target_properties(test-sycl-graph-epoch-lifecycle PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-graph-epoch-lifecycle COMMAND test-sycl-graph-epoch-lifecycle)
+    set_tests_properties(sycl-graph-epoch-lifecycle PROPERTIES LABELS "sycl;execution;lifecycle;graph-epoch;host;tsan-capable")
     add_test(NAME sycl-lifecycle-placement-publication
         COMMAND test-sycl-lifecycle-load-txn --case publication-concurrency)
     set_tests_properties(sycl-lifecycle-placement-publication PROPERTIES LABELS "sycl;lifecycle;host;tsan-capable")

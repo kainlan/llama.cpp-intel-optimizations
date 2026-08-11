@@ -88,6 +88,383 @@ error Registry::attach_root(ContextId context, lifecycle::ModelToken root, Sessi
     return error::OK;
 }
 
+error Registry::begin_record(ContextId             context,
+                             SessionId             session,
+                             SessionResetEpoch     reset_epoch,
+                             lifecycle::ModelToken root,
+                             GraphEpoch *          graph_epoch) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!graph_epoch) {
+        return error::NULL_OUTPUT;
+    }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = entry.session;
+    if (entry.state != context_phase::OPEN || owner.state != session_phase::OPEN) {
+        return error::BUSY;
+    }
+    if (validate_root(owner.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (owner.recording_epoch.value != 0 || owner.graph.id.value != 0) {
+        return error::BUSY;
+    }
+    uint64_t   value = 0;
+    const auto rc =
+        next_id(next_graph_epoch_, error::OVERFLOW, mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, value);
+    if (rc != error::OK) {
+        return rc;
+    }
+    persistent_epoch_entry epoch;
+    epoch.id         = { value };
+    epoch.token_root = root;
+    owner.epochs.emplace(value, std::move(epoch));
+    owner.recording_epoch = { value };
+    *graph_epoch          = { value };
+    return error::OK;
+}
+
+error Registry::activate(ContextId             context,
+                         SessionId             session,
+                         SessionResetEpoch     reset_epoch,
+                         GraphEpoch            graph_epoch,
+                         lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner    = entry.session;
+    auto   epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch.state != epoch_phase::RECORDING) {
+        return error::BUSY;
+    }
+    if (owner.active_epoch.value != 0) {
+        auto old = owner.epochs.find(owner.active_epoch.value);
+        if (old == owner.epochs.end() || old->second.state != epoch_phase::ACTIVE) {
+            return error::MISMATCH;
+        }
+        old->second.state = epoch_phase::REPLACED;
+    }
+    epoch.state           = epoch_phase::ACTIVE;
+    owner.active_epoch    = graph_epoch;
+    owner.recording_epoch = {};
+    return error::OK;
+}
+
+error Registry::begin_invocation(ContextId             context,
+                                 SessionId             session,
+                                 SessionResetEpoch     reset_epoch,
+                                 GraphEpoch            graph_epoch,
+                                 lifecycle::ModelToken root,
+                                 InvocationId *        invocation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!invocation) {
+        return error::NULL_OUTPUT;
+    }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto epoch_it = entry.session.epochs.find(graph_epoch.value);
+    if (epoch_it == entry.session.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch.state != epoch_phase::ACTIVE || !(entry.session.active_epoch == graph_epoch)) {
+        return error::BUSY;
+    }
+    uint64_t   value = 0;
+    const auto rc =
+        next_id(next_invocation_id_, error::OVERFLOW, mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, value);
+    if (rc != error::OK) {
+        return rc;
+    }
+    epoch.invocations.insert(value);
+    *invocation = { value };
+    return error::OK;
+}
+
+error Registry::finish_invocation(ContextId             context,
+                                  SessionId             session,
+                                  SessionResetEpoch     reset_epoch,
+                                  GraphEpoch            graph_epoch,
+                                  InvocationId          invocation,
+                                  lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto epoch_it = entry.session.epochs.find(graph_epoch.value);
+    if (epoch_it == entry.session.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    const auto invocation_it = epoch.invocations.find(invocation.value);
+    if (invocation.value == 0 || invocation_it == epoch.invocations.end()) {
+        return error::STALE;
+    }
+    epoch.invocations.erase(invocation_it);
+    return error::OK;
+}
+
+error Registry::rollback_record(ContextId             context,
+                                SessionId             session,
+                                SessionResetEpoch     reset_epoch,
+                                GraphEpoch            graph_epoch,
+                                lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner    = entry.session;
+    auto   epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    if (validate_root(epoch_it->second.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch_it->second.state != epoch_phase::RECORDING || !epoch_it->second.invocations.empty()) {
+        return error::BUSY;
+    }
+    owner.epochs.erase(epoch_it);
+    owner.recording_epoch = {};
+    return error::OK;
+}
+
+error Registry::begin_retire(ContextId             context,
+                             SessionId             session,
+                             SessionResetEpoch     reset_epoch,
+                             GraphEpoch            graph_epoch,
+                             lifecycle::ModelToken root,
+                             const int *           devices,
+                             size_t                device_count,
+                             RetireTicket *        ticket) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ticket) {
+        return error::NULL_OUTPUT;
+    }
+    *ticket = {};
+    if (!devices || device_count == 0) {
+        return error::MISMATCH;
+    }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner    = entry.session;
+    auto   epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch.state != epoch_phase::ACTIVE && epoch.state != epoch_phase::REPLACED) {
+        return error::BUSY;
+    }
+    if (!epoch.invocations.empty()) {
+        return error::BUSY;
+    }
+    std::vector<int> canonical_devices;
+    if (!canonicalize_unique_ids(devices, device_count, canonical_devices)) {
+        return error::MISMATCH;
+    }
+    for (int device : canonical_devices) {
+        if (device < 0 || device >= static_cast<int>(max_devices) || entry.bound_device_refs[device] == 0) {
+            return error::MISMATCH;
+        }
+    }
+    if (owner.next_retire_serial == 0 || owner.next_retire_serial == UINT64_MAX) {
+        return error::OVERFLOW;
+    }
+    const uint64_t serial = owner.next_retire_serial++;
+    epoch.state           = epoch_phase::RETIRING;
+    epoch.retire_serial   = serial;
+    epoch.retire_devices  = std::move(canonical_devices);
+    if (owner.active_epoch == graph_epoch) {
+        owner.active_epoch = {};
+    }
+    *ticket = { context, session, reset_epoch, graph_epoch, root, serial, true };
+    return error::OK;
+}
+
+error Registry::attach_retire_terminal(const RetireTicket &            ticket,
+                                       int                             device,
+                                       std::shared_ptr<RetireTerminal> terminal) noexcept {
+    if (!terminal) {
+        return error::MISMATCH;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        context_it = contexts_.find(ticket.context.value);
+    if (!ticket.active || ticket.serial == 0 || context_it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & owner = context_it->second.session;
+    if (!(owner.id == ticket.session) || !(owner.reset_epoch == ticket.reset_epoch)) {
+        return error::STALE;
+    }
+    auto epoch_it = owner.epochs.find(ticket.graph_epoch.value);
+    if (epoch_it == owner.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (epoch.state != epoch_phase::RETIRING || epoch.retire_serial != ticket.serial) {
+        return error::STALE;
+    }
+    if (validate_root(epoch.token_root, ticket.token_root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (!std::binary_search(epoch.retire_devices.begin(), epoch.retire_devices.end(), device)) {
+        return error::MISMATCH;
+    }
+    if (epoch.terminals.find(device) != epoch.terminals.end()) {
+        return error::STALE;
+    }
+    epoch.terminals.emplace(device, terminal);
+    return error::OK;
+}
+
+error Registry::finish_retire(const RetireTicket & ticket) noexcept {
+    std::vector<std::shared_ptr<RetireTerminal>> terminals;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        context_it = contexts_.find(ticket.context.value);
+        if (!ticket.active || ticket.serial == 0 || context_it == contexts_.end()) {
+            return error::STALE;
+        }
+        auto & owner = context_it->second.session;
+        if (!(owner.id == ticket.session) || !(owner.reset_epoch == ticket.reset_epoch)) {
+            return error::STALE;
+        }
+        auto epoch_it = owner.epochs.find(ticket.graph_epoch.value);
+        if (epoch_it == owner.epochs.end()) {
+            return error::STALE;
+        }
+        const auto & epoch = epoch_it->second;
+        if (epoch.state != epoch_phase::RETIRING || epoch.retire_serial != ticket.serial) {
+            return error::STALE;
+        }
+        if (validate_root(epoch.token_root, ticket.token_root) != error::OK) {
+            return error::MISMATCH;
+        }
+        if (epoch.terminals.size() != epoch.retire_devices.size()) {
+            return error::BUSY;
+        }
+        terminals.reserve(epoch.retire_devices.size());
+        for (int device : epoch.retire_devices) {
+            terminals.push_back(epoch.terminals.at(device));
+        }
+    }
+    for (const auto & terminal : terminals) {
+        terminal->wait();
+    }
+
+    std::vector<std::shared_ptr<RetireTerminal>> released;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        context_it = contexts_.find(ticket.context.value);
+        if (context_it == contexts_.end()) {
+            return error::STALE;
+        }
+        auto & owner = context_it->second.session;
+        if (!(owner.id == ticket.session) || !(owner.reset_epoch == ticket.reset_epoch)) {
+            return error::STALE;
+        }
+        auto epoch_it = owner.epochs.find(ticket.graph_epoch.value);
+        if (epoch_it == owner.epochs.end() || epoch_it->second.state != epoch_phase::RETIRING ||
+            epoch_it->second.retire_serial != ticket.serial) {
+            return error::STALE;
+        }
+        if (validate_root(epoch_it->second.token_root, ticket.token_root) != error::OK) {
+            return error::MISMATCH;
+        }
+        for (auto & item : epoch_it->second.terminals) {
+            released.push_back(std::move(item.second));
+        }
+        owner.epochs.erase(epoch_it);
+    }
+    return error::OK;
+}
+
+error Registry::extract_epoch(ContextId             context,
+                              SessionId             session,
+                              SessionResetEpoch     reset_epoch,
+                              GraphEpoch            graph_epoch,
+                              lifecycle::ModelToken root,
+                              epoch_snapshot *      out) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!out) {
+        return error::NULL_OUTPUT;
+    }
+    auto context_it = contexts_.find(context.value);
+    if (context.value == 0 || context_it == contexts_.end()) {
+        return error::STALE;
+    }
+    const auto & entry = context_it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto epoch_it = entry.session.epochs.find(graph_epoch.value);
+    if (epoch_it == entry.session.epochs.end()) {
+        return error::STALE;
+    }
+    const auto & epoch = epoch_it->second;
+    if (validate_root(epoch.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    *out = { graph_epoch,
+             epoch.state,
+             static_cast<uint32_t>(epoch.invocations.size()),
+             static_cast<uint32_t>(epoch.retire_devices.size()),
+             static_cast<uint32_t>(epoch.terminals.size()),
+             entry.session.active_epoch == graph_epoch };
+    return error::OK;
+}
+
 error Registry::begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                             lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -100,7 +477,7 @@ error Registry::begin_graph(ContextId context, SessionId session, SessionResetEp
     if (session_rc != error::OK) return session_rc;
     if (entry.session.state != session_phase::OPEN || validate_root(entry.session.token_root, root) != error::OK) return error::MISMATCH;
     const auto & graph = entry.session.graph;
-    if (graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED || graph_terminal_unretired(graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED || graph_terminal_unretired(graph)) return error::BUSY;
     uint64_t graph_value = 0;
     const auto rc = next_id(next_graph_epoch_, error::OVERFLOW, mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, graph_value);
     if (rc != error::OK) return rc;
@@ -408,7 +785,7 @@ error Registry::begin_drain(ContextId context, DrainTicket * ticket) noexcept {
     if (context.value == 0 || it == contexts_.end()) return error::STALE;
     auto & entry = it->second;
     if (entry.state != context_phase::OPEN || entry.active_drain_serial != 0) return error::BUSY;
-    if (entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
     if (mutation_ == test_mutation::M6b_DRAIN_SERIAL_OVERFLOW || entry.next_drain_serial == 0 || entry.next_drain_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.next_drain_serial++;
     entry.active_drain_serial = serial;
@@ -499,7 +876,7 @@ error Registry::close_context_if_idle(ContextId context) noexcept {
         if (owner.context == context && owner.invocation.value != 0) return error::DEVICE_BUSY;
     }
     auto & graph = entry.session.graph;
-    if (graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED) return error::BUSY;
+    if (!entry.session.epochs.empty() || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED) return error::BUSY;
     if (graph_terminal_unretired(graph)) {
         graph.state = graph_phase::RETIRED;
         graph.invocation = {};
@@ -519,7 +896,7 @@ error Registry::begin_reset(ContextId context, SessionId session, SessionResetEp
     if (entry.state != context_phase::OPEN || entry.session.state != session_phase::OPEN || entry.session.active_reset_serial != 0) return error::BUSY;
     const auto session_rc = validate_session(entry, session, expected_epoch);
     if (session_rc != error::OK) return session_rc;
-    if (entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
+    if (!entry.session.epochs.empty() || entry.session.graph.state == graph_phase::OPEN || entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) return error::BUSY;
     if (mutation_ == test_mutation::M6c_RESET_SERIAL_OVERFLOW || entry.session.next_reset_serial == 0 || entry.session.next_reset_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.session.next_reset_serial++;
     entry.session.active_reset_serial = serial;
