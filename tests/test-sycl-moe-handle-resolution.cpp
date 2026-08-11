@@ -470,6 +470,10 @@ int main() {
     ggml_sycl::unified_cache * cache = nullptr;
     sycl::queue *              q     = nullptr;
     try {
+        if (sycl::device::get_devices().empty()) {
+            fprintf(stderr, "SKIP: no SYCL devices available for lifecycle execution\n");
+            return 0;
+        }
         const size_t device_count = ggml_backend_sycl_get_device_count();
         if (device_count == 0) {
             fprintf(stderr, "no SYCL devices available after logical mapping init\n");
