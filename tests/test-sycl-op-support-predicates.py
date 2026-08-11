@@ -3,11 +3,12 @@
 
 import re
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT_SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 CONCAT_SOURCE = ROOT / "ggml/src/ggml-sycl/concat.cpp"
+BACKEND_OPS_SOURCE = ROOT / "tests/test-backend-ops.cpp"
 
 
 def _supports_source(text: Optional[str] = None) -> str:
@@ -42,6 +43,57 @@ def _concat_case_sets(text: str) -> Tuple[Set[str], Set[str]]:
 
 def test_pool_2d_does_not_inherit_acc_restrictions() -> None:
     _assert_expression(_case(_supports_source(), "POOL_2D", "ACC"), "true")
+
+
+def test_rope_predicate_and_inplace_inventory_counts() -> None:
+    source = _supports_source()
+    _assert_expression(
+        _case(source, "ROPE", "IM2COL"),
+        "op->view_src == nullptr || ggml_is_contiguous(op)",
+    )
+    _assert_expression(_case(source, "IM2COL", "UPSCALE"), "true")
+
+    inventory = BACKEND_OPS_SOURCE.read_text(encoding="utf-8")
+    start = inventory.index("// single inplace test per type/mode/ff")
+    end = inventory.index("for (int v :", start)
+    block = inventory[start:end]
+
+    def loop_values(declaration: str) -> List[str]:
+        match = re.search(rf"for \({declaration} : \{{([^}}]+)\}}\)", block)
+        assert match is not None
+        return [value.strip() for value in match.group(1).split(",")]
+
+    types = loop_values("ggml_type type")
+    modes = loop_values("int mode")
+    factors = loop_values("bool ff")
+    inplace_views = [
+        int(match.group(1))
+        for line in block.splitlines()
+        if "new test_rope" in line
+        for match in [re.search(r"ff,\s*([01]),\s*true,\s*true\)", line)]
+        if match is not None
+    ]
+
+    assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
+    assert modes == [
+        "GGML_ROPE_TYPE_NORMAL",
+        "GGML_ROPE_TYPE_NEOX",
+        "GGML_ROPE_TYPE_MROPE",
+        "GGML_ROPE_TYPE_IMROPE",
+        "GGML_ROPE_TYPE_VISION",
+    ]
+    assert factors == ["false", "true"]
+    assert inplace_views == [0, 1, 1]
+
+    multiplicity = len(types) * len(modes) * len(factors)
+    decisions = [view == 0 for view in inplace_views for _ in range(multiplicity)]
+    assert decisions.count(False) == 40  # non-contiguous in-place: decline
+    assert decisions.count(True) == 20   # contiguous in-place: preserve
+
+    rope_supported = lambda out_of_place, contiguous: out_of_place or contiguous
+    assert rope_supported(True, False)   # out-of-place is admitted regardless of dst layout
+    assert rope_supported(False, True)   # contiguous in-place control
+    assert not rope_supported(False, False)
 
 
 def test_norm_family_predicates_match_complete_kernel_contracts() -> None:
@@ -117,6 +169,11 @@ def test_concat_support_helper_and_dispatch_case_sets_are_identical() -> None:
 
 def test_review_mutations_are_detected() -> None:
     support = _supports_source()
+    rope = _case(support, "ROPE", "IM2COL")
+    expected_rope = _normalized_return(rope)
+    mutated_rope = rope.replace(" || ", " && ", 1)
+    assert _normalized_return(mutated_rope) != expected_rope
+
     group = _case(support, "GROUP_NORM", "RMS_NORM_BACK")
     expected_group = _normalized_return(group)
     mutated_group = group.replace(" && ", " || ", 1)

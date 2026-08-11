@@ -99118,6 +99118,12 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 return max_bias == 0.0f;
             }
         case GGML_OP_ROPE:
+            // ROPE kernels consume src0 row/channel strides, but every variant
+            // writes dst with packed offsets. An in-place result is a view and
+            // inherits src0's strides, so only the non-contiguous in-place case
+            // is unsafe. Out-of-place results have packed storage regardless of
+            // src0 layout; contiguous in-place results are safe too.
+            return op->view_src == nullptr || ggml_is_contiguous(op);
         case GGML_OP_IM2COL:
             return true;
         case GGML_OP_UPSCALE:
