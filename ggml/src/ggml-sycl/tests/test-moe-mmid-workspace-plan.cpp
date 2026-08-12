@@ -251,6 +251,20 @@ static void finalized_owner_accounting() {
     check(owners[1].used_bytes == before[1].used_bytes && total == before_total,
           "failed actual-alternate charge was not atomic");
 
+#ifndef MMID_TSAN_BUILD
+    const auto                                oom_before = owners;
+    const size_t                              oom_total  = total;
+    const std::vector<std::pair<int, size_t>> oom_charges{
+        { 0, 1 }
+    };
+    g_fail_heap_allocations.store(true);
+    const bool oom_result = moe_mmid_account_actual_owners(oom_charges, &owners, &total);
+    g_fail_heap_allocations.store(false);
+    check(!oom_result && owners.size() == oom_before.size() && owners[0].used_bytes == oom_before[0].used_bytes &&
+              owners[1].used_bytes == oom_before[1].used_bytes && total == oom_total,
+          "accounting owner-copy OOM escaped noexcept or mutated outputs");
+#endif
+
     owners[1].budget_bytes = 20;
     check(moe_mmid_account_actual_owners(
               {
@@ -260,6 +274,27 @@ static void finalized_owner_accounting() {
           "actual alternate workspace was not charged");
     check(owners[1].used_bytes == 9 && owners[1].workspace_bytes == 2 && total == 709,
           "actual alternate/per-device/global totals mismatch");
+}
+
+static void runtime_per_device_rebuild_is_atomic() {
+    const std::vector<int>    devices{ 0, 1 };
+    const std::vector<size_t> budgets{ 1000, 400 };
+    std::vector<size_t>       used{ 1, 2 };
+    check(moe_mmid_rebuild_per_device_usage(
+              {
+                  500, 200
+    },
+              { { 0, 100 }, { 1, 50 } }, { { 0, 80 }, { 1, 40 } }, devices, budgets, &used) &&
+              used == std::vector<size_t>({ 680, 290 }),
+          "KV growth stable-fit rebuild preserved stale per-device totals");
+    const auto before = used;
+    check(!moe_mmid_rebuild_per_device_usage(
+              {
+                  500, 200
+    },
+              { { 0, 100 }, { 1, 50 } }, { { 0, 80 }, { 1, 151 } }, devices, budgets, &used) &&
+              used == before,
+          "unequal-budget replacement rebuild was not atomic");
 }
 
 static void replacement_accounting_is_atomic() {
@@ -563,6 +598,7 @@ int main() {
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
         finalized_owner_accounting();
+        runtime_per_device_rebuild_is_atomic();
         replacement_accounting_is_atomic();
         cookie_saturates_without_reuse();
         registry_materialization_and_rollback();

@@ -215,27 +215,70 @@ bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & 
     if (owners == nullptr || total_vram_bytes == nullptr) {
         return false;
     }
-    std::vector<moe_mmid_owner_accounting> merged = *owners;
-    size_t                                 total  = *total_vram_bytes;
-    for (const auto & charge : charges) {
-        auto   owner     = std::find_if(merged.begin(), merged.end(), [&](const moe_mmid_owner_accounting & candidate) {
-            return candidate.owner_device == charge.first;
-        });
-        size_t next_used = 0;
-        size_t next_workspace = 0;
-        size_t next_total     = 0;
-        if (owner == merged.end() || !checked_add(owner->used_bytes, charge.second, &next_used) ||
-            next_used > owner->budget_bytes || !checked_add(owner->workspace_bytes, charge.second, &next_workspace) ||
-            !checked_add(total, charge.second, &next_total)) {
+    try {
+        std::vector<moe_mmid_owner_accounting> merged = *owners;
+        size_t                                 total  = *total_vram_bytes;
+        for (const auto & charge : charges) {
+            auto   owner = std::find_if(merged.begin(), merged.end(), [&](const moe_mmid_owner_accounting & candidate) {
+                return candidate.owner_device == charge.first;
+            });
+            size_t next_used      = 0;
+            size_t next_workspace = 0;
+            size_t next_total     = 0;
+            if (owner == merged.end() || !checked_add(owner->used_bytes, charge.second, &next_used) ||
+                next_used > owner->budget_bytes ||
+                !checked_add(owner->workspace_bytes, charge.second, &next_workspace) ||
+                !checked_add(total, charge.second, &next_total)) {
+                return false;
+            }
+            owner->used_bytes      = next_used;
+            owner->workspace_bytes = next_workspace;
+            total                  = next_total;
+        }
+        *owners           = std::move(merged);
+        *total_vram_bytes = total;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool moe_mmid_rebuild_per_device_usage(const std::vector<size_t> &                 base_usage,
+                                       const std::vector<std::pair<int, size_t>> & kv_charges,
+                                       const std::vector<std::pair<int, size_t>> & mmid_charges,
+                                       const std::vector<int> &                    devices,
+                                       const std::vector<size_t> &                 budgets,
+                                       std::vector<size_t> *                       used) noexcept {
+    if (used == nullptr || base_usage.size() != devices.size() || budgets.size() != devices.size()) {
+        return false;
+    }
+    try {
+        auto candidate = base_usage;
+        auto apply     = [&](const std::vector<std::pair<int, size_t>> & charges) {
+            for (const auto & charge : charges) {
+                const auto it = std::find(devices.begin(), devices.end(), charge.first);
+                if (it == devices.end()) {
+                    return false;
+                }
+                const size_t index = static_cast<size_t>(it - devices.begin());
+                if (candidate[index] > SIZE_MAX - charge.second) {
+                    return false;
+                }
+                candidate[index] += charge.second;
+                if (candidate[index] > budgets[index]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!apply(kv_charges) || !apply(mmid_charges)) {
             return false;
         }
-        owner->used_bytes      = next_used;
-        owner->workspace_bytes = next_workspace;
-        total                  = next_total;
+        *used = std::move(candidate);
+        return true;
+    } catch (...) {
+        return false;
     }
-    *owners           = std::move(merged);
-    *total_vram_bytes = total;
-    return true;
 }
 
 bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,

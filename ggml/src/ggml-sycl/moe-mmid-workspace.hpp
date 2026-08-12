@@ -93,6 +93,13 @@ bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & 
                                     size_t *                                    total_vram_bytes) noexcept;
 
 // Atomically replaces one already-accounted owner charge set with another.
+bool moe_mmid_rebuild_per_device_usage(const std::vector<size_t> &                 base_usage,
+                                       const std::vector<std::pair<int, size_t>> & kv_charges,
+                                       const std::vector<std::pair<int, size_t>> & mmid_charges,
+                                       const std::vector<int> &                    devices,
+                                       const std::vector<size_t> &                 budgets,
+                                       std::vector<size_t> *                       used) noexcept;
+
 bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
                                     const std::vector<std::pair<int, size_t>> & new_charges,
                                     const std::vector<int> &                    devices,

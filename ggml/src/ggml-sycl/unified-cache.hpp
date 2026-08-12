@@ -635,7 +635,8 @@ struct placement_plan {
     // Per-device VRAM usage (multi-device only, indexed by position in devices vector)
     std::vector<int>    devices;                  // Device IDs participating in this plan
     std::vector<size_t> per_device_vram;          // VRAM bytes used per device
-    std::vector<size_t> per_device_vram_budgets;  // Immutable original budgets, same indexing
+    std::vector<size_t> per_device_vram_budgets;       // Immutable original budgets, same indexing
+    std::vector<size_t> per_device_non_kv_mmid_vram;   // Final weights + other runtime charges
 
     // --- Multi-device runtime query maps (populated by compute_multi_device_plan) ---
 
@@ -755,6 +756,22 @@ struct placement_plan {
         host_bytes = weight_host_bytes + kv_host_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
+        }
+    }
+
+    bool rebuild_runtime_per_device_vram() noexcept {
+        if (!multi_device) return true;
+        try {
+            std::vector<std::pair<int, size_t>> kv_charges;
+            kv_charges.reserve(kv_layer_count());
+            for (uint32_t layer = 0; layer < kv_layer_count(); ++layer) {
+                const int owner = get_kv_device(static_cast<int>(layer));
+                if (owner >= 0) kv_charges.emplace_back(owner, kv_size_for_layer(layer));
+            }
+            return moe_mmid_rebuild_per_device_usage(per_device_non_kv_mmid_vram, kv_charges, {}, devices,
+                                                      per_device_vram_budgets, &per_device_vram);
+        } catch (...) {
+            return false;
         }
     }
 

@@ -11349,8 +11349,9 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         plan.moe_mmid_workspaces.empty()) {
         return moe_mmid_materialize_status::INVALID;
     }
-    std::vector<moe_mmid_materialized_owner_plan> owners;
-    owners.reserve(plan.moe_mmid_workspaces.size());
+    try {
+        std::vector<moe_mmid_materialized_owner_plan> owners;
+        owners.reserve(plan.moe_mmid_workspaces.size());
     for (const moe_mmid_owner_workspace_plan & workspace : plan.moe_mmid_workspaces) {
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == workspace.owner_device;
@@ -11406,7 +11407,10 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         blob.host_pinned = host_pinned;
         return blob;
     };
-    return unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners, allocator);
+        return unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners, allocator);
+    } catch (...) {
+        return moe_mmid_materialize_status::ALLOCATION_FAILED;
+    }
 }
 
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
@@ -23829,6 +23833,21 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         const size_t total_kv = kv_info.n_full_attn_layers() * kv_info.kv_bytes_per_layer() +
                                 kv_info.n_swa_layers * kv_info.kv_bytes_per_swa_layer();
         plan.kv_host_bytes = total_kv;
+    }
+
+    plan.per_device_non_kv_mmid_vram = plan.per_device_vram;
+    for (uint32_t layer = 0; layer < plan.kv_layer_count(); ++layer) {
+        const int owner = plan.get_kv_device(static_cast<int>(layer));
+        if (owner < 0) continue;
+        const auto it = std::find(plan.devices.begin(), plan.devices.end(), owner);
+        const size_t index = it == plan.devices.end() ? SIZE_MAX : static_cast<size_t>(it - plan.devices.begin());
+        const size_t bytes = plan.kv_size_for_layer(layer);
+        if (index >= plan.per_device_non_kv_mmid_vram.size() ||
+            plan.per_device_non_kv_mmid_vram[index] < bytes) {
+            plan.per_device_non_kv_mmid_vram.clear();
+            break;
+        }
+        plan.per_device_non_kv_mmid_vram[index] -= bytes;
     }
 
     plan_moe_mmid_workspaces(plan, tensor_inventory, kv_info.n_expert_used);
