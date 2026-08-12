@@ -10,9 +10,15 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace ggml_sycl;
+
+static_assert(!std::is_constructible<queue_submission_authority,
+                                     moe_mmid_queue_capability, uint64_t,
+                                     std::shared_ptr<moe::device_terminal>>::value,
+              "foreign terminal must not be publicly bindable to a queue label");
 
 namespace ggml_sycl { struct lifecycle_plan_snapshot {}; }
 
@@ -841,10 +847,10 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     auto pin = std::make_shared<int>(9); std::weak_ptr<int> weak_pin = pin;
     auto terminal = graph.graph_snapshot->terminals.at(0);
     auto make_authority = [&](moe_mmid_queue_capability queue, std::shared_ptr<void> invocation_pin) {
-        auto completion = workspace_admission_authority_test_factory::terminal(queue, 1702, terminal);
+        auto submission = workspace_admission_authority_test_factory::terminal(queue, 1702, terminal);
         return workspace_admission_authority_test_factory::direct(
             token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
-            { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), { std::move(completion) });
+            { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), { std::move(submission) });
     };
     moe_mmid_authoritative_admission_request direct{ make_authority(capability, pin), { 2, 2, 64, 96, 1 } };
     pin.reset();
@@ -856,24 +862,22 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     moe_mmid_authoritative_admission_request wrong_queue{ make_authority(forged, {}), { 2, 2, 64, 96, 1 } };
     check(registry.admit(std::move(wrong_queue)).status == moe_mmid_lease_status::INVALID,
           "same-device same-cookie different queue capability admitted");
-    auto wrong_completion = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
+    auto wrong_submission = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
     auto wrong_terminal_authority = workspace_admission_authority_test_factory::direct(
         token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
-        { { 0, 1701 } }, { capability }, {}, { wrong_completion });
+        { { 0, 1701 } }, { capability }, {}, { wrong_submission });
     check(registry.admit({ std::move(wrong_terminal_authority), { 2, 2, 64, 96, 1 } }).status ==
               moe_mmid_lease_status::INVALID, "substituted terminal queue authority admitted");
 
-    auto forged_graph_completion = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
     auto forged_graph_authority = workspace_admission_authority_test_factory::graph(
         token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
-        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { forged }, { forged_graph_completion });
+        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { forged });
     check(registry.admit({ std::move(forged_graph_authority), { 2, 2, 64, 96, 1 } }).status ==
               moe_mmid_lease_status::INVALID, "GRAPH substituted exact queue capability admitted");
 
-    auto graph_completion = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
     auto graph_authority = workspace_admission_authority_test_factory::graph(
         token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
-        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { capability }, { graph_completion });
+        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { capability });
 #ifndef MMID_TSAN_BUILD
     g_fail_heap_allocations.store(true);
 #endif
@@ -897,17 +901,17 @@ static void common_direct_authority_plan_queue_and_lifetime() {
         late_status = registry.materialize(token, 1700, plan, 0, { owner }, late_allocator);
     });
     while (!late_entered.load(std::memory_order_acquire)) std::this_thread::yield();
-    check(registry.replace_plan(plan, replacement, 1703), "stable exact plan replacement failed");
+    check(registry.replace_plan(plan, replacement, 1703, true), "stable exact plan replacement failed");
     late_release.store(true, std::memory_order_release); late_materialize.join();
     check(late_status == moe_mmid_materialize_status::INVALID,
           "paused late stale-plan materialization crossed replacement tombstone");
     moe_mmid_authoritative_admission_request stale{ make_authority(capability, {}), { 2, 2, 64, 96, 1 } };
     check(registry.admit(std::move(stale)).status == moe_mmid_lease_status::INVALID,
           "stale exact plan admitted after replacement rebind");
-    auto replacement_completion = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
+    auto replacement_submission = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
     auto replacement_authority = workspace_admission_authority_test_factory::direct(
         token, 1703, 1702, 0, replacement, graph.retained_occurrences, graph.table_owner,
-        { { 0, 1701 } }, { capability }, {}, { replacement_completion });
+        { { 0, 1701 } }, { capability }, {}, { replacement_submission });
     auto replacement_admitted = registry.admit({ std::move(replacement_authority), { 2, 2, 64, 96, 1 } });
     check(replacement_admitted.status == moe_mmid_lease_status::ACQUIRED,
           "stable replacement did not rebind unchanged materialized context");
@@ -915,6 +919,46 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     check(committed.bundle.terminal_release(), "committed old bundle did not finish after plan replacement");
     committed = {};
     check(weak_pin.expired(), "terminal direct bundle retained invocation pin");
+
+    // Generation tickets are reclaimable: repeated stable replacements do not
+    // consume tombstone capacity.
+    auto current = replacement;
+    uint64_t current_id = 1703;
+    for (size_t i = 0; i < 1000; ++i) {
+        auto next = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.replace_plan(current, next, ++current_id, true), "1000 stable replacements exhausted protocol");
+        current = std::move(next);
+    }
+
+    // Changed geometry is prepared off to the side, then atomically selected;
+    // the old context is retired from registry ownership.
+    auto changed = owner; changed.geometry = {};
+    check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+              moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH,
+                                          &changed.device_pool_bytes, &changed.host_pool_bytes),
+          "changed geometry setup failed");
+    auto changed_plan = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, current_id + 1, changed_plan, 0, { changed }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "changed geometry replacement context was not prepared");
+    check(registry.replace_plan(current, changed_plan, current_id + 1, false),
+          "changed geometry prepared context did not publish atomically");
+
+    auto loser = std::make_shared<const lifecycle_plan_snapshot>();
+    auto winner = std::make_shared<const lifecycle_plan_snapshot>();
+    std::atomic<int> replacement_wins{ 0 };
+    std::atomic<bool> replacement_go{ false };
+    std::thread replace_a([&] {
+        while (!replacement_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        replacement_wins += registry.replace_plan(changed_plan, winner, current_id + 2, true);
+    });
+    std::thread replace_b([&] {
+        while (!replacement_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        replacement_wins += registry.replace_plan(changed_plan, loser, current_id + 3, true);
+    });
+    replacement_go.store(true, std::memory_order_release);
+    replace_a.join(); replace_b.join();
+    check(replacement_wins.load() == 1, "concurrent replacement did not provide one CAS winner");
 }
 
 static void registry_bundle_rollback_move_oom_and_quarantine() {

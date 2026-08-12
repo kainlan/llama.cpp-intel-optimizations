@@ -527,8 +527,7 @@ struct registry_context {
     std::vector<std::shared_ptr<registry_pool_state>> pools;
     std::vector<std::shared_ptr<void>>                authorities;
     std::shared_ptr<const lifecycle_plan_snapshot>    exact_plan;
-    std::array<std::shared_ptr<const lifecycle_plan_snapshot>, 8> stale_plans{};
-    size_t                                             stale_plan_count = 0;
+    uint64_t                                           publication_generation = 0;
     std::vector<moe_mmid_queue_capability>            queues;
     bool                                               accepting = true;
 };
@@ -538,8 +537,7 @@ struct registry_context {
 struct moe_mmid_workspace_registry::state {
     mutable std::mutex                             mutex;
     std::vector<std::shared_ptr<registry_context>> contexts;
-    std::array<std::shared_ptr<const lifecycle_plan_snapshot>, 64> stale_plans{};
-    size_t stale_plan_count = 0;
+    uint64_t publication_generation = 1;
 };
 
 namespace {
@@ -791,11 +789,11 @@ bool moe_admitted_workspace_bundle::terminal_release() noexcept {
             slot.epoch != epoch_ || slot.bundle_serial != capability_) return false;
         bool ready = false;
         if (common_authority_) {
-            const auto & completion = common_authority_->completions[i];
-            if (!completion.valid() || completion.queue_identity_.get() != common_authority_->queues[i].identity_.get() ||
-                completion.invocation_serial_ != epoch_ || completion.admission_serial_ != capability_) return false;
-            ready = (completion.terminal_ && completion.terminal_->ready()) ||
-                    (completion.proof_ && completion.proof_->ready());
+            const auto & submission = common_authority_->submissions[i];
+            if (!submission.valid() || submission.queue_identity_.get() != common_authority_->queues[i].identity_.get() ||
+                submission.invocation_serial_ != epoch_ || submission.admission_serial_ != capability_) return false;
+            ready = (submission.terminal_ && submission.terminal_->ready()) ||
+                    (submission.proof_ && submission.proof_->ready());
         } else {
             const int device = owners_[i].owner_device;
             const auto terminal = graph_snapshot_->terminals.find(device);
@@ -833,11 +831,17 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         return moe_mmid_materialize_status::INVALID;
     }
     try {
+        uint64_t generation_ticket = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            generation_ticket = state_->publication_generation;
+        }
         auto candidate           = std::make_shared<registry_context>();
         candidate->token         = token;
         candidate->plan_identity = plan_identity;
         candidate->submit_device = submit_device;
         candidate->exact_plan    = std::move(exact_plan);
+        candidate->publication_generation = generation_ticket;
         candidate->pools.reserve(owners.size());
         candidate->queues.reserve(owners.size());
         for (const auto & owner : owners) {
@@ -901,19 +905,20 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             candidate->pools.push_back(std::move(pool));
         }
         std::lock_guard<std::mutex> lock(state_->mutex);
-        for (size_t i = 0; i < state_->stale_plan_count; ++i)
-            if (state_->stale_plans[i].get() == candidate->exact_plan.get())
-                return moe_mmid_materialize_status::INVALID;
+        if (generation_ticket != state_->publication_generation) return moe_mmid_materialize_status::INVALID;
+        bool has_active = false;
         for (const auto & existing : state_->contexts) {
             if (!same_token(existing->token, token) || existing->submit_device != submit_device) continue;
-            for (size_t i = 0; i < existing->stale_plan_count; ++i)
-                if (existing->stale_plans[i].get() == candidate->exact_plan.get())
-                    return moe_mmid_materialize_status::INVALID;
-            if (existing->plan_identity == plan_identity) {
-                return existing->exact_plan.get() == candidate->exact_plan.get() ?
+            if (candidate->exact_plan && existing->exact_plan.get() == candidate->exact_plan.get())
+                return moe_mmid_materialize_status::ALREADY_PUBLISHED;
+            if (existing->plan_identity == plan_identity)
+                return !candidate->exact_plan && !existing->exact_plan ?
                     moe_mmid_materialize_status::ALREADY_PUBLISHED : moe_mmid_materialize_status::INVALID;
-            }
+            if (candidate->exact_plan) has_active |= existing->accepting && existing->exact_plan != nullptr;
         }
+        // A second authoritative exact plan is a prepared replacement. Legacy
+        // host-test contexts remain independently addressable by plan id.
+        candidate->accepting = !candidate->exact_plan || !has_active;
         state_->contexts.push_back(std::move(candidate));
         return moe_mmid_materialize_status::PUBLISHED;
     } catch (...) {
@@ -1203,7 +1208,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
         request.shape.N <= 0 || request.shape.type < 0 || authority->owners.empty() ||
         authority->owners.size() > execution::max_devices || bindings->size() % request.shape.top_k != 0 ||
         authority->queues.size() != authority->owners.size() ||
-        authority->completions.size() != authority->owners.size()) return out;
+        authority->submissions.size() != authority->owners.size()) return out;
 
     uint64_t digest = 1469598103934665603ULL;
     auto mix = [&](uint64_t value) { digest = (digest ^ value) * 1099511628211ULL; };
@@ -1251,10 +1256,10 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     std::array<moe_mmid_workspace_geometry, execution::max_devices> geometry{};
     for (size_t r = 0; r < authority->owners.size(); ++r) {
         const auto & wanted = authority->owners[r]; const auto & queue = authority->queues[r];
-        const auto & completion = authority->completions[r];
+        const auto & submission = authority->submissions[r];
         if (!queue.valid() || queue.owner_device_ != wanted.owner_device || queue.cookie_ != wanted.queue_cookie ||
-            !completion.valid() || completion.queue_identity_.get() != queue.identity_.get() ||
-            completion.invocation_serial_ != authority->epoch || completion.admission_serial_ != 0) return out;
+            !submission.valid() || submission.queue_identity_.get() != queue.identity_.get() ||
+            submission.invocation_serial_ != authority->epoch || submission.admission_serial_ != 0) return out;
         for (size_t p = 0; p < context->pools.size(); ++p) {
             const auto & pool = context->pools[p];
             if (pool->owner_device != wanted.owner_device) continue;
@@ -1308,7 +1313,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     }
     const uint64_t capability = moe_mmid_mint_monotonic_cookie(next_bundle_capability); if (!capability) return out;
     for (size_t r = 0; r < authority->owners.size(); ++r) {
-        authority->completions[r].admission_serial_ = capability;
+        authority->submissions[r].admission_serial_ = capability;
         auto & slot = context->pools[pool_map[r]]->slots[selected[r]];
         slot.generation = out.bundle.leases_[r].generation_; slot.epoch = authority->epoch;
         slot.bundle_serial = capability; slot.quarantined = false; slot.busy = true;
@@ -1325,24 +1330,33 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
 bool moe_mmid_workspace_registry::replace_plan(
     const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
     const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
-    uint64_t replacement_identity) noexcept {
+    uint64_t replacement_identity, bool stable_geometry) noexcept {
     if (!expected || !replacement || !replacement_identity) return false;
     std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->stale_plan_count >= state_->stale_plans.size()) return false;
+    std::shared_ptr<registry_context> old_context, prepared_context;
     for (const auto & context : state_->contexts) {
-        if (context->exact_plan.get() != expected.get()) continue;
-        if (context->stale_plan_count >= context->stale_plans.size()) return false;
+        if (context->exact_plan.get() == expected.get() && context->accepting) old_context = context;
+        if (context->exact_plan.get() == replacement.get() && !context->accepting) prepared_context = context;
     }
-    // Global tombstone is published first under the same registry lock, so a
-    // materialization prepared before replacement cannot publish afterward.
-    state_->stale_plans[state_->stale_plan_count++] = expected;
-    for (const auto & context : state_->contexts) {
-        if (context->exact_plan.get() != expected.get()) continue;
-        context->stale_plans[context->stale_plan_count++] = expected;
-        context->exact_plan = replacement;
-        context->plan_identity = replacement_identity;
-        context->accepting = true;
-        for (const auto & pool : context->pools) pool->plan_identity = replacement_identity;
+    if (!old_context) return state_->contexts.empty();
+    if (!stable_geometry && !prepared_context) return false;
+    if (state_->publication_generation == UINT64_MAX) return false;
+    ++state_->publication_generation; // invalidates every in-flight materialization ticket
+    if (prepared_context) {
+        old_context->accepting = false;
+        prepared_context->accepting = true;
+        prepared_context->plan_identity = replacement_identity;
+        prepared_context->publication_generation = state_->publication_generation;
+        for (const auto & pool : prepared_context->pools) pool->plan_identity = replacement_identity;
+        // Drop registry ownership of the retired context; committed bundles
+        // retain its pools independently until terminal submission.
+        state_->contexts.erase(std::remove(state_->contexts.begin(), state_->contexts.end(), old_context),
+                               state_->contexts.end());
+    } else {
+        old_context->exact_plan = replacement;
+        old_context->plan_identity = replacement_identity;
+        old_context->publication_generation = state_->publication_generation;
+        for (const auto & pool : old_context->pools) pool->plan_identity = replacement_identity;
     }
     return true;
 }
@@ -1352,16 +1366,12 @@ size_t moe_mmid_workspace_registry::invalidate_plan(const lifecycle_plan_snapsho
     size_t invalidated = 0;
     try {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->stale_plan_count < state_->stale_plans.size()) {
-            for (const auto & context : state_->contexts) {
-                if (context->exact_plan.get() == exact_plan) {
-                    state_->stale_plans[state_->stale_plan_count++] = context->exact_plan;
-                    break;
-                }
-            }
-        }
+        bool matched = false;
         for (const auto & context : state_->contexts)
-            if (context->accepting && context->exact_plan.get() == exact_plan) { context->accepting = false; ++invalidated; }
+            if (context->accepting && context->exact_plan.get() == exact_plan) {
+                context->accepting = false; ++invalidated; matched = true;
+            }
+        if (matched && state_->publication_generation != UINT64_MAX) ++state_->publication_generation;
     } catch (...) { return 0; }
     return invalidated;
 }
@@ -1402,11 +1412,11 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
                     bool matched = false;
                     for (size_t i = 0; i < common->queues.size(); ++i) {
                         if (common->queues[i].identity_.get() != context->queues[pool_index].identity_.get()) continue;
-                        const auto & completion = common->completions[i]; matched = true;
-                        if (!completion.valid() || completion.admission_serial_ != slot.bundle_serial ||
-                            completion.invocation_serial_ != slot.epoch ||
-                            !((completion.terminal_ && completion.terminal_->ready()) ||
-                              (completion.proof_ && (wait ? completion.proof_->wait_and_confirm() : completion.proof_->ready()))))
+                        const auto & submission = common->submissions[i]; matched = true;
+                        if (!submission.valid() || submission.admission_serial_ != slot.bundle_serial ||
+                            submission.invocation_serial_ != slot.epoch ||
+                            !((submission.terminal_ && submission.terminal_->ready()) ||
+                              (submission.proof_ && (wait ? submission.proof_->wait_and_confirm() : submission.proof_->ready()))))
                             ready = false;
                     }
                     if (!matched) ready = false;

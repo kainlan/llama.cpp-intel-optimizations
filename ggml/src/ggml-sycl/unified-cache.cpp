@@ -307,9 +307,15 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
             }
             return true;
         }();
-        if (!stable_workspace || !unified_cache_moe_mmid_registry().replace_plan(
-                                     expected, replacement, replacement->version)) return false;
-        current->second = replacement;
+        if (!unified_cache_moe_mmid_registry().replace_plan(
+                expected, replacement, replacement->version, stable_workspace)) return false;
+        try {
+            current->second = replacement;
+        } catch (...) {
+            (void) unified_cache_moe_mmid_registry().replace_plan(
+                replacement, expected, expected->version, stable_workspace);
+            throw;
+        }
         return true;
     } catch (...) {
         return false;
@@ -333,24 +339,6 @@ moe_mmid_queue_capability workspace_admission_authority_issuer::queue(
     return out;
 }
 
-moe_mmid_queue_completion_capability workspace_admission_authority_issuer::terminal(
-    const moe_mmid_queue_capability & queue, uint64_t invocation_serial,
-    std::shared_ptr<moe::device_terminal> terminal) noexcept {
-    moe_mmid_queue_completion_capability out;
-    if (!queue.valid() || !invocation_serial || !terminal) return out;
-    out.queue_identity_ = queue.identity_; out.invocation_serial_ = invocation_serial; out.terminal_ = std::move(terminal);
-    return out;
-}
-
-moe_mmid_queue_completion_capability workspace_admission_authority_issuer::quiescence(
-    const moe_mmid_queue_capability & queue, uint64_t invocation_serial,
-    std::shared_ptr<moe::queue_quiescence_proof> proof) noexcept {
-    moe_mmid_queue_completion_capability out;
-    if (!queue.valid() || !invocation_serial || !proof) return out;
-    out.queue_identity_ = queue.identity_; out.invocation_serial_ = invocation_serial; out.proof_ = std::move(proof);
-    return out;
-}
-
 bool workspace_admission_authority_issuer::graph(
     moe::graph_retention_registry & registry, const moe::published_graph_token & token,
     std::shared_ptr<const moe::graph_retention_record> snapshot,
@@ -358,24 +346,38 @@ bool workspace_admission_authority_issuer::graph(
     std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
     std::shared_ptr<const moe::graph_private_table_owner> table,
     std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
-    std::vector<moe_mmid_queue_completion_capability> completions,
     workspace_admission_authority * out) noexcept {
     if (!out || !snapshot || !plan || !plan->plan || plan->version == 0 || !token.valid() ||
         plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
         snapshot->root.model.value != model_token.model_id || snapshot->root.load.value != model_token.load_txn_id ||
         snapshot->root.owner.generation != model_token.generation || snapshot->phase != moe::retention_phase::INSTALLED ||
-        owners.size() != queues.size() || owners.size() != completions.size()) return false;
+        owners.size() != queues.size()) return false;
     moe::published_graph_token canonical;
     if (registry.snapshot(snapshot->key).get() != snapshot.get() ||
         registry.acquire_published_token(snapshot->key, &canonical) != moe::retention_error::OK ||
         std::memcmp(&canonical, &token, sizeof(token)) != 0) return false;
     try {
+        std::vector<queue_submission_authority> submissions;
+        submissions.reserve(owners.size());
+        for (size_t i = 0; i < owners.size(); ++i) {
+            const auto terminal = snapshot->terminals.find(owners[i].owner_device);
+            const auto proof = snapshot->quiescence_proofs.find(owners[i].owner_device);
+            if (!queues[i].valid() || (terminal == snapshot->terminals.end() && proof == snapshot->quiescence_proofs.end()))
+                return false;
+            queue_submission_authority submission;
+            submission.queue_identity_ = queues[i].identity_;
+            submission.invocation_serial_ = snapshot->key.epoch.value;
+            if (terminal != snapshot->terminals.end()) submission.terminal_ = terminal->second;
+            else submission.proof_ = proof->second;
+            if (!submission.valid()) return false;
+            submissions.push_back(std::move(submission));
+        }
         auto state = std::make_shared<workspace_admission_authority::state>();
         state->token = model_token; state->submit_device = submit_device; state->plan_identity = plan->version;
         state->epoch = snapshot->key.epoch.value; state->plan = std::move(plan); state->graph_registry = &registry;
         state->graph_token = token; state->graph_snapshot = std::move(snapshot); state->occurrences = std::move(occurrences);
         state->table = std::move(table); state->owners = std::move(owners); state->queues = std::move(queues);
-        state->completions = std::move(completions); out->state_ = std::move(state); return true;
+        state->submissions = std::move(submissions); out->state_ = std::move(state); return true;
     } catch (...) { return false; }
 }
 
@@ -385,14 +387,14 @@ bool workspace_admission_authority_issuer::direct(
     std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
     std::shared_ptr<const moe::graph_private_table_owner> table,
     std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
-    std::vector<moe_mmid_queue_completion_capability> completions,
+    std::vector<queue_submission_authority> submissions,
     workspace_admission_authority * out) noexcept {
     if (!out || !snapshot.active() || !plan || !plan->plan || plan->version == 0 || !model_token.valid() ||
         plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
         snapshot.root().model.value != model_token.model_id || snapshot.root().load.value != model_token.load_txn_id ||
         snapshot.root().owner.generation != model_token.generation || submit_device < 0 || !occurrences ||
         occurrences->empty() || !table || owners.empty() || owners.size() != queues.size() ||
-        owners.size() != completions.size() || table->owner().context.value != snapshot.context().value ||
+        owners.size() != submissions.size() || table->owner().context.value != snapshot.context().value ||
         table->owner().epoch.value != snapshot.graph_epoch().value ||
         registry.validate_authoritative_invocation_snapshot(snapshot) != execution::error::OK) return false;
     std::shared_ptr<direct_invocation_pin> pin;
@@ -410,7 +412,7 @@ bool workspace_admission_authority_issuer::direct(
         state->epoch = exact.graph_epoch().value; state->plan = std::move(plan);
         state->invocation_pin = std::move(pin);
         state->occurrences = std::move(occurrences); state->table = std::move(table); state->owners = std::move(owners);
-        state->queues = std::move(queues); state->completions = std::move(completions);
+        state->queues = std::move(queues); state->submissions = std::move(submissions);
         out->state_ = std::move(state); return true;
     } catch (...) { return false; }
 }
@@ -3795,7 +3797,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             return nullptr;
         }
     } else {
-        // Copy data from source to device — deferred completion via ready_event
+        // Copy data from source to device — deferred submission via ready_event
         has_copy_event = true;
         copy_evt       = copy_to_device(device_ptr, src_ptr, size);
     }
@@ -6474,7 +6476,7 @@ bool unified_cache::stage_expert_group(int                          block_id,
         //    consecutive fills share the same staging VRAM.  The BCS H2D for
         //    tensor N+1 must not overwrite the temp buffer while the CCS reorder
         //    for tensor N is still reading it.  We chain fills via deps: each
-        //    fill's H2D depends on the previous fill's reorder completion event.
+        //    fill's H2D depends on the previous fill's reorder submission event.
         //    Without this, the BCS and CCS queues race on the shared temp buffer
         //    (WAR hazard) causing corrupted SOA layouts or BCS CAT faults.
         sycl::queue & dq  = get_dma_queue();
@@ -10513,7 +10515,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         // Host zones use TLSF. WEIGHT and persistent KV zones support
         // per-alloc zone_free. EXPERT_STAGING in SCRATCH is also scoped and
         // reclaimable: PP MoE CPU fallback allocates act/out slabs per expert
-        // and releases them after synchronous D2H -> CPU -> H2D completion.
+        // and releases them after synchronous D2H -> CPU -> H2D submission.
         // The staging_buffer_pool is also an explicit owner: when it releases an
         // idle slot, the backing STAGING-zone allocation must return to TLSF
         // immediately.
@@ -10779,7 +10781,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         if (mode < 0) {
             const char * env = std::getenv("GGML_SYCL_ALLOC_PHASE_GATE");
             // Diagnostic gate only. Default logging here interleaves with token
-            // output and breaks deterministic completion checks; enable it
+            // output and breaks deterministic submission checks; enable it
             // explicitly when auditing steady-state allocation regressions.
             mode             = (env != nullptr) ? std::atoi(env) : 0;  // 0=off, 1=warn, 2=assert
             s_phase_gate_mode.store(mode, std::memory_order_relaxed);
@@ -13916,7 +13918,7 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         mem_handle::from_direct(const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
     mem_copy(partial_handle, partial_src, partial_bytes, queue_, {});
 
-    // Apply the synchronous in-place SOA reorder only after upload completion.
+    // Apply the synchronous in-place SOA reorder only after upload submission.
     bool reordered =
         reorder_rows_to_soa(static_cast<uint8_t *>(dev_ptr), type, ncols, row_count, partial_bytes, &queue_);
     if (!reordered) {
@@ -13927,7 +13929,7 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
     }
 
     // Publish owner and accounting exactly once while construction remains
-    // serialized. Readers cannot observe a pointer before reorder completion.
+    // serialized. Readers cannot observe a pointer before reorder submission.
     partial_cache_.emplace(key, partial_entry{ dev_ptr,   device_idx, type,          ncols,
                                                row_start, row_count,  partial_bytes, std::move(partial_handle) });
     used_.fetch_add(partial_bytes, std::memory_order_relaxed);
