@@ -237,6 +237,8 @@ class moe_mmid_registry_lease {
     uint64_t                   generation_   = 0;
     uint64_t                   queue_cookie_ = 0;
     uint64_t                   epoch_        = 0;
+    moe_mmid_workspace_geometry admitted_geometry_;
+    moe_mmid_materialized_slices admitted_slices_;
     friend class moe_mmid_workspace_registry;
     friend class moe_admitted_workspace_bundle;
 };

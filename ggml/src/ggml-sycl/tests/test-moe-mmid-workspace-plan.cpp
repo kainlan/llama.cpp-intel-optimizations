@@ -452,7 +452,8 @@ static void registry_materialization_and_rollback() {
     aggregate_owner.geometry = aggregate;
     check(moe_mmid_checked_pool_bytes(aggregate, MOE_MMID_WORKSPACE_DEPTH, &aggregate_owner.device_pool_bytes,
                                       &aggregate_owner.host_pool_bytes), "mixed aggregate pool sizing failed");
-    check(registry.materialize({ 91, 92, 93 }, 902, 0, { aggregate_owner }, allocator) ==
+    const moe_mmid_model_token aggregate_token{ 91, 92, 93 };
+    check(registry.materialize(aggregate_token, 902, 0, { aggregate_owner }, allocator) ==
               moe_mmid_materialize_status::PUBLISHED,
           "mixed K/N canonical aggregate was not materialized");
     check(registry.published_contexts() == 2, "published contexts missing");
@@ -714,6 +715,44 @@ static moe_mmid_admission_request admission_request(const moe_mmid_model_token &
     return request;
 }
 
+static void registry_component_max_constituent_coverage() {
+    const moe_mmid_model_token token{ 49, 50, 51 };
+    std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    moe_mmid_workspace_geometry k_max, n_max, aggregate;
+    check(moe_mmid_plan_workspace({ 128, 32, 2, 2, 3 }, false, &k_max) &&
+              moe_mmid_plan_workspace({ 32, 128, 2, 2, 3 }, false, &n_max) &&
+              moe_mmid_component_max(&aggregate, k_max) && moe_mmid_component_max(&aggregate, n_max),
+          "constituent aggregate setup failed");
+    moe_mmid_materialized_owner_plan owner;
+    owner.owner_device = 0; owner.queue_cookie = 690; owner.geometry = aggregate;
+    check(moe_mmid_checked_pool_bytes(aggregate, MOE_MMID_WORKSPACE_DEPTH, &owner.device_pool_bytes,
+                                      &owner.host_pool_bytes) &&
+              registry.materialize(token, 691, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+          "constituent aggregate publication failed");
+    for (const auto & shape : std::vector<std::pair<int64_t, int64_t>>{ { 128, 32 }, { 32, 128 } }) {
+        auto request = admission_request(token, 691, { { 0, 690 } }, 692 + shape.first);
+        request.K = shape.first; request.N = shape.second;
+        auto admitted = registry.admit(request);
+        check(admitted.status == moe_mmid_lease_status::ACQUIRED, "constituent coverage rejected");
+        const auto & geometry = admitted.bundle.owner_leases()[0].geometry();
+        const auto & slices = admitted.bundle.owner_leases()[0].slices();
+        check(slices.activation_f32.bytes == geometry.activation_f32_bytes &&
+                  slices.output_f32.bytes == geometry.output_f32_bytes &&
+                  slices.activation_f32.bytes <= aggregate.activation_f32_bytes &&
+                  slices.output_f32.bytes <= aggregate.output_f32_bytes,
+              "admitted slices were not exact requested subranges");
+        check(admitted.bundle.terminal_release(), "constituent release failed");
+    }
+    auto too_large = admission_request(token, 691, { { 0, 690 } }, 999);
+    too_large.K = 160;
+    check(registry.admit(too_large).status == moe_mmid_lease_status::INVALID,
+          "T-1 aggregate capacity admitted oversized constituent");
+}
+
 static void registry_atomic_bundle_authority() {
     const moe_mmid_model_token token{ 51, 52, 53 };
     std::atomic<int> destroyed{ 0 };
@@ -966,6 +1005,7 @@ int main() {
         registry_replacement_and_queue_reset();
         registry_concurrent_depth_busy();
         registry_retirement_retains_outstanding_lease();
+        registry_component_max_constituent_coverage();
         registry_atomic_bundle_authority();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();

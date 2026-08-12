@@ -133,10 +133,15 @@ retention_error graph_retention_registry::validate_record(const graph_retention_
     for (const auto & batch : record.batches) {
         const auto & id = batch.identity;
         if (id.allocation_id == 0 || id.generation == 0 || id.layout_id == 0 || id.device < 0 ||
-            id.device >= static_cast<int>(execution::max_devices) || id.byte_size == 0 || id.occurrence == 0 ||
+            id.device >= static_cast<int>(execution::max_devices) || id.byte_size == 0 ||
             id.byte_offset > std::numeric_limits<size_t>::max() - id.byte_size || !batch.owner.valid() ||
             batch.owner.allocation_id() != id.allocation_id || batch.owner.generation() != id.generation ||
             batch.owner.device() != id.device || id.byte_offset + id.byte_size > batch.owner.extent()) {
+            return retention_error::MISMATCH;
+        }
+    }
+    for (size_t occurrence = 0; occurrence < record.batches.size(); ++occurrence) {
+        if (record.batches[occurrence].identity.occurrence != occurrence) {
             return retention_error::MISMATCH;
         }
     }

@@ -153,9 +153,10 @@ static retained_allocation_owner owner_capability(uint64_t                      
     return retained_allocation_test_factory::mint(allocation, generation, device, extent, handle);
 }
 
-static mmid_batch_binding binding(uint64_t allocation, const std::shared_ptr<const void> & handle, int device = 0) {
+static mmid_batch_binding binding(uint64_t allocation, const std::shared_ptr<const void> & handle, int device = 0,
+                                  uint32_t occurrence = 0) {
     return {
-        { allocation, 1, 9, device, 16, 64, 1 },
+        { allocation, 1, 9, device, 16, 64, occurrence },
         owner_capability(allocation, handle, device)
     };
 }
@@ -962,7 +963,7 @@ int main() {
 
     // Every durable identity component is validated, including range overflow
     // and correlation with the typed allocation owner.
-    const mmid_operand_identity valid_identity{ 501, 1, 9, 0, 16, 64, 1 };
+    const mmid_operand_identity valid_identity{ 501, 1, 9, 0, 16, 64, 0 };
     auto                        invalid = valid_identity;
     invalid.layout_id                   = 0;
     require_bad_identity(invalid, 501, "zero layout accepted");
@@ -983,10 +984,19 @@ int main() {
     invalid.byte_offset = 4080;
     invalid.byte_size   = 32;
     require_bad_identity(invalid, 501, "range outside canonical owner extent accepted");
-    invalid            = valid_identity;
-    invalid.occurrence = 0;
-    require_bad_identity(invalid, 501, "zero occurrence accepted");
     require_bad_identity(valid_identity, 999, "cross-owner allocation identity accepted");
+
+    graph_retention_registry ordered_registry;
+    fixture ordered_fixture(ordered_registry);
+    auto ordered_tx = begin_tx(ordered_fixture);
+    auto ordered_owner = std::make_shared<int>(501);
+    require(ordered_tx.add_batch(binding(601, ordered_owner, 0, 0)) == retention_error::OK &&
+                ordered_tx.add_batch(binding(602, ordered_owner, 0, 1)) == retention_error::OK &&
+                ordered_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                ordered_tx.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
+            "zero-based ordered batch setup failed");
+    ordered_tx.mark_finalized();
+    require(ordered_tx.commit() == retention_error::OK, "zero-based 0..N-1 commit rejected");
 
     // Concurrent replay/invalidation: successful replays finish exactly; once
     // invalidation makes the epoch RETIRING, stale token starts are rejected.

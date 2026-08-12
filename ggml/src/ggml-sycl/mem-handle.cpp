@@ -468,6 +468,18 @@ mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     return h;
 }
 
+#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_t generation, size_t extent,
+                                                 size_t offset, size_t size) noexcept {
+    mem_handle_lock_guard guard(lock_);
+    canonical_allocation_id_ = allocation_id;
+    canonical_generation_ = generation;
+    canonical_extent_ = extent;
+    offset_ = offset;
+    size_ = size;
+}
+#endif
+
 std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integration::retain(
     const mem_handle & handle) noexcept {
     try {

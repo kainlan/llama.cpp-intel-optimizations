@@ -530,6 +530,17 @@ bool same_token(const moe_mmid_model_token & a, const moe_mmid_model_token & b) 
     return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id && a.generation == b.generation;
 }
 
+moe_mmid_blob retained_subrange(const moe_mmid_blob & blob, size_t offset, size_t bytes) noexcept {
+    moe_mmid_blob out;
+    if (!blob.valid() || bytes == 0 || offset > blob.bytes || bytes > blob.bytes - offset) return out;
+    out.owner = blob.owner;
+    out.ptr = static_cast<unsigned char *>(blob.ptr) + offset;
+    out.bytes = bytes;
+    out.device = blob.device;
+    out.host_pinned = blob.host_pinned;
+    return out;
+}
+
 bool same_geometry(const moe_mmid_workspace_geometry & a, const moe_mmid_workspace_geometry & b) noexcept {
 #define MMID_GEOMETRY_EQ(f) a.f == b.f
     return MMID_GEOMETRY_EQ(valid) && MMID_GEOMETRY_EQ(activation_rows) && MMID_GEOMETRY_EQ(occurrences) &&
@@ -586,12 +597,12 @@ int moe_mmid_registry_lease::owner_device() const noexcept {
 
 const moe_mmid_workspace_geometry & moe_mmid_registry_lease::geometry() const noexcept {
     static const moe_mmid_workspace_geometry invalid;
-    return valid() ? authority_->pool->geometry : invalid;
+    return valid() ? admitted_geometry_ : invalid;
 }
 
 const moe_mmid_materialized_slices & moe_mmid_registry_lease::slices() const noexcept {
     static const moe_mmid_materialized_slices invalid;
-    return valid() ? authority_->slices : invalid;
+    return valid() ? admitted_slices_ : invalid;
 }
 
 moe_mmid_release_status moe_mmid_registry_lease::terminal_release(uint64_t queue, uint64_t generation) noexcept {
@@ -884,6 +895,8 @@ moe_mmid_registry_lease_result moe_mmid_workspace_registry::acquire(const moe_mm
             }
             const uint64_t next_generation = slot.generation + 1;
             // shared_ptr handoff and scalar writes are nonthrowing. Publish BUSY last.
+            out.lease.admitted_geometry_   = pool->geometry;
+            out.lease.admitted_slices_     = authority->slices;
             out.lease.authority_           = std::move(authority);
             out.lease.generation_          = next_generation;
             out.lease.queue_cookie_        = queue_cookie;
@@ -980,6 +993,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     if (!context || context->pools.size() != request.owners.size()) return out;
 
     const size_t capacity = bindings->size() / request.top_k;
+    std::array<moe_mmid_workspace_geometry, execution::max_devices> requested_geometry{};
     for (size_t r = 0; r < request.owners.size(); ++r) {
         const auto & wanted = request.owners[r];
         if (wanted.owner_device < 0 || wanted.queue_cookie == 0) return out;
@@ -988,11 +1002,26 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
             if (pool->owner_device != wanted.owner_device) continue;
             if (pool_map[r] != SIZE_MAX || pool->queue_cookie != wanted.queue_cookie) return out;
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
-            moe_mmid_workspace_geometry expected;
+            auto & needed = requested_geometry[r];
+            const auto & available = pool->geometry;
             if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N),
                                             request.ne11, request.top_k, capacity },
-                                          wanted.owner_device != request.submit_device, &expected) ||
-                !same_geometry(expected, pool->geometry)) return out;
+                                          wanted.owner_device != request.submit_device, &needed) ||
+                !moe_mmid_validate_workspace_geometry(available, wanted.owner_device != request.submit_device) ||
+                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
+                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
+                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
+                available.activation_f32_bytes < needed.activation_f32_bytes ||
+                available.activation_q8_bytes < needed.activation_q8_bytes ||
+                available.output_f32_bytes < needed.output_f32_bytes ||
+                available.output_q8_bytes < needed.output_q8_bytes ||
+                available.descriptor_host_bytes < needed.descriptor_host_bytes ||
+                available.secondary_activation_d2h_bytes < needed.secondary_activation_d2h_bytes ||
+                available.secondary_activation_h2d_bytes < needed.secondary_activation_h2d_bytes ||
+                available.secondary_output_d2h_bytes < needed.secondary_output_d2h_bytes ||
+                available.secondary_output_h2d_bytes < needed.secondary_output_h2d_bytes ||
+                available.secondary_bounce_bytes < needed.secondary_bounce_bytes ||
+                available.host_slot_bytes < needed.host_slot_bytes) return out;
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out;
@@ -1019,6 +1048,27 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
         lease.generation_ = pool->slots[selected[r]].generation + 1;
         lease.queue_cookie_ = request.owners[r].queue_cookie;
         lease.epoch_ = snapshot->key.epoch.value;
+        lease.admitted_geometry_ = requested_geometry[r];
+        const size_t device_base = static_cast<size_t>(selected[r]) * pool->geometry.device_slot_bytes;
+        const size_t host_base = static_cast<size_t>(selected[r]) * pool->geometry.host_slot_bytes;
+        lease.admitted_slices_.activation_f32 = retained_subrange(
+            pool->device_pool, device_base + pool->geometry.activation_f32_offset,
+            requested_geometry[r].activation_f32_bytes);
+        lease.admitted_slices_.activation_q8 = retained_subrange(
+            pool->device_pool, device_base + pool->geometry.activation_q8_offset,
+            requested_geometry[r].activation_q8_bytes);
+        lease.admitted_slices_.output_f32 = retained_subrange(
+            pool->device_pool, device_base + pool->geometry.output_f32_offset,
+            requested_geometry[r].output_f32_bytes);
+        lease.admitted_slices_.output_q8 = retained_subrange(
+            pool->device_pool, device_base + pool->geometry.output_q8_offset,
+            requested_geometry[r].output_q8_bytes);
+        if (requested_geometry[r].host_slot_bytes != 0)
+            lease.admitted_slices_.host = retained_subrange(pool->host_pool, host_base,
+                                                            requested_geometry[r].host_slot_bytes);
+        if (!lease.admitted_slices_.activation_f32.valid() || !lease.admitted_slices_.activation_q8.valid() ||
+            !lease.admitted_slices_.output_f32.valid() || !lease.admitted_slices_.output_q8.valid() ||
+            (requested_geometry[r].host_slot_bytes != 0 && !lease.admitted_slices_.host.valid())) return out;
         out.bundle.owners_[r] = request.owners[r];
     }
 

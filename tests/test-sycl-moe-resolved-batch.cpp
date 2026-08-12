@@ -52,11 +52,9 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
     h.key_                  = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
     h.gen_                  = cache_generation();
     h.cached_                  = { ptr, layout, on_device, false, sycl::event{} };
-    h.canonical_allocation_id_ = key_id.aux_id;
-    h.canonical_generation_    = h.gen_;
-    h.canonical_extent_        = 4096;
-    h.offset_                  = 64;
-    h.size_                    = 256;
+#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+    h.set_canonical_identity_for_test(key_id.aux_id, h.gen_, 4096, 64, 256);
+#endif
     h.leased_storage_owner_    = std::move(storage_owner);
     return h;
 }
