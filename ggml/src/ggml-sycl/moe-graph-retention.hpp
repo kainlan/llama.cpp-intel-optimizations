@@ -260,7 +260,7 @@ class graph_recording_transaction {
     graph_recording_transaction & operator=(graph_recording_transaction && other) noexcept;
     ~graph_recording_transaction();
 
-    graph_owner_key key() const noexcept { return key_; }
+    graph_owner_key key() const noexcept;
 
     retention_error add_batch(const mmid_batch_binding & binding) noexcept;
     retention_error add_table(const graph_private_table_binding & binding) noexcept;
@@ -269,7 +269,7 @@ class graph_recording_transaction {
     retention_error set_quiescence_proof(int device, const std::shared_ptr<queue_quiescence_proof> & proof) noexcept;
     retention_error note_submission(int device, submit_outcome outcome) noexcept;
 
-    void mark_finalized() noexcept { finalized_ = true; }
+    void mark_finalized() noexcept;
 
     retention_error commit() noexcept;
     // Abort a pre-commit partial record. Every possibly-submitted device must
@@ -278,18 +278,25 @@ class graph_recording_transaction {
     retention_error abort_partial() noexcept;
     retention_error rollback() noexcept;
   private:
-    retention_error            publish_resources() noexcept;
-    void                       move_from(graph_recording_transaction && other) noexcept;
-    void                       release_local_owners() noexcept;
-    graph_retention_registry * retention_ = nullptr;
-    execution::Registry *      lifecycle_ = nullptr;
-    std::shared_ptr<graph_retention_record> record_;
-    graph_owner_key                         key_{};
-    bool                       resources_published_ = false;
-    bool                       activated_           = false;
-    bool                       retirement_pending_  = false;
-    bool                       finalized_           = false;
-    bool                       finished_            = true;
+    enum class control_phase { OPEN, COMMITTING, ABORTING, FROZEN, TERMINAL };
+    struct control_state {
+        std::mutex                              mutex;
+        std::condition_variable                 cv;
+        graph_retention_registry *              retention = nullptr;
+        execution::Registry *                   lifecycle = nullptr;
+        std::shared_ptr<graph_retention_record> record;
+        graph_owner_key                         key{};
+        control_phase                           phase = control_phase::TERMINAL;
+        bool resources_published = false;
+        bool activated = false;
+        bool retirement_pending = false;
+        bool finalized = false;
+    };
+    static retention_error publish_resources_locked(control_state & state) noexcept;
+    static retention_error abort_control(const std::shared_ptr<control_state> & state) noexcept;
+    std::shared_ptr<control_state> capture_control() const noexcept;
+    mutable std::mutex             handle_mutex_;
+    std::shared_ptr<control_state> control_;
 };
 
 #ifdef GGML_SYCL_RETENTION_TESTING

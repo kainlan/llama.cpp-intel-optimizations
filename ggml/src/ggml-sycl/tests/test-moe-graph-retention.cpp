@@ -408,6 +408,98 @@ int main() {
     require(freeze_abort_rc == retention_error::OK && freeze_waits.load() == 1 && freeze_registry.size() == 0,
             "abort did not wait the exact frozen device-1 set");
 
+    // Immediate successful abort races every wrapper entry point. Regardless
+    // of which side reaches the shared control mutex first, terminal state is
+    // stable and every later mutator returns BUSY without touching reset state.
+    for (int operation = 0; operation < 6; ++operation) {
+        graph_retention_registry wrapper_registry;
+        fixture                  wrapper_fixture(wrapper_registry);
+        auto                     wrapper_tx = begin_tx(wrapper_fixture);
+        auto                     wrapper_owner = std::make_shared<int>(2200 + operation);
+        auto wrapper_table = graph_private_table_owner::create(
+            wrapper_tx.key(), 2300 + operation, 1, 0, { owner_capability(2400 + operation, wrapper_owner) });
+        std::atomic<bool> wrapper_go{ false };
+        retention_error abort_rc = retention_error::STALE;
+        retention_error mutate_rc = retention_error::STALE;
+        auto mutate = [&]() {
+            switch (operation) {
+                case 0: return wrapper_tx.add_batch(binding(2500 + operation, wrapper_owner));
+                case 1: return wrapper_tx.add_owner(owner_capability(2500 + operation, wrapper_owner));
+                case 2: return wrapper_tx.add_table({ static_cast<uint64_t>(2300 + operation), 1, 0, wrapper_table });
+                case 3: return wrapper_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits));
+                case 4: return wrapper_tx.note_submission(0, submit_outcome::UNKNOWN);
+                default: {
+                    auto proof_state = std::make_shared<drain_state>(
+                        drain_state{ &wrapper_go, &wrapper_go, &child_waits });
+                    return wrapper_tx.set_quiescence_proof(
+                        0, queue_quiescence_test_factory::mint(proof_state, drain_ready_callback,
+                                                               drain_wait_callback));
+                }
+            }
+        };
+        std::thread aborter([&] {
+            while (!wrapper_go.load(std::memory_order_acquire)) std::this_thread::yield();
+            abort_rc = wrapper_tx.abort_partial();
+        });
+        std::thread mutator([&] {
+            while (!wrapper_go.load(std::memory_order_acquire)) std::this_thread::yield();
+            mutate_rc = mutate();
+        });
+        wrapper_go.store(true, std::memory_order_release);
+        aborter.join();
+        mutator.join();
+        require(abort_rc == retention_error::OK &&
+                    (mutate_rc == retention_error::OK || mutate_rc == retention_error::BUSY) &&
+                    mutate() == retention_error::BUSY && wrapper_registry.size() == 0,
+                "successful abort race left wrapper mutable or dereferenced detached record");
+    }
+
+    // Commit and simultaneous aborts share the same protocol. A moved alias
+    // may be destroyed concurrently; its destructor joins the control-state
+    // transition rather than destroying transaction ownership independently.
+    graph_retention_registry control_registry;
+    fixture                  control_fixture(control_registry);
+    auto                     control_tx = begin_tx(control_fixture);
+    control_tx.mark_finalized();
+    std::atomic<bool> control_go{ false };
+    retention_error abort_a = retention_error::STALE;
+    retention_error abort_b = retention_error::STALE;
+    retention_error commit_race = retention_error::STALE;
+    std::thread abort_one([&] {
+        while (!control_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        abort_a = control_tx.abort_partial();
+    });
+    std::thread abort_two([&] {
+        while (!control_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        abort_b = control_tx.abort_partial();
+    });
+    std::thread committer([&] {
+        while (!control_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        commit_race = control_tx.commit();
+    });
+    control_go.store(true, std::memory_order_release);
+    abort_one.join();
+    abort_two.join();
+    committer.join();
+    require((abort_a == retention_error::OK || abort_b == retention_error::OK) &&
+                (abort_a == retention_error::OK || abort_a == retention_error::BUSY) &&
+                (abort_b == retention_error::OK || abort_b == retention_error::BUSY) &&
+                (commit_race == retention_error::INCOMPLETE_TERMINALS || commit_race == retention_error::BUSY) &&
+                control_registry.size() == 0 &&
+                control_tx.add_owner(owner_capability(2600, std::make_shared<int>(2600))) == retention_error::BUSY,
+            "commit/simultaneous-abort control race failed");
+
+    graph_retention_registry move_registry;
+    fixture                  move_fixture(move_registry);
+    auto move_source = std::make_unique<graph_recording_transaction>(begin_tx(move_fixture));
+    auto move_target = std::make_unique<graph_recording_transaction>(std::move(*move_source));
+    require(move_source->abort_partial() == retention_error::BUSY,
+            "moved-from wrapper retained transaction ownership");
+    move_source.reset();
+    std::thread moved_destroyer([&] { move_target.reset(); });
+    moved_destroyer.join();
+    require(move_registry.size() == 0, "moved transaction destructor did not settle shared control");
+
     // A failed partial drain remains quarantined with all owners and can be
     // retried after the exact queue proof succeeds.
     graph_retention_registry abort_registry;
