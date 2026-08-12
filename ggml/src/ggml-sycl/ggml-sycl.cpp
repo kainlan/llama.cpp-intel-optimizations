@@ -11296,9 +11296,8 @@ static bool ggml_sycl_same_mmid_workspace_plan(const ggml_sycl::placement_plan &
 }
 
 static uint64_t ggml_sycl_next_mmid_queue_cookie() {
-    static std::atomic<uint64_t> next{ 1 };
-    uint64_t cookie = next.fetch_add(1, std::memory_order_relaxed);
-    return cookie != 0 && cookie != UINT64_MAX ? cookie : 0;
+    static std::atomic<uint64_t> last_issued{ 0 };
+    return ggml_sycl::moe_mmid_mint_monotonic_cookie(last_issued);
 }
 
 static bool ggml_sycl_materialize_published_mmid_workspaces(
@@ -14408,6 +14407,14 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
 
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
+    next_plan.planner_n_ctx     = n_ctx;
+    next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
+    next_plan.planner_n_seq_max = n_seq_max;
+    if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(
+            next_plan, g_tensor_inventory_detail, next_kv_info.n_expert_used)) {
+        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace demand/accounting failed\n");
+        return;
+    }
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
     next->kv_info       = next_kv_info;

@@ -1,6 +1,7 @@
 // Pure MMID workspace geometry and fixed-slot lease contracts.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -73,6 +74,10 @@ bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & geometry,
 bool moe_mmid_checked_zone_total(size_t base_bytes, size_t workspace_bytes, size_t * out) noexcept;
 bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept;
 bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept;
+
+// Mints [1, UINT64_MAX-1] exactly once. Saturates fail-closed at exhaustion.
+// The caller-owned atomic permits deterministic near-overflow testing.
+uint64_t moe_mmid_mint_monotonic_cookie(std::atomic<uint64_t> & last_issued) noexcept;
 
 struct moe_mmid_owner_accounting {
     int    owner_device    = -1;

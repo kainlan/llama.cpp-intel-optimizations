@@ -20752,6 +20752,68 @@ static bool account_moe_mmid_workspaces(placement_plan & plan,
     return true;
 }
 
+bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
+                                            const std::vector<placement_tensor_info> & tensor_inventory,
+                                            int n_expert_used) noexcept {
+    try {
+        placement_plan demand = plan;
+        plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
+        if (!demand.moe_mmid_workspace_valid) return false;
+        bool fits = demand.moe_mmid_workspaces.size() == plan.moe_mmid_workspaces.size();
+        for (const auto & required : demand.moe_mmid_workspaces) {
+            const auto existing = std::find_if(plan.moe_mmid_workspaces.begin(), plan.moe_mmid_workspaces.end(),
+                [&](const moe_mmid_owner_workspace_plan & pool) {
+                    return pool.owner_device == required.owner_device && pool.valid;
+                });
+            fits = fits && existing != plan.moe_mmid_workspaces.end() &&
+                   required.device_pool_bytes <= existing->device_pool_bytes &&
+                   required.host_pool_bytes <= existing->host_pool_bytes;
+        }
+        if (fits) return true;
+
+        const size_t old_device = plan.moe_mmid_device_pool_bytes;
+        const size_t new_device = demand.moe_mmid_device_pool_bytes;
+        if (plan.vram_bytes < old_device || plan.vram_bytes - old_device > SIZE_MAX - new_device) return false;
+        const size_t new_vram = plan.vram_bytes - old_device + new_device;
+        if (!plan.multi_device && new_vram > plan.vram_budget) return false;
+        auto new_per_device = plan.per_device_vram;
+        if (plan.multi_device) {
+            auto adjust = [&](const moe_mmid_owner_workspace_plan & workspace, bool add) {
+                const auto device = std::find(plan.devices.begin(), plan.devices.end(), workspace.owner_device);
+                if (device == plan.devices.end()) return false;
+                const size_t index = static_cast<size_t>(device - plan.devices.begin());
+                if (index >= new_per_device.size()) return false;
+                if (add) {
+                    if (new_per_device[index] > SIZE_MAX - workspace.device_pool_bytes) return false;
+                    new_per_device[index] += workspace.device_pool_bytes;
+                    if (new_per_device[index] > plan.vram_budget) return false;
+                } else {
+                    if (new_per_device[index] < workspace.device_pool_bytes) return false;
+                    new_per_device[index] -= workspace.device_pool_bytes;
+                }
+                return true;
+            };
+            for (const auto & workspace : plan.moe_mmid_workspaces) if (!adjust(workspace, false)) return false;
+            for (const auto & workspace : demand.moe_mmid_workspaces) if (!adjust(workspace, true)) return false;
+        }
+        if (demand.moe_mmid_host_pool_bytes > plan.moe_mmid_host_pool_bytes) {
+            const size_t growth = demand.moe_mmid_host_pool_bytes - plan.moe_mmid_host_pool_bytes;
+            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth) return false;
+            plan.host_zone_scratch_bytes += growth;
+            plan.host_bytes += growth;
+        }
+        plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
+        plan.moe_mmid_device_pool_bytes = demand.moe_mmid_device_pool_bytes;
+        plan.moe_mmid_host_pool_bytes = demand.moe_mmid_host_pool_bytes;
+        plan.moe_mmid_workspace_valid = true;
+        plan.vram_bytes = new_vram;
+        plan.per_device_vram = std::move(new_per_device);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static void reject_moe_mmid_workspaces(placement_plan & plan) {
     plan.moe_mmid_workspace_valid = false;
     plan.moe_mmid_workspaces.clear();

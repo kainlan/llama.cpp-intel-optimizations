@@ -1215,6 +1215,13 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts = 0);
+// Recomputes MMID demand against updated planner capacity. If every owner fits
+// the immutable published pools, retains their exact geometry/accounting.
+// Otherwise publishes exact new geometry and checked accounting in `plan`.
+bool replan_moe_mmid_workspaces_for_runtime(placement_plan &                           plan,
+                                            const std::vector<placement_tensor_info> & tensor_inventory,
+                                            int                                        n_expert_used) noexcept;
+
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &         device_budgets,
                                          const std::vector<placement_tensor_info> & tensor_inventory,
                                          int                                        n_layers,

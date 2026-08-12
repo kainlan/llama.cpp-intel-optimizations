@@ -188,6 +188,19 @@ bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept
     return true;
 }
 
+uint64_t moe_mmid_mint_monotonic_cookie(std::atomic<uint64_t> & last_issued) noexcept {
+    uint64_t observed = last_issued.load(std::memory_order_relaxed);
+    for (;;) {
+        if (observed >= UINT64_MAX - 1) {
+            return 0;
+        }
+        const uint64_t next = observed + 1;
+        if (last_issued.compare_exchange_weak(observed, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
+
 bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept {
     if (remaining_bytes == nullptr || workspace_bytes > *remaining_bytes) {
         return false;
@@ -312,19 +325,23 @@ moe_mmid_release_status moe_mmid_workspace_pool::terminal_release(const moe_mmid
 }
 
 moe_mmid_blob moe_mmid_blob::slice(size_t offset, size_t length) const noexcept {
-    moe_mmid_blob out;
-    if (!valid() || offset > bytes || length > bytes - offset) {
+    try {
+        moe_mmid_blob out;
+        if (!valid() || offset > bytes || length > bytes - offset) {
+            return out;
+        }
+        out.owner = slice_owner ? slice_owner(offset, length) : owner;
+        if (!out.owner) {
+            return {};
+        }
+        out.ptr         = static_cast<unsigned char *>(ptr) + offset;
+        out.bytes       = length;
+        out.device      = device;
+        out.host_pinned = host_pinned;
         return out;
-    }
-    out.owner = slice_owner ? slice_owner(offset, length) : owner;
-    if (!out.owner) {
+    } catch (...) {
         return {};
     }
-    out.ptr         = static_cast<unsigned char *>(ptr) + offset;
-    out.bytes       = length;
-    out.device      = device;
-    out.host_pinned = host_pinned;
-    return out;
 }
 
 namespace {

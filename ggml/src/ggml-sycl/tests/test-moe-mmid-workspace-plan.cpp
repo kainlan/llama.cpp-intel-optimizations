@@ -251,6 +251,15 @@ static void finalized_owner_accounting() {
           "actual alternate/per-device/global totals mismatch");
 }
 
+static void cookie_saturates_without_reuse() {
+    std::atomic<uint64_t> cookie{ std::numeric_limits<uint64_t>::max() - 2 };
+    check(moe_mmid_mint_monotonic_cookie(cookie) == std::numeric_limits<uint64_t>::max() - 1,
+          "last valid queue cookie was not minted");
+    check(moe_mmid_mint_monotonic_cookie(cookie) == 0 && moe_mmid_mint_monotonic_cookie(cookie) == 0 &&
+              cookie.load() == std::numeric_limits<uint64_t>::max() - 1,
+          "exhausted queue cookie wrapped or reused zero/MAX");
+}
+
 static void registry_materialization_and_rollback() {
     const moe_mmid_model_token  token{ 1, 2, 3 };
     const auto                  owner = owner_plan(0, 100);
@@ -297,6 +306,18 @@ static void registry_materialization_and_rollback() {
                   moe_mmid_materialize_status::ALLOCATION_FAILED &&
               rollback_registry.published_contexts() == 0,
           "misaligned device base published instead of rolling back");
+
+    auto throwing_slice = [&](bool host, int device, size_t bytes, size_t) {
+        auto blob        = fake_blob(host, device, bytes, &rollback_destroyed);
+        blob.slice_owner = [](size_t, size_t) -> std::shared_ptr<void> {
+            throw std::bad_alloc();
+        };
+        return blob;
+    };
+    check(rollback_registry.materialize({ 15, 16, 17 }, 18, 0, { owner }, throwing_slice) ==
+                  moe_mmid_materialize_status::ALLOCATION_FAILED &&
+              rollback_registry.published_contexts() == 0,
+          "throwing slice owner terminated or published a partial context");
 }
 
 static void registry_multi_owner_context_and_identity() {
@@ -483,6 +504,7 @@ int main() {
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
         finalized_owner_accounting();
+        cookie_saturates_without_reuse();
         registry_materialization_and_rollback();
         registry_multi_owner_context_and_identity();
         registry_replacement_and_queue_reset();
