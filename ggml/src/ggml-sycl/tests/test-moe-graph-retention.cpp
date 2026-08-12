@@ -197,6 +197,109 @@ int main() {
                 outer_snapshot.graph_epoch == outer_epoch && outer_snapshot.invocation == outer_invocation,
             "child retirement disturbed outer invocation");
 
+    // A live child invocation pins the exact parent lease. Final submit/release
+    // is BUSY without mutating the parent; after child completion it succeeds.
+    graph_retention_registry parent_registry;
+    fixture                  parent_fixture(parent_registry);
+    auto                     parent_tx    = begin_tx(parent_fixture);
+    auto                     parent_owner = std::make_shared<int>(61);
+    require(parent_tx.add_owner(owner_capability(961, parent_owner)) == retention_error::OK &&
+                parent_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                    retention_error::OK &&
+                parent_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK,
+            "parent-pin child setup failed");
+    parent_tx.mark_finalized();
+    require(parent_tx.commit() == retention_error::OK, "parent-pin child publication failed");
+    published_graph_token parent_token;
+    InvocationId          live_child{};
+    require(parent_registry.acquire_published_token(parent_tx.key(), &parent_token) == retention_error::OK &&
+                parent_registry.begin_invocation(parent_token, &live_child) == retention_error::OK &&
+                parent_fixture.execution.complete_invocation(
+                    parent_fixture.context, parent_fixture.session, parent_fixture.reset,
+                    parent_fixture.outer_epoch, parent_fixture.outer_invocation, token(), 0) == error::BUSY,
+            "live child did not pin parent final completion");
+    snapshot pinned_parent{};
+    require(parent_fixture.execution.extract(parent_fixture.context, &pinned_parent) == error::OK &&
+                pinned_parent.invocation == parent_fixture.outer_invocation &&
+                pinned_parent.graph_state == graph_phase::OPEN,
+            "BUSY parent completion mutated state or released lease");
+    require(parent_registry.finish_invocation(parent_token, live_child) == retention_error::OK &&
+                parent_fixture.execution.complete_invocation(
+                    parent_fixture.context, parent_fixture.session, parent_fixture.reset,
+                    parent_fixture.outer_epoch, parent_fixture.outer_invocation, token(), 0) == error::OK &&
+                parent_fixture.execution.retire_graph(parent_fixture.context, parent_fixture.session,
+                                                      parent_fixture.reset, parent_fixture.outer_epoch,
+                                                      token()) == error::OK,
+            "parent completion did not succeed after child completion");
+
+    // The child token is namespaced to its recorded outer invocation. Reusing
+    // it under a replacement outer graph is rejected before child allocation.
+    GraphEpoch replacement_outer{};
+    InvocationId replacement_outer_invocation{};
+    const int replacement_devices[] = { 0 };
+    const int replacement_participants[] = { 0 };
+    require(parent_fixture.execution.begin_graph(parent_fixture.context, parent_fixture.session,
+                                                  parent_fixture.reset, token(), &replacement_outer) == error::OK &&
+                parent_fixture.execution.begin_invocation(
+                    parent_fixture.context, parent_fixture.session, parent_fixture.reset, replacement_outer,
+                    token(), replacement_devices, 1, replacement_participants, 1, 0,
+                    &replacement_outer_invocation) == error::OK &&
+                parent_registry.begin_invocation(parent_token, &live_child) == retention_error::LIFECYCLE_ERROR,
+            "stale child token crossed outer invocation replacement");
+    require(parent_registry.retire_exact(parent_tx.key()) == retention_error::OK,
+            "cross-outer child cleanup failed");
+
+    // Race the exact final parent transition against child completion. Either
+    // the child wins, or the parent observes BUSY and succeeds on retry; it may
+    // never release the device lease while the child remains live.
+    graph_retention_registry race_registry;
+    fixture                  race_fixture(race_registry);
+    auto                     race_tx    = begin_tx(race_fixture);
+    auto                     race_owner = std::make_shared<int>(62);
+    require(race_tx.add_owner(owner_capability(962, race_owner)) == retention_error::OK &&
+                race_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                    retention_error::OK &&
+                race_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK,
+            "parent/child race setup failed");
+    race_tx.mark_finalized();
+    require(race_tx.commit() == retention_error::OK, "parent/child race publication failed");
+    published_graph_token race_token;
+    InvocationId          race_child{};
+    require(race_registry.acquire_published_token(race_tx.key(), &race_token) == retention_error::OK &&
+                race_registry.begin_invocation(race_token, &race_child) == retention_error::OK,
+            "parent/child race invocation setup failed");
+    std::atomic<bool> race_go{ false };
+    retention_error child_race_rc = retention_error::STALE;
+    error parent_race_rc = error::STALE;
+    std::thread child_racer([&] {
+        while (!race_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        child_race_rc = race_registry.finish_invocation(race_token, race_child);
+    });
+    std::thread parent_racer([&] {
+        while (!race_go.load(std::memory_order_acquire)) std::this_thread::yield();
+        parent_race_rc = race_fixture.execution.complete_invocation(
+            race_fixture.context, race_fixture.session, race_fixture.reset, race_fixture.outer_epoch,
+            race_fixture.outer_invocation, token(), 0);
+    });
+    race_go.store(true, std::memory_order_release);
+    child_racer.join();
+    parent_racer.join();
+    require(child_race_rc == retention_error::OK &&
+                (parent_race_rc == error::OK || parent_race_rc == error::BUSY),
+            "parent/child race returned invalid status");
+    if (parent_race_rc == error::BUSY) {
+        parent_race_rc = race_fixture.execution.complete_invocation(
+            race_fixture.context, race_fixture.session, race_fixture.reset, race_fixture.outer_epoch,
+            race_fixture.outer_invocation, token(), 0);
+    }
+    snapshot raced_parent{};
+    require(parent_race_rc == error::OK &&
+                race_fixture.execution.extract(race_fixture.context, &raced_parent) == error::OK &&
+                raced_parent.invocation.value == 0,
+            "parent/child race released early or failed retry");
+    require(race_registry.retire_exact(race_tx.key()) == retention_error::OK,
+            "parent/child race cleanup failed");
+
     // Every pre-commit failpoint uses abort_partial and returns both registries
     // to baseline without requiring a fabricated terminal for untouched queues.
     for (int fail_after = 0; fail_after < 5; ++fail_after) {
@@ -267,6 +370,83 @@ int main() {
                                                         abort_fixture.reset, abort_key.epoch, token(),
                                                         &abort_removed) == error::STALE,
             "successful partial drain retry left lifecycle epoch");
+
+    // Even if the transaction object is destroyed while drain is unsettled,
+    // registry adoption preserves the last owners and exposes an exact retry.
+    graph_retention_registry destructor_registry;
+    fixture                  destructor_fixture(destructor_registry);
+    graph_owner_key          destructor_key{};
+    std::atomic<bool>        destructor_ready{ true };
+    std::atomic<bool>        destructor_succeeds{ false };
+    std::atomic<unsigned>    destructor_waits{ 0 };
+    auto destructor_state = std::make_shared<drain_state>(
+        drain_state{ &destructor_ready, &destructor_succeeds, &destructor_waits });
+    auto destructor_owner = std::make_shared<int>(124);
+    std::weak_ptr<int> destructor_weak = destructor_owner;
+    {
+        auto unsettled = begin_tx(destructor_fixture);
+        destructor_key = unsettled.key();
+        require(unsettled.add_owner(owner_capability(1124, destructor_owner, 1)) == retention_error::OK &&
+                    unsettled.note_submission(1, submit_outcome::UNKNOWN) == retention_error::OK &&
+                    unsettled.set_quiescence_proof(
+                        1, queue_quiescence_test_factory::mint(destructor_state, drain_ready_callback,
+                                                               drain_wait_callback)) == retention_error::OK,
+                "destructor quarantine setup failed");
+        destructor_owner.reset();
+    }
+    require(destructor_registry.snapshot(destructor_key) && !destructor_weak.expired(),
+            "unsettled destructor destroyed last durable owner");
+    destructor_succeeds.store(true, std::memory_order_release);
+    require(destructor_registry.abort_partial(destructor_key) == retention_error::OK &&
+                destructor_registry.size() == 0 && destructor_weak.expired(),
+            "registry partial-abort retry did not settle destructor quarantine");
+
+    // Deterministic assembly allocation failures prove the record is adopted
+    // before mutation: prior owners/tables/terminals remain registry-owned and
+    // the same transaction can drain and retry its abort.
+    for (retention_fault fault : { retention_fault::ADD_OWNER_ONCE, retention_fault::ADD_TABLE_ONCE,
+                                   retention_fault::ADD_TERMINAL_ONCE }) {
+        graph_retention_registry oom_registry(fault);
+        fixture                  oom_fixture(oom_registry);
+        auto                     oom_tx = begin_tx(oom_fixture);
+        const auto               oom_key = oom_tx.key();
+        auto                     durable = std::make_shared<int>(300 + static_cast<int>(fault));
+        std::weak_ptr<int>       durable_weak = durable;
+        require(oom_tx.add_batch(binding(1300 + static_cast<int>(fault), durable)) == retention_error::OK,
+                "durable pre-failpoint owner setup failed");
+        retention_error injected = retention_error::OK;
+        if (fault == retention_fault::ADD_OWNER_ONCE) {
+            injected = oom_tx.add_owner(owner_capability(1400, durable));
+        } else if (fault == retention_fault::ADD_TABLE_ONCE) {
+            auto owner = graph_private_table_owner::create(
+                oom_key, 1500 + static_cast<int>(fault), 1, 0, { owner_capability(1501, durable) });
+            injected = oom_tx.add_table({ 1500 + static_cast<uint64_t>(fault), 1, 0, owner });
+        } else {
+            injected = oom_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits));
+        }
+        durable.reset();
+        auto oom_snapshot = oom_registry.snapshot(oom_key);
+        require(injected == retention_error::BUSY && oom_snapshot && !durable_weak.expired(),
+                "assembly OOM lost pre-adopted durable owner");
+        require((fault != retention_fault::ADD_OWNER_ONCE || oom_snapshot->generic_owners.size() == 1) &&
+                    (fault != retention_fault::ADD_TABLE_ONCE || oom_snapshot->tables.size() == 1) &&
+                    (fault != retention_fault::ADD_TERMINAL_ONCE || oom_snapshot->terminals.size() == 1),
+                "post-insertion OOM did not preserve the inserted durable record");
+        oom_snapshot.reset();
+        require(oom_tx.abort_partial() == retention_error::OK && oom_registry.size() == 0 && durable_weak.expired(),
+                "assembly OOM abort did not restore registry baseline");
+    }
+    graph_retention_registry adopt_fault(retention_fault::ADOPT_ONCE);
+    fixture                  adopt_fixture(adopt_fault);
+    graph_recording_transaction rejected_adoption;
+    require(graph_recording_transaction::begin(adopt_fault, adopt_fixture.execution, adopt_fixture.context,
+                                                adopt_fixture.session, adopt_fixture.reset, token(),
+                                                &rejected_adoption) == retention_error::BUSY &&
+                adopt_fault.size() == 0,
+            "adoption failure left retention or lifecycle recording poisoned");
+    auto adopted_retry = begin_tx(adopt_fixture);
+    require(adopted_retry.abort_partial() == retention_error::OK,
+            "adoption failure lifecycle was not retryable");
 
     graph_retention_registry retention;
     fixture                  f(retention);

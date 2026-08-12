@@ -53,6 +53,18 @@ bool Registry::persistent_epochs_live(const session_entry & session) const noexc
                        [](const auto & item) { return item.second.state != epoch_phase::RETIRED; });
 }
 
+bool Registry::child_invocations_target(const session_entry & session, GraphEpoch graph,
+                                        InvocationId invocation) const noexcept {
+    for (const auto & epoch_item : session.epochs) {
+        for (const auto & child : epoch_item.second.child_invocation_owners) {
+            if (child.second.first == graph && child.second.second == invocation) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 ContextId Registry::create_context(error & out) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t value = 0;
@@ -773,7 +785,8 @@ error Registry::child_begin_invocation(ContextId context, SessionId session, Ses
         return error::MISMATCH;
     }
     if (!epoch.child_epoch || epoch.state != epoch_phase::ACTIVE || !(owner.active_epoch == graph_epoch) ||
-        outer.invocation.value == 0 ||
+        outer.invocation.value == 0 || !(outer.id == epoch.recording_outer_graph) ||
+        !(outer.invocation == epoch.recording_outer_invocation) ||
         (outer.state != graph_phase::OPEN && outer.state != graph_phase::SEALED)) {
         return error::BUSY;
     }
@@ -1069,9 +1082,15 @@ error Registry::submit_invocation_locked(ContextId context, SessionId session, S
             return error::MISMATCH;
         }
     }
+    if (graph.pending_participant_count == 0) return error::STALE;
+    // The final parent transition is a lease boundary. A live child replay is
+    // still executing under this exact parent and must complete first.
+    if (graph.pending_participant_count == 1 &&
+        child_invocations_target(entry.session, graph_epoch, invocation)) {
+        return error::BUSY;
+    }
     graph.participant_completed[static_cast<size_t>(pidx)] = true;
     graph.any_quarantined = graph.any_quarantined || terminal == graph_phase::QUARANTINED;
-    if (graph.pending_participant_count == 0) return error::STALE;
     --graph.pending_participant_count;
     if (graph.pending_participant_count != 0) {
         return error::OK;
@@ -1104,7 +1123,8 @@ error Registry::release_invocation_locked(ContextId context, SessionId session, 
     if (!(graph.id == graph_epoch)) return error::STALE;
     if (!(graph.invocation == invocation)) return error::MISMATCH;
     if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
-    if (!graph_terminal_unretired(graph) || graph.pending_participant_count != 0) return error::BUSY;
+    if (!graph_terminal_unretired(graph) || graph.pending_participant_count != 0 ||
+        child_invocations_target(entry.session, graph_epoch, invocation)) return error::BUSY;
     for (int claimed_device : graph.devices) {
         if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) return error::MISMATCH;
         const auto & owner = device_owners_[claimed_device];

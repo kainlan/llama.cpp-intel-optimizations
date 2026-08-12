@@ -40,7 +40,16 @@ enum class retention_error {
     PENDING,
     LIFECYCLE_ERROR,
 };
-enum class retention_fault { NONE, PREPARE_ONCE, PUBLISH_ONCE, RETIRE_SETUP_ONCE };
+enum class retention_fault {
+    NONE,
+    ADOPT_ONCE,
+    ADD_OWNER_ONCE,
+    ADD_TABLE_ONCE,
+    ADD_TERMINAL_ONCE,
+    PREPARE_ONCE,
+    PUBLISH_ONCE,
+    RETIRE_SETUP_ONCE,
+};
 
 class canonical_allocation_integration;
 
@@ -202,6 +211,7 @@ class graph_retention_registry {
     explicit graph_retention_registry(retention_fault fault = retention_fault::NONE) : fault_(fault) {}
 
     retention_error retire_exact(graph_owner_key key) noexcept;
+    retention_error abort_partial(graph_owner_key key) noexcept;
     retention_error acquire_published_token(graph_owner_key key, published_graph_token * out) const noexcept;
     retention_error begin_invocation(const published_graph_token & token,
                                      execution::InvocationId *     invocation) noexcept;
@@ -211,9 +221,10 @@ class graph_retention_registry {
     graph_owner_key                               active(execution::ContextId context) const noexcept;
     size_t                                        size() const noexcept;
   private:
-    retention_error prepare(const graph_retention_record & record) noexcept;
+    retention_error adopt(const std::shared_ptr<graph_retention_record> & record) noexcept;
+    retention_error prepare(const std::shared_ptr<graph_retention_record> & record) noexcept;
     retention_error publish_active(graph_owner_key key) noexcept;
-    retention_error quarantine(const graph_retention_record & record) noexcept;
+    retention_error quarantine(const std::shared_ptr<graph_retention_record> & record) noexcept;
     retention_error discard_partial(graph_owner_key key) noexcept;
     bool            consume_fault_locked(retention_fault fault) noexcept;
     retention_error validate_record(const graph_retention_record & record) const noexcept;
@@ -249,7 +260,7 @@ class graph_recording_transaction {
     graph_recording_transaction & operator=(graph_recording_transaction && other) noexcept;
     ~graph_recording_transaction();
 
-    graph_owner_key key() const noexcept { return record_.key; }
+    graph_owner_key key() const noexcept { return key_; }
 
     retention_error add_batch(const mmid_batch_binding & binding) noexcept;
     retention_error add_table(const graph_private_table_binding & binding) noexcept;
@@ -272,7 +283,8 @@ class graph_recording_transaction {
     void                       release_local_owners() noexcept;
     graph_retention_registry * retention_ = nullptr;
     execution::Registry *      lifecycle_ = nullptr;
-    graph_retention_record     record_{};
+    std::shared_ptr<graph_retention_record> record_;
+    graph_owner_key                         key_{};
     bool                       resources_published_ = false;
     bool                       activated_           = false;
     bool                       retirement_pending_  = false;

@@ -378,6 +378,8 @@ class Registry {
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
     bool  persistent_epochs_live(const session_entry & session) const noexcept;
+    bool  child_invocations_target(const session_entry & session, GraphEpoch graph,
+                                   InvocationId invocation) const noexcept;
     error abort_graph_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                              lifecycle::ModelToken root) noexcept;
     error submit_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,

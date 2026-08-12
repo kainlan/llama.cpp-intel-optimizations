@@ -181,46 +181,65 @@ retention_error graph_retention_registry::validate_record(const graph_retention_
     return retention_error::OK;
 }
 
-retention_error graph_retention_registry::prepare(const graph_retention_record & record) noexcept {
-    const auto valid = validate_record(record);
+retention_error graph_retention_registry::adopt(
+    const std::shared_ptr<graph_retention_record> & record) noexcept {
+    if (!record) {
+        return retention_error::MISMATCH;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (consume_fault_locked(retention_fault::ADOPT_ONCE)) {
+            return retention_error::BUSY;
+        }
+        if (!records_.emplace(record->key, record).second) {
+            return retention_error::BUSY;
+        }
+        try {
+            retire_in_progress_.emplace(record->key, false);
+        } catch (...) {
+            records_.erase(record->key);
+            throw;
+        }
+        return retention_error::OK;
+    } catch (...) {
+        return retention_error::BUSY;
+    }
+}
+
+retention_error graph_retention_registry::prepare(
+    const std::shared_ptr<graph_retention_record> & record) noexcept {
+    if (!record) {
+        return retention_error::MISMATCH;
+    }
+    const auto valid = validate_record(*record);
     if (valid != retention_error::OK) {
         return valid;
     }
     try {
-        auto staged   = std::make_shared<graph_retention_record>(record);
-        staged->phase = retention_phase::PENDING;
-        std::shared_ptr<graph_retention_record> released;
-        std::lock_guard<std::mutex>             lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if (consume_fault_locked(retention_fault::PREPARE_ONCE)) {
             return retention_error::BUSY;
         }
-        for (const auto & table : staged->tables) {
+        const auto current = records_.find(record->key);
+        const auto retiring = retire_in_progress_.find(record->key);
+        if (current == records_.end() || current->second != record || retiring == retire_in_progress_.end() ||
+            retiring->second || (record->phase != retention_phase::RECORDING &&
+                                  record->phase != retention_phase::QUARANTINED)) {
+            return retention_error::BUSY;
+        }
+        for (const auto & table : record->tables) {
             const auto owner = table_owners_.find(table.table_id);
-            if (owner != table_owners_.end() && !(owner->second == staged->key)) {
+            if (owner != table_owners_.end() && !(owner->second == record->key)) {
                 return retention_error::BUSY;
             }
         }
-        auto       current  = records_.find(staged->key);
-        const auto retiring = retire_in_progress_.find(staged->key);
-        if (retiring != retire_in_progress_.end() && retiring->second) {
-            return retention_error::BUSY;
+        for (const auto & table : record->tables) {
+            table_owners_[table.table_id] = record->key;
         }
-        if (current != records_.end() && current->second->phase != retention_phase::QUARANTINED &&
-            current->second->phase != retention_phase::PENDING) {
-            return retention_error::BUSY;
-        }
-        for (const auto & table : staged->tables) {
-            table_owners_[table.table_id] = staged->key;
-        }
-        if (current == records_.end()) {
-            records_.emplace(staged->key, staged);
-            retire_in_progress_.emplace(staged->key, false);
-        } else {
-            released        = std::move(current->second);
-            current->second = staged;
-        }
+        record->phase = retention_phase::PENDING;
         return retention_error::OK;
     } catch (...) {
+        record->phase = retention_phase::QUARANTINED;
         return retention_error::BUSY;
     }
 }
@@ -247,36 +266,20 @@ retention_error graph_retention_registry::publish_active(graph_owner_key key) no
     return retention_error::OK;
 }
 
-retention_error graph_retention_registry::quarantine(const graph_retention_record & record) noexcept {
-    try {
-        auto staged   = std::make_shared<graph_retention_record>(record);
-        staged->phase = retention_phase::QUARANTINED;
-        std::shared_ptr<graph_retention_record> released;
-        std::lock_guard<std::mutex>             lock(mutex_);
-        auto                                    it       = records_.find(staged->key);
-        const auto                              retiring = retire_in_progress_.find(staged->key);
-        if (retiring != retire_in_progress_.end() && retiring->second) {
-            return retention_error::BUSY;
-        }
-        if (it == records_.end()) {
-            records_.emplace(staged->key, staged);
-            retire_in_progress_.emplace(staged->key, false);
-        } else if (it->second->phase == retention_phase::INSTALLED) {
-            it->second->phase = retention_phase::QUARANTINED;
-        } else if (it->second->phase == retention_phase::RETIRING) {
-            staged->retire_ticket             = it->second->retire_ticket;
-            staged->attached_retire_terminals = it->second->attached_retire_terminals;
-            staged->publication_serial        = it->second->publication_serial;
-            released                          = std::move(it->second);
-            it->second                        = staged;
-        } else {
-            released   = std::move(it->second);
-            it->second = staged;
-        }
-        return retention_error::OK;
-    } catch (...) {
+retention_error graph_retention_registry::quarantine(
+    const std::shared_ptr<graph_retention_record> & record) noexcept {
+    if (!record) {
+        return retention_error::MISMATCH;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = records_.find(record->key);
+    const auto retiring = retire_in_progress_.find(record->key);
+    if (it == records_.end() || it->second != record ||
+        (retiring != retire_in_progress_.end() && retiring->second)) {
         return retention_error::BUSY;
     }
+    record->phase = retention_phase::QUARANTINED;
+    return retention_error::OK;
 }
 
 retention_error graph_retention_registry::discard_partial(graph_owner_key key) noexcept {
@@ -307,6 +310,39 @@ retention_error graph_retention_registry::discard_partial(graph_owner_key key) n
         retire_in_progress_.erase(key);
     }
     return retention_error::OK;
+}
+
+retention_error graph_retention_registry::abort_partial(graph_owner_key key) noexcept {
+    std::shared_ptr<graph_retention_record> record;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = records_.find(key);
+        const auto retiring = retire_in_progress_.find(key);
+        if (it == records_.end()) return retention_error::STALE;
+        if ((retiring != retire_in_progress_.end() && retiring->second) ||
+            it->second->phase == retention_phase::INSTALLED ||
+            it->second->phase == retention_phase::RETIRING) return retention_error::BUSY;
+        record = it->second;
+        record->phase = retention_phase::QUARANTINED;
+    }
+    for (const auto & submission : record->submissions) {
+        if (submission.second == submit_outcome::SUBMITTED) {
+            const auto terminal = record->terminals.find(submission.first);
+            if (terminal == record->terminals.end() || !terminal->second)
+                return retention_error::INCOMPLETE_TERMINALS;
+            terminal->second->wait();
+            if (!terminal->second->ready()) return retention_error::PENDING;
+        } else if (submission.second == submit_outcome::UNKNOWN) {
+            const auto proof = record->quiescence_proofs.find(submission.first);
+            if (proof == record->quiescence_proofs.end() || !proof->second ||
+                !proof->second->wait_and_confirm()) return retention_error::MISSING_QUIESCENCE_PROOF;
+        }
+    }
+    if (!record->lifecycle_registry ||
+        record->lifecycle_registry->child_abort_partial_record(
+            key.context, record->session, record->reset_epoch, key.epoch, record->root) != execution::error::OK)
+        return retention_error::LIFECYCLE_ERROR;
+    return discard_partial(key);
 }
 
 void graph_retention_registry::finish_retire_attempt(graph_owner_key key) noexcept {
@@ -599,16 +635,37 @@ retention_error graph_recording_transaction::begin(graph_retention_registry &   
     if (execution_registry.child_begin_record(context, session, reset_epoch, root, &epoch) != execution::error::OK) {
         return retention_error::LIFECYCLE_ERROR;
     }
+    std::shared_ptr<graph_retention_record> record;
+    try {
+        record = std::make_shared<graph_retention_record>();
+    } catch (...) {
+        execution::NoResourcesProof proof;
+        execution::RetireTicket ticket;
+        (void) execution_registry.child_fail_record_no_resources(context, session, reset_epoch, epoch, root, &proof);
+        (void) execution_registry.child_begin_retire_no_resources(proof, &ticket);
+        (void) execution_registry.child_finish_retire(ticket);
+        return retention_error::BUSY;
+    }
+    record->key                = { context, epoch };
+    record->lifecycle_registry = &execution_registry;
+    record->session            = session;
+    record->reset_epoch        = reset_epoch;
+    record->root               = root;
+    if (retention.adopt(record) != retention_error::OK) {
+        execution::NoResourcesProof proof;
+        execution::RetireTicket ticket;
+        (void) execution_registry.child_fail_record_no_resources(context, session, reset_epoch, epoch, root, &proof);
+        (void) execution_registry.child_begin_retire_no_resources(proof, &ticket);
+        (void) execution_registry.child_finish_retire(ticket);
+        return retention_error::BUSY;
+    }
     graph_recording_transaction staged;
-    staged.retention_                 = &retention;
-    staged.lifecycle_                 = &execution_registry;
-    staged.record_.key                = { context, epoch };
-    staged.record_.lifecycle_registry = &execution_registry;
-    staged.record_.session            = session;
-    staged.record_.reset_epoch        = reset_epoch;
-    staged.record_.root               = root;
-    staged.finished_                  = false;
-    *out                              = std::move(staged);
+    staged.retention_ = &retention;
+    staged.lifecycle_ = &execution_registry;
+    staged.record_    = std::move(record);
+    staged.key_       = staged.record_->key;
+    staged.finished_  = false;
+    *out              = std::move(staged);
     return retention_error::OK;
 }
 
@@ -618,7 +675,7 @@ graph_recording_transaction::graph_recording_transaction(graph_recording_transac
 
 graph_recording_transaction & graph_recording_transaction::operator=(graph_recording_transaction && other) noexcept {
     if (this != &other) {
-        rollback();
+        (void) abort_partial();
         move_from(std::move(other));
     }
     return *this;
@@ -632,6 +689,7 @@ void graph_recording_transaction::move_from(graph_recording_transaction && other
     retention_           = other.retention_;
     lifecycle_           = other.lifecycle_;
     record_              = std::move(other.record_);
+    key_                 = other.key_;
     resources_published_ = other.resources_published_;
     activated_           = other.activated_;
     retirement_pending_  = other.retirement_pending_;
@@ -646,9 +704,9 @@ retention_error graph_recording_transaction::publish_resources() noexcept {
     if (resources_published_) {
         return retention_error::OK;
     }
-    if (!lifecycle_ ||
-        lifecycle_->child_note_resources_published(record_.key.context, record_.session, record_.reset_epoch,
-                                                    record_.key.epoch, record_.root) != execution::error::OK) {
+    if (!record_ || !lifecycle_ ||
+        lifecycle_->child_note_resources_published(record_->key.context, record_->session, record_->reset_epoch,
+                                                    record_->key.epoch, record_->root) != execution::error::OK) {
         return retention_error::LIFECYCLE_ERROR;
     }
     resources_published_ = true;
@@ -656,17 +714,12 @@ retention_error graph_recording_transaction::publish_resources() noexcept {
 }
 
 retention_error graph_recording_transaction::add_batch(const mmid_batch_binding & binding) noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+    if (finished_ || !record_) return retention_error::STALE;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        if (record_.find_batch(binding.identity)) {
-            return retention_error::BUSY;
-        }
-        record_.batches.push_back(binding);
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->find_batch(binding.identity)) return retention_error::BUSY;
+        record_->batches.push_back(binding);
         return retention_error::OK;
     } catch (...) {
         return retention_error::BUSY;
@@ -674,140 +727,107 @@ retention_error graph_recording_transaction::add_batch(const mmid_batch_binding 
 }
 
 retention_error graph_recording_transaction::add_table(const graph_private_table_binding & binding) noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+    if (finished_ || !record_) return retention_error::STALE;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        record_.tables.push_back(binding);
-        return retention_error::OK;
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        record_->tables.push_back(binding);
+        return retention_->consume_fault_locked(retention_fault::ADD_TABLE_ONCE) ? retention_error::BUSY :
+                                                                                   retention_error::OK;
     } catch (...) {
         return retention_error::BUSY;
     }
 }
 
 retention_error graph_recording_transaction::add_owner(const retained_allocation_owner & owner) noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+    if (finished_ || !record_) return retention_error::STALE;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        record_.generic_owners.push_back(owner);
-        return retention_error::OK;
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        record_->generic_owners.push_back(owner);
+        return retention_->consume_fault_locked(retention_fault::ADD_OWNER_ONCE) ? retention_error::BUSY :
+                                                                                   retention_error::OK;
     } catch (...) {
         return retention_error::BUSY;
     }
 }
 
-retention_error graph_recording_transaction::set_terminal(int                                      device,
-                                                          const std::shared_ptr<device_terminal> & terminal) noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+retention_error graph_recording_transaction::set_terminal(
+    int device, const std::shared_ptr<device_terminal> & terminal) noexcept {
+    if (finished_ || !record_) return retention_error::STALE;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        return terminal && record_.terminals.emplace(device, terminal).second ? retention_error::OK :
-                                                                                retention_error::MISMATCH;
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (!terminal || !record_->terminals.emplace(device, terminal).second) return retention_error::MISMATCH;
+        return retention_->consume_fault_locked(retention_fault::ADD_TERMINAL_ONCE) ? retention_error::BUSY :
+                                                                                      retention_error::OK;
     } catch (...) {
         return retention_error::BUSY;
     }
 }
 
 retention_error graph_recording_transaction::set_quiescence_proof(
-    int                                             device,
-    const std::shared_ptr<queue_quiescence_proof> & proof) noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+    int device, const std::shared_ptr<queue_quiescence_proof> & proof) noexcept {
+    if (finished_ || !record_) return retention_error::STALE;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        return proof && record_.quiescence_proofs.emplace(device, proof).second ? retention_error::OK :
-                                                                                  retention_error::MISMATCH;
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        return proof && record_->quiescence_proofs.emplace(device, proof).second ? retention_error::OK :
+                                                                                   retention_error::MISMATCH;
     } catch (...) {
         return retention_error::BUSY;
     }
 }
 
 retention_error graph_recording_transaction::note_submission(int device, submit_outcome outcome) noexcept {
-    if (finished_ || device < 0 || device >= static_cast<int>(execution::max_devices) ||
-        outcome == submit_outcome::NOT_SUBMITTED) {
-        return retention_error::MISMATCH;
-    }
-    if (publish_resources() != retention_error::OK) {
-        return retention_error::LIFECYCLE_ERROR;
-    }
+    if (finished_ || !record_ || device < 0 || device >= static_cast<int>(execution::max_devices) ||
+        outcome == submit_outcome::NOT_SUBMITTED) return retention_error::MISMATCH;
+    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
     try {
-        return record_.submissions.emplace(device, outcome).second ? retention_error::OK : retention_error::BUSY;
+        std::lock_guard<std::mutex> lock(retention_->mutex_);
+        return record_->submissions.emplace(device, outcome).second ? retention_error::OK : retention_error::BUSY;
     } catch (...) {
         return retention_error::BUSY;
     }
 }
 
 void graph_recording_transaction::release_local_owners() noexcept {
-    record_.batches.clear();
-    record_.tables.clear();
-    record_.generic_owners.clear();
-    record_.terminals.clear();
-    record_.submissions.clear();
-    record_.quiescence_proofs.clear();
+    record_.reset();
 }
 
 retention_error graph_recording_transaction::commit() noexcept {
-    if (finished_) {
-        return retention_error::STALE;
-    }
-    if (!finalized_) {
-        return retention_error::NOT_FINALIZED;
-    }
+    if (finished_ || !record_) return retention_error::STALE;
+    if (!finalized_) return retention_error::NOT_FINALIZED;
+    const auto key = record_->key;
     if (retirement_pending_) {
-        const auto retire_rc = retention_->retire_exact(record_.key);
-        if (retire_rc == retention_error::OK) {
-            finished_ = true;
-            release_local_owners();
-        }
-        return retire_rc;
+        const auto rc = retention_->retire_exact(key);
+        if (rc == retention_error::OK) { finished_ = true; release_local_owners(); }
+        return rc;
     }
-    if (record_.quarantined()) {
-        return rollback();
-    }
-
+    if (record_->quarantined() && !record_->submissions.empty()) return rollback();
     const auto prepare_rc = retention_->prepare(record_);
     if (prepare_rc != retention_error::OK) {
-        retention_->quarantine(record_);
+        (void) retention_->quarantine(record_);
         return prepare_rc;
     }
     if (!activated_) {
-        if (lifecycle_->child_activate(record_.key.context, record_.session, record_.reset_epoch, record_.key.epoch,
-                                 record_.root) != execution::error::OK) {
-            retention_->quarantine(record_);
-            retirement_pending_  = true;
-            const auto retire_rc = retention_->retire_exact(record_.key);
-            if (retire_rc == retention_error::OK) {
-                finished_ = true;
-                release_local_owners();
-            }
-            return retire_rc == retention_error::OK ? retention_error::LIFECYCLE_ERROR : retire_rc;
+        if (lifecycle_->child_activate(key.context, record_->session, record_->reset_epoch, key.epoch,
+                                       record_->root) != execution::error::OK) {
+            (void) retention_->quarantine(record_);
+            retirement_pending_ = true;
+            const auto rc = retention_->retire_exact(key);
+            if (rc == retention_error::OK) { finished_ = true; release_local_owners(); }
+            return rc == retention_error::OK ? retention_error::LIFECYCLE_ERROR : rc;
         }
         activated_ = true;
     }
-    const auto publish_rc = retention_->publish_active(record_.key);
+    const auto publish_rc = retention_->publish_active(key);
     if (publish_rc != retention_error::OK) {
-        retention_->quarantine(record_);
-        retirement_pending_  = true;
-        const auto retire_rc = retention_->retire_exact(record_.key);
-        if (retire_rc == retention_error::OK) {
-            finished_ = true;
-            release_local_owners();
-        }
-        return retire_rc == retention_error::OK ? publish_rc : retire_rc;
+        (void) retention_->quarantine(record_);
+        retirement_pending_ = true;
+        const auto rc = retention_->retire_exact(key);
+        if (rc == retention_error::OK) { finished_ = true; release_local_owners(); }
+        return rc == retention_error::OK ? publish_rc : rc;
     }
     finished_ = true;
     release_local_owners();
@@ -815,78 +835,37 @@ retention_error graph_recording_transaction::commit() noexcept {
 }
 
 retention_error graph_recording_transaction::abort_partial() noexcept {
-    if (finished_) {
-        return retention_error::OK;
-    }
-    if (activated_ || retirement_pending_) {
-        return rollback();
-    }
-    // Publish the partial owner set as non-invokable quarantine before any
-    // potentially failing drain. This makes a failed abort durable and
-    // retryable instead of leaving its capabilities visible only on the stack.
-    if (resources_published_ && (!retention_ || retention_->quarantine(record_) != retention_error::OK)) {
-        return retention_error::BUSY;
-    }
-    // No submission label means no queue was touched by this child record.
-    // Once a device is labelled SUBMITTED/UNKNOWN, only its exact terminal or
-    // queue-quiescence proof may authorize lifecycle removal.
-    for (const auto & submission : record_.submissions) {
-        if (submission.second == submit_outcome::SUBMITTED) {
-            const auto terminal = record_.terminals.find(submission.first);
-            if (terminal == record_.terminals.end() || !terminal->second) {
-                return retention_error::INCOMPLETE_TERMINALS;
-            }
-            terminal->second->wait();
-            if (!terminal->second->ready()) {
-                return retention_error::PENDING;
-            }
-        } else if (submission.second == submit_outcome::UNKNOWN) {
-            const auto proof = record_.quiescence_proofs.find(submission.first);
-            if (proof == record_.quiescence_proofs.end() || !proof->second ||
-                !proof->second->wait_and_confirm()) {
-                return retention_error::MISSING_QUIESCENCE_PROOF;
-            }
-        }
-    }
-    if (!lifecycle_ ||
-        lifecycle_->child_abort_partial_record(record_.key.context, record_.session, record_.reset_epoch,
-                                               record_.key.epoch, record_.root) != execution::error::OK) {
-        // Quarantine remains authoritative and the transaction retains its
-        // local copy, so a lifecycle refusal cannot poison either registry.
-        return retention_error::LIFECYCLE_ERROR;
-    }
-    if (!retention_ || retention_->discard_partial(record_.key) != retention_error::OK) {
-        // discard_partial cannot contend for a non-active transaction owned by
-        // this object; fail closed if that invariant is ever violated.
-        return retention_error::BUSY;
-    }
-    finished_ = true;
-    release_local_owners();
-    return retention_error::OK;
-}
-
-retention_error graph_recording_transaction::rollback() noexcept {
-    if (finished_) {
-        return retention_error::OK;
-    }
-    if (!resources_published_) {
-        execution::NoResourcesProof proof;
-        execution::RetireTicket     ticket;
-        if (lifecycle_->child_fail_record_no_resources(record_.key.context, record_.session, record_.reset_epoch,
-                                                 record_.key.epoch, record_.root, &proof) != execution::error::OK ||
-            lifecycle_->child_begin_retire_no_resources(proof, &ticket) != execution::error::OK ||
-            lifecycle_->child_finish_retire(ticket) != execution::error::OK) {
-            return retention_error::LIFECYCLE_ERROR;
-        }
-        finished_ = true;
-        return retention_error::OK;
-    }
-    retention_->quarantine(record_);
-    const auto rc = retention_->retire_exact(record_.key);
+    if (finished_) return retention_error::OK;
+    if (!record_ || !retention_) return retention_error::STALE;
+    if (activated_ || retirement_pending_) return rollback();
+    const auto rc = retention_->abort_partial(record_->key);
     if (rc == retention_error::OK) {
         finished_ = true;
         release_local_owners();
     }
+    return rc;
+}
+
+retention_error graph_recording_transaction::rollback() noexcept {
+    if (finished_) return retention_error::OK;
+    if (!record_) return retention_error::STALE;
+    const auto key = record_->key;
+    if (!resources_published_) {
+        execution::NoResourcesProof proof;
+        execution::RetireTicket ticket;
+        if (lifecycle_->child_fail_record_no_resources(key.context, record_->session, record_->reset_epoch,
+                                                        key.epoch, record_->root, &proof) != execution::error::OK ||
+            lifecycle_->child_begin_retire_no_resources(proof, &ticket) != execution::error::OK ||
+            lifecycle_->child_finish_retire(ticket) != execution::error::OK)
+            return retention_error::LIFECYCLE_ERROR;
+        if (retention_->discard_partial(key) != retention_error::OK) return retention_error::BUSY;
+        finished_ = true;
+        release_local_owners();
+        return retention_error::OK;
+    }
+    (void) retention_->quarantine(record_);
+    const auto rc = retention_->retire_exact(key);
+    if (rc == retention_error::OK) { finished_ = true; release_local_owners(); }
     return rc;
 }
 
