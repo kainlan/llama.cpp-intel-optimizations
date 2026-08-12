@@ -11564,6 +11564,22 @@ moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
     return unified_cache_moe_mmid_registry().acquire(token, plan_identity, submit_device, owner_device, queue_cookie);
 }
 
+moe_mmid_queue_capability unified_cache_moe_mmid_exact_queue(
+    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int submit_device, int owner_device, const void * queue_object) noexcept {
+    return unified_cache_moe_mmid_registry().exact_queue(token, plan, submit_device, owner_device, queue_object);
+}
+
+moe_mmid_admitted_result unified_cache_admit_moe_mmid_workspace(
+    moe_mmid_authoritative_admission_request && request) noexcept {
+    return unified_cache_moe_mmid_registry().admit(std::move(request));
+}
+
+size_t unified_cache_recover_moe_mmid_workspaces(const moe_mmid_model_token & token,
+                                                  uint64_t plan_identity, bool wait) noexcept {
+    return unified_cache_moe_mmid_registry().recover_quarantined(token, plan_identity, wait);
+}
+
 bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
                                                uint64_t plan_identity) noexcept {
     return unified_cache_moe_mmid_registry().retire(token, plan_identity);

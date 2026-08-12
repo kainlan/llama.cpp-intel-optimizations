@@ -216,6 +216,7 @@ class moe_mmid_queue_capability {
     friend class moe_mmid_workspace_registry;
     friend class workspace_admission_authority_issuer;
     friend class queue_submission_authority;
+    friend class moe_queue_submit_integration;
     friend class moe_admitted_workspace_bundle;
 #ifdef GGML_SYCL_RETENTION_TESTING
     friend class moe_mmid_queue_capability_test_factory;
@@ -248,6 +249,15 @@ class queue_submission_authority {
 // Production enqueue/barrier code owns this integration point. Its minting
 // implementation is deliberately private to prevent post-hoc event rebinding.
 class moe_queue_submit_integration final {
+  public:
+    // Bind completion before admission, then arm the terminal from the actual
+    // final event produced by this exact queue. The opaque result cannot be
+    // relabelled or constructed by dispatch code.
+    static queue_submission_authority terminal(
+        const moe_mmid_queue_capability &, uint64_t, std::shared_ptr<moe::device_terminal>) noexcept;
+    static queue_submission_authority quiescence(
+        const moe_mmid_queue_capability &, uint64_t, std::shared_ptr<moe::queue_quiescence_proof>) noexcept;
+
   private:
     static queue_submission_authority mint_terminal(
         const moe_mmid_queue_capability &, uint64_t, std::shared_ptr<moe::device_terminal>) noexcept;
@@ -497,6 +507,10 @@ class moe_mmid_workspace_registry {
                                            uint64_t                     queue_cookie) noexcept;
     moe_mmid_admitted_result       admit(const moe_mmid_admission_request & request) noexcept;
     moe_mmid_admitted_result       admit(moe_mmid_authoritative_admission_request && request) noexcept;
+    moe_mmid_queue_capability      exact_queue(const moe_mmid_model_token & token,
+                                                const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+                                                int submit_device, int owner_device,
+                                                const void * queue_object) const noexcept;
     // Invalidates only future admissions using this exact shared plan object.
     // Already committed bundles retain their pools and finish normally.
     bool                           replace_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,

@@ -758,6 +758,40 @@ bool moe_admitted_workspace_bundle::matches(int submit, int owner, int64_t K, in
     return true;
 }
 
+queue_submission_authority moe_queue_submit_integration::mint_terminal(
+    const moe_mmid_queue_capability & queue, uint64_t invocation,
+    std::shared_ptr<moe::device_terminal> terminal) noexcept {
+    queue_submission_authority out;
+    if (!queue.valid() || invocation == 0 || !terminal) return out;
+    out.queue_identity_ = queue.identity_;
+    out.invocation_serial_ = invocation;
+    out.terminal_ = std::move(terminal);
+    return out;
+}
+
+queue_submission_authority moe_queue_submit_integration::mint_quiescence(
+    const moe_mmid_queue_capability & queue, uint64_t invocation,
+    std::shared_ptr<moe::queue_quiescence_proof> proof) noexcept {
+    queue_submission_authority out;
+    if (!queue.valid() || invocation == 0 || !proof) return out;
+    out.queue_identity_ = queue.identity_;
+    out.invocation_serial_ = invocation;
+    out.proof_ = std::move(proof);
+    return out;
+}
+
+queue_submission_authority moe_queue_submit_integration::terminal(
+    const moe_mmid_queue_capability & queue, uint64_t invocation,
+    std::shared_ptr<moe::device_terminal> terminal) noexcept {
+    return mint_terminal(queue, invocation, std::move(terminal));
+}
+
+queue_submission_authority moe_queue_submit_integration::quiescence(
+    const moe_mmid_queue_capability & queue, uint64_t invocation,
+    std::shared_ptr<moe::queue_quiescence_proof> proof) noexcept {
+    return mint_quiescence(queue, invocation, std::move(proof));
+}
+
 bool moe_admitted_workspace_bundle::mark_possible_submit() noexcept {
     if (!valid() || !registry_state_) return false;
     auto registry = std::static_pointer_cast<moe_mmid_workspace_registry::state>(registry_state_);
@@ -1375,6 +1409,22 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     out.bundle.K_ = request.shape.K; out.bundle.N_ = request.shape.N; out.bundle.type_ = request.shape.type;
     out.bundle.identity_digest_ = digest ? digest : 1; out.bundle.capability_ = capability;
     out.bundle.admitted_ = true; out.status = moe_mmid_lease_status::ACQUIRED; return out;
+}
+
+moe_mmid_queue_capability moe_mmid_workspace_registry::exact_queue(
+    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int submit_device, int owner_device, const void * queue_object) const noexcept {
+    if (!token.valid() || !plan || !queue_object || submit_device < 0 || owner_device < 0) return {};
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    for (const auto & context : state_->contexts) {
+        if (!same_token(context->token, token) || !context->accepting || context->submit_device != submit_device ||
+            context->exact_plan.get() != plan.get()) continue;
+        for (size_t i = 0; i < context->pools.size() && i < context->queues.size(); ++i) {
+            if (context->pools[i]->owner_device == owner_device && context->queues[i].valid() &&
+                context->queues[i].queue_object_ == queue_object) return context->queues[i];
+        }
+    }
+    return {};
 }
 
 bool moe_mmid_workspace_registry::replace_plan(
