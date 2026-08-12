@@ -4557,6 +4557,9 @@ inline bool ggml_sycl_weight_is_currently_device_resident(const ggml_tensor * te
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 
 struct ggml_backend_sycl_context {
+    // Retained by MMID queue capabilities so an exact queue binding cannot
+    // outlive the backend context that selected it.
+    std::shared_ptr<const void> backend_queue_lifetime = std::make_shared<const uint8_t>(0);
     int                                  device;
     std::string                          name;
     mutable std::mutex                   execution_state_mutex;

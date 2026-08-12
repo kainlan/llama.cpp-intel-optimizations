@@ -137,8 +137,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "direct recipe decode-only": "phase == moe_route_phase::DECODE && rows == 1",
         "direct recipe primary-only": "route_device == submit_device && direct_recipe_candidate",
         "direct recipe owned stable": "direct_recipe_candidate->has_stable_owner_identity()",
-        "direct recipe exact queue":
-            "authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(",
+        "direct recipe explicit invocation authority":
+            "queue_capability && queue_capability->valid()",
         "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
         "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
         "execution-row bounded activation copy":
@@ -385,7 +385,8 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = false")
     end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
     direct = mmid[start:end]
-    assert "q1_nvfp4_direct_b70_validated && ne12 == 1" in direct
+    assert "q1_nvfp4_direct_b70_validated = false" in direct
+    assert "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1" in direct
     validator = function_definition(HEADER.read_text(), "inline moe_batch_reject_reason validate_moe_batch_route(")
     assert "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()" in validator
     assert "owned_direct_slice_route_acceptance" in HOST_TEST.read_text()
@@ -429,9 +430,9 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
         "direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT",
         "direct_recipe_candidate->has_stable_owner_identity()",
         "K % qk == 0",
-        "ggml_sycl_execution_current_owner(backend, root)",
-        "cache->get_placement_plan_snapshot()",
-        "unified_cache_moe_mmid_exact_queue(",
+        "invocation_backend && invocation_queue",
+        "queue_capability && queue_capability->valid()",
+        "queue_capability->owner_device() == submit_device",
         'cap.reason = "direct-recipe-candidate"',
     ):
         assert witness in query, witness
@@ -489,9 +490,9 @@ def test_contract_and_mutation_witnesses() -> None:
                         "route_device >= 0 && direct_recipe_candidate", 1), host_test, mem_source),
         ("recipe-allows-ownerless", header,
          source.replace("direct_recipe_candidate->has_stable_owner_identity()", "true", 1), host_test, mem_source),
-        ("recipe-drops-exact-queue", header,
-         source.replace("authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(",
-                        "authoritative_candidate = ggml_sycl::moe_mmid_queue_capability(", 1), host_test, mem_source),
+        ("recipe-drops-explicit-queue-authority", header,
+         source.replace("queue_capability && queue_capability->valid()",
+                        "queue_capability", 1), host_test, mem_source),
         ("raw-direct-rejects-owned", header.replace(
             "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()",
             "route.lease.kind() == mem_handle_kind::DIRECT"), source, host_test, mem_source),

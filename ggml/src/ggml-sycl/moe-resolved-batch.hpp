@@ -341,7 +341,10 @@ struct moe_batch_route {
                                                                         size_t,
                                                                         size_t,
                                                                         ggml_layout_mode,
-                                                                        bool);
+                                                                        bool,
+                                                                        const void *,
+                                                                        const void *,
+                                                                        const moe_mmid_queue_capability *);
     friend bool                      test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle);
 };
 
@@ -789,6 +792,9 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                                                              size_t              count,
                                                              size_t              slots_per_token,
                                                              ggml_layout_mode    requested_layout,
-                                                             bool                allow_materialize = false);
+                                                             bool                allow_materialize = false,
+                                                             const void *        invocation_backend = nullptr,
+                                                             const void *        invocation_queue = nullptr,
+                                                             const moe_mmid_queue_capability * queue_capability = nullptr);
 
 }  // namespace ggml_sycl
