@@ -80,6 +80,23 @@ uint32_t lease_count(const ggml_sycl::unified_cache_entry & entry) {
     return entry.in_use_count.v.load(std::memory_order_acquire);
 }
 
+void initialize_host_entry(ggml_sycl::unified_cache_entry & entry,
+                           void *                            ptr,
+                           size_t                            size,
+                           ggml_layout_mode                  layout) {
+    entry.device_ptr    = ptr;
+    entry.src_ptr       = ptr;
+    entry.size          = size;
+    entry.type          = ggml_sycl::cache_entry_type::DENSE_WEIGHT;
+    entry.layer_id      = -1;
+    entry.expert_id     = -1;
+    entry.layout        = layout;
+    entry.state         = ggml_sycl::cache_entry_state::READY;
+    entry.location      = ggml_sycl::cache_location::HOST_PINNED;
+    entry.host_resident = true;
+    entry.owner_device  = ggml_sycl::mem_handle::HOST_DEVICE;
+}
+
 // A resolve concurrent with a state change must observe one WHOLE published
 // state, never a mixture of the old and the new.  The two states below differ
 // in all three fields of resolved_ptr that a caller acts on, so any field-by-
@@ -155,6 +172,8 @@ int test_lease_is_released_exactly_once() {
 
     ggml_sycl::unified_cache_entry entry_a = {};
     ggml_sycl::unified_cache_entry entry_b = {};
+    initialize_host_entry(entry_a, buf_a, sizeof(buf_a), GGML_LAYOUT_AOS);
+    initialize_host_entry(entry_b, buf_b, sizeof(buf_b), GGML_LAYOUT_SOA);
 
     // Each template handle owns one lease -- from_weight_lease_snapshot() takes ownership
     // of a bump the caller is expected to have already made.
@@ -165,7 +184,7 @@ int test_lease_is_released_exactly_once() {
         make_key(0xa11a), ggml_sycl::mem_handle::HOST_DEVICE, buf_a, GGML_LAYOUT_AOS, false, &entry_a,
         entry_a.storage_owner, entry_a.has_ready_event, entry_a.ready_event);
     const ggml_sycl::mem_handle lease_b = ggml_sycl::mem_handle::from_weight_lease_snapshot(
-        make_key(0xb22b), ggml_sycl::mem_handle::HOST_DEVICE, buf_b, GGML_LAYOUT_SOA, true, &entry_b,
+        make_key(0xb22b), ggml_sycl::mem_handle::HOST_DEVICE, buf_b, GGML_LAYOUT_SOA, false, &entry_b,
         entry_b.storage_owner, entry_b.has_ready_event, entry_b.ready_event);
 
     {
@@ -237,6 +256,7 @@ int test_concurrent_resolve_under_generation_churn() {
     alignas(64) std::uint8_t buf[64] = {};
 
     ggml_sycl::unified_cache_entry entry = {};
+    initialize_host_entry(entry, buf, sizeof(buf), GGML_LAYOUT_AOS);
     entry.in_use_count.v.store(1, std::memory_order_release);
 
     {

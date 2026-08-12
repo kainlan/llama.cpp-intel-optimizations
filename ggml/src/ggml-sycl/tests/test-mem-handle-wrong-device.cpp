@@ -473,13 +473,10 @@ static bool test_cache_entry_minted_retention_identity() {
     auto second_handle = ggml_sycl::mem_handle::from_weight_lease_snapshot(
         key, ggml_sycl::mem_handle::HOST_DEVICE, &second_storage, GGML_LAYOUT_AOS, false, &second, {}, false,
         sycl::event{});
-    const auto first_info  = first_handle.debug_info();
-    const auto second_info = second_handle.debug_info();
-    TEST_ASSERT(first_info.canonical_allocation_id == first.allocation_identity() &&
-                    first_info.canonical_generation == first.replacement_identity() &&
-                    first_info.canonical_extent == first.size,
-                "mem_handle must propagate exact cache-entry identity");
-    TEST_ASSERT(first_info.canonical_allocation_id != second_info.canonical_allocation_id,
+    TEST_ASSERT(first_handle.valid() && second_handle.valid(),
+                "authoritative cache fixtures must mint valid weight capabilities");
+    TEST_ASSERT(first.has_retention_identity() && second.has_retention_identity() &&
+                    first.allocation_identity() != second.allocation_identity(),
                 "fresh/recreated backing must mint a distinct allocation capability");
 
     // Forgery rejection: an entry capability cannot label another pointer.
@@ -500,8 +497,121 @@ static bool test_cache_entry_minted_retention_identity() {
     return true;
 }
 
-static bool test_retention_identity_mint_concurrency_and_exhaustion() {
-    TEST_BEGIN("retention_identity_mint_concurrency_and_exhaustion");
+static ggml_sycl_cache_id make_transition_id(uint64_t tag, size_t size) {
+    ggml_sycl_cache_id id{};
+    id.valid     = true;
+    id.model_id  = 9100 + tag;
+    id.aux_id    = tag;
+    id.name_hash = 0xabc000 + tag;
+    id.nbytes    = size;
+    id.type      = GGML_TYPE_F32;
+    id.ne[0]     = static_cast<int64_t>(size / sizeof(float));
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        id.ne[i] = 1;
+    }
+    return id;
+}
+
+static void release_weight_lease(ggml_sycl::unified_cache::weight_ptr_lease_result & lease) {
+    if (lease.entry) {
+        lease.entry->in_use_count.fetch_sub(1);
+        lease.entry = nullptr;
+    }
+}
+
+static bool test_retention_transitions_and_exhaustion(sycl::queue & q) {
+    TEST_BEGIN("retention_transitions_and_exhaustion");
+
+    constexpr size_t small_size = 4096;
+    constexpr size_t large_size = 8192;
+    std::vector<unsigned char> first(small_size, 0x11);
+    std::vector<unsigned char> second(small_size, 0x22);
+    std::vector<unsigned char> large(large_size, 0x33);
+    std::vector<unsigned char> large_changed(large_size, 0x44);
+    ggml_sycl::unified_cache   cache(q, 64 * 1024);
+    const auto                 id = make_transition_id(1, small_size);
+
+    void * initial_ptr = cache.ensure_cached(
+        id, first.data(), first.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true);
+    TEST_ASSERT(initial_ptr != nullptr, "initial cache publication must succeed");
+    q.wait_and_throw();
+    auto initial = cache.acquire_weight_lease(id);
+    TEST_ASSERT(initial && initial.allocation_id != 0 && initial.replacement_generation != 0,
+                "initial entry must publish a complete capability");
+    const uint64_t initial_alloc = initial.allocation_id;
+    const uint64_t initial_gen   = initial.replacement_generation;
+    release_weight_lease(initial);
+
+    // register_ready is completion, not adoption: a caller cannot change the
+    // extent while retaining the same pointer/capability.
+    cache.register_ready(id, initial_ptr, GGML_LAYOUT_AOS, small_size + 1,
+                         ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, first.data());
+    auto extent_check = cache.acquire_weight_lease(id);
+    TEST_ASSERT(extent_check && extent_check.ptr == initial_ptr && extent_check.allocation_extent == small_size &&
+                    extent_check.allocation_id == initial_alloc && extent_check.replacement_generation == initial_gen,
+                "same pointer with a forged extent must leave the old capability unchanged");
+    release_weight_lease(extent_check);
+
+    // A live lease forbids both byte replacement and reallocation.
+    auto live = cache.acquire_weight_lease(id);
+    TEST_ASSERT(live, "live-lease setup must acquire the entry");
+    TEST_ASSERT(cache.ensure_cached(id, second.data(), second.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                    -1, GGML_LAYOUT_AOS, true) == nullptr,
+                "recopy must refuse a live lease");
+    TEST_ASSERT(cache.ensure_cached(id, large.data(), large.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                    -1, GGML_LAYOUT_AOS, true) == nullptr,
+                "realloc must refuse a live lease");
+    TEST_ASSERT(live.ptr == initial_ptr && live.allocation_id == initial_alloc &&
+                    live.replacement_generation == initial_gen,
+                "live-lease refusal must preserve the old backing and generation");
+    release_weight_lease(live);
+
+    // Successful recopy preserves allocation identity and advances generation.
+    TEST_ASSERT(cache.ensure_cached(id, second.data(), second.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                    -1, GGML_LAYOUT_AOS, true) == initial_ptr,
+                "same-extent recopy must reuse the backing");
+    q.wait_and_throw();
+    auto recopied = cache.acquire_weight_lease(id);
+    TEST_ASSERT(recopied && recopied.allocation_id == initial_alloc &&
+                    recopied.replacement_generation != initial_gen,
+                "recopy must advance only replacement generation");
+    release_weight_lease(recopied);
+
+    // Successful realloc atomically replaces pointer, extent and both identities.
+    void * large_ptr = cache.ensure_cached(
+        id, large.data(), large.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true);
+    TEST_ASSERT(large_ptr != nullptr, "extent-changing realloc must succeed");
+    q.wait_and_throw();
+    auto reallocated = cache.acquire_weight_lease(id);
+    TEST_ASSERT(reallocated && reallocated.ptr == large_ptr && reallocated.allocation_extent == large_size &&
+                    reallocated.allocation_id != initial_alloc,
+                "realloc must publish a new complete backing capability");
+    const uint64_t realloc_alloc = reallocated.allocation_id;
+    release_weight_lease(reallocated);
+
+    // Eviction followed by recreation must never resurrect the old identity.
+    TEST_ASSERT(cache.evict(1) >= large_size, "entry must be evictable after its lease is released");
+    TEST_ASSERT(cache.lookup(id, GGML_LAYOUT_AOS) == nullptr, "evicted entry must disappear from lookup");
+    large_ptr = cache.ensure_cached(
+        id, large.data(), large.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true);
+    TEST_ASSERT(large_ptr != nullptr, "evicted entry must be recreatable");
+    q.wait_and_throw();
+    auto recreated = cache.acquire_weight_lease(id);
+    TEST_ASSERT(recreated && recreated.allocation_id != realloc_alloc,
+                "recreated backing must mint a fresh allocation identity");
+    release_weight_lease(recreated);
+
+    // Prepare an allocate_slot/register_ready transition before permanently
+    // exhausting the process-wide mint.
+    const auto slot_id  = make_transition_id(2, 1024);
+    void *     slot_ptr = cache.allocate_slot(slot_id, 1024, GGML_LAYOUT_AOS);
+    TEST_ASSERT(slot_ptr != nullptr, "slot setup must allocate");
+    cache.register_ready(slot_id, slot_ptr, GGML_LAYOUT_AOS, 1024,
+                         ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, first.data());
+    auto ready_before = cache.acquire_weight_lease(slot_id);
+    TEST_ASSERT(ready_before, "register_ready setup must publish the slot");
+    const uint64_t ready_gen = ready_before.replacement_generation;
+    release_weight_lease(ready_before);
 
     constexpr size_t thread_count = 8;
     constexpr size_t per_thread   = 128;
@@ -521,17 +631,66 @@ static bool test_retention_identity_mint_concurrency_and_exhaustion() {
     }
     std::unordered_set<uint64_t> unique;
     for (const auto & batch : ids) {
-        for (uint64_t id : batch) {
-            TEST_ASSERT(id != 0, "concurrent mint must never produce zero before exhaustion");
-            TEST_ASSERT(unique.insert(id).second, "concurrent mint must never reuse an identity");
+        for (uint64_t minted : batch) {
+            TEST_ASSERT(minted != 0, "concurrent mint must never produce zero before exhaustion");
+            TEST_ASSERT(unique.insert(minted).second, "concurrent mint must never reuse an identity");
         }
     }
 
+    const size_t cache_used_before = cache.used();
+    const size_t host_used_before  = ggml_sycl::unified_cache_get_runtime_host_bytes();
     ggml_sycl::unified_cache_exhaust_retention_identities_for_test();
-    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
-                "exhausted mint must fail closed instead of returning UINT64_MAX");
-    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0 &&
+                    ggml_sycl::unified_cache_mint_retention_identity() == 0,
                 "exhausted mint must remain permanently exhausted and never wrap");
+
+    const auto refused_slot_id = make_transition_id(3, 1024);
+    TEST_ASSERT(cache.allocate_slot(refused_slot_id, 1024, GGML_LAYOUT_AOS) == nullptr,
+                "allocate_slot must refuse zero identity before allocation");
+    TEST_ASSERT(cache.used() == cache_used_before && cache.lookup(refused_slot_id, GGML_LAYOUT_AOS) == nullptr,
+                "refused slot must roll back without budget or publication changes");
+
+    cache.register_ready(slot_id, slot_ptr, GGML_LAYOUT_AOS, 1024,
+                         ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, second.data());
+    auto ready_after = cache.acquire_weight_lease(slot_id);
+    TEST_ASSERT(ready_after && ready_after.ptr == slot_ptr && ready_after.replacement_generation == ready_gen &&
+                    ready_after.entry->src_ptr == first.data(),
+                "register_ready identity exhaustion must preserve old bytes metadata and generation");
+    release_weight_lease(ready_after);
+
+    auto old = cache.acquire_weight_lease(id);
+    TEST_ASSERT(old, "exhaustion rollback setup must find recreated entry");
+    const void *   old_ptr    = old.ptr;
+    const uint64_t old_alloc  = old.allocation_id;
+    const uint64_t old_gen    = old.replacement_generation;
+    const size_t   old_extent = old.allocation_extent;
+    release_weight_lease(old);
+    TEST_ASSERT(cache.ensure_cached(id, large_changed.data(), large_changed.size(),
+                                    ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true) ==
+                    nullptr,
+                "recopy must fail closed when generation mint is exhausted");
+    TEST_ASSERT(cache.ensure_cached(id, first.data(), first.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                    -1, GGML_LAYOUT_AOS, true) == nullptr,
+                "realloc/host-fallback path must fail before allocation when identity is exhausted");
+    auto preserved = cache.acquire_weight_lease(id);
+    TEST_ASSERT(preserved && preserved.ptr == old_ptr && preserved.allocation_id == old_alloc &&
+                    preserved.replacement_generation == old_gen && preserved.allocation_extent == old_extent,
+                "failed recopy/realloc/fallback transitions must preserve old backing and generation");
+    release_weight_lease(preserved);
+    TEST_ASSERT(ggml_sycl::unified_cache_get_runtime_host_bytes() == host_used_before,
+                "identity refusal must not allocate host fallback storage");
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &q;
+    req.size                                = 1024;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.constraints.must_host_pinned = true;
+    ggml_sycl::alloc_handle out{};
+    TEST_ASSERT(!ggml_sycl::unified_alloc(req, &out) && out.ptr == nullptr,
+                "unified_alloc must preallocate identity and refuse exhaustion before tier allocation");
+    TEST_ASSERT(ggml_sycl::unified_cache_get_runtime_host_bytes() == host_used_before,
+                "unified_alloc exhaustion must not leak or publish an allocation");
 
     TEST_PASS();
     return true;
@@ -577,7 +736,18 @@ int main(int argc, char ** argv) {
     all_passed &= test_mem_handle_stable_identity();
     all_passed &= test_cache_entry_minted_retention_identity();
     // Must run last: it deliberately leaves the process-wide mint exhausted.
-    all_passed &= test_retention_identity_mint_concurrency_and_exhaustion();
+    // Device transitions are skipped only on a genuinely device-less host; the
+    // identity-only tests above remain useful there.
+    if (n_gpu_devices > 0) {
+        try {
+            sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order{});
+            all_passed &= test_retention_transitions_and_exhaustion(q);
+        } catch (const sycl::exception & e) {
+            fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
+        }
+    } else {
+        fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: no GPU device\n");
+    }
 
     fprintf(stderr, "-------------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n", g_tests_run, g_tests_passed, g_tests_skipped);

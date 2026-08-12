@@ -1681,7 +1681,7 @@ struct unified_cache_entry {
     bool                  host_resident;    // Entry lives in host memory, not device (fallback when VRAM full)
     cache_location        location;         // DEVICE/HOST_PINNED/HOST_MMAP
     int                   owner_device = -1; // Cache/queue owner; callers cannot relabel this capability.
-    bool                  pool_allocated;   // True if device_ptr was sub-allocated from layout_pool_
+    bool                  pool_allocated = false;  // True if device_ptr was sub-allocated from layout_pool_
     bool                  cache_budget_charged = false;  // True if this entry incremented cache used_
     bool                  retired              = false;  // Hidden from routing; erased after in_use_count reaches zero.
     sycl::event           last_write_event;              // Event from last fill/reorder that wrote to device_ptr
