@@ -513,10 +513,7 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(device_batch);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes);
-            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
-            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
-                                               device.recipe.workspace.total_bytes - 1);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
 
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
@@ -531,16 +528,13 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(secondary_batch);
             choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true,
                                                secondary.recipe.workspace.total_bytes);
-            CHECK(choice && choice.executor == moe_batch_executor::SECONDARY_DEVICE);
-            choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false,
-                                               secondary.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WRONG_QUEUE);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
 
             auto soa = device_batch.batch.operands[0];
             soa.recipe.layout = GGML_LAYOUT_SOA;
             soa.admitted_recipe_signature = moe_execution_recipe_signature(soa.recipe);
             choice = choose_moe_batch_executor(soa, 0, true, soa.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::LAYOUT_MISMATCH);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
         }
     }
     moe_workspace_recipe overflow;

@@ -23308,6 +23308,8 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "recipe_mismatch";
         case moe_batch_reject_reason::WORKSPACE_UNDERSIZED:
             return "workspace_undersized";
+        case moe_batch_reject_reason::WORKSPACE_LEASE_MISSING:
+            return "workspace_lease_missing";
     }
     return "unknown";
 }

@@ -45,6 +45,7 @@ enum class moe_batch_reject_reason : uint8_t {
     RECIPE_MISSING,
     RECIPE_MISMATCH,
     WORKSPACE_UNDERSIZED,
+    WORKSPACE_LEASE_MISSING,
 };
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);
@@ -607,13 +608,37 @@ struct moe_batch_executor_choice {
     explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
 };
 
+class moe_mmid_workspace_registry;
+
+// Non-forgeable proof that admission atomically acquired every owner workspace
+// needed by one MMID submission. Until the registry mints this authority,
+// callers cannot enable the Q1_0/NVFP4 device executor by merely reporting a
+// byte count or reconstructing recipe metadata.
+class moe_admitted_workspace_bundle {
+  public:
+    bool valid() const noexcept { return admitted_; }
+
+  private:
+    bool admitted_ = false;
+    friend class moe_mmid_workspace_registry;
+};
+
 // Executor selection is deliberately metadata-only. Callers supply capability
 // and owning-queue facts; pointer address spaces are never consulted.
-inline moe_batch_executor_choice choose_moe_batch_executor(const moe_resolved_operand & operand,
-                                                           int                          submit_device,
-                                                           bool                         owning_queue_available,
-                                                           size_t reserved_workspace_bytes) {
+inline moe_batch_executor_choice choose_moe_batch_executor(
+    const moe_resolved_operand & operand,
+    int                          submit_device,
+    bool                         owning_queue_available,
+    size_t                       reserved_workspace_bytes,
+    const moe_admitted_workspace_bundle * workspace_bundle = nullptr) {
     moe_batch_executor_choice out;
+    const bool direct_q1_nvfp4 = operand.recipe.kind != moe_batch_executor::HOST_CPU &&
+                                 (operand.recipe.request.type == GGML_TYPE_Q1_0 ||
+                                  operand.recipe.request.type == GGML_TYPE_NVFP4);
+    if (direct_q1_nvfp4 && (!workspace_bundle || !workspace_bundle->valid())) {
+        out.reject = moe_batch_reject_reason::WORKSPACE_LEASE_MISSING;
+        return out;
+    }
     if (!validate_moe_execution_recipe(operand.recipe, operand.admitted_recipe_signature, operand.lease,
                                        operand.residency, submit_device, owning_queue_available,
                                        reserved_workspace_bytes, &out.reject)) {
