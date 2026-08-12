@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -56,6 +57,7 @@ enum class test_mutation {
     M6b_DRAIN_SERIAL_OVERFLOW,
     M6c_RESET_SERIAL_OVERFLOW,
     M6e_INVOCATION_ID_OVERFLOW,
+    M6f_REGISTRY_INCARNATION_OVERFLOW,
     M7_SUBMIT_RELEASES_DEVICES_EARLY,
     M8a_RECORD_ALLOCATION_FAILURE,
     M8b_INVOCATION_ALLOCATION_FAILURE,
@@ -138,6 +140,7 @@ struct RetireTicket {
 };
 
 class Registry;
+struct registry_control;
 
 // Opaque, allocation-free pin on the exact active outer invocation. Only its
 // Registry can mint or finish it; while live, the parent invocation cannot be
@@ -145,12 +148,13 @@ class Registry;
 class AuthoritativeInvocationSnapshot final {
   public:
     AuthoritativeInvocationSnapshot()                                                    = default;
+    ~AuthoritativeInvocationSnapshot();
     AuthoritativeInvocationSnapshot(const AuthoritativeInvocationSnapshot &)             = delete;
     AuthoritativeInvocationSnapshot & operator=(const AuthoritativeInvocationSnapshot &) = delete;
     AuthoritativeInvocationSnapshot(AuthoritativeInvocationSnapshot && other) noexcept;
     AuthoritativeInvocationSnapshot & operator=(AuthoritativeInvocationSnapshot && other) noexcept;
 
-    bool active() const noexcept { return active_; }
+    bool active() const noexcept;
 
     ContextId context() const noexcept { return context_; }
 
@@ -166,7 +170,10 @@ class AuthoritativeInvocationSnapshot final {
 
   private:
     friend class Registry;
-    const Registry *      registry_ = nullptr;
+    error finish_capability() noexcept;
+    void  steal(AuthoritativeInvocationSnapshot & other) noexcept;
+    std::shared_ptr<registry_control> control_;
+    uint64_t                         incarnation_ = 0;
     ContextId             context_{};
     SessionId             session_{};
     SessionResetEpoch     reset_epoch_{};
@@ -188,6 +195,9 @@ struct epoch_snapshot {
 class Registry {
   public:
     explicit Registry(test_mutation mutation = test_mutation::NONE);
+    ~Registry();
+    Registry(const Registry &) = delete;
+    Registry & operator=(const Registry &) = delete;
 
     ContextId create_context(error & out) noexcept;
     error     bind_backend(ContextId context, int device) noexcept;
@@ -353,6 +363,9 @@ class Registry {
     error extract(ContextId context, snapshot * out) const noexcept;
 
   private:
+    friend class AuthoritativeInvocationSnapshot;
+    error finish_authoritative_invocation_snapshot_locked(AuthoritativeInvocationSnapshot * snapshot) noexcept;
+
     struct graph_entry {
         GraphEpoch                  id{};
         graph_phase                 state = graph_phase::IDLE;
@@ -444,6 +457,7 @@ class Registry {
                                     lifecycle::ModelToken root) noexcept;
 
     mutable std::mutex                          mutex_;
+    std::shared_ptr<registry_control>            control_;
     test_mutation                               mutation_ = test_mutation::NONE;
     uint64_t                                    next_context_id_ = 1;
     uint64_t                                    next_session_id_ = 1;

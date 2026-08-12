@@ -307,11 +307,7 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
 
 namespace {
 struct direct_invocation_pin {
-    execution::Registry * registry = nullptr;
     execution::AuthoritativeInvocationSnapshot snapshot;
-    ~direct_invocation_pin() {
-        if (registry && snapshot.active()) (void) registry->finish_authoritative_invocation_snapshot(&snapshot);
-    }
 };
 }
 
@@ -364,9 +360,9 @@ bool workspace_admission_authority_issuer::direct(
     workspace_admission_authority * out) noexcept {
     std::shared_ptr<direct_invocation_pin> pin;
     try {
-        pin = std::make_shared<direct_invocation_pin>(); pin->registry = &registry; pin->snapshot = std::move(snapshot);
+        pin = std::make_shared<direct_invocation_pin>();
+        pin->snapshot = std::move(snapshot);
     } catch (...) {
-        if (snapshot.active()) (void) registry.finish_authoritative_invocation_snapshot(&snapshot);
         return false;
     }
     const auto & exact = pin->snapshot;

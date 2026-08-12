@@ -16,26 +16,91 @@ static int participant_index(const std::vector<int> & participants, int particip
 
 namespace ggml_sycl::execution {
 
+struct registry_control {
+    std::mutex mutex;
+    Registry * registry    = nullptr;
+    uint64_t   incarnation = 0;
+    bool       alive       = false;
+};
+
+namespace {
+std::atomic<uint64_t> next_registry_incarnation{ 1 };
+
+uint64_t mint_registry_incarnation() noexcept {
+    uint64_t candidate = next_registry_incarnation.load(std::memory_order_relaxed);
+    while (candidate != 0 && candidate != UINT64_MAX) {
+        if (next_registry_incarnation.compare_exchange_weak(candidate, candidate + 1, std::memory_order_relaxed,
+                                                            std::memory_order_relaxed)) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+}  // namespace
+
+AuthoritativeInvocationSnapshot::~AuthoritativeInvocationSnapshot() {
+    (void) finish_capability();
+}
+
 AuthoritativeInvocationSnapshot::AuthoritativeInvocationSnapshot(AuthoritativeInvocationSnapshot && other) noexcept {
-    *this = std::move(other);
+    steal(other);
 }
 
 AuthoritativeInvocationSnapshot & AuthoritativeInvocationSnapshot::operator=(
     AuthoritativeInvocationSnapshot && other) noexcept {
     if (this != &other) {
-        std::swap(registry_, other.registry_);
-        std::swap(context_, other.context_);
-        std::swap(session_, other.session_);
-        std::swap(reset_epoch_, other.reset_epoch_);
-        std::swap(graph_epoch_, other.graph_epoch_);
-        std::swap(invocation_, other.invocation_);
-        std::swap(root_, other.root_);
-        std::swap(active_, other.active_);
+        (void) finish_capability();
+        steal(other);
     }
     return *this;
 }
 
-Registry::Registry(test_mutation mutation) : mutation_(mutation) {}
+void AuthoritativeInvocationSnapshot::steal(AuthoritativeInvocationSnapshot & other) noexcept {
+    control_           = std::move(other.control_);
+    incarnation_       = other.incarnation_;
+    context_           = other.context_;
+    session_           = other.session_;
+    reset_epoch_       = other.reset_epoch_;
+    graph_epoch_       = other.graph_epoch_;
+    invocation_        = other.invocation_;
+    root_              = other.root_;
+    active_            = other.active_;
+    other.incarnation_ = 0;
+    other.active_      = false;
+}
+
+bool AuthoritativeInvocationSnapshot::active() const noexcept {
+    const auto control = control_;
+    if (!active_ || !control) return false;
+    std::lock_guard<std::mutex> lock(control->mutex);
+    return control->alive && control->registry != nullptr && control->incarnation == incarnation_;
+}
+
+error AuthoritativeInvocationSnapshot::finish_capability() noexcept {
+    const auto control = control_;
+    if (!active_ || !control) return error::MISMATCH;
+    std::lock_guard<std::mutex> gate(control->mutex);
+    if (!control->alive || control->registry == nullptr || control->incarnation != incarnation_) {
+        active_ = false;
+        control_.reset();
+        return error::STALE;
+    }
+    return control->registry->finish_authoritative_invocation_snapshot_locked(this);
+}
+
+Registry::Registry(test_mutation mutation) : control_(std::make_shared<registry_control>()), mutation_(mutation) {
+    control_->registry = this;
+    control_->incarnation =
+        mutation == test_mutation::M6f_REGISTRY_INCARNATION_OVERFLOW ? 0 : mint_registry_incarnation();
+    control_->alive = control_->incarnation != 0;
+}
+
+Registry::~Registry() {
+    std::lock_guard<std::mutex> gate(control_->mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
+    control_->alive    = false;
+    control_->registry = nullptr;
+}
 
 error Registry::persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept {
     if (mutation_ == allocation_site) {
@@ -1097,7 +1162,11 @@ error Registry::mint_authoritative_invocation_snapshot(ContextId                
     if (!out) {
         return error::NULL_OUTPUT;
     }
+    std::lock_guard<std::mutex> gate(control_->mutex);
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!control_->alive || control_->registry != this || control_->incarnation == 0) {
+        return error::OVERFLOW;
+    }
     if (out->active_) {
         return error::BUSY;
     }
@@ -1123,7 +1192,8 @@ error Registry::mint_authoritative_invocation_snapshot(ContextId                
     if (graph.authoritative_snapshot_pins == UINT32_MAX) {
         return error::OVERFLOW;
     }
-    out->registry_    = this;
+    out->control_     = control_;
+    out->incarnation_ = control_->incarnation;
     out->context_     = context;
     out->session_     = session;
     out->reset_epoch_ = reset_epoch;
@@ -1137,8 +1207,10 @@ error Registry::mint_authoritative_invocation_snapshot(ContextId                
 
 error Registry::validate_authoritative_invocation_snapshot(
     const AuthoritativeInvocationSnapshot & snapshot) const noexcept {
+    std::lock_guard<std::mutex> gate(control_->mutex);
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!snapshot.active_ || snapshot.registry_ != this) {
+    if (!control_->alive || snapshot.control_.get() != control_.get() || !snapshot.active_ ||
+        snapshot.incarnation_ == 0 || snapshot.incarnation_ != control_->incarnation) {
         return error::MISMATCH;
     }
     const auto it = contexts_.find(snapshot.context_.value);
@@ -1164,8 +1236,17 @@ error Registry::finish_authoritative_invocation_snapshot(AuthoritativeInvocation
     if (!snapshot) {
         return error::NULL_OUTPUT;
     }
+    if (snapshot->control_.get() != control_.get()) {
+        return error::MISMATCH;
+    }
+    return snapshot->finish_capability();
+}
+
+error Registry::finish_authoritative_invocation_snapshot_locked(
+    AuthoritativeInvocationSnapshot * snapshot) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!snapshot->active_ || snapshot->registry_ != this) {
+    if (!snapshot->active_ || snapshot->control_.get() != control_.get() ||
+        snapshot->incarnation_ != control_->incarnation) {
         return error::MISMATCH;
     }
     auto it = contexts_.find(snapshot->context_.value);
@@ -1185,8 +1266,9 @@ error Registry::finish_authoritative_invocation_snapshot(AuthoritativeInvocation
         return error::MISMATCH;
     }
     --graph.authoritative_snapshot_pins;
-    snapshot->registry_ = nullptr;
-    snapshot->active_   = false;
+    snapshot->control_.reset();
+    snapshot->incarnation_ = 0;
+    snapshot->active_      = false;
     return error::OK;
 }
 

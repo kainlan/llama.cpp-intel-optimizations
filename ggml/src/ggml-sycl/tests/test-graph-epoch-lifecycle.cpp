@@ -112,19 +112,106 @@ int main() {
                     pin.invocation() == pin_invocation && pin.root() == pin_root &&
                     pin_registry.validate_authoritative_invocation_snapshot(pin) == error::OK,
                 "exact authoritative invocation snapshot was not minted");
+        {
+            AuthoritativeInvocationSnapshot forgotten;
+            require(
+                pin_registry.mint_authoritative_invocation_snapshot(pin_context, pin_session, pin_reset, pin_graph,
+                                                                    pin_invocation, pin_root, &forgotten) == error::OK,
+                "forgotten-scope snapshot mint failed");
+        }
+        AuthoritativeInvocationSnapshot overwritten;
+        require(
+            pin_registry.mint_authoritative_invocation_snapshot(pin_context, pin_session, pin_reset, pin_graph,
+                                                                pin_invocation, pin_root, &overwritten) == error::OK,
+            "move-overwrite snapshot mint failed");
+        overwritten = std::move(pin);
+        require(!pin.active() && overwritten.active() &&
+                    pin_registry.validate_authoritative_invocation_snapshot(overwritten) == error::OK,
+                "move assignment did not finish old pin and steal source");
         require(pin_registry.submit_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation, pin_root,
                                                0) == error::OK &&
                     pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation,
                                                     pin_root) == error::BUSY,
                 "snapshot did not pin parent release");
         Registry foreign;
-        require(foreign.validate_authoritative_invocation_snapshot(pin) == error::MISMATCH,
+        require(foreign.validate_authoritative_invocation_snapshot(overwritten) == error::MISMATCH,
                 "foreign registry accepted invocation authority");
-        require(pin_registry.finish_authoritative_invocation_snapshot(&pin) == error::OK && !pin.active() &&
-                    pin_registry.finish_authoritative_invocation_snapshot(&pin) == error::MISMATCH &&
-                    pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation,
-                                                    pin_root) == error::OK,
+        auto concurrent_finish = std::async(
+            std::launch::async, [&] { return pin_registry.finish_authoritative_invocation_snapshot(&overwritten); });
+        auto release_rc =
+            pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation, pin_root);
+        require(concurrent_finish.get() == error::OK && !overwritten.active() &&
+                    (release_rc == error::OK || release_rc == error::BUSY),
+                "concurrent finish/release produced an invalid transition");
+        if (release_rc == error::BUSY) {
+            release_rc = pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation,
+                                                         pin_root);
+        }
+        require(release_rc == error::OK &&
+                    pin_registry.finish_authoritative_invocation_snapshot(&overwritten) == error::MISMATCH,
                 "authoritative pin finish/release semantics failed");
+    }
+
+    // A capability outliving its Registry cannot call through the destroyed
+    // object or authenticate a new Registry constructed at the same address.
+    {
+        alignas(Registry) unsigned char storage[sizeof(Registry)];
+        AuthoritativeInvocationSnapshot stale;
+        auto *                          first_registry    = new (storage) Registry();
+        error                           placement_error   = error::OK;
+        const auto                      placement_context = first_registry->create_context(placement_error);
+        const auto                      placement_root    = root_token(800);
+        SessionId                       placement_session{};
+        SessionResetEpoch               placement_reset{};
+        GraphEpoch                      placement_graph{};
+        InvocationId                    placement_invocation{};
+        const int                       placement_device[] = { 0 };
+        require(placement_error == error::OK && first_registry->bind_backend(placement_context, 0) == error::OK &&
+                    first_registry->attach_root(placement_context, placement_root, &placement_session,
+                                                &placement_reset) == error::OK &&
+                    first_registry->begin_graph(placement_context, placement_session, placement_reset, placement_root,
+                                                &placement_graph) == error::OK &&
+                    first_registry->begin_invocation(placement_context, placement_session, placement_reset,
+                                                     placement_graph, placement_root, placement_device, 1,
+                                                     placement_device, 1, 0, &placement_invocation) == error::OK &&
+                    first_registry->mint_authoritative_invocation_snapshot(
+                        placement_context, placement_session, placement_reset, placement_graph, placement_invocation,
+                        placement_root, &stale) == error::OK,
+                "placement-new authority fixture failed");
+        first_registry->~Registry();
+        require(!stale.active(), "Registry destruction left snapshot apparently active");
+        auto * reincarnated = new (storage) Registry();
+        require(reincarnated->validate_authoritative_invocation_snapshot(stale) == error::MISMATCH,
+                "same-address Registry reincarnation authenticated stale authority");
+        reincarnated->~Registry();
+    }
+
+    // Incarnation exhaustion is a fail-closed mint condition, not an ABA
+    // fallback to address identity.
+    {
+        Registry                        overflow_registry(test_mutation::M6f_REGISTRY_INCARNATION_OVERFLOW);
+        error                           overflow_error   = error::OK;
+        const auto                      overflow_context = overflow_registry.create_context(overflow_error);
+        const auto                      overflow_root    = root_token(900);
+        SessionId                       overflow_session{};
+        SessionResetEpoch               overflow_reset{};
+        GraphEpoch                      overflow_graph{};
+        InvocationId                    overflow_invocation{};
+        const int                       overflow_device[] = { 0 };
+        AuthoritativeInvocationSnapshot rejected;
+        require(overflow_error == error::OK && overflow_registry.bind_backend(overflow_context, 0) == error::OK &&
+                    overflow_registry.attach_root(overflow_context, overflow_root, &overflow_session,
+                                                  &overflow_reset) == error::OK &&
+                    overflow_registry.begin_graph(overflow_context, overflow_session, overflow_reset, overflow_root,
+                                                  &overflow_graph) == error::OK &&
+                    overflow_registry.begin_invocation(overflow_context, overflow_session, overflow_reset,
+                                                       overflow_graph, overflow_root, overflow_device, 1,
+                                                       overflow_device, 1, 0, &overflow_invocation) == error::OK &&
+                    overflow_registry.mint_authoritative_invocation_snapshot(
+                        overflow_context, overflow_session, overflow_reset, overflow_graph, overflow_invocation,
+                        overflow_root, &rejected) == error::OVERFLOW &&
+                    !rejected.active(),
+                "exhausted Registry incarnation minted authority");
     }
 
     Registry        reg;
