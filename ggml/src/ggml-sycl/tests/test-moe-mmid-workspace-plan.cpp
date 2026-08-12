@@ -1,7 +1,9 @@
+#define GGML_SYCL_RETENTION_TESTING 1
 #include "moe-mmid-workspace.hpp"
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -11,6 +13,53 @@
 #include <vector>
 
 using namespace ggml_sycl;
+
+// This standalone target intentionally does not link moe-graph-retention.cpp;
+// provide the capability constructors used only by its friend-backed fixture.
+namespace ggml_sycl::moe {
+struct test_graph_publication {
+    graph_owner_key key;
+    published_graph_token token;
+    std::shared_ptr<const graph_retention_record> snapshot;
+};
+static std::vector<test_graph_publication> test_graph_publications;
+static graph_retention_registry test_graph_registry;
+
+std::shared_ptr<const graph_retention_record> graph_retention_registry::snapshot(graph_owner_key key) const noexcept {
+    for (const auto & publication : test_graph_publications)
+        if (publication.key.context.value == key.context.value && publication.key.epoch.value == key.epoch.value)
+            return publication.snapshot;
+    return {};
+}
+retention_error graph_retention_registry::acquire_published_token(graph_owner_key key,
+                                                                  published_graph_token * out) const noexcept {
+    if (!out) return retention_error::MISMATCH;
+    for (const auto & publication : test_graph_publications) {
+        if (publication.key.context.value == key.context.value && publication.key.epoch.value == key.epoch.value) {
+            *out = publication.token;
+            return retention_error::OK;
+        }
+    }
+    return retention_error::STALE;
+}
+
+retained_allocation_owner::retained_allocation_owner(uint64_t allocation_id, uint64_t generation, int device,
+                                                     size_t extent, std::shared_ptr<const void> handle) :
+    allocation_id_(allocation_id), generation_(generation), device_(device), extent_(extent), handle_(std::move(handle)) {}
+
+graph_private_table_owner::graph_private_table_owner(graph_owner_key owner, uint64_t table_id, uint64_t layout_id,
+                                                     int device, std::vector<entry_type> entries) :
+    owner_(owner), table_id_(table_id), layout_id_(layout_id), device_(device), entries_(std::move(entries)) {}
+
+bool queue_quiescence_proof::ready() const noexcept { return ready_ && ready_(state_.get()); }
+bool queue_quiescence_proof::wait_and_confirm() noexcept { return wait_ && wait_(state_.get()) && ready(); }
+
+std::shared_ptr<const graph_private_table_owner> graph_private_table_owner::create(
+    graph_owner_key owner, uint64_t table_id, uint64_t layout_id, int device, std::vector<entry_type> entries) {
+    return std::shared_ptr<const graph_private_table_owner>(
+        new graph_private_table_owner(owner, table_id, layout_id, device, std::move(entries)));
+}
+} // namespace ggml_sycl::moe
 
 #if defined(__has_feature)
 #    if __has_feature(thread_sanitizer)
@@ -215,7 +264,9 @@ static moe_mmid_materialized_owner_plan owner_plan(int device, uint64_t queue, b
     moe_mmid_materialized_owner_plan owner;
     owner.owner_device = device;
     owner.queue_cookie = queue;
-    check(moe_mmid_plan_workspace({ 64, 96, 2, 2, 3 }, secondary, &owner.geometry), "owner geometry failed");
+    owner.shape = { 64, 96, 2, 2, 3 };
+    owner.secondary_owner = secondary;
+    check(moe_mmid_plan_workspace(owner.shape, secondary, &owner.geometry), "owner geometry failed");
     check(moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &owner.device_pool_bytes,
                                       &owner.host_pool_bytes),
           "owner pool failed");
@@ -395,6 +446,11 @@ static void registry_materialization_and_rollback() {
     check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::ALREADY_PUBLISHED,
           "duplicate publication replaced context");
 
+    auto overlap = owner;
+    overlap.geometry.output_f32_offset = overlap.geometry.activation_f32_offset;
+    check(registry.materialize({ 2, 3, 4 }, 91, 0, { overlap }, allocator) == moe_mmid_materialize_status::INVALID,
+          "overlapping caller geometry bypassed canonical registry geometry");
+
     auto too_small = owner;
     --too_small.device_pool_bytes;
     check(registry.materialize({ 4, 5, 6 }, 10, 0, { too_small }, allocator) == moe_mmid_materialize_status::INVALID,
@@ -438,9 +494,9 @@ static void registry_materialization_and_rollback() {
 }
 
 static void registry_multi_owner_context_and_identity() {
-    moe_mmid_workspace_registry registry;
     std::atomic<int>            destroyed{ 0 };
     std::atomic<int>            allocation_calls{ 0 };
+    moe_mmid_workspace_registry registry;
     auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
         allocation_calls.fetch_add(1);
         return fake_blob(host, device, bytes, &destroyed);
@@ -480,8 +536,8 @@ static void registry_multi_owner_context_and_identity() {
 }
 
 static void registry_replacement_and_queue_reset() {
-    moe_mmid_workspace_registry registry;
     std::atomic<int>            destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
     auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
         return fake_blob(host, device, bytes, &destroyed);
     };
@@ -504,8 +560,8 @@ static void registry_replacement_and_queue_reset() {
 }
 
 static void registry_concurrent_depth_busy() {
-    moe_mmid_workspace_registry registry;
     std::atomic<int>            destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
     auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
         return fake_blob(host, device, bytes, &destroyed);
     };
@@ -577,28 +633,74 @@ static void registry_retirement_retains_outstanding_lease() {
     check(destroyed.load() == 2, "device/host blobs were not destroyed after final lease");
 }
 
+struct ready_terminal final : moe::device_terminal {
+    explicit ready_terminal(std::shared_ptr<std::atomic<bool>> ready) : ready_(std::move(ready)) {}
+    bool ready() const noexcept override { return ready_->load(); }
+    void wait() noexcept override { ready_->store(true); }
+    std::shared_ptr<std::atomic<bool>> ready_;
+};
+
+static moe::published_graph_token graph_token_for(moe::graph_owner_key key, uint64_t serial) {
+    struct token_wire { moe::graph_owner_key key; uint64_t serial; } wire{ key, serial };
+    moe::published_graph_token token;
+    static_assert(sizeof(token) == sizeof(wire), "graph token test fixture ABI");
+    std::memcpy(&token, &wire, sizeof(token));
+    return token;
+}
+
 static moe_mmid_admission_request admission_request(const moe_mmid_model_token & token, uint64_t plan,
                                                      std::vector<moe_mmid_admission_owner> owners,
-                                                     uint64_t epoch = 900) {
+                                                     uint64_t epoch = 900,
+                                                     std::shared_ptr<std::atomic<bool>> ready =
+                                                         std::make_shared<std::atomic<bool>>(true)) {
     moe_mmid_admission_request request;
     request.token = token;
     request.plan_identity = plan;
     request.submit_device = 0;
-    request.epoch = epoch;
     request.top_k = 2;
     request.ne11 = 2;
     request.K = 64;
     request.N = 96;
     request.type = 1;
     request.owners = std::move(owners);
-    request.retained_occurrences = { { 101, 201 }, { 102, 202 }, { 101, 201 }, { 103, 203 }, { 104, 204 }, { 101, 201 } };
+
+    const moe::graph_owner_key key{ { token.model_id }, { epoch } };
+    auto snapshot = std::make_shared<moe::graph_retention_record>();
+    snapshot->key = key;
+    snapshot->root = { { token.model_id }, { token.load_txn_id }, { 1, token.generation } };
+    snapshot->phase = moe::retention_phase::INSTALLED;
+    snapshot->publication_serial = 12345;
+    std::vector<moe::retained_allocation_owner> table_entries;
+    auto bindings = std::make_shared<std::vector<moe::mmid_batch_binding>>();
+    const uint64_t ids[] = { 101, 102, 101, 103, 104, 101 };
+    for (uint32_t i = 0; i < 6; ++i) {
+        const int device = static_cast<int>(ids[i] % 2);
+        auto owner = moe::retained_allocation_test_factory::mint(ids[i], 7, device, 4096,
+                                                                 std::make_shared<int>(static_cast<int>(ids[i])));
+        moe::mmid_batch_binding binding{ { ids[i], 7, 55, device, 64, 128, i }, owner };
+        bindings->push_back(binding);
+        snapshot->batches.push_back(binding);
+        bool present = false;
+        for (const auto & entry : table_entries) present |= entry.allocation_id() == ids[i];
+        if (!present) table_entries.push_back(owner);
+    }
+    auto table = moe::graph_private_table_owner::create(key, 888, 55, 0, std::move(table_entries));
+    snapshot->tables.push_back({ table->table_id(), table->layout_id(), table->device(), table });
+    for (const auto & owner : request.owners)
+        snapshot->terminals.emplace(owner.owner_device, std::make_shared<ready_terminal>(ready));
+    request.graph_token = graph_token_for(key, snapshot->publication_serial);
+    moe::test_graph_publications.push_back({ key, request.graph_token, snapshot });
+    request.graph_registry = &moe::test_graph_registry;
+    request.graph_snapshot = snapshot;
+    request.retained_occurrences = bindings;
+    request.table_owner = table;
     return request;
 }
 
 static void registry_atomic_bundle_authority() {
     const moe_mmid_model_token token{ 51, 52, 53 };
-    moe_mmid_workspace_registry registry;
     std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
     auto allocator = [&](bool host, int device, size_t bytes, size_t) {
         return fake_blob(host, device, bytes, &destroyed);
     };
@@ -609,16 +711,26 @@ static void registry_atomic_bundle_authority() {
     auto admitted = registry.admit(request);
     check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid(),
           "all-owner atomic admission failed");
-    check(admitted.bundle.graph_owners().size() == 2 && admitted.bundle.graph_owners()[0].owner_device == 1 &&
+    check(admitted.bundle.owner_count() == 2 && admitted.bundle.graph_owners()[0].owner_device == 1 &&
               admitted.bundle.owner_leases()[0].owner_device() == 1 && admitted.bundle.owner_leases()[1].owner_device() == 0,
           "graph owner enumeration lost request order");
     check(admitted.bundle.retained_occurrences().size() == 6 &&
-              admitted.bundle.retained_occurrences()[0].weight == admitted.bundle.retained_occurrences()[2].weight &&
+              admitted.bundle.retained_occurrences()[0].identity.allocation_id ==
+                  admitted.bundle.retained_occurrences()[2].identity.allocation_id &&
               admitted.bundle.identity_digest() != 0,
           "repeated occurrence identity was deduplicated or digest missing");
-    for (const auto & lease : admitted.bundle.owner_leases()) {
-        check(lease.epoch() == request.epoch && lease.slices().activation_f32.valid() && lease.slices().output_q8.valid(),
-              "bundle lease omitted epoch or exact slices");
+    std::array<moe::mmid_operand_identity, 6> exact_identities{};
+    for (size_t i = 0; i < exact_identities.size(); ++i)
+        exact_identities[i] = admitted.bundle.retained_occurrences()[i].identity;
+    check(admitted.bundle.matches(0, 1, 64, 96, 1, exact_identities.data(), exact_identities.size()),
+          "complete exact identity match rejected");
+    exact_identities[2].byte_offset++;
+    check(!admitted.bundle.matches(0, 1, 64, 96, 1, exact_identities.data(), exact_identities.size()),
+          "offset identity substitution matched authority");
+    for (size_t i = 0; i < admitted.bundle.owner_count(); ++i) {
+        const auto & lease = admitted.bundle.owner_leases()[i];
+        check(lease.epoch() == request.graph_snapshot->key.epoch.value && lease.slices().activation_f32.valid() &&
+                  lease.slices().output_q8.valid(), "bundle lease omitted epoch or exact slices");
     }
     auto second = registry.admit(request);
     check(second.status == moe_mmid_lease_status::ACQUIRED, "second depth slot unavailable");
@@ -635,12 +747,27 @@ static void registry_atomic_bundle_authority() {
     check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "wrong submit device admitted");
     wrong = request; wrong.token.generation++;
     check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "stale model generation admitted");
+    wrong = request;
+    wrong.graph_token = graph_token_for({ request.graph_snapshot->key.context,
+                                          { request.graph_snapshot->key.epoch.value + 1 } },
+                                        request.graph_snapshot->publication_serial);
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "wrong graph capability admitted");
+    wrong = request;
+    auto substituted = std::make_shared<std::vector<moe::mmid_batch_binding>>(*request.retained_occurrences);
+    substituted->at(2).identity.generation++;
+    wrong.retained_occurrences = substituted;
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "identity substitution admitted");
+    wrong = request;
+    wrong.table_owner = moe::graph_private_table_owner::create(
+        request.graph_snapshot->key, request.table_owner->table_id(), request.table_owner->layout_id(),
+        request.table_owner->device(), request.table_owner->entries());
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "table-owner substitution admitted");
 }
 
 static void registry_bundle_rollback_move_oom_and_quarantine() {
     const moe_mmid_model_token token{ 61, 62, 63 };
-    moe_mmid_workspace_registry registry;
     std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
     auto allocator = [&](bool host, int device, size_t bytes, size_t) {
         return fake_blob(host, device, bytes, &destroyed);
     };
@@ -685,17 +812,54 @@ static void registry_bundle_rollback_move_oom_and_quarantine() {
     g_fail_heap_allocations.store(true);
     auto oom = registry.admit(both);
     g_fail_heap_allocations.store(false);
-    check(oom.status == moe_mmid_lease_status::INVALID && !oom.bundle.valid(), "OOM assembly escaped or admitted");
+    check(oom.status == moe_mmid_lease_status::ACQUIRED && oom.bundle.valid(),
+          "fail-new admission allocated or rejected preassembled authority");
+    check(oom.bundle.terminal_release(), "fail-new bundle release failed");
     auto after_oom = registry.admit(both);
-    check(after_oom.status == moe_mmid_lease_status::ACQUIRED, "OOM assembly mutated owner slots");
-    check(after_oom.bundle.terminal_release(), "post-OOM bundle release failed");
+    check(after_oom.status == moe_mmid_lease_status::ACQUIRED, "fail-new admission mutated owner slots");
+    check(after_oom.bundle.terminal_release(), "post-fail-new bundle release failed");
 #endif
+}
+
+static void registry_destroyed_quarantine_recovery() {
+    const moe_mmid_model_token token{ 66, 67, 68 };
+    std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 805, 0, { owner_plan(0, 806), owner_plan(1, 807, true) }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED, "quarantine context publication failed");
+    auto ready = std::make_shared<std::atomic<bool>>(false);
+    auto request = admission_request(token, 805, { { 0, 806 }, { 1, 807 } }, 901, ready);
+    {
+        auto admitted = registry.admit(request);
+        check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
+              "quarantine admission failed");
+        auto copied_lease = admitted.bundle.owner_leases()[0];
+        check(copied_lease.terminal_release(copied_lease.queue_cookie(), copied_lease.generation()) ==
+                  moe_mmid_release_status::WRONG_EPOCH,
+              "copied lease bypassed registry-owned quarantine");
+        check(!admitted.bundle.terminal_release(), "premature terminal release recycled submitted slots");
+    }
+    check(!registry.retire(token, 805), "retirement discarded destroyed quarantined bundle");
+    check(registry.recover_quarantined(token, 805, false) == 0, "unready quarantine recovered");
+    ready->store(true);
+    std::atomic<size_t> recovered{ 0 };
+    std::atomic<bool> raced_retire{ false };
+    std::thread recover_thread([&] { recovered.store(registry.recover_quarantined(token, 805, false)); });
+    std::thread retire_thread([&] { raced_retire.store(registry.retire(token, 805)); });
+    recover_thread.join();
+    retire_thread.join();
+    check(recovered.load() == 2, "ready destroyed quarantine was not recovered in retirement race");
+    check(raced_retire.load() || registry.retire(token, 805),
+          "context did not retire after quarantine recovery race");
 }
 
 static void registry_atomic_concurrency_multi_owner() {
     const moe_mmid_model_token token{ 71, 72, 73 };
-    moe_mmid_workspace_registry registry;
     std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
     auto allocator = [&](bool host, int device, size_t bytes, size_t) {
         return fake_blob(host, device, bytes, &destroyed);
     };
@@ -707,10 +871,12 @@ static void registry_atomic_concurrency_multi_owner() {
     std::atomic<bool> go{ false };
     std::vector<std::thread> threads;
     for (int i = 0; i < 8; ++i) {
-        threads.emplace_back([&] {
+        threads.emplace_back([&, i] {
+            auto local_request = request;
+            if (i & 1) std::reverse(local_request.owners.begin(), local_request.owners.end());
             ready.fetch_add(1);
             while (!go.load()) std::this_thread::yield();
-            auto result = registry.admit(request);
+            auto result = registry.admit(local_request);
             if (result.status == moe_mmid_lease_status::ACQUIRED) acquired.fetch_add(1);
             if (result.status == moe_mmid_lease_status::BUSY) busy.fetch_add(1);
             while (acquired.load() + busy.load() < 8) std::this_thread::yield();
@@ -785,6 +951,7 @@ int main() {
         registry_retirement_retains_outstanding_lease();
         registry_atomic_bundle_authority();
         registry_bundle_rollback_move_oom_and_quarantine();
+        registry_destroyed_quarantine_recovery();
         registry_atomic_concurrency_multi_owner();
         std::cout << "moe-mmid-workspace-plan: all tests passed\n";
         return 0;

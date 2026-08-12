@@ -621,11 +621,16 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     const bool direct_q1_nvfp4 = operand.recipe.kind != moe_batch_executor::HOST_CPU &&
                                  (operand.recipe.request.type == GGML_TYPE_Q1_0 ||
                                   operand.recipe.request.type == GGML_TYPE_NVFP4);
-    if (direct_q1_nvfp4 &&
-        (!workspace_bundle ||
-         !workspace_bundle->matches(submit_device, operand.recipe.owner_device, operand.recipe.request.K,
-                                    operand.recipe.request.N, static_cast<int32_t>(operand.recipe.request.type)))) {
-        out.reject = moe_batch_reject_reason::WORKSPACE_LEASE_MISSING;
+    if (direct_q1_nvfp4) {
+        if (!workspace_bundle ||
+            !workspace_bundle->matches(submit_device, operand.recipe.owner_device, operand.recipe.request.K,
+                                       operand.recipe.request.N, static_cast<int32_t>(operand.recipe.request.type))) {
+            out.reject = moe_batch_reject_reason::WORKSPACE_LEASE_MISSING;
+            return out;
+        }
+        // Admission authority is complete, but production graph/executor wiring
+        // remains deliberately closed until it supplies exact occurrence identities.
+        out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
         return out;
     }
     if (!validate_moe_execution_recipe(operand.recipe, operand.admitted_recipe_signature, operand.lease,
