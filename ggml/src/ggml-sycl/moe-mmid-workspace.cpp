@@ -565,6 +565,22 @@ bool context_idle_locked(const registry_context & context) {
     return true;
 }
 
+void gc_retired_context_locked(moe_mmid_workspace_registry::state & state,
+                               const std::shared_ptr<registry_context> & owning_context) {
+    if (!owning_context) return;
+    const auto retired = std::find(state.retired_contexts.begin(), state.retired_contexts.end(), owning_context);
+    if (retired == state.retired_contexts.end()) return;
+    std::array<size_t, execution::max_devices> order{};
+    std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+    for (size_t i = 0; i < owning_context->pools.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.begin() + owning_context->pools.size(), [&](size_t a, size_t b) {
+        return owning_context->pools[a]->owner_device < owning_context->pools[b]->owner_device;
+    });
+    for (size_t i = 0; i < owning_context->pools.size(); ++i)
+        locks[i] = std::unique_lock<std::mutex>(owning_context->pools[order[i]]->mutex);
+    if (context_idle_locked(*owning_context)) state.retired_contexts.erase(retired);
+}
+
 moe_mmid_blob retained_subrange(const moe_mmid_blob & blob, size_t offset, size_t bytes) noexcept {
     moe_mmid_blob out;
     if (!blob.valid() || bytes == 0 || offset > blob.bytes || bytes > blob.bytes - offset) return out;
@@ -702,6 +718,7 @@ moe_admitted_workspace_bundle & moe_admitted_workspace_bundle::operator=(moe_adm
         graph_snapshot_.swap(other.graph_snapshot_);
         common_authority_.swap(other.common_authority_);
         registry_state_.swap(other.registry_state_);
+        registry_context_.swap(other.registry_context_);
     }
     return *this;
 }
@@ -766,35 +783,42 @@ bool moe_admitted_workspace_bundle::mark_possible_submit() noexcept {
 }
 
 bool moe_admitted_workspace_bundle::release_all() noexcept {
-    if (!valid() || !registry_state_) return false;
+    if (!valid() || !registry_state_ || !registry_context_) return false;
     auto registry = std::static_pointer_cast<moe_mmid_workspace_registry::state>(registry_state_);
+    auto owning_context = std::static_pointer_cast<registry_context>(registry_context_);
     std::lock_guard<std::mutex> registry_lock(registry->mutex);
-    std::array<size_t, execution::max_devices> order{};
-    std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
-    for (size_t i = 0; i < owner_count_; ++i) order[i] = i;
-    std::sort(order.begin(), order.begin() + owner_count_, [&](size_t a, size_t b) {
-        return leases_[a].owner_device() < leases_[b].owner_device();
-    });
-    for (size_t i = 0; i < owner_count_; ++i)
-        locks[i] = std::unique_lock<std::mutex>(leases_[order[i]].authority_->pool->mutex);
-    for (size_t i = 0; i < owner_count_; ++i) {
-        auto & lease = leases_[i]; auto & slot = lease.authority_->pool->slots[lease.slot()];
-        if (!slot.busy || slot.quarantined || slot.generation != lease.generation() ||
-            slot.epoch != epoch_ || slot.bundle_serial != capability_) return false;
-    }
-    for (size_t i = 0; i < owner_count_; ++i) {
-        auto & lease = leases_[i]; auto & slot = lease.authority_->pool->slots[lease.slot()];
-        slot.busy = false; slot.epoch = 0; slot.bundle_serial = 0;
-        slot.quarantine_graph.reset(); slot.quarantine_authority.reset();
-    }
-    admitted_ = false; capability_ = 0; common_authority_.reset(); registry_state_.reset(); return true;
+    {
+        std::array<size_t, execution::max_devices> order{};
+        std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+        for (size_t i = 0; i < owner_count_; ++i) order[i] = i;
+        std::sort(order.begin(), order.begin() + owner_count_, [&](size_t a, size_t b) {
+            return leases_[a].owner_device() < leases_[b].owner_device();
+        });
+        for (size_t i = 0; i < owner_count_; ++i)
+            locks[i] = std::unique_lock<std::mutex>(leases_[order[i]].authority_->pool->mutex);
+        for (size_t i = 0; i < owner_count_; ++i) {
+            auto & lease = leases_[i]; auto & slot = lease.authority_->pool->slots[lease.slot()];
+            if (!slot.busy || slot.quarantined || slot.generation != lease.generation() ||
+                slot.epoch != epoch_ || slot.bundle_serial != capability_) return false;
+        }
+        for (size_t i = 0; i < owner_count_; ++i) {
+            auto & lease = leases_[i]; auto & slot = lease.authority_->pool->slots[lease.slot()];
+            slot.busy = false; slot.epoch = 0; slot.bundle_serial = 0;
+            slot.quarantine_graph.reset(); slot.quarantine_authority.reset();
+        }
+    } // pool locks drop before the post-release registry sweep revalidates
+    gc_retired_context_locked(*registry, owning_context);
+    admitted_ = false; capability_ = 0; common_authority_.reset();
+    registry_context_.reset(); registry_state_.reset(); return true;
 }
 
 bool moe_admitted_workspace_bundle::terminal_release() noexcept {
-    if (!valid() || !registry_state_) return false;
+    if (!valid() || !registry_state_ || !registry_context_) return false;
     if (!possible_submit_) return release_all();
     auto registry = std::static_pointer_cast<moe_mmid_workspace_registry::state>(registry_state_);
+    auto owning_context = std::static_pointer_cast<registry_context>(registry_context_);
     std::lock_guard<std::mutex> registry_lock(registry->mutex);
+    {
     std::array<size_t, execution::max_devices> order{};
     std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
     for (size_t i = 0; i < owner_count_; ++i) order[i] = i;
@@ -828,7 +852,10 @@ bool moe_admitted_workspace_bundle::terminal_release() noexcept {
         slot.busy = false; slot.quarantined = false; slot.epoch = 0; slot.bundle_serial = 0;
         slot.quarantine_graph.reset(); slot.quarantine_authority.reset();
     }
-    admitted_ = false; capability_ = 0; common_authority_.reset(); registry_state_.reset(); return true;
+    } // release every pool lock before revalidating retired ownership
+    gc_retired_context_locked(*registry, owning_context);
+    admitted_ = false; capability_ = 0; common_authority_.reset();
+    registry_context_.reset(); registry_state_.reset(); return true;
 }
 
 moe_mmid_workspace_registry::moe_mmid_workspace_registry() : state_(std::make_shared<state>()) {}
@@ -1191,6 +1218,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     out.bundle.identities_ = bindings;
     out.bundle.graph_snapshot_ = snapshot;
     out.bundle.registry_state_ = state_;
+    out.bundle.registry_context_ = context;
     out.bundle.epoch_ = snapshot->key.epoch.value;
     out.bundle.plan_identity_ = request.plan_identity;
     out.bundle.submit_device_ = request.submit_device;
@@ -1341,6 +1369,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     }
     out.bundle.owner_count_ = authority->owners.size(); out.bundle.identities_ = bindings;
     out.bundle.common_authority_ = std::move(authority); out.bundle.registry_state_ = state_;
+    out.bundle.registry_context_ = context;
     out.bundle.epoch_ = out.bundle.common_authority_->epoch;
     out.bundle.plan_identity_ = out.bundle.common_authority_->plan_identity; out.bundle.submit_device_ = out.bundle.common_authority_->submit_device;
     out.bundle.K_ = request.shape.K; out.bundle.N_ = request.shape.N; out.bundle.type_ = request.shape.type;
@@ -1377,7 +1406,17 @@ bool moe_mmid_workspace_registry::replace_plan(
         prepared_context->plan_identity = replacement_identity;
         prepared_context->publication_generation = publication_generation;
         for (const auto & pool : prepared_context->pools) pool->plan_identity = replacement_identity;
-        state_->retired_contexts.push_back(old_context);
+        {
+            std::array<size_t, execution::max_devices> order{};
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+            for (size_t i = 0; i < old_context->pools.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.begin() + old_context->pools.size(), [&](size_t a, size_t b) {
+                return old_context->pools[a]->owner_device < old_context->pools[b]->owner_device;
+            });
+            for (size_t i = 0; i < old_context->pools.size(); ++i)
+                locks[i] = std::unique_lock<std::mutex>(old_context->pools[order[i]]->mutex);
+            if (!context_idle_locked(*old_context)) state_->retired_contexts.push_back(old_context);
+        }
         state_->contexts.erase(std::remove(state_->contexts.begin(), state_->contexts.end(), old_context),
                                state_->contexts.end());
     } else {
@@ -1544,6 +1583,15 @@ size_t moe_mmid_workspace_registry::published_contexts() const noexcept {
     try {
         std::lock_guard<std::mutex> lock(state_->mutex);
         return state_->contexts.size();
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t moe_mmid_workspace_registry::retired_contexts_for_test() const noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->retired_contexts.size();
     } catch (...) {
         return 0;
     }

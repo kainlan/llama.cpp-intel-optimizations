@@ -1026,6 +1026,53 @@ static void model_scoped_replacement_and_retired_recovery() {
           "model A replacement invalidated model B generation ticket");
 }
 
+static void changed_replacement_terminal_release_gc() {
+    std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int queue_object = 0;
+    auto queue = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 3101);
+    auto owner = owner_plan(0, 3101); owner.queue_capability = queue;
+    const moe_mmid_model_token token{ 311, 312, 313 };
+    auto current = std::make_shared<const lifecycle_plan_snapshot>();
+    uint64_t plan_id = 3100;
+    check(registry.materialize(token, plan_id, current, 0, { owner }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED, "repeated replacement baseline failed");
+    for (size_t iteration = 0; iteration < 24; ++iteration) {
+        const uint64_t epoch = 3200 + iteration;
+        auto graph = admission_request(token, plan_id, { { 0, 3101 } }, epoch);
+        auto terminal = graph.graph_snapshot->terminals.at(0);
+        auto submission = workspace_admission_authority_test_factory::terminal(queue, epoch, terminal);
+        auto authority = workspace_admission_authority_test_factory::direct(
+            token, plan_id, epoch, 0, current, graph.retained_occurrences, graph.table_owner,
+            { { 0, 3101 } }, { queue }, {}, { submission });
+        auto old = registry.admit({ std::move(authority), { 2, 2, 64, 96, 1 } });
+        check(old.status == moe_mmid_lease_status::ACQUIRED, "repeated old admission failed");
+        auto next = std::make_shared<const lifecycle_plan_snapshot>();
+        auto changed = owner;
+        check(moe_mmid_plan_workspace({ 64 + 32 * (iteration + 1), 96, 2, 2, 3 }, false, &changed.geometry) &&
+                  moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH,
+                                              &changed.device_pool_bytes, &changed.host_pool_bytes) &&
+                  registry.materialize(token, plan_id + 1, next, 0, { changed }, allocator) ==
+                      moe_mmid_materialize_status::PUBLISHED,
+              "repeated changed context preparation failed");
+        std::atomic<bool> go{ false };
+        bool replaced = false, released = false;
+        std::thread replacer([&] { while (!go.load()) std::this_thread::yield();
+            replaced = registry.replace_plan(current, next, plan_id + 1, false); });
+        std::thread releaser([&] { while (!go.load()) std::this_thread::yield(); released = old.bundle.terminal_release(); });
+        go.store(true); replacer.join(); releaser.join();
+        check(replaced && released && registry.retired_contexts_for_test() == 0 &&
+                  registry.published_contexts() == 1,
+              "normal release did not GC retired changed context");
+        current = std::move(next); ++plan_id;
+    }
+    check(registry.retired_contexts_for_test() == 0 && registry.published_contexts() == 1,
+          "repeated changed replacement grew registry owners");
+}
+
 static void registry_bundle_rollback_move_oom_and_quarantine() {
     const moe_mmid_model_token token{ 61, 62, 63 };
     std::atomic<int> destroyed{ 0 };
@@ -1213,6 +1260,7 @@ int main() {
         registry_atomic_bundle_authority();
         common_direct_authority_plan_queue_and_lifetime();
         model_scoped_replacement_and_retired_recovery();
+        changed_replacement_terminal_release_gc();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();
         registry_atomic_concurrency_multi_owner();

@@ -451,6 +451,7 @@ class moe_admitted_workspace_bundle {
     std::shared_ptr<const moe::graph_retention_record> graph_snapshot_;
     std::shared_ptr<workspace_admission_authority::state> common_authority_;
     std::shared_ptr<void> registry_state_;
+    std::shared_ptr<void> registry_context_;
     friend class moe_mmid_workspace_registry;
 };
 
@@ -507,6 +508,7 @@ class moe_mmid_workspace_registry {
                                                        bool wait) noexcept;
     bool                           retire(const moe_mmid_model_token & token, uint64_t plan_identity = 0) noexcept;
     size_t                         published_contexts() const noexcept;
+    size_t                         retired_contexts_for_test() const noexcept;
     std::vector<moe_mmid_registry_context_info> list() const;
 
   public:
