@@ -113,6 +113,50 @@ def test_canonical_backend_aos_expert_handle_contract() -> None:
     assert not violations(source), violations(source)
 
 
+def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> None:
+    source = SOURCE.read_text()
+    start = source.index("struct moe_expert_meta {")
+    end = source.index("};", start)
+    meta = source[start:end]
+    assert "ggml_sycl_cache_id canonical_key" in meta
+    for borrowed in ("ggml_tensor *", "ggml_tensor_extra_gpu *", "data_ptr"):
+        assert borrowed not in meta, borrowed
+
+    producer = function(source, "static void moe_hybrid_init_once")
+    assert "meta.canonical_key = ggml_sycl_get_moe_expert_cache_key" in producer
+    keys = function(source, "static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys")
+    assert "const ggml_sycl_cache_id key = m.canonical_key" in keys
+    assert "ggml_sycl_get_moe_expert_cache_key(m." not in keys
+
+    resolver = function(source, "static moe_expert_source ggml_sycl_resolve_moe_meta_source")
+    for witness in ("cache->resolve_expert(req)", "resolved.lifetime",
+                    "has_stable_owner_identity()", "out.handle.resolve"):
+        assert witness in resolver, witness
+    prestage = function(source, "static void moe_prestage_popular_experts")
+    assert "expert_meta = g_moe_expert_meta" in prestage
+    assert "source_leases.push_back(std::move(source))" in prestage
+    materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
+    assert "meta_value = m" in materialize
+    assert "ggml_sycl_resolve_moe_meta_source(*meta, device)" in materialize
+
+    # Legacy pointer-only bridges cannot represent ownership and must fail closed.
+    lookup = function(source, "bool ggml_sycl_lookup_moe_expert_source_by_name")
+    stage = function(source, "bool moe_get_expert_stage_info")
+    assert "return false;" in lookup and "g_moe_expert_meta" not in lookup
+    assert "return false;" in stage and "g_moe_expert_meta" not in stage
+
+
+def test_private_production_route_has_graph_churn_regression() -> None:
+    test_source = (ROOT / "ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp").read_text()
+    churn = function(test_source, "void graph_churn_regression")
+    assert churn.count("successful_reuse_case(life, type, ne11)") == 2
+    assert "ggml_free(churn)" in churn
+    main = function(test_source, "int main()")
+    for type_name in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4"):
+        for ne11 in (1, 3):
+            assert f"graph_churn_regression(life, {type_name}, {ne11})" in main
+
+
 def test_real_sycl_owned_slice_lifecycle_is_registered() -> None:
     test = function(LIFECYCLE_TEST.read_text(), "static bool test_canonical_owned_aos_slice_lifecycle")
     for witness in (

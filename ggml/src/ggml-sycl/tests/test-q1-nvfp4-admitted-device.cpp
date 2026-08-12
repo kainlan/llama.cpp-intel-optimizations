@@ -274,6 +274,26 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     }
 }
 
+void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
+    // Graph A publishes metadata, runs twice, and is destroyed by the helper.
+    successful_reuse_case(life, type, ne11);
+
+    // Force allocator/address churn before graph B reuses the same tensor name.
+    // A persistent borrowed tensor/extra/data pointer is likely to become stale.
+    for (int i = 0; i < 64; ++i) {
+        ggml_context * churn = ggml_init({ 256 * 1024, nullptr, true });
+        require(churn != nullptr, "graph churn context allocation failed");
+        for (int j = 0; j < 32; ++j) {
+            auto * t = ggml_new_tensor_2d(churn, GGML_TYPE_F32, 32 + (j % 7), 8);
+            ggml_set_name(t, j % 2 ? "blk.0.ffn_gate_exps.weight" : "graph_churn");
+        }
+        ggml_free(churn);
+    }
+
+    // Graph B must resolve the canonical value key and run twice independently.
+    successful_reuse_case(life, type, ne11);
+}
+
 void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_quarantine) {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
@@ -315,10 +335,10 @@ int main() {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
         if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return 77; }
-        { lifecycle_fixture life; successful_reuse_case(life, GGML_TYPE_Q1_0, 1);
-          successful_reuse_case(life, GGML_TYPE_Q1_0, 3);
-          successful_reuse_case(life, GGML_TYPE_NVFP4, 1);
-          successful_reuse_case(life, GGML_TYPE_NVFP4, 3); }
+        { lifecycle_fixture life; graph_churn_regression(life, GGML_TYPE_Q1_0, 1);
+          graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
+          graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
+          graph_churn_regression(life, GGML_TYPE_NVFP4, 3); }
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         injected_async_terminal_failure_case();

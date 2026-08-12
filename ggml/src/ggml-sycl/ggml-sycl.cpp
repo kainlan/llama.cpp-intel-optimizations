@@ -2769,18 +2769,19 @@ static int moe_extract_block_number(const char * name) {
 // Populated once during moe_hybrid_init_once(), keyed by (hash_layer_id, expert_idx).
 // ---------------------------------------------------------------------------
 struct moe_expert_meta {
-    const ggml_tensor *     tensor;       // src0 tensor for cache key generation
-    std::string             tensor_name;  // stable copy; graph tensor names/pointers may not survive PP->TG transitions
-    ggml_tensor_extra_gpu * extra;        // tensor extra for cache UUID
-    ggml_type               type;         // weight quantization type
-    int64_t                 ne0;          // columns (K)
-    int64_t                 ne1;          // rows (N)
-    const void *            data_ptr;     // host-accessible weight data
-    size_t                  bytes;        // per-expert weight bytes
-    int                     layer_id;     // hash-based layer_id
-    int                     expert_idx;   // expert index within layer
-    moe_tensor_type         tensor_role;  // gate/up/down classification
-    int                     block_num;    // transformer block number (-1 if unknown)
+    // Persistent metadata is deliberately value-only. Graph tensors, tensor
+    // extras, and storage addresses are observations used only while producing
+    // this descriptor; the canonical cache key is the storage authority.
+    ggml_sycl_cache_id canonical_key{};
+    std::string        tensor_name;
+    ggml_type          type        = GGML_TYPE_COUNT;
+    int64_t            ne0         = 0;
+    int64_t            ne1         = 0;
+    size_t             bytes       = 0;
+    int                layer_id    = -1;
+    int                expert_idx  = -1;
+    moe_tensor_type    tensor_role = MOE_TENSOR_UNKNOWN;
+    int                block_num   = -1;
 };
 
 static std::vector<moe_expert_meta> g_moe_expert_meta;
@@ -2809,6 +2810,68 @@ static bool               ggml_sycl_release_moe_tensor_phase_layouts_except_two(
 static bool               ggml_sycl_release_moe_tensor_phase_layouts_except(const ggml_tensor * src0,
                                                                             int                 device,
                                                                             ggml_layout_mode    keep_layout);
+
+struct moe_expert_source {
+    ggml_sycl::mem_handle handle{};
+    const void *          ptr           = nullptr;
+    int                   owning_device = ggml_sycl::mem_handle::HOST_DEVICE;
+    bool                  has_ready     = false;
+    sycl::event           ready{};
+
+    explicit operator bool() const { return handle.valid() && ptr != nullptr; }
+};
+
+// Resolve the value key through unified-cache and retain the returned lifetime.
+// Missing or ownerless entries fail closed; graph tensors are never consulted.
+static moe_expert_source ggml_sycl_resolve_moe_meta_source(const moe_expert_meta & meta, int preferred_device) {
+    moe_expert_source out{};
+    if (!meta.canonical_key.valid) {
+        return out;
+    }
+    std::vector<int> devices;
+    if (preferred_device >= 0) {
+        devices.push_back(preferred_device);
+    }
+    const int n_devs = std::min<int>(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    for (int d = 0; d < n_devs; ++d) {
+        if (std::find(devices.begin(), devices.end(), d) == devices.end()) {
+            devices.push_back(d);
+        }
+    }
+    for (int d : devices) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+        if (!cache) {
+            continue;
+        }
+        ggml_sycl::expert_resolve_request req{};
+        req.key              = ggml_sycl_layout_specific_moe_expert_cache_key(meta.canonical_key, GGML_LAYOUT_AOS);
+        req.requested_layout = GGML_LAYOUT_AOS;
+        req.layer_id         = meta.layer_id;
+        req.expert_id        = meta.expert_idx;
+        req.current_device   = preferred_device;
+        req.preferred_device = preferred_device;
+        req.device_policy    = ggml_sycl::expert_resolve_device_policy::ANY;
+        req.allow_host       = true;
+        req.allow_mmap_host  = true;
+        req.require_ready    = false;
+        auto resolved = cache->resolve_expert(req);
+        if (!resolved || !resolved.lifetime || !resolved.lifetime->has_stable_owner_identity()) {
+            continue;
+        }
+        out.handle        = std::move(*resolved.lifetime);
+        out.owning_device = resolved.owning_device;
+        auto owned        = out.handle.resolve(resolved.owning_device);
+        if (!owned.ptr || owned.layout != GGML_LAYOUT_AOS || owned.ptr != resolved.ptr) {
+            out = {};
+            continue;
+        }
+        out.ptr       = owned.ptr;
+        out.has_ready = resolved.has_ready_event;
+        out.ready     = resolved.has_ready_event ? resolved.ready_event : sycl::event{};
+        return out;
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Lightweight popularity ranking: maps (layer_id, expert_id) -> popularity rank.
@@ -3145,16 +3208,8 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                 g_expert_popularity.clear();
                 g_expert_popularity_initialized = false;
             }
-            {
-                // The dying owner's tensor observers must not outlive it; the
-                // activating owner rebuilds both registries in init_once().
-                std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-                g_moe_expert_meta.clear();
-            }
-            {
-                std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
-                g_expert_groups.clear();
-            }
+            // Both metadata registries are value-only and intentionally survive
+            // teardown; the next successful init atomically publishes replacements.
             // The expert-bias and fused-activation cluster (llama.cpp-nlww).
             // Clearing it here is what retires the once-semantics: the next
             // owner finds biases_scanned false and act_variant undetected, so
@@ -3516,14 +3571,20 @@ static void moe_prestage_popular_experts() {
         return;
     }
 
-    std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-    if (g_moe_expert_meta.empty()) {
+    // Copy descriptors under the registry mutex. No registry element address
+    // may escape the critical section or be used by background staging.
+    std::vector<moe_expert_meta> expert_meta;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+        expert_meta = g_moe_expert_meta;
+    }
+    if (expert_meta.empty()) {
         return;
     }
 
     // Count unique layer IDs for budget calculations.
     std::unordered_set<int> layer_ids;
-    for (const auto & meta : g_moe_expert_meta) {
+    for (const auto & meta : expert_meta) {
         layer_ids.insert(meta.layer_id);
     }
 
@@ -3532,7 +3593,7 @@ static void moe_prestage_popular_experts() {
         return;
     }
 
-    const size_t expert_bytes = g_moe_expert_meta[0].bytes;
+    const size_t expert_bytes = expert_meta[0].bytes;
     if (expert_bytes == 0) {
         return;
     }
@@ -3576,8 +3637,8 @@ static void moe_prestage_popular_experts() {
     // Under VRAM pressure, down_exps are dropped first since they can be prefetched
     // during the gate*up -> SiLU computation.
     std::vector<const moe_expert_meta *> priority_list;
-    priority_list.reserve(g_moe_expert_meta.size());
-    for (const auto & meta : g_moe_expert_meta) {
+    priority_list.reserve(expert_meta.size());
+    for (const auto & meta : expert_meta) {
         priority_list.push_back(&meta);
     }
     std::sort(priority_list.begin(), priority_list.end(), [&](const moe_expert_meta * a, const moe_expert_meta * b) {
@@ -3612,7 +3673,7 @@ static void moe_prestage_popular_experts() {
 
         // Build expert groups from the metadata, keyed by (block_num, expert_idx)
         std::unordered_map<int64_t, expert_meta_group> meta_groups;
-        for (const auto & meta : g_moe_expert_meta) {
+        for (const auto & meta : expert_meta) {
             if (meta.block_num < 0) {
                 continue;
             }
@@ -3673,34 +3734,44 @@ static void moe_prestage_popular_experts() {
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
+        // Source leases remain live until every staging queue is drained.
+        std::vector<moe_expert_source> source_leases;
+        source_leases.reserve(sorted_groups.size() * 3);
+
         // Helper: build staging data + cache_layout_request for one tensor
         auto build_tensor_data = [&](const moe_expert_meta * meta, ggml_sycl::staging_tensor_data & sd,
                                      ggml_sycl::cache_layout_request & req, ggml_sycl_gpu_reorder_fill_ctx & gpu_fctx,
                                      ggml_sycl_reorder_fill_ctx & host_fctx) -> bool {
-            if (!meta || !meta->tensor || !meta->extra) {
+            if (!meta || !meta->canonical_key.valid) {
                 return false;
             }
             if (!ggml_sycl_layout_supports_soa(meta->type)) {
                 return false;
             }
 
-            ggml_sycl_cache_id ckey = ggml_sycl_get_moe_expert_cache_key(meta->tensor, meta->extra, meta->expert_idx);
-            if (!ckey.valid) {
+            const ggml_sycl_cache_id ckey = meta->canonical_key;
+            moe_expert_source source = ggml_sycl_resolve_moe_meta_source(*meta, device);
+            if (!source) {
                 return false;
             }
+            if (source.has_ready) {
+                source.ready.wait();
+            }
+            source_leases.push_back(std::move(source));
+            const void * source_ptr = source_leases.back().ptr;
 
             const size_t soa_bytes =
                 ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, GGML_LAYOUT_SOA, device);
             const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta->bytes;
 
-            sd.src_ptr   = meta->data_ptr;
+            sd.src_ptr   = source_ptr;
             sd.src_size  = meta->bytes;
             sd.dst_size  = dst_bytes;
             sd.layer_id  = meta->layer_id;
             sd.expert_id = meta->expert_idx;
 
             req.key              = ggml_sycl_layout_specific_moe_expert_cache_key(ckey, GGML_LAYOUT_SOA);
-            req.src_ptr          = meta->data_ptr;
+            req.src_ptr          = source_ptr;
             req.src_size         = meta->bytes;
             req.dst_size         = dst_bytes;
             req.type             = ggml_sycl::cache_entry_type::MOE_EXPERT;
@@ -3730,9 +3801,9 @@ static void moe_prestage_popular_experts() {
                 host_fctx.nbytes           = meta->bytes;
                 host_fctx.dst_bytes        = dst_bytes;
                 host_fctx.layout           = GGML_LAYOUT_SOA;
-                host_fctx.src_is_device    = ggml_sycl_get_alloc_type(meta->data_ptr) == sycl::usm::alloc::device;
+                host_fctx.src_is_device    = source_leases.back().owning_device >= 0;
                 host_fctx.device_id        = device;
-                host_fctx.source_device_id = ggml_sycl_device_owner_for_ptr(meta->data_ptr, host_fctx.src_is_device);
+                host_fctx.source_device_id = source_leases.back().owning_device;
 
                 req.fill_fn  = ggml_sycl_fill_reordered_host;
                 req.fill_ctx = &host_fctx;
@@ -3779,11 +3850,10 @@ static void moe_prestage_popular_experts() {
                 const auto   pp_owner            = ggml_sycl_cache_plan_owner(cache);
                 const auto & pp                  = *pp_owner;
                 auto         check_expert_tensor = [&](const moe_expert_meta * meta) -> bool {
-                    if (!meta || !meta->tensor || !meta->tensor->name) {
+                    if (!meta || meta->tensor_name.empty()) {
                         return true;
                     }
-                    const std::string tname(meta->tensor->name);
-                    return pp.expert_on_device(tname, mg.expert_idx, device);
+                    return pp.expert_on_device(meta->tensor_name, mg.expert_idx, device);
                 };
                 bool gate_on_dev = check_expert_tensor(mg.gate);
                 bool up_on_dev   = check_expert_tensor(mg.up);
@@ -3989,6 +4059,7 @@ static void moe_prestage_popular_experts() {
                 ggml_sycl_cache_id      key;
                 size_t                  dst_bytes;
                 int                     budget_idx;  // index into sec_budgets
+                moe_expert_source       source;
             };
 
             std::vector<sec_work_item> sec_work;
@@ -4021,8 +4092,8 @@ static void moe_prestage_popular_experts() {
                 // specific secondary device. Without this, Phase 2 can stage
                 // host-planned experts onto secondary GPUs or move a role to a
                 // different secondary device than the planner selected.
-                if (meta->tensor && meta->tensor->name) {
-                    const std::string tname(meta->tensor->name);
+                if (!meta->tensor_name.empty()) {
+                    const std::string & tname = meta->tensor_name;
                     for (int i = 0; i < static_cast<int>(sec_budgets.size()); ++i) {
                         const auto & b         = sec_budgets[i];
                         auto *       sec_cache = b.cache;
@@ -4078,17 +4149,21 @@ static void moe_prestage_popular_experts() {
                 }
 
                 ggml_sycl_cache_id key =
-                    ggml_sycl_get_moe_expert_cache_key(meta->tensor, meta->extra, meta->expert_idx);
-                if (!key.valid) {
+                    ggml_sycl_layout_specific_moe_expert_cache_key(meta->canonical_key, GGML_LAYOUT_SOA);
+
+                moe_expert_source source = ggml_sycl_resolve_moe_meta_source(*meta, budget.dev);
+                if (!source) {
                     continue;
                 }
-                key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
+                if (source.has_ready) {
+                    source.ready.wait();
+                }
 
                 // Deduct budget eagerly during collection so device selection
                 // remains accurate for subsequent experts.
                 budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
 
-                sec_work.push_back({ meta, key, dst_bytes, planned_budget_idx });
+                sec_work.push_back({ meta, key, dst_bytes, planned_budget_idx, std::move(source) });
             }
 
             const bool sec_use_gpu = !ggml_sycl_gpu_reorder_disabled();
@@ -4124,7 +4199,7 @@ static void moe_prestage_popular_experts() {
 
                     try {
                         auto result = budget.cache->direct_stage_expert(
-                            item.key, item.meta->data_ptr, item.meta->bytes, item.dst_bytes, GGML_LAYOUT_SOA,
+                            item.key, item.source.ptr, item.meta->bytes, item.dst_bytes, GGML_LAYOUT_SOA,
                             ggml_sycl_fill_reordered_gpu, &fctx, &budget.cache->get_queue());
                         if (result.ok && result.ptr) {
                             budget.staged++;
@@ -4172,7 +4247,7 @@ static void moe_prestage_popular_experts() {
                     ci.key        = item.key;
                     ci.dst_bytes  = item.dst_bytes;
                     ci.budget_idx = item.budget_idx;
-                    ci.source_ptr = item.meta->data_ptr;
+                    ci.source_ptr = item.source.ptr;
                     ci.ok         = false;
 
                     ci.reorder_ctx.type          = item.meta->type;
@@ -4184,20 +4259,29 @@ static void moe_prestage_popular_experts() {
                     ci.reorder_ctx.src_is_device = false;
                     ci.reorder_ctx.device_id     = budget.dev;
 
-                    const bool source_is_device =
-                        ggml_sycl_get_alloc_type(item.meta->data_ptr) == sycl::usm::alloc::device;
+                    const bool source_is_device = item.source.owning_device >= 0;
                     if (source_is_device) {
-                        const int     source_device = ggml_sycl_device_owner_for_ptr(item.meta->data_ptr, true);
                         sycl::queue & fallback_queue =
                             budget.cache ? budget.cache->get_queue() : ggml_sycl_get_device(budget.dev).default_queue();
-                        sycl::queue * source_queue =
-                            ggml_sycl_owner_queue_for_ptr(item.meta->data_ptr, source_device, fallback_queue);
+                        sycl::queue * source_queue = ggml_sycl_owner_queue_for_ptr(
+                            item.source.ptr, item.source.owning_device, fallback_queue);
                         ci.source_host.resize(item.meta->bytes);
-                        ggml_sycl::mem_handle dst_handle = ggml_sycl::mem_handle::from_direct(
-                            ci.source_host.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
-                        ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_chunk_ptr(
-                            const_cast<void *>(item.meta->data_ptr), source_device, GGML_LAYOUT_AOS, true);
-                        ggml_sycl::mem_copy(dst_handle, src_handle, item.meta->bytes, *source_queue);
+                        ggml_sycl::alloc_handle host_owner{};
+                        ggml_sycl::alloc_request host_req{};
+                        host_req.queue = source_queue;
+                        host_req.device = item.source.owning_device;
+                        host_req.size = item.meta->bytes;
+                        host_req.intent.role = ggml_sycl::alloc_role::EXPERT_STAGING;
+                        host_req.intent.category = ggml_sycl::runtime_category::STAGING;
+                        host_req.intent.constraints.must_host_pinned = true;
+                        if (!ggml_sycl::unified_alloc(host_req, &host_owner) || !host_owner.ptr) {
+                            continue;
+                        }
+                        ggml_sycl::mem_handle dst_handle =
+                            ggml_sycl::mem_handle::from_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
+                        ggml_sycl::mem_copy(dst_handle, item.source.handle, item.meta->bytes, *source_queue);
+                        ci.source_host.assign(static_cast<const uint8_t *>(dst_handle.resolve().ptr),
+                                              static_cast<const uint8_t *>(dst_handle.resolve().ptr) + item.meta->bytes);
                         ci.source_ptr = ci.source_host.data();
                     }
 
@@ -4419,25 +4503,27 @@ static void ggml_sycl_invalidate_moe_layout_caches(ggml_tensor_extra_gpu * extra
 
 namespace ggml_sycl {
 void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id) {
-    // Look up expert metadata (type, dims, data pointer)
-    const moe_expert_meta * meta = nullptr;
+    moe_expert_meta meta{};
+    bool            found = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
         for (const auto & m : g_moe_expert_meta) {
             if (m.layer_id == layer_idx && m.expert_idx == expert_idx) {
-                meta = &m;
+                meta  = m;
+                found = true;
                 break;
             }
         }
     }
-    if (!meta) {
+    if (!found) {
         return nullptr;
     }
-
-    // Validate data pointer — skip if corrupt (non-canonical address on x86-64)
-    const uintptr_t data_addr = reinterpret_cast<uintptr_t>(meta->data_ptr);
-    if (data_addr == 0 || (data_addr >> 47) != 0) {
+    moe_expert_source source = ggml_sycl_resolve_moe_meta_source(meta, device_id);
+    if (!source) {
         return nullptr;
+    }
+    if (source.has_ready) {
+        source.ready.wait();
     }
 
     // Get unified cache for target device
@@ -4449,20 +4535,16 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     // P4: Check placement plan — skip device staging for experts planned for host.
     // Without this, adaptive prestage and ExpertPrefetcher::hint() bypass the plan
     // and exhaust the WEIGHT zone on MoE models that exceed VRAM.
-    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && meta->tensor && meta->tensor->name) {
-        const std::string tname(meta->tensor->name);
-        if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(tname, expert_idx, device_id)) {
+    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {
+        if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {
             return nullptr;  // Expert planned for host — caller handles host fallback
         }
     }
 
     // Build cache key from expert tensor metadata
-    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(meta->tensor, meta->extra, meta->expert_idx);
-    if (!key.valid) {
-        return nullptr;
-    }
+    ggml_sycl_cache_id key = meta.canonical_key;
 
-    if (!ggml_sycl_layout_supports_soa(meta->type)) {
+    if (!ggml_sycl_layout_supports_soa(meta.type)) {
         return nullptr;
     }
 
@@ -4474,20 +4556,20 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
 
     // Compute SOA byte count for this expert's dimensions
     const size_t soa_bytes =
-        ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, GGML_LAYOUT_SOA, device_id);
-    const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta->bytes;
+        ggml_sycl_layout_bytes_for_dims(meta.type, meta.ne0, meta.ne1, GGML_LAYOUT_SOA, device_id);
+    const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta.bytes;
 
     // Build AOS→SOA reorder context
     ggml_sycl_reorder_fill_ctx reorder_ctx{};
-    reorder_ctx.type             = meta->type;
-    reorder_ctx.ncols            = meta->ne0;
-    reorder_ctx.nrows            = meta->ne1;
-    reorder_ctx.nbytes           = meta->bytes;
+    reorder_ctx.type             = meta.type;
+    reorder_ctx.ncols            = meta.ne0;
+    reorder_ctx.nrows            = meta.ne1;
+    reorder_ctx.nbytes           = meta.bytes;
     reorder_ctx.dst_bytes        = dst_bytes;
     reorder_ctx.layout           = GGML_LAYOUT_SOA;
-    reorder_ctx.src_is_device    = ggml_sycl_get_alloc_type(meta->data_ptr) == sycl::usm::alloc::device;
+    reorder_ctx.src_is_device    = source.owning_device >= 0;
     reorder_ctx.device_id        = device_id;
-    reorder_ctx.source_device_id = ggml_sycl_device_owner_for_ptr(meta->data_ptr, reorder_ctx.src_is_device);
+    reorder_ctx.source_device_id = source.owning_device;
 
     // Route H2D to BCS (copy-only) queue to keep SOA reorder off CCS.
     // Without this, runtime expert staging during inference monopolizes CCS
@@ -4495,7 +4577,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     sycl::queue * bcs_q = &cache->get_bcs_queue();
 
     try {
-        auto result = cache->direct_stage_expert(key, meta->data_ptr, meta->bytes, dst_bytes, GGML_LAYOUT_SOA,
+        auto result = cache->direct_stage_expert(key, source.ptr, meta.bytes, dst_bytes, GGML_LAYOUT_SOA,
                                                  ggml_sycl_fill_reordered_host, &reorder_ctx, bcs_q);
         if (result.ok && result.ptr) {
             return result.ptr;
@@ -4802,11 +4884,10 @@ static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys(c
     }
     std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
     for (const auto & m : g_moe_expert_meta) {
-        const bool same_tensor = m.tensor == src0;
-        const bool same_name   = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
-        if ((same_tensor || same_name) && m.expert_idx == expert_id && m.tensor && m.extra) {
-            ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(m.tensor, m.extra, m.expert_idx);
-            if (key.valid) {
+        const bool same_name = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
+        if (same_name && m.expert_idx == expert_id && m.canonical_key.valid) {
+            const ggml_sycl_cache_id key = m.canonical_key;
+            {
                 bool duplicate = false;
                 for (const auto & existing : keys) {
                     if (ggml_sycl::detail::cache_id_equal(existing, key)) {
@@ -4828,6 +4909,7 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
                                                                   const ggml_tensor *                  src0,
                                                                   int                                  expert_id,
                                                                   const moe_expert_meta &              meta,
+                                                                  const void *                         source_aos,
                                                                   const ggml_sycl_xmx_tiled_fill_ctx & tiled_ctx,
                                                                   const void *                         staged_ptr,
                                                                   size_t                               staged_bytes,
@@ -4854,9 +4936,9 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         }
         fprintf(stderr,
                 "[MOE-MATERIALIZE] fail reason=%s tensor=%s expert=%d device=%d layout=%d key_valid=%d "
-                "meta=%d meta_ptr=%p meta_bytes=%zu entry=%p entry_ptr=%p entry_loc=%d entry_layout=%d\n",
+                "meta=%d meta_bytes=%zu entry=%p entry_ptr=%p entry_loc=%d entry_layout=%d\n",
                 reason, src0 && src0->name ? src0->name : "?", expert_id, device, (int) layout, key.valid ? 1 : 0,
-                meta ? 1 : 0, meta ? meta->data_ptr : nullptr, meta ? meta->bytes : 0, entry,
+                meta ? 1 : 0, meta ? meta->bytes : 0, entry,
                 entry ? entry->ptr : nullptr, entry ? (int) entry->location : -1, entry ? (int) entry->layout : -1);
     };
 
@@ -4873,21 +4955,27 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         log_fail("no-cache-or-plan");
         return false;
     }
-    const moe_expert_meta * meta = nullptr;
+    moe_expert_meta meta_value{};
+    bool            meta_found = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
         for (const auto & m : g_moe_expert_meta) {
-            const bool same_tensor = m.tensor == src0;
-            const bool same_name   = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
-            if ((same_tensor || same_name) && m.expert_idx == expert_id) {
-                meta = &m;
+            const bool same_name = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
+            if (same_name && m.expert_idx == expert_id) {
+                meta_value = m;
+                meta_found = true;
                 break;
             }
         }
     }
-    if (!meta || !meta->data_ptr || meta->bytes == 0) {
-        log_fail("meta-missing", meta);
+    const moe_expert_meta * meta = meta_found ? &meta_value : nullptr;
+    moe_expert_source source = meta ? ggml_sycl_resolve_moe_meta_source(*meta, device) : moe_expert_source{};
+    if (!meta || !source || meta->bytes == 0) {
+        log_fail("meta-or-owned-source-missing", meta);
         return false;
+    }
+    if (source.has_ready) {
+        source.ready.wait();
     }
 
     const size_t layout_bytes = ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, layout, device);
@@ -4909,9 +4997,9 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         reorder_ctx.nbytes           = meta->bytes;
         reorder_ctx.dst_bytes        = dst_bytes;
         reorder_ctx.layout           = layout;
-        reorder_ctx.src_is_device    = ggml_sycl_get_alloc_type(meta->data_ptr) == sycl::usm::alloc::device;
+        reorder_ctx.src_is_device    = source.owning_device >= 0;
         reorder_ctx.device_id        = device;
-        reorder_ctx.source_device_id = ggml_sycl_device_owner_for_ptr(meta->data_ptr, reorder_ctx.src_is_device);
+        reorder_ctx.source_device_id = source.owning_device;
         fill_fn                      = ggml_sycl_fill_reordered_host;
         fill_ctx                     = &reorder_ctx;
     } else if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
@@ -4954,7 +5042,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     sycl::queue *         q = &cache->get_bcs_queue();
     ggml_sycl::mem_handle storage_handle;
     ggml_sycl::mem_handle source_layout_handle;
-    const void *          stage_src_ptr       = meta->data_ptr;
+    const void *          stage_src_ptr       = source.ptr;
     size_t                stage_src_size      = meta->bytes;
     const void *          stage_fill_ctx      = fill_ctx;
     bool                  stage_from_soa      = false;
@@ -5071,7 +5159,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         source_layout_handle = ggml_sycl::mem_handle{};
         if (release_conflicting_layouts()) {
             tiled_ctx.source_layout = GGML_LAYOUT_AOS;
-            stage_src_ptr           = meta->data_ptr;
+            stage_src_ptr           = source.ptr;
             stage_src_size          = meta->bytes;
             stage_fill_ctx          = &tiled_ctx;
             stage_from_soa          = false;
@@ -5092,7 +5180,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         return false;
     }
     if (layout == GGML_LAYOUT_XMX_TILED) {
-        ggml_sycl_validate_xmx_tiled_materialization_original(*q, device, src0, expert_id, *meta, tiled_ctx, staged.ptr,
+        ggml_sycl_validate_xmx_tiled_materialization_original(*q, device, src0, expert_id, *meta, source.ptr, tiled_ctx, staged.ptr,
                                                               dst_bytes, staged.event, stage_from_soa);
     }
     auto resolved_storage = storage_handle.resolve(device);
@@ -5779,53 +5867,14 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
 }
 
 bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out) {
-    out                          = {};
-    const moe_expert_meta * meta = nullptr;
-    {
-        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        for (const auto & m : g_moe_expert_meta) {
-            if (m.layer_id == layer_idx && m.expert_idx == expert_idx) {
-                meta = &m;
-                break;
-            }
-        }
-    }
-    if (!meta) {
-        return false;
-    }
-    const uintptr_t data_addr = reinterpret_cast<uintptr_t>(meta->data_ptr);
-    if (data_addr == 0 || (data_addr >> 47) != 0) {
-        return false;
-    }
-    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(meta->tensor, meta->extra, meta->expert_idx);
-    if (!key.valid) {
-        return false;
-    }
-    // Determine optimal layout for this expert type/dimensions.
-    // MXFP4 experts use SOA (COALESCED requires blocks_per_row%32==0 which
-    // fails for 120B's 2880-col experts with blocks_per_row=90).
-    const layout_mode optimal_layout = GGML_LAYOUT_SOA;
-    if (!ggml_sycl_layout_supports_soa(meta->type)) {
-        return false;
-    }
-    const size_t layout_bytes =
-        ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, optimal_layout, device_id);
-    if (layout_bytes == 0) {
-        return false;
-    }
-    const size_t dst_bytes = (layout_bytes > 0) ? layout_bytes : meta->bytes;
-    out.cache_key          = ggml_sycl_layout_specific_moe_expert_cache_key(key, optimal_layout);
-    out.src_ptr            = meta->data_ptr;
-    out.src_size           = meta->bytes;
-    out.dst_size           = dst_bytes;
-    out.layout             = optimal_layout;
-    out.type               = meta->type;
-    out.ncols              = meta->ne0;
-    out.nrows              = meta->ne1;
-    out.layer_id           = meta->layer_id;
-    out.expert_id          = meta->expert_idx;
-    out.valid              = true;
-    return true;
+    // expert_stage_info has no ownership slot for its src_ptr. Publishing a
+    // pointer here would let background work outlive the local cache lease.
+    // Fail closed until that public descriptor can carry a mem_handle.
+    GGML_UNUSED(layer_idx);
+    GGML_UNUSED(expert_idx);
+    GGML_UNUSED(device_id);
+    out = {};
+    return false;
 }
 
 sycl::event fill_reordered_host(sycl::queue &                    queue,
@@ -6952,13 +7001,14 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         g_moe_expert_meta.reserve(expert_list.size());
         for (const auto & info : expert_list) {
             moe_expert_meta meta{};
-            meta.tensor      = info.tensor;
+            meta.canonical_key = ggml_sycl_get_moe_expert_cache_key(info.tensor, info.extra, info.expert_idx);
+            if (!meta.canonical_key.valid) {
+                continue;
+            }
             meta.tensor_name = info.tensor && info.tensor->name ? std::string(info.tensor->name) : std::string();
-            meta.extra       = info.extra;
             meta.type        = info.tensor->type;
             meta.ne0         = info.tensor->ne[0];
             meta.ne1         = info.tensor->ne[1];
-            meta.data_ptr    = info.data_ptr;
             meta.bytes       = info.bytes;
             meta.layer_id    = info.layer_id;
             meta.expert_idx  = info.expert_idx;
@@ -6984,18 +7034,14 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             if (meta.block_num < 0) {
                 continue;
             }
-            if (!meta.tensor || !meta.extra) {
+            if (!meta.canonical_key.valid) {
                 continue;
             }
 
             const int64_t gkey = expert_group_key(meta.block_num, meta.expert_idx);
             auto &        grp  = g_expert_groups[gkey];
 
-            // Generate the cache key for this expert slice
-            ggml_sycl_cache_id ckey = ggml_sycl_get_moe_expert_cache_key(meta.tensor, meta.extra, meta.expert_idx);
-            if (!ckey.valid) {
-                continue;
-            }
+            const ggml_sycl_cache_id ckey = meta.canonical_key;
 
             switch (meta.tensor_role) {
                 case MOE_TENSOR_GATE:
@@ -9282,21 +9328,9 @@ bool ggml_sycl_lookup_moe_expert_source_by_name(const char * name, int expert_id
         return false;
     }
 
-    std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-    for (const auto & meta : g_moe_expert_meta) {
-        if (meta.expert_idx != expert_idx || meta.tensor_name != name) {
-            continue;
-        }
-        if (!meta.data_ptr || meta.bytes == 0) {
-            return false;
-        }
-        *ptr = meta.data_ptr;
-        if (bytes) {
-            *bytes = meta.bytes;
-        }
-        return true;
-    }
-
+    // This legacy API cannot return ownership alongside the pointer. Never
+    // expose a cache-resolved address whose local mem_handle would immediately
+    // be destroyed; callers must use the retained route/batch APIs instead.
     return false;
 }
 
@@ -23714,18 +23748,6 @@ static bool ggml_sycl_try_pp_host_moe_route(const ggml_tensor *                 
     if (host_base) {
         host_ptr = static_cast<const void *>(static_cast<const char *>(host_base) +
                                              static_cast<size_t>(expert_id) * expert_size);
-    } else {
-        std::shared_lock<std::shared_mutex> meta_lock(g_moe_expert_meta_mutex);
-        for (const auto & meta : g_moe_expert_meta) {
-            const bool same_tensor = meta.tensor == src0;
-            const bool same_name   = src0->name && !meta.tensor_name.empty() && meta.tensor_name == src0->name;
-            if ((same_tensor || same_name) && meta.expert_idx == expert_id && meta.data_ptr && meta.bytes != 0) {
-                host_ptr       = meta.data_ptr;
-                host_bytes     = meta.bytes;
-                host_src_label = "expert-meta";
-                break;
-            }
-        }
     }
     if (!host_ptr || ggml_sycl::ggml_sycl_is_device_expert_ptr(host_ptr)) {
         return false;
@@ -27808,6 +27830,7 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
                                                                   const ggml_tensor *                  src0,
                                                                   int                                  expert_id,
                                                                   const moe_expert_meta &              meta,
+                                                                  const void *                         source_aos,
                                                                   const ggml_sycl_xmx_tiled_fill_ctx & tiled_ctx,
                                                                   const void *                         staged_ptr,
                                                                   size_t                               staged_bytes,
@@ -27815,7 +27838,7 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
                                                                   bool                                 stage_from_soa) {
 #if SYCL_XMX_MOE_AVAILABLE
     if (!ggml_sycl_xmx_tiled_materialize_original_validate_take() || !staged_ptr || staged_bytes == 0 ||
-        !meta.data_ptr || meta.bytes == 0 || tiled_ctx.info.total_bytes == 0) {
+        !source_aos || meta.bytes == 0 || tiled_ctx.info.total_bytes == 0) {
         return;
     }
     try {
@@ -27824,11 +27847,11 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
         std::vector<uint8_t> actual(staged_bytes);
         ::ggml_sycl_safe_memcpy_sync(queue, actual.data(), staged_ptr, staged_bytes);
 
-        const void *         reference_aos = meta.data_ptr;
+        const void *         reference_aos = source_aos;
         std::vector<uint8_t> reference_aos_host;
-        if (::ggml_sycl_get_alloc_type(meta.data_ptr) == sycl::usm::alloc::device) {
+        if (::ggml_sycl_get_alloc_type(source_aos) == sycl::usm::alloc::device) {
             reference_aos_host.resize(meta.bytes);
-            ::ggml_sycl_safe_memcpy_sync(queue, reference_aos_host.data(), meta.data_ptr, meta.bytes);
+            ::ggml_sycl_safe_memcpy_sync(queue, reference_aos_host.data(), source_aos, meta.bytes);
             reference_aos = reference_aos_host.data();
         }
 
@@ -27874,6 +27897,7 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
     GGML_UNUSED(src0);
     GGML_UNUSED(expert_id);
     GGML_UNUSED(meta);
+    GGML_UNUSED(source_aos);
     GGML_UNUSED(tiled_ctx);
     GGML_UNUSED(staged_ptr);
     GGML_UNUSED(staged_bytes);
@@ -93468,13 +93492,12 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
         std::shared_lock<std::shared_mutex> bias_lock(g_moe_bias_state_mutex);
         bias_clean = g_moe_bias_state.clean();
     }
-    std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
     return bias_clean && !g_moe_hybrid_init_success[0].load(std::memory_order_relaxed) &&
            !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_moe_discovery_registry.has_active_owner() && g_moe_discovery_registry.parked_owner_count() == 0 &&
            !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
-           g_moe_expert_meta.empty() && g_adaptive_prestage.test_pending_empty() &&
+           g_adaptive_prestage.test_pending_empty() &&
            !g_expert_prefetchers[0].is_initialized() && !g_pinned_buffer_pools[0].is_initialized() &&
            !g_cpu_expert_pools[0].is_active() && !g_expert_predictors[0].test_scores_allocated() &&
            !ggml_sycl_cpu_retained_active() && ggml_sycl::unified_cache_shutdown_state_clean() &&
