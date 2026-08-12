@@ -411,7 +411,9 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     assert "ggml_sycl_get_backend_context_for_device(workspace.owner_device)" in materialize
     assert "backend ? backend->stream() : nullptr" in materialize
     assert ".default_queue()" not in materialize
-    assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot.version" in materialize
+    assert "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot" in materialize
+    assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot, submit_device" in materialize
+    assert "snapshot.version, *snapshot.plan" not in materialize
     pre_admit = mmid[:start]
     assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit
     assert "canonical_published" in pre_admit

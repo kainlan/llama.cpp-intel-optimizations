@@ -11304,18 +11304,18 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken & token,
-    const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
-    if (!snapshot.plan || snapshot.plan->moe_mmid_workspaces.empty()) {
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
         return true;
     }
-    const int submit_device = snapshot.plan->device_id >= 0 ? snapshot.plan->device_id :
-                              !snapshot.plan->devices.empty() ? snapshot.plan->devices.front() : -1;
-    if (submit_device < 0 || snapshot.version == 0) {
+    const int submit_device = snapshot->plan->device_id >= 0 ? snapshot->plan->device_id :
+                              !snapshot->plan->devices.empty() ? snapshot->plan->devices.front() : -1;
+    if (submit_device < 0 || snapshot->version == 0) {
         return false;
     }
     std::vector<ggml_sycl::moe_mmid_queue_binding> bindings;
-    bindings.reserve(snapshot.plan->moe_mmid_workspaces.size());
-    for (const auto & workspace : snapshot.plan->moe_mmid_workspaces) {
+    bindings.reserve(snapshot->plan->moe_mmid_workspaces.size());
+    for (const auto & workspace : snapshot->plan->moe_mmid_workspaces) {
         // Runtime admission uses backend-context streams, not device defaults.
         // Materialization must bind the identical queue object or exact-queue
         // authority will (correctly) refuse every ordinary invocation.
@@ -11333,7 +11333,7 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::moe_mmid_model_token owner{
         token.model.value, token.load.value, token.owner.generation };
     const auto result = ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(
-        owner, snapshot.version, *snapshot.plan, submit_device, bindings);
+        owner, snapshot, submit_device, bindings);
     return result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
            result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED;
 }
@@ -11408,7 +11408,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         placement_inserted = true;
         // Expert registration and owner queues are complete at load_end. Make
         // every fixed pool available transactionally before publishing LIVE.
-        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, *plan_snapshot)) {
+        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot)) {
             throw std::bad_alloc();
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
@@ -14456,7 +14456,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
         return;
     }
-    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, *next)) {
+    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next)) {
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         return;
     }
