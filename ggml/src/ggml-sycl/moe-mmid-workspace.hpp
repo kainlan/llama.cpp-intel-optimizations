@@ -38,11 +38,15 @@ struct moe_mmid_workspace_geometry {
     size_t q8_ne10_row_bytes = 0;
     size_t q8_ne01_row_bytes = 0;
 
-    size_t activation_f32_bytes = 0;
-    size_t activation_q8_bytes  = 0;
-    size_t output_f32_bytes     = 0;
-    size_t output_q8_bytes      = 0;
-    size_t device_slot_bytes    = 0;
+    size_t activation_f32_offset = 0;
+    size_t activation_f32_bytes  = 0;
+    size_t activation_q8_offset  = 0;
+    size_t activation_q8_bytes   = 0;
+    size_t output_f32_offset     = 0;
+    size_t output_f32_bytes      = 0;
+    size_t output_q8_offset      = 0;
+    size_t output_q8_bytes       = 0;
+    size_t device_slot_bytes     = 0;
 
     size_t descriptor_host_bytes          = 0;
     size_t secondary_activation_d2h_bytes = 0;
@@ -53,6 +57,7 @@ struct moe_mmid_workspace_geometry {
     size_t host_slot_bytes                = 0;
 };
 
+bool moe_mmid_capacity(size_t n_ctx, size_t n_ubatch, size_t n_seq_max, size_t * out) noexcept;
 bool moe_mmid_q8_1_row_bytes(size_t elements, size_t * out) noexcept;
 bool moe_mmid_plan_workspace(const moe_mmid_shape &        shape,
                              bool                          secondary_owner,
@@ -63,6 +68,9 @@ bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & geometry,
                                  uint32_t                            depth,
                                  size_t *                            device_bytes,
                                  size_t *                            host_bytes) noexcept;
+bool moe_mmid_checked_zone_total(size_t base_bytes, size_t workspace_bytes, size_t * out) noexcept;
+bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept;
+bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept;
 
 enum class moe_mmid_lease_status : uint8_t { ACQUIRED, BUSY, INVALID };
 enum class moe_mmid_release_status : uint8_t { RELEASED, STALE, WRONG_QUEUE, WRONG_EPOCH, INVALID };
@@ -109,6 +117,7 @@ class moe_mmid_workspace_pool {
     moe_mmid_release_status terminal_release(const moe_mmid_workspace_lease & lease,
                                              uint64_t                         queue_identity,
                                              uint64_t                         terminal_epoch) noexcept;
+    bool                    set_generation_for_test(uint32_t slot, uint64_t generation) noexcept;
 
   private:
     struct state;

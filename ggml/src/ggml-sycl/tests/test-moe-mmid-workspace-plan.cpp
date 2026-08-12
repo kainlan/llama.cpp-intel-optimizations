@@ -24,6 +24,11 @@ static void geometry_exact_and_boundary() {
     check(g.activation_f32_bytes == 768 && g.activation_q8_bytes == 216, "activation bytes mismatch");
     check(g.output_f32_bytes == 2304 && g.output_q8_bytes == 648, "output bytes mismatch");
     check(g.device_slot_bytes == 4096, "256-byte device slice accounting mismatch");
+    check(g.activation_f32_offset % 256 == 0 && g.activation_q8_offset % 256 == 0 && g.output_f32_offset % 256 == 0 &&
+              g.output_q8_offset % 256 == 0,
+          "device slice start lost 256-byte alignment");
+    check(g.activation_q8_offset == 768 && g.output_f32_offset == 1024 && g.output_q8_offset == 3328,
+          "device slice-start mutant survived");
     check(g.descriptor_host_bytes == 96, "16-byte descriptor accounting mismatch");
     check(g.secondary_activation_d2h_bytes == 768 && g.secondary_activation_h2d_bytes == 768 &&
               g.secondary_output_d2h_bytes == 2304 && g.secondary_output_h2d_bytes == 2304,
@@ -33,6 +38,12 @@ static void geometry_exact_and_boundary() {
     size_t device = 0, host = 0;
     check(moe_mmid_checked_pool_bytes(g, MOE_MMID_WORKSPACE_DEPTH, &device, &host), "exact pool rejected");
     check(device == 8192 && host == 12480, "pool multiplication mismatch");
+    size_t remaining = device;
+    check(moe_mmid_debit_device_budget(device, &remaining) && remaining == 0,
+          "exact per-device workspace debit failed");
+    remaining = device - 1;
+    check(!moe_mmid_debit_device_budget(device, &remaining) && remaining == device - 1,
+          "T-1 per-device budget was mutated or admitted");
     check(!moe_mmid_checked_pool_bytes(g, MOE_MMID_WORKSPACE_DEPTH - 1, &device, &host), "T-1 depth silently clamped");
 }
 
@@ -49,6 +60,11 @@ static void broadcast_and_occurrences() {
 }
 
 static void maxima_and_overflow() {
+    size_t capacity = 0;
+    check(moe_mmid_capacity(4096, 512, 8, &capacity) && capacity == 512,
+          "n_seq_max incorrectly multiplied workspace C");
+    check(moe_mmid_capacity(128, 512, 8, &capacity) && capacity == 128, "nonzero n_ctx cap ignored");
+
     moe_mmid_workspace_geometry a, b, maximum;
     check(moe_mmid_plan_workspace({ 64, 32, 2, 2, 5 }, true, &a), "shape a rejected");
     check(moe_mmid_plan_workspace({ 32, 96, 1, 2, 5 }, true, &b), "shape b rejected");
@@ -56,7 +72,20 @@ static void maxima_and_overflow() {
     check(maximum.activation_f32_bytes == a.activation_f32_bytes, "activation component not maxed");
     check(maximum.output_f32_bytes == b.output_f32_bytes, "output component not maxed");
     check(maximum.device_slot_bytes >= a.device_slot_bytes && maximum.device_slot_bytes >= b.device_slot_bytes,
-          "component maxima total under-sized");
+          "mixed K/N component maxima total under-sized");
+    const size_t expected_bounce = 2 * std::max(a.activation_f32_bytes, b.activation_f32_bytes) +
+                                   2 * std::max(a.output_f32_bytes, b.output_f32_bytes);
+    check(maximum.secondary_bounce_bytes == expected_bounce &&
+              maximum.host_slot_bytes == maximum.descriptor_host_bytes + expected_bounce,
+          "four independently merged bounce maxima were not recomputed");
+
+    moe_mmid_workspace_geometry unchanged          = maximum;
+    moe_mmid_workspace_geometry overflow_candidate = b;
+    overflow_candidate.secondary_output_h2d_bytes  = std::numeric_limits<size_t>::max();
+    check(!moe_mmid_component_max(&maximum, overflow_candidate), "merged bounce overflow admitted");
+    check(maximum.secondary_bounce_bytes == unchanged.secondary_bounce_bytes &&
+              maximum.host_slot_bytes == unchanged.host_slot_bytes,
+          "failed merge partially mutated aggregate");
 
     size_t row = 7;
     check(!moe_mmid_q8_1_row_bytes(31, &row) && row == 7, "partial Q8_1 row accepted or output changed");
@@ -69,6 +98,11 @@ static void maxima_and_overflow() {
     size_t d = 11, h = 12;
     check(!moe_mmid_checked_pool_bytes(huge, MOE_MMID_WORKSPACE_DEPTH, &d, &h) && d == 11 && h == 12,
           "pool overflow did not fail atomically");
+    size_t zone = 19;
+    check(!moe_mmid_checked_zone_total(std::numeric_limits<size_t>::max(), 1, &zone) && zone == 19,
+          "host-zone addition overflow did not fail atomically");
+    check(!moe_mmid_checked_product(std::numeric_limits<size_t>::max(), 2, &zone) && zone == 19,
+          "host-zone product overflow did not fail atomically");
 }
 
 static void pool_identity_generation_and_terminal_release() {
@@ -98,6 +132,15 @@ static void pool_identity_generation_and_terminal_release() {
     moe_mmid_workspace_pool bad_depth(1);
     check(bad_depth.depth() == 0 && bad_depth.acquire(1, 1).status == moe_mmid_lease_status::INVALID,
           "non-fixed depth did not fail closed");
+
+    moe_mmid_workspace_pool generation_edge;
+    check(generation_edge.set_generation_for_test(0, std::numeric_limits<uint64_t>::max()),
+          "generation edge setup failed");
+    auto later_slot = generation_edge.acquire(77, 88);
+    check(later_slot.status == moe_mmid_lease_status::ACQUIRED && later_slot.lease.slot() == 1,
+          "generation-max slot prevented scanning a later reusable slot");
+    check(generation_edge.terminal_release(later_slot.lease, 77, 88) == moe_mmid_release_status::RELEASED,
+          "later-slot terminal release failed");
 }
 
 static void concurrent_depth_busy_and_reuse() {

@@ -20356,9 +20356,10 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
     return zone_inventory;
 }
 
-static void plan_moe_mmid_workspaces(placement_plan &                           plan,
-                                     const std::vector<placement_tensor_info> & tensor_inventory,
-                                     int                                        n_expert_used) {
+static void plan_moe_mmid_workspaces(placement_plan &                              plan,
+                                     const std::vector<placement_tensor_info> &    tensor_inventory,
+                                     int                                           n_expert_used,
+                                     const std::vector<std::pair<int, bool>> &     candidate_owners) {
     plan.moe_mmid_workspaces.clear();
     plan.moe_mmid_device_pool_bytes = 0;
     plan.moe_mmid_host_pool_bytes   = 0;
@@ -20373,13 +20374,13 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             item.ne[0] <= 0 || item.ne[1] <= 0) {
             continue;
         }
-        std::unordered_set<int> owners;
-        for (const placement_entry & entry : plan.entries) {
-            if (entry.name == item.name && entry.expert_id >= 0 && entry.on_device && entry.target_device >= 0) {
-                owners.insert(entry.target_device);
+        for (const auto & owner_candidate : candidate_owners) {
+            const int  owner     = owner_candidate.first;
+            const bool secondary = owner_candidate.second;
+            if (owner < 0 || (secondary && !planner_moe_multi_device_executor_supports_layout(
+                                                  item, planner_multi_device_moe_common_layout(item, owner)))) {
+                continue;
             }
-        }
-        for (int owner : owners) {
             moe_mmid_shape shape;
             shape.ne10  = static_cast<size_t>(item.ne[0]);
             shape.ne01  = static_cast<size_t>(item.ne[1]);
@@ -20387,13 +20388,11 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             shape.top_k = static_cast<size_t>(n_expert_used);
             const uint32_t ubatch = item.planner_n_ubatch != 0 ? item.planner_n_ubatch : plan.planner_n_ubatch;
             const uint32_t seqmax = item.planner_n_seq_max != 0 ? item.planner_n_seq_max : plan.planner_n_seq_max;
-            if (ubatch == 0 || seqmax == 0 || static_cast<size_t>(seqmax) > SIZE_MAX / static_cast<size_t>(ubatch)) {
+            if (!moe_mmid_capacity(plan.planner_n_ctx, ubatch, seqmax, &shape.c)) {
                 plan.moe_mmid_workspace_valid = false;
                 continue;
             }
-            shape.c = static_cast<size_t>(ubatch) * static_cast<size_t>(seqmax);
             moe_mmid_workspace_geometry candidate;
-            const bool secondary = plan.device_id < 0 || owner != plan.device_id;
             if (!moe_mmid_plan_workspace(shape, secondary, &candidate) ||
                 !moe_mmid_component_max(&maxima[owner], candidate)) {
                 plan.moe_mmid_workspace_valid = false;
@@ -20424,6 +20423,37 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
     }
 }
 
+static void validate_moe_mmid_execution_owners(placement_plan & plan) {
+    auto has_owner = [&](int device) {
+        return std::any_of(plan.moe_mmid_workspaces.begin(), plan.moe_mmid_workspaces.end(),
+                           [&](const moe_mmid_owner_workspace_plan & workspace) {
+                               return workspace.valid && workspace.owner_device == device;
+                           });
+    };
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0) {
+            continue;
+        }
+        if (entry.on_device && entry.target_device >= 0 && !has_owner(entry.target_device)) {
+            plan.moe_mmid_workspace_valid = false;
+        }
+        for (const placement_alternate_layout & alternate : entry.alternate_layouts) {
+            const int target = alternate.target_device >= 0 ? alternate.target_device : entry.target_device;
+            if (target < 0) {
+                continue;
+            }
+            const bool primary = target == plan.device_id;
+            const bool executable = primary ? planner_moe_primary_executor_supports_layout_on_device(
+                                                  entry, alternate.layout, target) :
+                                              planner_moe_multi_device_executor_supports_layout(entry,
+                                                                                                alternate.layout);
+            if (executable && !has_owner(target)) {
+                plan.moe_mmid_workspace_valid = false;
+            }
+        }
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -20435,7 +20465,6 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     plan.max_tensor_bytes       = 0;
     plan.max_staging_pair_bytes = 0;
-    plan_moe_mmid_workspaces(plan, tensor_inventory, n_expert_used);
     for (const auto & item : tensor_inventory) {
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
@@ -20850,15 +20879,6 @@ static void populate_host_zone_sizing(placement_plan &                          
     // picks the pool when the exact layout was computed and the coarse table
     // figure when it was not -- never the sum, which would double-count.
     plan.moe_vram_runtime_bytes = std::max(plan.moe_expert_ptrs_bytes, plan.moe_control_pool_bytes);
-    if (plan.moe_mmid_workspace_valid &&
-        plan.moe_mmid_device_pool_bytes <= SIZE_MAX - plan.moe_vram_runtime_bytes) {
-        plan.moe_vram_runtime_bytes += plan.moe_mmid_device_pool_bytes;
-    } else if (plan.moe_mmid_device_pool_bytes != 0) {
-        plan.moe_mmid_workspace_valid = false;
-        plan.moe_mmid_workspaces.clear();
-        plan.moe_mmid_device_pool_bytes = 0;
-        plan.moe_mmid_host_pool_bytes = 0;
-    }
 
     // 7. DMA staging pool: device-resident double-buffer for host→device weight streaming.
     //    Two slices, each sized to the largest tensor the weight stream can actually carry.
@@ -20966,13 +20986,33 @@ static void populate_host_zone_sizing(placement_plan &                          
     // preload uses instead of a fixed two-buffer heuristic.
     const size_t s1_in_flight           = s1_preload_max_in_flight_limit();
     const size_t s1_reorder_guard_bytes = 2ull * 1024ull * 1024ull;
-    const size_t s1_per_inflight_bytes =
-        std::max(plan.max_tensor_bytes * 2, plan.max_staging_pair_bytes) + s1_reorder_guard_bytes;
-    const size_t s1_preload_staging_bytes = s1_per_inflight_bytes * s1_in_flight;
-    plan.host_zone_staging_bytes =
-        std::max<size_t>(k_min_zone_bytes, s1_preload_staging_bytes + k_tp_staging_headroom + plan.expert_bias_bytes +
-                                               plan.moe_routing_ids_bytes + plan.tp_staging_buffer_bytes +
-                                               plan.moe_mmid_host_pool_bytes);
+    size_t       twice_max_tensor       = 0;
+    size_t       s1_per_inflight_bytes  = 0;
+    size_t       s1_preload_staging_bytes = 0;
+    size_t       host_staging_total       = 0;
+    bool host_sizing_valid =
+        moe_mmid_checked_zone_total(plan.max_tensor_bytes, plan.max_tensor_bytes, &twice_max_tensor) &&
+        moe_mmid_checked_zone_total(std::max(twice_max_tensor, plan.max_staging_pair_bytes),
+                                    s1_reorder_guard_bytes, &s1_per_inflight_bytes) &&
+        moe_mmid_checked_product(s1_per_inflight_bytes, s1_in_flight, &s1_preload_staging_bytes);
+    if (host_sizing_valid) {
+        host_staging_total = s1_preload_staging_bytes;
+        for (size_t bytes : { k_tp_staging_headroom, plan.expert_bias_bytes, plan.moe_routing_ids_bytes,
+                              plan.tp_staging_buffer_bytes, plan.moe_mmid_host_pool_bytes }) {
+            size_t next = 0;
+            if (!moe_mmid_checked_zone_total(host_staging_total, bytes, &next)) {
+                host_sizing_valid = false;
+                break;
+            }
+            host_staging_total = next;
+        }
+    }
+    if (!host_sizing_valid) {
+        plan.moe_mmid_workspace_valid = false;
+        plan.moe_mmid_host_pool_bytes = 0;
+        host_staging_total             = k_min_zone_bytes;
+    }
+    plan.host_zone_staging_bytes = std::max<size_t>(k_min_zone_bytes, host_staging_total);
     GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
                   s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
     // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
@@ -21179,6 +21219,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // scratch zone capacities from the budget BEFORE packing weights.
     // Without this, weights fill all available VRAM and leave zero space
     // for compute scratch → "VRAM exhaustion" abort on large models.
+    plan_moe_mmid_workspaces(plan, tensor_inventory, kv_info.n_expert_used,
+                             { { device_id, false } });
     size_t remaining       = vram_budget;
     size_t arena_total     = 0;
     size_t scratch_reserve = 0;
@@ -21201,6 +21243,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 "runtime=%.1f MB (arena=%.1f MB, weight zone=%.1f MB)\n",
                 scratch_reserve / (1024.0 * 1024.0), onednn_reserve / (1024.0 * 1024.0),
                 runtime_reserve / (1024.0 * 1024.0), arena_total / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0));
+        }
+    }
+    if (plan.moe_mmid_workspace_valid && !plan.moe_mmid_workspaces.empty()) {
+        const size_t reserve = plan.moe_mmid_workspaces.front().device_pool_bytes;
+        if (!moe_mmid_debit_device_budget(reserve, &remaining)) {
+            plan.moe_mmid_workspace_valid = false;
+            remaining = 0;
         }
     }
     log_moe_device_policy("MOE-POLICY", device_id, vram_budget, remaining, arena_total, scratch_reserve,
@@ -21390,6 +21439,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
 
+    validate_moe_mmid_execution_owners(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
 
     // Build the name->index lookup for O(1) queries
@@ -22516,6 +22566,26 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         return static_cast<uint8_t>(a.expert_role) < static_cast<uint8_t>(b.expert_role);
     });
 
+    std::vector<std::pair<int, bool>> mmid_candidate_owners;
+    mmid_candidate_owners.reserve(device_budgets.size());
+    for (size_t d = 0; d < device_budgets.size(); ++d) {
+        mmid_candidate_owners.emplace_back(device_budgets[d].device_id, d != 0);
+    }
+    plan_moe_mmid_workspaces(plan, tensor_inventory, kv_info.n_expert_used, mmid_candidate_owners);
+    for (const moe_mmid_owner_workspace_plan & workspace : plan.moe_mmid_workspaces) {
+        auto owner = std::find_if(device_budgets.begin(), device_budgets.end(), [&](const device_budget & budget) {
+            return budget.device_id == workspace.owner_device;
+        });
+        const size_t d = static_cast<size_t>(std::distance(device_budgets.begin(), owner));
+        if (owner == device_budgets.end() || d >= remaining.size() ||
+            !moe_mmid_debit_device_budget(workspace.device_pool_bytes, &remaining[d])) {
+            plan.moe_mmid_workspace_valid = false;
+            if (d < remaining.size()) {
+                remaining[d] = 0;
+            }
+        }
+    }
+
     // Step 4: Pack entries into devices.
     // Behavior depends on parallelism mode:
     //   LAYER:  All tensors (dense + MoE) assigned by layer owner.
@@ -23374,6 +23444,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         plan.kv_host_bytes = total_kv;
     }
 
+    validate_moe_mmid_execution_owners(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
 
     plan.build_index();

@@ -4316,6 +4316,22 @@ set_tests_properties(sycl-moe-control-plan PROPERTIES
     TIMEOUT 30
 )
 
+add_executable(test-moe-mmid-workspace-plan
+    tests/test-moe-mmid-workspace-plan.cpp
+    moe-mmid-workspace.cpp
+)
+target_include_directories(test-moe-mmid-workspace-plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(test-moe-mmid-workspace-plan PRIVATE Threads::Threads)
+set_target_properties(test-moe-mmid-workspace-plan PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-mmid-workspace-plan COMMAND test-moe-mmid-workspace-plan)
+set_tests_properties(sycl-moe-mmid-workspace-plan PROPERTIES
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # Planner-owned PP MoE oneDNN scratch admission (llama.cpp-ijla).
 # moe-scratch-admission.cpp is dependency-free by design -- it includes no SYCL
 # header and links no backend library -- so this target compiles the production

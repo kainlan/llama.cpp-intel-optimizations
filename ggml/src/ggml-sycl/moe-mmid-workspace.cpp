@@ -25,19 +25,31 @@ bool checked_mul(size_t a, size_t b, size_t * out) noexcept {
     return true;
 }
 
-bool checked_aligned_add(size_t bytes, size_t * total) noexcept {
+bool checked_aligned_place(size_t bytes, size_t * total, size_t * offset = nullptr) noexcept {
     const size_t mask = MOE_MMID_DEVICE_ALIGNMENT - 1;
     size_t       aligned;
     if (!checked_add(*total, mask, &aligned)) {
         return false;
     }
     aligned &= ~mask;
+    if (offset != nullptr) {
+        *offset = aligned;
+    }
     return checked_add(aligned, bytes, total);
 }
 
 std::atomic<uint64_t> next_pool_identity{ 1 };
 
 }  // namespace
+
+bool moe_mmid_capacity(size_t n_ctx, size_t n_ubatch, size_t n_seq_max, size_t * out) noexcept {
+    (void) n_seq_max;
+    if (out == nullptr || n_ubatch == 0) {
+        return false;
+    }
+    *out = n_ctx != 0 ? std::min(n_ctx, n_ubatch) : n_ubatch;
+    return true;
+}
 
 bool moe_mmid_q8_1_row_bytes(size_t elements, size_t * out) noexcept {
     // block_q8_1 is 32 quants plus two fp16 scalars: exactly 36 bytes per
@@ -71,9 +83,10 @@ bool moe_mmid_plan_workspace(const moe_mmid_shape &        shape,
     }
 
     size_t device = 0;
-    if (!checked_aligned_add(g.activation_f32_bytes, &device) || !checked_aligned_add(g.activation_q8_bytes, &device) ||
-        !checked_aligned_add(g.output_f32_bytes, &device) || !checked_aligned_add(g.output_q8_bytes, &device) ||
-        !checked_aligned_add(0, &device)) {
+    if (!checked_aligned_place(g.activation_f32_bytes, &device, &g.activation_f32_offset) ||
+        !checked_aligned_place(g.activation_q8_bytes, &device, &g.activation_q8_offset) ||
+        !checked_aligned_place(g.output_f32_bytes, &device, &g.output_f32_offset) ||
+        !checked_aligned_place(g.output_q8_bytes, &device, &g.output_q8_offset) || !checked_aligned_place(0, &device)) {
         return false;
     }
     g.device_slot_bytes = device;
@@ -102,7 +115,8 @@ bool moe_mmid_component_max(moe_mmid_workspace_geometry * a, const moe_mmid_work
     if (a == nullptr || !b.valid) {
         return false;
     }
-#define MMID_MAX(field) a->field = std::max(a->field, b.field)
+    moe_mmid_workspace_geometry merged = *a;
+#define MMID_MAX(field) merged.field = std::max(merged.field, b.field)
     MMID_MAX(activation_rows);
     MMID_MAX(occurrences);
     MMID_MAX(q8_ne10_row_bytes);
@@ -111,23 +125,32 @@ bool moe_mmid_component_max(moe_mmid_workspace_geometry * a, const moe_mmid_work
     MMID_MAX(activation_q8_bytes);
     MMID_MAX(output_f32_bytes);
     MMID_MAX(output_q8_bytes);
-    MMID_MAX(device_slot_bytes);
     MMID_MAX(descriptor_host_bytes);
     MMID_MAX(secondary_activation_d2h_bytes);
     MMID_MAX(secondary_activation_h2d_bytes);
     MMID_MAX(secondary_output_d2h_bytes);
     MMID_MAX(secondary_output_h2d_bytes);
-    MMID_MAX(secondary_bounce_bytes);
 #undef MMID_MAX
     size_t device = 0;
-    if (!checked_aligned_add(a->activation_f32_bytes, &device) ||
-        !checked_aligned_add(a->activation_q8_bytes, &device) || !checked_aligned_add(a->output_f32_bytes, &device) ||
-        !checked_aligned_add(a->output_q8_bytes, &device) || !checked_aligned_add(0, &device) ||
-        !checked_add(a->descriptor_host_bytes, a->secondary_bounce_bytes, &a->host_slot_bytes)) {
+    if (!checked_aligned_place(merged.activation_f32_bytes, &device, &merged.activation_f32_offset) ||
+        !checked_aligned_place(merged.activation_q8_bytes, &device, &merged.activation_q8_offset) ||
+        !checked_aligned_place(merged.output_f32_bytes, &device, &merged.output_f32_offset) ||
+        !checked_aligned_place(merged.output_q8_bytes, &device, &merged.output_q8_offset) ||
+        !checked_aligned_place(0, &device)) {
         return false;
     }
-    a->device_slot_bytes = device;
-    a->valid             = true;
+    size_t bounce = 0;
+    if (!checked_add(bounce, merged.secondary_activation_d2h_bytes, &bounce) ||
+        !checked_add(bounce, merged.secondary_activation_h2d_bytes, &bounce) ||
+        !checked_add(bounce, merged.secondary_output_d2h_bytes, &bounce) ||
+        !checked_add(bounce, merged.secondary_output_h2d_bytes, &bounce) ||
+        !checked_add(merged.descriptor_host_bytes, bounce, &merged.host_slot_bytes)) {
+        return false;
+    }
+    merged.secondary_bounce_bytes = bounce;
+    merged.device_slot_bytes      = device;
+    merged.valid                  = true;
+    *a                            = merged;
     return true;
 }
 
@@ -144,6 +167,32 @@ bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & g,
     }
     *device_bytes = d;
     *host_bytes   = h;
+    return true;
+}
+
+bool moe_mmid_checked_zone_total(size_t base_bytes, size_t workspace_bytes, size_t * out) noexcept {
+    size_t total;
+    if (out == nullptr || !checked_add(base_bytes, workspace_bytes, &total)) {
+        return false;
+    }
+    *out = total;
+    return true;
+}
+
+bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept {
+    size_t total;
+    if (out == nullptr || !checked_mul(count, bytes, &total)) {
+        return false;
+    }
+    *out = total;
+    return true;
+}
+
+bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept {
+    if (remaining_bytes == nullptr || workspace_bytes > *remaining_bytes) {
+        return false;
+    }
+    *remaining_bytes -= workspace_bytes;
     return true;
 }
 
@@ -183,7 +232,7 @@ moe_mmid_lease_result moe_mmid_workspace_pool::acquire(uint64_t queue, uint64_t 
             continue;
         }
         if (slot.generation == UINT64_MAX) {
-            return result;
+            continue;
         }
         slot.busy  = true;
         slot.queue = queue;
@@ -199,6 +248,15 @@ moe_mmid_lease_result moe_mmid_workspace_pool::acquire(uint64_t queue, uint64_t 
     }
     result.status = moe_mmid_lease_status::BUSY;
     return result;
+}
+
+bool moe_mmid_workspace_pool::set_generation_for_test(uint32_t slot, uint64_t generation) noexcept {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (slot >= state_->slots.size() || state_->slots[slot].busy) {
+        return false;
+    }
+    state_->slots[slot].generation = generation;
+    return true;
 }
 
 moe_mmid_release_status moe_mmid_workspace_pool::terminal_release(const moe_mmid_workspace_lease & lease,
