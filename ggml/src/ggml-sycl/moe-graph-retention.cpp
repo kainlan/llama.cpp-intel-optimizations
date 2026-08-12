@@ -313,34 +313,53 @@ retention_error graph_retention_registry::discard_partial(graph_owner_key key) n
 }
 
 retention_error graph_retention_registry::abort_partial(graph_owner_key key) noexcept {
-    std::shared_ptr<graph_retention_record> record;
-    {
+    // Freeze and snapshot under the same mutex used by every assembly mutator.
+    // After the phase transition no mutable registry container is consulted
+    // outside the lock; waits operate only on this exact immutable snapshot.
+    std::map<int, submit_outcome>                          submissions;
+    std::map<int, std::shared_ptr<device_terminal>>        terminals;
+    std::map<int, std::shared_ptr<queue_quiescence_proof>> proofs;
+    execution::Registry *                                  lifecycle_registry = nullptr;
+    execution::SessionId                                   session{};
+    execution::SessionResetEpoch                           reset_epoch{};
+    lifecycle::ModelToken                                  root{};
+    try {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = records_.find(key);
+        const auto it       = records_.find(key);
         const auto retiring = retire_in_progress_.find(key);
         if (it == records_.end()) return retention_error::STALE;
         if ((retiring != retire_in_progress_.end() && retiring->second) ||
-            it->second->phase == retention_phase::INSTALLED ||
-            it->second->phase == retention_phase::RETIRING) return retention_error::BUSY;
-        record = it->second;
-        record->phase = retention_phase::QUARANTINED;
+            (it->second->phase != retention_phase::RECORDING &&
+             it->second->phase != retention_phase::QUARANTINED)) return retention_error::BUSY;
+        // Copy first so allocation failure leaves RECORDING retryable; publish
+        // the freeze only once the complete exact snapshot exists.
+        submissions        = it->second->submissions;
+        terminals          = it->second->terminals;
+        proofs             = it->second->quiescence_proofs;
+        lifecycle_registry = it->second->lifecycle_registry;
+        session            = it->second->session;
+        reset_epoch        = it->second->reset_epoch;
+        root               = it->second->root;
+        it->second->phase  = retention_phase::QUARANTINED;
+    } catch (...) {
+        return retention_error::BUSY;
     }
-    for (const auto & submission : record->submissions) {
+    for (const auto & submission : submissions) {
         if (submission.second == submit_outcome::SUBMITTED) {
-            const auto terminal = record->terminals.find(submission.first);
-            if (terminal == record->terminals.end() || !terminal->second)
+            const auto terminal = terminals.find(submission.first);
+            if (terminal == terminals.end() || !terminal->second)
                 return retention_error::INCOMPLETE_TERMINALS;
             terminal->second->wait();
             if (!terminal->second->ready()) return retention_error::PENDING;
         } else if (submission.second == submit_outcome::UNKNOWN) {
-            const auto proof = record->quiescence_proofs.find(submission.first);
-            if (proof == record->quiescence_proofs.end() || !proof->second ||
-                !proof->second->wait_and_confirm()) return retention_error::MISSING_QUIESCENCE_PROOF;
+            const auto proof = proofs.find(submission.first);
+            if (proof == proofs.end() || !proof->second || !proof->second->wait_and_confirm())
+                return retention_error::MISSING_QUIESCENCE_PROOF;
         }
     }
-    if (!record->lifecycle_registry ||
-        record->lifecycle_registry->child_abort_partial_record(
-            key.context, record->session, record->reset_epoch, key.epoch, record->root) != execution::error::OK)
+    if (!lifecycle_registry ||
+        lifecycle_registry->child_abort_partial_record(key.context, session, reset_epoch, key.epoch, root) !=
+            execution::error::OK)
         return retention_error::LIFECYCLE_ERROR;
     return discard_partial(key);
 }
@@ -701,23 +720,24 @@ void graph_recording_transaction::move_from(graph_recording_transaction && other
 }
 
 retention_error graph_recording_transaction::publish_resources() noexcept {
-    if (resources_published_) {
-        return retention_error::OK;
-    }
-    if (!record_ || !lifecycle_ ||
-        lifecycle_->child_note_resources_published(record_->key.context, record_->session, record_->reset_epoch,
-                                                    record_->key.epoch, record_->root) != execution::error::OK) {
+    if (!record_ || !retention_ || !lifecycle_) return retention_error::STALE;
+    std::lock_guard<std::mutex> lock(retention_->mutex_);
+    if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
+    if (resources_published_) return retention_error::OK;
+    if (lifecycle_->child_note_resources_published(record_->key.context, record_->session, record_->reset_epoch,
+                                                    record_->key.epoch, record_->root) != execution::error::OK)
         return retention_error::LIFECYCLE_ERROR;
-    }
     resources_published_ = true;
     return retention_error::OK;
 }
 
 retention_error graph_recording_transaction::add_batch(const mmid_batch_binding & binding) noexcept {
     if (finished_ || !record_) return retention_error::STALE;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         if (record_->find_batch(binding.identity)) return retention_error::BUSY;
         record_->batches.push_back(binding);
         return retention_error::OK;
@@ -728,9 +748,11 @@ retention_error graph_recording_transaction::add_batch(const mmid_batch_binding 
 
 retention_error graph_recording_transaction::add_table(const graph_private_table_binding & binding) noexcept {
     if (finished_ || !record_) return retention_error::STALE;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         record_->tables.push_back(binding);
         return retention_->consume_fault_locked(retention_fault::ADD_TABLE_ONCE) ? retention_error::BUSY :
                                                                                    retention_error::OK;
@@ -741,9 +763,11 @@ retention_error graph_recording_transaction::add_table(const graph_private_table
 
 retention_error graph_recording_transaction::add_owner(const retained_allocation_owner & owner) noexcept {
     if (finished_ || !record_) return retention_error::STALE;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         record_->generic_owners.push_back(owner);
         return retention_->consume_fault_locked(retention_fault::ADD_OWNER_ONCE) ? retention_error::BUSY :
                                                                                    retention_error::OK;
@@ -755,9 +779,11 @@ retention_error graph_recording_transaction::add_owner(const retained_allocation
 retention_error graph_recording_transaction::set_terminal(
     int device, const std::shared_ptr<device_terminal> & terminal) noexcept {
     if (finished_ || !record_) return retention_error::STALE;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         if (!terminal || !record_->terminals.emplace(device, terminal).second) return retention_error::MISMATCH;
         return retention_->consume_fault_locked(retention_fault::ADD_TERMINAL_ONCE) ? retention_error::BUSY :
                                                                                       retention_error::OK;
@@ -769,9 +795,11 @@ retention_error graph_recording_transaction::set_terminal(
 retention_error graph_recording_transaction::set_quiescence_proof(
     int device, const std::shared_ptr<queue_quiescence_proof> & proof) noexcept {
     if (finished_ || !record_) return retention_error::STALE;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         return proof && record_->quiescence_proofs.emplace(device, proof).second ? retention_error::OK :
                                                                                    retention_error::MISMATCH;
     } catch (...) {
@@ -782,9 +810,11 @@ retention_error graph_recording_transaction::set_quiescence_proof(
 retention_error graph_recording_transaction::note_submission(int device, submit_outcome outcome) noexcept {
     if (finished_ || !record_ || device < 0 || device >= static_cast<int>(execution::max_devices) ||
         outcome == submit_outcome::NOT_SUBMITTED) return retention_error::MISMATCH;
-    if (publish_resources() != retention_error::OK) return retention_error::LIFECYCLE_ERROR;
+    const auto publish_rc = publish_resources();
+    if (publish_rc != retention_error::OK) return publish_rc;
     try {
         std::lock_guard<std::mutex> lock(retention_->mutex_);
+        if (record_->phase != retention_phase::RECORDING) return retention_error::BUSY;
         return record_->submissions.emplace(device, outcome).second ? retention_error::OK : retention_error::BUSY;
     } catch (...) {
         return retention_error::BUSY;
@@ -804,10 +834,13 @@ retention_error graph_recording_transaction::commit() noexcept {
         if (rc == retention_error::OK) { finished_ = true; release_local_owners(); }
         return rc;
     }
-    if (record_->quarantined() && !record_->submissions.empty()) return rollback();
+    // UNKNOWN without its proof is still repairable RECORDING state. Freeze it
+    // only after the exact quiescence proof has been attached.
+    if (record_->quarantined() && record_->quiescence_complete()) return rollback();
     const auto prepare_rc = retention_->prepare(record_);
     if (prepare_rc != retention_error::OK) {
-        (void) retention_->quarantine(record_);
+        // Validation/prepare refusal is not an abort freeze; callers may still
+        // repair the RECORDING transaction and retry commit.
         return prepare_rc;
     }
     if (!activated_) {

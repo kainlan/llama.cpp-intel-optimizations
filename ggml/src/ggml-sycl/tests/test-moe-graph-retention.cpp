@@ -113,6 +113,26 @@ static bool drain_wait_callback(void * opaque) noexcept {
     return state->succeeds->load(std::memory_order_acquire);
 }
 
+struct blocking_drain_state {
+    std::atomic<bool> *     entered;
+    std::atomic<bool> *     release;
+    std::atomic<unsigned> * waits;
+};
+
+static bool blocking_drain_ready_callback(const void *) noexcept {
+    return true;
+}
+
+static bool blocking_drain_wait_callback(void * opaque) noexcept {
+    auto * state = static_cast<blocking_drain_state *>(opaque);
+    state->waits->fetch_add(1, std::memory_order_relaxed);
+    state->entered->store(true, std::memory_order_release);
+    while (!state->release->load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 struct lock_probe {
     lock_probe(graph_retention_registry & registry, std::atomic<unsigned> & drops) : registry(registry), drops(drops) {}
 
@@ -337,6 +357,56 @@ int main() {
                     token(), &removed) == error::STALE,
                 "partial abort left child lifecycle epoch behind");
     }
+
+    // abort_partial freezes an exact device-1 snapshot before unlocking. Its
+    // deterministic wait gives every mutator class a chance to race the frozen
+    // record; all must return BUSY and device 0 must not join the drain set.
+    graph_retention_registry freeze_registry;
+    fixture                  freeze_fixture(freeze_registry);
+    auto                     freeze_tx  = begin_tx(freeze_fixture);
+    const auto               freeze_key = freeze_tx.key();
+    std::atomic<bool>        freeze_entered{ false };
+    std::atomic<bool>        freeze_release{ false };
+    std::atomic<unsigned>    freeze_waits{ 0 };
+    auto freeze_state = std::make_shared<blocking_drain_state>(
+        blocking_drain_state{ &freeze_entered, &freeze_release, &freeze_waits });
+    require(freeze_tx.note_submission(1, submit_outcome::UNKNOWN) == retention_error::OK &&
+                freeze_tx.set_quiescence_proof(
+                    1, queue_quiescence_test_factory::mint(freeze_state, blocking_drain_ready_callback,
+                                                           blocking_drain_wait_callback)) == retention_error::OK,
+            "freeze-race device-1 setup failed");
+    retention_error freeze_abort_rc = retention_error::STALE;
+    std::thread freeze_aborter([&] { freeze_abort_rc = freeze_tx.abort_partial(); });
+    while (!freeze_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    auto frozen_owner = std::make_shared<int>(125);
+    auto frozen_table = graph_private_table_owner::create(
+        freeze_key, 2125, 1, 0, { owner_capability(2126, frozen_owner) });
+    auto extra_proof_state = std::make_shared<drain_state>(
+        drain_state{ &freeze_entered, &freeze_release, &freeze_waits });
+    require(freeze_tx.add_batch(binding(2127, frozen_owner)) == retention_error::BUSY &&
+                freeze_tx.add_owner(owner_capability(2128, frozen_owner)) == retention_error::BUSY &&
+                freeze_tx.add_table({ 2125, 1, 0, frozen_table }) == retention_error::BUSY &&
+                freeze_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                    retention_error::BUSY &&
+                freeze_tx.note_submission(0, submit_outcome::UNKNOWN) == retention_error::BUSY &&
+                freeze_tx.set_quiescence_proof(
+                    0, queue_quiescence_test_factory::mint(extra_proof_state, drain_ready_callback,
+                                                           drain_wait_callback)) == retention_error::BUSY,
+            "assembly mutator crossed partial-abort freeze");
+    auto frozen_snapshot = freeze_registry.snapshot(freeze_key);
+    require(frozen_snapshot && frozen_snapshot->phase == retention_phase::QUARANTINED &&
+                frozen_snapshot->submissions.size() == 1 && frozen_snapshot->submissions.count(1) == 1 &&
+                frozen_snapshot->quiescence_proofs.size() == 1 && frozen_snapshot->quiescence_proofs.count(1) == 1 &&
+                frozen_snapshot->batches.empty() && frozen_snapshot->generic_owners.empty() &&
+                frozen_snapshot->tables.empty() && frozen_snapshot->terminals.empty(),
+            "frozen abort set changed after concurrent mutators");
+    frozen_snapshot.reset();
+    freeze_release.store(true, std::memory_order_release);
+    freeze_aborter.join();
+    require(freeze_abort_rc == retention_error::OK && freeze_waits.load() == 1 && freeze_registry.size() == 0,
+            "abort did not wait the exact frozen device-1 set");
 
     // A failed partial drain remains quarantined with all owners and can be
     // retried after the exact queue proof succeeds.
