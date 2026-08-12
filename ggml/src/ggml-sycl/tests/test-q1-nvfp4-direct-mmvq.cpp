@@ -231,12 +231,14 @@ void source_contract_tests() {
     assert(admitted_api != std::string::npos && admitted_end != std::string::npos);
     const std::string admitted_body = cpp.substr(admitted_api, admitted_end - admitted_api);
     for (const char * required :
-         { "buffers.activation_q8_bytes != required_q8", "buffers.output_f32_bytes != required_output",
-           "ne11 != 1 && ne11 != top_k", "quantize_row_q8_1_sycl<quantize_q8_1>", "mmvq_submit_q1_nvfp4_aos_id(" }) {
+         { "weight_type == GGML_TYPE_Q1_0", "weight_type == GGML_TYPE_NVFP4",
+           "buffers.activation_q8_bytes != required_q8", "buffers.output_f32_bytes != required_output",
+           "ne11 != 1 && ne11 != top_k", "ids_host[i] < 0 || ids_host[i] >= n_experts", "checked_mul", "checked_add",
+           "mmvq_submit_quantize_q8_1_aos_after", "mmvq_submit_q1_nvfp4_aos_id(" }) {
         assert(admitted_body.find(required) != std::string::npos);
     }
-    for (const char * forbidden :
-         { "unified_alloc", "mmvq_alloc_device_scratch", "managed_host_pinned_buffer", "MERGE_RING_SIZE", "memcpy(" }) {
+    for (const char * forbidden : { "unified_alloc", "mmvq_alloc_device_scratch", "managed_host_pinned_buffer",
+                                    "MERGE_RING_SIZE", "memcpy(", "std::vector", " new ", "new(" }) {
         assert(admitted_body.find(forbidden) == std::string::npos);
     }
     assert(recipe.find("moe_admitted_workspace_bundle") != std::string::npos);

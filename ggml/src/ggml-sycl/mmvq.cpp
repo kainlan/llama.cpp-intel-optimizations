@@ -21881,7 +21881,8 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
                                            int64_t                          q8_nb12,
                                            int64_t                          dst_nb1,
                                            int64_t                          dst_nb2,
-                                           const std::vector<sycl::event> * deps) {
+                                           const std::vector<sycl::event> * deps,
+                                           const sycl::event *              dependency) {
     constexpr int rows_per_group = GGML_SYCL_MOE_MMV_Y;
     static_assert(rows_per_group * WARP_SIZE <= 1024, "MMVQ-ID work-group exceeds SYCL limit");
     const int            block_num_z = ceil_div(nrows_per_expert, rows_per_group);
@@ -21889,7 +21890,9 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
     const sycl::range<3> block_dims(1, rows_per_group, WARP_SIZE);
 
     return q.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
+        if (dependency) {
+            cgh.depends_on(*dependency);
+        } else if (deps && !deps->empty()) {
             cgh.depends_on(*deps);
         }
         cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
@@ -21982,7 +21985,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
             event = mmvq_submit_aos_id_impl<GGML_TYPE_Q1_0, QK1_0, QI1_0, block_q1_0, VDR_Q1_0_Q8_1_MMVQ,
                                             vec_dot_q1_0_q8_1>(
                 q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
-                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps);
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
             break;
         case GGML_TYPE_NVFP4:
             if (ncols % QK_NVFP4 != 0) {
@@ -21991,7 +21994,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
             event = mmvq_submit_aos_id_impl<GGML_TYPE_NVFP4, QK_NVFP4, QI_NVFP4, block_nvfp4, VDR_NVFP4_Q8_1_MMVQ,
                                             vec_dot_nvfp4_q8_1>(
                 q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
-                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps);
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
             break;
         default:
             return false;
@@ -22002,60 +22005,168 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
     return true;
 }
 
-bool mmvq_submit_q1_nvfp4_aos_id_admitted(
-    sycl::queue &                          q,
-    ggml_type                              weight_type,
-    ggml_layout_mode                       weight_layout,
-    const void * const *                   expert_ptrs_device,
-    const float *                          activation_f32,
-    const int32_t *                        ids_device,
-    int                                    ncols,
-    int                                    nrows_per_expert,
-    int                                    top_k,
-    int                                    n_tokens,
-    int                                    ne11,
-    int64_t                                ids_nb0,
-    int64_t                                ids_nb1,
-    const mmvq_q1_nvfp4_admitted_buffers & buffers,
-    const std::vector<sycl::event> *       deps,
-    sycl::event *                          event_out) {
-    // Decode has one or more independently indexed activation rows per token:
-    // ne11 is either broadcast (1) or one row per selected expert (top_k).
-    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device ||
-        !buffers.activation_q8 || !buffers.output_f32 || ncols <= 0 || nrows_per_expert <= 0 || top_k <= 0 ||
-        n_tokens <= 0 || (ne11 != 1 && ne11 != top_k) || ids_nb0 <= 0 || ids_nb1 <= 0 || ncols % QK8_1 != 0) {
+bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
+                                 ggml_type            weight_type,
+                                 ggml_layout_mode     weight_layout,
+                                 const void * const * expert_ptrs_device,
+                                 const void *         y_q8_1,
+                                 const int32_t *      ids_device,
+                                 float *              dst,
+                                 int                  ncols,
+                                 int                  nrows_per_expert,
+                                 int                  total_batches,
+                                 int                  n_ids,
+                                 int                  n_tokens,
+                                 int                  ne11,
+                                 int64_t              ids_nb0,
+                                 int64_t              ids_nb1,
+                                 int64_t              q8_nb11,
+                                 int64_t              q8_nb12,
+                                 int64_t              dst_nb1,
+                                 int64_t              dst_nb2,
+                                 const sycl::event &  dependency,
+                                 sycl::event *        event_out) {
+    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !y_q8_1 || !ids_device || !dst || ncols <= 0 ||
+        nrows_per_expert <= 0 || !mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens) || ne11 <= 0 ||
+        ids_nb0 <= 0 || ids_nb1 <= 0 || q8_nb11 <= 0 || q8_nb12 <= 0 || dst_nb1 <= 0 || dst_nb2 <= 0) {
+        return false;
+    }
+    sycl::event event;
+    if (weight_type == GGML_TYPE_Q1_0 && ncols % QK1_0 == 0) {
+        event =
+            mmvq_submit_aos_id_impl<GGML_TYPE_Q1_0, QK1_0, QI1_0, block_q1_0, VDR_Q1_0_Q8_1_MMVQ, vec_dot_q1_0_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency);
+    } else if (weight_type == GGML_TYPE_NVFP4 && ncols % QK_NVFP4 == 0) {
+        event = mmvq_submit_aos_id_impl<GGML_TYPE_NVFP4, QK_NVFP4, QI_NVFP4, block_nvfp4, VDR_NVFP4_Q8_1_MMVQ,
+                                        vec_dot_nvfp4_q8_1>(
+            q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+            ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency);
+    } else {
+        return false;
+    }
+    if (event_out) {
+        *event_out = event;
+    }
+    return true;
+}
+
+static sycl::event mmvq_submit_quantize_q8_1_aos_after(sycl::queue &       q,
+                                                       const float *       src,
+                                                       void *              dst,
+                                                       int                 ncols,
+                                                       size_t              quant_blocks,
+                                                       const sycl::event * dependency) {
+    dpct::has_capability_or_fail(q.get_device(), { sycl::aspect::fp16 });
+    const size_t global_range = quant_blocks * static_cast<size_t>(WARP_SIZE);
+    return q.submit([&](sycl::handler & cgh) {
+        if (dependency) {
+            cgh.depends_on(*dependency);
+        }
+        cgh.parallel_for(sycl::nd_range<1>({ global_range }, { static_cast<size_t>(WARP_SIZE) }),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             quantize_q8_1<QK8_1 / WARP_SIZE>()(src, dst, ncols, ncols, item);
+                         });
+    });
+}
+
+bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
+                                          ggml_type                              weight_type,
+                                          ggml_layout_mode                       weight_layout,
+                                          const void * const *                   expert_ptrs_device,
+                                          const float *                          activation_f32,
+                                          const int32_t *                        ids_device,
+                                          const int32_t *                        ids_host,
+                                          int                                    n_experts,
+                                          int                                    ncols,
+                                          int                                    nrows_per_expert,
+                                          int                                    top_k,
+                                          int                                    n_tokens,
+                                          int                                    ne11,
+                                          int64_t                                ids_nb0,
+                                          int64_t                                ids_nb1,
+                                          const mmvq_q1_nvfp4_admitted_buffers & buffers,
+                                          const sycl::event *                    dependency,
+                                          sycl::event *                          event_out) {
+    const int  weight_qk = weight_type == GGML_TYPE_Q1_0 ? QK1_0 : weight_type == GGML_TYPE_NVFP4 ? QK_NVFP4 : 0;
+    const auto aligned   = [](const void * ptr, size_t alignment) {
+        return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+    };
+    if (weight_qk == 0 || weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device ||
+        !ids_host || !buffers.activation_q8 || !buffers.output_f32 || n_experts <= 0 || ncols <= 0 ||
+        nrows_per_expert <= 0 || top_k <= 0 || n_tokens <= 0 || (ne11 != 1 && ne11 != top_k) ||
+        ncols % weight_qk != 0 || ncols % QK8_1 != 0 || ids_nb0 < static_cast<int64_t>(sizeof(int32_t)) ||
+        ids_nb1 < static_cast<int64_t>(sizeof(int32_t)) || ids_nb0 % alignof(int32_t) != 0 ||
+        ids_nb1 % alignof(int32_t) != 0 || !aligned(expert_ptrs_device, alignof(void *)) ||
+        !aligned(activation_f32, alignof(float)) || !aligned(ids_device, alignof(int32_t)) ||
+        !aligned(buffers.activation_q8, alignof(block_q8_1)) || !aligned(buffers.output_f32, alignof(float))) {
         return false;
     }
 
-    const size_t activation_rows = static_cast<size_t>(ne11) * static_cast<size_t>(n_tokens);
-    const size_t occurrences     = static_cast<size_t>(top_k) * static_cast<size_t>(n_tokens);
-    const size_t q8_row_bytes    = static_cast<size_t>(ncols / QK8_1) * sizeof(block_q8_1);
-    if (activation_rows > static_cast<size_t>(INT_MAX) || occurrences > static_cast<size_t>(INT_MAX) ||
-        activation_rows > SIZE_MAX / q8_row_bytes || occurrences > SIZE_MAX / static_cast<size_t>(nrows_per_expert) ||
-        occurrences * static_cast<size_t>(nrows_per_expert) > SIZE_MAX / sizeof(float)) {
+    const size_t sk             = static_cast<size_t>(top_k);
+    const size_t st             = static_cast<size_t>(n_tokens);
+    const size_t sr             = static_cast<size_t>(ne11);
+    const size_t sn             = static_cast<size_t>(nrows_per_expert);
+    const size_t blocks_per_row = static_cast<size_t>(ncols / QK8_1);
+    const auto   checked_mul    = [](size_t a, size_t b, size_t * out) {
+        if (a != 0 && b > SIZE_MAX / a) {
+            return false;
+        }
+        *out = a * b;
+        return true;
+    };
+    const auto checked_add = [](size_t a, size_t b, size_t * out) {
+        if (b > SIZE_MAX - a) {
+            return false;
+        }
+        *out = a + b;
+        return true;
+    };
+
+    size_t occurrences = 0, activation_rows = 0, quant_blocks = 0, q8_row_bytes = 0, required_q8 = 0;
+    size_t output_values = 0, required_output = 0, ids_slot_span = 0, ids_token_span = 0, ids_max_offset = 0;
+    size_t q8_nb12 = 0, dst_nb1 = 0, dst_nb2 = 0, block_num_z = 0, kernel_groups = 0, kernel_items = 0;
+    if (!checked_mul(sk, st, &occurrences) || !checked_mul(sr, st, &activation_rows) ||
+        !checked_mul(activation_rows, blocks_per_row, &quant_blocks) ||
+        !checked_mul(blocks_per_row, sizeof(block_q8_1), &q8_row_bytes) ||
+        !checked_mul(activation_rows, q8_row_bytes, &required_q8) || !checked_mul(occurrences, sn, &output_values) ||
+        !checked_mul(output_values, sizeof(float), &required_output) ||
+        !checked_mul(sk - 1, static_cast<size_t>(ids_nb0), &ids_slot_span) ||
+        !checked_mul(st - 1, static_cast<size_t>(ids_nb1), &ids_token_span) ||
+        !checked_add(ids_slot_span, ids_token_span, &ids_max_offset) ||
+        !checked_add(ids_max_offset, sizeof(int32_t), &ids_max_offset) || !checked_mul(sr, q8_row_bytes, &q8_nb12) ||
+        !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2)) {
         return false;
     }
-    const size_t required_q8     = activation_rows * q8_row_bytes;
-    const size_t required_output = occurrences * static_cast<size_t>(nrows_per_expert) * sizeof(float);
-    // Exact byte equality prevents an executor from silently borrowing an
-    // adjacent occurrence or a larger legacy scratch allocation.
-    if (buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
+    block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
+    if (!checked_mul(occurrences, block_num_z, &kernel_groups) ||
+        !checked_mul(kernel_groups, static_cast<size_t>(GGML_SYCL_MOE_MMV_Y) * WARP_SIZE, &kernel_items) ||
+        !checked_mul(quant_blocks, static_cast<size_t>(WARP_SIZE), &kernel_groups) || occurrences > INT_MAX ||
+        activation_rows > INT_MAX || ids_max_offset > static_cast<size_t>(PTRDIFF_MAX) || q8_row_bytes > INT64_MAX ||
+        q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || kernel_items == 0 || kernel_groups == 0 ||
+        buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
         return false;
+    }
+    // Strides must describe non-overlapping top-k slots and complete tokens.
+    if (static_cast<size_t>(ids_nb0) < sizeof(int32_t) ||
+        (st > 1 && static_cast<size_t>(ids_nb1) < ids_slot_span + sizeof(int32_t))) {
+        return false;
+    }
+    for (size_t i = 0; i < occurrences; ++i) {
+        if (ids_host[i] < 0 || ids_host[i] >= n_experts) {
+            return false;
+        }
     }
 
-    sycl::queue * stream = &q;
-    sycl::event quant_event = quantize_row_q8_1_sycl<quantize_q8_1>(
-        activation_f32, static_cast<char *>(buffers.activation_q8), ncols, static_cast<int>(activation_rows), ncols,
-        stream, deps);
-    std::vector<sycl::event> kernel_deps{ quant_event };
-    const int64_t q8_nb11 = static_cast<int64_t>(q8_row_bytes);
-    const int64_t q8_nb12 = static_cast<int64_t>(static_cast<size_t>(ne11) * q8_row_bytes);
-    const int64_t dst_nb1 = static_cast<int64_t>(static_cast<size_t>(nrows_per_expert) * sizeof(float));
-    const int64_t dst_nb2 = static_cast<int64_t>(static_cast<size_t>(top_k) * static_cast<size_t>(dst_nb1));
+    // Every condition used by quantization and the downstream ID primitive is
+    // now proven. No failure-returning work remains between these two submits.
+    sycl::event quant_event =
+        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, dependency);
     return mmvq_submit_q1_nvfp4_aos_id(
-        q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32,
-        ncols, nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11,
-        q8_nb12, dst_nb1, dst_nb2, &kernel_deps, event_out);
+        q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32, ncols,
+        nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+        static_cast<int64_t>(q8_row_bytes), static_cast<int64_t>(q8_nb12), static_cast<int64_t>(dst_nb1),
+        static_cast<int64_t>(dst_nb2), quant_event, event_out);
 }
 
 sycl::event mmvq_submit_quantize_q8_1_soa(sycl::queue &                    q,
