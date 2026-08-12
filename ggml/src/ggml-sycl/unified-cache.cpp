@@ -587,7 +587,9 @@ static std::atomic<bool>     g_test_fail_next_arena_free{ false };
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
-static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
+// One identity namespace for every backing that can enter retained caches.
+// UINT64_MAX is the permanent exhausted sentinel; CAS prevents wrap/reuse.
+static std::atomic<uint64_t> g_retention_identity_counter{ 1 };
 
 static size_t arena_caller_reserved_headroom(size_t device_total_vram, size_t budget_bytes) {
     return device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
@@ -2623,33 +2625,47 @@ unified_cache::unified_cache(sycl::queue & queue,
 // check adds no new synchronization of its own. (Defined here, outside the
 // zone-audit anonymous namespace above, because a member of a ggml_sycl-scope
 // struct cannot be defined inside an inner unnamed namespace.)
-namespace {
-std::atomic<uint64_t> g_next_cache_allocation_id{ 1 };
-std::atomic<uint64_t> g_next_cache_replacement_generation{ 1 };
-
-uint64_t mint_nonzero(std::atomic<uint64_t> & counter) noexcept {
-    uint64_t value = counter.load(std::memory_order_relaxed);
+uint64_t unified_cache_mint_retention_identity() noexcept {
+    uint64_t value = g_retention_identity_counter.load(std::memory_order_relaxed);
     while (value != 0 && value != UINT64_MAX) {
-        if (counter.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) {
+        if (g_retention_identity_counter.compare_exchange_weak(
+                value, value + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
             return value;
         }
     }
     // Exhaustion is permanent and fail-closed; never wrap and reuse an ID.
     return 0;
 }
-}  // namespace
+
+void unified_cache_set_retention_identity_counter_for_test(uint64_t next) noexcept {
+    g_retention_identity_counter.store(next, std::memory_order_relaxed);
+}
 
 unified_cache_entry::unified_cache_entry() noexcept {
-    renew_allocation_identity();
+    (void) renew_allocation_identity();
 }
 
-void unified_cache_entry::renew_allocation_identity() noexcept {
-    allocation_id = mint_nonzero(g_next_cache_allocation_id);
-    renew_replacement_generation();
+bool unified_cache_entry::renew_allocation_identity() noexcept {
+    const uint64_t allocation = unified_cache_mint_retention_identity();
+    const uint64_t generation = unified_cache_mint_retention_identity();
+    if (allocation == 0 || generation == 0) {
+        allocation_id_          = 0;
+        replacement_generation_ = 0;
+        return false;
+    }
+    allocation_id_          = allocation;
+    replacement_generation_ = generation;
+    return true;
 }
 
-void unified_cache_entry::renew_replacement_generation() noexcept {
-    replacement_generation = mint_nonzero(g_next_cache_replacement_generation);
+bool unified_cache_entry::renew_replacement_generation() noexcept {
+    const uint64_t generation = unified_cache_mint_retention_identity();
+    if (generation == 0) {
+        replacement_generation_ = 0;
+        return false;
+    }
+    replacement_generation_ = generation;
+    return true;
 }
 
 void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
@@ -3461,8 +3477,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     it->second.state           = cache_entry_state::IN_PROGRESS;
                 }
 
-                // Update entry with new allocation
-                it->second.renew_allocation_identity();
+                // Update entry with new allocation. Identity exhaustion must
+                // never publish an unidentifiable backing.
+                if (!it->second.renew_allocation_identity()) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention identity exhausted during realloc\n");
+                    return nullptr;
+                }
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = size;
                 it->second.content_hash         = new_hash;
@@ -3495,7 +3515,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached-recopy")) {
                     return nullptr;
                 }
-                it->second.renew_replacement_generation();
+                if (!it->second.renew_replacement_generation()) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention generation exhausted during recopy\n");
+                    return nullptr;
+                }
                 GGML_SYCL_DEBUG(
                     "[UNIFIED-CACHE] Content changed for model=%llu name_hash=0x%llx (hash %llx -> %llx), "
                     "re-uploading\n",
@@ -5374,7 +5397,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
         auto                                old = entries_.find(cache_key);
         if (old != entries_.end()) {
-            if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
+            if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
+                !old->second.retired) {
                 stamp_pending_owner(old->second, load_effect_guard);
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
@@ -5522,7 +5546,8 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
         unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
         auto                                old = entries_.find(cache_key);
         if (old != entries_.end()) {
-            if (old->second.device_ptr == ptr && old->second.layout == layout && !old->second.retired) {
+            if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
+                !old->second.retired) {
                 stamp_pending_owner(old->second, load_effect_guard);
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
@@ -6107,48 +6132,35 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
     }
     if (it != entries_.end()) {
         auto & entry = it->second;
+        // register_ready completes the exact slot returned by allocate_slot;
+        // it is not an adoption API. This prevents callers from assigning a
+        // cache capability to arbitrary storage and keeps extent atomic with
+        // pointer/device identity.
+        if (entry.device_ptr != device_ptr || entry.size != size || entry.layout != layout ||
+            entry.location != cache_location::DEVICE || !entry.has_retention_identity()) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] register_ready refused backing/extent mismatch ptr=%p expected=%p "
+                           "size=%zu expected_size=%zu layout=%d expected_layout=%d\n",
+                           device_ptr, entry.device_ptr, size, entry.size, (int) layout, (int) entry.layout);
+            return;
+        }
+        if (entry.state == cache_entry_state::READY && entry.src_ptr != src_ptr) {
+            if (entry.in_use_count.load() != 0 || !entry.renew_replacement_generation()) {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] register_ready refused content replacement with live leases or "
+                               "exhausted identity\n");
+                return;
+            }
+        }
         stamp_pending_owner(entry, load_effect_guard);
-        entry.device_ptr      = device_ptr;
         entry.state           = cache_entry_state::READY;
         entry.has_ready_event = false;
-        entry.layout          = layout;
-        entry.size            = size;
         entry.src_ptr         = src_ptr;
         entry.onednn_pack_m   = onednn_pack_m;
         entry.access_count++;
         entry.last_access = time_++;
     } else {
-        // Entry was not pre-allocated via allocate_slot — create it directly as READY
-        unified_cache_entry entry{};
-        entry.device_ptr      = device_ptr;
-        entry.src_ptr         = src_ptr;
-        entry.content_hash    = 0;
-        entry.size            = size;
-        entry.type            = type;
-        entry.layer_id        = layer_id;
-        entry.expert_id       = expert_id;
-        entry.layout          = layout;
-        entry.onednn_pack_m   = onednn_pack_m;
-        entry.xmx_info        = {};
-        entry.access_count    = 1;
-        entry.last_access     = time_++;
-        entry.pinned          = false;
-        entry.hot             = false;
-        entry.state           = cache_entry_state::READY;
-        entry.has_ready_event = false;
-        entry.host_resident   = false;
-        entry.location        = cache_location::DEVICE;
-        entry.pool_allocated  = false;
-
-        stamp_pending_owner(entry, load_effect_guard);
-        entries_[cache_key] = entry;
-        auto id_it          = id_to_key_.find(key);
-        if (id_it == id_to_key_.end()) {
-            if (id_to_key_.bucket_count() == 0) {
-                id_to_key_.rehash(1);
-            }
-            id_to_key_.emplace(key, cache_key);
-        }
+        // Capability creation is cache-owned: callers must allocate_slot first.
+        GGML_LOG_ERROR("[UNIFIED-CACHE] register_ready refused unknown pointer; allocate_slot is required\n");
+        return;
     }
     entry_cv_.notify_all();
 
@@ -6846,8 +6858,8 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             result.on_device = !entry.host_resident;
             result.entry                = &entry;  // pointer stable across unordered_map inserts
             result.storage_owner         = entry.storage_owner;
-            result.allocation_id          = entry.allocation_id;
-            result.replacement_generation = entry.replacement_generation;
+            result.allocation_id          = entry.allocation_identity();
+            result.replacement_generation = entry.replacement_identity();
             result.allocation_extent      = entry.size;
             result.byte_offset            = 0;
             result.byte_size              = entry.size;
@@ -10920,7 +10932,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.tier         = tier;
     rec.handle.role         = req.intent.role;
     rec.handle.category     = cat;
-    rec.handle.alloc_id     = g_runtime_alloc_id.fetch_add(1, std::memory_order_relaxed);
+    rec.handle.alloc_id     = unified_cache_mint_retention_identity();
+    if (rec.handle.alloc_id == 0) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] retention identity exhausted; refusing allocation publication\n");
+        return false;
+    }
     rec.handle.vram_zone    = out->vram_zone;  // Propagate zone routing set by zone_alloc paths above
     rec.handle.zone_managed = out->zone_managed;
     rec.handle.host_zone    = out->host_zone;
@@ -13956,7 +13972,10 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     handle.tier     = alloc_tier::HOST_PINNED;
     handle.role     = role;
     handle.category = category;
-    handle.alloc_id = g_runtime_alloc_id.fetch_add(1, std::memory_order_relaxed);
+    handle.alloc_id = unified_cache_mint_retention_identity();
+    if (handle.alloc_id == 0) {
+        return {};
+    }
 
     runtime_alloc_record rec{};
     rec.handle           = handle;
@@ -13993,7 +14012,10 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     handle.tier     = alloc_tier::DEVICE_VRAM;
     handle.role     = role;
     handle.category = category;
-    handle.alloc_id = g_runtime_alloc_id.fetch_add(1, std::memory_order_relaxed);
+    handle.alloc_id = unified_cache_mint_retention_identity();
+    if (handle.alloc_id == 0) {
+        return {};
+    }
 
     runtime_alloc_record rec{};
     rec.handle           = handle;
@@ -14493,7 +14515,10 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
 
                 it->second.pinned = was_pinned;
                 release_entry_allocation_locked(it->second);
-                it->second.renew_allocation_identity();
+                if (!it->second.renew_allocation_identity()) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention identity exhausted during alloc replacement\n");
+                    return nullptr;
+                }
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = alloc_size;
                 it->second.direct_alloc_owner   = new_direct_alloc_owner;
@@ -14509,7 +14534,10 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                     }
                     return nullptr;
                 }
-                it->second.renew_replacement_generation();
+                if (!it->second.renew_replacement_generation()) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention generation exhausted during alloc recopy\n");
+                    return nullptr;
+                }
             }
 
             it->second.src_ptr      = src_ptr;
@@ -20487,10 +20515,9 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
     return zone_inventory;
 }
 
-static void plan_moe_mmid_workspaces(placement_plan &                              plan,
-                                     const std::vector<placement_tensor_info> &    tensor_inventory,
-                                     int                                           n_expert_used,
-                                     const std::vector<std::pair<int, bool>> &     candidate_owners) {
+static void plan_moe_mmid_workspaces(placement_plan &                           plan,
+                                     const std::vector<placement_tensor_info> & tensor_inventory,
+                                     int                                        n_expert_used) {
     plan.moe_mmid_workspaces.clear();
     plan.moe_mmid_device_pool_bytes = 0;
     plan.moe_mmid_host_pool_bytes   = 0;

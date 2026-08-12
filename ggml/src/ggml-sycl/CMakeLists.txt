@@ -1821,6 +1821,14 @@ target_compile_definitions(test-mem-handle-wrong-device PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
 target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
+# This source constructs sycl::event directly; do not rely on ggml-sycl's
+# private/transitive device link to supply the SYCL runtime/device image.
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
+else()
+    target_compile_options(test-mem-handle-wrong-device PRIVATE "-fsycl")
+    target_link_options(test-mem-handle-wrong-device PRIVATE "-fsycl")
+endif()
 add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
 set_tests_properties(mem-handle-wrong-device PROPERTIES
     LABELS "sycl;handle;device-identity;tdd"

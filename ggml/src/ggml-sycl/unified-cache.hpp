@@ -1640,18 +1640,24 @@ struct stale_weight_alloc {
     bool           pool_allocated = false;
 };
 
+// Process-wide capability mint shared by runtime, arena and cache allocations.
+// It never returns zero and never wraps: zero means permanent exhaustion.
+uint64_t unified_cache_mint_retention_identity() noexcept;
+void unified_cache_set_retention_identity_counter_for_test(uint64_t next) noexcept;
+
 // Metadata for a cached entry
 struct unified_cache_entry {
     unified_cache_entry() noexcept;
-    void renew_allocation_identity() noexcept;
-    void renew_replacement_generation() noexcept;
 
-    // Minted at cache-entry allocation/replacement time. These are capability
-    // identity, never hashes of keys or pointers. Copies preserve identity;
-    // a backing replacement explicitly renews both values.
-    uint64_t              allocation_id          = 0;
-    uint64_t              replacement_generation = 0;
-    void *                device_ptr;       // GPU memory pointer (or host memory if host_resident)
+    // Cache-owned, read-only capability identity.  Callers may observe it only
+    // through a lease snapshot; they cannot write or renew it.
+    uint64_t allocation_identity() const noexcept { return allocation_id_; }
+    uint64_t replacement_identity() const noexcept { return replacement_generation_; }
+    bool has_retention_identity() const noexcept {
+        return allocation_id_ != 0 && replacement_generation_ != 0;
+    }
+
+    void *                device_ptr = nullptr;  // GPU memory pointer (or host memory if host_resident)
     const void *          src_ptr;          // Source data pointer (for change detection)
     uint64_t              content_hash;     // Simple hash of content (first/last bytes)
     size_t                size;             // Size in bytes
@@ -1750,6 +1756,17 @@ struct unified_cache_entry {
 
     void record_lease_event(bool acquire, const char * site);
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
+
+  private:
+    friend class unified_cache;
+    friend class mem_handle;
+
+    // Minted capabilities, never hashes of keys or pointers. Copies preserve
+    // identity; only unified_cache may renew them while holding rw_mutex_.
+    uint64_t allocation_id_          = 0;
+    uint64_t replacement_generation_ = 0;
+    bool renew_allocation_identity() noexcept;
+    bool renew_replacement_generation() noexcept;
 };
 
 // Weight set for a transformer layer (for bulk pinning)

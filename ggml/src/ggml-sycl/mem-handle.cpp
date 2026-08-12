@@ -265,11 +265,20 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
         h.cached_.has_ready_event = true;
         h.cached_.ready_event     = ready_event;
     }
+    // A cache entry is the authority for both backing and capability. Refuse
+    // attempts to attach its identity to an arbitrary pointer/layout/device
+    // tuple. A live lease prevents cache mutation while this snapshot is read.
+    if (entry && (ptr != entry->device_ptr || layout != entry->layout ||
+                  on_device != (entry->location == cache_location::DEVICE) ||
+                  !entry->has_retention_identity())) {
+        entry->in_use_count.fetch_sub(1);
+        return {};
+    }
     h.leased_entry_         = entry;  // ownership of the refcount bump transferred
     h.leased_storage_owner_ = std::move(storage_owner);
     if (entry) {
-        h.canonical_allocation_id_ = entry->allocation_id;
-        h.canonical_generation_    = entry->replacement_generation;
+        h.canonical_allocation_id_ = entry->allocation_identity();
+        h.canonical_generation_    = entry->replacement_identity();
         h.canonical_extent_        = entry->size;
         h.offset_                  = 0;
         h.size_                    = entry->size;

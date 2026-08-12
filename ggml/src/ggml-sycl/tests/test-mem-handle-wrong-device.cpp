@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -464,21 +466,58 @@ static bool test_cache_entry_minted_retention_identity() {
         sycl::event{});
     const auto first_info  = first_handle.debug_info();
     const auto second_info = second_handle.debug_info();
-    TEST_ASSERT(first_info.canonical_allocation_id == first.allocation_id &&
-                    first_info.canonical_generation == first.replacement_generation &&
+    TEST_ASSERT(first_info.canonical_allocation_id == first.allocation_identity() &&
+                    first_info.canonical_generation == first.replacement_identity() &&
                     first_info.canonical_extent == first.size,
                 "mem_handle must propagate exact cache-entry identity");
     TEST_ASSERT(first_info.canonical_allocation_id != second_info.canonical_allocation_id,
-                "identical cache keys must not collide across backing allocations");
+                "fresh/recreated backing must mint a distinct allocation capability");
 
-    const uint64_t prior_allocation = first.allocation_id;
-    const uint64_t prior_generation = first.replacement_generation;
-    first.renew_replacement_generation();
-    TEST_ASSERT(first.allocation_id == prior_allocation && first.replacement_generation != prior_generation,
-                "content replacement must preserve allocation and advance generation");
-    first.renew_allocation_identity();
-    TEST_ASSERT(first.allocation_id != prior_allocation,
-                "backing replacement must mint a new allocation identity");
+    // Forgery rejection: an entry capability cannot label another pointer.
+    first.in_use_count.fetch_add(1);
+    auto forged = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, ggml_sycl::mem_handle::HOST_DEVICE, &second_storage, GGML_LAYOUT_AOS, false, &first, {}, false,
+        sycl::event{});
+    TEST_ASSERT(!forged.valid(), "cache capability factory must reject a pointer not owned by the leased entry");
+
+    TEST_PASS();
+    return true;
+}
+
+static bool test_retention_identity_mint_concurrency_and_exhaustion() {
+    TEST_BEGIN("retention_identity_mint_concurrency_and_exhaustion");
+
+    constexpr size_t thread_count = 8;
+    constexpr size_t per_thread   = 128;
+    std::vector<std::vector<uint64_t>> ids(thread_count);
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+    for (size_t t = 0; t < thread_count; ++t) {
+        workers.emplace_back([&, t] {
+            ids[t].reserve(per_thread);
+            for (size_t i = 0; i < per_thread; ++i) {
+                ids[t].push_back(ggml_sycl::unified_cache_mint_retention_identity());
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    std::unordered_set<uint64_t> unique;
+    for (const auto & batch : ids) {
+        for (uint64_t id : batch) {
+            TEST_ASSERT(id != 0, "concurrent mint must never produce zero before exhaustion");
+            TEST_ASSERT(unique.insert(id).second, "concurrent mint must never reuse an identity");
+        }
+    }
+
+    ggml_sycl::unified_cache_set_retention_identity_counter_for_test(std::numeric_limits<uint64_t>::max() - 1);
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == std::numeric_limits<uint64_t>::max() - 1,
+                "last representable identity before sentinel must mint exactly once");
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
+                "exhausted mint must fail closed instead of returning UINT64_MAX");
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
+                "exhausted mint must remain permanently exhausted and never wrap");
 
     TEST_PASS();
     return true;
@@ -523,6 +562,8 @@ int main(int argc, char ** argv) {
     all_passed &= test_mem_handle_hash_identity();
     all_passed &= test_mem_handle_stable_identity();
     all_passed &= test_cache_entry_minted_retention_identity();
+    // Must run last: it deliberately leaves the process-wide mint exhausted.
+    all_passed &= test_retention_identity_mint_concurrency_and_exhaustion();
 
     fprintf(stderr, "-------------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n", g_tests_run, g_tests_passed, g_tests_skipped);
