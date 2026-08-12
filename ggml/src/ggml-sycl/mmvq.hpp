@@ -473,6 +473,17 @@ sycl::event mmvq_submit_mxfp4_soa(sycl::queue &                    q,
 // unsupported type/layout/shape. All input/output buffers must remain alive and
 // accessible to q through completion of the event written to event_out. If
 // event_out is null, the caller must wait/synchronize q before releasing them.
+//
+// The admitted-buffer wrapper below is the allocation-free executor boundary.
+// Its two writable ranges must be exact subranges of a retained MMID workspace
+// lease; it never invokes unified_alloc, scratch allocation, or a staging ring.
+struct mmvq_q1_nvfp4_admitted_buffers {
+    void *  activation_q8       = nullptr;
+    size_t  activation_q8_bytes = 0;
+    float * output_f32          = nullptr;
+    size_t  output_f32_bytes    = 0;
+};
+
 bool mmvq_submit_q1_nvfp4_aos(sycl::queue &                    q,
                               ggml_type                        weight_type,
                               ggml_layout_mode                 weight_layout,
@@ -514,6 +525,28 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  int64_t                          dst_nb2,
                                  const std::vector<sycl::event> * deps      = nullptr,
                                  sycl::event *                    event_out = nullptr);
+
+// Decode-only composition over caller-supplied admitted workspace slices.
+// activation_f32 is contiguous [token][ne11][K]. The wrapper quantizes it into
+// buffers.activation_q8, writes [token][top_k][N] to buffers.output_f32, and
+// returns the actual terminal kernel event. No destination scatter is implied.
+bool mmvq_submit_q1_nvfp4_aos_id_admitted(
+    sycl::queue &                          q,
+    ggml_type                              weight_type,
+    ggml_layout_mode                       weight_layout,
+    const void * const *                   expert_ptrs_device,
+    const float *                          activation_f32,
+    const int32_t *                        ids_device,
+    int                                    ncols,
+    int                                    nrows_per_expert,
+    int                                    top_k,
+    int                                    n_tokens,
+    int                                    ne11,
+    int64_t                                ids_nb0,
+    int64_t                                ids_nb1,
+    const mmvq_q1_nvfp4_admitted_buffers & buffers,
+    const std::vector<sycl::event> *       deps      = nullptr,
+    sycl::event *                          event_out = nullptr);
 
 sycl::event mmvq_submit_mxfp4_soa_batched(sycl::queue &                    q,
                                           const void * const *             expert_ptrs_device,

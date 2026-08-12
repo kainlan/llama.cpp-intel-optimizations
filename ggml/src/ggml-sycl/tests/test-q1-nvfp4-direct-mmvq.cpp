@@ -209,6 +209,8 @@ void source_contract_tests() {
     }
     assert(hpp.find("bool mmvq_submit_q1_nvfp4_aos(") != std::string::npos);
     assert(hpp.find("bool mmvq_submit_q1_nvfp4_aos_id(") != std::string::npos);
+    assert(hpp.find("mmvq_q1_nvfp4_admitted_buffers") != std::string::npos);
+    assert(hpp.find("bool mmvq_submit_q1_nvfp4_aos_id_admitted(") != std::string::npos);
     const size_t id_api         = cpp.find("bool mmvq_submit_q1_nvfp4_aos_id(");
     const size_t validation     = cpp.find("mmvq_q1_nvfp4_aos_id_batch_shape_valid", id_api);
     const size_t event_creation = cpp.find("sycl::event event;", id_api);
@@ -223,6 +225,20 @@ void source_contract_tests() {
     assert(policy.find("q1-nvfp4-direct-prompt-chunking-pending") == std::string::npos);
     assert(policy.find("mmvq_submit_q1_nvfp4_aos(*target_queue") != std::string::npos);
     assert(cpp.find("mmvq_submit_q1_nvfp4_aos_id(*stream") != std::string::npos);
+
+    const size_t admitted_api = cpp.find("bool mmvq_submit_q1_nvfp4_aos_id_admitted(");
+    const size_t admitted_end = cpp.find("sycl::event mmvq_submit_quantize_q8_1_soa", admitted_api);
+    assert(admitted_api != std::string::npos && admitted_end != std::string::npos);
+    const std::string admitted_body = cpp.substr(admitted_api, admitted_end - admitted_api);
+    for (const char * required :
+         { "buffers.activation_q8_bytes != required_q8", "buffers.output_f32_bytes != required_output",
+           "ne11 != 1 && ne11 != top_k", "quantize_row_q8_1_sycl<quantize_q8_1>", "mmvq_submit_q1_nvfp4_aos_id(" }) {
+        assert(admitted_body.find(required) != std::string::npos);
+    }
+    for (const char * forbidden :
+         { "unified_alloc", "mmvq_alloc_device_scratch", "managed_host_pinned_buffer", "MERGE_RING_SIZE", "memcpy(" }) {
+        assert(admitted_body.find(forbidden) == std::string::npos);
+    }
     assert(recipe.find("moe_admitted_workspace_bundle") != std::string::npos);
     assert(recipe.find("WORKSPACE_LEASE_MISSING") != std::string::npos);
 }

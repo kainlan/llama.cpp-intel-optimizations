@@ -22002,6 +22002,62 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
     return true;
 }
 
+bool mmvq_submit_q1_nvfp4_aos_id_admitted(
+    sycl::queue &                          q,
+    ggml_type                              weight_type,
+    ggml_layout_mode                       weight_layout,
+    const void * const *                   expert_ptrs_device,
+    const float *                          activation_f32,
+    const int32_t *                        ids_device,
+    int                                    ncols,
+    int                                    nrows_per_expert,
+    int                                    top_k,
+    int                                    n_tokens,
+    int                                    ne11,
+    int64_t                                ids_nb0,
+    int64_t                                ids_nb1,
+    const mmvq_q1_nvfp4_admitted_buffers & buffers,
+    const std::vector<sycl::event> *       deps,
+    sycl::event *                          event_out) {
+    // Decode has one or more independently indexed activation rows per token:
+    // ne11 is either broadcast (1) or one row per selected expert (top_k).
+    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device ||
+        !buffers.activation_q8 || !buffers.output_f32 || ncols <= 0 || nrows_per_expert <= 0 || top_k <= 0 ||
+        n_tokens <= 0 || (ne11 != 1 && ne11 != top_k) || ids_nb0 <= 0 || ids_nb1 <= 0 || ncols % QK8_1 != 0) {
+        return false;
+    }
+
+    const size_t activation_rows = static_cast<size_t>(ne11) * static_cast<size_t>(n_tokens);
+    const size_t occurrences     = static_cast<size_t>(top_k) * static_cast<size_t>(n_tokens);
+    const size_t q8_row_bytes    = static_cast<size_t>(ncols / QK8_1) * sizeof(block_q8_1);
+    if (activation_rows > static_cast<size_t>(INT_MAX) || occurrences > static_cast<size_t>(INT_MAX) ||
+        activation_rows > SIZE_MAX / q8_row_bytes || occurrences > SIZE_MAX / static_cast<size_t>(nrows_per_expert) ||
+        occurrences * static_cast<size_t>(nrows_per_expert) > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    const size_t required_q8     = activation_rows * q8_row_bytes;
+    const size_t required_output = occurrences * static_cast<size_t>(nrows_per_expert) * sizeof(float);
+    // Exact byte equality prevents an executor from silently borrowing an
+    // adjacent occurrence or a larger legacy scratch allocation.
+    if (buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
+        return false;
+    }
+
+    sycl::queue * stream = &q;
+    sycl::event quant_event = quantize_row_q8_1_sycl<quantize_q8_1>(
+        activation_f32, static_cast<char *>(buffers.activation_q8), ncols, static_cast<int>(activation_rows), ncols,
+        stream, deps);
+    std::vector<sycl::event> kernel_deps{ quant_event };
+    const int64_t q8_nb11 = static_cast<int64_t>(q8_row_bytes);
+    const int64_t q8_nb12 = static_cast<int64_t>(static_cast<size_t>(ne11) * q8_row_bytes);
+    const int64_t dst_nb1 = static_cast<int64_t>(static_cast<size_t>(nrows_per_expert) * sizeof(float));
+    const int64_t dst_nb2 = static_cast<int64_t>(static_cast<size_t>(top_k) * static_cast<size_t>(dst_nb1));
+    return mmvq_submit_q1_nvfp4_aos_id(
+        q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32,
+        ncols, nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11,
+        q8_nb12, dst_nb1, dst_nb2, &kernel_deps, event_out);
+}
+
 sycl::event mmvq_submit_quantize_q8_1_soa(sycl::queue &                    q,
                                           const float *                    x,
                                           void *                           y_q8_soa,
