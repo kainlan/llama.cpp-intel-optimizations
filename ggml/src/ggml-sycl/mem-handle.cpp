@@ -473,7 +473,7 @@ void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_
                                                  size_t offset, size_t size) noexcept {
     mem_handle_lock_guard guard(lock_);
     canonical_allocation_id_ = allocation_id;
-    canonical_generation_ = generation;
+    canonical_generation_ = generation ? generation : 1;
     canonical_extent_ = extent;
     offset_ = offset;
     size_ = size;

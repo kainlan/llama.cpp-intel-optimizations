@@ -3378,6 +3378,7 @@ target_link_options(test-sycl-moe-resolved-batch PRIVATE "-fsycl")
 target_compile_definitions(test-sycl-moe-resolved-batch PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_RETENTION_IDENTITY_TESTING=1
 )
 target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)
