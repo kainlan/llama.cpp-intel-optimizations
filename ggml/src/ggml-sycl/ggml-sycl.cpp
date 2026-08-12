@@ -59615,6 +59615,23 @@ struct moe_direct_bundle_completion {
 
 struct moe_direct_submit_failure final {};
 
+// Pre-admission-only production witness. Saturating the counter bounds both
+// logging and counter mutation; no ownership or formatting allocation occurs.
+static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
+static void ggml_sycl_moe_log_canonical_publish_pre_admission(
+    const ggml_tensor * tensor, const ggml_sycl::moe_resolved_batch_result & batch, bool published) noexcept {
+    uint32_t current = g_moe_decode_canonical_publish_diagnostics.load(std::memory_order_relaxed);
+    while (current < 16 && !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(
+                               current, current + 1, std::memory_order_relaxed)) {}
+    if (current >= 16) return;
+    const ggml_sycl::mem_handle * lease =
+        batch && !batch.batch.operands.empty() ? &batch.batch.operands.front().lease : nullptr;
+    fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0,
+            lease ? static_cast<int>(lease->kind()) : -1,
+            lease && lease->has_stable_owner_identity() ? 1 : 0);
+}
+
 static bool ggml_sycl_moe_row_agg_debug_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     v = cached.load(std::memory_order_acquire);
@@ -63397,9 +63414,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
     if (ne12 == 1) {
         ctx.moe_graphs_disabled_once = true;
+        bool canonical_published = false;
         if (route_layout == GGML_LAYOUT_AOS && src0->buffer && src0->buffer->context &&
             !ggml_backend_buffer_is_host(src0->buffer)) {
-            (void) ggml_sycl_publish_backend_aos_expert_handles(
+            canonical_published = ggml_sycl_publish_backend_aos_expert_handles(
                 static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context),
                 const_cast<ggml_tensor *>(src0));
         }
@@ -63413,8 +63431,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                            retained_decode_batch_result.expert_id,
                            ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
                            retained_decode_batch_result.source_reason);
+            ggml_sycl_moe_log_canonical_publish_pre_admission(src0, retained_decode_batch_result,
+                                                               canonical_published);
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode admission failed");
         }
+        ggml_sycl_moe_log_canonical_publish_pre_admission(src0, retained_decode_batch_result,
+                                                           canonical_published);
     }
 
     // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and

@@ -98,6 +98,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "slot index": "operand.slot_index = i % slots_per_token",
         "missing lease": "return moe_batch_reject_reason::MISSING_HANDLE",
         "raw lease": "return moe_batch_reject_reason::RAW_COMPAT_HANDLE",
+        "raw direct requires ownerless identity":
+            "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()",
         "stable identity": "route.lease.has_stable_owner_identity()",
         "pointer agreement": "resolved.ptr != route.transient_ptr",
         "layout agreement": "resolved.layout != route.actual_layout",
@@ -379,6 +381,9 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
     direct = mmid[start:end]
     assert "q1_nvfp4_direct_b70_validated && ne12 == 1" in direct
+    validator = function_definition(HEADER.read_text(), "inline moe_batch_reject_reason validate_moe_batch_route(")
+    assert "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()" in validator
+    assert "owned_direct_slice_route_acceptance" in HOST_TEST.read_text()
     assert mmid.index("ggml_sycl_publish_backend_aos_expert_handles(") < mmid.index(
         "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
     assert "std::make_shared<const std::vector<int32_t>>(decode.expert_ids)" in direct
@@ -402,6 +407,10 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     assert "backend ? backend->stream() : nullptr" in materialize
     assert ".default_queue()" not in materialize
     assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot.version" in materialize
+    pre_admit = mmid[:start]
+    assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit
+    assert "canonical_published" in pre_admit
+    assert "lease->kind()" in source and "lease->has_stable_owner_identity()" in source
 
 
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
@@ -445,6 +454,9 @@ def test_contract_and_mutation_witnesses() -> None:
     semantic_mutants = [
         ("slot-zero", header.replace("operand.slot_index       = i % slots_per_token;",
                                      "operand.slot_index = 0;"), source, host_test, mem_source),
+        ("raw-direct-rejects-owned", header.replace(
+            "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()",
+            "route.lease.kind() == mem_handle_kind::DIRECT"), source, host_test, mem_source),
         ("drop-primary-lease-device", header.replace("route.lease.device() != submit_device", "false"),
          source, host_test, mem_source),
         ("drop-secondary-lease-device", header.replace("route.lease.device() != route.owning_device", "false"),

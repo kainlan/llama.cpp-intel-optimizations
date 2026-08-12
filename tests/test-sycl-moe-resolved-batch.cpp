@@ -237,6 +237,37 @@ static bool test_executor_choice_is_residency_and_capability_driven() {
     return true;
 }
 
+static bool test_owned_direct_slice_route_acceptance() {
+    std::vector<sycl::device> devices;
+    try { devices = sycl::device::get_devices(); } catch (...) { return true; }
+    if (devices.empty()) return true;
+    sycl::queue q(devices.front());
+    ggml_sycl::alloc_request req{};
+    req.queue = &q;
+    req.device = 0;
+    req.size = 512;
+    req.intent.role = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.constraints.must_device = true;
+    ggml_sycl::alloc_handle allocation{};
+    CHECK(ggml_sycl::unified_alloc(req, &allocation));
+    auto owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
+    auto slice = owner.slice(128, 256);
+    const auto resolved = slice.resolve(0);
+    CHECK(slice.kind() == ggml_sycl::mem_handle_kind::DIRECT);
+    CHECK(slice.has_stable_owner_identity() && resolved.ptr && resolved.on_device);
+    ggml_sycl::moe_batch_route route{};
+    route.residency = ggml_sycl::moe_batch_residency::PRIMARY_DEVICE;
+    route.transient_ptr = resolved.ptr;
+    route.owning_device = 0;
+    route.actual_layout = GGML_LAYOUT_AOS;
+    route.lease = slice;
+    const int32_t ids[] = { 1 };
+    auto accepted = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
+    CHECK(accepted);
+    CHECK(accepted.batch.operands[0].lease.stable_identity_equal(slice));
+    return true;
+}
+
 static bool test_fail_closed_contract() {
     int           value = 7;
     const int32_t ids[] = { 7 };
@@ -680,7 +711,8 @@ static bool test_decode_admission_is_route_mode_independent() {
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
         !test_canonical_bind_is_zero_based_and_exact() || !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
-        !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
+        !test_owned_direct_slice_route_acceptance() || !test_fail_closed_contract() ||
+        !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
         !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {

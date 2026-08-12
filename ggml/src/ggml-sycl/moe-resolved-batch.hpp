@@ -656,7 +656,7 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
     if (!route.lease.valid()) {
         return moe_batch_reject_reason::MISSING_HANDLE;
     }
-    if (route.lease.kind() == mem_handle_kind::DIRECT) {
+    if (route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()) {
         return moe_batch_reject_reason::RAW_COMPAT_HANDLE;
     }
     if (!route.lease.has_stable_owner_identity()) {

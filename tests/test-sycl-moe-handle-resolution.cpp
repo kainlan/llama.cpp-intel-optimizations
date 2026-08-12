@@ -6,6 +6,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mem-handle.hpp"
+#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 
 #include <algorithm>
@@ -214,8 +215,22 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     TEST_ASSERT(resolved.ptr == static_cast<char *>(base) + expert_bytes, "padded expert slice pointer mismatch");
     TEST_ASSERT(resolved.layout == GGML_LAYOUT_AOS && resolved.on_device, "canonical slice metadata mismatch");
     TEST_ASSERT(expert.size() == expert_bytes && expert.device() == 0, "canonical slice range/device mismatch");
+    TEST_ASSERT(expert.kind() == ggml_sycl::mem_handle_kind::DIRECT,
+                "owned allocation slice should preserve DIRECT representation");
     TEST_ASSERT(expert.has_stable_owner_identity(), "canonical slice must have allocator identity");
     TEST_ASSERT(!expert.resolve(1), "wrong-device resolve must fail");
+
+    ggml_sycl::moe_batch_route route{};
+    route.residency = ggml_sycl::moe_batch_residency::PRIMARY_DEVICE;
+    route.transient_ptr = resolved.ptr;
+    route.owning_device = 0;
+    route.actual_layout = GGML_LAYOUT_AOS;
+    route.lease = expert;
+    const int32_t selected[] = { 1 };
+    auto admitted = ggml_sycl::build_moe_resolved_batch(selected, 1, 1, 0, [&](int32_t) { return route; });
+    TEST_ASSERT(admitted, "owned DIRECT slice with stable identity must pass retained route validation");
+    TEST_ASSERT(admitted.batch.operands[0].lease.stable_identity_equal(expert),
+                "retained route changed canonical owned slice identity");
 
     const size_t          old_identity = expert.stable_identity_hash();
     ggml_sycl::mem_handle retained     = expert;
