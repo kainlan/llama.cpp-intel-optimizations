@@ -14407,6 +14407,11 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
 
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
+    if (next_plan.vram_bytes > SIZE_MAX - current->plan->moe_mmid_device_pool_bytes) {
+        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow\n");
+        return;
+    }
+    next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
     next_plan.planner_n_ctx     = n_ctx;
     next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
     next_plan.planner_n_seq_max = n_seq_max;

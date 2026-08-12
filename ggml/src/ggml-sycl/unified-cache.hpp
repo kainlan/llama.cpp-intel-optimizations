@@ -633,8 +633,9 @@ struct placement_plan {
     moe_context_control_layout base_context_control_layout;
 
     // Per-device VRAM usage (multi-device only, indexed by position in devices vector)
-    std::vector<int>    devices;          // Device IDs participating in this plan
-    std::vector<size_t> per_device_vram;  // VRAM bytes used per device
+    std::vector<int>    devices;                  // Device IDs participating in this plan
+    std::vector<size_t> per_device_vram;          // VRAM bytes used per device
+    std::vector<size_t> per_device_vram_budgets;  // Immutable original budgets, same indexing
 
     // --- Multi-device runtime query maps (populated by compute_multi_device_plan) ---
 

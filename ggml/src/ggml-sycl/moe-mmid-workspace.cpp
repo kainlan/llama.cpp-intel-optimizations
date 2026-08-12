@@ -238,6 +238,54 @@ bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & 
     return true;
 }
 
+bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
+                                    const std::vector<std::pair<int, size_t>> & new_charges,
+                                    const std::vector<int> &                    devices,
+                                    const std::vector<size_t> &                 budgets,
+                                    std::vector<size_t> *                       used,
+                                    size_t *                                    total) noexcept {
+    if (used == nullptr || total == nullptr || devices.size() != budgets.size() || used->size() != devices.size()) {
+        return false;
+    }
+    try {
+        auto   candidate  = *used;
+        size_t old_global = 0;
+        auto   index_for  = [&](int device) {
+            const auto it = std::find(devices.begin(), devices.end(), device);
+            return it == devices.end() ? SIZE_MAX : static_cast<size_t>(it - devices.begin());
+        };
+        for (const auto & charge : old_charges) {
+            const size_t index = index_for(charge.first);
+            if (index == SIZE_MAX || candidate[index] < charge.second || old_global > SIZE_MAX - charge.second) {
+                return false;
+            }
+            candidate[index] -= charge.second;
+            old_global += charge.second;
+        }
+        if (*total < old_global) {
+            return false;
+        }
+        size_t replacement_total = *total - old_global;
+        for (const auto & charge : new_charges) {
+            const size_t index = index_for(charge.first);
+            if (index == SIZE_MAX || candidate[index] > SIZE_MAX - charge.second ||
+                replacement_total > SIZE_MAX - charge.second) {
+                return false;
+            }
+            candidate[index] += charge.second;
+            replacement_total += charge.second;
+            if (candidate[index] > budgets[index]) {
+                return false;
+            }
+        }
+        *used  = std::move(candidate);
+        *total = replacement_total;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 struct moe_mmid_workspace_pool::state {
     struct slot_state {
         uint64_t generation = 0;

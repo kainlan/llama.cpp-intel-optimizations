@@ -12,6 +12,16 @@
 
 using namespace ggml_sycl;
 
+#if defined(__has_feature)
+#    if __has_feature(thread_sanitizer)
+#        define MMID_TSAN_BUILD 1
+#    endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#    define MMID_TSAN_BUILD 1
+#endif
+
+#ifndef MMID_TSAN_BUILD
 static std::atomic<size_t> g_heap_allocations{ 0 };
 static std::atomic<bool>   g_fail_heap_allocations{ false };
 
@@ -33,6 +43,7 @@ void operator delete(void * ptr) noexcept {
 void operator delete(void * ptr, std::size_t) noexcept {
     std::free(ptr);
 }
+#endif
 
 static void check(bool value, const char * message) {
     if (!value) {
@@ -251,6 +262,48 @@ static void finalized_owner_accounting() {
           "actual alternate/per-device/global totals mismatch");
 }
 
+static void replacement_accounting_is_atomic() {
+    const std::vector<int>    devices{ 0, 1 };
+    const std::vector<size_t> budgets{ 1000, 300 };
+    std::vector<size_t>       used{ 700, 250 };
+    size_t                    total = 950;
+    check(moe_mmid_reaccount_replacement(
+              {
+                  { 0, 100 },
+                  { 1, 50  }
+    },
+              { { 0, 100 }, { 1, 50 } }, devices, budgets, &used, &total) &&
+              used == std::vector<size_t>({ 700, 250 }) && total == 950,
+          "stable-fit replacement changed original totals");
+    check(moe_mmid_reaccount_replacement(
+              {
+                  { 0, 100 },
+                  { 1, 50  }
+    },
+              { { 0, 150 }, { 1, 70 } }, devices, budgets, &used, &total) &&
+              used == std::vector<size_t>({ 750, 270 }) && total == 1020,
+          "growth replacement double-counted its base");
+    const auto   before       = used;
+    const size_t before_total = total;
+    check(!moe_mmid_reaccount_replacement(
+              {
+                  { 0, 150 },
+                  { 1, 70  }
+    },
+              { { 0, 150 }, { 1, 101 } }, devices, budgets, &used, &total) &&
+              used == before && total == before_total,
+          "unequal per-device budget rejection was not atomic");
+    used                       = { std::numeric_limits<size_t>::max(), 1 };
+    total                      = std::numeric_limits<size_t>::max();
+    const auto overflow_before = used;
+    check(!moe_mmid_reaccount_replacement(
+              {
+    },
+              { { 0, 1 } }, devices, { std::numeric_limits<size_t>::max(), 2 }, &used, &total) &&
+              used == overflow_before && total == std::numeric_limits<size_t>::max(),
+          "replacement overflow mutated accounting");
+}
+
 static void cookie_saturates_without_reuse() {
     std::atomic<uint64_t> cookie{ std::numeric_limits<uint64_t>::max() - 2 };
     check(moe_mmid_mint_monotonic_cookie(cookie) == std::numeric_limits<uint64_t>::max() - 1,
@@ -336,16 +389,22 @@ static void registry_multi_owner_context_and_identity() {
           "second context failed");
     auto wrong_queue = registry.acquire(a, 1000, 0, 1, 20);
     check(wrong_queue.status == moe_mmid_lease_status::INVALID, "wrong owner queue admitted");
-    const int    allocation_calls_before_acquire = allocation_calls.load();
-    const size_t heap_before_acquire             = g_heap_allocations.load();
+    const int allocation_calls_before_acquire = allocation_calls.load();
+#ifndef MMID_TSAN_BUILD
+    const size_t heap_before_acquire = g_heap_allocations.load();
     g_fail_heap_allocations.store(true);
+#endif
     auto lease = registry.acquire(a, 1000, 0, 1, 21);
+#ifndef MMID_TSAN_BUILD
     g_fail_heap_allocations.store(false);
+#endif
     check(lease.status == moe_mmid_lease_status::ACQUIRED && lease.lease.owner_device() == 1 &&
               lease.lease.submit_device() == 0 && lease.lease.plan_identity() == 1000,
           "lease identities mismatch");
     check(allocation_calls.load() == allocation_calls_before_acquire, "acquire allocated backing storage");
+#ifndef MMID_TSAN_BUILD
     check(g_heap_allocations.load() == heap_before_acquire, "acquire performed a heap allocation");
+#endif
     check(lease.lease.slices().activation_f32.valid() && lease.lease.slices().host.valid(),
           "exact retained slices missing");
     check(lease.lease.terminal_release(21, lease.lease.generation() + 1) == moe_mmid_release_status::STALE,
@@ -504,6 +563,7 @@ int main() {
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
         finalized_owner_accounting();
+        replacement_accounting_is_atomic();
         cookie_saturates_without_reuse();
         registry_materialization_and_rollback();
         registry_multi_owner_context_and_identity();

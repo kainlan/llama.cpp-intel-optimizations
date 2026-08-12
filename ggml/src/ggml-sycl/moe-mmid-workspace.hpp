@@ -92,6 +92,14 @@ bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & 
                                     std::vector<moe_mmid_owner_accounting> *    owners,
                                     size_t *                                    total_vram_bytes) noexcept;
 
+// Atomically replaces one already-accounted owner charge set with another.
+bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
+                                    const std::vector<std::pair<int, size_t>> & new_charges,
+                                    const std::vector<int> &                    devices,
+                                    const std::vector<size_t> &                 budgets,
+                                    std::vector<size_t> *                       used,
+                                    size_t *                                    total) noexcept;
+
 enum class moe_mmid_lease_status : uint8_t { ACQUIRED, BUSY, INVALID };
 enum class moe_mmid_release_status : uint8_t { RELEASED, STALE, WRONG_QUEUE, WRONG_EPOCH, INVALID };
 
