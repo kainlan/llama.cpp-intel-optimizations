@@ -13,6 +13,8 @@
 
 namespace ggml_sycl {
 
+struct lifecycle_plan_snapshot;
+
 constexpr size_t   MOE_MMID_DEVICE_ALIGNMENT = 256;
 constexpr uint32_t MOE_MMID_WORKSPACE_DEPTH  = 2;
 
@@ -195,9 +197,28 @@ struct moe_mmid_model_token {
     bool valid() const noexcept { return model_id != 0 && load_txn_id != 0 && generation != 0; }
 };
 
+class moe_mmid_queue_capability {
+  public:
+    bool valid() const noexcept { return identity_ != nullptr && queue_object_ != nullptr && cookie_ != 0; }
+    uint64_t cookie() const noexcept { return cookie_; }
+    int owner_device() const noexcept { return owner_device_; }
+
+  private:
+    std::shared_ptr<const void> identity_;
+    const void *                queue_object_ = nullptr;
+    uint64_t                    cookie_       = 0;
+    int                         owner_device_ = -1;
+    friend class moe_mmid_workspace_registry;
+    friend class workspace_admission_authority_issuer;
+#ifdef GGML_SYCL_RETENTION_TESTING
+    friend class moe_mmid_queue_capability_test_factory;
+#endif
+};
+
 struct moe_mmid_materialized_owner_plan {
     int                         owner_device = -1;
-    uint64_t                    queue_cookie = 0;
+    uint64_t                    queue_cookie = 0; // legacy host-test materialization only
+    moe_mmid_queue_capability   queue_capability;
     bool                        secondary_owner = false;
     moe_mmid_workspace_geometry geometry;
     size_t                      device_pool_bytes = 0;
@@ -248,6 +269,85 @@ struct moe_mmid_admission_owner {
     uint64_t queue_cookie = 0;
 };
 
+class workspace_admission_authority {
+  public:
+    workspace_admission_authority() = default;
+    workspace_admission_authority(const workspace_admission_authority &) = delete;
+    workspace_admission_authority & operator=(const workspace_admission_authority &) = delete;
+    workspace_admission_authority(workspace_admission_authority &&) noexcept = default;
+    workspace_admission_authority & operator=(workspace_admission_authority &&) noexcept = default;
+    bool valid() const noexcept { return state_ != nullptr; }
+
+  private:
+    struct state {
+        moe_mmid_model_token token;
+        int submit_device = -1;
+        uint64_t plan_identity = 0;
+        uint64_t epoch = 0;
+        std::shared_ptr<const lifecycle_plan_snapshot> plan;
+        moe::graph_retention_registry * graph_registry = nullptr;
+        moe::published_graph_token graph_token;
+        std::shared_ptr<const moe::graph_retention_record> graph_snapshot;
+        std::shared_ptr<void> invocation_pin;
+        std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences;
+        std::shared_ptr<const moe::graph_private_table_owner> table;
+        std::vector<moe_mmid_admission_owner> owners;
+        std::vector<moe_mmid_queue_capability> queues;
+        std::map<int, std::shared_ptr<moe::device_terminal>> terminals;
+        std::map<int, std::shared_ptr<moe::queue_quiescence_proof>> quiescence_proofs;
+    };
+    std::shared_ptr<state> state_;
+    friend class workspace_admission_authority_issuer;
+    friend class moe_mmid_workspace_registry;
+    friend class moe_admitted_workspace_bundle;
+#ifdef GGML_SYCL_RETENTION_TESTING
+    friend class workspace_admission_authority_test_factory;
+#endif
+};
+
+struct workspace_admission_shape {
+    size_t  top_k = 0;
+    size_t  ne11  = 0;
+    int64_t K     = 0;
+    int64_t N     = 0;
+    int32_t type  = -1;
+};
+
+class workspace_admission_authority_issuer {
+  public:
+    static moe_mmid_queue_capability queue(int owner_device, const void * exact_queue,
+                                            uint64_t cookie, std::shared_ptr<const void> lifetime = {}) noexcept;
+    static bool graph(moe::graph_retention_registry & registry,
+                      const moe::published_graph_token & token,
+                      std::shared_ptr<const moe::graph_retention_record> snapshot,
+                      std::shared_ptr<const lifecycle_plan_snapshot> plan,
+                      moe_mmid_model_token model_token, int submit_device,
+                      std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
+                      std::shared_ptr<const moe::graph_private_table_owner> table,
+                      std::vector<moe_mmid_admission_owner> owners,
+                      std::vector<moe_mmid_queue_capability> queues,
+                      workspace_admission_authority * out) noexcept;
+
+    static bool direct(execution::Registry & registry,
+                       execution::AuthoritativeInvocationSnapshot snapshot,
+                       std::shared_ptr<const lifecycle_plan_snapshot> plan,
+                       moe_mmid_model_token model_token, int submit_device,
+                       std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
+                       std::shared_ptr<const moe::graph_private_table_owner> table,
+                       std::vector<moe_mmid_admission_owner> owners,
+                       std::vector<moe_mmid_queue_capability> queues,
+                       std::map<int, std::shared_ptr<moe::device_terminal>> terminals,
+                       std::map<int, std::shared_ptr<moe::queue_quiescence_proof>> quiescence_proofs,
+                       workspace_admission_authority * out) noexcept;
+};
+
+struct moe_mmid_authoritative_admission_request {
+    workspace_admission_authority authority;
+    workspace_admission_shape     shape;
+};
+
+// Legacy graph-shaped request retained until production callers convert to the
+// opaque common authority. It cannot mint DIRECT authority.
 struct moe_mmid_admission_request {
     moe_mmid_model_token                    token;
     uint64_t                                plan_identity = 0;
@@ -309,6 +409,7 @@ class moe_admitted_workspace_bundle {
     std::array<moe_mmid_admission_owner, execution::max_devices> owners_{};
     std::shared_ptr<const std::vector<moe::mmid_batch_binding>> identities_;
     std::shared_ptr<const moe::graph_retention_record> graph_snapshot_;
+    std::shared_ptr<workspace_admission_authority::state> common_authority_;
     friend class moe_mmid_workspace_registry;
 };
 
@@ -341,12 +442,22 @@ class moe_mmid_workspace_registry {
                                                int                                                   submit_device,
                                                const std::vector<moe_mmid_materialized_owner_plan> & owners,
                                                const moe_mmid_blob_allocator &                       allocator) noexcept;
+    moe_mmid_materialize_status    materialize(const moe_mmid_model_token & token,
+                                               uint64_t plan_identity,
+                                               std::shared_ptr<const lifecycle_plan_snapshot> plan,
+                                               int submit_device,
+                                               const std::vector<moe_mmid_materialized_owner_plan> & owners,
+                                               const moe_mmid_blob_allocator & allocator) noexcept;
     moe_mmid_registry_lease_result acquire(const moe_mmid_model_token & token,
                                            uint64_t                     plan_identity,
                                            int                          submit_device,
                                            int                          owner_device,
                                            uint64_t                     queue_cookie) noexcept;
     moe_mmid_admitted_result       admit(const moe_mmid_admission_request & request) noexcept;
+    moe_mmid_admitted_result       admit(moe_mmid_authoritative_admission_request && request) noexcept;
+    // Invalidates only future admissions using this exact shared plan object.
+    // Already committed bundles retain their pools and finish normally.
+    size_t                         invalidate_plan(const lifecycle_plan_snapshot * exact_plan) noexcept;
     size_t                         recover_quarantined(const moe_mmid_model_token & token, uint64_t plan_identity,
                                                        bool wait) noexcept;
     bool                           retire(const moe_mmid_model_token & token, uint64_t plan_identity = 0) noexcept;
@@ -357,5 +468,40 @@ class moe_mmid_workspace_registry {
     struct state;
     std::unique_ptr<state> state_;
 };
+
+#ifdef GGML_SYCL_RETENTION_TESTING
+class moe_mmid_queue_capability_test_factory final {
+  public:
+    static moe_mmid_queue_capability mint(int owner_device, const void * queue_object, uint64_t cookie,
+                                          std::shared_ptr<const void> lifetime = {}) {
+        moe_mmid_queue_capability out;
+        out.identity_ = std::make_shared<std::shared_ptr<const void>>(std::move(lifetime));
+        out.queue_object_ = queue_object; out.cookie_ = cookie; out.owner_device_ = owner_device;
+        return out;
+    }
+};
+
+class workspace_admission_authority_test_factory final {
+  public:
+    static workspace_admission_authority direct(
+        moe_mmid_model_token token, uint64_t plan_identity, uint64_t epoch, int submit_device,
+        std::shared_ptr<const lifecycle_plan_snapshot> plan,
+        std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
+        std::shared_ptr<const moe::graph_private_table_owner> table,
+        std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
+        std::shared_ptr<void> invocation_pin = {},
+        std::map<int, std::shared_ptr<moe::device_terminal>> terminals = {},
+        std::map<int, std::shared_ptr<moe::queue_quiescence_proof>> proofs = {}) {
+        workspace_admission_authority out;
+        auto state = std::make_shared<workspace_admission_authority::state>();
+        state->token = token; state->plan_identity = plan_identity; state->epoch = epoch;
+        state->submit_device = submit_device; state->plan = std::move(plan);
+        state->occurrences = std::move(occurrences); state->table = std::move(table);
+        state->owners = std::move(owners); state->queues = std::move(queues);
+        state->invocation_pin = std::move(invocation_pin); state->terminals = std::move(terminals);
+        state->quiescence_proofs = std::move(proofs); out.state_ = std::move(state); return out;
+    }
+};
+#endif
 
 }  // namespace ggml_sycl

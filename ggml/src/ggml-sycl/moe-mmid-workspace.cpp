@@ -504,6 +504,7 @@ struct registry_slot_state {
     bool     busy        = false;
     bool     quarantined = false;
     std::shared_ptr<const moe::graph_retention_record> quarantine_graph;
+    std::shared_ptr<void> quarantine_authority;
 };
 
 struct registry_pool_state {
@@ -524,6 +525,9 @@ struct registry_context {
     int                                               submit_device = -1;
     std::vector<std::shared_ptr<registry_pool_state>> pools;
     std::vector<std::shared_ptr<void>>                authorities;
+    std::shared_ptr<const lifecycle_plan_snapshot>    exact_plan;
+    std::vector<moe_mmid_queue_capability>            queues;
+    bool                                               accepting = true;
 };
 
 bool same_token(const moe_mmid_model_token & a, const moe_mmid_model_token & b) {
@@ -627,6 +631,7 @@ moe_mmid_release_status moe_mmid_registry_lease::terminal_release(uint64_t queue
     slot_state.epoch       = 0;
     slot_state.quarantined = false;
     slot_state.quarantine_graph.reset();
+    slot_state.quarantine_authority.reset();
     return moe_mmid_release_status::RELEASED;
 }
 
@@ -659,13 +664,14 @@ moe_admitted_workspace_bundle & moe_admitted_workspace_bundle::operator=(moe_adm
         owners_.swap(other.owners_);
         identities_.swap(other.identities_);
         graph_snapshot_.swap(other.graph_snapshot_);
+        common_authority_.swap(other.common_authority_);
     }
     return *this;
 }
 
 bool moe_admitted_workspace_bundle::valid() const noexcept {
     return admitted_ && capability_ != 0 && epoch_ != 0 && plan_identity_ != 0 && owner_count_ != 0 &&
-           owner_count_ <= leases_.size() && identities_ && graph_snapshot_;
+           owner_count_ <= leases_.size() && identities_ && (graph_snapshot_ || common_authority_);
 }
 
 const std::vector<moe::mmid_batch_binding> & moe_admitted_workspace_bundle::retained_occurrences() const noexcept {
@@ -705,8 +711,9 @@ bool moe_admitted_workspace_bundle::mark_possible_submit() noexcept {
         std::lock_guard<std::mutex> lock(lease.authority_->pool->mutex);
         auto & slot = lease.authority_->pool->slots[lease.slot()];
         if (!slot.busy || slot.generation != lease.generation() || slot.epoch != epoch_) return false;
-        slot.quarantine_graph = graph_snapshot_;
-        slot.quarantined = true;
+        slot.quarantine_graph     = graph_snapshot_;
+        slot.quarantine_authority = common_authority_;
+        slot.quarantined          = true;
     }
     possible_submit_ = true;
     return true;
@@ -723,18 +730,21 @@ bool moe_admitted_workspace_bundle::release_all() noexcept {
     }
     admitted_ = false;
     capability_ = 0;
+    common_authority_.reset();
     return ok;
 }
 
 bool moe_admitted_workspace_bundle::terminal_release() noexcept {
     if (!valid()) return false;
     if (possible_submit_) {
+        const auto & terminals = graph_snapshot_ ? graph_snapshot_->terminals : common_authority_->terminals;
+        const auto & proofs = graph_snapshot_ ? graph_snapshot_->quiescence_proofs : common_authority_->quiescence_proofs;
         for (size_t i = 0; i < owner_count_; ++i) {
             const int device = owners_[i].owner_device;
-            const auto terminal = graph_snapshot_->terminals.find(device);
-            const auto proof = graph_snapshot_->quiescence_proofs.find(device);
-            const bool ready = (terminal != graph_snapshot_->terminals.end() && terminal->second && terminal->second->ready()) ||
-                               (proof != graph_snapshot_->quiescence_proofs.end() && proof->second && proof->second->ready());
+            const auto terminal = terminals.find(device);
+            const auto proof = proofs.find(device);
+            const bool ready = (terminal != terminals.end() && terminal->second && terminal->second->ready()) ||
+                               (proof != proofs.end() && proof->second && proof->second->ready());
             if (!ready) return false;
         }
         for (size_t i = 0; i < owner_count_; ++i) {
@@ -758,11 +768,17 @@ moe_mmid_workspace_registry::moe_mmid_workspace_registry() : state_(new state) {
 moe_mmid_workspace_registry::~moe_mmid_workspace_registry() = default;
 
 moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
-    const moe_mmid_model_token &                          token,
-    uint64_t                                              plan_identity,
-    int                                                   submit_device,
+    const moe_mmid_model_token & token, uint64_t plan_identity, int submit_device,
     const std::vector<moe_mmid_materialized_owner_plan> & owners,
-    const moe_mmid_blob_allocator &                       allocator) noexcept {
+    const moe_mmid_blob_allocator & allocator) noexcept {
+    return materialize(token, plan_identity, {}, submit_device, owners, allocator);
+}
+
+moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
+    const moe_mmid_model_token & token, uint64_t plan_identity,
+    std::shared_ptr<const lifecycle_plan_snapshot> exact_plan, int submit_device,
+    const std::vector<moe_mmid_materialized_owner_plan> & owners,
+    const moe_mmid_blob_allocator & allocator) noexcept {
     if (!token.valid() || plan_identity == 0 || submit_device < 0 || owners.empty() || !allocator) {
         return moe_mmid_materialize_status::INVALID;
     }
@@ -771,10 +787,15 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         candidate->token         = token;
         candidate->plan_identity = plan_identity;
         candidate->submit_device = submit_device;
+        candidate->exact_plan    = std::move(exact_plan);
         candidate->pools.reserve(owners.size());
+        candidate->queues.reserve(owners.size());
         for (const auto & owner : owners) {
             size_t expected_device = 0, expected_host = 0;
-            if (owner.owner_device < 0 || owner.queue_cookie == 0 ||
+            const uint64_t queue_cookie = owner.queue_capability.valid() ? owner.queue_capability.cookie() : owner.queue_cookie;
+            if (owner.owner_device < 0 || queue_cookie == 0 ||
+                (candidate->exact_plan && (!owner.queue_capability.valid() ||
+                 owner.queue_capability.owner_device() != owner.owner_device)) ||
                 !moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner) ||
                 !moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
                                              &expected_host) ||
@@ -785,8 +806,9 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             pool->owner_device  = owner.owner_device;
             pool->submit_device = submit_device;
             pool->plan_identity = plan_identity;
-            pool->queue_cookie  = owner.queue_cookie;
+            pool->queue_cookie  = queue_cookie;
             pool->geometry      = owner.geometry;
+            candidate->queues.push_back(owner.queue_capability);
             pool->device_pool   = allocator(false, owner.owner_device, expected_device, MOE_MMID_DEVICE_ALIGNMENT);
             if (!pool->device_pool.valid() || pool->device_pool.host_pinned ||
                 pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device ||
@@ -858,7 +880,7 @@ moe_mmid_registry_lease_result moe_mmid_workspace_registry::acquire(const moe_mm
             std::lock_guard<std::mutex> lock(state_->mutex);
             for (const auto & context : state_->contexts) {
                 if (!same_token(context->token, token) || context->plan_identity != plan_identity ||
-                    context->submit_device != submit_device) {
+                    context->submit_device != submit_device || !context->accepting) {
                     continue;
                 }
                 for (size_t i = 0; i < context->pools.size(); ++i) {
@@ -988,7 +1010,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     std::lock_guard<std::mutex> registry_lock(state_->mutex);
     for (const auto & candidate : state_->contexts) {
         if (same_token(candidate->token, request.token) && candidate->plan_identity == request.plan_identity &&
-            candidate->submit_device == request.submit_device) { context = candidate; break; }
+            candidate->submit_device == request.submit_device && candidate->accepting) { context = candidate; break; }
     }
     if (!context || context->pools.size() != request.owners.size()) return out;
 
@@ -1095,6 +1117,159 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     return out;
 }
 
+moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
+    moe_mmid_authoritative_admission_request && request) noexcept {
+    moe_mmid_admitted_result out;
+    auto authority = std::move(request.authority.state_);
+    if (!authority || !authority->plan || authority->plan_identity == 0 || authority->epoch == 0) return out;
+
+    // GRAPH is an adapter over the already-proven publication path. DIRECT is
+    // admitted below from the exact outer-invocation pin without inventing a
+    // graph token.
+    if (authority->graph_snapshot) {
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            bool exact = false;
+            for (const auto & context : state_->contexts)
+                exact |= same_token(context->token, authority->token) &&
+                         context->plan_identity == authority->plan_identity &&
+                         context->submit_device == authority->submit_device && context->accepting &&
+                         context->exact_plan.get() == authority->plan.get();
+            if (!exact) return out;
+        }
+        moe_mmid_admission_request legacy;
+        legacy.token = authority->token;
+        legacy.plan_identity = authority->plan_identity;
+        legacy.submit_device = authority->submit_device;
+        legacy.graph_registry = authority->graph_registry;
+        legacy.graph_token = authority->graph_token;
+        legacy.graph_snapshot = authority->graph_snapshot;
+        legacy.retained_occurrences = authority->occurrences;
+        legacy.table_owner = authority->table;
+        legacy.top_k = request.shape.top_k; legacy.ne11 = request.shape.ne11;
+        legacy.K = request.shape.K; legacy.N = request.shape.N; legacy.type = request.shape.type;
+        legacy.owners = authority->owners;
+        out = admit(legacy);
+        if (out.status == moe_mmid_lease_status::ACQUIRED) out.bundle.common_authority_ = std::move(authority);
+        return out;
+    }
+
+    const auto & bindings = authority->occurrences;
+    if (!authority->token.valid() || authority->submit_device < 0 || !bindings || bindings->empty() ||
+        !authority->table || request.shape.top_k == 0 || request.shape.ne11 == 0 || request.shape.K <= 0 ||
+        request.shape.N <= 0 || request.shape.type < 0 || authority->owners.empty() ||
+        authority->owners.size() > execution::max_devices || bindings->size() % request.shape.top_k != 0 ||
+        authority->queues.size() != authority->owners.size()) return out;
+
+    uint64_t digest = 1469598103934665603ULL;
+    auto mix = [&](uint64_t value) { digest = (digest ^ value) * 1099511628211ULL; };
+    for (size_t i = 0; i < bindings->size(); ++i) {
+        const auto & binding = bindings->at(i); const auto & id = binding.identity;
+        if (id.allocation_id == 0 || id.generation == 0 || id.layout_id == 0 || id.device < 0 || id.byte_size == 0 ||
+            id.occurrence != i || id.byte_offset > binding.owner.extent() ||
+            id.byte_size > binding.owner.extent() - id.byte_offset || id.allocation_id != binding.owner.allocation_id() ||
+            id.generation != binding.owner.generation() || id.device != binding.owner.device()) return out;
+        bool retained = false;
+        for (const auto & entry : authority->table->entries())
+            retained |= entry.allocation_id() == id.allocation_id && entry.generation() == id.generation &&
+                        entry.device() == id.device && entry.extent() == binding.owner.extent();
+        if (!retained) return out;
+        mix(id.allocation_id); mix(id.generation); mix(id.layout_id); mix(static_cast<uint64_t>(id.device));
+        mix(id.byte_offset); mix(id.byte_size); mix(id.occurrence);
+    }
+
+    std::shared_ptr<registry_context> context;
+    std::array<size_t, execution::max_devices> pool_map{}, order{};
+    std::array<uint32_t, execution::max_devices> selected{};
+    std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+    pool_map.fill(SIZE_MAX); selected.fill(UINT32_MAX);
+    std::lock_guard<std::mutex> registry_lock(state_->mutex);
+    for (const auto & candidate : state_->contexts) {
+        if (same_token(candidate->token, authority->token) && candidate->plan_identity == authority->plan_identity &&
+            candidate->submit_device == authority->submit_device && candidate->accepting &&
+            candidate->exact_plan.get() == authority->plan.get()) { context = candidate; break; }
+    }
+    if (!context || context->pools.size() != authority->owners.size() || context->queues.size() != authority->queues.size())
+        return out;
+
+    const size_t capacity = bindings->size() / request.shape.top_k;
+    std::array<moe_mmid_workspace_geometry, execution::max_devices> geometry{};
+    for (size_t r = 0; r < authority->owners.size(); ++r) {
+        const auto & wanted = authority->owners[r]; const auto & queue = authority->queues[r];
+        if (!queue.valid() || queue.owner_device_ != wanted.owner_device || queue.cookie_ != wanted.queue_cookie) return out;
+        for (size_t p = 0; p < context->pools.size(); ++p) {
+            const auto & pool = context->pools[p];
+            if (pool->owner_device != wanted.owner_device) continue;
+            if (pool_map[r] != SIZE_MAX || p >= context->queues.size() ||
+                context->queues[p].identity_.get() != queue.identity_.get() ||
+                context->queues[p].queue_object_ != queue.queue_object_ || pool->queue_cookie != queue.cookie_) return out;
+            for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
+            const auto & available = pool->geometry; auto & needed = geometry[r];
+            if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.shape.K), static_cast<size_t>(request.shape.N),
+                                            request.shape.ne11, request.shape.top_k, capacity },
+                                          wanted.owner_device != authority->submit_device, &needed) ||
+                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
+                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
+                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
+                available.activation_f32_bytes < needed.activation_f32_bytes ||
+                available.activation_q8_bytes < needed.activation_q8_bytes ||
+                available.output_f32_bytes < needed.output_f32_bytes || available.output_q8_bytes < needed.output_q8_bytes ||
+                available.host_slot_bytes < needed.host_slot_bytes) return out;
+            pool_map[r] = p;
+        }
+        if (pool_map[r] == SIZE_MAX) return out; order[r] = r;
+    }
+    std::sort(order.begin(), order.begin() + authority->owners.size(), [&](size_t a, size_t b) {
+        return authority->owners[a].owner_device < authority->owners[b].owner_device;
+    });
+    for (size_t i = 0; i < authority->owners.size(); ++i)
+        locks[i] = std::unique_lock<std::mutex>(context->pools[pool_map[order[i]]]->mutex);
+    for (size_t r = 0; r < authority->owners.size(); ++r) {
+        const size_t p = pool_map[r]; const auto & pool = context->pools[p];
+        for (uint32_t slot = 0; slot < MOE_MMID_WORKSPACE_DEPTH; ++slot)
+            if (!pool->slots[slot].busy && pool->slots[slot].generation != UINT64_MAX) { selected[r] = slot; break; }
+        if (selected[r] == UINT32_MAX) { out.status = moe_mmid_lease_status::BUSY; return out; }
+        const size_t ai = p * MOE_MMID_WORKSPACE_DEPTH + selected[r];
+        if (ai >= context->authorities.size()) return out;
+        auto lease_authority = std::static_pointer_cast<moe_mmid_registry_lease::authority>(context->authorities[ai]);
+        if (!lease_authority || lease_authority->pool.get() != pool.get()) return out;
+        auto & lease = out.bundle.leases_[r]; lease.authority_ = std::move(lease_authority);
+        lease.generation_ = pool->slots[selected[r]].generation + 1; lease.queue_cookie_ = authority->queues[r].cookie_;
+        lease.epoch_ = authority->epoch; lease.admitted_geometry_ = geometry[r];
+        const size_t db = static_cast<size_t>(selected[r]) * pool->geometry.device_slot_bytes;
+        const size_t hb = static_cast<size_t>(selected[r]) * pool->geometry.host_slot_bytes;
+        lease.admitted_slices_.activation_f32 = retained_subrange(pool->device_pool, db + pool->geometry.activation_f32_offset, geometry[r].activation_f32_bytes);
+        lease.admitted_slices_.activation_q8 = retained_subrange(pool->device_pool, db + pool->geometry.activation_q8_offset, geometry[r].activation_q8_bytes);
+        lease.admitted_slices_.output_f32 = retained_subrange(pool->device_pool, db + pool->geometry.output_f32_offset, geometry[r].output_f32_bytes);
+        lease.admitted_slices_.output_q8 = retained_subrange(pool->device_pool, db + pool->geometry.output_q8_offset, geometry[r].output_q8_bytes);
+        if (geometry[r].host_slot_bytes) lease.admitted_slices_.host = retained_subrange(pool->host_pool, hb, geometry[r].host_slot_bytes);
+        if (!lease.admitted_slices_.activation_f32.valid() || !lease.admitted_slices_.activation_q8.valid() ||
+            !lease.admitted_slices_.output_f32.valid() || !lease.admitted_slices_.output_q8.valid() ||
+            (geometry[r].host_slot_bytes && !lease.admitted_slices_.host.valid())) return out;
+        out.bundle.owners_[r] = authority->owners[r];
+    }
+    const uint64_t capability = moe_mmid_mint_monotonic_cookie(next_bundle_capability); if (!capability) return out;
+    for (size_t r = 0; r < authority->owners.size(); ++r) { auto & slot = context->pools[pool_map[r]]->slots[selected[r]];
+        slot.generation = out.bundle.leases_[r].generation_; slot.epoch = authority->epoch; slot.quarantined = false; slot.busy = true; }
+    out.bundle.owner_count_ = authority->owners.size(); out.bundle.identities_ = bindings;
+    out.bundle.common_authority_ = std::move(authority); out.bundle.epoch_ = out.bundle.common_authority_->epoch;
+    out.bundle.plan_identity_ = out.bundle.common_authority_->plan_identity; out.bundle.submit_device_ = out.bundle.common_authority_->submit_device;
+    out.bundle.K_ = request.shape.K; out.bundle.N_ = request.shape.N; out.bundle.type_ = request.shape.type;
+    out.bundle.identity_digest_ = digest ? digest : 1; out.bundle.capability_ = capability;
+    out.bundle.admitted_ = true; out.status = moe_mmid_lease_status::ACQUIRED; return out;
+}
+
+size_t moe_mmid_workspace_registry::invalidate_plan(const lifecycle_plan_snapshot * exact_plan) noexcept {
+    if (!exact_plan) return 0;
+    size_t invalidated = 0;
+    try {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        for (const auto & context : state_->contexts)
+            if (context->accepting && context->exact_plan.get() == exact_plan) { context->accepting = false; ++invalidated; }
+    } catch (...) { return 0; }
+    return invalidated;
+}
+
 size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_token & token, uint64_t plan_identity,
                                                          bool wait) noexcept {
     if (!token.valid() || plan_identity == 0) return 0;
@@ -1105,18 +1280,21 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
         for (const auto & pool : context->pools) {
             std::lock_guard<std::mutex> pool_lock(pool->mutex);
             for (auto & slot : pool->slots) {
-                if (!slot.busy || !slot.quarantined || !slot.quarantine_graph) continue;
-                const auto & graph = *slot.quarantine_graph;
-                const auto terminal = graph.terminals.find(pool->owner_device);
-                const auto proof = graph.quiescence_proofs.find(pool->owner_device);
-                bool ready = terminal != graph.terminals.end() && terminal->second && terminal->second->ready();
-                if (!ready && proof != graph.quiescence_proofs.end() && proof->second)
+                if (!slot.busy || !slot.quarantined || (!slot.quarantine_graph && !slot.quarantine_authority)) continue;
+                auto common = std::static_pointer_cast<workspace_admission_authority::state>(slot.quarantine_authority);
+                const auto & terminals = slot.quarantine_graph ? slot.quarantine_graph->terminals : common->terminals;
+                const auto & proofs = slot.quarantine_graph ? slot.quarantine_graph->quiescence_proofs : common->quiescence_proofs;
+                const auto terminal = terminals.find(pool->owner_device);
+                const auto proof = proofs.find(pool->owner_device);
+                bool ready = terminal != terminals.end() && terminal->second && terminal->second->ready();
+                if (!ready && proof != proofs.end() && proof->second)
                     ready = wait ? proof->second->wait_and_confirm() : proof->second->ready();
                 if (!ready) continue;
                 slot.busy = false;
                 slot.quarantined = false;
                 slot.epoch = 0;
                 slot.quarantine_graph.reset();
+                slot.quarantine_authority.reset();
                 ++released;
             }
         }

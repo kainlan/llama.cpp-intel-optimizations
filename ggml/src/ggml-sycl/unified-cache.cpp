@@ -125,6 +125,8 @@ std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const 
 std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
 }  // namespace
 
+static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry();
+
 uint64_t lifecycle_next_plan_publication_id() noexcept {
     uint64_t next = g_lifecycle_plan_next_version.load(std::memory_order_relaxed);
     for (;;) {
@@ -276,7 +278,10 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
 
 bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                       const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
-    if (!expected || !replacement || expected->model_id == 0 || expected->load_txn_id == 0) {
+    if (!expected || !replacement || expected.get() == replacement.get() || expected->model_id == 0 ||
+        expected->load_txn_id == 0 || replacement->model_id != expected->model_id ||
+        replacement->load_txn_id != expected->load_txn_id || replacement->slot != expected->slot ||
+        replacement->slot_generation != expected->slot_generation || replacement->version == 0) {
         return false;
     }
     try {
@@ -289,11 +294,101 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (current == model->second.end() || current->second.get() != expected.get()) {
             return false;
         }
+        // Linearize invalidation while the exact registry publication is still
+        // current. Admissions that committed before this registry lock retain
+        // their bundles; every later admission sees accepting=false.
+        (void) unified_cache_moe_mmid_registry().invalidate_plan(expected.get());
         current->second = replacement;
         return true;
     } catch (...) {
         return false;
     }
+}
+
+namespace {
+struct direct_invocation_pin {
+    execution::Registry * registry = nullptr;
+    execution::AuthoritativeInvocationSnapshot snapshot;
+    ~direct_invocation_pin() {
+        if (registry && snapshot.active()) (void) registry->finish_authoritative_invocation_snapshot(&snapshot);
+    }
+};
+}
+
+moe_mmid_queue_capability workspace_admission_authority_issuer::queue(
+    int owner_device, const void * exact_queue, uint64_t cookie, std::shared_ptr<const void> lifetime) noexcept {
+    moe_mmid_queue_capability out;
+    if (owner_device < 0 || !exact_queue || cookie == 0) return out;
+    try {
+        out.identity_ = std::make_shared<std::shared_ptr<const void>>(std::move(lifetime));
+        out.queue_object_ = exact_queue; out.cookie_ = cookie; out.owner_device_ = owner_device;
+    } catch (...) { return {}; }
+    return out;
+}
+
+bool workspace_admission_authority_issuer::graph(
+    moe::graph_retention_registry & registry, const moe::published_graph_token & token,
+    std::shared_ptr<const moe::graph_retention_record> snapshot,
+    std::shared_ptr<const lifecycle_plan_snapshot> plan, moe_mmid_model_token model_token, int submit_device,
+    std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
+    std::shared_ptr<const moe::graph_private_table_owner> table,
+    std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
+    workspace_admission_authority * out) noexcept {
+    if (!out || !snapshot || !plan || !plan->plan || plan->version == 0 || !token.valid() ||
+        plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
+        snapshot->root.model.value != model_token.model_id || snapshot->root.load.value != model_token.load_txn_id ||
+        snapshot->root.owner.generation != model_token.generation || snapshot->phase != moe::retention_phase::INSTALLED ||
+        owners.size() != queues.size()) return false;
+    moe::published_graph_token canonical;
+    if (registry.snapshot(snapshot->key).get() != snapshot.get() ||
+        registry.acquire_published_token(snapshot->key, &canonical) != moe::retention_error::OK ||
+        std::memcmp(&canonical, &token, sizeof(token)) != 0) return false;
+    try {
+        auto state = std::make_shared<workspace_admission_authority::state>();
+        state->token = model_token; state->submit_device = submit_device; state->plan_identity = plan->version;
+        state->epoch = snapshot->key.epoch.value; state->plan = std::move(plan); state->graph_registry = &registry;
+        state->graph_token = token; state->graph_snapshot = std::move(snapshot); state->occurrences = std::move(occurrences);
+        state->table = std::move(table); state->owners = std::move(owners); state->queues = std::move(queues);
+        out->state_ = std::move(state); return true;
+    } catch (...) { return false; }
+}
+
+bool workspace_admission_authority_issuer::direct(
+    execution::Registry & registry, execution::AuthoritativeInvocationSnapshot snapshot,
+    std::shared_ptr<const lifecycle_plan_snapshot> plan, moe_mmid_model_token model_token, int submit_device,
+    std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
+    std::shared_ptr<const moe::graph_private_table_owner> table,
+    std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
+    std::map<int, std::shared_ptr<moe::device_terminal>> terminals,
+    std::map<int, std::shared_ptr<moe::queue_quiescence_proof>> quiescence_proofs,
+    workspace_admission_authority * out) noexcept {
+    std::shared_ptr<direct_invocation_pin> pin;
+    try {
+        pin = std::make_shared<direct_invocation_pin>(); pin->registry = &registry; pin->snapshot = std::move(snapshot);
+    } catch (...) {
+        if (snapshot.active()) (void) registry.finish_authoritative_invocation_snapshot(&snapshot);
+        return false;
+    }
+    const auto & exact = pin->snapshot;
+    if (!out || !exact.active() || !plan || !plan->plan || plan->version == 0 || !model_token.valid() ||
+        plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
+        exact.root().model.value != model_token.model_id || exact.root().load.value != model_token.load_txn_id ||
+        exact.root().owner.generation != model_token.generation || submit_device < 0 || !occurrences ||
+        occurrences->empty() || !table || owners.empty() || owners.size() != queues.size() ||
+        table->owner().context.value != exact.context().value ||
+        table->owner().epoch.value != exact.graph_epoch().value ||
+        registry.validate_authoritative_invocation_snapshot(exact) != execution::error::OK) return false;
+    for (size_t i = 0; i < owners.size(); ++i)
+        if (!queues[i].valid() || queues[i].owner_device() != owners[i].owner_device ||
+            queues[i].cookie() != owners[i].queue_cookie) return false;
+    try {
+        auto state = std::make_shared<workspace_admission_authority::state>();
+        state->token = model_token; state->submit_device = submit_device; state->plan_identity = plan->version;
+        state->epoch = exact.graph_epoch().value; state->plan = std::move(plan); state->invocation_pin = std::move(pin);
+        state->occurrences = std::move(occurrences); state->table = std::move(table); state->owners = std::move(owners);
+        state->queues = std::move(queues); state->terminals = std::move(terminals);
+        state->quiescence_proofs = std::move(quiescence_proofs); out->state_ = std::move(state); return true;
+    } catch (...) { return false; }
 }
 
 void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
@@ -11339,9 +11434,10 @@ static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
     return registry;
 }
 
-moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
     const moe_mmid_model_token & token,
     uint64_t plan_identity,
+    std::shared_ptr<const lifecycle_plan_snapshot> exact_plan,
     const placement_plan & plan,
     int submit_device,
     const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
@@ -11362,6 +11458,8 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         moe_mmid_materialized_owner_plan owner;
         owner.owner_device      = workspace.owner_device;
         owner.queue_cookie      = binding->queue_cookie;
+        owner.queue_capability  = binding->capability.valid() ? binding->capability :
+            workspace_admission_authority_issuer::queue(workspace.owner_device, binding->queue, binding->queue_cookie);
         owner.secondary_owner   = workspace.secondary_owner;
         owner.geometry          = workspace.slot;
         owner.device_pool_bytes = workspace.device_pool_bytes;
@@ -11408,10 +11506,27 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         blob.host_pinned = host_pinned;
         return blob;
     };
-        return unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners, allocator);
+        return exact_plan ? unified_cache_moe_mmid_registry().materialize(
+                                token, plan_identity, std::move(exact_plan), submit_device, owners, allocator) :
+                            unified_cache_moe_mmid_registry().materialize(
+                                token, plan_identity, submit_device, owners, allocator);
     } catch (...) {
         return moe_mmid_materialize_status::ALLOCATION_FAILED;
     }
+}
+
+moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+    const moe_mmid_model_token & token, uint64_t plan_identity, const placement_plan & plan,
+    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
+    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings);
+}
+
+moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
+    if (!plan || !plan->plan || plan->version == 0 || plan->model_id != token.model_id ||
+        plan->load_txn_id != token.load_txn_id) return moe_mmid_materialize_status::INVALID;
+    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings);
 }
 
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(

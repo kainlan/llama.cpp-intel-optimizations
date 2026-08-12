@@ -14,6 +14,8 @@
 
 using namespace ggml_sycl;
 
+namespace ggml_sycl { struct lifecycle_plan_snapshot {}; }
+
 // This standalone target intentionally does not link moe-graph-retention.cpp;
 // provide the capability constructors used only by its friend-backed fixture.
 namespace ggml_sycl::moe {
@@ -820,6 +822,50 @@ static void registry_atomic_bundle_authority() {
     check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "table-owner substitution admitted");
 }
 
+static void common_direct_authority_plan_queue_and_lifetime() {
+    const moe_mmid_model_token token{ 151, 152, 153 };
+    auto plan = std::make_shared<const lifecycle_plan_snapshot>();
+    int exact_queue = 0;
+    auto queue_lifetime = std::make_shared<int>(7);
+    auto capability = moe_mmid_queue_capability_test_factory::mint(0, &exact_queue, 1701, queue_lifetime);
+    auto owner = owner_plan(0, 1701); owner.queue_capability = capability;
+    std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 1700, plan, 0, { owner }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED, "authoritative context publication failed");
+
+    auto graph = admission_request(token, 1700, { { 0, 1701 } }, 1702);
+    auto pin = std::make_shared<int>(9); std::weak_ptr<int> weak_pin = pin;
+    std::map<int, std::shared_ptr<moe::device_terminal>> terminals;
+    terminals.emplace(0, graph.graph_snapshot->terminals.at(0));
+    auto make_authority = [&](moe_mmid_queue_capability queue, std::shared_ptr<void> invocation_pin) {
+        return workspace_admission_authority_test_factory::direct(
+            token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
+            { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), terminals);
+    };
+    moe_mmid_authoritative_admission_request direct{ make_authority(capability, pin), { 2, 2, 64, 96, 1 } };
+    pin.reset();
+    auto committed = registry.admit(std::move(direct));
+    check(committed.status == moe_mmid_lease_status::ACQUIRED && committed.bundle.valid() && !weak_pin.expired(),
+          "direct authority did not retain invocation pin");
+
+    auto forged = moe_mmid_queue_capability_test_factory::mint(0, &exact_queue, 1701, queue_lifetime);
+    moe_mmid_authoritative_admission_request wrong_queue{ make_authority(forged, {}), { 2, 2, 64, 96, 1 } };
+    check(registry.admit(std::move(wrong_queue)).status == moe_mmid_lease_status::INVALID,
+          "same-device same-cookie different queue capability admitted");
+
+    check(registry.invalidate_plan(plan.get()) == 1, "exact plan invalidation missed context");
+    moe_mmid_authoritative_admission_request stale{ make_authority(capability, {}), { 2, 2, 64, 96, 1 } };
+    check(registry.admit(std::move(stale)).status == moe_mmid_lease_status::INVALID,
+          "stale exact plan admitted after replacement invalidation");
+    check(committed.bundle.terminal_release(), "committed direct bundle did not finish after plan replacement");
+    committed = {};
+    check(weak_pin.expired(), "terminal direct bundle retained invocation pin");
+}
+
 static void registry_bundle_rollback_move_oom_and_quarantine() {
     const moe_mmid_model_token token{ 61, 62, 63 };
     std::atomic<int> destroyed{ 0 };
@@ -1007,6 +1053,7 @@ int main() {
         registry_retirement_retains_outstanding_lease();
         registry_component_max_constituent_coverage();
         registry_atomic_bundle_authority();
+        common_direct_authority_plan_queue_and_lifetime();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();
         registry_atomic_concurrency_multi_owner();

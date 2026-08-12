@@ -1073,15 +1073,23 @@ struct placement_plan {
 };
 
 struct moe_mmid_queue_binding {
-    int           owner_device = -1;
-    sycl::queue * queue        = nullptr;
-    uint64_t      queue_cookie = 0;
+    int                       owner_device = -1;
+    sycl::queue *             queue        = nullptr;
+    uint64_t                  queue_cookie = 0;
+    moe_mmid_queue_capability capability; // copied into authority construction when present
 };
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
     const moe_mmid_model_token & token,
     uint64_t plan_identity,
     const placement_plan & plan,
+    int submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings) noexcept;
+// Authoritative construction: the materialized pools retain this exact plan
+// snapshot and private capabilities minted from the exact queue objects.
+moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+    const moe_mmid_model_token & token,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
     int submit_device,
     const std::vector<moe_mmid_queue_binding> & bindings) noexcept;
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
