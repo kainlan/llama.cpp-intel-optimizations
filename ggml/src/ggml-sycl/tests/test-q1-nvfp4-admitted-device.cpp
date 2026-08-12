@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -245,13 +246,32 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    require(first.workspace_slot != UINT32_MAX && first.workspace_generation != 0 &&
-            after.workspace_slot == first.workspace_slot &&
-            after.workspace_generation == first.workspace_generation,
-            "second submission did not reuse the same workspace slot generation");
-    require(after.candidate >= before.candidate + 2 && after.admit >= before.admit + 2 &&
-            after.submit >= before.submit + 2 && after.terminal >= before.terminal + 2 &&
-            after.recycle >= before.recycle + 2, "two-submit lifecycle counters did not prove slot reuse");
+    const auto observed = [&]() {
+        return " observed first=(slot=" + std::to_string(first.workspace_slot) +
+               ", generation=" + std::to_string(first.workspace_generation) + ") after=(slot=" +
+               std::to_string(after.workspace_slot) + ", generation=" +
+               std::to_string(after.workspace_generation) + ") counters before/first/after=" +
+               std::to_string(before.candidate) + "/" + std::to_string(first.candidate) + "/" +
+               std::to_string(after.candidate) + " candidate, " + std::to_string(before.admit) + "/" +
+               std::to_string(first.admit) + "/" + std::to_string(after.admit) + " admit, " +
+               std::to_string(before.submit) + "/" + std::to_string(first.submit) + "/" +
+               std::to_string(after.submit) + " submit, " + std::to_string(before.terminal) + "/" +
+               std::to_string(first.terminal) + "/" + std::to_string(after.terminal) + " terminal, " +
+               std::to_string(before.recycle) + "/" + std::to_string(first.recycle) + "/" +
+               std::to_string(after.recycle) + " recycle";
+    };
+    if (first.workspace_slot == UINT32_MAX || first.workspace_generation == 0 ||
+        first.workspace_generation == std::numeric_limits<uint64_t>::max() ||
+        after.workspace_slot != first.workspace_slot ||
+        after.workspace_generation != first.workspace_generation + 1) {
+        throw std::runtime_error("second submission did not reuse the same workspace slot at generation+1;" +
+                                 observed());
+    }
+    if (after.candidate < before.candidate + 2 || after.admit < before.admit + 2 ||
+        after.submit < before.submit + 2 || after.terminal < before.terminal + 2 ||
+        after.recycle < before.recycle + 2) {
+        throw std::runtime_error("two-submit lifecycle counters did not prove slot reuse;" + observed());
+    }
 }
 
 void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_quarantine) {
