@@ -2821,23 +2821,9 @@ struct moe_expert_source {
     explicit operator bool() const { return handle.valid() && ptr != nullptr; }
 };
 
-// direct_stage_expert() may return while its final H2D/reorder is still in
-// flight. Publish every locally-held source/staging/storage lease against that
-// terminal event before the caller's scope can drop it. A failed stage has no
-// trustworthy terminal event, so synchronously drain its queue before release.
-static void ggml_sycl_retain_direct_stage_owners(std::vector<ggml_sycl::mem_handle> owners,
-                                                 const ggml_sycl::direct_stage_result & result,
-                                                 sycl::queue & queue) {
-    owners.erase(std::remove_if(owners.begin(), owners.end(),
-                                [](const ggml_sycl::mem_handle & owner) { return !owner.valid(); }),
-                 owners.end());
-    if (owners.empty()) {
-        return;
-    }
-    if (result.ok && result.ptr) {
-        ggml_sycl::retain_handles_until_event(std::move(owners), result.event);
-        return;
-    }
+// A direct stage may enqueue work before returning failure or throwing. Drain
+// that exact queue while the source/destination owners are still in scope.
+static void ggml_sycl_drain_direct_stage_queue(sycl::queue & queue) noexcept {
     try {
         queue.wait_and_throw();
     } catch (const std::exception & e) {
@@ -2845,6 +2831,43 @@ static void ggml_sycl_retain_direct_stage_owners(std::vector<ggml_sycl::mem_hand
     } catch (...) {
         GGML_LOG_ERROR("[MOE-STAGE] failed-stage queue drain reported an unknown error\n");
     }
+}
+
+// Construct this before direct_stage_expert(). Field order is intentional: the
+// publisher ticket exists before owner-vector allocation and remains active
+// throughout the submit-to-retain handoff. The two vector slots are also
+// allocated before submit, so installing the destination never grows it.
+struct ggml_sycl_direct_stage_owner_handoff {
+    ggml_sycl::retained_handle_publish_ticket publish_ticket = ggml_sycl::begin_retained_handle_publish();
+    std::vector<ggml_sycl::mem_handle>         owners;
+
+    explicit ggml_sycl_direct_stage_owner_handoff(const ggml_sycl::mem_handle & source) {
+        owners.reserve(2);
+        owners.push_back(source);
+        owners.emplace_back();
+    }
+
+    void set_destination(const ggml_sycl::mem_handle & destination) { owners[1] = destination; }
+};
+
+// direct_stage_expert() may return while its final H2D/reorder is still in
+// flight. Publish copies of every locally-held lease against that terminal
+// event. Keeping handoff.owners intact until this function returns is crucial:
+// if worker startup or publication allocation throws, the exact queue is
+// drained before either original owner can unwind.
+static void ggml_sycl_retain_direct_stage_owners(ggml_sycl_direct_stage_owner_handoff & handoff,
+                                                 const ggml_sycl::direct_stage_result & result,
+                                                 sycl::queue & queue) {
+    if (result.ok && result.ptr) {
+        try {
+            ggml_sycl::retain_handles_until_event(handoff.owners, result.event, std::move(handoff.publish_ticket));
+            return;
+        } catch (...) {
+            ggml_sycl_drain_direct_stage_queue(queue);
+            return;
+        }
+    }
+    ggml_sycl_drain_direct_stage_queue(queue);
 }
 
 // Resolve the value key through unified-cache and retain the returned lifetime.
@@ -4223,23 +4246,21 @@ static void moe_prestage_popular_experts() {
                     fctx.prealloc_temp_size = sec_prealloc_size;
                     fctx.bcs_queue          = budget.cache ? &budget.cache->get_bcs_queue() : nullptr;
 
-                    sycl::queue &                  stage_queue = budget.cache->get_queue();
-                    ggml_sycl::mem_handle          storage_handle;
-                    ggml_sycl::direct_stage_result result{};
+                    sycl::queue &                       stage_queue = budget.cache->get_queue();
+                    ggml_sycl_direct_stage_owner_handoff handoff(item.source.handle);
+                    ggml_sycl::mem_handle                storage_handle;
+                    ggml_sycl::direct_stage_result       result{};
                     try {
                         result = budget.cache->direct_stage_expert(
                             item.key, item.source.ptr, item.meta->bytes, item.dst_bytes, GGML_LAYOUT_SOA,
                             ggml_sycl_fill_reordered_gpu, &fctx, &stage_queue, &storage_handle);
-                        ggml_sycl_retain_direct_stage_owners({ item.source.handle, storage_handle }, result,
-                                                             stage_queue);
+                        handoff.set_destination(storage_handle);
+                        ggml_sycl_retain_direct_stage_owners(handoff, result, stage_queue);
                         if (result.ok && result.ptr) {
                             budget.staged++;
                         }
                     } catch (...) {
-                        try {
-                            stage_queue.wait_and_throw();
-                        } catch (...) {
-                        }
+                        ggml_sycl_drain_direct_stage_queue(stage_queue);
                     }
                 }
 
@@ -4402,15 +4423,25 @@ static void moe_prestage_popular_experts() {
                     auto & budget = sec_budgets[ci.budget_idx];
 
                     // Route raw H2D to BCS (copy engine) on the secondary GPU.
-                    sycl::queue * sec_bcs = &budget.cache->get_bcs_queue();
+                    // The handoff is established before submission: a failure
+                    // after enqueue is not reflected in budget.staged.
+                    sycl::queue *                       sec_bcs = &budget.cache->get_bcs_queue();
+                    ggml_sycl_direct_stage_owner_handoff handoff(ci.reorder_handle);
+                    ggml_sycl::mem_handle                storage_handle;
                     try {
                         auto result =
                             budget.cache->direct_stage_expert(ci.key, ci.reorder_buf, ci.dst_bytes, ci.dst_bytes,
-                                                              GGML_LAYOUT_SOA, nullptr, nullptr, sec_bcs);
+                                                              GGML_LAYOUT_SOA, nullptr, nullptr, sec_bcs,
+                                                              &storage_handle);
+                        handoff.set_destination(storage_handle);
+                        ggml_sycl_retain_direct_stage_owners(handoff, result, *sec_bcs);
                         if (result.ok && result.ptr) {
                             budget.staged++;
                         }
                     } catch (...) {
+                        // direct_stage_expert() or retained publication may
+                        // throw after enqueue; drain regardless of staged count.
+                        ggml_sycl_drain_direct_stage_queue(*sec_bcs);
                     }
                 }
 
@@ -4611,22 +4642,21 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     // and can trigger xe driver GT engine resets (>640ms preempt timeout).
     sycl::queue * bcs_q = &cache->get_bcs_queue();
 
+    ggml_sycl_direct_stage_owner_handoff handoff(source.handle);
     try {
         ggml_sycl::mem_handle storage_handle;
         auto result = cache->direct_stage_expert(key, source.ptr, meta.bytes, dst_bytes, GGML_LAYOUT_SOA,
                                                  ggml_sycl_fill_reordered_host, &reorder_ctx, bcs_q,
                                                  &storage_handle);
-        ggml_sycl_retain_direct_stage_owners({ source.handle, storage_handle }, result, *bcs_q);
+        handoff.set_destination(storage_handle);
+        ggml_sycl_retain_direct_stage_owners(handoff, result, *bcs_q);
         if (result.ok && result.ptr) {
             return result.ptr;
         }
     } catch (...) {
         // A throw provides no terminal event. Drain before the local source
         // lease is released, then let the caller fall back to CPU dispatch.
-        try {
-            bcs_q->wait_and_throw();
-        } catch (...) {
-        }
+        ggml_sycl_drain_direct_stage_queue(*bcs_q);
     }
 
     return nullptr;
@@ -5126,25 +5156,23 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
 #endif
     ggml_sycl::scoped_planned_materialization planned_materialization(cache, "MoE selected expert layout materialize");
     auto                                      stage_once = [&]() {
+        ggml_sycl_direct_stage_owner_handoff handoff(stage_from_soa ? source_layout_handle : source.handle);
         storage_handle = ggml_sycl::mem_handle{};
         ggml_sycl::direct_stage_result result{};
         try {
             result = cache->direct_stage_expert(key, stage_src_ptr, stage_src_size, dst_bytes, layout, fill_fn,
                                                 stage_fill_ctx, q, &storage_handle);
+            handoff.set_destination(storage_handle);
         } catch (...) {
             // No event escaped the failed submission. Drain before either
             // locally leased XMX source can unwind.
-            try {
-                q->wait_and_throw();
-            } catch (...) {
-            }
+            ggml_sycl_drain_direct_stage_queue(*q);
             throw;
         }
         // XMX may read either the locally leased SOA materialization or the
         // canonical AOS source directly from a device kernel. Retain that exact
         // source together with destination storage through the final event.
-        ggml_sycl_retain_direct_stage_owners(
-            { stage_from_soa ? source_layout_handle : source.handle, storage_handle }, result, *q);
+        ggml_sycl_retain_direct_stage_owners(handoff, result, *q);
         if (ggml_sycl_moe_route_log_enabled() && (!result.ok || !result.ptr)) {
             static std::atomic<int> logged_stage_fail{ 0 };
             const int               n = logged_stage_fail.fetch_add(1, std::memory_order_relaxed);
@@ -7466,28 +7494,25 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     GGML_SYCL_DEBUG("[MOE-PHASE2-PLAN] Uploading L%d E%d to GPU%d (planner-assigned)\n", info.layer_id,
                                     info.expert_idx, budget.dev);
 
-                    sycl::queue *                  phase2_bcs = &budget.cache->get_bcs_queue();
-                    ggml_sycl::direct_stage_result stage_result{};
+                    sycl::queue *                       phase2_bcs = &budget.cache->get_bcs_queue();
+                    ggml_sycl_direct_stage_owner_handoff handoff(d2h_staging);
+                    ggml_sycl::mem_handle                storage_handle;
+                    ggml_sycl::direct_stage_result       stage_result{};
                     try {
-                        stage_result =
-                            budget.cache->direct_stage_expert(key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA,
-                                                              ggml_sycl_fill_reordered_host, &reorder_ctx, phase2_bcs);
+                        stage_result = budget.cache->direct_stage_expert(
+                            key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA, ggml_sycl_fill_reordered_host,
+                            &reorder_ctx, phase2_bcs, &storage_handle);
+                        handoff.set_destination(storage_handle);
                     } catch (const std::exception & e) {
                         GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert EXCEPTION: %s\n", e.what());
-                        try {
-                            phase2_bcs->wait_and_throw();
-                        } catch (...) {
-                        }
+                        ggml_sycl_drain_direct_stage_queue(*phase2_bcs);
                         continue;
                     } catch (...) {
                         GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert UNKNOWN EXCEPTION\n");
-                        try {
-                            phase2_bcs->wait_and_throw();
-                        } catch (...) {
-                        }
+                        ggml_sycl_drain_direct_stage_queue(*phase2_bcs);
                         continue;
                     }
-                    ggml_sycl_retain_direct_stage_owners({ d2h_staging }, stage_result, *phase2_bcs);
+                    ggml_sycl_retain_direct_stage_owners(handoff, stage_result, *phase2_bcs);
                     if (stage_result.ok && stage_result.ptr) {
                         set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
                         budget.n_slots--;
@@ -7627,28 +7652,25 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     reorder_ctx.src_is_device = false;
                     reorder_ctx.device_id     = budget.dev;
 
-                    sycl::queue *                  phase2_bcs = &budget.cache->get_bcs_queue();
-                    ggml_sycl::direct_stage_result stage_result{};
+                    sycl::queue *                       phase2_bcs = &budget.cache->get_bcs_queue();
+                    ggml_sycl_direct_stage_owner_handoff handoff(d2h_staging);
+                    ggml_sycl::mem_handle                storage_handle;
+                    ggml_sycl::direct_stage_result       stage_result{};
                     try {
-                        stage_result =
-                            budget.cache->direct_stage_expert(key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA,
-                                                              ggml_sycl_fill_reordered_host, &reorder_ctx, phase2_bcs);
+                        stage_result = budget.cache->direct_stage_expert(
+                            key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA, ggml_sycl_fill_reordered_host,
+                            &reorder_ctx, phase2_bcs, &storage_handle);
+                        handoff.set_destination(storage_handle);
                     } catch (const std::exception & e) {
                         GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert EXCEPTION: %s\n", e.what());
-                        try {
-                            phase2_bcs->wait_and_throw();
-                        } catch (...) {
-                        }
+                        ggml_sycl_drain_direct_stage_queue(*phase2_bcs);
                         continue;
                     } catch (...) {
                         GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert UNKNOWN EXCEPTION\n");
-                        try {
-                            phase2_bcs->wait_and_throw();
-                        } catch (...) {
-                        }
+                        ggml_sycl_drain_direct_stage_queue(*phase2_bcs);
                         continue;
                     }
-                    ggml_sycl_retain_direct_stage_owners({ d2h_staging }, stage_result, *phase2_bcs);
+                    ggml_sycl_retain_direct_stage_owners(handoff, stage_result, *phase2_bcs);
                     if (stage_result.ok && stage_result.ptr) {
                         set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
                         budget.n_slots--;
