@@ -514,6 +514,10 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
+            moe_admitted_workspace_bundle ordinary_bundle;
+            choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
+                                               device.recipe.workspace.total_bytes, &ordinary_bundle);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
 
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
