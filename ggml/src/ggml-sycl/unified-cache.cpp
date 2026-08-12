@@ -294,10 +294,21 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (current == model->second.end() || current->second.get() != expected.get()) {
             return false;
         }
-        // Linearize invalidation while the exact registry publication is still
-        // current. Admissions that committed before this registry lock retain
-        // their bundles; every later admission sees accepting=false.
-        (void) unified_cache_moe_mmid_registry().invalidate_plan(expected.get());
+        const auto stable_workspace = [&] {
+            if (!expected->plan || !replacement->plan) return false;
+            const auto & a = expected->plan->moe_mmid_workspaces;
+            const auto & b = replacement->plan->moe_mmid_workspaces;
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].owner_device != b[i].owner_device || a[i].depth != b[i].depth ||
+                    a[i].valid != b[i].valid || a[i].secondary_owner != b[i].secondary_owner ||
+                    a[i].device_pool_bytes != b[i].device_pool_bytes || a[i].host_pool_bytes != b[i].host_pool_bytes ||
+                    !moe_mmid_same_workspace_geometry(a[i].slot, b[i].slot)) return false;
+            }
+            return true;
+        }();
+        if (!stable_workspace || !unified_cache_moe_mmid_registry().replace_plan(
+                                     expected, replacement, replacement->version)) return false;
         current->second = replacement;
         return true;
     } catch (...) {
@@ -322,6 +333,24 @@ moe_mmid_queue_capability workspace_admission_authority_issuer::queue(
     return out;
 }
 
+moe_mmid_queue_completion_capability workspace_admission_authority_issuer::terminal(
+    const moe_mmid_queue_capability & queue, uint64_t invocation_serial,
+    std::shared_ptr<moe::device_terminal> terminal) noexcept {
+    moe_mmid_queue_completion_capability out;
+    if (!queue.valid() || !invocation_serial || !terminal) return out;
+    out.queue_identity_ = queue.identity_; out.invocation_serial_ = invocation_serial; out.terminal_ = std::move(terminal);
+    return out;
+}
+
+moe_mmid_queue_completion_capability workspace_admission_authority_issuer::quiescence(
+    const moe_mmid_queue_capability & queue, uint64_t invocation_serial,
+    std::shared_ptr<moe::queue_quiescence_proof> proof) noexcept {
+    moe_mmid_queue_completion_capability out;
+    if (!queue.valid() || !invocation_serial || !proof) return out;
+    out.queue_identity_ = queue.identity_; out.invocation_serial_ = invocation_serial; out.proof_ = std::move(proof);
+    return out;
+}
+
 bool workspace_admission_authority_issuer::graph(
     moe::graph_retention_registry & registry, const moe::published_graph_token & token,
     std::shared_ptr<const moe::graph_retention_record> snapshot,
@@ -329,12 +358,13 @@ bool workspace_admission_authority_issuer::graph(
     std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
     std::shared_ptr<const moe::graph_private_table_owner> table,
     std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
+    std::vector<moe_mmid_queue_completion_capability> completions,
     workspace_admission_authority * out) noexcept {
     if (!out || !snapshot || !plan || !plan->plan || plan->version == 0 || !token.valid() ||
         plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
         snapshot->root.model.value != model_token.model_id || snapshot->root.load.value != model_token.load_txn_id ||
         snapshot->root.owner.generation != model_token.generation || snapshot->phase != moe::retention_phase::INSTALLED ||
-        owners.size() != queues.size()) return false;
+        owners.size() != queues.size() || owners.size() != completions.size()) return false;
     moe::published_graph_token canonical;
     if (registry.snapshot(snapshot->key).get() != snapshot.get() ||
         registry.acquire_published_token(snapshot->key, &canonical) != moe::retention_error::OK ||
@@ -345,7 +375,7 @@ bool workspace_admission_authority_issuer::graph(
         state->epoch = snapshot->key.epoch.value; state->plan = std::move(plan); state->graph_registry = &registry;
         state->graph_token = token; state->graph_snapshot = std::move(snapshot); state->occurrences = std::move(occurrences);
         state->table = std::move(table); state->owners = std::move(owners); state->queues = std::move(queues);
-        out->state_ = std::move(state); return true;
+        state->completions = std::move(completions); out->state_ = std::move(state); return true;
     } catch (...) { return false; }
 }
 
@@ -355,35 +385,33 @@ bool workspace_admission_authority_issuer::direct(
     std::shared_ptr<const std::vector<moe::mmid_batch_binding>> occurrences,
     std::shared_ptr<const moe::graph_private_table_owner> table,
     std::vector<moe_mmid_admission_owner> owners, std::vector<moe_mmid_queue_capability> queues,
-    std::map<int, std::shared_ptr<moe::device_terminal>> terminals,
-    std::map<int, std::shared_ptr<moe::queue_quiescence_proof>> quiescence_proofs,
+    std::vector<moe_mmid_queue_completion_capability> completions,
     workspace_admission_authority * out) noexcept {
+    if (!out || !snapshot.active() || !plan || !plan->plan || plan->version == 0 || !model_token.valid() ||
+        plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
+        snapshot.root().model.value != model_token.model_id || snapshot.root().load.value != model_token.load_txn_id ||
+        snapshot.root().owner.generation != model_token.generation || submit_device < 0 || !occurrences ||
+        occurrences->empty() || !table || owners.empty() || owners.size() != queues.size() ||
+        owners.size() != completions.size() || table->owner().context.value != snapshot.context().value ||
+        table->owner().epoch.value != snapshot.graph_epoch().value ||
+        registry.validate_authoritative_invocation_snapshot(snapshot) != execution::error::OK) return false;
     std::shared_ptr<direct_invocation_pin> pin;
     try {
         pin = std::make_shared<direct_invocation_pin>();
         pin->snapshot = std::move(snapshot);
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
     const auto & exact = pin->snapshot;
-    if (!out || !exact.active() || !plan || !plan->plan || plan->version == 0 || !model_token.valid() ||
-        plan->model_id != model_token.model_id || plan->load_txn_id != model_token.load_txn_id ||
-        exact.root().model.value != model_token.model_id || exact.root().load.value != model_token.load_txn_id ||
-        exact.root().owner.generation != model_token.generation || submit_device < 0 || !occurrences ||
-        occurrences->empty() || !table || owners.empty() || owners.size() != queues.size() ||
-        table->owner().context.value != exact.context().value ||
-        table->owner().epoch.value != exact.graph_epoch().value ||
-        registry.validate_authoritative_invocation_snapshot(exact) != execution::error::OK) return false;
     for (size_t i = 0; i < owners.size(); ++i)
         if (!queues[i].valid() || queues[i].owner_device() != owners[i].owner_device ||
             queues[i].cookie() != owners[i].queue_cookie) return false;
     try {
         auto state = std::make_shared<workspace_admission_authority::state>();
         state->token = model_token; state->submit_device = submit_device; state->plan_identity = plan->version;
-        state->epoch = exact.graph_epoch().value; state->plan = std::move(plan); state->invocation_pin = std::move(pin);
+        state->epoch = exact.graph_epoch().value; state->plan = std::move(plan);
+        state->invocation_pin = std::move(pin);
         state->occurrences = std::move(occurrences); state->table = std::move(table); state->owners = std::move(owners);
-        state->queues = std::move(queues); state->terminals = std::move(terminals);
-        state->quiescence_proofs = std::move(quiescence_proofs); out->state_ = std::move(state); return true;
+        state->queues = std::move(queues); state->completions = std::move(completions);
+        out->state_ = std::move(state); return true;
     } catch (...) { return false; }
 }
 

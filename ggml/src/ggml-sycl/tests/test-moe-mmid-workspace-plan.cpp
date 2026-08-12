@@ -839,12 +839,12 @@ static void common_direct_authority_plan_queue_and_lifetime() {
 
     auto graph = admission_request(token, 1700, { { 0, 1701 } }, 1702);
     auto pin = std::make_shared<int>(9); std::weak_ptr<int> weak_pin = pin;
-    std::map<int, std::shared_ptr<moe::device_terminal>> terminals;
-    terminals.emplace(0, graph.graph_snapshot->terminals.at(0));
+    auto terminal = graph.graph_snapshot->terminals.at(0);
     auto make_authority = [&](moe_mmid_queue_capability queue, std::shared_ptr<void> invocation_pin) {
+        auto completion = workspace_admission_authority_test_factory::terminal(queue, 1702, terminal);
         return workspace_admission_authority_test_factory::direct(
             token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
-            { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), terminals);
+            { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), { std::move(completion) });
     };
     moe_mmid_authoritative_admission_request direct{ make_authority(capability, pin), { 2, 2, 64, 96, 1 } };
     pin.reset();
@@ -856,12 +856,63 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     moe_mmid_authoritative_admission_request wrong_queue{ make_authority(forged, {}), { 2, 2, 64, 96, 1 } };
     check(registry.admit(std::move(wrong_queue)).status == moe_mmid_lease_status::INVALID,
           "same-device same-cookie different queue capability admitted");
+    auto wrong_completion = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
+    auto wrong_terminal_authority = workspace_admission_authority_test_factory::direct(
+        token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
+        { { 0, 1701 } }, { capability }, {}, { wrong_completion });
+    check(registry.admit({ std::move(wrong_terminal_authority), { 2, 2, 64, 96, 1 } }).status ==
+              moe_mmid_lease_status::INVALID, "substituted terminal queue authority admitted");
 
-    check(registry.invalidate_plan(plan.get()) == 1, "exact plan invalidation missed context");
+    auto forged_graph_completion = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
+    auto forged_graph_authority = workspace_admission_authority_test_factory::graph(
+        token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
+        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { forged }, { forged_graph_completion });
+    check(registry.admit({ std::move(forged_graph_authority), { 2, 2, 64, 96, 1 } }).status ==
+              moe_mmid_lease_status::INVALID, "GRAPH substituted exact queue capability admitted");
+
+    auto graph_completion = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
+    auto graph_authority = workspace_admission_authority_test_factory::graph(
+        token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
+        graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { capability }, { graph_completion });
+#ifndef MMID_TSAN_BUILD
+    g_fail_heap_allocations.store(true);
+#endif
+    auto graph_admitted = registry.admit({ std::move(graph_authority), { 2, 2, 64, 96, 1 } });
+#ifndef MMID_TSAN_BUILD
+    g_fail_heap_allocations.store(false);
+#endif
+    check(graph_admitted.status == moe_mmid_lease_status::ACQUIRED,
+          "GRAPH common helper allocated or rejected exact authority");
+    check(graph_admitted.bundle.terminal_release(), "GRAPH common helper release failed");
+
+    auto replacement = std::make_shared<const lifecycle_plan_snapshot>();
+    std::atomic<bool> late_entered{ false }, late_release{ false };
+    moe_mmid_materialize_status late_status = moe_mmid_materialize_status::PUBLISHED;
+    auto late_allocator = [&](bool host, int device, size_t bytes, size_t alignment) {
+        late_entered.store(true, std::memory_order_release);
+        while (!late_release.load(std::memory_order_acquire)) std::this_thread::yield();
+        return allocator(host, device, bytes, alignment);
+    };
+    std::thread late_materialize([&] {
+        late_status = registry.materialize(token, 1700, plan, 0, { owner }, late_allocator);
+    });
+    while (!late_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    check(registry.replace_plan(plan, replacement, 1703), "stable exact plan replacement failed");
+    late_release.store(true, std::memory_order_release); late_materialize.join();
+    check(late_status == moe_mmid_materialize_status::INVALID,
+          "paused late stale-plan materialization crossed replacement tombstone");
     moe_mmid_authoritative_admission_request stale{ make_authority(capability, {}), { 2, 2, 64, 96, 1 } };
     check(registry.admit(std::move(stale)).status == moe_mmid_lease_status::INVALID,
-          "stale exact plan admitted after replacement invalidation");
-    check(committed.bundle.terminal_release(), "committed direct bundle did not finish after plan replacement");
+          "stale exact plan admitted after replacement rebind");
+    auto replacement_completion = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
+    auto replacement_authority = workspace_admission_authority_test_factory::direct(
+        token, 1703, 1702, 0, replacement, graph.retained_occurrences, graph.table_owner,
+        { { 0, 1701 } }, { capability }, {}, { replacement_completion });
+    auto replacement_admitted = registry.admit({ std::move(replacement_authority), { 2, 2, 64, 96, 1 } });
+    check(replacement_admitted.status == moe_mmid_lease_status::ACQUIRED,
+          "stable replacement did not rebind unchanged materialized context");
+    check(replacement_admitted.bundle.terminal_release(), "replacement bundle release failed");
+    check(committed.bundle.terminal_release(), "committed old bundle did not finish after plan replacement");
     committed = {};
     check(weak_pin.expired(), "terminal direct bundle retained invocation pin");
 }
@@ -934,28 +985,26 @@ static void registry_destroyed_quarantine_recovery() {
               moe_mmid_materialize_status::PUBLISHED, "quarantine context publication failed");
     auto ready = std::make_shared<std::atomic<bool>>(false);
     auto request = admission_request(token, 805, { { 0, 806 }, { 1, 807 } }, 901, ready);
-    {
-        auto admitted = registry.admit(request);
-        check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
-              "quarantine admission failed");
-        auto copied_lease = admitted.bundle.owner_leases()[0];
-        check(copied_lease.terminal_release(copied_lease.queue_cookie(), copied_lease.generation()) ==
-                  moe_mmid_release_status::WRONG_EPOCH,
-              "copied lease bypassed registry-owned quarantine");
-        check(!admitted.bundle.terminal_release(), "premature terminal release recycled submitted slots");
-    }
-    check(!registry.retire(token, 805), "retirement discarded destroyed quarantined bundle");
+    auto admitted = registry.admit(request);
+    check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
+          "quarantine admission failed");
+    auto copied_lease = admitted.bundle.owner_leases()[0];
+    check(copied_lease.terminal_release(copied_lease.queue_cookie(), copied_lease.generation()) ==
+              moe_mmid_release_status::WRONG_EPOCH,
+          "copied lease bypassed registry-owned quarantine");
+    check(!admitted.bundle.terminal_release(), "premature terminal release recycled submitted slots");
+    check(!registry.retire(token, 805), "retirement discarded quarantined bundle");
     check(registry.recover_quarantined(token, 805, false) == 0, "unready quarantine recovered");
     ready->store(true);
     std::atomic<size_t> recovered{ 0 };
-    std::atomic<bool> raced_retire{ false };
+    std::atomic<bool> terminal_released{ false };
     std::thread recover_thread([&] { recovered.store(registry.recover_quarantined(token, 805, false)); });
-    std::thread retire_thread([&] { raced_retire.store(registry.retire(token, 805)); });
-    recover_thread.join();
-    retire_thread.join();
-    check(recovered.load() == 2, "ready destroyed quarantine was not recovered in retirement race");
-    check(raced_retire.load() || registry.retire(token, 805),
-          "context did not retire after quarantine recovery race");
+    std::thread release_thread([&] { terminal_released.store(admitted.bundle.terminal_release()); });
+    recover_thread.join(); release_thread.join();
+    check((recovered.load() == 2 && !terminal_released.load()) ||
+              (recovered.load() == 0 && terminal_released.load()),
+          "release/recover race partially transitioned multi-owner bundle");
+    check(registry.retire(token, 805), "context did not retire after atomic quarantine recovery race");
 }
 
 static void registry_atomic_concurrency_multi_owner() {
