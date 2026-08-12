@@ -1,101 +1,37 @@
-// Executable device regression test for the allocation-free admitted adapter.
-#include "mmvq.hpp"
-#include "unified-cache.hpp"
+// BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+#include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
-#include "ggml-sycl.h"
+#include "ggml.h"
 
-#include <climits>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <sycl/sycl.hpp>
 
 namespace {
-
-void require(bool condition, const char * message) {
-    if (!condition) throw std::runtime_error(message);
-}
-
-ggml_sycl::moe_mmid_owner_workspace_plan workspace_plan(int device) {
-    ggml_sycl::moe_mmid_owner_workspace_plan workspace;
-    workspace.owner_device = device;
-    require(ggml_sycl::moe_mmid_plan_workspace({ 64, 96, 1, 3, 2 }, false, &workspace.slot),
-            "synthetic MMID workspace shape rejected");
-    workspace.valid = ggml_sycl::moe_mmid_checked_pool_bytes(
-        workspace.slot, workspace.depth, &workspace.device_pool_bytes, &workspace.host_pool_bytes);
-    require(workspace.valid, "synthetic MMID workspace pool rejected");
-    return workspace;
-}
-
-ggml_sycl::placement_plan synthetic_mmid_plan() {
-    ggml_sycl::placement_plan plan{};
-    plan.device_id = 0;
-    plan.devices = { 0 };
-    plan.vram_budget = SIZE_MAX;
-    plan.planner_n_ctx = 2;
-    plan.planner_n_ubatch = 2;
-    plan.planner_n_seq_max = 1;
-    auto workspace = workspace_plan(0);
-    plan.moe_mmid_device_pool_bytes = workspace.device_pool_bytes;
-    plan.moe_mmid_host_pool_bytes = workspace.host_pool_bytes;
-    plan.moe_mmid_workspaces.push_back(workspace);
-    return plan;
-}
-
-void wrapper_exact_plan_identity(sycl::queue & q) {
-    const ggml_sycl::moe_mmid_model_token token{ 0xf001, 0xf002, 0xf003 };
-    auto snapshot = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>();
-    snapshot->model_id = token.model_id;
-    snapshot->load_txn_id = token.load_txn_id;
-    snapshot->slot_generation = token.generation;
-    snapshot->version = 0xf004;
-    snapshot->plan = std::make_shared<const ggml_sycl::placement_plan>(synthetic_mmid_plan());
-    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> exact = snapshot;
-    const std::vector<ggml_sycl::moe_mmid_queue_binding> bindings{ { 0, &q, 0xf005 } };
-    require(ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(token, exact, 0, bindings) ==
-                ggml_sycl::moe_mmid_materialize_status::PUBLISHED,
-            "exact-plan wrapper materialization failed");
-    require(ggml_sycl::unified_cache_moe_mmid_exact_queue(token, exact, 0, 0, &q).valid(),
-            "wrapper did not retain exact shared plan");
-    auto foreign_mutable = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*snapshot);
-    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> equal_but_distinct = foreign_mutable;
-    require(!ggml_sycl::unified_cache_moe_mmid_exact_queue(token, equal_but_distinct, 0, 0, &q).valid(),
-            "equal-but-distinct wrapper plan was accepted");
-    require(ggml_sycl::unified_cache_retire_moe_mmid_workspaces(token, snapshot->version),
-            "wrapper fixture retirement failed");
-}
+void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 struct synthetic_inventory {
     ggml_sycl_tensor_info tensors[3]{};
     ggml_sycl_tensor_inventory inventory{};
     ggml_sycl_placement_envelope envelope{ 2, 2, 1, -1 };
-
     synthetic_inventory() {
-        constexpr const char * names[] = {
-            "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"
-        };
-        constexpr int experts = 4;
-        constexpr int K = QK1_0;
-        constexpr int N = 96;
+        constexpr const char * names[] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                           "blk.0.ffn_down_exps.weight" };
+        constexpr int experts = 4, K = QK1_0, N = 96;
         for (size_t i = 0; i < 3; ++i) {
-            tensors[i].name = names[i];
-            tensors[i].type = GGML_TYPE_Q1_0;
-            tensors[i].ne[0] = i == 2 ? N : K;
-            tensors[i].ne[1] = i == 2 ? K : N;
-            tensors[i].ne[2] = experts;
-            tensors[i].ne[3] = 1;
-            tensors[i].size = ggml_row_size(tensors[i].type, tensors[i].ne[0]) *
-                              static_cast<size_t>(tensors[i].ne[1]) * experts;
+            tensors[i].name = names[i]; tensors[i].type = GGML_TYPE_Q1_0;
+            tensors[i].ne[0] = i == 2 ? N : K; tensors[i].ne[1] = i == 2 ? K : N;
+            tensors[i].ne[2] = experts; tensors[i].ne[3] = 1;
+            tensors[i].size = ggml_row_size(tensors[i].type, tensors[i].ne[0]) * tensors[i].ne[1] * experts;
             inventory.total_size += tensors[i].size;
         }
-        inventory.tensors = tensors;
-        inventory.count = 3;
-        inventory.n_expert = experts;
-        inventory.n_expert_used = 3;
-        inventory.n_layer = 1;
-        inventory.n_ctx = 2;
-        inventory.n_ubatch = 2;
+        inventory.tensors = tensors; inventory.count = 3; inventory.n_expert = experts;
+        inventory.n_expert_used = 3; inventory.n_layer = 1;
+        inventory.n_ctx = 2; inventory.n_ubatch = 2;
     }
 };
 
@@ -103,177 +39,161 @@ struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     ggml_sycl_model_token model{};
     ggml_sycl_exec_context_id context{};
-
+    ggml_sycl_q1_nvfp4_test_scope_token scope{};
     lifecycle_fixture() {
         backend = ggml_backend_sycl_init(0);
-        require(backend != nullptr, "SYCL backend initialization failed");
+        require(backend, "SYCL backend initialization failed");
         ggml_sycl_load_txn load{};
-        require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK,
-                "synthetic lifecycle load begin failed");
+        require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
         synthetic_inventory fixture;
         require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
-                    GGML_SYCL_LIFECYCLE_OK,
-                "synthetic lifecycle inventory staging failed");
-        const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
-        require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
-                "synthetic inventory produced no MMID demand");
+                    GGML_SYCL_LIFECYCLE_OK, "inventory staging failed");
+        // load_end materializes the exact planned workspace/queue before LIVE publication.
         require(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle load commit failed");
-        const auto exact = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
-        require(exact && exact->plan && !exact->plan->moe_mmid_workspaces.empty(),
-                "committed lifecycle plan lost MMID demand");
-        require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
-                "execution context create failed");
+        require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
+        require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK, "context create failed");
         require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
-                "execution context/backend bind failed");
-        require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1) ==
-                    GGML_SYCL_LIFECYCLE_OK,
-                "execution context/model bind failed");
-        ggml_sycl_execution_snapshot state{};
-        require(ggml_backend_sycl_execution_context_extract(context, &state) == GGML_SYCL_EXECUTION_OK &&
-                    state.token_root.model_id == model.model_id &&
-                    state.token_root.load_txn_id == model.load_txn_id &&
-                    state.token_root.slot == model.slot &&
-                    state.token_root.slot_generation == model.slot_generation,
-                "execution lifecycle did not retain model root");
+                "context bind failed");
+        require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1) == GGML_SYCL_LIFECYCLE_OK,
+                "model root bind failed");
+        require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, &scope), "private scope mint failed");
+        auto forged = scope; ++forged.nonce;
+        require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged scope token accepted");
+        require(ggml_sycl_q1_nvfp4_test_scope_enter(backend, &scope), "private scope enter failed");
     }
-
     ~lifecycle_fixture() {
-        ggml_sycl_exec_drain_ticket ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value != 0 &&
-            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK) {
-            if (ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
-                GGML_SYCL_EXECUTION_OK) {
-                (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-                (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
-            }
+        if (backend) ggml_sycl_q1_nvfp4_test_scope_leave(backend, &scope);
+        ggml_sycl_exec_drain_ticket ticket{}; ggml_sycl_exec_control_host_alloc_batch batch{};
+        if (context.value && ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
+            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) == GGML_SYCL_EXECUTION_OK) {
+            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
+            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
         }
-        if (model.model_id != 0) (void) ggml_backend_sycl_model_unloaded_token(model);
+        if (model.model_id) (void) ggml_backend_sycl_model_unloaded_token(model);
         if (backend) ggml_backend_free(backend);
     }
 };
 
-template <typename T> struct usm_owner {
-    sycl::queue * q = nullptr;
-    T * ptr = nullptr;
-    usm_owner(sycl::queue & queue, size_t count) : q(&queue), ptr(sycl::malloc_shared<T>(count, queue)) {
-        if (!ptr) throw std::bad_alloc();
-    }
-    ~usm_owner() { if (ptr) sycl::free(ptr, *q); }
-};
-
-void run_case(sycl::queue & q, ggml_type type, int ne11) {
-    constexpr int experts = 4, top_k = 3, tokens = 2, rows = 5;
-    const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
-    const size_t block_bytes = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
-    const size_t blocks_per_row = static_cast<size_t>(K / (type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4));
-    const size_t weight_bytes = static_cast<size_t>(experts) * rows * blocks_per_row * block_bytes;
-    const size_t activation_rows = static_cast<size_t>(ne11) * tokens;
-    const size_t q8_bytes = activation_rows * static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
-    const size_t output_values = static_cast<size_t>(top_k) * tokens * rows;
-
-    usm_owner<unsigned char> weights(q, weight_bytes);
-    usm_owner<const void *> table(q, experts);
-    usm_owner<float> activation(q, activation_rows * K);
-    usm_owner<int32_t> ids(q, top_k * tokens);
-    usm_owner<unsigned char> q8(q, q8_bytes + alignof(block_q8_1));
-    usm_owner<float> output(q, output_values + 1);
-
-    std::vector<float> weight_row(K);
-    for (int e = 0; e < experts; ++e) {
-        table.ptr[e] = weights.ptr + static_cast<size_t>(e) * rows * blocks_per_row * block_bytes;
-        for (int r = 0; r < rows; ++r) {
-            for (int k = 0; k < K; ++k) weight_row[k] = 0.25f + float((e + r + k) % 11) / 13.0f;
-            void * row = weights.ptr + (static_cast<size_t>(e) * rows + r) * blocks_per_row * block_bytes;
-            if (type == GGML_TYPE_Q1_0) quantize_row_q1_0_ref(weight_row.data(), static_cast<block_q1_0 *>(row), K);
-            else quantize_row_nvfp4_ref(weight_row.data(), static_cast<block_nvfp4 *>(row), K);
-        }
-    }
-    for (size_t i = 0; i < activation_rows * static_cast<size_t>(K); ++i) activation.ptr[i] = 0.5f + float(i % 17) / 19.0f;
-    const int32_t snapshot[] = { 3, 1, 3, 0, 2, 0 }; // repeated and nonmonotonic
-    std::fill(ids.ptr, ids.ptr + top_k * tokens, -1); // adapter must upload snapshot, not trust this
-    std::memset(q8.ptr, 0x5a, q8_bytes);
-    std::fill(output.ptr, output.ptr + output_values, 123.0f);
-
-    float * activation_ptr = activation.ptr;
-    sycl::event delayed = q.submit([&](sycl::handler & h) {
-        h.single_task([=]() {
-            volatile int spin = 0;
-            for (int i = 0; i < 100000; ++i) spin += i;
-            activation_ptr[0] = 2.0f + float(spin == -1);
-        });
-    });
-    mmvq_q1_nvfp4_admitted_buffers buffers{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
-    sycl::event terminal;
-    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
-                                                  snapshot, experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
-                                                  top_k * sizeof(int32_t), buffers, &delayed, &terminal),
-            "valid admitted submit rejected");
-    terminal.wait_and_throw();
-    bool any_nonzero = false;
-    for (size_t i = 0; i < output_values; ++i) {
-        require(std::isfinite(output.ptr[i]), "non-finite output");
-        any_nonzero |= output.ptr[i] != 0.0f;
-    }
-    require(any_nonzero, "nonzero weights produced only zero output");
-    require(std::memcmp(ids.ptr, snapshot, sizeof(snapshot)) == 0, "retained ID snapshot was not uploaded exactly");
-
-    auto expect_pre_submit_refusal = [&](const char * name, ggml_type bad_type, int bad_k, const int32_t * bad_ids,
-                                         int64_t nb0, int64_t nb1, void * q8_ptr, size_t q8_size,
-                                         size_t output_size) {
-        std::memset(q8.ptr, 0x6b, q8_bytes);
-        std::fill(output.ptr, output.ptr + output_values, 77.0f);
-        mmvq_q1_nvfp4_admitted_buffers bad{ q8_ptr, q8_size, output.ptr, output_size };
-        require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, bad_type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
-                                                       bad_ids, experts, bad_k, rows, top_k, tokens, ne11, nb0, nb1,
-                                                       bad), name);
-        for (size_t i = 0; i < q8_bytes; ++i) require(q8.ptr[i] == 0x6b, "refusal changed Q8 bytes");
-        for (size_t i = 0; i < output_values; ++i) require(output.ptr[i] == 77.0f, "refusal changed output");
-    };
-    int32_t invalid_ids[] = { 3, 1, experts, 0, 2, 0 };
-    expect_pre_submit_refusal("unsupported type submitted", GGML_TYPE_F32, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("zero K submitted", type, 0, snapshot, sizeof(int32_t), top_k * sizeof(int32_t), q8.ptr,
-                              q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("T-1 Q8 submitted", type, K, snapshot, sizeof(int32_t), top_k * sizeof(int32_t), q8.ptr,
-                              q8_bytes - 1, output_values * sizeof(float));
-    expect_pre_submit_refusal("output mismatch submitted", type, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float) - 1);
-    expect_pre_submit_refusal("invalid ID submitted", type, K, invalid_ids, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("invalid slot stride submitted", type, K, snapshot, 2 * sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("invalid token stride submitted", type, K, snapshot, sizeof(int32_t),
-                              (top_k + 1) * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("misaligned Q8 submitted", type, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr + 1, q8_bytes, output_values * sizeof(float));
-
-    mmvq_q1_nvfp4_admitted_buffers overflow{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
-    require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
-                                                   snapshot, experts, K, rows, INT_MAX, INT_MAX, ne11,
-                                                   sizeof(int32_t), top_k * sizeof(int32_t), overflow),
-            "overflow shape submitted");
+ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * tensor,
+                                   ggml_backend_buffer_usage usage) {
+    auto * buffer = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, tensor));
+    if (!buffer) return nullptr;
+    ggml_backend_buffer_set_usage(buffer, usage);
+    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+    return buffer;
 }
 
+struct graph_case {
+    ggml_context * ctx = nullptr; ggml_cgraph * graph = nullptr; ggml_tensor * out = nullptr;
+    std::vector<ggml_backend_buffer_t> buffers;
+    graph_case() = default;
+    graph_case(const graph_case &) = delete;
+    graph_case & operator=(const graph_case &) = delete;
+    graph_case(graph_case && other) noexcept : ctx(other.ctx), graph(other.graph), out(other.out),
+                                               buffers(std::move(other.buffers)) {
+        other.ctx = nullptr; other.graph = nullptr; other.out = nullptr; other.buffers.clear();
+    }
+    ~graph_case() { for (auto * b : buffers) if (b) ggml_backend_buffer_free(b); if (ctx) ggml_free(ctx); }
+};
+
+graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
+                      std::vector<float> & oracle, size_t & output_count) {
+    constexpr int experts = 4, top_k = 3, tokens = 1, rows = 5;
+    const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    graph_case c;
+    c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
+    auto * weights = ggml_new_tensor_3d(c.ctx, type, K, rows, experts);
+    auto * input = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, K, ne11, tokens);
+    auto * ids = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, top_k, tokens);
+    ggml_set_name(weights, "blk.0.ffn_gate_exps.weight"); ggml_set_name(input, "route_input");
+    ggml_set_name(ids, "route_ids"); c.out = ggml_mul_mat_id(c.ctx, weights, input, ids);
+    ggml_set_name(c.out, "route_output");
+    auto * buft = ggml_backend_get_default_buffer_type(backend);
+    c.buffers = { alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
+                  alloc_tensor(buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                  alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                  alloc_tensor(buft, c.out, GGML_BACKEND_BUFFER_USAGE_COMPUTE) };
+    require(std::all_of(c.buffers.begin(), c.buffers.end(), [](auto * b) { return b != nullptr; }),
+            "tensor buffer allocation failed");
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+
+    std::vector<float> source(static_cast<size_t>(experts) * rows * K), dequant(source.size());
+    for (size_t i = 0; i < source.size(); ++i) source[i] = 0.15f + float((i * 7) % 23) / 29.0f;
+    std::vector<unsigned char> packed(ggml_nbytes(weights));
+    for (int e = 0; e < experts; ++e) for (int r = 0; r < rows; ++r) {
+        const float * src = source.data() + (static_cast<size_t>(e) * rows + r) * K;
+        void * dst = packed.data() + (static_cast<size_t>(e) * rows + r) * ggml_row_size(type, K);
+        float * dq = dequant.data() + (static_cast<size_t>(e) * rows + r) * K;
+        if (type == GGML_TYPE_Q1_0) { quantize_row_q1_0_ref(src, static_cast<block_q1_0 *>(dst), K);
+                                      dequantize_row_q1_0(static_cast<block_q1_0 *>(dst), dq, K); }
+        else { quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
+               dequantize_row_nvfp4(static_cast<block_nvfp4 *>(dst), dq, K); }
+    }
+    std::vector<float> activation(static_cast<size_t>(ne11) * K);
+    for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
+    const int32_t selected[top_k] = { 3, 1, 3 }; // repeated, non-monotonic
+    ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
+    c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
+    output_count = static_cast<size_t>(rows) * top_k; oracle.resize(output_count);
+    for (int slot = 0; slot < top_k; ++slot) for (int r = 0; r < rows; ++r) {
+        const float * w = dequant.data() + (static_cast<size_t>(selected[slot]) * rows + r) * K;
+        const float * a = activation.data() + static_cast<size_t>(ne11 == 1 ? 0 : slot) * K;
+        float sum = 0; for (int k = 0; k < K; ++k) sum += w[k] * a[k];
+        oracle[static_cast<size_t>(slot) * rows + r] = sum;
+    }
+    return c;
+}
+
+void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
+    std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    for (int pass = 0; pass < 2; ++pass) {
+        require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS, "production graph compute failed");
+        ggml_backend_synchronize(life.backend);
+        std::vector<float> got(count); ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
+        for (size_t i = 0; i < count; ++i) {
+            const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
+            require(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance, "CPU oracle mismatch");
+        }
+    }
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require(after.candidate >= before.candidate + 2 && after.admit >= before.admit + 2 &&
+            after.submit >= before.submit + 2 && after.terminal >= before.terminal + 2 &&
+            after.recycle >= before.recycle + 2, "two-submit lifecycle counters did not prove slot reuse");
+}
+
+void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_quarantine) {
+    lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
+    auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    ggml_sycl_q1_nvfp4_test_failure_once(failure);
+    require(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS, "injected failure was not reported");
+    ggml_sycl_execution_snapshot state{};
+    require(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
+            "failure context snapshot unavailable");
+    require(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
+            state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED, "failure graph was not terminal/quarantined");
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    if (expect_quarantine) require(after.quarantine == before.quarantine + 1, "post-mark quarantine not counted");
+    else require(after.quarantine == before.quarantine, "pre-mark refusal incorrectly quarantined workspace");
+}
 } // namespace
 
 int main() {
     try {
-        sycl::queue q{ sycl::gpu_selector_v };
-        lifecycle_fixture lifecycle;
-        wrapper_exact_plan_identity(q);
-        run_case(q, GGML_TYPE_Q1_0, 1);
-        run_case(q, GGML_TYPE_Q1_0, 3);
-        run_case(q, GGML_TYPE_NVFP4, 1);
-        run_case(q, GGML_TYPE_NVFP4, 3);
-        std::cout << "Q1/NVFP4 lifecycle-aware admitted device adapter: PASS\n";
-        return 0;
-    } catch (const sycl::exception & e) {
-        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
-        return 77;
-    } catch (const std::exception & e) {
-        std::cerr << "FAIL: " << e.what() << '\n';
-        return 1;
-    }
+        bool have_gpu = false;
+        for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
+        if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return 77; }
+        { lifecycle_fixture life; successful_reuse_case(life, GGML_TYPE_Q1_0, 1);
+          successful_reuse_case(life, GGML_TYPE_Q1_0, 3);
+          successful_reuse_case(life, GGML_TYPE_NVFP4, 1);
+          successful_reuse_case(life, GGML_TYPE_NVFP4, 3); }
+        injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
+        injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
+        std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
+    } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return 77; }
+      catch (const std::exception & e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

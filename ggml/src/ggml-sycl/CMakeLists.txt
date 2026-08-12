@@ -105,7 +105,9 @@ target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 if (BUILD_TESTING)
     # Exposes only the monotonic near-exhaustion seam; production builds do not
     # contain a counter-control symbol.
-    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_RETENTION_IDENTITY_TESTING=1)
+    target_compile_definitions(ggml-sycl PRIVATE
+        GGML_SYCL_RETENTION_IDENTITY_TESTING=1
+        GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1)
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
@@ -4381,7 +4383,7 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
 # Allocation-free admitted Q1/NVFP4 adapter device regression. It links the
 # production backend so the real quantizer and ID MMVQ kernels execute; exit 77
 # is a device-unavailable skip, not a pass.
-if (NOT GGML_BACKEND_DL)
+if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     add_executable(test-sycl-q1-nvfp4-admitted-device
         tests/test-q1-nvfp4-admitted-device.cpp
     )

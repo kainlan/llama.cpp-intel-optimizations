@@ -81,6 +81,9 @@
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+#endif
 #include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
@@ -9910,6 +9913,89 @@ static std::atomic<uint64_t> g_sycl_lifecycle_release_slot_calls{ 0 };
 static std::atomic<uint32_t> g_sycl_lifecycle_load_end_last_slot{ GGML_SYCL_MODEL_SLOT_NONE };
 static std::atomic<uint32_t> g_sycl_lifecycle_release_slot_last_slot{ GGML_SYCL_MODEL_SLOT_NONE };
 static std::atomic<uint64_t> g_sycl_lifecycle_release_slot_last_reclaimed{ 0 };
+
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+namespace {
+struct q1_nvfp4_test_scope_record {
+    uint64_t context_id = 0;
+    uint64_t nonce = 0;
+    bool armed = false;
+};
+std::mutex g_q1_nvfp4_test_scope_mutex;
+std::unordered_map<ggml_backend_t, q1_nvfp4_test_scope_record> g_q1_nvfp4_test_scopes;
+std::atomic<uint64_t> g_q1_nvfp4_test_nonce{ 1 };
+std::atomic<uint32_t> g_q1_nvfp4_test_failure{ GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE };
+std::atomic<uint64_t> g_q1_nvfp4_test_candidate{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_admit{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_submit{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_terminal{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_recycle{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
+
+bool ggml_sycl_q1_nvfp4_test_authorized(const ggml_backend_sycl_context & ctx) {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    for (const auto & item : g_q1_nvfp4_test_scopes) {
+        if (item.first && item.first->context == &ctx && item.second.armed &&
+            item.second.context_id != 0 && item.second.context_id == ctx.execution_context_id) return true;
+    }
+    return false;
+}
+
+bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure failure) {
+    uint32_t expected = static_cast<uint32_t>(failure);
+    return g_q1_nvfp4_test_failure.compare_exchange_strong(
+        expected, GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE, std::memory_order_acq_rel);
+}
+} // namespace
+
+bool ggml_sycl_q1_nvfp4_test_scope_mint(ggml_backend_t backend, ggml_sycl_exec_context_id context,
+                                        ggml_sycl_q1_nvfp4_test_scope_token * token) {
+    if (!backend || !token || context.value == 0) return false;
+    auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (!backend_ctx || backend_ctx->execution_context_id != context.value) return false;
+    uint64_t nonce = g_q1_nvfp4_test_nonce.fetch_add(1, std::memory_order_relaxed);
+    if (nonce == 0) nonce = g_q1_nvfp4_test_nonce.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    g_q1_nvfp4_test_scopes[backend] = { context.value, nonce, false };
+    *token = { nonce, reinterpret_cast<uintptr_t>(backend), context.value };
+    return true;
+}
+
+bool ggml_sycl_q1_nvfp4_test_scope_enter(ggml_backend_t backend,
+                                         const ggml_sycl_q1_nvfp4_test_scope_token * token) {
+    if (!backend || !token || token->backend_identity != reinterpret_cast<uintptr_t>(backend)) return false;
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    auto it = g_q1_nvfp4_test_scopes.find(backend);
+    if (it == g_q1_nvfp4_test_scopes.end() || it->second.nonce != token->nonce ||
+        it->second.context_id != token->context_id) return false;
+    auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (!backend_ctx || backend_ctx->execution_context_id != token->context_id) return false;
+    it->second.armed = true;
+    return true;
+}
+
+void ggml_sycl_q1_nvfp4_test_scope_leave(ggml_backend_t backend,
+                                         const ggml_sycl_q1_nvfp4_test_scope_token * token) {
+    if (!backend || !token) return;
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    auto it = g_q1_nvfp4_test_scopes.find(backend);
+    if (it != g_q1_nvfp4_test_scopes.end() && it->second.nonce == token->nonce) g_q1_nvfp4_test_scopes.erase(it);
+}
+
+void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * out) {
+    if (!out) return;
+    *out = { g_q1_nvfp4_test_candidate.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_admit.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_submit.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_terminal.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_recycle.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_quarantine.load(std::memory_order_relaxed) };
+}
+
+void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
+    g_q1_nvfp4_test_failure.store(static_cast<uint32_t>(failure), std::memory_order_release);
+}
+#endif
 
 void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model_lifecycle_probe * out) {
     if (!out) {
@@ -63479,9 +63565,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // secondary residency remain outside this route. All fall-throughs are
     // pre-submit refusals; once marked, the exact queue is drained/recovered.
     constexpr bool q1_nvfp4_direct_b70_validated = false;
-    if (q1_nvfp4_direct_b70_validated && ne12 == 1 &&
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+    const bool q1_nvfp4_private_test_authorized = ggml_sycl_q1_nvfp4_test_authorized(ctx);
+#else
+    constexpr bool q1_nvfp4_private_test_authorized = false;
+#endif
+    if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1 &&
         (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) && route_layout == GGML_LAYOUT_AOS &&
         retained_decode_batch_result) {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+        g_q1_nvfp4_test_candidate.fetch_add(1, std::memory_order_relaxed);
+#endif
         const auto & decode = retained_decode_batch_result.batch;
         bool all_primary = !decode.operands.empty();
         for (const auto & operand : decode.operands) {
@@ -63493,7 +63587,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
         if (all_primary && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
             exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root) && plan_snapshot &&
-            plan_snapshot->plan && ids->ne[0] > 0 && ids->ne[1] == 1 && ne11 == 1 &&
+            plan_snapshot->plan && ids->ne[0] > 0 && ids->ne[1] == 1 &&
+            (ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0])) &&
             nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
             auto retained_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
                 ctx, src0, decode, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
@@ -63561,6 +63656,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                   static_cast<int32_t>(src0->type) };
                 auto admitted = ggml_sycl::unified_cache_admit_moe_mmid_workspace(std::move(request));
                 if (admitted.status == ggml_sycl::moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid()) {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                    g_q1_nvfp4_test_admit.fetch_add(1, std::memory_order_relaxed);
+                    if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK)) {
+                        throw moe_direct_submit_failure{};
+                    }
+#endif
                     // Move authority first. Any lease/slice reference into the
                     // moved-from result is invalid; reacquire solely from the
                     // completion-owned bundle.
@@ -63569,12 +63670,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const auto & slices = lease[0].slices();
                     auto * activation = static_cast<float *>(slices.activation_f32.ptr);
                     auto * ids_device = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
-                    const size_t activation_bytes = static_cast<size_t>(ne00) * sizeof(float);
+                    const size_t activation_bytes = static_cast<size_t>(ne00) * static_cast<size_t>(ne11) * sizeof(float);
                     const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ne01) * sizeof(float);
                     if (activation && ids_device && src1_device_base && dst_device_base &&
                         slices.activation_f32.bytes == activation_bytes && slices.output_f32.bytes == output_bytes &&
                         completion->bundle.mark_possible_submit()) {
                         try {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                            if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK)) {
+                                throw moe_direct_submit_failure{};
+                            }
+#endif
                             sycl::event dependency = retained_table.has_ready_event ?
                                 exact_queue->submit([&](sycl::handler & h) {
                                     h.depends_on(retained_table.ready_event);
@@ -63591,6 +63697,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     sizeof(int32_t), ids->ne[0] * sizeof(int32_t), buffers, &dependency, &kernel)) {
                                 throw moe_direct_submit_failure{};
                             }
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                            g_q1_nvfp4_test_submit.fetch_add(1, std::memory_order_relaxed);
+#endif
                             sycl::event final = exact_queue->submit([&](sycl::handler & h) {
                                 h.depends_on(kernel);
                                 h.memcpy(dst_device_base, slices.output_f32.ptr, output_bytes);
@@ -63598,7 +63707,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             terminal->arm(final);
                             exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
-                                h.host_task([completion] { (void) completion->bundle.terminal_release(); });
+                                h.host_task([completion] {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                                    g_q1_nvfp4_test_terminal.fetch_add(1, std::memory_order_relaxed);
+#endif
+                                    const bool recycled = completion->bundle.terminal_release();
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                                    if (recycled) g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
+#endif
+                                });
                             });
                             // No diagnostics or ownership construction is allowed
                             // after admission. The B70 validation gate remains shut,
@@ -63606,6 +63723,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // this boundary or use preallocated counters.
                             return;
                         } catch (...) {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                            g_q1_nvfp4_test_quarantine.fetch_add(1, std::memory_order_relaxed);
+#endif
                             // wait_and_throw may report an asynchronous error after
                             // it has drained. A non-throwing exact-queue wait is the
                             // finalizer: only after it returns do we publish an
