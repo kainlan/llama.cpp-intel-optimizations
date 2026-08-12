@@ -215,12 +215,16 @@ void source_contract_tests() {
     const size_t validation     = cpp.find("mmvq_q1_nvfp4_aos_id_batch_shape_valid", id_api);
     const size_t event_creation = cpp.find("sycl::event event;", id_api);
     assert(id_api != std::string::npos && validation < event_creation);  // reject before any launch is selected
-    // Direct primitives remain compiled, but the central query boundary must
-    // not advertise them until registry-owned all-owner workspace admission is
-    // complete. The opaque workspace guard remains defense in depth.
+    // Direct primitives remain compiled. The query may mint only a narrow
+    // primary/decode/AoS recipe candidate backed by active exact authority;
+    // executor selection and the global B70 gate remain closed.
     const std::string policy = slurp("ggml/src/ggml-sycl/ggml-sycl.cpp");
     const std::string recipe = slurp("ggml/src/ggml-sycl/moe-resolved-batch.hpp");
-    assert(policy.find("device-type-stage2-unimplemented") != std::string::npos);
+    assert(policy.find("direct-recipe-candidate") != std::string::npos);
+    assert(policy.find("phase == moe_route_phase::DECODE && rows == 1") != std::string::npos);
+    assert(policy.find("route_device == submit_device && direct_recipe_candidate") != std::string::npos);
+    assert(policy.find("unified_cache_moe_mmid_exact_queue(") != std::string::npos);
+    assert(policy.find("q1_nvfp4_direct_b70_validated = false") != std::string::npos);
     assert(policy.find("q1-nvfp4-direct-requires-aos") == std::string::npos);
     assert(policy.find("q1-nvfp4-direct-prompt-chunking-pending") == std::string::npos);
     assert(policy.find("mmvq_submit_q1_nvfp4_aos(*target_queue") != std::string::npos);

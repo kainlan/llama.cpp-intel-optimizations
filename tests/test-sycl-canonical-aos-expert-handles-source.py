@@ -90,7 +90,10 @@ def violations(source: str) -> list[str]:
         "resolver checks registered handles first": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("cache->resolve_expert"),
         "resolver retains canonical lease": "route.lease" in route and "std::move(handle)" in source,
         "resolver propagates ready event": "route.has_ready_event = stored->has_ready_event" in source,
-        "Q1/NVFP4 remains disabled": "device-type-stage2-unimplemented" in capability,
+        "Q1/NVFP4 executor gate remains disabled": "q1_nvfp4_direct_b70_validated = false" in source,
+        "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
+        "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
+        "Q1/NVFP4 recipe requires stable owner": "direct_recipe_candidate->has_stable_owner_identity()" in capability,
     }
     failures.extend(name for name, ok in requirements.items() if not ok)
 

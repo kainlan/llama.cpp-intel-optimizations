@@ -132,8 +132,13 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "typed capability refusal": "moe_batch_reject_reason::CAPABILITY_UNSUPPORTED",
         "Q1 decode refusal": "type == GGML_TYPE_Q1_0",
         "NVFP4 decode refusal": "type == GGML_TYPE_NVFP4",
-        "unconditional Q1/NVFP4 device refusal":
+        "Q1/NVFP4 narrow recipe branch":
             "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)",
+        "direct recipe decode-only": "phase == moe_route_phase::DECODE && rows == 1",
+        "direct recipe primary-only": "route_device == submit_device && direct_recipe_candidate",
+        "direct recipe owned stable": "direct_recipe_candidate->has_stable_owner_identity()",
+        "direct recipe exact queue":
+            "authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(",
         "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
         "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
         "execution-row bounded activation copy":
@@ -410,7 +415,28 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     pre_admit = mmid[:start]
     assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit
     assert "canonical_published" in pre_admit
-    assert "lease->kind()" in source and "lease->has_stable_owner_identity()" in source
+    assert "expert0->handle.kind()" in pre_admit
+    assert "expert0->handle.has_stable_owner_identity()" in pre_admit
+    assert pre_admit.index("ggml_sycl_moe_log_canonical_publish_pre_admission(") < pre_admit.index(
+        "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
+    query = function_definition(source, "static moe_route_capability ggml_sycl_moe_query_route_capability(")
+    for witness in (
+        "phase == moe_route_phase::DECODE && rows == 1",
+        "layout == GGML_LAYOUT_AOS",
+        "route_device == submit_device",
+        "direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT",
+        "direct_recipe_candidate->has_stable_owner_identity()",
+        "K % qk == 0",
+        "ggml_sycl_execution_current_owner(backend, root)",
+        "cache->get_placement_plan_snapshot()",
+        "unified_cache_moe_mmid_exact_queue(",
+        'cap.reason = "direct-recipe-candidate"',
+    ):
+        assert witness in query, witness
+    assert "&normalized.lease" in source
+    assert "ggml_sycl_moe_mark_direct_authority_pre_admission(src0)" in direct
+    assert direct.index("ggml_sycl_moe_mark_direct_authority_pre_admission(src0)") < direct.index(
+        "unified_cache_admit_moe_mmid_workspace")
 
 
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
@@ -454,6 +480,16 @@ def test_contract_and_mutation_witnesses() -> None:
     semantic_mutants = [
         ("slot-zero", header.replace("operand.slot_index       = i % slots_per_token;",
                                      "operand.slot_index = 0;"), source, host_test, mem_source),
+        ("recipe-allows-prompt", header,
+         source.replace("phase == moe_route_phase::DECODE && rows == 1", "rows >= 1", 1), host_test, mem_source),
+        ("recipe-allows-secondary", header,
+         source.replace("route_device == submit_device && direct_recipe_candidate",
+                        "route_device >= 0 && direct_recipe_candidate", 1), host_test, mem_source),
+        ("recipe-allows-ownerless", header,
+         source.replace("direct_recipe_candidate->has_stable_owner_identity()", "true", 1), host_test, mem_source),
+        ("recipe-drops-exact-queue", header,
+         source.replace("authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(",
+                        "authoritative_candidate = ggml_sycl::moe_mmid_queue_capability(", 1), host_test, mem_source),
         ("raw-direct-rejects-owned", header.replace(
             "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()",
             "route.lease.kind() == mem_handle_kind::DIRECT"), source, host_test, mem_source),

@@ -22673,15 +22673,10 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
 #endif
 }
 
-static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type                 type,
-                                                                 layout_mode               layout,
-                                                                 moe_route_phase           phase,
-                                                                 int64_t                   K,
-                                                                 int64_t                   N,
-                                                                 size_t                    rows,
-                                                                 int                       route_device,
-                                                                 moe_layer_route_residency residency,
-                                                                 int                       submit_device) {
+static moe_route_capability ggml_sycl_moe_query_route_capability(
+    ggml_type type, layout_mode layout, moe_route_phase phase, int64_t K, int64_t N, size_t rows,
+    int route_device, moe_layer_route_residency residency, int submit_device,
+    const ggml_sycl::mem_handle * direct_recipe_candidate = nullptr) {
     moe_route_capability cap;
     cap.phase        = phase;
     cap.local_device = route_device >= 0 && route_device == submit_device;
@@ -22718,13 +22713,41 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type      
         return cap;
     }
 
-    // Direct primitives exist, but the retained device executor is not a
-    // capability until admission owns an atomic all-owner workspace bundle.
-    // Keep this query boundary closed; the executor's opaque-bundle guard is
-    // defense in depth rather than capability authority.
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
-        cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
-        cap.reason        = "device-type-stage2-unimplemented";
+        // Recipe availability is narrower than executor capability. It merely
+        // lets an exact primary decode candidate reach DIRECT admission;
+        // choose_moe_batch_executor still requires the admitted bundle.
+        const int64_t qk = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+        const bool static_candidate = phase == moe_route_phase::DECODE && rows == 1 && layout == GGML_LAYOUT_AOS &&
+                                      route_device == submit_device && direct_recipe_candidate &&
+                                      direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT &&
+                                      direct_recipe_candidate->has_stable_owner_identity() && K % qk == 0 &&
+                                      K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
+        bool authoritative_candidate = false;
+        if (static_candidate) {
+            const auto exec = ggml_sycl_take_execution_state_snapshot(
+                ggml_sycl_get_backend_context_for_device(submit_device));
+            ggml_sycl::lifecycle::ModelToken root{};
+            auto * backend = ggml_sycl_get_backend_context_for_device(submit_device);
+            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(submit_device);
+            const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;
+            if (backend && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
+                exec.invocation_id && ggml_sycl_execution_current_owner(backend, root) && plan && plan->plan) {
+                const ggml_sycl::moe_mmid_model_token token{
+                    root.model.value, root.load.value, root.owner.generation };
+                authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(
+                    token, plan, submit_device, submit_device, backend->stream()).valid();
+            }
+        }
+        if (authoritative_candidate) {
+            cap.supported = true;
+            cap.kernel = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
+            cap.reject_reason = moe_layer_reject_reason::NONE;
+            cap.reason = "direct-recipe-candidate";
+        } else {
+            cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
+            cap.reason = "direct-recipe-authority-unavailable";
+        }
         return cap;
     }
 
@@ -23373,7 +23396,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         } else if (normalized.residency != moe_batch_residency::UNAVAILABLE) {
             const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                 src0->type, normalized.actual_layout, normalized.recipe.request.phase, src0->ne[0], src0->ne[1], rows,
-                normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device);
+                normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device, &normalized.lease);
             if (cap.supported) {
                 normalized.recipe.kind = normalized.residency == moe_batch_residency::PRIMARY_DEVICE ?
                                              moe_batch_executor::PRIMARY_DEVICE :
@@ -59618,18 +59641,24 @@ struct moe_direct_submit_failure final {};
 // Pre-admission-only production witness. Saturating the counter bounds both
 // logging and counter mutation; no ownership or formatting allocation occurs.
 static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
+static std::atomic<uint32_t> g_moe_direct_authority_candidates{ 0 };
 static void ggml_sycl_moe_log_canonical_publish_pre_admission(
-    const ggml_tensor * tensor, const ggml_sycl::moe_resolved_batch_result & batch, bool published) noexcept {
+    const ggml_tensor * tensor, bool published, int kind, bool stable) noexcept {
     uint32_t current = g_moe_decode_canonical_publish_diagnostics.load(std::memory_order_relaxed);
     while (current < 16 && !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(
                                current, current + 1, std::memory_order_relaxed)) {}
     if (current >= 16) return;
-    const ggml_sycl::mem_handle * lease =
-        batch && !batch.batch.operands.empty() ? &batch.batch.operands.front().lease : nullptr;
     fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
-            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0,
-            lease ? static_cast<int>(lease->kind()) : -1,
-            lease && lease->has_stable_owner_identity() ? 1 : 0);
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+}
+static void ggml_sycl_moe_mark_direct_authority_pre_admission(const ggml_tensor * tensor) noexcept {
+    uint32_t current = g_moe_direct_authority_candidates.load(std::memory_order_relaxed);
+    while (current < 16 && !g_moe_direct_authority_candidates.compare_exchange_weak(
+                               current, current + 1, std::memory_order_relaxed)) {}
+    if (current < 16) {
+        fprintf(stderr, "[MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=%s count=%u\n",
+                tensor && tensor->name[0] ? tensor->name : "?", current + 1);
+    }
 }
 
 static bool ggml_sycl_moe_row_agg_debug_enabled() {
@@ -63415,12 +63444,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     if (ne12 == 1) {
         ctx.moe_graphs_disabled_once = true;
         bool canonical_published = false;
+        int  published_kind = -1;
+        bool published_stable = false;
         if (route_layout == GGML_LAYOUT_AOS && src0->buffer && src0->buffer->context &&
             !ggml_backend_buffer_is_host(src0->buffer)) {
             canonical_published = ggml_sycl_publish_backend_aos_expert_handles(
                 static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context),
                 const_cast<ggml_tensor *>(src0));
+            auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+            const auto * expert0 = canonical_published && extra ?
+                extra->find_moe_storage_handle_on_device(0, GGML_LAYOUT_AOS, ctx.device) : nullptr;
+            if (expert0) {
+                published_kind = static_cast<int>(expert0->handle.kind());
+                published_stable = expert0->handle.has_stable_owner_identity();
+            }
         }
+        ggml_sycl_moe_log_canonical_publish_pre_admission(
+            src0, canonical_published, published_kind, published_stable);
         retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
             /*allow_materialize=*/false);
@@ -63431,12 +63471,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                            retained_decode_batch_result.expert_id,
                            ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
                            retained_decode_batch_result.source_reason);
-            ggml_sycl_moe_log_canonical_publish_pre_admission(src0, retained_decode_batch_result,
-                                                               canonical_published);
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode admission failed");
         }
-        ggml_sycl_moe_log_canonical_publish_pre_admission(src0, retained_decode_batch_result,
-                                                           canonical_published);
     }
 
     // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and
@@ -63518,6 +63554,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     execution_registry, std::move(invocation), plan_snapshot, model_token, ctx.device,
                     bindings, private_table, std::move(owners), std::move(queues), std::move(submissions),
                     &authority)) {
+                ggml_sycl_moe_mark_direct_authority_pre_admission(src0);
                 ggml_sycl::moe_mmid_authoritative_admission_request request;
                 request.authority = std::move(authority);
                 request.shape = { static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne11), ne00, ne01,
