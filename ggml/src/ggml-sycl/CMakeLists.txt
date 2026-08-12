@@ -4378,6 +4378,35 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
 # script that only asserted this deleted file contained certain case names were
 # removed with it.
 
+# Allocation-free admitted Q1/NVFP4 adapter device regression. It links the
+# production backend so the real quantizer and ID MMVQ kernels execute; exit 77
+# is a device-unavailable skip, not a pass.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-q1-nvfp4-admitted-device
+        tests/test-q1-nvfp4-admitted-device.cpp
+    )
+    target_include_directories(test-sycl-q1-nvfp4-admitted-device PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl")
+    target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE ggml-base ggml-sycl ggml-cpu)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-sycl-q1-nvfp4-admitted-device PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-q1-nvfp4-admitted-device COMMAND test-sycl-q1-nvfp4-admitted-device)
+    set_tests_properties(sycl-q1-nvfp4-admitted-device PROPERTIES
+        LABELS "sycl;moe;mmvq;device;B70;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+    )
+endif()
+
 # MMVQ sub-group-per-row launch geometry (llama.cpp-99ke).
 # mmvq-launch-geometry.hpp is dependency-free by design -- it includes no SYCL
 # header and links no backend library -- so this target compiles the production

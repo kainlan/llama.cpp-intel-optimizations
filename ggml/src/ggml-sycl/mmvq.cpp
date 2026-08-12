@@ -22051,13 +22051,25 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
     return true;
 }
 
+static sycl::event mmvq_upload_packed_ids_after(sycl::queue &       q,
+                                                 int32_t *           ids_device,
+                                                 const int32_t *     ids_host,
+                                                 size_t              ids_bytes,
+                                                 const sycl::event * dependency) {
+    return q.submit([&](sycl::handler & cgh) {
+        if (dependency) {
+            cgh.depends_on(*dependency);
+        }
+        cgh.memcpy(ids_device, ids_host, ids_bytes);
+    });
+}
+
 static sycl::event mmvq_submit_quantize_q8_1_aos_after(sycl::queue &       q,
                                                        const float *       src,
                                                        void *              dst,
                                                        int                 ncols,
                                                        size_t              quant_blocks,
                                                        const sycl::event * dependency) {
-    dpct::has_capability_or_fail(q.get_device(), { sycl::aspect::fp16 });
     const size_t global_range = quant_blocks * static_cast<size_t>(WARP_SIZE);
     return q.submit([&](sycl::handler & cgh) {
         if (dependency) {
@@ -22075,7 +22087,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
                                           const float *                          activation_f32,
-                                          const int32_t *                        ids_device,
+                                          int32_t *                              ids_device,
                                           const int32_t *                        ids_host,
                                           int                                    n_experts,
                                           int                                    ncols,
@@ -22099,7 +22111,8 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         ids_nb1 < static_cast<int64_t>(sizeof(int32_t)) || ids_nb0 % alignof(int32_t) != 0 ||
         ids_nb1 % alignof(int32_t) != 0 || !aligned(expert_ptrs_device, alignof(void *)) ||
         !aligned(activation_f32, alignof(float)) || !aligned(ids_device, alignof(int32_t)) ||
-        !aligned(buffers.activation_q8, alignof(block_q8_1)) || !aligned(buffers.output_f32, alignof(float))) {
+        !aligned(buffers.activation_q8, alignof(block_q8_1)) || !aligned(buffers.output_f32, alignof(float)) ||
+        !q.get_device().has(sycl::aspect::fp16)) {
         return false;
     }
 
@@ -22107,7 +22120,10 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
     const size_t st             = static_cast<size_t>(n_tokens);
     const size_t sr             = static_cast<size_t>(ne11);
     const size_t sn             = static_cast<size_t>(nrows_per_expert);
-    const size_t blocks_per_row = static_cast<size_t>(ncols / QK8_1);
+    const size_t blocks_per_row        = static_cast<size_t>(ncols / QK8_1);
+    const size_t weight_blocks_per_row = static_cast<size_t>(ncols / weight_qk);
+    const size_t weight_block_bytes =
+        weight_type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
     const auto   checked_mul    = [](size_t a, size_t b, size_t * out) {
         if (a != 0 && b > SIZE_MAX / a) {
             return false;
@@ -22126,6 +22142,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
     size_t occurrences = 0, activation_rows = 0, quant_blocks = 0, q8_row_bytes = 0, required_q8 = 0;
     size_t output_values = 0, required_output = 0, ids_slot_span = 0, ids_token_span = 0, ids_max_offset = 0;
     size_t q8_nb12 = 0, dst_nb1 = 0, dst_nb2 = 0, block_num_z = 0, kernel_groups = 0, kernel_items = 0;
+    size_t weight_blocks = 0, weight_bytes = 0, ids_bytes = 0;
     if (!checked_mul(sk, st, &occurrences) || !checked_mul(sr, st, &activation_rows) ||
         !checked_mul(activation_rows, blocks_per_row, &quant_blocks) ||
         !checked_mul(blocks_per_row, sizeof(block_q8_1), &q8_row_bytes) ||
@@ -22135,7 +22152,10 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         !checked_mul(st - 1, static_cast<size_t>(ids_nb1), &ids_token_span) ||
         !checked_add(ids_slot_span, ids_token_span, &ids_max_offset) ||
         !checked_add(ids_max_offset, sizeof(int32_t), &ids_max_offset) || !checked_mul(sr, q8_row_bytes, &q8_nb12) ||
-        !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2)) {
+        !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2) ||
+        !checked_mul(sn, weight_blocks_per_row, &weight_blocks) ||
+        !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes) ||
+        !checked_mul(occurrences, sizeof(int32_t), &ids_bytes)) {
         return false;
     }
     block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
@@ -22143,13 +22163,14 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         !checked_mul(kernel_groups, static_cast<size_t>(GGML_SYCL_MOE_MMV_Y) * WARP_SIZE, &kernel_items) ||
         !checked_mul(quant_blocks, static_cast<size_t>(WARP_SIZE), &kernel_groups) || occurrences > INT_MAX ||
         activation_rows > INT_MAX || ids_max_offset > static_cast<size_t>(PTRDIFF_MAX) || q8_row_bytes > INT64_MAX ||
-        q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || kernel_items == 0 || kernel_groups == 0 ||
+        q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || weight_blocks > INT_MAX ||
+        weight_bytes > INT_MAX || kernel_items == 0 || kernel_groups == 0 ||
         buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
         return false;
     }
     // Strides must describe non-overlapping top-k slots and complete tokens.
-    if (static_cast<size_t>(ids_nb0) < sizeof(int32_t) ||
-        (st > 1 && static_cast<size_t>(ids_nb1) < ids_slot_span + sizeof(int32_t))) {
+    if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) ||
+        ids_nb1 != static_cast<int64_t>(sk * sizeof(int32_t))) {
         return false;
     }
     for (size_t i = 0; i < occurrences; ++i) {
@@ -22158,10 +22179,12 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         }
     }
 
-    // Every condition used by quantization and the downstream ID primitive is
-    // now proven. No failure-returning work remains between these two submits.
+    // Upload the one retained packed snapshot; ids_device's prior contents are
+    // irrelevant. Chaining quantization after this upload ensures dependency
+    // cannot race either activation consumption or ID publication.
+    sycl::event ids_event = mmvq_upload_packed_ids_after(q, ids_device, ids_host, ids_bytes, dependency);
     sycl::event quant_event =
-        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, dependency);
+        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, &ids_event);
     return mmvq_submit_q1_nvfp4_aos_id(
         q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32, ncols,
         nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,

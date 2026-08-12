@@ -550,15 +550,20 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  sycl::event *        event_out = nullptr);
 
 // Decode-only composition over caller-supplied admitted workspace slices.
-// activation_f32 is contiguous [token][ne11][K]. The wrapper quantizes it into
-// buffers.activation_q8, writes [token][top_k][N] to buffers.output_f32, and
-// returns the actual terminal kernel event. No destination scatter is implied.
+// activation_f32 is contiguous [token][ne11][K]. ids_host is the packed,
+// immutable retained snapshot [token][top_k]; the adapter uploads that exact
+// snapshot into ids_device after dependency completes. Callers must retain
+// ids_host until the returned terminal event completes, and dependency must
+// not mutate ids_host. Independent/pre-populated device IDs are never trusted.
+// The wrapper quantizes into buffers.activation_q8, writes
+// [token][top_k][N] to buffers.output_f32, and returns the actual terminal
+// kernel event. No destination scatter is implied.
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
                                           const float *                          activation_f32,
-                                          const int32_t *                        ids_device,
+                                          int32_t *                              ids_device,
                                           const int32_t *                        ids_host,
                                           int                                    n_experts,
                                           int                                    ncols,
