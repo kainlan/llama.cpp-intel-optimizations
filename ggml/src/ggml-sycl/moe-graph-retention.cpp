@@ -279,6 +279,36 @@ retention_error graph_retention_registry::quarantine(const graph_retention_recor
     }
 }
 
+retention_error graph_retention_registry::discard_partial(graph_owner_key key) noexcept {
+    std::shared_ptr<graph_retention_record> released;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto                  it = records_.find(key);
+        if (it == records_.end()) {
+            return retention_error::OK;
+        }
+        const auto retiring = retire_in_progress_.find(key);
+        if ((retiring != retire_in_progress_.end() && retiring->second) ||
+            it->second->phase == retention_phase::INSTALLED || it->second->phase == retention_phase::RETIRING) {
+            return retention_error::BUSY;
+        }
+        const auto active = active_by_context_.find(key.context.value);
+        if (active != active_by_context_.end() && active->second == key) {
+            return retention_error::BUSY;
+        }
+        for (const auto & table : it->second->tables) {
+            const auto owner = table_owners_.find(table.table_id);
+            if (owner != table_owners_.end() && owner->second == key) {
+                table_owners_.erase(owner);
+            }
+        }
+        released = std::move(it->second);
+        records_.erase(it);
+        retire_in_progress_.erase(key);
+    }
+    return retention_error::OK;
+}
+
 void graph_retention_registry::finish_retire_attempt(graph_owner_key key) noexcept {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -325,13 +355,13 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
         return done(valid);
     }
     execution::epoch_snapshot epoch{};
-    auto lifecycle_rc = record->lifecycle_registry->extract_epoch(key.context, record->session, record->reset_epoch,
+    auto lifecycle_rc = record->lifecycle_registry->child_extract_epoch(key.context, record->session, record->reset_epoch,
                                                                   key.epoch, record->root, &epoch);
     if (lifecycle_rc != execution::error::OK) {
         return done(retention_error::LIFECYCLE_ERROR);
     }
     if (epoch.state == execution::epoch_phase::RECORDING) {
-        lifecycle_rc = record->lifecycle_registry->rollback_record(key.context, record->session, record->reset_epoch,
+        lifecycle_rc = record->lifecycle_registry->child_rollback_record(key.context, record->session, record->reset_epoch,
                                                                    key.epoch, record->root);
         if (lifecycle_rc != execution::error::OK) {
             return done(retention_error::LIFECYCLE_ERROR);
@@ -357,7 +387,7 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
             return done(retention_error::BUSY);
         }
         lifecycle_rc =
-            record->lifecycle_registry->begin_retire(key.context, record->session, record->reset_epoch, key.epoch,
+            record->lifecycle_registry->child_begin_retire(key.context, record->session, record->reset_epoch, key.epoch,
                                                      record->root, devices.data(), devices.size(), &ticket);
         if (lifecycle_rc != execution::error::OK) {
             return done(retention_error::LIFECYCLE_ERROR);
@@ -403,7 +433,7 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
         if (attached) {
             continue;
         }
-        lifecycle_rc = record->lifecycle_registry->attach_retire_terminal(ticket, terminal.first, terminal.second);
+        lifecycle_rc = record->lifecycle_registry->child_attach_retire_terminal(ticket, terminal.first, terminal.second);
         if (lifecycle_rc != execution::error::OK) {
             return done(retention_error::LIFECYCLE_ERROR);
         }
@@ -424,14 +454,14 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
         }
         ticket = record->retire_ticket;
     }
-    lifecycle_rc = record->lifecycle_registry->finish_retire(ticket);
+    lifecycle_rc = record->lifecycle_registry->child_finish_retire(ticket);
     if (lifecycle_rc == execution::error::BUSY) {
         return done(retention_error::PENDING);
     }
     if (lifecycle_rc != execution::error::OK) {
         return done(retention_error::LIFECYCLE_ERROR);
     }
-    if (record->lifecycle_registry->extract_epoch(key.context, record->session, record->reset_epoch, key.epoch,
+    if (record->lifecycle_registry->child_extract_epoch(key.context, record->session, record->reset_epoch, key.epoch,
                                                   record->root, &epoch) != execution::error::OK ||
         epoch.state != execution::epoch_phase::RETIRED) {
         return done(retention_error::LIFECYCLE_ERROR);
@@ -499,7 +529,7 @@ retention_error graph_retention_registry::begin_invocation(const published_graph
         reset              = it->second->reset_epoch;
         root               = it->second->root;
     }
-    return execution_registry->begin_invocation(token.key_.context, session, reset, token.key_.epoch, root,
+    return execution_registry->child_begin_invocation(token.key_.context, session, reset, token.key_.epoch, root,
                                                 invocation) == execution::error::OK ?
                retention_error::OK :
                retention_error::LIFECYCLE_ERROR;
@@ -523,7 +553,7 @@ retention_error graph_retention_registry::finish_invocation(const published_grap
         reset              = it->second->reset_epoch;
         root               = it->second->root;
     }
-    return execution_registry->finish_invocation(token.key_.context, session, reset, token.key_.epoch, invocation,
+    return execution_registry->child_finish_invocation(token.key_.context, session, reset, token.key_.epoch, invocation,
                                                  root) == execution::error::OK ?
                retention_error::OK :
                retention_error::LIFECYCLE_ERROR;
@@ -566,7 +596,7 @@ retention_error graph_recording_transaction::begin(graph_retention_registry &   
         return retention_error::MISMATCH;
     }
     execution::GraphEpoch epoch{};
-    if (execution_registry.begin_record(context, session, reset_epoch, root, &epoch) != execution::error::OK) {
+    if (execution_registry.child_begin_record(context, session, reset_epoch, root, &epoch) != execution::error::OK) {
         return retention_error::LIFECYCLE_ERROR;
     }
     graph_recording_transaction staged;
@@ -595,7 +625,7 @@ graph_recording_transaction & graph_recording_transaction::operator=(graph_recor
 }
 
 graph_recording_transaction::~graph_recording_transaction() {
-    rollback();
+    (void) abort_partial();
 }
 
 void graph_recording_transaction::move_from(graph_recording_transaction && other) noexcept {
@@ -617,7 +647,7 @@ retention_error graph_recording_transaction::publish_resources() noexcept {
         return retention_error::OK;
     }
     if (!lifecycle_ ||
-        lifecycle_->note_record_resources_published(record_.key.context, record_.session, record_.reset_epoch,
+        lifecycle_->child_note_resources_published(record_.key.context, record_.session, record_.reset_epoch,
                                                     record_.key.epoch, record_.root) != execution::error::OK) {
         return retention_error::LIFECYCLE_ERROR;
     }
@@ -755,7 +785,7 @@ retention_error graph_recording_transaction::commit() noexcept {
         return prepare_rc;
     }
     if (!activated_) {
-        if (lifecycle_->activate(record_.key.context, record_.session, record_.reset_epoch, record_.key.epoch,
+        if (lifecycle_->child_activate(record_.key.context, record_.session, record_.reset_epoch, record_.key.epoch,
                                  record_.root) != execution::error::OK) {
             retention_->quarantine(record_);
             retirement_pending_  = true;
@@ -784,6 +814,49 @@ retention_error graph_recording_transaction::commit() noexcept {
     return retention_error::OK;
 }
 
+retention_error graph_recording_transaction::abort_partial() noexcept {
+    if (finished_) {
+        return retention_error::OK;
+    }
+    if (activated_ || retirement_pending_) {
+        return rollback();
+    }
+    // No submission label means no queue was touched by this child record.
+    // Once a device is labelled SUBMITTED/UNKNOWN, only its exact terminal or
+    // queue-quiescence proof may authorize lifecycle removal.
+    for (const auto & submission : record_.submissions) {
+        if (submission.second == submit_outcome::SUBMITTED) {
+            const auto terminal = record_.terminals.find(submission.first);
+            if (terminal == record_.terminals.end() || !terminal->second) {
+                return retention_error::INCOMPLETE_TERMINALS;
+            }
+            terminal->second->wait();
+            if (!terminal->second->ready()) {
+                return retention_error::PENDING;
+            }
+        } else if (submission.second == submit_outcome::UNKNOWN) {
+            const auto proof = record_.quiescence_proofs.find(submission.first);
+            if (proof == record_.quiescence_proofs.end() || !proof->second ||
+                !proof->second->wait_and_confirm()) {
+                return retention_error::MISSING_QUIESCENCE_PROOF;
+            }
+        }
+    }
+    if (!retention_ || retention_->discard_partial(record_.key) != retention_error::OK) {
+        return retention_error::BUSY;
+    }
+    if (!lifecycle_ ||
+        lifecycle_->child_abort_partial_record(record_.key.context, record_.session, record_.reset_epoch,
+                                               record_.key.epoch, record_.root) != execution::error::OK) {
+        // The transaction still owns every capability locally. Do not mark it
+        // finished or release owners after a lifecycle removal failure.
+        return retention_error::LIFECYCLE_ERROR;
+    }
+    finished_ = true;
+    release_local_owners();
+    return retention_error::OK;
+}
+
 retention_error graph_recording_transaction::rollback() noexcept {
     if (finished_) {
         return retention_error::OK;
@@ -791,10 +864,10 @@ retention_error graph_recording_transaction::rollback() noexcept {
     if (!resources_published_) {
         execution::NoResourcesProof proof;
         execution::RetireTicket     ticket;
-        if (lifecycle_->fail_record_no_resources(record_.key.context, record_.session, record_.reset_epoch,
+        if (lifecycle_->child_fail_record_no_resources(record_.key.context, record_.session, record_.reset_epoch,
                                                  record_.key.epoch, record_.root, &proof) != execution::error::OK ||
-            lifecycle_->begin_retire_no_resources(proof, &ticket) != execution::error::OK ||
-            lifecycle_->finish_retire(ticket) != execution::error::OK) {
+            lifecycle_->child_begin_retire_no_resources(proof, &ticket) != execution::error::OK ||
+            lifecycle_->child_finish_retire(ticket) != execution::error::OK) {
             return retention_error::LIFECYCLE_ERROR;
         }
         finished_ = true;

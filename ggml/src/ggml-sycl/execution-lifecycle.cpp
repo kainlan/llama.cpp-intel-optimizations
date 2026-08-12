@@ -139,7 +139,7 @@ error Registry::begin_record(ContextId             context,
     if (validate_root(owner.token_root, root) != error::OK) {
         return error::MISMATCH;
     }
-    if (owner.recording_epoch.value != 0 || owner.graph.id.value != 0) {
+    if (owner.recording_epoch.value != 0) {
         return error::BUSY;
     }
     uint64_t   value = 0;
@@ -640,6 +640,96 @@ error Registry::extract_epoch(ContextId             context,
              static_cast<uint32_t>(epoch.terminals.size()),
              entry.session.active_epoch == graph_epoch };
     return error::OK;
+}
+
+error Registry::child_begin_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                   lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept {
+    return begin_record(context, session, reset_epoch, root, graph_epoch);
+}
+
+error Registry::child_activate(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                               GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
+    return activate(context, session, reset_epoch, graph_epoch, root);
+}
+
+error Registry::child_begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                       GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                                       InvocationId * invocation) noexcept {
+    return begin_invocation(context, session, reset_epoch, graph_epoch, root, invocation);
+}
+
+error Registry::child_finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                        GraphEpoch graph_epoch, InvocationId invocation,
+                                        lifecycle::ModelToken root) noexcept {
+    return finish_invocation(context, session, reset_epoch, graph_epoch, invocation, root);
+}
+
+error Registry::child_note_resources_published(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                               GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
+    return note_record_resources_published(context, session, reset_epoch, graph_epoch, root);
+}
+
+error Registry::child_rollback_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                      GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
+    return rollback_record(context, session, reset_epoch, graph_epoch, root);
+}
+
+error Registry::child_abort_partial_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                           GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner    = entry.session;
+    auto   epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    if (validate_root(epoch_it->second.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (epoch_it->second.state != epoch_phase::RECORDING || !epoch_it->second.invocations.empty()) {
+        return error::BUSY;
+    }
+    owner.recording_epoch = {};
+    owner.epochs.erase(epoch_it);
+    return error::OK;
+}
+
+error Registry::child_fail_record_no_resources(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                               GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                                               NoResourcesProof * proof) noexcept {
+    return fail_record_no_resources(context, session, reset_epoch, graph_epoch, root, proof);
+}
+
+error Registry::child_begin_retire(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                   GraphEpoch graph_epoch, lifecycle::ModelToken root, const int * devices,
+                                   size_t device_count, RetireTicket * ticket) noexcept {
+    return begin_retire(context, session, reset_epoch, graph_epoch, root, devices, device_count, ticket);
+}
+
+error Registry::child_begin_retire_no_resources(const NoResourcesProof & proof, RetireTicket * ticket) noexcept {
+    return begin_retire_no_resources(proof, ticket);
+}
+
+error Registry::child_attach_retire_terminal(const RetireTicket & ticket, int device,
+                                             std::shared_ptr<RetireTerminal> terminal) noexcept {
+    return attach_retire_terminal(ticket, device, std::move(terminal));
+}
+
+error Registry::child_finish_retire(const RetireTicket & ticket) noexcept {
+    return finish_retire(ticket);
+}
+
+error Registry::child_extract_epoch(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                    GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                                    epoch_snapshot * out) const noexcept {
+    return extract_epoch(context, session, reset_epoch, graph_epoch, root, out);
 }
 
 error Registry::begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,

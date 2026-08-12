@@ -310,7 +310,13 @@ mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_
     return h;
 }
 
-mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size, int device, uint64_t generation) {
+mem_handle mem_handle::from_arena_zone(int      zone_id,
+                                       size_t   offset,
+                                       size_t   size,
+                                       int      device,
+                                       uint64_t generation,
+                                       uint64_t allocation_id,
+                                       size_t   allocation_extent) {
     mem_handle h;
     // Map zone_id to the appropriate arena handle kind.
     // vram_zone_id: KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4
@@ -334,8 +340,11 @@ mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size, 
     h.zone_id_   = zone_id;
     h.offset_    = offset;
     h.size_      = size;
-    h.arena_gen_ = generation;
-    h.gen_       = 0;  // Force first resolve
+    h.arena_gen_              = generation;
+    h.canonical_allocation_id_ = allocation_id;
+    h.canonical_generation_    = generation;
+    h.canonical_extent_ = allocation_extent;
+    h.gen_                = 0;  // Force first resolve
     h.cached_    = {};
     return h;
 }
@@ -411,8 +420,11 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
 
     const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
     mem_handle h         = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE);
-    h.offset_            = 0;
-    h.size_              = handle.size;
+    h.offset_                   = 0;
+    h.size_                     = handle.size;
+    h.canonical_allocation_id_  = handle.alloc_id;
+    h.canonical_generation_     = handle.epoch_id ? handle.epoch_id : 1;
+    h.canonical_extent_         = handle.size;
     h.owned_alloc_ = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
     return h;
 }
@@ -450,21 +462,16 @@ std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integrat
             if (!handle.cached_.ptr) {
                 return std::nullopt;
             }
-            device = handle.device_;
-            if (handle.owned_alloc_) {
-                allocation_id = handle.owned_alloc_->alloc_id;
-                generation    = handle.owned_alloc_->epoch_id ? handle.owned_alloc_->epoch_id : 1;
-                device        = handle.owned_alloc_->device;
-                extent        = handle.owned_alloc_->size;
-            } else if (handle.kind_ == mem_handle_kind::WEIGHT && handle.key_.id.valid) {
-                allocation_id = static_cast<uint64_t>(handle.stable_identity_hash_locked());
-                generation    = handle.gen_ ? handle.gen_ : 1;
-                extent        = handle.key_.id.nbytes;
-            } else if (handle.is_arena()) {
-                allocation_id = static_cast<uint64_t>(handle.stable_identity_hash_locked());
-                generation    = handle.arena_gen_;
-                extent        = handle.size_;
-            } else {
+            device        = handle.owned_alloc_ ? handle.owned_alloc_->device : handle.device_;
+            allocation_id = handle.canonical_allocation_id_;
+            generation    = handle.canonical_generation_;
+            extent        = handle.canonical_extent_;
+            if (handle.kind_ == mem_handle_kind::WEIGHT && allocation_id == 0) {
+                // Cache-entry minted IDs/replacement generations are not yet
+                // propagated by unified-cache. Never substitute a key hash.
+                return std::nullopt;
+            }
+            if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) {
                 // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
                 // not carry an exact allocation identity/range.
                 return std::nullopt;
@@ -497,10 +504,6 @@ std::optional<moe::mmid_batch_binding> moe::canonical_allocation_integration::bi
         mem_handle_lock_guard guard(handle.lock_);
         byte_offset = handle.offset_;
         byte_size   = handle.size_;
-        if (handle.kind_ == mem_handle_kind::WEIGHT) {
-            byte_offset = 0;
-            byte_size   = handle.key_.id.nbytes;
-        }
     }
     if (byte_size == 0 || byte_offset > owner->extent() || byte_size > owner->extent() - byte_offset) {
         return std::nullopt;
@@ -817,6 +820,9 @@ size_t mem_handle::stable_identity_hash_locked() const {
     if (is_weight()) {
         h = mem_handle_hash_combine(h, unified_cache_key_hash{}(key_));
     } else if (is_arena()) {
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(canonical_allocation_id_));
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(canonical_generation_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(canonical_extent_));
         h = mem_handle_hash_combine(h, std::hash<int>()(zone_id_));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
@@ -855,7 +861,9 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
     }
 
     if (is_arena()) {
-        return zone_id_ == other.zone_id_ && offset_ == other.offset_ && size_ == other.size_ &&
+        return canonical_allocation_id_ == other.canonical_allocation_id_ &&
+               canonical_generation_ == other.canonical_generation_ && canonical_extent_ == other.canonical_extent_ &&
+               zone_id_ == other.zone_id_ && offset_ == other.offset_ && size_ == other.size_ &&
                arena_gen_ == other.arena_gen_;
     }
 

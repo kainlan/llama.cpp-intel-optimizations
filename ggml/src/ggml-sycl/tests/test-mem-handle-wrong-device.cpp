@@ -379,18 +379,22 @@ static bool test_mem_handle_stable_identity() {
     ggml_sycl::mem_handle other_device = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, true, 1);
     TEST_ASSERT(!device_a.stable_identity_equal(other_device), "device owner participates in DIRECT stable identity");
 
-    ggml_sycl::mem_handle arena_a =
-        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7);
-    ggml_sycl::mem_handle arena_b =
-        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7);
-    ggml_sycl::mem_handle arena_new_gen =
-        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 8);
+    ggml_sycl::mem_handle arena_a = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7, 700, 12288);
+    ggml_sycl::mem_handle arena_b = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7, 700, 12288);
+    ggml_sycl::mem_handle arena_new_gen = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 8, 700, 12288);
+    ggml_sycl::mem_handle arena_collision = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7, 701, 12288);
     TEST_ASSERT(arena_a.stable_identity_equal(arena_b),
                 "arena handles with same owner/zone/offset/size/generation must share stable identity");
     TEST_ASSERT(arena_a.stable_identity_hash() == arena_b.stable_identity_hash(),
                 "arena stable hash must match stable identity equality");
     TEST_ASSERT(!arena_a.stable_identity_equal(arena_new_gen),
                 "arena generation participates in retained-cache stable identity");
+    TEST_ASSERT(!arena_a.stable_identity_equal(arena_collision),
+                "distinct allocator-minted IDs never alias despite identical arena coordinates");
 
     ggml_sycl_cache_id id = {};
     id.valid              = true;

@@ -217,6 +217,42 @@ class Registry {
                         lifecycle::ModelToken root,
                         epoch_snapshot *      out) const noexcept;
 
+    // Child persistent epochs deliberately coexist with the outer compatibility
+    // graph/invocation. Production retained command graphs use only this named
+    // API so they cannot accidentally inherit outer-graph exclusion rules.
+    error child_begin_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                             lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept;
+    error child_activate(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
+                         lifecycle::ModelToken root) noexcept;
+    error child_begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                 GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                                 InvocationId * invocation) noexcept;
+    error child_finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                  GraphEpoch graph_epoch, InvocationId invocation,
+                                  lifecycle::ModelToken root) noexcept;
+    error child_note_resources_published(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                         GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
+    error child_rollback_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
+    // Called only after the retention integration has synchronously proven all
+    // possibly-touched child queues quiescent. Removes a partial RECORDING epoch
+    // without manufacturing a no-resources proof after publication began.
+    error child_abort_partial_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                     GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept;
+    error child_fail_record_no_resources(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                                         GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                                         NoResourcesProof * proof) noexcept;
+    error child_begin_retire(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                             GraphEpoch graph_epoch, lifecycle::ModelToken root, const int * devices,
+                             size_t device_count, RetireTicket * ticket) noexcept;
+    error child_begin_retire_no_resources(const NoResourcesProof & proof, RetireTicket * ticket) noexcept;
+    error child_attach_retire_terminal(const RetireTicket & ticket, int device,
+                                       std::shared_ptr<RetireTerminal> terminal) noexcept;
+    error child_finish_retire(const RetireTicket & ticket) noexcept;
+    error child_extract_epoch(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
+                              GraphEpoch graph_epoch, lifecycle::ModelToken root,
+                              epoch_snapshot * out) const noexcept;
+
     // Compatibility adapter used by the current backend until ea0b migrates it.
     error begin_graph(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                       lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept;

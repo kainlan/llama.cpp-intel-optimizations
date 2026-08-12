@@ -222,7 +222,13 @@ class mem_handle {
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
     // The handle kind is derived from zone_id:
     //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
-    static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size, int device, uint64_t generation);
+    static mem_handle from_arena_zone(int zone_id,
+                                      size_t offset,
+                                      size_t size,
+                                      int device,
+                                      uint64_t generation,
+                                      uint64_t allocation_id = 0,
+                                      size_t allocation_extent = 0);
 
     // Compatibility/test bridge for legacy raw pointers whose arena-chunk
     // ownership must be protected while callers are migrated to allocation-time
@@ -420,6 +426,13 @@ class mem_handle {
     size_t   offset_    = 0;  // Offset within the zone
     size_t   size_      = 0;  // Allocation size
     uint64_t arena_gen_ = 0;  // Arena generation (for invalidation)
+
+    // Exact allocator-minted retention identity. Cache WEIGHT constructors do
+    // not populate these until unified-cache propagation lands; graph retention
+    // therefore rejects those handles rather than hashing key/pointer identity.
+    uint64_t canonical_allocation_id_ = 0;
+    uint64_t canonical_generation_    = 0;
+    size_t   canonical_extent_        = 0;
 
     // Mutable because resolve() is logically const (returns the current
     // pointer) but updates the cache as a side effect.

@@ -80309,40 +80309,62 @@ static bool moe_graph_retention_publish(ggml_backend_sycl_context * ctx) {
         ggml_sycl::moe::retention_error::OK) {
         return false;
     }
-    std::set<std::tuple<uint64_t, uint64_t, int>> seen;
-    std::set<int>                                 devices;
-    for (const auto & handle : handles) {
-        auto owner = ggml_sycl::moe::canonical_allocation_integration::retain(handle);
-        if (!owner) {
-            return false;
+    using exact_capability = std::tuple<uint64_t, uint64_t, int, size_t, size_t>;
+    std::set<exact_capability> seen;
+    std::set<int>              devices;
+    auto fail_partial = [&]() {
+        const auto rc = tx.abort_partial();
+        if (rc != ggml_sycl::moe::retention_error::OK) {
+            ctx->moe_graphs_disabled = true;
+            GGML_LOG_ERROR("[SYCL-MOE-RETENTION] partial child abort failed rc=%d; replay quarantined\n",
+                           static_cast<int>(rc));
         }
-        devices.insert(owner->device());
-        if (seen.emplace(owner->allocation_id(), owner->generation(), owner->device()).second &&
-            tx.add_owner(*owner) != ggml_sycl::moe::retention_error::OK) {
-            return false;
+        return false;
+    };
+    for (const auto & handle : handles) {
+        const auto resolved = handle.resolve();
+        const uint64_t layout_id = resolved.ptr ? static_cast<uint64_t>(resolved.layout) + 1 : 0;
+        auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(handle, layout_id, 1);
+        if (!binding) {
+            return fail_partial();
+        }
+        const auto & id = binding->identity;
+        devices.insert(id.device);
+        if (seen.emplace(id.allocation_id, id.generation, id.device, id.byte_offset, id.byte_size).second &&
+            tx.add_owner(binding->owner) != ggml_sycl::moe::retention_error::OK) {
+            return fail_partial();
         }
     }
     devices.insert(ctx->device);
     std::map<int, std::shared_ptr<ggml_sycl::moe::device_terminal>> terminals;
-    if (tx.note_submission(ctx->device, ggml_sycl::moe::submit_outcome::SUBMITTED) !=
-        ggml_sycl::moe::retention_error::OK) {
-        return false;
-    }
     for (int device : devices) {
         auto terminal = std::make_shared<moe_sycl_event_terminal>();
         if (tx.set_terminal(device, terminal) != ggml_sycl::moe::retention_error::OK) {
-            return false;
+            return fail_partial();
         }
         terminals.emplace(device, std::move(terminal));
     }
+    // Submission is published only after every exact terminal exists. A
+    // terminal-construction failpoint therefore remains an untouched partial
+    // record and abort_partial never invents a queue proof.
+    if (tx.note_submission(ctx->device, ggml_sycl::moe::submit_outcome::SUBMITTED) !=
+        ggml_sycl::moe::retention_error::OK) {
+        return fail_partial();
+    }
     tx.mark_finalized();
     if (tx.commit() != ggml_sycl::moe::retention_error::OK) {
-        return false;
+        return fail_partial();
     }
     const auto key = registry.active({ ctx->execution_context_id });
     ggml_sycl::moe::published_graph_token token;
     if (registry.acquire_published_token(key, &token) != ggml_sycl::moe::retention_error::OK) {
-        (void) registry.retire_exact(key);
+        const auto retire_rc = registry.retire_exact(key);
+        if (retire_rc != ggml_sycl::moe::retention_error::OK &&
+            retire_rc != ggml_sycl::moe::retention_error::STALE) {
+            ctx->moe_graphs_disabled = true;
+            GGML_LOG_ERROR("[SYCL-MOE-RETENTION] unpublished child epoch retirement failed rc=%d\n",
+                           static_cast<int>(retire_rc));
+        }
         return false;
     }
     ctx->moe_retention_epoch     = key;

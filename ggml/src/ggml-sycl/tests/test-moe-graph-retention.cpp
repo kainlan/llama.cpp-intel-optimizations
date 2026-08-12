@@ -156,6 +156,81 @@ static void require_bad_identity(mmid_operand_identity identity, uint64_t owner_
 }
 
 int main() {
+    // A retained child epoch records, publishes, replays, and retires while an
+    // outer compatibility invocation remains open on the same session.
+    graph_retention_registry child_retention;
+    fixture                  child_fixture(child_retention);
+    GraphEpoch               outer_epoch{};
+    InvocationId             outer_invocation{};
+    const int                outer_devices[]     = { 0 };
+    const int                outer_participants[] = { 0 };
+    require(child_fixture.execution.begin_graph(child_fixture.context, child_fixture.session, child_fixture.reset,
+                                                  token(), &outer_epoch) == error::OK &&
+                child_fixture.execution.begin_invocation(
+                    child_fixture.context, child_fixture.session, child_fixture.reset, outer_epoch, token(),
+                    outer_devices, 1, outer_participants, 1, 0, &outer_invocation) == error::OK,
+            "outer compatibility invocation setup failed");
+    std::atomic<bool>     child_ready{ true };
+    std::atomic<unsigned> child_waits{ 0 };
+    auto                  child_tx    = begin_tx(child_fixture);
+    auto                  child_owner = std::make_shared<int>(6);
+    require(child_tx.add_batch(binding(96, child_owner)) == retention_error::OK &&
+                child_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                    retention_error::OK &&
+                child_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK,
+            "child record inside outer invocation failed");
+    child_tx.mark_finalized();
+    require(child_tx.commit() == retention_error::OK, "child publication inside outer invocation failed");
+    published_graph_token child_token;
+    InvocationId          child_invocation{};
+    require(child_retention.acquire_published_token(child_tx.key(), &child_token) == retention_error::OK &&
+                child_retention.begin_invocation(child_token, &child_invocation) == retention_error::OK &&
+                child_retention.finish_invocation(child_token, child_invocation) == retention_error::OK &&
+                child_retention.retire_exact(child_tx.key()) == retention_error::OK,
+            "child replay/retirement inside outer invocation failed");
+    snapshot outer_snapshot{};
+    require(child_fixture.execution.extract(child_fixture.context, &outer_snapshot) == error::OK &&
+                outer_snapshot.graph_epoch == outer_epoch && outer_snapshot.invocation == outer_invocation,
+            "child retirement disturbed outer invocation");
+
+    // Every pre-commit failpoint uses abort_partial and returns both registries
+    // to baseline without requiring a fabricated terminal for untouched queues.
+    for (int fail_after = 0; fail_after < 5; ++fail_after) {
+        graph_retention_registry partial_registry;
+        fixture                  partial_fixture(partial_registry);
+        auto                     partial        = begin_tx(partial_fixture);
+        const auto               partial_key    = partial.key();
+        auto                     partial_owner0 = std::make_shared<int>(70 + fail_after);
+        auto                     partial_owner1 = std::make_shared<int>(80 + fail_after);
+        require(partial.add_owner(owner_capability(970 + fail_after, partial_owner0, 0)) == retention_error::OK,
+                "partial first-owner setup failed");
+        if (fail_after >= 1) {
+            require(partial.add_owner(owner_capability(980 + fail_after, partial_owner1, 1)) == retention_error::OK,
+                    "partial second-owner setup failed");
+        }
+        if (fail_after >= 2) {
+            require(partial.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                        retention_error::OK,
+                    "partial primary-terminal setup failed");
+        }
+        if (fail_after >= 3) {
+            require(partial.set_terminal(1, std::make_shared<test_terminal>(child_ready, child_waits)) ==
+                        retention_error::OK,
+                    "partial secondary-terminal setup failed");
+        }
+        if (fail_after >= 4) {
+            require(partial.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK,
+                    "partial submission setup failed");
+        }
+        require(partial.abort_partial() == retention_error::OK && partial_registry.size() == 0,
+                "partial abort did not restore retention baseline");
+        epoch_snapshot removed{};
+        require(partial_fixture.execution.child_extract_epoch(
+                    partial_fixture.context, partial_fixture.session, partial_fixture.reset, partial_key.epoch,
+                    token(), &removed) == error::STALE,
+                "partial abort left child lifecycle epoch behind");
+    }
+
     graph_retention_registry retention;
     fixture                  f(retention);
     std::atomic<bool>        ready{ true };

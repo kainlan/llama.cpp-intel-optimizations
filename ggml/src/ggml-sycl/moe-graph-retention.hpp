@@ -214,6 +214,7 @@ class graph_retention_registry {
     retention_error prepare(const graph_retention_record & record) noexcept;
     retention_error publish_active(graph_owner_key key) noexcept;
     retention_error quarantine(const graph_retention_record & record) noexcept;
+    retention_error discard_partial(graph_owner_key key) noexcept;
     bool            consume_fault_locked(retention_fault fault) noexcept;
     retention_error validate_record(const graph_retention_record & record) const noexcept;
     void            finish_retire_attempt(graph_owner_key key) noexcept;
@@ -260,6 +261,10 @@ class graph_recording_transaction {
     void mark_finalized() noexcept { finalized_ = true; }
 
     retention_error commit() noexcept;
+    // Abort a pre-commit partial record. Every possibly-submitted device must
+    // have an exact terminal or UNKNOWN quiescence proof; otherwise owners stay
+    // quarantined and the abort fails closed.
+    retention_error abort_partial() noexcept;
     retention_error rollback() noexcept;
   private:
     retention_error            publish_resources() noexcept;
