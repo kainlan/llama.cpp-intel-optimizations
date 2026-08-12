@@ -2016,17 +2016,19 @@ static bool retained_cache_id_less(const ggml_sycl_cache_id & a, const ggml_sycl
     if (a.load_scoped != b.load_scoped) {
         return a.load_scoped < b.load_scoped;
     }
-    if (a.model_id != b.model_id) {
-        return a.model_id < b.model_id;
-    }
-    if (a.load_txn_id != b.load_txn_id) {
-        return a.load_txn_id < b.load_txn_id;
-    }
-    if (a.model_slot != b.model_slot) {
-        return a.model_slot < b.model_slot;
-    }
-    if (a.slot_generation != b.slot_generation) {
-        return a.slot_generation < b.slot_generation;
+    if (a.load_scoped) {
+        if (a.model_id != b.model_id) {
+            return a.model_id < b.model_id;
+        }
+        if (a.load_txn_id != b.load_txn_id) {
+            return a.load_txn_id < b.load_txn_id;
+        }
+        if (a.model_slot != b.model_slot) {
+            return a.model_slot < b.model_slot;
+        }
+        if (a.slot_generation != b.slot_generation) {
+            return a.slot_generation < b.slot_generation;
+        }
     }
     if (a.has_gguf != b.has_gguf) {
         return a.has_gguf < b.has_gguf;
@@ -2043,8 +2045,13 @@ static bool retained_cache_id_less(const ggml_sycl_cache_id & a, const ggml_sycl
     if (a.nbytes != b.nbytes) {
         return a.nbytes < b.nbytes;
     }
-    if (a.name_hash != b.name_hash) {
-        return a.name_hash < b.name_hash;
+    if (!a.has_gguf) {
+        if (a.model_id != b.model_id) {
+            return a.model_id < b.model_id;
+        }
+        if (a.name_hash != b.name_hash) {
+            return a.name_hash < b.name_hash;
+        }
     }
     if (a.type != b.type) {
         return a.type < b.type;

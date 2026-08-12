@@ -7,6 +7,7 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mem-handle.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 
 #include <algorithm>
@@ -190,6 +191,38 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     TEST_ASSERT(missing.ptr == nullptr, "missing expert pointer should be null");
 
     sycl::free(pinned, q);
+    return true;
+}
+
+static bool test_routed_prestage_exact_layout_receipt(sycl::queue & q) {
+    printf("\n=== Test: routed prestage exact layout pin receipt ===\n");
+    auto * cache = ggml_sycl::get_unified_cache_for_device(0);
+    TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
+    const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
+    std::vector<uint8_t> data(256, 0x5e);
+    ggml_sycl_cache_id base = ggml_sycl::test_make_cache_id(data.data(), token.model.value);
+    base.load_scoped     = true;
+    base.load_txn_id     = token.load.value;
+    base.model_slot      = token.owner.slot;
+    base.slot_generation = token.owner.generation;
+    const auto soa_key = ggml_sycl::detail::layout_specific_moe_expert_cache_key(base, GGML_LAYOUT_SOA);
+    auto stage = cache->direct_stage_expert(soa_key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA,
+                                            nullptr, nullptr, &q);
+    TEST_ASSERT(stage.ok, "SOA routed fixture staging failed");
+    stage.event.wait_and_throw();
+
+    const int32_t ids[] = { 0 };
+    auto overflow = ggml_sycl::prestage_routed_experts(&q, ids, INT32_MAX, 2, data.data(), data.size(), data.size(), 7,
+                                                        1, 0, &base);
+    TEST_ASSERT(!overflow.success && overflow.n_unique == 0, "routing cardinality overflow was multiplied first");
+    auto receipt = ggml_sycl::prestage_routed_experts(&q, ids, 1, 1, data.data(), data.size(), data.size(), 7, 1, 0,
+                                                       &base);
+    TEST_ASSERT(receipt.success && receipt.n_gpu == 1 && receipt.pins.size() == 1,
+                "layout-specific routed prestage did not pin exact writer key");
+    TEST_ASSERT(receipt.pins[0].layout == GGML_LAYOUT_SOA &&
+                    ggml_sycl::detail::cache_id_equal(receipt.pins[0].key, soa_key),
+                "prestage receipt reconstructed a base AOS key");
+    ggml_sycl::unpin_routed_experts(0, receipt.pins);
     return true;
 }
 
@@ -515,7 +548,34 @@ int main() {
         return 1;
     }
 
-    bool ok = true;
+    // The producer-level builder fixtures below mint load-scoped keys. Install
+    // the same exact bound lifecycle and candidate-plan authority as model load;
+    // fabricated model IDs cannot exercise owner validation correctly.
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    auto   begin    = registry.begin_outer();
+    if (begin.code != ggml_sycl::lifecycle::error::OK) {
+        fprintf(stderr, "failed to begin MoE handle fixture lifecycle\n");
+        return 1;
+    }
+    registry.bind_candidate(begin.txn);
+    ggml_sycl::placement_plan fixture_plan{};
+    fixture_plan.build_index();
+    ggml_sycl::lifecycle_stage_placement_plan(begin.txn.value, std::move(fixture_plan));
+    struct lifecycle_fixture_guard {
+        ggml_sycl::lifecycle::Registry & registry;
+        ggml_sycl::lifecycle::LoadTxnId  txn;
+        ~lifecycle_fixture_guard() {
+            registry.unbind_candidate(txn);
+            ggml_sycl::lifecycle_abort_placement_plan(txn.value);
+            (void) registry.end(txn, false);
+        }
+    } fixture_guard{ registry, begin.txn };
+
+    const uint64_t fixture_model = registry.current_active_token().model.value;
+    bool ok = fixture_model != 0;
+    ok &= ggml_sycl::test_exact_wrapper_owner_matches(fixture_model, fixture_model);
+    ok &= !ggml_sycl::test_exact_wrapper_owner_matches(fixture_model + 1, fixture_model);
+    ok &= !ggml_sycl::test_exact_wrapper_owner_matches(0x5a17, fixture_model);
     ok &= test_normal_cache_expert_resolution(*q);
     ok &= test_direct_staged_device_resolution(*q);
     // Keep the global-cache / ready-event chaining coverage ahead of the
@@ -531,6 +591,7 @@ int main() {
     ok &= test_moe_ptr_table_lease_covers_populated_slots();
     ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
     ok &= test_direct_host_and_miss_resolution(*q);
+    ok &= test_routed_prestage_exact_layout_receipt(*q);
     ok &= test_canonical_owned_aos_slice_lifecycle(*q);
     ok &= test_expert_staging_host_compute_zone_ownership(*q);
     ok &= test_planner_role_specific_expert_placement();

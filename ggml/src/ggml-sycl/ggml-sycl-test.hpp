@@ -38,6 +38,7 @@ uint64_t           test_backend_graph_replay_count(ggml_backend_t backend);
 bool               test_graph_recording_uses_gpu_only_dispatch();
 bool               test_backend_graph_recording_uses_gpu_only_dispatch(ggml_backend_t backend);
 bool               test_moe_route_preserves_ready_event_for_chaining();
+bool               test_exact_wrapper_owner_matches(uint64_t wrapper_model_id, uint64_t expected_model_id);
 bool               test_moe_ptr_table_retains_route_lease_until_event();
 bool               test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
 bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();

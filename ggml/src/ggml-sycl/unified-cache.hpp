@@ -4252,6 +4252,13 @@ void unpin_all_experts();
 // === Routing-Aware Expert Pre-staging ===
 // These functions use routing indices from argsort to pre-stage only needed experts
 
+// Exact cache representation pinned by prestage. This receipt, rather than
+// routing inputs, is the sole authority for the matching unpin.
+struct routed_expert_pin {
+    ggml_sycl_cache_id key{};
+    ggml_layout_mode   layout = GGML_LAYOUT_AOS;
+};
+
 // Result of pre-staging operation
 struct prestage_result {
     int                                         n_unique = 0;
@@ -4261,6 +4268,7 @@ struct prestage_result {
     int                                         n_cpu  = 0;
     int                                         n_miss = 0;
     std::unordered_map<int32_t, cache_location> expert_locations;
+    std::vector<routed_expert_pin>              pins;
 };
 
 // Pre-stage only the experts identified by routing indices.
@@ -4306,15 +4314,7 @@ prestage_result prestage_routed_experts(void *          queue,
 //   layer_id:        Layer ID for cache key
 //   n_experts_total: Total experts for bounds checking
 //   device_id:       Device ID for cache lookup
-void unpin_routed_experts(const int32_t * expert_ids,
-                          int             n_expert_used,
-                          int             n_tokens,
-                          const void *    weight_base_ptr,
-                          size_t          expert_stride,
-                          int             layer_id,
-                          int             n_experts_total,
-                          int                         device_id,
-                          const ggml_sycl_cache_id * canonical_keys);
+void unpin_routed_experts(int device_id, const std::vector<routed_expert_pin> & pins);
 
 // === Multi-Device Partial Row API (free-standing wrappers) ===
 

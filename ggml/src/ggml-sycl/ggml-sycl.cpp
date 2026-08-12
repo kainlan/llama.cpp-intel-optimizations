@@ -2261,6 +2261,28 @@ static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
            a.owner.generation == b.owner.generation;
 }
 
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
+
+// Resolve a wrapper's owner without ever substituting another model. A nonzero
+// model_id is an assertion: it must name the exact bound load candidate or an
+// exact LIVE registry token. Stale/mutated wrappers fail closed.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t model_id) noexcept {
+    if (model_id == 0) {
+        return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+    }
+    const auto candidate = ggml_sycl_bound_load_candidate();
+    if (candidate && candidate->model_id == model_id) {
+        return { { candidate->model_id }, { candidate->load_txn_id },
+                 { candidate->slot, candidate->slot_generation } };
+    }
+    const auto state = ggml_sycl::lifecycle::global_registry().find({ model_id });
+    if (!state || state->phase != ggml_sycl::lifecycle::model_phase::LIVE || state->token.model.value != model_id) {
+        return {};
+    }
+    return state->token;
+}
+
 static bool ggml_sycl_host_row_authorized(const ggml_sycl::lifecycle::ModelToken & owner) noexcept {
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate) {
@@ -2391,6 +2413,11 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_make_
 }
 
 static void ggml_sycl_publish_test_plan(ggml_sycl::placement_plan plan) {
+    const auto bound = ggml_sycl::lifecycle::global_registry().bound_candidate();
+    if (bound.value != 0) {
+        ggml_sycl::lifecycle_stage_placement_plan(bound.value, std::move(plan));
+        return;
+    }
     const auto                  snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan));
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(snapshot);
@@ -3347,42 +3374,7 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
 
 static ggml_sycl_cache_id ggml_sycl_layout_specific_moe_expert_cache_key(ggml_sycl_cache_id key,
                                                                          ggml_layout_mode   layout) {
-    uint64_t layout_key_tag = 0;
-    switch (layout) {
-        case GGML_LAYOUT_AOS:
-            return key;
-        case GGML_LAYOUT_SOA:
-            layout_key_tag = 0x4d4f45534f410000ull;  // "MOESOA"
-            break;
-        case GGML_LAYOUT_COALESCED:
-            layout_key_tag = 0x4d4f45434f414c00ull;  // "MOECOAL"
-            break;
-        case GGML_LAYOUT_MXFP4_I8:
-            layout_key_tag = 0x4d584650344938ull;  // "MXFP4I8"
-            break;
-        case GGML_LAYOUT_XMX_TILED:
-            layout_key_tag = 0x4d4f45584d585400ull;  // "MOEXMXT"
-            break;
-        case GGML_LAYOUT_XMX_TILED_BUNDLE4:
-            layout_key_tag = 0x4d584d5842340000ull;  // "XMXB4"
-            break;
-        case GGML_LAYOUT_XMX_GEMM_TILED:
-            layout_key_tag = 0x4d4f45584d584700ull;  // "MOEXMXG"
-            break;
-        case GGML_LAYOUT_ONEDNN_PACKED:
-            layout_key_tag = 0x4d4f454f4e454400ull;  // "MOEONED"
-            break;
-        case GGML_LAYOUT_ONEDNN_WOQ:
-            layout_key_tag = 0x4d4f45574f510000ull;  // "MOEWOQ"
-            break;
-        case GGML_LAYOUT_MXFP4_DPAS:
-            layout_key_tag = 0x4d584650344450ull;  // "MXFP4DP"
-            break;
-    }
-    if (layout_key_tag != 0) {
-        key.aux_id = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
-    }
-    return key;
+    return ggml_sycl::detail::layout_specific_moe_expert_cache_key(key, layout);
 }
 
 struct ggml_sycl_reorder_fill_ctx {
@@ -8180,17 +8172,8 @@ static std::string ggml_sycl_canonical_checksum_key(const ggml_tensor * tensor) 
     if (!name || name[0] == '\0') {
         return {};
     }
-    ggml_sycl::lifecycle::ModelToken owner{};
-    const ggml_tensor_extra_gpu *    extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-    if (extra && extra->model_id != 0) {
-        const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
-        if (state) {
-            owner = state->token;
-        }
-    }
-    if (owner.model.value == 0) {
-        owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
-    }
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+    const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
     return ggml_sycl_owner_name_key(owner, name);
 }
 
@@ -8474,6 +8457,17 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
                                          void **                    out_ptr,
                                          std::vector<sycl::event> * out_events);
 
+static bool test_register_moe_builder_identity(ggml_tensor & tensor, ggml_tensor_extra_gpu & extra) {
+    const auto token = lifecycle::global_registry().current_active_token();
+    if (token.model.value == 0 || token.load.value == 0) {
+        return false;
+    }
+    extra.model_id = token.model.value;
+    tensor.extra   = &extra;
+    ggml_backend_sycl_register_weight_identity(&tensor, 0, 0, ggml_nbytes(&tensor), token.model.value);
+    return true;
+}
+
 static bool test_ensure_weight_zone(unified_cache * cache, sycl::queue & q, size_t needed_bytes) {
     if (!cache) {
         return false;
@@ -8680,6 +8674,11 @@ bool test_backend_graph_recording_uses_gpu_only_dispatch(ggml_backend_t backend)
     return !cpu_offload_active;
 }
 
+bool test_exact_wrapper_owner_matches(uint64_t wrapper_model_id, uint64_t expected_model_id) {
+    const auto owner = ggml_sycl_exact_wrapper_owner(wrapper_model_id);
+    return owner.model.value != 0 && owner.model.value == expected_model_id;
+}
+
 bool test_moe_route_preserves_ready_event_for_chaining() {
     unified_cache * cache = get_unified_cache_for_device(0);
     if (!cache) {
@@ -8701,8 +8700,9 @@ bool test_moe_route_preserves_ready_event_for_chaining() {
     ggml_set_name(&tensor, "blk.7.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
-    extra.model_id = 0x5a17;
-    tensor.extra   = &extra;
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     constexpr int        expert_id = 3;
     std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x6d);
@@ -8747,8 +8747,9 @@ bool test_moe_ptr_table_retains_route_lease_until_event() {
     ggml_set_name(&tensor, "blk.7.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
-    extra.model_id = 0x5a18;
-    tensor.extra   = &extra;
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     constexpr int        expert_id = 3;
     std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x71);
@@ -8841,8 +8842,9 @@ bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
     ggml_set_name(&tensor, "blk.11.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
-    extra.model_id = 0x5a19;
-    tensor.extra   = &extra;
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x79);
     tensor.data = data.data();
@@ -8985,6 +8987,10 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
     up_data.resize(static_cast<size_t>(up_tensor.nb[2]), 0x91);
     gate_tensor.data = gate_data.data();
     up_tensor.data   = up_data.data();
+    if (!test_register_moe_builder_identity(gate_tensor, gate_extra) ||
+        !test_register_moe_builder_identity(up_tensor, up_extra)) {
+        return false;
+    }
 
     ggml_sycl::placement_plan plan{};
     for (int e = 0; e < gate_tensor.ne[2]; ++e) {
@@ -12508,17 +12514,8 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        ggml_sycl::lifecycle::ModelToken owner{};
         const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-        if (extra && extra->model_id != 0) {
-            const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
-            if (state) {
-                owner = state->token;
-            }
-        }
-        if (owner.model.value == 0) {
-            owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
-        }
+        const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
         const std::string key = ggml_sycl_owner_name_key(owner, name);
         if (!key.empty()) {
             std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
@@ -12597,16 +12594,8 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
         // one that is not published would otherwise find no identity at all and
         // silently drop to the fallback UUID path.  Same lookup order as
         // ggml_sycl_get_tensor_usage().
-        ggml_sycl::lifecycle::ModelToken owner{};
-        if (extra && extra->model_id != 0) {
-            const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
-            if (state) {
-                owner = state->token;
-            }
-        }
-        if (owner.model.value == 0) {
-            owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
-        }
+        const uint64_t extra_model_id = extra ? extra->model_id : 0;
+        const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
 
         if (owner.model.value != 0) {
             auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
@@ -15361,9 +15350,10 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
     data.resize(static_cast<size_t>(tensor.nb[2]), 0x42);
     ggml_set_name(&tensor, "blk.13.ffn_gate_exps.weight");
-    extra.model_id = 0x5a21;
-    tensor.extra   = &extra;
-    tensor.data    = data.data();
+    tensor.data = data.data();
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     ggml_sycl::placement_plan plan{};
     for (int e = 0; e < tensor.ne[2]; ++e) {
@@ -15447,11 +15437,11 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
     ggml_set_name(&tensor, "blk.17.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
-    extra.model_id = 0x5a22;
-    tensor.extra   = &extra;
-
-    std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x63);
+    std::vector<uint8_t>  data(static_cast<size_t>(tensor.nb[2]), 0x63);
     tensor.data = data.data();
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     ggml_sycl::placement_plan plan{};
     for (int e = 0; e < tensor.ne[2]; ++e) {
@@ -15571,11 +15561,11 @@ bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
     ggml_set_name(&tensor, "blk.23.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
-    extra.model_id = 0x5a23;
-    tensor.extra   = &extra;
-
-    std::vector<uint8_t> data(static_cast<size_t>(tensor.nb[2]), 0x67);
+    std::vector<uint8_t>  data(static_cast<size_t>(tensor.nb[2]), 0x67);
     tensor.data = data.data();
+    if (!test_register_moe_builder_identity(tensor, extra)) {
+        return false;
+    }
 
     ggml_sycl::placement_plan plan{};
     for (int e = 0; e < tensor.ne[2]; ++e) {
@@ -19914,16 +19904,8 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
     // Canonical MoE identity is minted only from the exact lifecycle owner and
     // the registered GGUF parent slice.  Wrapper addresses, allocation ids,
     // cache UUIDs and graph-local extras are observations, never identity.
-    ggml_sycl::lifecycle::ModelToken owner{};
-    if (extra && extra->model_id != 0) {
-        const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
-        if (state) {
-            owner = state->token;
-        }
-    }
-    if (owner.model.value == 0) {
-        owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
-    }
+    const uint64_t extra_model_id = extra ? extra->model_id : 0;
+    const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
     if (owner.model.value == 0 || owner.load.value == 0 ||
         owner.owner.slot == ggml_sycl::lifecycle::no_model_slot || owner.owner.generation == 0) {
         return id; // fail closed on a partial owner
@@ -19945,8 +19927,11 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
     }
 
     const size_t expert_bytes = tensor->nb[2];
-    const size_t expert_offs  = static_cast<size_t>(expert_id) * expert_bytes;
-    if (expert_bytes == 0 || expert_offs > parent.nbytes || expert_bytes > parent.nbytes - expert_offs ||
+    if (expert_bytes == 0 || static_cast<size_t>(expert_id) > SIZE_MAX / expert_bytes) {
+        return id;
+    }
+    const size_t expert_offs = static_cast<size_t>(expert_id) * expert_bytes;
+    if (expert_offs > parent.nbytes || expert_bytes > parent.nbytes - expert_offs ||
         parent.file_offs > SIZE_MAX - expert_offs) {
         return id;
     }
@@ -64206,6 +64191,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         (src0_alloc_prestage == sycl::usm::alloc::host || src0_alloc_prestage == sycl::usm::alloc::shared);
     const bool use_routing_prestage = use_expert_cache && (n_experts > 64) && !src0_usm_accessible_prestage;
     std::vector<ggml_sycl_cache_id> routed_expert_keys;
+    ggml_sycl::prestage_result      routed_prestage;
     if (use_routing_prestage) {
         routed_expert_keys.reserve(static_cast<size_t>(n_experts));
         for (int e = 0; e < n_experts; ++e) {
@@ -64223,7 +64209,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const size_t expert_size_prestage = expert_stride;
 
         // Pre-stage only needed experts using the dispatch path's canonical keys.
-        ggml_sycl::prestage_result prestage_res = ggml_sycl::prestage_routed_experts(
+        routed_prestage = ggml_sycl::prestage_routed_experts(
             stream,                       // SYCL queue
             expert_ids_ptr,               // Routing indices
             n_expert_used,                // Experts per token
@@ -64239,7 +64225,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         GGML_SYCL_DEBUG(
             "[MOE-PRESTAGE] Layer %d: %d unique experts, n_gpu=%d, n_cpu=%d, n_miss=%d (threshold=%d, "
             "n_experts=%ld)\n",
-            layer_id, prestage_res.n_unique, prestage_res.n_gpu, prestage_res.n_cpu, prestage_res.n_miss,
+            layer_id, routed_prestage.n_unique, routed_prestage.n_gpu, routed_prestage.n_cpu, routed_prestage.n_miss,
             max_blind_threshold, (long) n_experts);
     }
 
@@ -68708,13 +68694,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     // Unpin routed experts after dispatch completes (allows eviction)
     if (use_routing_prestage) {
-        const int32_t * expert_ids_ptr = ids_host.data();
-        const int       n_expert_used  = static_cast<int>(ids->ne[0]);
-        const int       n_tokens_ids   = static_cast<int>(ids->ne[1]);
-        const size_t    expert_stride  = src0->nb[2];
-
-        ggml_sycl::unpin_routed_experts(expert_ids_ptr, n_expert_used, n_tokens_ids, src0_host_storage, expert_stride,
-                                        layer_id, static_cast<int>(n_experts), ctx.device, routed_expert_keys.data());
+        ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);
 
         GGML_SYCL_DEBUG("[MOE-UNPIN] Layer %d: Unpinned routed experts\n", layer_id);
     }

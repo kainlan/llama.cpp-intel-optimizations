@@ -80,6 +80,30 @@ static inline bool cache_id_equal(const ggml_sycl_cache_id & a, const ggml_sycl_
     return true;
 }
 
+// Every MoE representation is written under a representation-specific key.
+// Readers must apply this exact transform before probing/pinning; the layout
+// argument in unified_cache_key is not a substitute for the aux-id namespace.
+static inline ggml_sycl_cache_id layout_specific_moe_expert_cache_key(ggml_sycl_cache_id key,
+                                                                      ggml_layout_mode   layout) {
+    uint64_t tag = 0;
+    switch (layout) {
+        case GGML_LAYOUT_AOS: return key;
+        case GGML_LAYOUT_SOA: tag = 0x4d4f45534f410000ull; break;
+        case GGML_LAYOUT_COALESCED: tag = 0x4d4f45434f414c00ull; break;
+        case GGML_LAYOUT_MXFP4_I8: tag = 0x4d584650344938ull; break;
+        case GGML_LAYOUT_XMX_TILED: tag = 0x4d4f45584d585400ull; break;
+        case GGML_LAYOUT_XMX_TILED_BUNDLE4: tag = 0x4d584d5842340000ull; break;
+        case GGML_LAYOUT_XMX_GEMM_TILED: tag = 0x4d4f45584d584700ull; break;
+        case GGML_LAYOUT_ONEDNN_PACKED: tag = 0x4d4f454f4e454400ull; break;
+        case GGML_LAYOUT_ONEDNN_WOQ: tag = 0x4d4f45574f510000ull; break;
+        case GGML_LAYOUT_MXFP4_DPAS: tag = 0x4d584650344450ull; break;
+    }
+    if (tag != 0) {
+        key.aux_id = cache_hash_combine(key.aux_id, tag);
+    }
+    return key;
+}
+
 struct cache_id_equal_fn {
     bool operator()(const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) const { return cache_id_equal(a, b); }
 };

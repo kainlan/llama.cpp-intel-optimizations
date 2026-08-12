@@ -12487,7 +12487,11 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
 
     // Step 1: Deduplicate expert IDs with bounds checking
     std::unordered_set<int32_t> unique_experts;
-    const int                   total_ids = n_expert_used * n_tokens;
+    if (n_expert_used > std::numeric_limits<int>::max() / n_tokens) {
+        GGML_LOG_WARN("[PRESTAGE] routing shape overflow: used=%d tokens=%d\n", n_expert_used, n_tokens);
+        return result;
+    }
+    const int total_ids = n_expert_used * n_tokens;
 
     for (int i = 0; i < total_ids; i++) {
         const int32_t expert_id = expert_ids[i];
@@ -12525,8 +12529,10 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
 
         bool device_resolved = false;
         for (ggml_layout_mode layout : pin_layouts) {
-            if (cache->lookup(key, layout)) {
-                cache->pin(key, layout);
+            const ggml_sycl_cache_id layout_key = detail::layout_specific_moe_expert_cache_key(key, layout);
+            if (cache->lookup(layout_key, layout)) {
+                cache->pin(layout_key, layout);
+                result.pins.push_back({ layout_key, layout });
                 device_resolved = true;
                 break;
             }
@@ -12561,47 +12567,17 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
     return result;
 }
 
-void unpin_routed_experts(const int32_t * expert_ids,
-                          int             n_expert_used,
-                          int             n_tokens,
-                          const void *    weight_base_ptr,
-                          size_t          expert_stride,
-                          int             layer_id,
-                          int             n_experts_total,
-                          int                         device_id,
-                          const ggml_sycl_cache_id * canonical_keys) {
-    // Validate inputs
-    if (!expert_ids || n_expert_used <= 0 || n_tokens <= 0 || !weight_base_ptr) {
-        return;
-    }
-
-    // Get unified cache for this device
+void unpin_routed_experts(int device_id, const std::vector<routed_expert_pin> & pins) {
     unified_cache * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
         return;
     }
-
-    // Deduplicate expert IDs (same as prestage)
-    std::unordered_set<int32_t> unique_experts;
-    const int                   total_ids = n_expert_used * n_tokens;
-
-    for (int i = 0; i < total_ids; i++) {
-        const int32_t expert_id = expert_ids[i];
-        if (expert_id >= 0 && expert_id < n_experts_total) {
-            unique_experts.insert(expert_id);
+    for (const routed_expert_pin & pin : pins) {
+        if (pin.key.valid && pin.key.load_scoped) {
+            cache->unpin(pin.key, pin.layout);
         }
     }
-
-    // Unpin all unique experts
-    for (int32_t expert_id : unique_experts) {
-        const ggml_sycl_cache_id key = canonical_keys ? canonical_keys[expert_id] : ggml_sycl_cache_id{};
-        if (key.valid && key.load_scoped) {
-            cache->unpin(key, GGML_LAYOUT_AOS);
-        }
-    }
-
-    GGML_UNUSED(expert_stride);
-    GGML_SYCL_DEBUG("[UNPIN] Layer %d: Unpinned %zu experts\n", layer_id, unique_experts.size());
+    GGML_SYCL_DEBUG("[UNPIN] Unpinned %zu exact routed representations\n", pins.size());
 }
 
 // (ExpertPlacementTable removed — the cache IS the placement.
