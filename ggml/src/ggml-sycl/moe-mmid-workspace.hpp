@@ -3,7 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <vector>
 
 namespace ggml_sycl {
 
@@ -118,6 +120,99 @@ class moe_mmid_workspace_pool {
                                              uint64_t                         queue_identity,
                                              uint64_t                         terminal_epoch) noexcept;
     bool                    set_generation_for_test(uint32_t slot, uint64_t generation) noexcept;
+
+  private:
+    struct state;
+    std::unique_ptr<state> state_;
+};
+
+// Dependency-free materialization contracts. Production wraps each allocation's
+// mem_handle in `owner`; host tests use the same API with fake byte blobs.
+struct moe_mmid_blob {
+    std::shared_ptr<void>                                owner;
+    std::function<std::shared_ptr<void>(size_t, size_t)> slice_owner;
+    void *                                               ptr         = nullptr;
+    size_t                                               bytes       = 0;
+    int                                                  device      = -1;
+    bool                                                 host_pinned = false;
+
+    bool valid() const noexcept { return owner && ptr != nullptr && bytes != 0; }
+
+    moe_mmid_blob slice(size_t offset, size_t length) const noexcept;
+};
+
+struct moe_mmid_model_token {
+    uint64_t model_id    = 0;
+    uint64_t load_txn_id = 0;
+    uint64_t generation  = 0;
+
+    bool valid() const noexcept { return model_id != 0 && load_txn_id != 0 && generation != 0; }
+};
+
+struct moe_mmid_materialized_owner_plan {
+    int                         owner_device = -1;
+    uint64_t                    queue_cookie = 0;
+    moe_mmid_workspace_geometry geometry;
+    size_t                      device_pool_bytes = 0;
+    size_t                      host_pool_bytes   = 0;
+};
+
+using moe_mmid_blob_allocator =
+    std::function<moe_mmid_blob(bool host_pinned, int device, size_t bytes, size_t alignment)>;
+
+enum class moe_mmid_materialize_status : uint8_t { PUBLISHED, ALREADY_PUBLISHED, INVALID, ALLOCATION_FAILED };
+
+struct moe_mmid_materialized_slices {
+    moe_mmid_blob activation_f32;
+    moe_mmid_blob activation_q8;
+    moe_mmid_blob output_f32;
+    moe_mmid_blob output_q8;
+    moe_mmid_blob host;
+};
+
+class moe_mmid_registry_lease {
+  public:
+    bool                                 valid() const noexcept;
+    uint32_t                             slot() const noexcept;
+    uint64_t                             generation() const noexcept;
+    uint64_t                             plan_identity() const noexcept;
+    uint64_t                             queue_cookie() const noexcept;
+    int                                  submit_device() const noexcept;
+    int                                  owner_device() const noexcept;
+    const moe_mmid_workspace_geometry &  geometry() const noexcept;
+    const moe_mmid_materialized_slices & slices() const noexcept;
+    moe_mmid_release_status              terminal_release(uint64_t queue_cookie, uint64_t generation) noexcept;
+
+  private:
+    struct authority;
+    std::shared_ptr<authority> authority_;
+    friend class moe_mmid_workspace_registry;
+};
+
+struct moe_mmid_registry_lease_result {
+    moe_mmid_lease_status   status = moe_mmid_lease_status::INVALID;
+    moe_mmid_registry_lease lease;
+};
+
+class moe_mmid_workspace_registry {
+  public:
+    moe_mmid_workspace_registry();
+    ~moe_mmid_workspace_registry();
+    moe_mmid_workspace_registry(const moe_mmid_workspace_registry &)             = delete;
+    moe_mmid_workspace_registry & operator=(const moe_mmid_workspace_registry &) = delete;
+
+    moe_mmid_materialize_status    materialize(const moe_mmid_model_token &                          token,
+                                               uint64_t                                              plan_identity,
+                                               int                                                   submit_device,
+                                               const std::vector<moe_mmid_materialized_owner_plan> & owners,
+                                               const moe_mmid_blob_allocator &                       allocator) noexcept;
+    moe_mmid_registry_lease_result acquire(const moe_mmid_model_token & token,
+                                           uint64_t                     plan_identity,
+                                           int                          submit_device,
+                                           int                          owner_device,
+                                           uint64_t                     queue_cookie) noexcept;
+    bool                           retire(const moe_mmid_model_token & token) noexcept;
+    size_t                         published_contexts() const noexcept;
 
   private:
     struct state;

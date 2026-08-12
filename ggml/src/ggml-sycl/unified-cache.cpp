@@ -11224,6 +11224,98 @@ mem_handle unified_allocate(const alloc_request & req) {
     return mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
 }
 
+static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
+    // Function-local construction makes this registry retire before the
+    // allocation registries it uses during static teardown.
+    static moe_mmid_workspace_registry registry;
+    return registry;
+}
+
+moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+    const moe_mmid_model_token & token,
+    uint64_t plan_identity,
+    const placement_plan & plan,
+    int submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
+    if (!plan.moe_mmid_workspace_valid || plan_identity == 0 || submit_device < 0 ||
+        plan.moe_mmid_workspaces.empty()) {
+        return moe_mmid_materialize_status::INVALID;
+    }
+    std::vector<moe_mmid_materialized_owner_plan> owners;
+    owners.reserve(plan.moe_mmid_workspaces.size());
+    for (const moe_mmid_owner_workspace_plan & workspace : plan.moe_mmid_workspaces) {
+        auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
+            return candidate.owner_device == workspace.owner_device;
+        });
+        if (!workspace.valid || binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
+            return moe_mmid_materialize_status::INVALID;
+        }
+        moe_mmid_materialized_owner_plan owner;
+        owner.owner_device     = workspace.owner_device;
+        owner.queue_cookie     = binding->queue_cookie;
+        owner.geometry         = workspace.slot;
+        owner.device_pool_bytes = workspace.device_pool_bytes;
+        owner.host_pool_bytes   = workspace.host_pool_bytes;
+        owners.push_back(owner);
+    }
+
+    auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t) -> moe_mmid_blob {
+        auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
+            return candidate.owner_device == device;
+        });
+        if (binding == bindings.end() || binding->queue == nullptr || bytes == 0) {
+            return {};
+        }
+        alloc_request request;
+        request.queue                = binding->queue;
+        request.device               = device;
+        request.size                 = bytes;
+        request.suppress_failure_log = true;
+        request.intent.role          = host_pinned ? alloc_role::STAGING : alloc_role::COMPUTE;
+        request.intent.category      = host_pinned ? runtime_category::STAGING : runtime_category::COMPUTE;
+        request.intent.cohort_id     = "moe_mmid_workspace";
+        request.intent.constraints.must_device             = !host_pinned;
+        request.intent.constraints.must_host_pinned        = host_pinned;
+        request.intent.constraints.use_pinned_pool         = host_pinned;
+        request.intent.constraints.forbid_host_zone_growth = host_pinned;
+        request.intent.constraints.prefer_vram_zone        = host_pinned ? vram_zone_id::COUNT : vram_zone_id::RUNTIME;
+        auto handle = std::make_shared<mem_handle>(unified_allocate(request));
+        const resolved_ptr resolved = handle->resolve();
+        if (!resolved.ptr || resolved.on_device == host_pinned) {
+            return {};
+        }
+        moe_mmid_blob blob;
+        blob.owner       = handle;
+        blob.slice_owner = [handle](size_t offset, size_t length) -> std::shared_ptr<void> {
+            mem_handle slice = handle->slice(offset, length);
+            return slice.valid() ? std::make_shared<mem_handle>(std::move(slice)) : nullptr;
+        };
+        blob.ptr         = resolved.ptr;
+        blob.bytes       = bytes;
+        blob.device      = device;
+        blob.host_pinned = host_pinned;
+        return blob;
+    };
+    return unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners, allocator);
+}
+
+moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
+    const moe_mmid_model_token & token,
+    uint64_t plan_identity,
+    int submit_device,
+    int owner_device,
+    uint64_t queue_cookie) noexcept {
+    return unified_cache_moe_mmid_registry().acquire(token, plan_identity, submit_device, owner_device, queue_cookie);
+}
+
+bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token) noexcept {
+    return unified_cache_moe_mmid_registry().retire(token);
+}
+
+size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
+    return unified_cache_moe_mmid_registry().published_contexts();
+}
+
 mem_handle scoped_unified_alloc::as_mem_handle() const {
     if (!handle_.ptr) {
         return mem_handle{};

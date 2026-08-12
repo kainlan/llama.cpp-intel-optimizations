@@ -1051,6 +1051,27 @@ struct placement_plan {
     size_t expert_placement_unclassified_count_ = 0;
 };
 
+struct moe_mmid_queue_binding {
+    int           owner_device = -1;
+    sycl::queue * queue        = nullptr;
+    uint64_t      queue_cookie = 0;
+};
+
+moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
+    const moe_mmid_model_token & token,
+    uint64_t plan_identity,
+    const placement_plan & plan,
+    int submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings) noexcept;
+moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
+    const moe_mmid_model_token & token,
+    uint64_t plan_identity,
+    int submit_device,
+    int owner_device,
+    uint64_t queue_cookie) noexcept;
+bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token) noexcept;
+size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
+
 // Immutable lifecycle-owned plan snapshots. A null plan with
 // explicit_no_plan=true is the published no_alloc/UNKNOWN outcome.
 enum class lifecycle_plan_verdict : uint8_t { UNKNOWN, DEVICE, HOST, MIXED };

@@ -143,6 +143,176 @@ static void pool_identity_generation_and_terminal_release() {
           "later-slot terminal release failed");
 }
 
+struct fake_allocation {
+    explicit fake_allocation(size_t bytes, std::atomic<int> * destroyed) : storage(bytes), destroyed(destroyed) {}
+
+    ~fake_allocation() {
+        if (destroyed) {
+            destroyed->fetch_add(1);
+        }
+    }
+
+    std::vector<unsigned char> storage;
+    std::atomic<int> *         destroyed;
+};
+
+static moe_mmid_blob fake_blob(bool host, int device, size_t bytes, std::atomic<int> * destroyed) {
+    auto          allocation = std::make_shared<fake_allocation>(bytes, destroyed);
+    moe_mmid_blob blob;
+    blob.owner       = allocation;
+    blob.ptr         = allocation->storage.data();
+    blob.bytes       = bytes;
+    blob.device      = device;
+    blob.host_pinned = host;
+    return blob;
+}
+
+static moe_mmid_materialized_owner_plan owner_plan(int device, uint64_t queue, bool secondary = false) {
+    moe_mmid_materialized_owner_plan owner;
+    owner.owner_device = device;
+    owner.queue_cookie = queue;
+    check(moe_mmid_plan_workspace({ 64, 96, 2, 2, 3 }, secondary, &owner.geometry), "owner geometry failed");
+    check(moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &owner.device_pool_bytes,
+                                      &owner.host_pool_bytes),
+          "owner pool failed");
+    return owner;
+}
+
+static void registry_materialization_and_rollback() {
+    const moe_mmid_model_token  token{ 1, 2, 3 };
+    const auto                  owner = owner_plan(0, 100);
+    std::atomic<int>            destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+          "registry publication failed");
+    check(registry.published_contexts() == 1, "published context missing");
+    check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::ALREADY_PUBLISHED,
+          "duplicate publication replaced context");
+
+    auto too_small = owner;
+    --too_small.device_pool_bytes;
+    check(registry.materialize({ 4, 5, 6 }, 10, 0, { too_small }, allocator) == moe_mmid_materialize_status::INVALID,
+          "T-1 immutable plan admitted");
+
+    moe_mmid_workspace_registry rollback_registry;
+    std::atomic<int>            rollback_destroyed{ 0 };
+    int                         calls   = 0;
+    auto                        failing = [&](bool host, int device, size_t bytes, size_t) {
+        ++calls;
+        return calls == 2 ? moe_mmid_blob{} : fake_blob(host, device, bytes, &rollback_destroyed);
+    };
+    check(rollback_registry.materialize({ 7, 8, 9 }, 11, 0, { owner, owner_plan(1, 101, true) }, failing) ==
+              moe_mmid_materialize_status::ALLOCATION_FAILED,
+          "allocation failure did not roll back");
+    check(rollback_registry.published_contexts() == 0 && rollback_destroyed.load() == 1,
+          "failed transaction retained or published its first blob");
+}
+
+static void registry_multi_owner_context_and_identity() {
+    moe_mmid_workspace_registry registry;
+    std::atomic<int>            destroyed{ 0 };
+    auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    const moe_mmid_model_token a{ 10, 11, 12 }, b{ 10, 13, 14 };
+    check(registry.materialize(a, 1000, 0, { owner_plan(0, 20), owner_plan(1, 21, true) }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "multi-owner context failed");
+    check(registry.materialize(b, 1001, 1, { owner_plan(1, 31) }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+          "second context failed");
+    auto wrong_queue = registry.acquire(a, 1000, 0, 1, 20);
+    check(wrong_queue.status == moe_mmid_lease_status::INVALID, "wrong owner queue admitted");
+    auto lease = registry.acquire(a, 1000, 0, 1, 21);
+    check(lease.status == moe_mmid_lease_status::ACQUIRED && lease.lease.owner_device() == 1 &&
+              lease.lease.submit_device() == 0 && lease.lease.plan_identity() == 1000,
+          "lease identities mismatch");
+    check(lease.lease.slices().activation_f32.valid() && lease.lease.slices().host.valid(),
+          "exact retained slices missing");
+    check(lease.lease.terminal_release(21, lease.lease.generation() + 1) == moe_mmid_release_status::STALE,
+          "wrong lease generation released slot");
+    check(lease.lease.terminal_release(20, lease.lease.generation()) == moe_mmid_release_status::WRONG_QUEUE,
+          "wrong terminal queue released slot");
+    check(lease.lease.terminal_release(21, lease.lease.generation()) == moe_mmid_release_status::RELEASED,
+          "terminal release failed");
+}
+
+static void registry_concurrent_depth_busy() {
+    moe_mmid_workspace_registry registry;
+    std::atomic<int>            destroyed{ 0 };
+    auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    const moe_mmid_model_token token{ 30, 31, 32 };
+    check(
+        registry.materialize(token, 40, 0, { owner_plan(0, 50) }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+        "concurrent context publish failed");
+    std::atomic<int>         ready{ 0 }, attempted{ 0 }, acquired{ 0 }, busy{ 0 };
+    std::atomic<bool>        go{ false };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1);
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            auto result = registry.acquire(token, 40, 0, 0, 50);
+            if (result.status == moe_mmid_lease_status::ACQUIRED) {
+                acquired.fetch_add(1);
+            }
+            if (result.status == moe_mmid_lease_status::BUSY) {
+                busy.fetch_add(1);
+            }
+            attempted.fetch_add(1);
+            while (attempted.load() != 8) {
+                std::this_thread::yield();
+            }
+            if (result.status == moe_mmid_lease_status::ACQUIRED) {
+                check(result.lease.terminal_release(50, result.lease.generation()) == moe_mmid_release_status::RELEASED,
+                      "concurrent registry release failed");
+            }
+            (void) i;
+        });
+    }
+    while (ready.load() != 8) {
+        std::this_thread::yield();
+    }
+    go.store(true);
+    for (auto & thread : threads) {
+        thread.join();
+    }
+    check(acquired.load() == 2 && busy.load() == 6, "registry depth grew under BUSY pressure");
+}
+
+static void registry_retirement_retains_outstanding_lease() {
+    moe_mmid_registry_lease delayed;
+    std::atomic<int>        destroyed{ 0 };
+    {
+        moe_mmid_workspace_registry registry;
+        auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+            return fake_blob(host, device, bytes, &destroyed);
+        };
+        const moe_mmid_model_token token{ 40, 41, 42 };
+        check(registry.materialize(token, 50, 0, { owner_plan(0, 60) }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED,
+              "delayed context publish failed");
+        auto acquired = registry.acquire(token, 50, 0, 0, 60);
+        check(acquired.status == moe_mmid_lease_status::ACQUIRED, "delayed lease acquire failed");
+        delayed = acquired.lease;
+        check(registry.retire(token), "model retirement failed");
+        check(registry.acquire(token, 50, 0, 0, 60).status == moe_mmid_lease_status::INVALID,
+              "retired model remained admissible");
+        check(destroyed.load() == 0, "retirement destroyed outstanding lease blobs");
+    }
+    check(destroyed.load() == 0, "registry destruction destroyed outstanding lease blobs");
+    check(delayed.terminal_release(60, delayed.generation()) == moe_mmid_release_status::RELEASED,
+          "delayed terminal release failed");
+    delayed = {};
+    check(destroyed.load() == 2, "device/host blobs were not destroyed after final lease");
+}
+
 static void concurrent_depth_busy_and_reuse() {
     moe_mmid_workspace_pool  pool;
     std::atomic<int>         ready{ 0 };
@@ -191,6 +361,10 @@ int main() {
         maxima_and_overflow();
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
+        registry_materialization_and_rollback();
+        registry_multi_owner_context_and_identity();
+        registry_concurrent_depth_busy();
+        registry_retirement_retains_outstanding_lease();
         std::cout << "moe-mmid-workspace-plan: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {
