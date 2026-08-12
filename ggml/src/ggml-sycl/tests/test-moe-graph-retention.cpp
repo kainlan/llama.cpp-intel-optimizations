@@ -37,6 +37,12 @@ struct fixture {
                     execution.bind_backend(context, 1) == error::OK &&
                     execution.attach_root(context, token(), &session, &reset) == error::OK,
                 "fixture setup failed");
+        const int devices[] = { 0 };
+        const int participants[] = { 0 };
+        require(execution.begin_graph(context, session, reset, token(), &outer_epoch) == error::OK &&
+                    execution.begin_invocation(context, session, reset, outer_epoch, token(), devices, 1,
+                                               participants, 1, 0, &outer_invocation) == error::OK,
+                "fixture outer invocation setup failed");
     }
 
     graph_retention_registry & retention;
@@ -45,6 +51,8 @@ struct fixture {
     ContextId                  context{};
     SessionId                  session{};
     SessionResetEpoch          reset{};
+    GraphEpoch                outer_epoch{};
+    InvocationId              outer_invocation{};
 };
 
 class test_terminal final : public device_terminal {
@@ -160,16 +168,8 @@ int main() {
     // outer compatibility invocation remains open on the same session.
     graph_retention_registry child_retention;
     fixture                  child_fixture(child_retention);
-    GraphEpoch               outer_epoch{};
-    InvocationId             outer_invocation{};
-    const int                outer_devices[]     = { 0 };
-    const int                outer_participants[] = { 0 };
-    require(child_fixture.execution.begin_graph(child_fixture.context, child_fixture.session, child_fixture.reset,
-                                                  token(), &outer_epoch) == error::OK &&
-                child_fixture.execution.begin_invocation(
-                    child_fixture.context, child_fixture.session, child_fixture.reset, outer_epoch, token(),
-                    outer_devices, 1, outer_participants, 1, 0, &outer_invocation) == error::OK,
-            "outer compatibility invocation setup failed");
+    const GraphEpoch   outer_epoch      = child_fixture.outer_epoch;
+    const InvocationId outer_invocation = child_fixture.outer_invocation;
     std::atomic<bool>     child_ready{ true };
     std::atomic<unsigned> child_waits{ 0 };
     auto                  child_tx    = begin_tx(child_fixture);
@@ -183,11 +183,15 @@ int main() {
     require(child_tx.commit() == retention_error::OK, "child publication inside outer invocation failed");
     published_graph_token child_token;
     InvocationId          child_invocation{};
+    InvocationId child_invocation2{};
     require(child_retention.acquire_published_token(child_tx.key(), &child_token) == retention_error::OK &&
                 child_retention.begin_invocation(child_token, &child_invocation) == retention_error::OK &&
                 child_retention.finish_invocation(child_token, child_invocation) == retention_error::OK &&
+                child_retention.begin_invocation(child_token, &child_invocation2) == retention_error::OK &&
+                child_invocation2.value != child_invocation.value &&
+                child_retention.finish_invocation(child_token, child_invocation2) == retention_error::OK &&
                 child_retention.retire_exact(child_tx.key()) == retention_error::OK,
-            "child replay/retirement inside outer invocation failed");
+            "child multiple replay/retirement inside outer invocation failed");
     snapshot outer_snapshot{};
     require(child_fixture.execution.extract(child_fixture.context, &outer_snapshot) == error::OK &&
                 outer_snapshot.graph_epoch == outer_epoch && outer_snapshot.invocation == outer_invocation,
@@ -230,6 +234,39 @@ int main() {
                     token(), &removed) == error::STALE,
                 "partial abort left child lifecycle epoch behind");
     }
+
+    // A failed partial drain remains quarantined with all owners and can be
+    // retried after the exact queue proof succeeds.
+    graph_retention_registry abort_registry;
+    fixture                  abort_fixture(abort_registry);
+    auto                     abort_tx    = begin_tx(abort_fixture);
+    const auto               abort_key   = abort_tx.key();
+    auto                     abort_owner = std::make_shared<int>(123);
+    std::weak_ptr<int>       abort_weak  = abort_owner;
+    std::atomic<bool>        abort_drain_ready{ true };
+    std::atomic<bool>        abort_drain_succeeds{ false };
+    std::atomic<unsigned>    abort_drain_waits{ 0 };
+    auto abort_drain_state = std::make_shared<drain_state>(
+        drain_state{ &abort_drain_ready, &abort_drain_succeeds, &abort_drain_waits });
+    require(abort_tx.add_owner(owner_capability(1123, abort_owner, 1)) == retention_error::OK &&
+                abort_tx.note_submission(1, submit_outcome::UNKNOWN) == retention_error::OK &&
+                abort_tx.set_quiescence_proof(
+                    1, queue_quiescence_test_factory::mint(abort_drain_state, drain_ready_callback,
+                                                           drain_wait_callback)) == retention_error::OK,
+            "partial drain retry setup failed");
+    abort_owner.reset();
+    require(abort_tx.abort_partial() == retention_error::MISSING_QUIESCENCE_PROOF &&
+                abort_registry.snapshot(abort_key) && !abort_weak.expired(),
+            "failed partial drain did not retain quarantine and owners");
+    abort_drain_succeeds.store(true, std::memory_order_release);
+    require(abort_tx.abort_partial() == retention_error::OK && abort_registry.size() == 0 && abort_weak.expired() &&
+                abort_drain_waits.load() == 2,
+            "successful partial drain retry did not erase quarantine and owners");
+    epoch_snapshot abort_removed{};
+    require(abort_fixture.execution.child_extract_epoch(abort_fixture.context, abort_fixture.session,
+                                                        abort_fixture.reset, abort_key.epoch, token(),
+                                                        &abort_removed) == error::STALE,
+            "successful partial drain retry left lifecycle epoch");
 
     graph_retention_registry retention;
     fixture                  f(retention);

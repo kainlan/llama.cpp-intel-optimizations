@@ -139,7 +139,7 @@ error Registry::begin_record(ContextId             context,
     if (validate_root(owner.token_root, root) != error::OK) {
         return error::MISMATCH;
     }
-    if (owner.recording_epoch.value != 0) {
+    if (owner.recording_epoch.value != 0 || owner.graph.id.value != 0) {
         return error::BUSY;
     }
     uint64_t   value = 0;
@@ -644,29 +644,214 @@ error Registry::extract_epoch(ContextId             context,
 
 error Registry::child_begin_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                    lifecycle::ModelToken root, GraphEpoch * graph_epoch) noexcept {
-    return begin_record(context, session, reset_epoch, root, graph_epoch);
+    if (!graph_epoch) {
+        return error::NULL_OUTPUT;
+    }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::map<uint64_t, persistent_epoch_entry> staged;
+    try {
+        staged.emplace(0, persistent_epoch_entry{});
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
+    auto node = staged.extract(staged.begin());
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto & entry = it->second;
+    if (validate_session(entry, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = entry.session;
+    const auto & outer = owner.graph;
+    if (entry.state != context_phase::OPEN || owner.state != session_phase::OPEN ||
+        outer.invocation.value == 0 ||
+        (outer.state != graph_phase::OPEN && outer.state != graph_phase::SEALED)) {
+        return error::BUSY;
+    }
+    if (validate_root(owner.token_root, root) != error::OK || validate_root(outer.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (owner.recording_epoch.value != 0) {
+        return error::BUSY;
+    }
+    uint64_t   value = 0;
+    const auto rc = next_id(next_graph_epoch_, error::OVERFLOW,
+                            mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, value);
+    if (rc != error::OK) {
+        return rc;
+    }
+    node.key()                            = value;
+    node.mapped().id                      = { value };
+    node.mapped().token_root              = root;
+    node.mapped().child_epoch             = true;
+    node.mapped().recording_outer_graph   = outer.id;
+    node.mapped().recording_outer_invocation = outer.invocation;
+    owner.epochs.insert(std::move(node));
+    owner.recording_epoch = { value };
+    *graph_epoch          = { value };
+    return error::OK;
 }
 
 error Registry::child_activate(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
-    return activate(context, session, reset_epoch, graph_epoch, root);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end() ||
+        validate_session(it->second, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = it->second.session;
+    auto epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    const auto & outer = owner.graph;
+    if (validate_root(epoch.token_root, root) != error::OK || validate_root(outer.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (!epoch.child_epoch || epoch.state != epoch_phase::RECORDING || !(outer.id == epoch.recording_outer_graph) ||
+        !(outer.invocation == epoch.recording_outer_invocation) ||
+        (outer.state != graph_phase::OPEN && outer.state != graph_phase::SEALED)) {
+        return error::BUSY;
+    }
+    if (owner.active_epoch.value != 0) {
+        auto old = owner.epochs.find(owner.active_epoch.value);
+        if (old == owner.epochs.end() || old->second.state != epoch_phase::ACTIVE) {
+            return error::MISMATCH;
+        }
+        old->second.state = epoch_phase::RETIRING;
+    }
+    epoch.state           = epoch_phase::ACTIVE;
+    owner.active_epoch    = graph_epoch;
+    owner.recording_epoch = {};
+    return error::OK;
 }
 
 error Registry::child_begin_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                        GraphEpoch graph_epoch, lifecycle::ModelToken root,
                                        InvocationId * invocation) noexcept {
-    return begin_invocation(context, session, reset_epoch, graph_epoch, root, invocation);
+    if (!invocation) {
+        return error::NULL_OUTPUT;
+    }
+    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
+    if (allocation_rc != error::OK) {
+        return allocation_rc;
+    }
+    std::set<uint64_t> staged;
+    std::map<uint64_t, std::pair<GraphEpoch, InvocationId>> staged_owner;
+    try {
+        staged.insert(0);
+        staged_owner.emplace(0, std::pair<GraphEpoch, InvocationId>{});
+    } catch (const std::bad_alloc &) {
+        return error::ALLOCATION_FAILED;
+    }
+    auto invocation_node = staged.extract(staged.begin());
+    auto owner_node      = staged_owner.extract(staged_owner.begin());
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end() ||
+        validate_session(it->second, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = it->second.session;
+    auto epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    const auto & outer = owner.graph;
+    if (validate_root(epoch.token_root, root) != error::OK || validate_root(outer.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (!epoch.child_epoch || epoch.state != epoch_phase::ACTIVE || !(owner.active_epoch == graph_epoch) ||
+        outer.invocation.value == 0 ||
+        (outer.state != graph_phase::OPEN && outer.state != graph_phase::SEALED)) {
+        return error::BUSY;
+    }
+    uint64_t value = 0;
+    const auto rc = next_id(next_invocation_id_, error::OVERFLOW,
+                            mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, value);
+    if (rc != error::OK) {
+        return rc;
+    }
+    invocation_node.value() = value;
+    owner_node.key()        = value;
+    owner_node.mapped()     = { outer.id, outer.invocation };
+    epoch.invocations.insert(std::move(invocation_node));
+    epoch.child_invocation_owners.insert(std::move(owner_node));
+    *invocation = { value };
+    return error::OK;
 }
 
 error Registry::child_finish_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                         GraphEpoch graph_epoch, InvocationId invocation,
                                         lifecycle::ModelToken root) noexcept {
-    return finish_invocation(context, session, reset_epoch, graph_epoch, invocation, root);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end() ||
+        validate_session(it->second, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = it->second.session;
+    auto epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end()) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    if (!epoch.child_epoch) {
+        return error::MISMATCH;
+    }
+    const auto invocation_it = epoch.invocations.find(invocation.value);
+    const auto parent_it = epoch.child_invocation_owners.find(invocation.value);
+    if (invocation.value == 0 || invocation_it == epoch.invocations.end() ||
+        parent_it == epoch.child_invocation_owners.end()) {
+        return error::STALE;
+    }
+    const auto & outer = owner.graph;
+    if (validate_root(epoch.token_root, root) != error::OK || validate_root(outer.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (!(parent_it->second.first == outer.id) || !(parent_it->second.second == outer.invocation)) {
+        return error::MISMATCH;
+    }
+    epoch.invocations.erase(invocation_it);
+    epoch.child_invocation_owners.erase(parent_it);
+    return error::OK;
 }
 
 error Registry::child_note_resources_published(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                                GraphEpoch graph_epoch, lifecycle::ModelToken root) noexcept {
-    return note_record_resources_published(context, session, reset_epoch, graph_epoch, root);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end() ||
+        validate_session(it->second, session, reset_epoch) != error::OK) {
+        return error::STALE;
+    }
+    auto & owner = it->second.session;
+    auto epoch_it = owner.epochs.find(graph_epoch.value);
+    if (epoch_it == owner.epochs.end() || !(owner.recording_epoch == graph_epoch)) {
+        return error::STALE;
+    }
+    auto & epoch = epoch_it->second;
+    const auto & outer = owner.graph;
+    if (validate_root(epoch.token_root, root) != error::OK || validate_root(outer.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (!epoch.child_epoch || epoch.state != epoch_phase::RECORDING || !(outer.id == epoch.recording_outer_graph) ||
+        !(outer.invocation == epoch.recording_outer_invocation)) {
+        return error::BUSY;
+    }
+    epoch.resources_published = true;
+    return error::OK;
 }
 
 error Registry::child_rollback_record(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
@@ -693,7 +878,8 @@ error Registry::child_abort_partial_record(ContextId context, SessionId session,
     if (validate_root(epoch_it->second.token_root, root) != error::OK) {
         return error::MISMATCH;
     }
-    if (epoch_it->second.state != epoch_phase::RECORDING || !epoch_it->second.invocations.empty()) {
+    if (!epoch_it->second.child_epoch || epoch_it->second.state != epoch_phase::RECORDING ||
+        !epoch_it->second.invocations.empty()) {
         return error::BUSY;
     }
     owner.recording_epoch = {};
@@ -744,8 +930,11 @@ error Registry::begin_graph(ContextId context, SessionId session, SessionResetEp
     if (session_rc != error::OK) return session_rc;
     if (entry.session.state != session_phase::OPEN || validate_root(entry.session.token_root, root) != error::OK) return error::MISMATCH;
     const auto & graph = entry.session.graph;
-    if (persistent_epochs_live(entry.session) || graph.state == graph_phase::OPEN ||
-        graph.state == graph_phase::SEALED || graph_terminal_unretired(graph)) {
+    const bool non_child_epoch_live = std::any_of(
+        entry.session.epochs.begin(), entry.session.epochs.end(),
+        [](const auto & item) { return !item.second.child_epoch && item.second.state != epoch_phase::RETIRED; });
+    if (non_child_epoch_live || graph.state == graph_phase::OPEN || graph.state == graph_phase::SEALED ||
+        graph_terminal_unretired(graph)) {
         return error::BUSY;
     }
     uint64_t graph_value = 0;

@@ -319,9 +319,13 @@ class Registry {
         epoch_phase                                              state = epoch_phase::RECORDING;
         lifecycle::ModelToken                                    token_root{};
         std::set<uint64_t>                                       invocations;
+        GraphEpoch                                               recording_outer_graph{};
+        InvocationId                                             recording_outer_invocation{};
+        std::map<uint64_t, std::pair<GraphEpoch, InvocationId>>  child_invocation_owners;
         uint64_t                                                 retire_serial = 0;
         uint64_t                                                 no_resources_proof_serial = 0;
         bool                                                     resources_published       = false;
+        bool                                                     child_epoch              = false;
         std::vector<int>                                         retire_devices;
         std::map<int, std::shared_ptr<RetireTerminal>>           terminals;
     };

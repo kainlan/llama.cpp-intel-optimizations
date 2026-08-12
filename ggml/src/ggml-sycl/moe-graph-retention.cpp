@@ -821,6 +821,12 @@ retention_error graph_recording_transaction::abort_partial() noexcept {
     if (activated_ || retirement_pending_) {
         return rollback();
     }
+    // Publish the partial owner set as non-invokable quarantine before any
+    // potentially failing drain. This makes a failed abort durable and
+    // retryable instead of leaving its capabilities visible only on the stack.
+    if (resources_published_ && (!retention_ || retention_->quarantine(record_) != retention_error::OK)) {
+        return retention_error::BUSY;
+    }
     // No submission label means no queue was touched by this child record.
     // Once a device is labelled SUBMITTED/UNKNOWN, only its exact terminal or
     // queue-quiescence proof may authorize lifecycle removal.
@@ -842,15 +848,17 @@ retention_error graph_recording_transaction::abort_partial() noexcept {
             }
         }
     }
-    if (!retention_ || retention_->discard_partial(record_.key) != retention_error::OK) {
-        return retention_error::BUSY;
-    }
     if (!lifecycle_ ||
         lifecycle_->child_abort_partial_record(record_.key.context, record_.session, record_.reset_epoch,
                                                record_.key.epoch, record_.root) != execution::error::OK) {
-        // The transaction still owns every capability locally. Do not mark it
-        // finished or release owners after a lifecycle removal failure.
+        // Quarantine remains authoritative and the transaction retains its
+        // local copy, so a lifecycle refusal cannot poison either registry.
         return retention_error::LIFECYCLE_ERROR;
+    }
+    if (!retention_ || retention_->discard_partial(record_.key) != retention_error::OK) {
+        // discard_partial cannot contend for a non-active transaction owned by
+        // this object; fail closed if that invariant is ever violated.
+        return retention_error::BUSY;
     }
     finished_ = true;
     release_local_owners();
