@@ -22705,34 +22705,13 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(ggml_type      
         return cap;
     }
 
-    // Reviewed direct primitives consume the canonical AoS expert allocation in
-    // place. Admission is shape/layout/owner complete; no converter or weight
-    // migration may be selected after this point.
+    // Direct primitives exist, but the retained device executor is not a
+    // capability until admission owns an atomic all-owner workspace bundle.
+    // Keep this query boundary closed; the executor's opaque-bundle guard is
+    // defense in depth rather than capability authority.
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
-        const int64_t block_k = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
-        if (phase != moe_route_phase::DECODE) {
-            // Primary prompt dispatch still allocates a whole-batch Q8 artifact;
-            // do not advertise the bounded recipe until chunk execution owns it.
-            cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
-            cap.reason        = "q1-nvfp4-direct-prompt-chunking-pending";
-            return cap;
-        }
-        if (layout != GGML_LAYOUT_AOS) {
-            cap.reject_reason = moe_layer_reject_reason::LAYOUT;
-            cap.reason        = "q1-nvfp4-direct-requires-aos";
-            return cap;
-        }
-        if (K % block_k != 0 || K > INT_MAX || N > INT_MAX) {
-            cap.reject_reason = moe_layer_reject_reason::SHAPE;
-            cap.reason        = "q1-nvfp4-direct-invalid-block-shape";
-            return cap;
-        }
-        cap.supported             = true;
-        cap.kernel                = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
-        cap.requires_host_staging = route_device != submit_device;
-        cap.reject_reason         = moe_layer_reject_reason::NONE;
-        cap.reason                = route_device == submit_device ? "local-q1-nvfp4-aos" :
-                                                                    "secondary-q1-nvfp4-aos-owner-queue";
+        cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
+        cap.reason        = "device-type-stage2-unimplemented";
         return cap;
     }
 

@@ -213,17 +213,18 @@ void source_contract_tests() {
     const size_t validation     = cpp.find("mmvq_q1_nvfp4_aos_id_batch_shape_valid", id_api);
     const size_t event_creation = cpp.find("sycl::event event;", id_api);
     assert(id_api != std::string::npos && validation < event_creation);  // reject before any launch is selected
-    // Stage2 advertises only the immutable retained AoS recipe. The dense
-    // converter/materializer remains absent and unsupported layouts fail closed.
+    // Direct primitives remain compiled, but the central query boundary must
+    // not advertise them until registry-owned all-owner workspace admission is
+    // complete. The opaque workspace guard remains defense in depth.
     const std::string policy = slurp("ggml/src/ggml-sycl/ggml-sycl.cpp");
     const std::string recipe = slurp("ggml/src/ggml-sycl/moe-resolved-batch.hpp");
-    assert(policy.find("DEVICE_MMVQ_Q1_NVFP4_AOS") != std::string::npos);
-    assert(policy.find("q1-nvfp4-direct-requires-aos") != std::string::npos);
-    assert(policy.find("q1-nvfp4-direct-prompt-chunking-pending") != std::string::npos);
+    assert(policy.find("device-type-stage2-unimplemented") != std::string::npos);
+    assert(policy.find("q1-nvfp4-direct-requires-aos") == std::string::npos);
+    assert(policy.find("q1-nvfp4-direct-prompt-chunking-pending") == std::string::npos);
     assert(policy.find("mmvq_submit_q1_nvfp4_aos(*target_queue") != std::string::npos);
     assert(cpp.find("mmvq_submit_q1_nvfp4_aos_id(*stream") != std::string::npos);
-    assert(recipe.find("plan_moe_q1_nvfp4_device_workspace") != std::string::npos);
-    assert(recipe.find("moe_recipe_queue::OWNER") != std::string::npos);
+    assert(recipe.find("moe_admitted_workspace_bundle") != std::string::npos);
+    assert(recipe.find("WORKSPACE_LEASE_MISSING") != std::string::npos);
 }
 }  // namespace
 
