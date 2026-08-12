@@ -114,6 +114,8 @@ static ggml_sycl::moe_batch_route route_for(void *                         ptr,
     route.recipe.transfer = residency == ggml_sycl::moe_batch_residency::HOST ?
                                 ggml_sycl::moe_recipe_transfer::HOST_ACTIVATION :
                                 ggml_sycl::moe_recipe_transfer::NONE;
+    route.recipe_reason = residency == ggml_sycl::moe_batch_residency::HOST ? "test-host-recipe" :
+                                                                               "test-device-recipe";
     return route;
 }
 
@@ -619,7 +621,15 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             const int32_t ids[]    = { 9 };
             auto          admitted = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return host; });
             CHECK(admitted);
-            CHECK(choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes));
+            const auto & admitted_operand = admitted.batch.operands[0];
+            CHECK(admitted_operand.recipe_reason == host.recipe_reason);
+            CHECK(admitted_operand.admitted_recipe_signature ==
+                  moe_admitted_recipe_signature(admitted_operand.recipe, admitted_operand.lease));
+            CHECK(make_moe_admitted_recipe_ticket(admitted_operand).valid());
+            auto substituted_lease = admitted_operand;
+            substituted_lease.lease = weight_handle(&value, 0, GGML_LAYOUT_AOS, 990, false);
+            CHECK(!make_moe_admitted_recipe_ticket(substituted_lease).valid());
+            CHECK(choose_moe_batch_executor(admitted_operand, 0, false, ws.total_bytes));
             auto mutated = admitted.batch.operands[0];
             mutated.recipe.request.rows++;
             auto choice = choose_moe_batch_executor(mutated, 0, false, ws.total_bytes);

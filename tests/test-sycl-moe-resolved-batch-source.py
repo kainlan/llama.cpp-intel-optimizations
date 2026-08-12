@@ -117,6 +117,15 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "terminal role retention": "moe_retained_role_bundle roles",
         "role result defaults closed": "reject = moe_batch_reject_reason::MISSING_ROLE",
         "role alignment opens explicitly": "out.reject = moe_batch_reject_reason::NONE",
+        "lease-bound recipe authority":
+            "moe_admitted_recipe_signature(const moe_execution_recipe & recipe, const mem_handle & lease)",
+        "recipe signature mixes lease identity":
+            "h = (h ^ lease.stable_identity_hash()) * 1099511628211ULL",
+        "lease-bound recipe admission":
+            "operand.admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease)",
+        "retained recipe reason": "operand.recipe_reason = route.recipe_reason",
+        "retained exact queue capability":
+            "operand.recipe_queue_capability = route.recipe_queue_capability",
     }
     required_source = {
         "canonical resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
@@ -140,6 +149,14 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "direct recipe explicit invocation authority":
             "queue_capability && queue_capability->valid()",
         "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
+        "capability recipe reason retention":
+            "normalized.recipe_reason = cap.reason ? cap.reason : \"capability-reason-unavailable\"",
+        "direct recipe retains exact queue capability":
+            "normalized.recipe_queue_capability = *queue_capability",
+        "direct admission consumes retained queue capability":
+            "queue_cap = decode.operands.front().recipe_queue_capability",
+        "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe.kernel)",
+        "fallback uses retained recipe reason": "operand.recipe_reason ? operand.recipe_reason",
         "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
         "execution-row bounded activation copy":
             "std::memcpy(act, task.activations, rows * static_cast<size_t>(K) * sizeof(float))",
@@ -299,6 +316,10 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         failures.append("prompt IDs are not snapshotted exactly once")
     if mmid.count("append_retained_operand(") != 2:
         failures.append("decode and hybrid prompt routers share retained dispatch helper")
+    append_start = mmid.index("auto append_retained_operand")
+    append_end = mmid.index("if (false)", append_start)
+    if has_tokens(mmid[append_start:append_end], "ggml_sycl_moe_query_route_capability("):
+        failures.append("retained partition re-queries recipe authority")
 
     # Token-wise boundaries prevent comments, formatting, or a dead nested block
     # from hiding authority reacquisition in the complete active pair path.
@@ -493,6 +514,20 @@ def test_contract_and_mutation_witnesses() -> None:
         ("recipe-drops-explicit-queue-authority", header,
          source.replace("queue_capability && queue_capability->valid()",
                         "queue_capability", 1), host_test, mem_source),
+        ("drop-lease-bound-recipe-authority", header.replace(
+            "h = (h ^ lease.stable_identity_hash()) * 1099511628211ULL;", "(void) lease;"),
+         source, host_test, mem_source),
+        ("drop-retained-recipe-reason", header.replace(
+            "operand.recipe_reason             = route.recipe_reason;", ""),
+         source, host_test, mem_source),
+        ("drop-retained-queue-authority", header.replace(
+            "operand.recipe_queue_capability   = route.recipe_queue_capability;", ""),
+         source, host_test, mem_source),
+        ("requery-retained-recipe-authority", header,
+         source.replace("(void) phase;", "(void) ggml_sycl_moe_query_route_capability(\n"
+                        "src0->type, operand.actual_layout, phase, src0->ne[0], src0->ne[1], rows,\n"
+                        "operand.owning_device, moe_layer_route_residency::DEVICE, ctx.device);", 1),
+         host_test, mem_source),
         ("raw-direct-rejects-owned", header.replace(
             "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()",
             "route.lease.kind() == mem_handle_kind::DIRECT"), source, host_test, mem_source),

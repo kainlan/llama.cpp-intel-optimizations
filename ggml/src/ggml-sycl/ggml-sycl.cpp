@@ -23505,6 +23505,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 normalized.recipe.queue    = moe_recipe_queue::NONE;
                 normalized.recipe.transfer = moe_recipe_transfer::HOST_ACTIVATION;
                 normalized.recipe.valid    = true;
+                normalized.recipe_reason   = "host-resident";
                 if (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) {
                     normalized.recipe.valid = plan_moe_host_workspace(
                         normalized.recipe.request, ggml_row_size(traits->vec_dot_type, src0->ne[0]),
@@ -23516,7 +23517,11 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 src0->type, normalized.actual_layout, normalized.recipe.request.phase, src0->ne[0], src0->ne[1], rows,
                 normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device, &normalized.lease,
                 invocation_backend, invocation_queue, queue_capability);
+            normalized.recipe_reason = cap.reason ? cap.reason : "capability-reason-unavailable";
             if (cap.supported) {
+                if (cap.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS && queue_capability) {
+                    normalized.recipe_queue_capability = *queue_capability;
+                }
                 normalized.recipe.kind = normalized.residency == moe_batch_residency::PRIMARY_DEVICE ?
                                              moe_batch_executor::PRIMARY_DEVICE :
                                              moe_batch_executor::SECONDARY_DEVICE;
@@ -63680,8 +63685,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::moe_mmid_model_token model_token{
                 root.model.value, root.load.value, root.owner.generation };
             sycl::queue * exact_queue = ctx.stream();
-            auto queue_cap = ggml_sycl::unified_cache_moe_mmid_exact_queue(
-                model_token, plan_snapshot, ctx.device, ctx.device, exact_queue);
+            // The direct recipe and exact queue capability were proven together
+            // during canonical batch admission. Preserve that immutable authority;
+            // do not re-query the registry after normalization.
+            auto queue_cap = decode.operands.front().recipe_queue_capability;
+            for (const auto & operand : decode.operands) {
+                if (!operand.recipe_queue_capability.valid() ||
+                    operand.recipe_queue_capability.cookie() != queue_cap.cookie() ||
+                    operand.recipe_queue_capability.owner_device() != queue_cap.owner_device()) {
+                    queue_cap = {};
+                    break;
+                }
+            }
             ggml_sycl::execution::AuthoritativeInvocationSnapshot invocation;
             auto & execution_registry = ggml_sycl::execution::global_registry();
             const bool snapshot_ok = private_table && queue_cap.valid() &&
@@ -64695,12 +64710,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
                     (operand.owning_device >= 0 && operand.owning_device < n_gpu_devs &&
                      ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device));
-                const moe_route_capability capability = operand.residency == ggml_sycl::moe_batch_residency::HOST ?
-                                                            moe_route_capability{} :
-                                                            ggml_sycl_moe_query_route_capability(
-                                                                src0->type, operand.actual_layout, phase, src0->ne[0],
-                                                                src0->ne[1], rows, operand.owning_device,
-                                                                moe_layer_route_residency::DEVICE, ctx.device);
+                // Admission already retained the exact capability-derived recipe
+                // and bound its signature to this lease. Never fabricate a second
+                // argument-less capability query at fallback/partition time.
+                (void) phase;
+                (void) rows;
                 const auto choice = ggml_sycl::choose_moe_batch_executor(
                     operand, ctx.device, queue_available, operand.recipe.workspace.total_bytes);
                 if (!choice) {
@@ -64710,8 +64724,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         src0->name ? src0->name : "?", operand.occurrence, operand.expert_id, operand.owning_device,
                         ggml_sycl::moe_batch_reject_reason_name(choice.reject), ggml_type_name(src0->type),
                         ggml_sycl_layout_mode_name(operand.actual_layout),
-                        ggml_sycl::moe_route_kernel_name(capability.kernel),
-                        capability.reason ? capability.reason : "not-queried", queue_available ? 1 : 0);
+                        ggml_sycl::moe_route_kernel_name(operand.recipe.kernel),
+                        operand.recipe_reason ? operand.recipe_reason : "retained-recipe-reason-unavailable",
+                        queue_available ? 1 : 0);
                     return choice;
                 }
 

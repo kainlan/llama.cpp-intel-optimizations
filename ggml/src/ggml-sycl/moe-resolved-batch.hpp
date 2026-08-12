@@ -212,6 +212,14 @@ inline size_t moe_execution_recipe_signature(const moe_execution_recipe & recipe
     return h;
 }
 
+inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe, const mem_handle & lease) {
+    size_t h = moe_execution_recipe_signature(recipe);
+    // Bind recipe authority to the allocator/cache-minted identity. A recipe
+    // copied onto a different same-layout lease is not an admitted recipe.
+    h = (h ^ lease.stable_identity_hash()) * 1099511628211ULL;
+    return h;
+}
+
 inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
                                           size_t                       admitted_signature,
                                           const mem_handle &           lease,
@@ -249,7 +257,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     }
-    if (moe_execution_recipe_signature(recipe) != admitted_signature || recipe.request.submit != submit_device) {
+    if (moe_admitted_recipe_signature(recipe, lease) != admitted_signature || recipe.request.submit != submit_device) {
         return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
     }
     const resolved_ptr resolved = lease.resolve();
@@ -325,8 +333,10 @@ struct moe_batch_route {
     bool                 has_ready_event   = false;
     sycl::event          ready_event;
     mem_handle           lease;
-    moe_execution_recipe recipe;
-    int                  source_reason = 0;
+    moe_execution_recipe           recipe;
+    moe_mmid_queue_capability      recipe_queue_capability;
+    const char *                   recipe_reason = "recipe-unavailable";
+    int                            source_reason = 0;
 
     bool has_authoritative_planned_alternate() const { return authoritative_planned_alternate_; }
 
@@ -363,8 +373,10 @@ struct moe_resolved_operand {
     bool                 has_ready_event  = false;
     sycl::event          ready_event;
     mem_handle           lease;
-    moe_execution_recipe recipe;
-    size_t               admitted_recipe_signature = 0;
+    moe_execution_recipe           recipe;
+    moe_mmid_queue_capability      recipe_queue_capability;
+    const char *                   recipe_reason = "recipe-unavailable";
+    size_t                         admitted_recipe_signature = 0;
 };
 
 // Opaque execution authority created only from an admitted operand. Runtime
@@ -386,7 +398,7 @@ class moe_admitted_recipe_ticket {
 inline moe_admitted_recipe_ticket make_moe_admitted_recipe_ticket(const moe_resolved_operand & operand) {
     moe_admitted_recipe_ticket ticket;
     if (operand.recipe.valid &&
-        operand.admitted_recipe_signature == moe_execution_recipe_signature(operand.recipe)) {
+        operand.admitted_recipe_signature == moe_admitted_recipe_signature(operand.recipe, operand.lease)) {
         ticket.recipe_    = operand.recipe;
         ticket.signature_ = operand.admitted_recipe_signature;
         ticket.valid_     = true;
@@ -773,7 +785,9 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
         }
         operand.lease                     = route.lease;
         operand.recipe                    = route.recipe;
-        operand.admitted_recipe_signature = moe_execution_recipe_signature(route.recipe);
+        operand.recipe_queue_capability   = route.recipe_queue_capability;
+        operand.recipe_reason             = route.recipe_reason;
+        operand.admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease);
         if (!route.recipe.valid) {
             out.reject     = moe_batch_reject_reason::RECIPE_MISSING;
             out.occurrence = i;
