@@ -116,7 +116,8 @@ GGML_BACKEND_API void ggml_backend_sycl_register_host_weight_tensor(ggml_backend
                                                                     struct ggml_tensor * tensor);
 
 // Cache identity for weights and MoE experts (no pointers, layout handled separately).
-// model_id: unique per model load
+// load_scoped: when true, the complete model load/slot owner is part of identity
+// model_id/load_txn_id/model_slot/slot_generation: exact lifecycle owner
 // has_gguf/file_id/file_idx/file_offs/nbytes: GGUF-backed weights
 // name_hash/type/ne: non-GGUF weights (fallback identity)
 // aux_id: reserved for non-GGUF/MoE uniqueness (e.g., cache_uuid)
@@ -133,7 +134,11 @@ GGML_BACKEND_API void ggml_backend_sycl_register_host_weight_tensor(ggml_backend
 // identity keeps every logical field in its key and never shares.
 struct ggml_sycl_cache_id {
     bool           valid;
+    bool           load_scoped;
     uint64_t       model_id;
+    uint64_t       load_txn_id;
+    uint32_t       model_slot;
+    uint64_t       slot_generation;
     bool           has_gguf;
     uint64_t       file_id;
     uint16_t       file_idx;

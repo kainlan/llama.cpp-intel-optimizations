@@ -24,10 +24,10 @@ namespace ggml_sycl {
 // The four: cache_id_equal and cache_id_hash below; same_logical_moe_expert in
 // unified-cache.cpp; retained_cache_id_less in cpu-dispatch.cpp.
 //
-// 192 is the size on the LP64 targets this backend builds for. On a platform
+// 216 is the size on the LP64 targets this backend builds for. On a platform
 // with a different layout this fires with nothing wrong -- read the four sites,
 // confirm they are complete, and record the new size.
-static_assert(sizeof(ggml_sycl_cache_id) == 192,
+static_assert(sizeof(ggml_sycl_cache_id) == 216,
               "ggml_sycl_cache_id changed: update cache_id_equal, cache_id_hash, "
               "same_logical_moe_expert (unified-cache.cpp) and retained_cache_id_less (cpu-dispatch.cpp)");
 
@@ -55,7 +55,12 @@ static inline size_t cache_hash_combine(size_t seed, size_t value) {
 // Without GGUF identity there is no physical fact to key on, so model_id,
 // name_hash and aux_id all stay in and such weights never share across models.
 static inline bool cache_id_equal(const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
-    if (a.valid != b.valid || a.has_gguf != b.has_gguf) {
+    if (a.valid != b.valid || a.load_scoped != b.load_scoped || a.has_gguf != b.has_gguf) {
+        return false;
+    }
+    if (a.load_scoped &&
+        (a.model_id != b.model_id || a.load_txn_id != b.load_txn_id || a.model_slot != b.model_slot ||
+         a.slot_generation != b.slot_generation)) {
         return false;
     }
     const bool compare_logical = !a.has_gguf;
@@ -86,7 +91,14 @@ struct cache_id_hash {
         // two physically identical weights land in the same bucket.
         size_t h = 0;
         h        = cache_hash_combine(h, std::hash<bool>()(id.valid));
+        h        = cache_hash_combine(h, std::hash<bool>()(id.load_scoped));
         h        = cache_hash_combine(h, std::hash<bool>()(id.has_gguf));
+        if (id.load_scoped) {
+            h = cache_hash_combine(h, std::hash<uint64_t>()(id.model_id));
+            h = cache_hash_combine(h, std::hash<uint64_t>()(id.load_txn_id));
+            h = cache_hash_combine(h, std::hash<uint32_t>()(id.model_slot));
+            h = cache_hash_combine(h, std::hash<uint64_t>()(id.slot_generation));
+        }
         if (!id.has_gguf) {
             h = cache_hash_combine(h, std::hash<uint64_t>()(id.model_id));
             h = cache_hash_combine(h, std::hash<uint64_t>()(id.name_hash));

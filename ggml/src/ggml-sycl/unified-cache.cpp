@@ -5301,7 +5301,9 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
         // Must track cache_id_equal's field list -- see the static_assert in
         // unified-cache-key.hpp, which fires when a field is added here.
         auto same_logical_moe_expert = [](const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
-            if (!a.valid || !b.valid || a.model_id != b.model_id || a.has_gguf != b.has_gguf ||
+            if (!a.valid || !b.valid || a.load_scoped != b.load_scoped || a.model_id != b.model_id ||
+                a.load_txn_id != b.load_txn_id || a.model_slot != b.model_slot ||
+                a.slot_generation != b.slot_generation || a.has_gguf != b.has_gguf ||
                 a.file_id != b.file_id || a.file_idx != b.file_idx || a.file_offs != b.file_offs ||
                 a.nbytes != b.nbytes || a.name_hash != b.name_hash || a.type != b.type ||
                 a.tp_sharded != b.tp_sharded || a.tp_rank != b.tp_rank || a.tp_world_size != b.tp_world_size) {
@@ -12452,53 +12454,6 @@ void unpin_all_experts() {
 
 // === Routing-Aware Expert Pre-staging ===
 
-// Helper: Create a cache ID for an expert that matches the dispatch path's key generation.
-// Uses semantic tensor identity (model id + tensor name + expert id + type/dims), not graph-local
-// tensor/extra wrapper identity, so prestaged entries are found across PP/TG graph transitions.
-static ggml_sycl_cache_id make_expert_cache_id(const char * tensor_name,
-                                               uint64_t     cache_uuid,
-                                               uint32_t     model_id,
-                                               int          expert_id,
-                                               ggml_type    tensor_type = GGML_TYPE_COUNT,
-                                               int64_t      ne0         = 0,
-                                               int64_t      ne1         = 0) {
-    (void) cache_uuid;
-    ggml_sycl_cache_id id{};
-
-    // Use name-based key with expert_id suffix for per-expert uniqueness.
-    // Matches ggml_sycl_get_moe_expert_cache_key in ggml-sycl.cpp.
-    std::string expert_name = (tensor_name && tensor_name[0]) ? std::string(tensor_name) : std::string("unknown");
-    expert_name += ":e";
-    expert_name += std::to_string(expert_id);
-    uint64_t name_hash = static_cast<uint64_t>(std::hash<std::string>()(expert_name));
-
-    id.valid         = true;
-    id.model_id      = model_id;
-    id.has_gguf      = false;
-    id.file_id       = 0;
-    id.file_idx      = 0;
-    id.file_offs     = 0;
-    id.nbytes        = 0;
-    id.name_hash     = name_hash;
-    id.type          = tensor_type;
-    id.tp_sharded    = false;
-    id.tp_rank       = 0;
-    id.tp_world_size = 1;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        id.ne[i]           = 0;
-        id.tp_local_ne[i]  = 0;
-        id.tp_offset_ne[i] = 0;
-    }
-    id.ne[0] = ne0;
-    id.ne[1] = ne1;
-    id.ne[2] = 1;
-    id.ne[3] = 1;
-
-    id.aux_id = 0;
-
-    return id;
-}
-
 prestage_result prestage_routed_experts(void *          queue_ptr,
                                         const int32_t * expert_ids,
                                         int             n_expert_used,
@@ -12508,13 +12463,8 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
                                         size_t          expert_size,
                                         int             layer_id,
                                         int             n_experts_total,
-                                        int             device_id,
-                                        const char *    tensor_name,
-                                        uint64_t        cache_uuid,
-                                        uint32_t        model_id,
-                                        ggml_type       tensor_type,
-                                        int64_t         ne0,
-                                        int64_t         ne1) {
+                                        int                         device_id,
+                                        const ggml_sycl_cache_id * canonical_keys) {
     prestage_result result{};
     result.n_unique = 0;
     result.success  = false;
@@ -12564,8 +12514,12 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         GGML_LAYOUT_XMX_TILED_BUNDLE4,
     };
     for (int32_t expert_id : unique_experts) {
-        ggml_sycl_cache_id key =
-            make_expert_cache_id(tensor_name, cache_uuid, model_id, expert_id, tensor_type, ne0, ne1);
+        const ggml_sycl_cache_id key = canonical_keys ? canonical_keys[expert_id] : ggml_sycl_cache_id{};
+        if (!key.valid || !key.load_scoped) {
+            result.n_miss++;
+            result.expert_locations[expert_id] = cache_location::UNKNOWN;
+            continue;
+        }
 
         bool device_resolved = false;
         for (ggml_layout_mode layout : pin_layouts) {
@@ -12612,13 +12566,8 @@ void unpin_routed_experts(const int32_t * expert_ids,
                           size_t          expert_stride,
                           int             layer_id,
                           int             n_experts_total,
-                          int             device_id,
-                          const char *    tensor_name,
-                          uint64_t        cache_uuid,
-                          uint32_t        model_id,
-                          ggml_type       tensor_type,
-                          int64_t         ne0,
-                          int64_t         ne1) {
+                          int                         device_id,
+                          const ggml_sycl_cache_id * canonical_keys) {
     // Validate inputs
     if (!expert_ids || n_expert_used <= 0 || n_tokens <= 0 || !weight_base_ptr) {
         return;
@@ -12643,12 +12592,13 @@ void unpin_routed_experts(const int32_t * expert_ids,
 
     // Unpin all unique experts
     for (int32_t expert_id : unique_experts) {
-        ggml_sycl_cache_id key =
-            make_expert_cache_id(tensor_name, cache_uuid, model_id, expert_id, tensor_type, ne0, ne1);
-
-        cache->unpin(key, GGML_LAYOUT_AOS);
+        const ggml_sycl_cache_id key = canonical_keys ? canonical_keys[expert_id] : ggml_sycl_cache_id{};
+        if (key.valid && key.load_scoped) {
+            cache->unpin(key, GGML_LAYOUT_AOS);
+        }
     }
 
+    GGML_UNUSED(expert_stride);
     GGML_SYCL_DEBUG("[UNPIN] Layer %d: Unpinned %zu experts\n", layer_id, unique_experts.size());
 }
 

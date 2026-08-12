@@ -4290,13 +4290,8 @@ prestage_result prestage_routed_experts(void *          queue,
                                         size_t          expert_size,
                                         int             layer_id,
                                         int             n_experts_total,
-                                        int             device_id,
-                                        const char *    tensor_name,
-                                        uint64_t        cache_uuid,
-                                        uint32_t        model_id,
-                                        ggml_type       tensor_type = GGML_TYPE_COUNT,
-                                        int64_t         ne0         = 0,
-                                        int64_t         ne1         = 0);
+                                        int                         device_id,
+                                        const ggml_sycl_cache_id * canonical_keys);
 
 // Unpin routed experts after MoE computation completes.
 // Call this after the MoE kernel finishes to allow eviction of these experts.
@@ -4317,13 +4312,8 @@ void unpin_routed_experts(const int32_t * expert_ids,
                           size_t          expert_stride,
                           int             layer_id,
                           int             n_experts_total,
-                          int             device_id,
-                          const char *    tensor_name,
-                          uint64_t        cache_uuid,
-                          uint32_t        model_id,
-                          ggml_type       tensor_type = GGML_TYPE_COUNT,
-                          int64_t         ne0         = 0,
-                          int64_t         ne1         = 0);
+                          int                         device_id,
+                          const ggml_sycl_cache_id * canonical_keys);
 
 // === Multi-Device Partial Row API (free-standing wrappers) ===
 

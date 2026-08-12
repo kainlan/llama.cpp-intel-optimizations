@@ -17,10 +17,10 @@
 // is what kept a tied embedding/output-head pair staged twice.  The tests below
 // assert the policy instead.
 //
-// What is NOT changed: the MoE expert path.  Expert slices are synthetic views
-// with no file identity of their own (has_gguf == false), so they still key on
-// name + expert id + aux_id, and the original llama.cpp-twc regression -- expert
-// keys colliding on a null identity hash -- is still covered.
+// MoE expert slices use a stricter policy than dense weights: their canonical
+// keys name both the exact ModelToken owner and their slice of the registered
+// GGUF parent. The legacy logical-key collision regression remains covered for
+// non-GGUF ids, while test 8 pins the load-scoped replacement contract.
 //
 // Related: llama.cpp-qvid (this file's failing key dump), llama.cpp-i14 (stable
 // logical + representation identity keys), llama.cpp-twc (the original expert
@@ -445,9 +445,9 @@ static bool test_cache_id_equality_policy() {
 // =============================================================================
 // Test 7: MoE expert keys stay unique (llama.cpp-twc)
 //
-// Expert slices are synthetic views: has_gguf is false, so they key on
-// name + expert id + aux_id. The original regression was a null identity hash
-// collapsing every expert onto one key.
+// This preserves the original logical-id collision regression independently
+// of the canonical GGUF/load-scoped builder. The original regression was a
+// null identity hash collapsing every expert onto one key.
 // =============================================================================
 static bool test_moe_expert_keys_unique() {
     printf("TEST: test_moe_expert_keys_unique\n");
@@ -527,6 +527,71 @@ static bool test_moe_expert_keys_unique() {
 }
 
 // =============================================================================
+// Test 8: MoE identities are exact ModelToken + GGUF parent-slice identities.
+// =============================================================================
+static bool test_load_scoped_moe_identity_contract() {
+    printf("TEST: test_load_scoped_moe_identity_contract\n");
+
+    ggml_sycl_cache_id expert{};
+    expert.valid           = true;
+    expert.load_scoped     = true;
+    expert.model_id        = 11;
+    expert.load_txn_id     = 21;
+    expert.model_slot      = 3;
+    expert.slot_generation = 7;
+    expert.has_gguf        = true;
+    expert.file_id         = 0xabc;
+    expert.file_idx        = 1;
+    expert.file_offs       = 0x10000 + 4 * 4096;
+    expert.nbytes          = 4096;
+    expert.name_hash       = 0x111;
+    expert.type            = GGML_TYPE_Q4_0;
+    expert.ne[0]           = 256;
+    expert.ne[1]           = 64;
+    expert.ne[2]           = 1;
+    expert.ne[3]           = 1;
+    expert.tp_world_size   = 1;
+
+    // Two graph wrappers over the same token and parent bytes are one expert;
+    // wrapper-local metadata churn cannot split the physical slice.
+    ggml_sycl_cache_id wrapper = expert;
+    wrapper.name_hash = 0x222;
+    TEST_ASSERT(ggml_sycl::detail::cache_id_equal(expert, wrapper),
+                "same-token wrappers over one GGUF expert slice must compare equal");
+    TEST_ASSERT(ggml_sycl::detail::cache_id_hash{}(expert) == ggml_sycl::detail::cache_id_hash{}(wrapper),
+                "same-token wrappers must hash equally");
+
+    ggml_sycl_cache_id other = expert;
+    other.model_id = 12;
+    TEST_ASSERT(!ggml_sycl::detail::cache_id_equal(expert, other), "different models must be isolated");
+    other = expert;
+    other.load_txn_id = 22;
+    TEST_ASSERT(!ggml_sycl::detail::cache_id_equal(expert, other), "different loads must be isolated");
+    other = expert;
+    other.model_slot = 4;
+    TEST_ASSERT(!ggml_sycl::detail::cache_id_equal(expert, other), "different slots must be isolated");
+    other = expert;
+    other.slot_generation = 8;
+    TEST_ASSERT(!ggml_sycl::detail::cache_id_equal(expert, other), "stale slot generations must be isolated");
+    other = expert;
+    other.file_offs += expert.nbytes;
+    TEST_ASSERT(!ggml_sycl::detail::cache_id_equal(expert, other), "different GGUF expert offsets must be isolated");
+
+    // Dense GGUF policy remains physical and intentionally ignores lifecycle fields.
+    ggml_sycl_cache_id dense_a = expert;
+    dense_a.load_scoped = false;
+    ggml_sycl_cache_id dense_b = dense_a;
+    dense_b.model_id = 99;
+    dense_b.load_txn_id = 100;
+    dense_b.model_slot = 9;
+    dense_b.slot_generation = 10;
+    TEST_ASSERT(ggml_sycl::detail::cache_id_equal(dense_a, dense_b),
+                "dense GGUF identity policy must remain load-independent");
+
+    return true;
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 int main() {
@@ -539,6 +604,7 @@ int main() {
     RUN_TEST(test_non_gguf_tensors_keep_logical_identity);
     RUN_TEST(test_cache_id_equality_policy);
     RUN_TEST(test_moe_expert_keys_unique);
+    RUN_TEST(test_load_scoped_moe_identity_contract);
 
     printf("\n=== Summary ===\n");
     printf("Tests run: %d, Passed: %d, Failed: %d\n", g_tests_run, g_tests_passed, g_tests_failed);

@@ -19837,50 +19837,85 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
                                                              ggml_tensor_extra_gpu * extra,
                                                              int                     expert_id) {
     ggml_sycl_cache_id id{};
-    if (!extra || expert_id < 0) {
+    if (!tensor || expert_id < 0 || expert_id >= tensor->ne[2]) {
         return id;
     }
-    // Use name-based key: tensor name + expert_id suffix for per-expert uniqueness.
-    // This ensures different experts have distinct name hashes while keeping the
-    // key derivable from tensor metadata alone (name + type + dimensions).
-    const char * raw_name    = tensor ? ggml_get_name(tensor) : "unknown";
-    std::string  expert_name = (raw_name && raw_name[0]) ? std::string(raw_name) : std::string("unknown");
+
+    const char * raw_name = ggml_get_name(tensor);
+    if (!raw_name || !raw_name[0]) {
+        return id;
+    }
+
+    // Canonical MoE identity is minted only from the exact lifecycle owner and
+    // the registered GGUF parent slice.  Wrapper addresses, allocation ids,
+    // cache UUIDs and graph-local extras are observations, never identity.
+    ggml_sycl::lifecycle::ModelToken owner{};
+    if (extra && extra->model_id != 0) {
+        const auto state = ggml_sycl::lifecycle::global_registry().find({ extra->model_id });
+        if (state) {
+            owner = state->token;
+        }
+    }
+    if (owner.model.value == 0) {
+        owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+    }
+    if (owner.model.value == 0 || owner.load.value == 0 ||
+        owner.owner.slot == ggml_sycl::lifecycle::no_model_slot || owner.owner.generation == 0) {
+        return id; // fail closed on a partial owner
+    }
+
+    ggml_sycl_weight_identity parent{};
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+        const auto it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, raw_name));
+        if (it == g_sycl_weight_identities_by_name.end()) {
+            return id;
+        }
+        parent = it->second;
+    }
+    if (parent.file_id == 0 || parent.nbytes == 0 || parent.model_id != owner.model.value ||
+        parent.load_txn_id != owner.load.value || parent.slot != owner.owner.slot ||
+        parent.slot_generation != owner.owner.generation) {
+        return id;
+    }
+
+    const size_t expert_bytes = tensor->nb[2];
+    const size_t expert_offs  = static_cast<size_t>(expert_id) * expert_bytes;
+    if (expert_bytes == 0 || expert_offs > parent.nbytes || expert_bytes > parent.nbytes - expert_offs ||
+        parent.file_offs > SIZE_MAX - expert_offs) {
+        return id;
+    }
+
+    std::string expert_name(raw_name);
     expert_name += ":e";
     expert_name += std::to_string(expert_id);
-    uint64_t name_hash = static_cast<uint64_t>(std::hash<std::string>()(expert_name));
 
-    id.valid         = true;
-    // MoE expert slices are synthetic per-expert views derived from tensor
-    // name + expert id + type + per-expert dimensions.  Graph-local wrappers
-    // can churn extra->model_id across PP/TG while still referring to the same
-    // underlying expert memory, so model_id must not participate in this key.
-    id.model_id      = 0;
-    id.has_gguf      = false;
-    id.file_id       = 0;
-    id.file_idx      = 0;
-    id.file_offs     = 0;
-    id.nbytes        = 0;
-    id.name_hash     = name_hash;
-    // Use proper tensor type and per-expert dimensions instead of sentinels.
-    // This makes the key compatible with resolve_weight() which expects real
-    // tensor metadata in cache entries.
-    id.type          = tensor ? tensor->type : GGML_TYPE_COUNT;
-    id.tp_sharded    = false;
-    id.tp_rank       = 0;
-    id.tp_world_size = 1;
-    // Per-expert dimensions: ne[0]=K, ne[1]=N (rows per expert), ne[2]=1, ne[3]=1
+    id.valid           = true;
+    id.load_scoped     = true;
+    id.model_id        = owner.model.value;
+    id.load_txn_id     = owner.load.value;
+    id.model_slot      = owner.owner.slot;
+    id.slot_generation = owner.owner.generation;
+    id.has_gguf        = true;
+    id.file_id         = parent.file_id;
+    id.file_idx        = parent.file_idx;
+    id.file_offs       = parent.file_offs + expert_offs;
+    id.nbytes          = expert_bytes;
+    id.name_hash       = static_cast<uint64_t>(std::hash<std::string>()(expert_name));
+    id.type            = tensor->type;
+    id.tp_sharded      = false;
+    id.tp_rank         = 0;
+    id.tp_world_size   = 1;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         id.ne[i]           = 0;
         id.tp_local_ne[i]  = 0;
         id.tp_offset_ne[i] = 0;
     }
-    if (tensor) {
-        id.ne[0] = tensor->ne[0];
-        id.ne[1] = tensor->ne[1];
-        id.ne[2] = 1;
-        id.ne[3] = 1;
-    }
-    if (extra->tp_sharded && extra->tp_world_size > 1) {
+    id.ne[0] = tensor->ne[0];
+    id.ne[1] = tensor->ne[1];
+    id.ne[2] = 1;
+    id.ne[3] = 1;
+    if (extra && extra->tp_sharded && extra->tp_world_size > 1) {
         id.tp_sharded    = true;
         id.tp_rank       = extra->tp_rank;
         id.tp_world_size = extra->tp_world_size;
@@ -19889,14 +19924,7 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
             id.tp_offset_ne[i] = extra->tp_offset_ne[i];
         }
     }
-    // Keep real model expert keys stable across graph-local wrappers.  Some
-    // wrappers temporarily have model_id == 0 even though they name the same
-    // model weight, so a wrapper-local UUID would split the cache identity and
-    // duplicate planned layouts.  Synthetic unnamed tensors still need a
-    // per-extra UUID to avoid aliasing tests that reuse metadata.
-    const bool named_model_weight = raw_name && raw_name[0] != '\0' && std::strcmp(raw_name, "unknown") != 0 &&
-                                    std::strstr(raw_name, ".weight") != nullptr;
-    id.aux_id = named_model_weight ? 0 : ggml_sycl_assign_cache_uuid(extra);
+    id.aux_id = 0;
     return id;
 }
 
@@ -64112,7 +64140,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool src0_usm_accessible_prestage =
         (src0_alloc_prestage == sycl::usm::alloc::host || src0_alloc_prestage == sycl::usm::alloc::shared);
     const bool use_routing_prestage = use_expert_cache && (n_experts > 64) && !src0_usm_accessible_prestage;
+    std::vector<ggml_sycl_cache_id> routed_expert_keys;
     if (use_routing_prestage) {
+        routed_expert_keys.reserve(static_cast<size_t>(n_experts));
+        for (int e = 0; e < n_experts; ++e) {
+            routed_expert_keys.push_back(ggml_sycl_get_moe_expert_cache_key(src0, src0_extra, e));
+        }
         // Get expert indices from IDs tensor (already copied to ids_host)
         const int32_t * expert_ids_ptr = ids_host.data();
         const int       n_expert_used  = static_cast<int>(ids->ne[0]);  // experts per token (typically 4)
@@ -64124,12 +64157,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const size_t expert_stride        = src0->nb[2];  // bytes between experts
         const size_t expert_size_prestage = expert_stride;
 
-        // Get cache key info from tensor extra to match dispatch path keys
-        const uint64_t uuid     = src0_extra ? ggml_sycl_assign_cache_uuid(src0_extra) : 0;
-        const uint32_t mod_id   = src0_extra ? src0_extra->model_id : 0;
-        const char *   ten_name = ggml_get_name(src0);
-
-        // Pre-stage only needed experts
+        // Pre-stage only needed experts using the dispatch path's canonical keys.
         ggml_sycl::prestage_result prestage_res = ggml_sycl::prestage_routed_experts(
             stream,                       // SYCL queue
             expert_ids_ptr,               // Routing indices
@@ -64141,12 +64169,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             layer_id,                     // Layer ID
             static_cast<int>(n_experts),  // Total experts for bounds checking
             ctx.device,                   // Device ID
-            ten_name,                     // Tensor name (for key matching)
-            uuid,                         // Cache UUID (for key matching)
-            mod_id,                       // Model ID (for key matching)
-            src0->type,                   // Tensor type (for name-based key)
-            src0->ne[0],                  // K dimension (for name-based key)
-            src0->ne[1]);                 // N per-expert rows (for name-based key)
+            routed_expert_keys.data());   // Canonical load-scoped keys
 
         GGML_SYCL_DEBUG(
             "[MOE-PRESTAGE] Layer %d: %d unique experts, n_gpu=%d, n_cpu=%d, n_miss=%d (threshold=%d, "
@@ -68625,12 +68648,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const int       n_tokens_ids   = static_cast<int>(ids->ne[1]);
         const size_t    expert_stride  = src0->nb[2];
 
-        const uint64_t uuid_unpin   = src0_extra ? ggml_sycl_assign_cache_uuid(src0_extra) : 0;
-        const uint32_t mod_id_unpin = src0_extra ? src0_extra->model_id : 0;
-
         ggml_sycl::unpin_routed_experts(expert_ids_ptr, n_expert_used, n_tokens_ids, src0_host_storage, expert_stride,
-                                        layer_id, static_cast<int>(n_experts), ctx.device, ggml_get_name(src0),
-                                        uuid_unpin, mod_id_unpin, src0->type, src0->ne[0], src0->ne[1]);
+                                        layer_id, static_cast<int>(n_experts), ctx.device, routed_expert_keys.data());
 
         GGML_SYCL_DEBUG("[MOE-UNPIN] Layer %d: Unpinned routed experts\n", layer_id);
     }
