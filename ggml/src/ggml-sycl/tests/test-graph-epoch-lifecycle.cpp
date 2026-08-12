@@ -86,6 +86,47 @@ struct probe_terminal final : RetireTerminal {
 };
 
 int main() {
+    // Direct-decode authority is minted only for the exact live outer
+    // invocation and pins its release boundary until explicitly finished.
+    {
+        Registry          pin_registry;
+        error             pin_error   = error::OK;
+        const auto        pin_context = pin_registry.create_context(pin_error);
+        const auto        pin_root    = root_token(700);
+        SessionId         pin_session{};
+        SessionResetEpoch pin_reset{};
+        GraphEpoch        pin_graph{};
+        InvocationId      pin_invocation{};
+        const int         pin_device[] = { 0 };
+        require(pin_error == error::OK && pin_registry.bind_backend(pin_context, 0) == error::OK &&
+                    pin_registry.attach_root(pin_context, pin_root, &pin_session, &pin_reset) == error::OK &&
+                    pin_registry.begin_graph(pin_context, pin_session, pin_reset, pin_root, &pin_graph) == error::OK &&
+                    pin_registry.begin_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_root, pin_device,
+                                                  1, pin_device, 1, 0, &pin_invocation) == error::OK,
+                "authoritative invocation fixture failed");
+        AuthoritativeInvocationSnapshot pin;
+        require(pin_registry.mint_authoritative_invocation_snapshot(pin_context, pin_session, pin_reset, pin_graph,
+                                                                    pin_invocation, pin_root, &pin) == error::OK &&
+                    pin.active() && pin.context() == pin_context && pin.session() == pin_session &&
+                    pin.reset_epoch() == pin_reset && pin.graph_epoch() == pin_graph &&
+                    pin.invocation() == pin_invocation && pin.root() == pin_root &&
+                    pin_registry.validate_authoritative_invocation_snapshot(pin) == error::OK,
+                "exact authoritative invocation snapshot was not minted");
+        require(pin_registry.submit_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation, pin_root,
+                                               0) == error::OK &&
+                    pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation,
+                                                    pin_root) == error::BUSY,
+                "snapshot did not pin parent release");
+        Registry foreign;
+        require(foreign.validate_authoritative_invocation_snapshot(pin) == error::MISMATCH,
+                "foreign registry accepted invocation authority");
+        require(pin_registry.finish_authoritative_invocation_snapshot(&pin) == error::OK && !pin.active() &&
+                    pin_registry.finish_authoritative_invocation_snapshot(&pin) == error::MISMATCH &&
+                    pin_registry.release_invocation(pin_context, pin_session, pin_reset, pin_graph, pin_invocation,
+                                                    pin_root) == error::OK,
+                "authoritative pin finish/release semantics failed");
+    }
+
     Registry        reg;
     error           err     = error::OK;
     const ContextId context = reg.create_context(err);

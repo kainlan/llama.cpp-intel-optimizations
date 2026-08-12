@@ -137,6 +137,45 @@ struct RetireTicket {
     bool                  active = false;
 };
 
+class Registry;
+
+// Opaque, allocation-free pin on the exact active outer invocation. Only its
+// Registry can mint or finish it; while live, the parent invocation cannot be
+// released even after its terminal transition has completed.
+class AuthoritativeInvocationSnapshot final {
+  public:
+    AuthoritativeInvocationSnapshot()                                                    = default;
+    AuthoritativeInvocationSnapshot(const AuthoritativeInvocationSnapshot &)             = delete;
+    AuthoritativeInvocationSnapshot & operator=(const AuthoritativeInvocationSnapshot &) = delete;
+    AuthoritativeInvocationSnapshot(AuthoritativeInvocationSnapshot && other) noexcept;
+    AuthoritativeInvocationSnapshot & operator=(AuthoritativeInvocationSnapshot && other) noexcept;
+
+    bool active() const noexcept { return active_; }
+
+    ContextId context() const noexcept { return context_; }
+
+    SessionId session() const noexcept { return session_; }
+
+    SessionResetEpoch reset_epoch() const noexcept { return reset_epoch_; }
+
+    GraphEpoch graph_epoch() const noexcept { return graph_epoch_; }
+
+    InvocationId invocation() const noexcept { return invocation_; }
+
+    lifecycle::ModelToken root() const noexcept { return root_; }
+
+  private:
+    friend class Registry;
+    const Registry *      registry_ = nullptr;
+    ContextId             context_{};
+    SessionId             session_{};
+    SessionResetEpoch     reset_epoch_{};
+    GraphEpoch            graph_epoch_{};
+    InvocationId          invocation_{};
+    lifecycle::ModelToken root_{};
+    bool                  active_ = false;
+};
+
 struct epoch_snapshot {
     GraphEpoch  graph_epoch{};
     epoch_phase state              = epoch_phase::RECORDING;
@@ -262,8 +301,22 @@ class Registry {
                            InvocationId * invocation) noexcept;
     error seal_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
                           InvocationId invocation, lifecycle::ModelToken root) noexcept;
-    error submit_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch, GraphEpoch graph_epoch,
-                            InvocationId invocation, lifecycle::ModelToken root, int device) noexcept;
+    error mint_authoritative_invocation_snapshot(ContextId                         context,
+                                                 SessionId                         session,
+                                                 SessionResetEpoch                 reset_epoch,
+                                                 GraphEpoch                        graph_epoch,
+                                                 InvocationId                      invocation,
+                                                 lifecycle::ModelToken             root,
+                                                 AuthoritativeInvocationSnapshot * out) noexcept;
+    error validate_authoritative_invocation_snapshot(const AuthoritativeInvocationSnapshot & snapshot) const noexcept;
+    error finish_authoritative_invocation_snapshot(AuthoritativeInvocationSnapshot * snapshot) noexcept;
+    error submit_invocation(ContextId             context,
+                            SessionId             session,
+                            SessionResetEpoch     reset_epoch,
+                            GraphEpoch            graph_epoch,
+                            InvocationId          invocation,
+                            lifecycle::ModelToken root,
+                            int                   device) noexcept;
     error submit_quarantined_invocation(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                         GraphEpoch graph_epoch, InvocationId invocation,
                                         lifecycle::ModelToken root, int device) noexcept;
@@ -311,7 +364,8 @@ class Registry {
         std::vector<bool>           participant_joined;
         std::vector<bool>           participant_completed;
         uint32_t         pending_participant_count = 0;
-        bool             any_quarantined = false;
+        uint32_t                    authoritative_snapshot_pins = 0;
+        bool                        any_quarantined             = false;
     };
 
     struct persistent_epoch_entry {

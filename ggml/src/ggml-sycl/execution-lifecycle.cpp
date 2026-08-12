@@ -16,6 +16,25 @@ static int participant_index(const std::vector<int> & participants, int particip
 
 namespace ggml_sycl::execution {
 
+AuthoritativeInvocationSnapshot::AuthoritativeInvocationSnapshot(AuthoritativeInvocationSnapshot && other) noexcept {
+    *this = std::move(other);
+}
+
+AuthoritativeInvocationSnapshot & AuthoritativeInvocationSnapshot::operator=(
+    AuthoritativeInvocationSnapshot && other) noexcept {
+    if (this != &other) {
+        std::swap(registry_, other.registry_);
+        std::swap(context_, other.context_);
+        std::swap(session_, other.session_);
+        std::swap(reset_epoch_, other.reset_epoch_);
+        std::swap(graph_epoch_, other.graph_epoch_);
+        std::swap(invocation_, other.invocation_);
+        std::swap(root_, other.root_);
+        std::swap(active_, other.active_);
+    }
+    return *this;
+}
+
 Registry::Registry(test_mutation mutation) : mutation_(mutation) {}
 
 error Registry::persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept {
@@ -1068,6 +1087,109 @@ error Registry::seal_invocation(ContextId context, SessionId session, SessionRes
     return error::OK;
 }
 
+error Registry::mint_authoritative_invocation_snapshot(ContextId                         context,
+                                                       SessionId                         session,
+                                                       SessionResetEpoch                 reset_epoch,
+                                                       GraphEpoch                        graph_epoch,
+                                                       InvocationId                      invocation,
+                                                       lifecycle::ModelToken             root,
+                                                       AuthoritativeInvocationSnapshot * out) noexcept {
+    if (!out) {
+        return error::NULL_OUTPUT;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (out->active_) {
+        return error::BUSY;
+    }
+    auto it = contexts_.find(context.value);
+    if (context.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto &     entry      = it->second;
+    const auto session_rc = validate_session(entry, session, reset_epoch);
+    if (session_rc != error::OK) {
+        return session_rc;
+    }
+    auto & graph = entry.session.graph;
+    if (!(graph.id == graph_epoch) || !(graph.invocation == invocation)) {
+        return graph.id == graph_epoch ? error::MISMATCH : error::STALE;
+    }
+    if (validate_root(graph.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (graph.state != graph_phase::OPEN && graph.state != graph_phase::SEALED) {
+        return error::BUSY;
+    }
+    if (graph.authoritative_snapshot_pins == UINT32_MAX) {
+        return error::OVERFLOW;
+    }
+    out->registry_    = this;
+    out->context_     = context;
+    out->session_     = session;
+    out->reset_epoch_ = reset_epoch;
+    out->graph_epoch_ = graph_epoch;
+    out->invocation_  = invocation;
+    out->root_        = root;
+    out->active_      = true;
+    ++graph.authoritative_snapshot_pins;
+    return error::OK;
+}
+
+error Registry::validate_authoritative_invocation_snapshot(
+    const AuthoritativeInvocationSnapshot & snapshot) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!snapshot.active_ || snapshot.registry_ != this) {
+        return error::MISMATCH;
+    }
+    const auto it = contexts_.find(snapshot.context_.value);
+    if (snapshot.context_.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    const auto & entry      = it->second;
+    const auto   session_rc = validate_session(entry, snapshot.session_, snapshot.reset_epoch_);
+    if (session_rc != error::OK) {
+        return session_rc;
+    }
+    const auto & graph = entry.session.graph;
+    if (!(graph.id == snapshot.graph_epoch_) || !(graph.invocation == snapshot.invocation_)) {
+        return error::STALE;
+    }
+    if (validate_root(graph.token_root, snapshot.root_) != error::OK || graph.authoritative_snapshot_pins == 0) {
+        return error::MISMATCH;
+    }
+    return error::OK;
+}
+
+error Registry::finish_authoritative_invocation_snapshot(AuthoritativeInvocationSnapshot * snapshot) noexcept {
+    if (!snapshot) {
+        return error::NULL_OUTPUT;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!snapshot->active_ || snapshot->registry_ != this) {
+        return error::MISMATCH;
+    }
+    auto it = contexts_.find(snapshot->context_.value);
+    if (snapshot->context_.value == 0 || it == contexts_.end()) {
+        return error::STALE;
+    }
+    auto &     entry      = it->second;
+    const auto session_rc = validate_session(entry, snapshot->session_, snapshot->reset_epoch_);
+    if (session_rc != error::OK) {
+        return session_rc;
+    }
+    auto & graph = entry.session.graph;
+    if (!(graph.id == snapshot->graph_epoch_) || !(graph.invocation == snapshot->invocation_)) {
+        return error::STALE;
+    }
+    if (validate_root(graph.token_root, snapshot->root_) != error::OK || graph.authoritative_snapshot_pins == 0) {
+        return error::MISMATCH;
+    }
+    --graph.authoritative_snapshot_pins;
+    snapshot->registry_ = nullptr;
+    snapshot->active_   = false;
+    return error::OK;
+}
+
 error Registry::submit_invocation_locked(ContextId context, SessionId session, SessionResetEpoch reset_epoch,
                                          GraphEpoch graph_epoch, InvocationId invocation,
                                          lifecycle::ModelToken root, int device, graph_phase terminal,
@@ -1131,13 +1253,23 @@ error Registry::release_invocation_locked(ContextId context, SessionId session, 
     const auto session_rc = validate_session(entry, session, reset_epoch);
     if (session_rc != error::OK) return session_rc;
     auto & graph = entry.session.graph;
-    if (!(graph.id == graph_epoch)) return error::STALE;
-    if (!(graph.invocation == invocation)) return error::MISMATCH;
-    if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
+    if (!(graph.id == graph_epoch)) {
+        return error::STALE;
+    }
+    if (!(graph.invocation == invocation)) {
+        return error::MISMATCH;
+    }
+    if (validate_root(graph.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
     if (!graph_terminal_unretired(graph) || graph.pending_participant_count != 0 ||
-        child_invocations_target(entry.session, graph_epoch, invocation)) return error::BUSY;
+        graph.authoritative_snapshot_pins != 0 || child_invocations_target(entry.session, graph_epoch, invocation)) {
+        return error::BUSY;
+    }
     for (int claimed_device : graph.devices) {
-        if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) return error::MISMATCH;
+        if (claimed_device < 0 || claimed_device >= static_cast<int>(max_devices)) {
+            return error::MISMATCH;
+        }
         const auto & owner = device_owners_[claimed_device];
         if (!(owner.context == context && owner.session == session && owner.reset_epoch == reset_epoch &&
               owner.graph_epoch == graph_epoch && owner.invocation == invocation && owner.token_root == root)) {
@@ -1256,13 +1388,22 @@ error Registry::retire_graph(ContextId context, SessionId session, SessionResetE
     const auto session_rc = validate_session(entry, session, reset_epoch);
     if (session_rc != error::OK) return session_rc;
     auto & graph = entry.session.graph;
-    if (!(graph.id == graph_epoch)) return error::STALE;
-    if (validate_root(graph.token_root, root) != error::OK) return error::MISMATCH;
-    if (graph.state == graph_phase::RETIRED) return error::STALE;
-    if (!graph_terminal_unretired(graph) || graph.invocation.value != 0 || graph.pending_participant_count != 0) return error::BUSY;
-    graph = {};
-    graph.state = graph_phase::RETIRED;
-    graph.id = graph_epoch;
+    if (!(graph.id == graph_epoch)) {
+        return error::STALE;
+    }
+    if (validate_root(graph.token_root, root) != error::OK) {
+        return error::MISMATCH;
+    }
+    if (graph.state == graph_phase::RETIRED) {
+        return error::STALE;
+    }
+    if (!graph_terminal_unretired(graph) || graph.invocation.value != 0 || graph.pending_participant_count != 0 ||
+        graph.authoritative_snapshot_pins != 0) {
+        return error::BUSY;
+    }
+    graph            = {};
+    graph.state      = graph_phase::RETIRED;
+    graph.id         = graph_epoch;
     graph.token_root = root;
     return error::OK;
 }
