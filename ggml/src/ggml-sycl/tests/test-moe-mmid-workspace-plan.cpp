@@ -961,6 +961,71 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     check(replacement_wins.load() == 1, "concurrent replacement did not provide one CAS winner");
 }
 
+static void model_scoped_replacement_and_retired_recovery() {
+    std::atomic<int> destroyed{ 0 };
+    moe_mmid_workspace_registry registry;
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int qa = 0, qb = 0;
+    auto plan_a = std::make_shared<const lifecycle_plan_snapshot>();
+    auto plan_b = std::make_shared<const lifecycle_plan_snapshot>();
+    auto cap_a = moe_mmid_queue_capability_test_factory::mint(0, &qa, 2101);
+    auto cap_b = moe_mmid_queue_capability_test_factory::mint(0, &qb, 2201);
+    auto owner_a = owner_plan(0, 2101); owner_a.queue_capability = cap_a;
+    auto owner_b = owner_plan(0, 2201); owner_b.queue_capability = cap_b;
+    const moe_mmid_model_token token_a{ 211, 212, 213 }, token_b{ 221, 222, 223 };
+    check(registry.materialize(token_b, 2200, plan_b, 0, { owner_b }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED, "cross-model active setup failed");
+    auto no_mmid_expected = std::make_shared<const lifecycle_plan_snapshot>();
+    auto no_mmid_replacement = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.replace_plan(no_mmid_expected, no_mmid_replacement, 2300, true),
+          "no-MMID model replacement was poisoned by unrelated active model");
+
+    check(registry.materialize(token_a, 2100, plan_a, 0, { owner_a }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED, "retired recovery old setup failed");
+    auto graph = admission_request(token_a, 2100, { { 0, 2101 } }, 2102,
+                                   std::make_shared<std::atomic<bool>>(false));
+    auto terminal = graph.graph_snapshot->terminals.at(0);
+    auto submission = workspace_admission_authority_test_factory::terminal(cap_a, 2102, terminal);
+    auto authority = workspace_admission_authority_test_factory::direct(
+        token_a, 2100, 2102, 0, plan_a, graph.retained_occurrences, graph.table_owner,
+        { { 0, 2101 } }, { cap_a }, {}, { submission });
+    auto admitted = registry.admit({ std::move(authority), { 2, 2, 64, 96, 1 } });
+    check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
+          "retired recovery submitted-old setup failed");
+    auto plan_a2 = std::make_shared<const lifecycle_plan_snapshot>();
+    auto changed = owner_a;
+    check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+              moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH,
+                                          &changed.device_pool_bytes, &changed.host_pool_bytes) &&
+              registry.materialize(token_a, 2103, plan_a2, 0, { changed }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED &&
+              registry.replace_plan(plan_a, plan_a2, 2103, false),
+          "changed replacement did not retain submitted old context");
+    terminal->wait();
+    admitted = {}; // destroyed submitted bundle; retired registry must retain recovery authority
+    check(registry.recover_quarantined(token_a, 2100, false) == 1,
+          "retired exact context was not searchable for recovery");
+
+    std::atomic<bool> entered{ false }, release{ false };
+    auto paused = [&](bool host, int device, size_t bytes, size_t alignment) {
+        entered.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        return allocator(host, device, bytes, alignment);
+    };
+    auto plan_b_late = std::make_shared<const lifecycle_plan_snapshot>();
+    moe_mmid_materialize_status late = moe_mmid_materialize_status::INVALID;
+    std::thread late_thread([&] { late = registry.materialize(token_b, 2202, plan_b_late, 0, { owner_b }, paused); });
+    while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    auto plan_a3 = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.replace_plan(plan_a2, plan_a3, 2104, true),
+          "model A replacement failed during model B materialization");
+    release.store(true, std::memory_order_release); late_thread.join();
+    check(late == moe_mmid_materialize_status::PUBLISHED,
+          "model A replacement invalidated model B generation ticket");
+}
+
 static void registry_bundle_rollback_move_oom_and_quarantine() {
     const moe_mmid_model_token token{ 61, 62, 63 };
     std::atomic<int> destroyed{ 0 };
@@ -1147,6 +1212,7 @@ int main() {
         registry_component_max_constituent_coverage();
         registry_atomic_bundle_authority();
         common_direct_authority_plan_queue_and_lifetime();
+        model_scoped_replacement_and_retired_recovery();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();
         registry_atomic_concurrency_multi_owner();

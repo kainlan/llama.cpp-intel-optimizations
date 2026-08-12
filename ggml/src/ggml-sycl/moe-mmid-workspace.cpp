@@ -527,6 +527,7 @@ struct registry_context {
     std::vector<std::shared_ptr<registry_pool_state>> pools;
     std::vector<std::shared_ptr<void>>                authorities;
     std::shared_ptr<const lifecycle_plan_snapshot>    exact_plan;
+    std::weak_ptr<const lifecycle_plan_snapshot>      previous_plan;
     uint64_t                                           publication_generation = 0;
     std::vector<moe_mmid_queue_capability>            queues;
     bool                                               accepting = true;
@@ -535,14 +536,33 @@ struct registry_context {
 }  // namespace
 
 struct moe_mmid_workspace_registry::state {
+    struct model_publication {
+        moe_mmid_model_token token;
+        uint64_t generation = 1;
+    };
     mutable std::mutex                             mutex;
     std::vector<std::shared_ptr<registry_context>> contexts;
-    uint64_t publication_generation = 1;
+    std::vector<std::shared_ptr<registry_context>> retired_contexts;
+    std::vector<model_publication>                 model_publications;
 };
 
 namespace {
 bool same_token(const moe_mmid_model_token & a, const moe_mmid_model_token & b) {
     return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id && a.generation == b.generation;
+}
+
+uint64_t & model_publication_generation(moe_mmid_workspace_registry::state & state,
+                                        const moe_mmid_model_token & token) {
+    for (auto & publication : state.model_publications)
+        if (same_token(publication.token, token)) return publication.generation;
+    state.model_publications.push_back({ token, 1 });
+    return state.model_publications.back().generation;
+}
+
+bool context_idle_locked(const registry_context & context) {
+    for (const auto & pool : context.pools)
+        for (const auto & slot : pool->slots) if (slot.busy || slot.quarantined) return false;
+    return true;
 }
 
 moe_mmid_blob retained_subrange(const moe_mmid_blob & blob, size_t offset, size_t bytes) noexcept {
@@ -834,7 +854,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         uint64_t generation_ticket = 0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            generation_ticket = state_->publication_generation;
+            generation_ticket = model_publication_generation(*state_, token);
         }
         auto candidate           = std::make_shared<registry_context>();
         candidate->token         = token;
@@ -905,7 +925,8 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             candidate->pools.push_back(std::move(pool));
         }
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (generation_ticket != state_->publication_generation) return moe_mmid_materialize_status::INVALID;
+        if (generation_ticket != model_publication_generation(*state_, token))
+            return moe_mmid_materialize_status::INVALID;
         bool has_active = false;
         for (const auto & existing : state_->contexts) {
             if (!same_token(existing->token, token) || existing->submit_device != submit_device) continue;
@@ -1338,24 +1359,32 @@ bool moe_mmid_workspace_registry::replace_plan(
         if (context->exact_plan.get() == expected.get() && context->accepting) old_context = context;
         if (context->exact_plan.get() == replacement.get() && !context->accepting) prepared_context = context;
     }
-    if (!old_context) return state_->contexts.empty();
+    if (!old_context) {
+        for (const auto & context : state_->contexts) {
+            const auto previous = context->previous_plan.lock();
+            if (previous.get() == expected.get()) return false;
+        }
+        return prepared_context == nullptr;
+    }
     if (!stable_geometry && !prepared_context) return false;
-    if (state_->publication_generation == UINT64_MAX) return false;
-    ++state_->publication_generation; // invalidates every in-flight materialization ticket
+    uint64_t & publication_generation = model_publication_generation(*state_, old_context->token);
+    if (publication_generation == UINT64_MAX) return false;
+    ++publication_generation; // invalidates only this model token's in-flight tickets
     if (prepared_context) {
         old_context->accepting = false;
         prepared_context->accepting = true;
+        prepared_context->previous_plan = expected;
         prepared_context->plan_identity = replacement_identity;
-        prepared_context->publication_generation = state_->publication_generation;
+        prepared_context->publication_generation = publication_generation;
         for (const auto & pool : prepared_context->pools) pool->plan_identity = replacement_identity;
-        // Drop registry ownership of the retired context; committed bundles
-        // retain its pools independently until terminal submission.
+        state_->retired_contexts.push_back(old_context);
         state_->contexts.erase(std::remove(state_->contexts.begin(), state_->contexts.end(), old_context),
                                state_->contexts.end());
     } else {
+        old_context->previous_plan = expected;
         old_context->exact_plan = replacement;
         old_context->plan_identity = replacement_identity;
-        old_context->publication_generation = state_->publication_generation;
+        old_context->publication_generation = publication_generation;
         for (const auto & pool : old_context->pools) pool->plan_identity = replacement_identity;
     }
     return true;
@@ -1371,7 +1400,12 @@ size_t moe_mmid_workspace_registry::invalidate_plan(const lifecycle_plan_snapsho
             if (context->accepting && context->exact_plan.get() == exact_plan) {
                 context->accepting = false; ++invalidated; matched = true;
             }
-        if (matched && state_->publication_generation != UINT64_MAX) ++state_->publication_generation;
+        if (matched) for (const auto & context : state_->contexts) {
+            if (context->exact_plan.get() != exact_plan) continue;
+            uint64_t & generation = model_publication_generation(*state_, context->token);
+            if (generation != UINT64_MAX) ++generation;
+            break;
+        }
     } catch (...) { return 0; }
     return invalidated;
 }
@@ -1381,7 +1415,9 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
     if (!token.valid() || plan_identity == 0) return 0;
     size_t released = 0;
     std::lock_guard<std::mutex> registry_lock(state_->mutex);
-    for (const auto & context : state_->contexts) {
+    std::vector<std::shared_ptr<registry_context>> searchable = state_->contexts;
+    searchable.insert(searchable.end(), state_->retired_contexts.begin(), state_->retired_contexts.end());
+    for (const auto & context : searchable) {
         if (!same_token(context->token, token) || context->plan_identity != plan_identity) continue;
         std::array<size_t, execution::max_devices> order{};
         std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
@@ -1437,6 +1473,20 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
             }
         }
     }
+    state_->retired_contexts.erase(
+        std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
+                       [&](const std::shared_ptr<registry_context> & context) {
+                           if (!same_token(context->token, token)) return false;
+                           std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+                           std::array<size_t, execution::max_devices> order{};
+                           for (size_t i = 0; i < context->pools.size(); ++i) order[i] = i;
+                           std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
+                               return context->pools[a]->owner_device < context->pools[b]->owner_device;
+                           });
+                           for (size_t i = 0; i < context->pools.size(); ++i)
+                               locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
+                           return context_idle_locked(*context);
+                       }), state_->retired_contexts.end());
     return released;
 }
 
@@ -1446,20 +1496,35 @@ bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uin
     }
     try {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        const size_t                before = state_->contexts.size();
-        state_->contexts.erase(
-            std::remove_if(state_->contexts.begin(), state_->contexts.end(),
-                           [&](const std::shared_ptr<registry_context> & context) {
-                               if (!same_token(context->token, token) ||
-                                   (plan_identity != 0 && context->plan_identity != plan_identity)) return false;
-                               for (const auto & pool : context->pools) {
-                                   std::lock_guard<std::mutex> pool_lock(pool->mutex);
-                                   for (const auto & slot : pool->slots) if (slot.quarantined) return false;
-                               }
-                               return true;
-                           }),
-            state_->contexts.end());
-        return before != state_->contexts.size();
+        const size_t before = state_->contexts.size() + state_->retired_contexts.size();
+        auto matches = [&](const std::shared_ptr<registry_context> & context) {
+            return same_token(context->token, token) &&
+                   (plan_identity == 0 || context->plan_identity == plan_identity);
+        };
+        auto lock_pools = [](const std::shared_ptr<registry_context> & context,
+                             std::array<std::unique_lock<std::mutex>, execution::max_devices> & locks) {
+            std::array<size_t, execution::max_devices> order{};
+            for (size_t i = 0; i < context->pools.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
+                return context->pools[a]->owner_device < context->pools[b]->owner_device;
+            });
+            for (size_t i = 0; i < context->pools.size(); ++i)
+                locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
+        };
+        state_->contexts.erase(std::remove_if(state_->contexts.begin(), state_->contexts.end(), [&](const auto & context) {
+            if (!matches(context)) return false;
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
+            for (const auto & pool : context->pools) for (const auto & slot : pool->slots)
+                if (slot.quarantined) return false;
+            return true; // ordinary outstanding leases retain their pools independently
+        }), state_->contexts.end());
+        state_->retired_contexts.erase(std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
+            [&](const auto & context) {
+                if (!matches(context)) return false;
+                std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
+                return context_idle_locked(*context);
+            }), state_->retired_contexts.end());
+        return before != state_->contexts.size() + state_->retired_contexts.size();
     } catch (...) {
         return false;
     }

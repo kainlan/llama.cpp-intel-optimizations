@@ -509,8 +509,9 @@ class moe_mmid_workspace_registry {
     size_t                         published_contexts() const noexcept;
     std::vector<moe_mmid_registry_context_info> list() const;
 
-  private:
+  public:
     struct state;
+  private:
     std::shared_ptr<state> state_;
     friend class moe_admitted_workspace_bundle;
 };
