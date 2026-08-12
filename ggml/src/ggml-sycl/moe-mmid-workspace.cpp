@@ -461,7 +461,8 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             pool->geometry      = owner.geometry;
             pool->device_pool   = allocator(false, owner.owner_device, expected_device, MOE_MMID_DEVICE_ALIGNMENT);
             if (!pool->device_pool.valid() || pool->device_pool.host_pinned ||
-                pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device) {
+                pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device ||
+                reinterpret_cast<uintptr_t>(pool->device_pool.ptr) % MOE_MMID_DEVICE_ALIGNMENT != 0) {
                 return moe_mmid_materialize_status::ALLOCATION_FAILED;
             }
             if (expected_host != 0) {

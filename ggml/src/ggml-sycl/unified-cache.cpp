@@ -10562,6 +10562,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         return false;
     }
 
+    if (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid non-power-of-two alignment=%zu\n", req.alignment);
+        return false;
+    }
+
     if (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) {
         GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: both must_device and must_host_pinned are set\n");
         return false;
@@ -10686,7 +10691,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
-                ptr                    = cache->zone_alloc(zid, alloc_size);
+                ptr                    = cache->zone_alloc(zid, alloc_size,
+                                                           req.alignment != 0 ? req.alignment : 64);
                 if (ptr) {
                     from_arena        = true;
                     out->zone_managed = true;
@@ -10824,7 +10830,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                         return nullptr;
                     }
                 }
-                void * p = ucache->host_zone_alloc(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                const size_t alignment = req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT;
+                void * p = ucache->host_zone_alloc(zone, alloc_size, alignment);
                 if (p) {
                     return p;
                 }
@@ -10847,11 +10854,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;
                 }
-                return ucache->host_zone_alloc(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                return ucache->host_zone_alloc(zone, alloc_size, alignment);
             };
             if (req.intent.constraints.use_pinned_pool) {
                 if (!ucache->host_zones_configured()) {
-                    ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                    ptr = ucache->host_pool_alloc(
+                        alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 } else {
                     host_zone_id pool_zone = select_zone();
                     ptr                    = try_zone_alloc_contiguous(pool_zone);
@@ -10876,7 +10884,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // Zones not configured: direct runtime allocation.  host_pool_alloc
                 // is itself backed by a single-chunk TLSF and returns nullptr
                 // rather than spanning chunks.
-                ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                ptr = ucache->host_pool_alloc(
+                    alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
             }
             if (!ptr && req.intent.constraints.use_pinned_pool && req.intent.role == alloc_role::KV) {
                 // Runtime contexts can legitimately need more host KV than the
@@ -10884,7 +10893,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // allocation owned by unified_cache and ref-counted via
                 // alloc_handle, but fall back to the pinned pool rather than
                 // forcing a hard failure or a raw sycl::malloc_host escape.
-                ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                ptr = ucache->host_pool_alloc(
+                    alloc_size, req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 if (ptr) {
                     uses_pinned_pool = true;
                     zone_managed     = false;
@@ -11275,7 +11285,7 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         owners.push_back(owner);
     }
 
-    auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t) -> moe_mmid_blob {
+    auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t alignment) -> moe_mmid_blob {
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == device;
         });
@@ -11286,6 +11296,7 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         request.queue                = binding->queue;
         request.device               = device;
         request.size                 = bytes;
+        request.alignment            = alignment;
         request.suppress_failure_log = true;
         request.intent.role          = host_pinned ? alloc_role::STAGING : alloc_role::COMPUTE;
         request.intent.category      = host_pinned ? runtime_category::STAGING : runtime_category::COMPUTE;
@@ -11297,7 +11308,8 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
         request.intent.constraints.prefer_vram_zone        = host_pinned ? vram_zone_id::COUNT : vram_zone_id::RUNTIME;
         auto handle = std::make_shared<mem_handle>(unified_allocate(request));
         const resolved_ptr resolved = handle->resolve();
-        if (!resolved.ptr || resolved.on_device == host_pinned) {
+        if (!resolved.ptr || resolved.on_device == host_pinned ||
+            reinterpret_cast<uintptr_t>(resolved.ptr) % alignment != 0) {
             return {};
         }
         moe_mmid_blob blob;

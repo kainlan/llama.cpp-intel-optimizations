@@ -10623,6 +10623,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
         }
         const auto result = registry->finalize_teardown(ticket, true);
         if (result == ggml_sycl::lifecycle::error::OK) {
+            // Retirement blocks new admission immediately; outstanding terminal
+            // leases retain their exact blobs until completion.
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces({
+                owner.model.value, owner.load.value, owner.owner.generation });
             // Full plans can be large; durable replay identity remains compact
             // in Registry::dead_ after this snapshot is deleted.
             ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value);
@@ -11265,6 +11269,35 @@ class ggml_sycl_load_candidate_end_scope {
     bool                             enabled_;
 };
 
+static bool ggml_sycl_materialize_published_mmid_workspaces(
+    const ggml_sycl::lifecycle::ModelToken & token,
+    const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
+    if (!snapshot.plan || snapshot.plan->moe_mmid_workspaces.empty()) {
+        return true;
+    }
+    const int submit_device = snapshot.plan->device_id >= 0 ? snapshot.plan->device_id :
+                              !snapshot.plan->devices.empty() ? snapshot.plan->devices.front() : -1;
+    if (submit_device < 0 || snapshot.version == 0) {
+        return false;
+    }
+    std::vector<ggml_sycl::moe_mmid_queue_binding> bindings;
+    bindings.reserve(snapshot.plan->moe_mmid_workspaces.size());
+    for (const auto & workspace : snapshot.plan->moe_mmid_workspaces) {
+        sycl::queue * queue = &ggml_sycl_get_device(workspace.owner_device).default_queue();
+        const uint64_t cookie = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(queue));
+        if (cookie == 0) {
+            return false;
+        }
+        bindings.push_back({ workspace.owner_device, queue, cookie });
+    }
+    const ggml_sycl::moe_mmid_model_token owner{
+        token.model.value, token.load.value, token.owner.generation };
+    const auto result = ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(
+        owner, snapshot.version, *snapshot.plan, submit_device, bindings);
+    return result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
+           result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
@@ -11333,6 +11366,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             throw std::bad_alloc();
         }
         placement_inserted = true;
+        // Expert registration and owner queues are complete at load_end. Make
+        // every fixed pool available transactionally before publishing LIVE.
+        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, *plan_snapshot)) {
+            throw std::bad_alloc();
+        }
         ggml_sycl_prepared_plan_publication prepared_publication;
         {
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
@@ -11383,6 +11421,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
     } catch (...) {
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces({
+                ticket.token.model.value, ticket.token.load.value, ticket.token.owner.generation });
             ggml_sycl::lifecycle_erase_placement_plan(ticket.token.model.value, ticket.token.load.value);
         } else if (ticket.token.load.value != 0) {
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);

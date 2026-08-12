@@ -3749,6 +3749,7 @@ struct alloc_request {
     sycl::queue * queue                = nullptr;
     int           device               = -1;
     size_t        size                 = 0;
+    size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
     bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
     alloc_intent  intent;
 };

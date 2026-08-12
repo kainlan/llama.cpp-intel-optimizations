@@ -152,7 +152,7 @@ static void pool_identity_generation_and_terminal_release() {
 }
 
 struct fake_allocation {
-    explicit fake_allocation(size_t bytes, std::atomic<int> * destroyed) : storage(bytes), destroyed(destroyed) {}
+    explicit fake_allocation(size_t bytes, std::atomic<int> * destroyed) : storage(bytes + 255), destroyed(destroyed) {}
 
     ~fake_allocation() {
         if (destroyed) {
@@ -167,11 +167,12 @@ struct fake_allocation {
 static moe_mmid_blob fake_blob(bool host, int device, size_t bytes, std::atomic<int> * destroyed) {
     auto          allocation = std::make_shared<fake_allocation>(bytes, destroyed);
     moe_mmid_blob blob;
-    blob.owner       = allocation;
-    blob.ptr         = allocation->storage.data();
-    blob.bytes       = bytes;
-    blob.device      = device;
-    blob.host_pinned = host;
+    blob.owner          = allocation;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation->storage.data());
+    blob.ptr            = reinterpret_cast<void *>((raw + 255) & ~uintptr_t{ 255 });
+    blob.bytes          = bytes;
+    blob.device         = device;
+    blob.host_pinned    = host;
     return blob;
 }
 
@@ -257,12 +258,25 @@ static void registry_materialization_and_rollback() {
           "allocation failure did not roll back");
     check(rollback_registry.published_contexts() == 0 && rollback_destroyed.load() == 1,
           "failed transaction retained or published its first blob");
+
+    auto misaligned = [&](bool host, int device, size_t bytes, size_t) {
+        moe_mmid_blob blob = fake_blob(host, device, bytes + 1, &rollback_destroyed);
+        blob.ptr           = static_cast<unsigned char *>(blob.ptr) + 1;
+        blob.bytes         = bytes;
+        return blob;
+    };
+    check(rollback_registry.materialize({ 12, 13, 14 }, 15, 0, { owner }, misaligned) ==
+                  moe_mmid_materialize_status::ALLOCATION_FAILED &&
+              rollback_registry.published_contexts() == 0,
+          "misaligned device base published instead of rolling back");
 }
 
 static void registry_multi_owner_context_and_identity() {
     moe_mmid_workspace_registry registry;
     std::atomic<int>            destroyed{ 0 };
+    std::atomic<int>            allocation_calls{ 0 };
     auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+        allocation_calls.fetch_add(1);
         return fake_blob(host, device, bytes, &destroyed);
     };
     const moe_mmid_model_token a{ 10, 11, 12 }, b{ 10, 13, 14 };
@@ -273,10 +287,12 @@ static void registry_multi_owner_context_and_identity() {
           "second context failed");
     auto wrong_queue = registry.acquire(a, 1000, 0, 1, 20);
     check(wrong_queue.status == moe_mmid_lease_status::INVALID, "wrong owner queue admitted");
-    auto lease = registry.acquire(a, 1000, 0, 1, 21);
+    const int allocation_calls_before_acquire = allocation_calls.load();
+    auto      lease                           = registry.acquire(a, 1000, 0, 1, 21);
     check(lease.status == moe_mmid_lease_status::ACQUIRED && lease.lease.owner_device() == 1 &&
               lease.lease.submit_device() == 0 && lease.lease.plan_identity() == 1000,
           "lease identities mismatch");
+    check(allocation_calls.load() == allocation_calls_before_acquire, "acquire allocated backing storage");
     check(lease.lease.slices().activation_f32.valid() && lease.lease.slices().host.valid(),
           "exact retained slices missing");
     check(lease.lease.terminal_release(21, lease.lease.generation() + 1) == moe_mmid_release_status::STALE,
