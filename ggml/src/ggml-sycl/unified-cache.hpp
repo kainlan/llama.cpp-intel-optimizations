@@ -514,6 +514,9 @@ struct moe_mmid_owner_workspace_plan {
     int                         owner_device = -1;
     uint32_t                    depth        = MOE_MMID_WORKSPACE_DEPTH;
     bool                        valid        = false;
+    bool                        secondary_owner = false;
+    // Exact canonical component-max geometry. It is not representable by one
+    // source shape when different tensors contribute the K and N maxima.
     moe_mmid_workspace_geometry slot;
     size_t                      device_pool_bytes = 0;
     size_t                      host_pool_bytes   = 0;

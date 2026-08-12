@@ -157,6 +157,50 @@ bool moe_mmid_component_max(moe_mmid_workspace_geometry * a, const moe_mmid_work
     return true;
 }
 
+bool moe_mmid_validate_workspace_geometry(const moe_mmid_workspace_geometry & g,
+                                          bool secondary_owner) noexcept {
+    if (!g.valid || g.activation_rows == 0 || g.occurrences == 0 || g.q8_ne10_row_bytes == 0 ||
+        g.q8_ne01_row_bytes == 0 || g.activation_f32_bytes == 0 || g.activation_q8_bytes == 0 ||
+        g.output_f32_bytes == 0 || g.output_q8_bytes == 0 || g.descriptor_host_bytes == 0 ||
+        g.activation_f32_bytes % g.activation_rows != 0 ||
+        g.activation_q8_bytes % g.activation_rows != 0 ||
+        g.activation_q8_bytes / g.activation_rows != g.q8_ne10_row_bytes ||
+        g.output_f32_bytes % g.occurrences != 0 ||
+        g.output_q8_bytes % g.occurrences != 0 ||
+        g.output_q8_bytes / g.occurrences != g.q8_ne01_row_bytes ||
+        g.descriptor_host_bytes / sizeof(moe_mmid_descriptor) != g.occurrences ||
+        g.descriptor_host_bytes % sizeof(moe_mmid_descriptor) != 0) {
+        return false;
+    }
+    size_t device = 0;
+    size_t activation_f32_offset = 0, activation_q8_offset = 0, output_f32_offset = 0, output_q8_offset = 0;
+    if (!checked_aligned_place(g.activation_f32_bytes, &device, &activation_f32_offset) ||
+        !checked_aligned_place(g.activation_q8_bytes, &device, &activation_q8_offset) ||
+        !checked_aligned_place(g.output_f32_bytes, &device, &output_f32_offset) ||
+        !checked_aligned_place(g.output_q8_bytes, &device, &output_q8_offset) ||
+        !checked_aligned_place(0, &device) || activation_f32_offset != g.activation_f32_offset ||
+        activation_q8_offset != g.activation_q8_offset || output_f32_offset != g.output_f32_offset ||
+        output_q8_offset != g.output_q8_offset || device != g.device_slot_bytes) {
+        return false;
+    }
+    const size_t expected_activation_d2h = secondary_owner ? g.activation_f32_bytes : 0;
+    const size_t expected_activation_h2d = secondary_owner ? g.activation_f32_bytes : 0;
+    const size_t expected_output_d2h = secondary_owner ? g.output_f32_bytes : 0;
+    const size_t expected_output_h2d = secondary_owner ? g.output_f32_bytes : 0;
+    size_t bounce = 0, host = 0;
+    if (g.secondary_activation_d2h_bytes != expected_activation_d2h ||
+        g.secondary_activation_h2d_bytes != expected_activation_h2d ||
+        g.secondary_output_d2h_bytes != expected_output_d2h ||
+        g.secondary_output_h2d_bytes != expected_output_h2d ||
+        !checked_add(expected_activation_d2h, expected_activation_h2d, &bounce) ||
+        !checked_add(bounce, expected_output_d2h, &bounce) ||
+        !checked_add(bounce, expected_output_h2d, &bounce) ||
+        !checked_add(g.descriptor_host_bytes, bounce, &host)) {
+        return false;
+    }
+    return bounce == g.secondary_bounce_bytes && host == g.host_slot_bytes;
+}
+
 bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & g,
                                  uint32_t                            depth,
                                  size_t *                            device_bytes,
@@ -719,11 +763,9 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         candidate->pools.reserve(owners.size());
         for (const auto & owner : owners) {
             size_t expected_device = 0, expected_host = 0;
-            moe_mmid_workspace_geometry canonical;
             if (owner.owner_device < 0 || owner.queue_cookie == 0 ||
-                !moe_mmid_plan_workspace(owner.shape, owner.secondary_owner, &canonical) ||
-                !same_geometry(canonical, owner.geometry) ||
-                !moe_mmid_checked_pool_bytes(canonical, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
+                !moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner) ||
+                !moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
                                              &expected_host) ||
                 owner.device_pool_bytes != expected_device || owner.host_pool_bytes != expected_host) {
                 return moe_mmid_materialize_status::INVALID;
@@ -733,7 +775,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             pool->submit_device = submit_device;
             pool->plan_identity = plan_identity;
             pool->queue_cookie  = owner.queue_cookie;
-            pool->geometry      = canonical;
+            pool->geometry      = owner.geometry;
             pool->device_pool   = allocator(false, owner.owner_device, expected_device, MOE_MMID_DEVICE_ALIGNMENT);
             if (!pool->device_pool.valid() || pool->device_pool.host_pinned ||
                 pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device ||
@@ -859,166 +901,7 @@ moe_mmid_registry_lease_result moe_mmid_workspace_registry::acquire(const moe_mm
     }
 }
 
-#if 0 // Compile-excluded scalar admission security mutant; capability admission below is authoritative.
-moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admission_request & request) noexcept {
-    moe_mmid_admitted_result out;
-    if (!request.token.valid() || request.plan_identity == 0 || request.submit_device < 0 || request.epoch == 0 ||
-        request.top_k == 0 || request.ne11 == 0 || request.K <= 0 || request.N <= 0 || request.type < 0 ||
-        request.owners.empty() || request.retained_occurrences.empty() ||
-        request.retained_occurrences.size() % request.top_k != 0) {
-        return out;
-    }
-    for (const auto & identity : request.retained_occurrences) {
-        if (identity.weight == 0 || identity.table == 0) {
-            return out;
-        }
-    }
-    try {
-        // All potentially throwing bundle assembly precedes slot mutation.
-        out.bundle.leases_.resize(request.owners.size());
-        out.bundle.owners_     = request.owners;
-        out.bundle.identities_ = request.retained_occurrences;
-        out.bundle.epoch_      = request.epoch;
-        out.bundle.plan_identity_ = request.plan_identity;
-        out.bundle.submit_device_ = request.submit_device;
-        out.bundle.K_             = request.K;
-        out.bundle.N_             = request.N;
-        out.bundle.type_          = request.type;
 
-        uint64_t digest = 1469598103934665603ULL;
-        auto mix = [&](uint64_t value) { digest = (digest ^ value) * 1099511628211ULL; };
-        mix(request.token.model_id); mix(request.token.load_txn_id); mix(request.token.generation);
-        mix(request.plan_identity); mix(static_cast<uint64_t>(request.submit_device)); mix(request.epoch);
-        mix(request.top_k); mix(request.ne11); mix(static_cast<uint64_t>(request.K));
-        mix(static_cast<uint64_t>(request.N)); mix(static_cast<uint64_t>(request.type));
-        for (const auto & owner : request.owners) {
-            mix(static_cast<uint64_t>(owner.owner_device)); mix(owner.queue_cookie);
-        }
-        for (const auto & identity : request.retained_occurrences) {
-            mix(identity.weight); mix(identity.table);
-        }
-        out.bundle.identity_digest_ = digest != 0 ? digest : 1;
-
-        std::shared_ptr<registry_context> context;
-        std::vector<size_t> pool_for_request(request.owners.size(), SIZE_MAX);
-        std::vector<std::pair<int, size_t>> lock_order;
-        lock_order.reserve(request.owners.size());
-        std::vector<uint32_t> selected_slots(request.owners.size(), UINT32_MAX);
-        std::vector<std::unique_lock<std::mutex>> locks;
-        locks.reserve(request.owners.size());
-
-        std::lock_guard<std::mutex> registry_lock(state_->mutex);
-        for (const auto & candidate : state_->contexts) {
-            if (same_token(candidate->token, request.token) && candidate->plan_identity == request.plan_identity &&
-                candidate->submit_device == request.submit_device) {
-                context = candidate;
-                break;
-            }
-        }
-        if (!context || context->pools.size() != request.owners.size()) {
-            return out;
-        }
-
-        const size_t capacity = request.retained_occurrences.size() / request.top_k;
-        for (size_t r = 0; r < request.owners.size(); ++r) {
-            const auto & wanted = request.owners[r];
-            if (wanted.owner_device < 0 || wanted.queue_cookie == 0) {
-                return out;
-            }
-            for (size_t p = 0; p < context->pools.size(); ++p) {
-                const auto & pool = context->pools[p];
-                if (pool->owner_device != wanted.owner_device) {
-                    continue;
-                }
-                if (pool_for_request[r] != SIZE_MAX || pool->queue_cookie != wanted.queue_cookie) {
-                    return out;
-                }
-                for (size_t prior = 0; prior < r; ++prior) {
-                    if (pool_for_request[prior] == p) {
-                        return out;
-                    }
-                }
-                moe_mmid_workspace_geometry expected;
-                if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N),
-                                                request.ne11, request.top_k, capacity },
-                                              wanted.owner_device != request.submit_device, &expected) ||
-                    expected.device_slot_bytes != pool->geometry.device_slot_bytes ||
-                    expected.host_slot_bytes != pool->geometry.host_slot_bytes ||
-                    expected.activation_f32_bytes != pool->geometry.activation_f32_bytes ||
-                    expected.activation_q8_bytes != pool->geometry.activation_q8_bytes ||
-                    expected.output_f32_bytes != pool->geometry.output_f32_bytes ||
-                    expected.output_q8_bytes != pool->geometry.output_q8_bytes ||
-                    expected.descriptor_host_bytes != pool->geometry.descriptor_host_bytes) {
-                    return out;
-                }
-                pool_for_request[r] = p;
-            }
-            if (pool_for_request[r] == SIZE_MAX) {
-                return out;
-            }
-            lock_order.emplace_back(wanted.owner_device, r);
-        }
-        std::sort(lock_order.begin(), lock_order.end());
-        for (const auto & item : lock_order) {
-            locks.emplace_back(context->pools[pool_for_request[item.second]]->mutex);
-        }
-
-        // Inspect every owner while all locks are held. No BUSY/generation write
-        // occurs unless every exact owner has a usable slot and authority.
-        for (size_t r = 0; r < request.owners.size(); ++r) {
-            const size_t p = pool_for_request[r];
-            const auto & pool = context->pools[p];
-            for (uint32_t slot = 0; slot < MOE_MMID_WORKSPACE_DEPTH; ++slot) {
-                if (!pool->slots[slot].busy && pool->slots[slot].generation != UINT64_MAX) {
-                    selected_slots[r] = slot;
-                    break;
-                }
-            }
-            if (selected_slots[r] == UINT32_MAX) {
-                out.status = moe_mmid_lease_status::BUSY;
-                return out;
-            }
-            const size_t authority_index = p * MOE_MMID_WORKSPACE_DEPTH + selected_slots[r];
-            if (authority_index >= context->authorities.size()) {
-                return out;
-            }
-            auto authority = std::static_pointer_cast<moe_mmid_registry_lease::authority>(
-                context->authorities[authority_index]);
-            if (!authority || authority->pool.get() != pool.get()) {
-                return out;
-            }
-            auto & lease         = out.bundle.leases_[r];
-            lease.authority_     = std::move(authority);
-            lease.generation_    = pool->slots[selected_slots[r]].generation + 1;
-            lease.queue_cookie_  = request.owners[r].queue_cookie;
-            lease.epoch_         = request.epoch;
-        }
-
-        for (size_t r = 0; r < request.owners.size(); ++r) {
-            auto & slot = context->pools[pool_for_request[r]]->slots[selected_slots[r]];
-            slot.generation = out.bundle.leases_[r].generation_;
-            slot.epoch      = request.epoch;
-            slot.busy       = true;
-        }
-        const uint64_t capability = next_bundle_capability.fetch_add(1, std::memory_order_relaxed);
-        if (capability == 0 || capability == UINT64_MAX) {
-            // Capability exhaustion is fail-closed and rolls back exact slots.
-            for (size_t r = 0; r < request.owners.size(); ++r) {
-                auto & slot = context->pools[pool_for_request[r]]->slots[selected_slots[r]];
-                slot.busy = false;
-                slot.epoch = 0;
-            }
-            return out;
-        }
-        out.bundle.capability_ = capability;
-        out.bundle.admitted_   = true;
-        out.status             = moe_mmid_lease_status::ACQUIRED;
-        return out;
-    } catch (...) {
-        return out;
-    }
-}
-#endif
 
 moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admission_request & request) noexcept {
     moe_mmid_admitted_result out;

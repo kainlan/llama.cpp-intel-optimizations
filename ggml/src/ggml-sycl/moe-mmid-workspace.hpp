@@ -70,6 +70,10 @@ bool moe_mmid_plan_workspace(const moe_mmid_shape &        shape,
                              moe_mmid_workspace_geometry * out) noexcept;
 bool moe_mmid_component_max(moe_mmid_workspace_geometry *       aggregate,
                             const moe_mmid_workspace_geometry & candidate) noexcept;
+// Validates registry-consumable canonical/component-max geometry without
+// requiring a fictitious single source shape.
+bool moe_mmid_validate_workspace_geometry(const moe_mmid_workspace_geometry & geometry,
+                                          bool secondary_owner) noexcept;
 bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & geometry,
                                  uint32_t                            depth,
                                  size_t *                            device_bytes,
@@ -194,7 +198,6 @@ struct moe_mmid_model_token {
 struct moe_mmid_materialized_owner_plan {
     int                         owner_device = -1;
     uint64_t                    queue_cookie = 0;
-    moe_mmid_shape              shape;
     bool                        secondary_owner = false;
     moe_mmid_workspace_geometry geometry;
     size_t                      device_pool_bytes = 0;

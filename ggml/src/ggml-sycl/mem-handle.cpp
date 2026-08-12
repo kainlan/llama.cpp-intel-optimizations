@@ -509,7 +509,7 @@ std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integrat
 
 std::optional<moe::mmid_batch_binding> moe::canonical_allocation_integration::bind(
     const mem_handle & handle, uint64_t layout_id, uint32_t occurrence) noexcept {
-    if (layout_id == 0 || occurrence == 0) {
+    if (layout_id == 0) {
         return std::nullopt;
     }
     auto owner = retain(handle);

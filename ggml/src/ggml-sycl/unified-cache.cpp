@@ -11360,9 +11360,10 @@ moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
             return moe_mmid_materialize_status::INVALID;
         }
         moe_mmid_materialized_owner_plan owner;
-        owner.owner_device     = workspace.owner_device;
-        owner.queue_cookie     = binding->queue_cookie;
-        owner.geometry         = workspace.slot;
+        owner.owner_device      = workspace.owner_device;
+        owner.queue_cookie      = binding->queue_cookie;
+        owner.secondary_owner   = workspace.secondary_owner;
+        owner.geometry          = workspace.slot;
         owner.device_pool_bytes = workspace.device_pool_bytes;
         owner.host_pool_bytes   = workspace.host_pool_bytes;
         owners.push_back(owner);
@@ -20699,8 +20700,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
 
     for (const auto & owner : maxima) {
         moe_mmid_owner_workspace_plan workspace;
-        workspace.owner_device = owner.first;
-        workspace.slot         = owner.second;
+        workspace.owner_device    = owner.first;
+        workspace.secondary_owner = owner.first != primary_device;
+        workspace.slot            = owner.second;
         workspace.valid = moe_mmid_checked_pool_bytes(workspace.slot, workspace.depth,
                                                        &workspace.device_pool_bytes, &workspace.host_pool_bytes);
         if (!workspace.valid || workspace.device_pool_bytes > SIZE_MAX - plan.moe_mmid_device_pool_bytes ||

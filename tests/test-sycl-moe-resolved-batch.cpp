@@ -51,8 +51,13 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
     h.device_               = device;
     h.key_                  = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
     h.gen_                  = cache_generation();
-    h.cached_               = { ptr, layout, on_device, false, sycl::event{} };
-    h.leased_storage_owner_ = std::move(storage_owner);
+    h.cached_                  = { ptr, layout, on_device, false, sycl::event{} };
+    h.canonical_allocation_id_ = key_id.aux_id;
+    h.canonical_generation_    = h.gen_;
+    h.canonical_extent_        = 4096;
+    h.offset_                  = 64;
+    h.size_                    = 256;
+    h.leased_storage_owner_    = std::move(storage_owner);
     return h;
 }
 
@@ -158,6 +163,18 @@ static bool test_explicit_planned_alternate_on_submit_device() {
         route_for(&alternate, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA, 6);
     unproved.planned_device = 1;
     CHECK(!ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return unproved; }));
+    return true;
+}
+
+static bool test_canonical_bind_is_zero_based_and_exact() {
+    int storage = 0;
+    auto handle = weight_handle(&storage, 0, GGML_LAYOUT_AOS, 321, true);
+    auto first = ggml_sycl::moe::canonical_allocation_integration::bind(handle, GGML_LAYOUT_AOS + 1, 0);
+    CHECK(first && first->identity.occurrence == 0);
+    CHECK(first->identity.allocation_id == key_for(321).aux_id && first->identity.generation != 0);
+    CHECK(first->identity.byte_offset == 64 && first->identity.byte_size == 256);
+    auto second = ggml_sycl::moe::canonical_allocation_integration::bind(handle, GGML_LAYOUT_AOS + 1, 1);
+    CHECK(second && second->identity.occurrence == 1);
     return true;
 }
 
@@ -513,11 +530,11 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(device_batch);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
             moe_admitted_workspace_bundle ordinary_bundle;
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes, &ordinary_bundle);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
 
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
@@ -532,13 +549,13 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(secondary_batch);
             choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true,
                                                secondary.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
 
             auto soa = device_batch.batch.operands[0];
             soa.recipe.layout = GGML_LAYOUT_SOA;
             soa.admitted_recipe_signature = moe_execution_recipe_signature(soa.recipe);
             choice = choose_moe_batch_executor(soa, 0, true, soa.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_LEASE_MISSING);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
         }
     }
     moe_workspace_recipe overflow;
@@ -664,7 +681,7 @@ static bool test_decode_admission_is_route_mode_independent() {
 
 int main() {
     if (!test_host_primary_secondary_mixed_and_occurrences() || !test_explicit_planned_alternate_on_submit_device() ||
-        !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
+        !test_canonical_bind_is_zero_based_and_exact() || !test_identity_sharing_and_ready_event() || !test_executor_choice_is_residency_and_capability_driven() ||
         !test_fail_closed_contract() || !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||

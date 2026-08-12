@@ -80481,11 +80481,16 @@ static bool moe_graph_retention_publish(ggml_backend_sycl_context * ctx) {
         }
         return false;
     };
-    for (const auto & handle : handles) {
+    for (size_t occurrence = 0; occurrence < handles.size(); ++occurrence) {
+        const auto & handle = handles[occurrence];
         const auto resolved = handle.resolve();
         const uint64_t layout_id = resolved.ptr ? static_cast<uint64_t>(resolved.layout) + 1 : 0;
-        auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(handle, layout_id, 1);
-        if (!binding) {
+        if (occurrence > UINT32_MAX) {
+            return fail_partial();
+        }
+        auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(
+            handle, layout_id, static_cast<uint32_t>(occurrence));
+        if (!binding || tx.add_batch(*binding) != ggml_sycl::moe::retention_error::OK) {
             return fail_partial();
         }
         const auto & id = binding->identity;

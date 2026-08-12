@@ -264,9 +264,8 @@ static moe_mmid_materialized_owner_plan owner_plan(int device, uint64_t queue, b
     moe_mmid_materialized_owner_plan owner;
     owner.owner_device = device;
     owner.queue_cookie = queue;
-    owner.shape = { 64, 96, 2, 2, 3 };
     owner.secondary_owner = secondary;
-    check(moe_mmid_plan_workspace(owner.shape, secondary, &owner.geometry), "owner geometry failed");
+    check(moe_mmid_plan_workspace({ 64, 96, 2, 2, 3 }, secondary, &owner.geometry), "owner geometry failed");
     check(moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &owner.device_pool_bytes,
                                       &owner.host_pool_bytes),
           "owner pool failed");
@@ -438,9 +437,27 @@ static void registry_materialization_and_rollback() {
     };
     check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
           "registry publication failed");
-    check(registry.published_contexts() == 1, "published context missing");
+
+    // Planner component maxima need not correspond to one source shape: K and
+    // N may come from different tensors. Materialization consumes this exact
+    // canonical aggregate rather than reconstructing it from a zero/fake shape.
+    moe_mmid_workspace_geometry mixed_k, mixed_n, aggregate;
+    check(moe_mmid_plan_workspace({ 128, 32, 2, 2, 3 }, false, &mixed_k) &&
+              moe_mmid_plan_workspace({ 32, 128, 2, 2, 3 }, false, &mixed_n) &&
+              moe_mmid_component_max(&aggregate, mixed_k) && moe_mmid_component_max(&aggregate, mixed_n),
+          "mixed K/N aggregate setup failed");
+    moe_mmid_materialized_owner_plan aggregate_owner;
+    aggregate_owner.owner_device = 0;
+    aggregate_owner.queue_cookie = 901;
+    aggregate_owner.geometry = aggregate;
+    check(moe_mmid_checked_pool_bytes(aggregate, MOE_MMID_WORKSPACE_DEPTH, &aggregate_owner.device_pool_bytes,
+                                      &aggregate_owner.host_pool_bytes), "mixed aggregate pool sizing failed");
+    check(registry.materialize({ 91, 92, 93 }, 902, 0, { aggregate_owner }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "mixed K/N canonical aggregate was not materialized");
+    check(registry.published_contexts() == 2, "published contexts missing");
     const auto listed = registry.list();
-    check(listed.size() == 1 && listed[0].token.model_id == token.model_id && listed[0].plan_identity == 9 &&
+    check(listed.size() == 2 && listed[0].token.model_id == token.model_id && listed[0].plan_identity == 9 &&
               listed[0].submit_device == 0 && listed[0].owner_count == 1,
           "published lifecycle context listing mismatch");
     check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::ALREADY_PUBLISHED,
