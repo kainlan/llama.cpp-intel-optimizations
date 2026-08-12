@@ -20763,6 +20763,16 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         placement_plan demand = plan;
         plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
         if (!demand.moe_mmid_workspace_valid) return false;
+        // Runtime KV refresh has already restored the existing global MMID
+        // charge. Stable geometry is not a budget bypass: validate before the
+        // early return, accepting the exact boundary and rejecting budget+1.
+        if (!plan.multi_device) {
+            size_t admitted = 0;
+            if (!moe_mmid_admit_single_device_total(plan.vram_bytes, 0, plan.vram_budget, &admitted) ||
+                admitted != plan.vram_bytes) {
+                return false;
+            }
+        }
         bool fits = demand.moe_mmid_workspaces.size() == plan.moe_mmid_workspaces.size();
         for (const auto & required : demand.moe_mmid_workspaces) {
             const auto existing = std::find_if(plan.moe_mmid_workspaces.begin(), plan.moe_mmid_workspaces.end(),
@@ -20784,7 +20794,12 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         const size_t base_vram = plan.vram_bytes - old_global;
         if (base_vram > SIZE_MAX - demand.moe_mmid_device_pool_bytes) return false;
         const size_t new_vram = base_vram + demand.moe_mmid_device_pool_bytes;
-        if (!plan.multi_device && new_vram > plan.vram_budget) return false;
+        if (!plan.multi_device) {
+            size_t admitted = 0;
+            if (!moe_mmid_admit_single_device_total(base_vram, demand.moe_mmid_device_pool_bytes,
+                                                     plan.vram_budget, &admitted) ||
+                admitted != new_vram) return false;
+        }
         auto new_per_device = plan.per_device_vram;
         if (plan.multi_device) {
             std::vector<std::pair<int, size_t>> old_charges, new_charges;

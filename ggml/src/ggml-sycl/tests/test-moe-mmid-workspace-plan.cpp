@@ -276,6 +276,35 @@ static void finalized_owner_accounting() {
           "actual alternate/per-device/global totals mismatch");
 }
 
+static void stable_geometry_single_device_budget_boundary() {
+    size_t old_capacity = 0, grown_capacity = 0;
+    check(moe_mmid_capacity(4, 8, 1, &old_capacity) && moe_mmid_capacity(8, 8, 1, &grown_capacity) &&
+              old_capacity == 4 && grown_capacity == 8,
+          "runtime n_ctx growth setup failed");
+
+    // The immutable pool was conservatively materialized for the grown demand;
+    // runtime n_ctx growth therefore remains a stable-geometry fit.
+    moe_mmid_workspace_geometry immutable, grown;
+    check(moe_mmid_plan_workspace({ 64, 96, 2, 2, grown_capacity }, false, &immutable) &&
+              moe_mmid_plan_workspace({ 64, 96, 2, 2, grown_capacity }, false, &grown) &&
+              immutable.device_slot_bytes == grown.device_slot_bytes,
+          "stable runtime geometry setup failed");
+
+    const size_t exact_budget = 1000 + immutable.device_slot_bytes;
+    size_t       admitted     = 77;
+    check(moe_mmid_admit_single_device_total(1000, immutable.device_slot_bytes, exact_budget, &admitted) &&
+              admitted == exact_budget,
+          "stable geometry exact-budget runtime refresh was rejected");
+    const size_t unchanged = admitted;
+    check(!moe_mmid_admit_single_device_total(1001, immutable.device_slot_bytes, exact_budget, &admitted) &&
+              admitted == unchanged,
+          "stable geometry budget+1 refresh was accepted or mutated output");
+    check(!moe_mmid_admit_single_device_total(std::numeric_limits<size_t>::max(), 1, std::numeric_limits<size_t>::max(),
+                                              &admitted) &&
+              admitted == unchanged,
+          "stable geometry overflow mutated admission output");
+}
+
 static void runtime_per_device_rebuild_is_atomic() {
     const std::vector<int>    devices{ 0, 1 };
     const std::vector<size_t> budgets{ 1000, 400 };
@@ -598,6 +627,7 @@ int main() {
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
         finalized_owner_accounting();
+        stable_geometry_single_device_budget_boundary();
         runtime_per_device_rebuild_is_atomic();
         replacement_accounting_is_atomic();
         cookie_saturates_without_reuse();

@@ -100,6 +100,12 @@ bool moe_mmid_rebuild_per_device_usage(const std::vector<size_t> &              
                                        const std::vector<size_t> &                 budgets,
                                        std::vector<size_t> *                       used) noexcept;
 
+// Checked single-device admission shared by stable-fit and replacement paths.
+bool moe_mmid_admit_single_device_total(size_t   base_bytes,
+                                        size_t   workspace_bytes,
+                                        size_t   budget_bytes,
+                                        size_t * admitted_total) noexcept;
+
 bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
                                     const std::vector<std::pair<int, size_t>> & new_charges,
                                     const std::vector<int> &                    devices,
