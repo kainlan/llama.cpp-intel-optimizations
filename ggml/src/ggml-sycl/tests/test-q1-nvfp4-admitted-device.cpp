@@ -2,12 +2,14 @@
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
 #include "ggml.h"
+#include "unified-cache.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 #include <sycl/sycl.hpp>
 
@@ -37,42 +39,108 @@ struct synthetic_inventory {
 
 struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
+    std::vector<ggml_backend_t> retained_backends;
+    ggml_sycl_load_txn load{};
+    bool load_open = false;
     ggml_sycl_model_token model{};
     ggml_sycl_exec_context_id context{};
     ggml_sycl_q1_nvfp4_test_scope_token scope{};
+    bool scope_minted = false;
+
     lifecycle_fixture() {
-        backend = ggml_backend_sycl_init(0);
-        require(backend, "SYCL backend initialization failed");
-        ggml_sycl_load_txn load{};
-        require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
-        synthetic_inventory fixture;
-        require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
-                    GGML_SYCL_LIFECYCLE_OK, "inventory staging failed");
-        // load_end materializes the exact planned workspace/queue before LIVE publication.
-        require(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK,
-                "synthetic lifecycle load commit failed");
-        require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
-        require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK, "context create failed");
-        require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
-                "context bind failed");
-        require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1) == GGML_SYCL_LIFECYCLE_OK,
-                "model root bind failed");
-        require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, &scope), "private scope mint failed");
-        auto forged = scope; ++forged.nonce;
-        require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged scope token accepted");
-        require(ggml_sycl_q1_nvfp4_test_scope_enter(backend, &scope), "private scope enter failed");
+        try {
+            const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
+            if (begin_result != GGML_SYCL_LIFECYCLE_OK) {
+                throw std::runtime_error("load begin result=" + std::to_string(static_cast<int>(begin_result)));
+            }
+            load_open = true;
+            synthetic_inventory fixture;
+            const auto stage_result =
+                ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            if (stage_result != GGML_SYCL_LIFECYCLE_OK) {
+                throw std::runtime_error("inventory staging result=" +
+                                         std::to_string(static_cast<int>(stage_result)));
+            }
+            const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
+            require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
+                    "inventory candidate has no MMID workspace owners");
+
+            // Inventory staging uses temporary backends. Create fresh retained
+            // backends afterwards, one per unique owner device, so load_end's
+            // exact-queue lookup cannot observe a transient context that was cleared.
+            std::unordered_set<int> owner_devices;
+            for (const auto & workspace : candidate->plan->moe_mmid_workspaces) {
+                require(workspace.valid && workspace.owner_device >= 0, "invalid candidate MMID owner");
+                owner_devices.insert(workspace.owner_device);
+            }
+            for (int device : owner_devices) {
+                ggml_backend_t retained = ggml_backend_sycl_init(device);
+                require(retained != nullptr, "candidate owner backend initialization failed");
+                retained_backends.push_back(retained);
+                if (!backend || device == candidate->plan->device_id) backend = retained;
+            }
+            require(backend != nullptr, "no primary candidate owner backend");
+
+            const auto commit_result = ggml_backend_sycl_model_load_end(load, true, &model);
+            load_open = false;
+            std::cerr << "synthetic lifecycle load_end result=" << static_cast<int>(commit_result) << '\n';
+            if (commit_result != GGML_SYCL_LIFECYCLE_OK) {
+                throw std::runtime_error("synthetic lifecycle load commit result=" +
+                                         std::to_string(static_cast<int>(commit_result)));
+            }
+            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
+                    "plan activation failed");
+            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
+                    "context create failed");
+            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
+                    "context bind failed");
+            require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1) ==
+                        GGML_SYCL_LIFECYCLE_OK, "model root bind failed");
+            require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
+                    "private scope mint failed");
+            scope_minted = true;
+            auto forged = scope; ++forged.nonce;
+            require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged nonce accepted");
+            forged = scope; ++forged.model.slot_generation;
+            require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged model token accepted");
+            require(ggml_sycl_q1_nvfp4_test_scope_enter(backend, &scope), "private scope enter failed");
+        } catch (...) {
+            cleanup();
+            throw;
+        }
     }
-    ~lifecycle_fixture() {
-        if (backend) ggml_sycl_q1_nvfp4_test_scope_leave(backend, &scope);
-        ggml_sycl_exec_drain_ticket ticket{}; ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value && ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
-            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) == GGML_SYCL_EXECUTION_OK) {
+
+    void cleanup() noexcept {
+        if (scope_minted && backend) {
+            ggml_sycl_q1_nvfp4_test_scope_leave(backend, &scope);
+            scope_minted = false;
+        }
+        ggml_sycl_exec_drain_ticket ticket{};
+        ggml_sycl_exec_control_host_alloc_batch batch{};
+        if (context.value &&
+            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
+            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
+                GGML_SYCL_EXECUTION_OK) {
             (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
             (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
         }
-        if (model.model_id) (void) ggml_backend_sycl_model_unloaded_token(model);
-        if (backend) ggml_backend_free(backend);
+        context = {};
+        if (model.model_id) {
+            (void) ggml_backend_sycl_model_unloaded_token(model);
+            model = {};
+        } else if (load_open) {
+            const auto abort_result = ggml_backend_sycl_model_load_end(load, false, nullptr);
+            std::cerr << "synthetic lifecycle abort result=" << static_cast<int>(abort_result) << '\n';
+            load_open = false;
+        }
+        for (auto it = retained_backends.rbegin(); it != retained_backends.rend(); ++it) {
+            ggml_backend_free(*it);
+        }
+        retained_backends.clear();
+        backend = nullptr;
     }
+
+    ~lifecycle_fixture() { cleanup(); }
 };
 
 ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * tensor,

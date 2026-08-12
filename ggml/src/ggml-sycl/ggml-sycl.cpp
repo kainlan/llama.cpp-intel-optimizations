@@ -9919,6 +9919,7 @@ namespace {
 struct q1_nvfp4_test_scope_record {
     uint64_t context_id = 0;
     uint64_t nonce = 0;
+    ggml_sycl_model_token model{};
     bool armed = false;
 };
 std::mutex g_q1_nvfp4_test_scope_mutex;
@@ -9932,13 +9933,33 @@ std::atomic<uint64_t> g_q1_nvfp4_test_terminal{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_recycle{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
 
+bool ggml_sycl_q1_nvfp4_test_model_matches(ggml_sycl_model_token a, ggml_sycl_model_token b) {
+    return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id &&
+           a.slot == b.slot && a.slot_generation == b.slot_generation;
+}
+
+bool ggml_sycl_q1_nvfp4_test_root_matches(const ggml_backend_sycl_context & ctx,
+                                          const q1_nvfp4_test_scope_record & record) {
+    std::lock_guard<std::mutex> state_lock(ctx.execution_state_mutex);
+    return record.context_id != 0 && record.context_id == ctx.execution_context_id &&
+           record.model.model_id == ctx.execution_root_model_id &&
+           record.model.load_txn_id == ctx.execution_root_load_txn_id &&
+           record.model.slot == ctx.execution_root_slot &&
+           record.model.slot_generation == ctx.execution_root_slot_generation;
+}
+
 bool ggml_sycl_q1_nvfp4_test_authorized(const ggml_backend_sycl_context & ctx) {
     std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
     for (const auto & item : g_q1_nvfp4_test_scopes) {
         if (item.first && item.first->context == &ctx && item.second.armed &&
-            item.second.context_id != 0 && item.second.context_id == ctx.execution_context_id) return true;
+            ggml_sycl_q1_nvfp4_test_root_matches(ctx, item.second)) return true;
     }
     return false;
+}
+
+void ggml_sycl_q1_nvfp4_test_revoke_backend(ggml_backend_t backend) {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    g_q1_nvfp4_test_scopes.erase(backend);
 }
 
 bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure failure) {
@@ -9949,15 +9970,19 @@ bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure fai
 } // namespace
 
 bool ggml_sycl_q1_nvfp4_test_scope_mint(ggml_backend_t backend, ggml_sycl_exec_context_id context,
+                                        ggml_sycl_model_token model,
                                         ggml_sycl_q1_nvfp4_test_scope_token * token) {
-    if (!backend || !token || context.value == 0) return false;
+    if (!backend || !token || context.value == 0 || model.model_id == 0 || model.load_txn_id == 0 ||
+        model.slot == GGML_SYCL_MODEL_SLOT_NONE || model.slot_generation == 0) return false;
     auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
-    if (!backend_ctx || backend_ctx->execution_context_id != context.value) return false;
+    q1_nvfp4_test_scope_record record{ context.value, 0, model, false };
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
+    if (!backend_ctx || !ggml_sycl_q1_nvfp4_test_root_matches(*backend_ctx, record)) return false;
     uint64_t nonce = g_q1_nvfp4_test_nonce.fetch_add(1, std::memory_order_relaxed);
     if (nonce == 0) nonce = g_q1_nvfp4_test_nonce.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
-    g_q1_nvfp4_test_scopes[backend] = { context.value, nonce, false };
-    *token = { nonce, reinterpret_cast<uintptr_t>(backend), context.value };
+    record.nonce = nonce;
+    g_q1_nvfp4_test_scopes[backend] = record;
+    *token = { nonce, reinterpret_cast<uintptr_t>(backend), context.value, model };
     return true;
 }
 
@@ -9967,9 +9992,10 @@ bool ggml_sycl_q1_nvfp4_test_scope_enter(ggml_backend_t backend,
     std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_scope_mutex);
     auto it = g_q1_nvfp4_test_scopes.find(backend);
     if (it == g_q1_nvfp4_test_scopes.end() || it->second.nonce != token->nonce ||
-        it->second.context_id != token->context_id) return false;
+        it->second.context_id != token->context_id ||
+        !ggml_sycl_q1_nvfp4_test_model_matches(it->second.model, token->model)) return false;
     auto * backend_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
-    if (!backend_ctx || backend_ctx->execution_context_id != token->context_id) return false;
+    if (!backend_ctx || !ggml_sycl_q1_nvfp4_test_root_matches(*backend_ctx, it->second)) return false;
     it->second.armed = true;
     return true;
 }
@@ -70334,6 +70360,9 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+    ggml_sycl_q1_nvfp4_test_revoke_backend(backend);
+#endif
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
