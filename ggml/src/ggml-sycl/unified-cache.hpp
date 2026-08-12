@@ -1069,7 +1069,8 @@ moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
     int submit_device,
     int owner_device,
     uint64_t queue_cookie) noexcept;
-bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token) noexcept;
+bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
+                                               uint64_t plan_identity = 0) noexcept;
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
 
 // Immutable lifecycle-owned plan snapshots. A null plan with

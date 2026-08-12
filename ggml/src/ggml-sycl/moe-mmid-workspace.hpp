@@ -199,7 +199,16 @@ class moe_mmid_registry_lease {
   private:
     struct authority;
     std::shared_ptr<authority> authority_;
+    uint64_t                   generation_   = 0;
+    uint64_t                   queue_cookie_ = 0;
     friend class moe_mmid_workspace_registry;
+};
+
+struct moe_mmid_registry_context_info {
+    moe_mmid_model_token token;
+    uint64_t             plan_identity = 0;
+    int                  submit_device = -1;
+    size_t               owner_count   = 0;
 };
 
 struct moe_mmid_registry_lease_result {
@@ -224,8 +233,9 @@ class moe_mmid_workspace_registry {
                                            int                          submit_device,
                                            int                          owner_device,
                                            uint64_t                     queue_cookie) noexcept;
-    bool                           retire(const moe_mmid_model_token & token) noexcept;
+    bool                           retire(const moe_mmid_model_token & token, uint64_t plan_identity = 0) noexcept;
     size_t                         published_contexts() const noexcept;
+    std::vector<moe_mmid_registry_context_info> list() const;
 
   private:
     struct state;

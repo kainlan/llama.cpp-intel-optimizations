@@ -1,14 +1,38 @@
 #include "moe-mmid-workspace.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace ggml_sycl;
+
+static std::atomic<size_t> g_heap_allocations{ 0 };
+static std::atomic<bool>   g_fail_heap_allocations{ false };
+
+void * operator new(std::size_t bytes) {
+    g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
+    if (g_fail_heap_allocations.load(std::memory_order_relaxed)) {
+        throw std::bad_alloc();
+    }
+    if (void * ptr = std::malloc(bytes)) {
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+void operator delete(void * ptr) noexcept {
+    std::free(ptr);
+}
+
+void operator delete(void * ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
 
 static void check(bool value, const char * message) {
     if (!value) {
@@ -238,6 +262,10 @@ static void registry_materialization_and_rollback() {
     check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
           "registry publication failed");
     check(registry.published_contexts() == 1, "published context missing");
+    const auto listed = registry.list();
+    check(listed.size() == 1 && listed[0].token.model_id == token.model_id && listed[0].plan_identity == 9 &&
+              listed[0].submit_device == 0 && listed[0].owner_count == 1,
+          "published lifecycle context listing mismatch");
     check(registry.materialize(token, 9, 0, { owner }, allocator) == moe_mmid_materialize_status::ALREADY_PUBLISHED,
           "duplicate publication replaced context");
 
@@ -287,12 +315,16 @@ static void registry_multi_owner_context_and_identity() {
           "second context failed");
     auto wrong_queue = registry.acquire(a, 1000, 0, 1, 20);
     check(wrong_queue.status == moe_mmid_lease_status::INVALID, "wrong owner queue admitted");
-    const int allocation_calls_before_acquire = allocation_calls.load();
-    auto      lease                           = registry.acquire(a, 1000, 0, 1, 21);
+    const int    allocation_calls_before_acquire = allocation_calls.load();
+    const size_t heap_before_acquire             = g_heap_allocations.load();
+    g_fail_heap_allocations.store(true);
+    auto lease = registry.acquire(a, 1000, 0, 1, 21);
+    g_fail_heap_allocations.store(false);
     check(lease.status == moe_mmid_lease_status::ACQUIRED && lease.lease.owner_device() == 1 &&
               lease.lease.submit_device() == 0 && lease.lease.plan_identity() == 1000,
           "lease identities mismatch");
     check(allocation_calls.load() == allocation_calls_before_acquire, "acquire allocated backing storage");
+    check(g_heap_allocations.load() == heap_before_acquire, "acquire performed a heap allocation");
     check(lease.lease.slices().activation_f32.valid() && lease.lease.slices().host.valid(),
           "exact retained slices missing");
     check(lease.lease.terminal_release(21, lease.lease.generation() + 1) == moe_mmid_release_status::STALE,
@@ -301,6 +333,30 @@ static void registry_multi_owner_context_and_identity() {
           "wrong terminal queue released slot");
     check(lease.lease.terminal_release(21, lease.lease.generation()) == moe_mmid_release_status::RELEASED,
           "terminal release failed");
+}
+
+static void registry_replacement_and_queue_reset() {
+    moe_mmid_workspace_registry registry;
+    std::atomic<int>            destroyed{ 0 };
+    auto                        allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    const moe_mmid_model_token token{ 20, 21, 22 };
+    check(
+        registry.materialize(token, 200, 0, { owner_plan(0, 70) }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+        "replacement baseline failed");
+    check(
+        registry.materialize(token, 201, 0, { owner_plan(0, 71) }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+        "replacement transaction failed");
+    check(registry.acquire(token, 201, 0, 0, 70).status == moe_mmid_lease_status::INVALID,
+          "queue reset accepted stale generation cookie");
+    check(registry.retire(token, 200), "exact old-plan retirement failed");
+    check(registry.acquire(token, 200, 0, 0, 70).status == moe_mmid_lease_status::INVALID,
+          "retired replacement baseline remained visible");
+    auto current = registry.acquire(token, 201, 0, 0, 71);
+    check(current.status == moe_mmid_lease_status::ACQUIRED, "new replacement context disappeared with old retirement");
+    check(current.lease.terminal_release(71, current.lease.generation()) == moe_mmid_release_status::RELEASED,
+          "replacement terminal release failed");
 }
 
 static void registry_concurrent_depth_busy() {
@@ -429,6 +485,7 @@ int main() {
         finalized_owner_accounting();
         registry_materialization_and_rollback();
         registry_multi_owner_context_and_identity();
+        registry_replacement_and_queue_reset();
         registry_concurrent_depth_busy();
         registry_retirement_retains_outstanding_lease();
         std::cout << "moe-mmid-workspace-plan: all tests passed\n";

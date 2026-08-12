@@ -11269,6 +11269,38 @@ class ggml_sycl_load_candidate_end_scope {
     bool                             enabled_;
 };
 
+static bool ggml_sycl_same_mmid_workspace_plan(const ggml_sycl::placement_plan & a,
+                                               const ggml_sycl::placement_plan & b) {
+    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
+        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
+        const auto & x = a.moe_mmid_workspaces[i];
+        const auto & y = b.moe_mmid_workspaces[i];
+        const auto & gx = x.slot;
+        const auto & gy = y.slot;
+        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
+            x.device_pool_bytes != y.device_pool_bytes || x.host_pool_bytes != y.host_pool_bytes ||
+            gx.valid != gy.valid || gx.activation_rows != gy.activation_rows || gx.occurrences != gy.occurrences ||
+            gx.activation_f32_offset != gy.activation_f32_offset || gx.activation_f32_bytes != gy.activation_f32_bytes ||
+            gx.activation_q8_offset != gy.activation_q8_offset || gx.activation_q8_bytes != gy.activation_q8_bytes ||
+            gx.output_f32_offset != gy.output_f32_offset || gx.output_f32_bytes != gy.output_f32_bytes ||
+            gx.output_q8_offset != gy.output_q8_offset || gx.output_q8_bytes != gy.output_q8_bytes ||
+            gx.device_slot_bytes != gy.device_slot_bytes || gx.descriptor_host_bytes != gy.descriptor_host_bytes ||
+            gx.secondary_bounce_bytes != gy.secondary_bounce_bytes || gx.host_slot_bytes != gy.host_slot_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t ggml_sycl_next_mmid_queue_cookie() {
+    static std::atomic<uint64_t> next{ 1 };
+    uint64_t cookie = next.fetch_add(1, std::memory_order_relaxed);
+    return cookie != 0 && cookie != UINT64_MAX ? cookie : 0;
+}
+
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken & token,
     const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
@@ -11284,7 +11316,7 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     bindings.reserve(snapshot.plan->moe_mmid_workspaces.size());
     for (const auto & workspace : snapshot.plan->moe_mmid_workspaces) {
         sycl::queue * queue = &ggml_sycl_get_device(workspace.owner_device).default_queue();
-        const uint64_t cookie = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(queue));
+        const uint64_t cookie = ggml_sycl_next_mmid_queue_cookie();
         if (cookie == 0) {
             return false;
         }
@@ -11390,6 +11422,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         auto result = registry->finalize_end(ticket, true, publication, std::move(state));
         if (result.cleanup_required) {
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+                { result.token.model.value, result.token.load.value, result.token.owner.generation },
+                plan_snapshot->version);
             ggml_sycl::lifecycle_erase_placement_plan(result.token.model.value, result.token.load.value);
             const bool cleanup_ok =
                 ggml_sycl_abort_owner_effects_noexcept(result.token, "load_end/commit-then-cleanup-required");
@@ -11421,8 +11456,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
     } catch (...) {
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
-            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces({
-                ticket.token.model.value, ticket.token.load.value, ticket.token.owner.generation });
+            const auto failed_plan = ggml_sycl::lifecycle_find_placement_plan(
+                ticket.token.model.value, ticket.token.load.value);
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+                { ticket.token.model.value, ticket.token.load.value, ticket.token.owner.generation },
+                failed_plan ? failed_plan->version : 0);
             ggml_sycl::lifecycle_erase_placement_plan(ticket.token.model.value, ticket.token.load.value);
         } else if (ticket.token.load.value != 0) {
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
@@ -14374,9 +14412,14 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
     next->kv_info       = next_kv_info;
     next->model_n_layer = current->model_n_layer;
-    next->version       = ggml_sycl::lifecycle_next_plan_publication_id();
+    const bool stable_mmid = ggml_sycl_same_mmid_workspace_plan(*current->plan, *next->plan);
+    next->version = stable_mmid ? current->version : ggml_sycl::lifecycle_next_plan_publication_id();
     if (next->version == 0) {
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
+        return;
+    }
+    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, *next)) {
+        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         return;
     }
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
@@ -14386,9 +14429,17 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // The live-update ticket prevents exact-token teardown from entering
     // TEARING_DOWN until this CAS/publication transaction finalizes.
     if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
+        if (!stable_mmid) {
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+                { current->model_id, current->load_txn_id, current->slot_generation }, immutable->version);
+        }
         return;
     }
     ggml_sycl_publish_prepared_plan_locked(prepared_publication);
+    if (!stable_mmid) {
+        (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+            { current->model_id, current->load_txn_id, current->slot_generation }, current->version);
+    }
     g_runtime_update_succeeded = true;
 
     if (g_placement_kv_info.valid()) {

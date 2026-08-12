@@ -11418,8 +11418,9 @@ moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
     return unified_cache_moe_mmid_registry().acquire(token, plan_identity, submit_device, owner_device, queue_cookie);
 }
 
-bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token) noexcept {
-    return unified_cache_moe_mmid_registry().retire(token);
+bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
+                                               uint64_t plan_identity) noexcept {
+    return unified_cache_moe_mmid_registry().retire(token, plan_identity);
 }
 
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
