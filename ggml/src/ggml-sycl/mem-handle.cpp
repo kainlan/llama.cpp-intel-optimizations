@@ -257,7 +257,8 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
                                                   const sycl::event &       ready_event) {
     mem_handle h;
     h.kind_   = mem_handle_kind::WEIGHT;
-    h.device_ = device;
+    // A leased entry, not the caller, is authoritative for owning device.
+    h.device_ = entry ? entry->owner_device : device;
     h.key_    = key;
     h.gen_    = cache_generation();  // Fresh — no slow-path re-query
     h.cached_ = { ptr, layout, on_device };
@@ -270,7 +271,8 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     // tuple. A live lease prevents cache mutation while this snapshot is read.
     if (entry && (ptr != entry->device_ptr || layout != entry->layout ||
                   on_device != (entry->location == cache_location::DEVICE) ||
-                  !entry->has_retention_identity())) {
+                  !entry->has_retention_identity() ||
+                  (entry->location == cache_location::DEVICE && entry->owner_device < 0))) {
         entry->in_use_count.fetch_sub(1);
         return {};
     }

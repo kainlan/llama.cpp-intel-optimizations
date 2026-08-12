@@ -2637,9 +2637,15 @@ uint64_t unified_cache_mint_retention_identity() noexcept {
     return 0;
 }
 
-void unified_cache_set_retention_identity_counter_for_test(uint64_t next) noexcept {
-    g_retention_identity_counter.store(next, std::memory_order_relaxed);
+#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+void unified_cache_exhaust_retention_identities_for_test() noexcept {
+    uint64_t value = g_retention_identity_counter.load(std::memory_order_relaxed);
+    while (value != UINT64_MAX &&
+           !g_retention_identity_counter.compare_exchange_weak(
+               value, UINT64_MAX, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
 }
+#endif
 
 unified_cache_entry::unified_cache_entry() noexcept {
     (void) renew_allocation_identity();
@@ -2661,7 +2667,8 @@ bool unified_cache_entry::renew_allocation_identity() noexcept {
 bool unified_cache_entry::renew_replacement_generation() noexcept {
     const uint64_t generation = unified_cache_mint_retention_identity();
     if (generation == 0) {
-        replacement_generation_ = 0;
+        // A failed renewal is not a transition: preserve the identity of the
+        // still-published bytes.
         return false;
     }
     replacement_generation_ = generation;
@@ -3351,6 +3358,13 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     return nullptr;
                 }
 
+                // Reserve the complete next capability before allocation or
+                // mutation. Exhaustion leaves the published entry untouched.
+                unified_cache_entry reserved_identity{};
+                if (!reserved_identity.has_retention_identity()) {
+                    return nullptr;
+                }
+
                 // Size changed - need to reallocate device buffer
                 GGML_SYCL_DEBUG(
                     "[UNIFIED-CACHE] Size changed for model=%llu name_hash=0x%llx (%zu -> %zu bytes), reallocating\n",
@@ -3462,27 +3476,30 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     }
                 }
 
-                // Release old buffer after new allocation succeeds (only if it was on device)
-                if (!it->second.host_resident && it->second.device_ptr) {
-                    release_entry_allocation_locked(it->second);
-                    // Device pointer freed — baked graph pointers to this entry are now stale
-                    has_evictions_.store(true, std::memory_order_release);
-                }
-
-                // Copy new data (only if on device, host buffer already filled above)
+                // Keep an owning copy of the old backing until the new backing,
+                // producer event and reserved identity are all ready to publish.
+                unified_cache_entry old_backing = it->second;
+                sycl::event         copy_evt;
                 if (!is_host_resident) {
-                    sycl::event copy_evt       = copy_to_device(new_device_ptr, src_ptr, size);
+                    try {
+                        copy_evt = copy_to_device(new_device_ptr, src_ptr, size);
+                    } catch (...) {
+                        // Direct allocations roll back through the temporary
+                        // owner; host-zone allocations require explicit return.
+                        if (is_host_resident) {
+                            host_zone_free(host_zone_id::WEIGHT, new_device_ptr);
+                        }
+                        it->second.pinned = was_pinned;
+                        return nullptr;
+                    }
                     it->second.has_ready_event = true;
                     it->second.ready_event     = copy_evt;
                     it->second.state           = cache_entry_state::IN_PROGRESS;
                 }
 
-                // Update entry with new allocation. Identity exhaustion must
-                // never publish an unidentifiable backing.
-                if (!it->second.renew_allocation_identity()) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention identity exhausted during realloc\n");
-                    return nullptr;
-                }
+                // Atomic metadata commit under rw_mutex_.
+                it->second.allocation_id_          = reserved_identity.allocation_identity();
+                it->second.replacement_generation_ = reserved_identity.replacement_identity();
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = size;
                 it->second.content_hash         = new_hash;
@@ -3507,7 +3524,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         saturating_sub_used(old_size);
                     }
                 }
-                it->second.pinned = was_pinned;
+                it->second.owner_device = get_device_id_from_queue(queue_);
+                it->second.pinned       = was_pinned;
+                release_entry_allocation_locked(old_backing);
+                has_evictions_.store(true, std::memory_order_release);
             } else if (content_changed) {
                 // Same size but content changed - just re-upload.  This still
                 // replaces bytes observed through existing mem_handle leases,
@@ -3515,7 +3535,8 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached-recopy")) {
                     return nullptr;
                 }
-                if (!it->second.renew_replacement_generation()) {
+                const uint64_t next_generation = unified_cache_mint_retention_identity();
+                if (next_generation == 0) {
                     GGML_LOG_ERROR("[UNIFIED-CACHE] retention generation exhausted during recopy\n");
                     return nullptr;
                 }
@@ -3524,7 +3545,9 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     "re-uploading\n",
                     (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
                     (unsigned long long) it->second.content_hash, (unsigned long long) new_hash);
-                sycl::event copy_evt       = copy_to_device(it->second.device_ptr, src_ptr, size);
+                sycl::event copy_evt = copy_to_device(it->second.device_ptr, src_ptr, size);
+                // Commit generation only after submission succeeded.
+                it->second.replacement_generation_ = next_generation;
                 it->second.has_ready_event = true;
                 it->second.ready_event     = copy_evt;
                 it->second.state           = cache_entry_state::IN_PROGRESS;
@@ -3543,6 +3566,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     }
 
     misses_++;
+
+    // Reserve cache allocation+generation before eviction or tier allocation.
+    unified_cache_entry entry{};
+    if (!entry.has_retention_identity()) {
+        return nullptr;
+    }
 
     // Need to allocate - check if we have space
     bool use_host_fallback = false;
@@ -3649,8 +3678,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // Compute content hash for new entry (only computed once on cache miss)
     uint64_t content_hash = compute_content_hash(src_ptr, size);
 
-    // Create cache entry
-    unified_cache_entry entry{};
+    // Create cache entry using the pre-reserved capability.
     entry.device_ptr   = device_ptr;
     entry.src_ptr      = src_ptr;       // Track source for change detection
     entry.content_hash = content_hash;  // Track content for change detection
@@ -3677,6 +3705,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     }
     entry.host_resident        = is_host_resident;
     entry.location             = entry_location;
+    entry.owner_device         = get_device_id_from_queue(queue_);
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = !is_host_resident;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
@@ -5932,6 +5961,10 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
         process_deferred_frees();
     }
 
+    // Reserve the complete capability before any old-entry destruction or
+    // physical slot allocation. Exact existing-slot reuse does not need it.
+    unified_cache_entry reserved_entry{};
+
     // Check if entry already exists with matching layout and size
     auto it = entries_.find(cache_key);
     if (it != entries_.end()) {
@@ -5942,6 +5975,9 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
             // HOST_MMAP entries are raw mmap pointers, not device allocations;
             // treat them as a mismatch so a real device allocation is made.
             return entry.device_ptr;
+        }
+        if (!reserved_entry.has_retention_identity()) {
+            return nullptr;
         }
         // Layout/size mismatch or HOST_MMAP — evict old entry.
         // llama.cpp-vtf7f: refuse to erase an entry that any mem_handle
@@ -5971,6 +6007,10 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                     (int) entry.state);
         }
         entries_.erase(it);
+    }
+
+    if (!reserved_entry.has_retention_identity()) {
+        return nullptr;
     }
 
     // Check VRAM budget and evict if needed.
@@ -6057,8 +6097,8 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
         return nullptr;
     }
 
-    // Create entry in IN_PROGRESS state (not yet READY — caller must register_ready)
-    unified_cache_entry entry{};
+    // Create entry in IN_PROGRESS state using the pre-reserved capability.
+    unified_cache_entry entry = reserved_entry;
     entry.device_ptr           = device_ptr;
     entry.src_ptr              = nullptr;
     entry.content_hash         = 0;
@@ -6077,6 +6117,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     entry.has_ready_event      = false;
     entry.host_resident        = false;
     entry.location             = cache_location::DEVICE;
+    entry.owner_device         = get_device_id_from_queue(queue_);
     entry.pool_allocated       = is_pool_alloc;
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = !is_pool_alloc;
@@ -6840,12 +6881,18 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             if (entry.state != cache_entry_state::READY) {
                 return result;
             }
-            if (!entry.device_ptr) {
+            if (!entry.device_ptr || !entry.has_retention_identity()) {
                 return result;
             }
             // HOST_MMAP entries hold raw mmap pointers — not GPU-accessible; same
             // filter as get_weight_ptr so mem_handle semantics are consistent.
             if (entry.location == cache_location::HOST_MMAP) {
+                return result;
+            }
+            if (entry.owner_device < 0) {
+                entry.owner_device = get_device_id_from_queue(queue_);
+            }
+            if (entry.location == cache_location::DEVICE && entry.owner_device < 0) {
                 return result;
             }
             // Bump the lease refcount under shared_lock.  Visible to any evictor
@@ -10625,7 +10672,14 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         tier = alloc_tier::HOST_PINNED;
     }
 
-    const size_t alloc_size     = std::max<size_t>(req.size, 1);
+    const size_t alloc_size = std::max<size_t>(req.size, 1);
+    // Reserve capability before any tier allocation. A failed physical
+    // allocation burns the ID (safe); exhaustion performs no allocation.
+    const uint64_t reserved_alloc_id = unified_cache_mint_retention_identity();
+    if (reserved_alloc_id == 0) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] retention identity exhausted before allocation\n");
+        return false;
+    }
     bool         reserve_device = (tier == alloc_tier::DEVICE_VRAM);
     bool         reserve_host   = (tier == alloc_tier::HOST_PINNED);
 
@@ -10942,11 +10996,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.tier         = tier;
     rec.handle.role         = req.intent.role;
     rec.handle.category     = cat;
-    rec.handle.alloc_id     = unified_cache_mint_retention_identity();
-    if (rec.handle.alloc_id == 0) {
-        GGML_LOG_ERROR("[UNIFIED-ALLOC] retention identity exhausted; refusing allocation publication\n");
-        return false;
-    }
+    rec.handle.alloc_id     = reserved_alloc_id;
     rec.handle.vram_zone    = out->vram_zone;  // Propagate zone routing set by zone_alloc paths above
     rec.handle.zone_managed = out->zone_managed;
     rec.handle.host_zone    = out->host_zone;

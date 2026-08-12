@@ -26,7 +26,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -454,8 +453,18 @@ static bool test_cache_entry_minted_retention_identity() {
     ggml_sycl::unified_cache_entry second{};
     int                            first_storage  = 1;
     int                            second_storage = 2;
-    first.size  = sizeof(first_storage);
-    second.size = sizeof(second_storage);
+    first.device_ptr   = &first_storage;
+    first.size         = sizeof(first_storage);
+    first.layout       = GGML_LAYOUT_AOS;
+    first.location     = ggml_sycl::cache_location::HOST_PINNED;
+    first.host_resident = true;
+    first.owner_device = ggml_sycl::mem_handle::HOST_DEVICE;
+    second.device_ptr   = &second_storage;
+    second.size         = sizeof(second_storage);
+    second.layout       = GGML_LAYOUT_AOS;
+    second.location     = ggml_sycl::cache_location::HOST_PINNED;
+    second.host_resident = true;
+    second.owner_device = ggml_sycl::mem_handle::HOST_DEVICE;
     first.in_use_count.fetch_add(1);
     second.in_use_count.fetch_add(1);
     auto first_handle = ggml_sycl::mem_handle::from_weight_lease_snapshot(
@@ -479,6 +488,13 @@ static bool test_cache_entry_minted_retention_identity() {
         key, ggml_sycl::mem_handle::HOST_DEVICE, &second_storage, GGML_LAYOUT_AOS, false, &first, {}, false,
         sycl::event{});
     TEST_ASSERT(!forged.valid(), "cache capability factory must reject a pointer not owned by the leased entry");
+
+    // Forged device is ignored: the entry is authoritative.
+    first.in_use_count.fetch_add(1);
+    auto forged_device = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, 77, &first_storage, GGML_LAYOUT_AOS, false, &first, {}, false, sycl::event{});
+    TEST_ASSERT(forged_device.device() == first.owner_device,
+                "caller device must not relabel a cache-owned capability");
 
     TEST_PASS();
     return true;
@@ -511,9 +527,7 @@ static bool test_retention_identity_mint_concurrency_and_exhaustion() {
         }
     }
 
-    ggml_sycl::unified_cache_set_retention_identity_counter_for_test(std::numeric_limits<uint64_t>::max() - 1);
-    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == std::numeric_limits<uint64_t>::max() - 1,
-                "last representable identity before sentinel must mint exactly once");
+    ggml_sycl::unified_cache_exhaust_retention_identities_for_test();
     TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
                 "exhausted mint must fail closed instead of returning UINT64_MAX");
     TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,

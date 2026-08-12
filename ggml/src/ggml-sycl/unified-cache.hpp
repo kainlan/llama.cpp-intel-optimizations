@@ -1643,7 +1643,11 @@ struct stale_weight_alloc {
 // Process-wide capability mint shared by runtime, arena and cache allocations.
 // It never returns zero and never wraps: zero means permanent exhaustion.
 uint64_t unified_cache_mint_retention_identity() noexcept;
-void unified_cache_set_retention_identity_counter_for_test(uint64_t next) noexcept;
+#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+// Test-only, monotonic seam: may advance the default minter toward exhaustion,
+// but can never rewind it or make an issued identity reusable.
+void unified_cache_exhaust_retention_identities_for_test() noexcept;
+#endif
 
 // Metadata for a cached entry
 struct unified_cache_entry {
@@ -1676,6 +1680,7 @@ struct unified_cache_entry {
     sycl::event           ready_event;      // Completion event for IN_PROGRESS entries
     bool                  host_resident;    // Entry lives in host memory, not device (fallback when VRAM full)
     cache_location        location;         // DEVICE/HOST_PINNED/HOST_MMAP
+    int                   owner_device = -1; // Cache/queue owner; callers cannot relabel this capability.
     bool                  pool_allocated;   // True if device_ptr was sub-allocated from layout_pool_
     bool                  cache_budget_charged = false;  // True if this entry incremented cache used_
     bool                  retired              = false;  // Hidden from routing; erased after in_use_count reaches zero.

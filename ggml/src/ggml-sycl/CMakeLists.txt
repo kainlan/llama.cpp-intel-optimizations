@@ -1809,6 +1809,10 @@ endif() # direct-source static SYCL fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-wrong-device
     tests/test-mem-handle-wrong-device.cpp
+    unified-cache.cpp
+    model-lifecycle.cpp
+    pinned-pool.cpp
+    mem-handle.cpp
 )
 target_include_directories(test-mem-handle-wrong-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -1816,25 +1820,21 @@ target_include_directories(test-mem-handle-wrong-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${SYCL_INCLUDE_DIR}
 )
+target_compile_options(test-mem-handle-wrong-device PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-mem-handle-wrong-device PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
 target_compile_definitions(test-mem-handle-wrong-device PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_RETENTION_IDENTITY_TESTING=1
 )
-target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
-# This source constructs sycl::event directly; do not rely on ggml-sycl's
-# private/transitive device link to supply the SYCL runtime/device image.
+target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
-else()
-    target_compile_options(test-mem-handle-wrong-device PRIVATE "-fsycl")
-    target_link_options(test-mem-handle-wrong-device PRIVATE "-fsycl")
 endif()
 add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
 set_tests_properties(mem-handle-wrong-device PROPERTIES
     LABELS "sycl;handle;device-identity;tdd"
-    # setvars.sh puts compiler/lib before redist/lib on this workstation, but the
-    # backend-visible Level Zero devices are exposed via redist/lib.
-    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
     TIMEOUT 120
 )
 
@@ -1988,6 +1988,10 @@ endif() # static SYCL backend fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-mem-handle-concurrent-resolve
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-concurrent-resolve.cpp
+    unified-cache.cpp
+    model-lifecycle.cpp
+    pinned-pool.cpp
+    mem-handle.cpp
 )
 target_include_directories(test-sycl-mem-handle-concurrent-resolve PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -2001,14 +2005,13 @@ target_compile_definitions(test-sycl-mem-handle-concurrent-resolve PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
-target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME test-sycl-mem-handle-concurrent-resolve COMMAND test-sycl-mem-handle-concurrent-resolve)
 set_tests_properties(test-sycl-mem-handle-concurrent-resolve PROPERTIES
     LABELS "sycl;handle;concurrency;tdd"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 
