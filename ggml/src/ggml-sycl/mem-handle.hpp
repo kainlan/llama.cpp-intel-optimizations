@@ -310,9 +310,15 @@ class mem_handle {
     // Arena-specific accessors (meaningful only for arena handles).
     int zone_id() const { return zone_id_; }
 
-    size_t offset() const { return offset_; }
+    size_t offset() const {
+        mem_handle_lock_guard g(lock_);
+        return offset_;
+    }
 
-    size_t size() const { return size_; }
+    size_t size() const {
+        mem_handle_lock_guard g(lock_);
+        return size_;
+    }
 
     uint64_t generation() const { return arena_gen_; }
 
@@ -423,16 +429,16 @@ class mem_handle {
 
     // Arena-specific fields (only used for ARENA_* kinds).
     int      zone_id_   = 0;  // Which zone (maps to vram_zone_id)
-    size_t   offset_    = 0;  // Offset within the zone
-    size_t   size_      = 0;  // Allocation size
+    mutable size_t offset_ = 0;  // GUARDED by lock_ for WEIGHT; immutable arena slice offset
+    mutable size_t size_   = 0;  // GUARDED by lock_ for WEIGHT; immutable arena slice size
     uint64_t arena_gen_ = 0;  // Arena generation (for invalidation)
 
     // Exact allocator-minted retention identity. Cache WEIGHT constructors do
     // not populate these until unified-cache propagation lands; graph retention
     // therefore rejects those handles rather than hashing key/pointer identity.
-    uint64_t canonical_allocation_id_ = 0;
-    uint64_t canonical_generation_    = 0;
-    size_t   canonical_extent_        = 0;
+    mutable uint64_t canonical_allocation_id_ = 0;  // GUARDED by lock_
+    mutable uint64_t canonical_generation_    = 0;  // GUARDED by lock_
+    mutable size_t   canonical_extent_        = 0;  // GUARDED by lock_
 
     // Mutable because resolve() is logically const (returns the current
     // pointer) but updates the cache as a side effect.
@@ -497,6 +503,9 @@ struct mem_handle_debug_info {
     size_t          size                 = 0;
     uint64_t        generation           = 0;
     size_t          stable_identity_hash = 0;
+    uint64_t        canonical_allocation_id = 0;
+    uint64_t        canonical_generation    = 0;
+    size_t          canonical_extent        = 0;
     bool            has_stable_identity  = false;
     bool            has_ready_event      = false;
     const char *    owner_tag            = "";

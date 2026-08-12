@@ -2623,6 +2623,35 @@ unified_cache::unified_cache(sycl::queue & queue,
 // check adds no new synchronization of its own. (Defined here, outside the
 // zone-audit anonymous namespace above, because a member of a ggml_sycl-scope
 // struct cannot be defined inside an inner unnamed namespace.)
+namespace {
+std::atomic<uint64_t> g_next_cache_allocation_id{ 1 };
+std::atomic<uint64_t> g_next_cache_replacement_generation{ 1 };
+
+uint64_t mint_nonzero(std::atomic<uint64_t> & counter) noexcept {
+    uint64_t value = counter.load(std::memory_order_relaxed);
+    while (value != 0 && value != UINT64_MAX) {
+        if (counter.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) {
+            return value;
+        }
+    }
+    // Exhaustion is permanent and fail-closed; never wrap and reuse an ID.
+    return 0;
+}
+}  // namespace
+
+unified_cache_entry::unified_cache_entry() noexcept {
+    renew_allocation_identity();
+}
+
+void unified_cache_entry::renew_allocation_identity() noexcept {
+    allocation_id = mint_nonzero(g_next_cache_allocation_id);
+    renew_replacement_generation();
+}
+
+void unified_cache_entry::renew_replacement_generation() noexcept {
+    replacement_generation = mint_nonzero(g_next_cache_replacement_generation);
+}
+
 void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
     if (!g_ggml_sycl_debug || !site) {
         return;
@@ -3433,6 +3462,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 }
 
                 // Update entry with new allocation
+                it->second.renew_allocation_identity();
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = size;
                 it->second.content_hash         = new_hash;
@@ -3465,6 +3495,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached-recopy")) {
                     return nullptr;
                 }
+                it->second.renew_replacement_generation();
                 GGML_SYCL_DEBUG(
                     "[UNIFIED-CACHE] Content changed for model=%llu name_hash=0x%llx (hash %llx -> %llx), "
                     "re-uploading\n",
@@ -6814,7 +6845,12 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
             result.entry                = &entry;  // pointer stable across unordered_map inserts
-            result.storage_owner        = entry.storage_owner;
+            result.storage_owner         = entry.storage_owner;
+            result.allocation_id          = entry.allocation_id;
+            result.replacement_generation = entry.replacement_generation;
+            result.allocation_extent      = entry.size;
+            result.byte_offset            = 0;
+            result.byte_size              = entry.size;
             if (entry.has_ready_event) {
                 result.has_ready_event = true;
                 result.ready_event     = entry.ready_event;
@@ -14365,6 +14401,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
 
                 it->second.pinned = was_pinned;
                 release_entry_allocation_locked(it->second);
+                it->second.renew_allocation_identity();
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = alloc_size;
                 it->second.direct_alloc_owner   = new_direct_alloc_owner;
@@ -14373,12 +14410,14 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 content_changed = true;
             }
 
-            if (!need_realloc && content_changed &&
-                !can_replace_cache_entry_locked(key, it->second, "ensure_cached_alloc-recopy")) {
-                if (needs_fill) {
-                    *needs_fill = false;
+            if (!need_realloc && content_changed) {
+                if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached_alloc-recopy")) {
+                    if (needs_fill) {
+                        *needs_fill = false;
+                    }
+                    return nullptr;
                 }
-                return nullptr;
+                it->second.renew_replacement_generation();
             }
 
             it->second.src_ptr      = src_ptr;

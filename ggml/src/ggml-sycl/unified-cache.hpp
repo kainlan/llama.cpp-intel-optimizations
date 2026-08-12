@@ -1621,6 +1621,15 @@ struct stale_weight_alloc {
 
 // Metadata for a cached entry
 struct unified_cache_entry {
+    unified_cache_entry() noexcept;
+    void renew_allocation_identity() noexcept;
+    void renew_replacement_generation() noexcept;
+
+    // Minted at cache-entry allocation/replacement time. These are capability
+    // identity, never hashes of keys or pointers. Copies preserve identity;
+    // a backing replacement explicitly renews both values.
+    uint64_t              allocation_id          = 0;
+    uint64_t              replacement_generation = 0;
     void *                device_ptr;       // GPU memory pointer (or host memory if host_resident)
     const void *          src_ptr;          // Source data pointer (for change detection)
     uint64_t              content_hash;     // Simple hash of content (first/last bytes)
@@ -1838,6 +1847,11 @@ class unified_cache {
         bool                  on_device       = false;
         unified_cache_entry * entry           = nullptr;  // opaque handle for lease release
         std::shared_ptr<void> storage_owner;
+        uint64_t              allocation_id          = 0;
+        uint64_t              replacement_generation = 0;
+        size_t                allocation_extent      = 0;
+        size_t                byte_offset            = 0;
+        size_t                byte_size              = 0;
         bool                  has_ready_event = false;
         sycl::event           ready_event;
 

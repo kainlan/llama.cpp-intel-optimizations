@@ -437,6 +437,53 @@ static bool test_mem_handle_stable_identity() {
 // Main
 // =============================================================================
 
+static bool test_cache_entry_minted_retention_identity() {
+    TEST_BEGIN("cache_entry_minted_retention_identity");
+
+    ggml_sycl_cache_id id{};
+    id.valid     = true;
+    id.model_id  = 9001;
+    id.name_hash = 9002;
+    id.nbytes    = 64;
+    id.type      = GGML_TYPE_Q8_0;
+    ggml_sycl::unified_cache_key key{ ggml_sycl::cache_entry_type::DENSE_WEIGHT, id, -1, -1 };
+
+    ggml_sycl::unified_cache_entry first{};
+    ggml_sycl::unified_cache_entry second{};
+    int                            first_storage  = 1;
+    int                            second_storage = 2;
+    first.size  = sizeof(first_storage);
+    second.size = sizeof(second_storage);
+    first.in_use_count.fetch_add(1);
+    second.in_use_count.fetch_add(1);
+    auto first_handle = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, ggml_sycl::mem_handle::HOST_DEVICE, &first_storage, GGML_LAYOUT_AOS, false, &first, {}, false,
+        sycl::event{});
+    auto second_handle = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, ggml_sycl::mem_handle::HOST_DEVICE, &second_storage, GGML_LAYOUT_AOS, false, &second, {}, false,
+        sycl::event{});
+    const auto first_info  = first_handle.debug_info();
+    const auto second_info = second_handle.debug_info();
+    TEST_ASSERT(first_info.canonical_allocation_id == first.allocation_id &&
+                    first_info.canonical_generation == first.replacement_generation &&
+                    first_info.canonical_extent == first.size,
+                "mem_handle must propagate exact cache-entry identity");
+    TEST_ASSERT(first_info.canonical_allocation_id != second_info.canonical_allocation_id,
+                "identical cache keys must not collide across backing allocations");
+
+    const uint64_t prior_allocation = first.allocation_id;
+    const uint64_t prior_generation = first.replacement_generation;
+    first.renew_replacement_generation();
+    TEST_ASSERT(first.allocation_id == prior_allocation && first.replacement_generation != prior_generation,
+                "content replacement must preserve allocation and advance generation");
+    first.renew_allocation_identity();
+    TEST_ASSERT(first.allocation_id != prior_allocation,
+                "backing replacement must mint a new allocation identity");
+
+    TEST_PASS();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     (void) argc;
     (void) argv;
@@ -475,6 +522,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_wrong_device_weight_handle_fails(n_gpu_devices);
     all_passed &= test_mem_handle_hash_identity();
     all_passed &= test_mem_handle_stable_identity();
+    all_passed &= test_cache_entry_minted_retention_identity();
 
     fprintf(stderr, "-------------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n", g_tests_run, g_tests_passed, g_tests_skipped);

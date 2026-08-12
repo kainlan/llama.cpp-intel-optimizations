@@ -267,6 +267,13 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     }
     h.leased_entry_         = entry;  // ownership of the refcount bump transferred
     h.leased_storage_owner_ = std::move(storage_owner);
+    if (entry) {
+        h.canonical_allocation_id_ = entry->allocation_id;
+        h.canonical_generation_    = entry->replacement_generation;
+        h.canonical_extent_        = entry->size;
+        h.offset_                  = 0;
+        h.size_                    = entry->size;
+    }
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
@@ -681,8 +688,13 @@ resolved_ptr mem_handle::resolve_slow() const {
         mem_handle_lock_guard g(lock_);
         stale = take_lease_state_locked();
         store_lease_state_locked(fresh);
-        cached_ = resolved;
-        gen_    = cache_generation();
+        cached_                  = resolved;
+        canonical_allocation_id_ = result.allocation_id;
+        canonical_generation_    = result.replacement_generation;
+        canonical_extent_        = result.allocation_extent;
+        offset_                   = result.byte_offset;
+        size_                     = result.byte_size;
+        gen_                      = cache_generation();
     }
     release_lease_state(stale);
 
@@ -934,8 +946,6 @@ mem_handle_debug_info mem_handle::debug_info() const {
     info.kind                = kind_;
     info.device              = device_;
     info.zone_id             = zone_id_;
-    info.offset              = offset_;
-    info.size                = size_;
     info.generation          = arena_gen_;
     info.has_stable_identity = has_stable_owner_identity();
     info.owner_tag           = debug_owner_tag_ ? debug_owner_tag_ : "";
@@ -944,9 +954,14 @@ mem_handle_debug_info mem_handle::debug_info() const {
     // stable_identity_hash() each take the lock, and the spinlock is not
     // recursive, so use the *_locked form here.
     mem_handle_lock_guard g(lock_);
-    info.valid                = cached_.ptr != nullptr;
-    info.has_ready_event      = cached_.has_ready_event;
-    info.stable_identity_hash = stable_identity_hash_locked();
+    info.valid                   = cached_.ptr != nullptr;
+    info.offset                  = offset_;
+    info.size                    = size_;
+    info.canonical_allocation_id = canonical_allocation_id_;
+    info.canonical_generation    = canonical_generation_;
+    info.canonical_extent        = canonical_extent_;
+    info.has_ready_event         = cached_.has_ready_event;
+    info.stable_identity_hash    = stable_identity_hash_locked();
     return info;
 }
 
