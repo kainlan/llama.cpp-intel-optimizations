@@ -4599,13 +4599,14 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_options})
     endif()
     target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE
-        ggml-sycl-q1-route-test-objects ggml-base ggml-cpu)
+        ggml-sycl-q1-route-test-objects)
+    # Derive the complete dependency closure (ggml base/CPU, oneDNN, oneMKL,
+    # oneCCL and the selected SYCL runtime) from the canonical backend. Do not
+    # link ggml-sycl itself: that would introduce a second backend implementation
+    # beside the private object variant and defeat seam isolation.
     get_target_property(_q1_route_link_libraries ggml-sycl LINK_LIBRARIES)
     if (_q1_route_link_libraries AND NOT _q1_route_link_libraries STREQUAL "_q1_route_link_libraries-NOTFOUND")
         target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_libraries})
-    endif()
-    if (TARGET IntelSYCL::SYCL_CXX)
-        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE IntelSYCL::SYCL_CXX)
     endif()
     set_target_properties(test-sycl-q1-nvfp4-admitted-device PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
