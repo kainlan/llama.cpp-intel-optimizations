@@ -785,10 +785,21 @@ error Registry::child_begin_invocation(ContextId context, SessionId session, Ses
         return error::MISMATCH;
     }
     if (!epoch.child_epoch || epoch.state != epoch_phase::ACTIVE || !(owner.active_epoch == graph_epoch) ||
-        outer.invocation.value == 0 || !(outer.id == epoch.recording_outer_graph) ||
-        !(outer.invocation == epoch.recording_outer_invocation) ||
+        outer.invocation.value == 0 ||
         (outer.state != graph_phase::OPEN && outer.state != graph_phase::SEALED)) {
         return error::BUSY;
+    }
+    // Recording/activation establish the child executable under one compatible
+    // outer invocation. Replays bind to whichever compatible outer invocation
+    // is current now, and therefore pin that exact parent's device leases.
+    for (int device : outer.devices) {
+        if (device < 0 || device >= static_cast<int>(max_devices)) return error::MISMATCH;
+        const auto & device_owner = device_owners_[device];
+        if (!(device_owner.context == context && device_owner.session == session &&
+              device_owner.reset_epoch == reset_epoch && device_owner.graph_epoch == outer.id &&
+              device_owner.invocation == outer.invocation && device_owner.token_root == root)) {
+            return error::DEVICE_BUSY;
+        }
     }
     uint64_t value = 0;
     const auto rc = next_id(next_invocation_id_, error::OVERFLOW,

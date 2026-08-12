@@ -191,13 +191,20 @@ retention_error graph_retention_registry::adopt(
         if (consume_fault_locked(retention_fault::ADOPT_ONCE)) {
             return retention_error::BUSY;
         }
-        if (!records_.emplace(record->key, record).second) {
-            return retention_error::BUSY;
-        }
+        const auto active_slot = active_by_context_.try_emplace(record->key.context.value, graph_owner_key{});
         try {
-            retire_in_progress_.emplace(record->key, false);
+            if (!records_.emplace(record->key, record).second) {
+                if (active_slot.second) active_by_context_.erase(active_slot.first);
+                return retention_error::BUSY;
+            }
+            try {
+                retire_in_progress_.emplace(record->key, false);
+            } catch (...) {
+                records_.erase(record->key);
+                throw;
+            }
         } catch (...) {
-            records_.erase(record->key);
+            if (active_slot.second) active_by_context_.erase(active_slot.first);
             throw;
         }
         return retention_error::OK;
@@ -260,9 +267,16 @@ retention_error graph_retention_registry::publish_active(graph_owner_key key) no
     if (next_publication_serial_ == 0 || next_publication_serial_ == UINT64_MAX) {
         return retention_error::BUSY;
     }
-    it->second->publication_serial        = next_publication_serial_++;
-    it->second->phase                     = retention_phase::INSTALLED;
-    active_by_context_[key.context.value] = key;
+    const auto active = active_by_context_.find(key.context.value);
+    if (active == active_by_context_.end()) {
+        // adopt() preallocates this slot. Its absence is an invariant failure,
+        // not permission to allocate after lifecycle activation.
+        it->second->phase = retention_phase::QUARANTINED;
+        return retention_error::BUSY;
+    }
+    it->second->publication_serial = next_publication_serial_++;
+    it->second->phase              = retention_phase::INSTALLED;
+    active->second                 = key;
     return retention_error::OK;
 }
 
@@ -475,6 +489,7 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
 
     for (const auto & terminal : record->terminals) {
         bool attached = false;
+        bool bookkeeping_fault = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto                  it = records_.find(key);
@@ -482,8 +497,12 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
                 retire_in_progress_.at(key) = false;
                 return retention_error::STALE;
             }
-            attached = record->attached_retire_terminals.count(terminal.first) != 0;
+            attached = record->attached_retire_terminals.test(static_cast<size_t>(terminal.first));
             ticket   = record->retire_ticket;
+            bookkeeping_fault = !attached && consume_fault_locked(retention_fault::TERMINAL_BOOKKEEP_ONCE);
+        }
+        if (bookkeeping_fault) {
+            return done(retention_error::BUSY);
         }
         if (attached) {
             continue;
@@ -498,7 +517,9 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
             retire_in_progress_.at(key) = false;
             return retention_error::STALE;
         }
-        record->attached_retire_terminals.insert(terminal.first);
+        // Fixed-size bookkeeping cannot allocate or throw after the lifecycle
+        // registry has accepted the terminal attachment.
+        record->attached_retire_terminals.set(static_cast<size_t>(terminal.first));
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -531,7 +552,7 @@ retention_error graph_retention_registry::retire_exact(graph_owner_key key) noex
         }
         const auto active = active_by_context_.find(key.context.value);
         if (active != active_by_context_.end() && active->second == key) {
-            active_by_context_.erase(active);
+            active->second = {};
         }
         for (const auto & table : record->tables) {
             const auto owner = table_owners_.find(table.table_id);

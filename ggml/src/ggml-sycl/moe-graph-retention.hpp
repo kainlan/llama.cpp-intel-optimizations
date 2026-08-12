@@ -2,6 +2,7 @@
 
 #include "execution-lifecycle.hpp"
 
+#include <bitset>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,7 @@ enum class retention_fault {
     PREPARE_ONCE,
     PUBLISH_ONCE,
     RETIRE_SETUP_ONCE,
+    TERMINAL_BOOKKEEP_ONCE,
 };
 
 class canonical_allocation_integration;
@@ -196,7 +198,7 @@ struct graph_retention_record {
     execution::SessionResetEpoch                           reset_epoch{};
     lifecycle::ModelToken                                  root{};
     execution::RetireTicket                                retire_ticket{};
-    std::set<int>                                          attached_retire_terminals;
+    std::bitset<execution::max_devices>                    attached_retire_terminals;
     uint64_t                                               publication_serial = 0;
 
     const mmid_batch_binding * find_batch(const mmid_operand_identity & identity) const noexcept;
@@ -237,6 +239,9 @@ class graph_retention_registry {
     uint64_t                                                           next_publication_serial_ = 1;
     std::map<graph_owner_key, std::shared_ptr<graph_retention_record>> records_;
     std::map<graph_owner_key, bool>                                    retire_in_progress_;
+    // Slots are allocated during adopt(), before lifecycle activation. They
+    // remain present (zeroed when inactive), making publication assignment
+    // allocation-free and noexcept-safe.
     std::unordered_map<uint64_t, graph_owner_key>                      active_by_context_;
     std::unordered_map<uint64_t, graph_owner_key>                      table_owners_;
     friend class graph_recording_transaction;

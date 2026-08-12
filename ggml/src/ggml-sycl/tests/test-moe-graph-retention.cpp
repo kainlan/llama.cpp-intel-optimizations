@@ -232,8 +232,10 @@ int main() {
     require(parent_tx.commit() == retention_error::OK, "parent-pin child publication failed");
     published_graph_token parent_token;
     InvocationId          live_child{};
+    unsigned              parent_replay_count = 0;
     require(parent_registry.acquire_published_token(parent_tx.key(), &parent_token) == retention_error::OK &&
                 parent_registry.begin_invocation(parent_token, &live_child) == retention_error::OK &&
+                (++parent_replay_count == 1) &&
                 parent_fixture.execution.complete_invocation(
                     parent_fixture.context, parent_fixture.session, parent_fixture.reset,
                     parent_fixture.outer_epoch, parent_fixture.outer_invocation, token(), 0) == error::BUSY,
@@ -252,8 +254,9 @@ int main() {
                                                       token()) == error::OK,
             "parent completion did not succeed after child completion");
 
-    // The child token is namespaced to its recorded outer invocation. Reusing
-    // it under a replacement outer graph is rejected before child allocation.
+    // The published executable survives outer-token replacement. Recording and
+    // activation were tied to token N; replay binds to the compatible current
+    // token N+1 and pins that exact parent invocation.
     GraphEpoch replacement_outer{};
     InvocationId replacement_outer_invocation{};
     const int replacement_devices[] = { 0 };
@@ -264,10 +267,24 @@ int main() {
                     parent_fixture.context, parent_fixture.session, parent_fixture.reset, replacement_outer,
                     token(), replacement_devices, 1, replacement_participants, 1, 0,
                     &replacement_outer_invocation) == error::OK &&
-                parent_registry.begin_invocation(parent_token, &live_child) == retention_error::LIFECYCLE_ERROR,
-            "stale child token crossed outer invocation replacement");
-    require(parent_registry.retire_exact(parent_tx.key()) == retention_error::OK,
-            "cross-outer child cleanup failed");
+                parent_registry.begin_invocation(parent_token, &live_child) == retention_error::OK &&
+                (++parent_replay_count == 2),
+            "published child token did not replay under compatible outer token N+1");
+    InvocationId wrong_root_child{};
+    require(parent_fixture.execution.child_begin_invocation(
+                parent_fixture.context, parent_fixture.session, parent_fixture.reset, parent_tx.key().epoch,
+                token(99), &wrong_root_child) == error::MISMATCH &&
+                parent_fixture.execution.complete_invocation(
+                    parent_fixture.context, parent_fixture.session, parent_fixture.reset, replacement_outer,
+                    replacement_outer_invocation, token(), 0) == error::BUSY &&
+                parent_registry.finish_invocation(parent_token, live_child) == retention_error::OK &&
+                parent_fixture.execution.complete_invocation(
+                    parent_fixture.context, parent_fixture.session, parent_fixture.reset, replacement_outer,
+                    replacement_outer_invocation, token(), 0) == error::OK &&
+                parent_fixture.execution.retire_graph(parent_fixture.context, parent_fixture.session,
+                                                       parent_fixture.reset, replacement_outer, token()) == error::OK &&
+                parent_registry.retire_exact(parent_tx.key()) == retention_error::OK && parent_replay_count == 2,
+            "cross-token replay did not pin/count/finish/retire exact token N+1 or rejected wrong root");
 
     // Race the exact final parent transition against child completion. Either
     // the child wins, or the parent observes BUSY and succeeds on retry; it may
@@ -920,6 +937,29 @@ int main() {
     require(retire_fault.retire_exact(retire_tx.key()) == retention_error::OK && retire_weak.expired(),
             "retirement setup failure was not retryable");
 
+    // Terminal bookkeeping uses a fixed device bitset. A deterministic refusal
+    // before lifecycle attachment cannot terminate or lose owners; retry
+    // attaches once and the post-attachment bookkeeping itself cannot allocate.
+    graph_retention_registry terminal_bookkeep_fault(retention_fault::TERMINAL_BOOKKEEP_ONCE);
+    fixture                  tbf(terminal_bookkeep_fault);
+    auto                     terminal_bookkeep_tx = begin_tx(tbf);
+    auto                     terminal_bookkeep_owner = std::make_shared<int>(15);
+    std::weak_ptr<int>       terminal_bookkeep_weak = terminal_bookkeep_owner;
+    require(terminal_bookkeep_tx.add_batch(binding(402, terminal_bookkeep_owner)) == retention_error::OK &&
+                terminal_bookkeep_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                terminal_bookkeep_tx.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) ==
+                    retention_error::OK,
+            "terminal bookkeeping fault setup failed");
+    terminal_bookkeep_owner.reset();
+    terminal_bookkeep_tx.mark_finalized();
+    require(terminal_bookkeep_tx.commit() == retention_error::OK &&
+                terminal_bookkeep_fault.retire_exact(terminal_bookkeep_tx.key()) == retention_error::BUSY &&
+                !terminal_bookkeep_weak.expired(),
+            "terminal bookkeeping fault terminated or dropped owner");
+    require(terminal_bookkeep_fault.retire_exact(terminal_bookkeep_tx.key()) == retention_error::OK &&
+                terminal_bookkeep_weak.expired(),
+            "terminal bookkeeping fault was not exactly retryable");
+
     // Every durable identity component is validated, including range overflow
     // and correlation with the typed allocation owner.
     const mmid_operand_identity valid_identity{ 501, 1, 9, 0, 16, 64, 1 };
@@ -947,6 +987,47 @@ int main() {
     invalid.occurrence = 0;
     require_bad_identity(invalid, 501, "zero occurrence accepted");
     require_bad_identity(valid_identity, 999, "cross-owner allocation identity accepted");
+
+    // Concurrent replay/invalidation: successful replays finish exactly; once
+    // invalidation makes the epoch RETIRING, stale token starts are rejected.
+    graph_retention_registry invalidate_registry;
+    fixture                  invalidate_fixture(invalidate_registry);
+    auto                     invalidate_tx = begin_tx(invalidate_fixture);
+    auto                     invalidate_owner = std::make_shared<int>(16);
+    require(invalidate_tx.add_batch(binding(403, invalidate_owner)) == retention_error::OK &&
+                invalidate_tx.note_submission(0, submit_outcome::SUBMITTED) == retention_error::OK &&
+                invalidate_tx.set_terminal(0, std::make_shared<test_terminal>(ready, waits)) == retention_error::OK,
+            "replay/invalidate setup failed");
+    invalidate_tx.mark_finalized();
+    require(invalidate_tx.commit() == retention_error::OK, "replay/invalidate publication failed");
+    published_graph_token invalidate_token;
+    require(invalidate_registry.acquire_published_token(invalidate_tx.key(), &invalidate_token) == retention_error::OK,
+            "replay/invalidate token acquisition failed");
+    std::atomic<bool> invalidate_go{ false };
+    std::atomic<unsigned> replay_successes{ 0 };
+    std::vector<std::thread> replay_threads;
+    for (int i = 0; i < 8; ++i) {
+        replay_threads.emplace_back([&] {
+            while (!invalidate_go.load(std::memory_order_acquire)) std::this_thread::yield();
+            InvocationId replay{};
+            if (invalidate_registry.begin_invocation(invalidate_token, &replay) == retention_error::OK) {
+                replay_successes.fetch_add(1, std::memory_order_relaxed);
+                require(invalidate_registry.finish_invocation(invalidate_token, replay) == retention_error::OK,
+                        "successful concurrent replay did not finish exactly");
+            }
+        });
+    }
+    invalidate_go.store(true, std::memory_order_release);
+    auto invalidate_rc = invalidate_registry.retire_exact(invalidate_tx.key());
+    for (auto & thread : replay_threads) thread.join();
+    if (invalidate_rc == retention_error::PENDING) {
+        invalidate_rc = invalidate_registry.retire_exact(invalidate_tx.key());
+    }
+    InvocationId stale_after_invalidate{};
+    require(invalidate_rc == retention_error::OK && replay_successes.load() <= replay_threads.size() &&
+                invalidate_registry.begin_invocation(invalidate_token, &stale_after_invalidate) ==
+                    retention_error::STALE,
+            "concurrent replay/invalidation admitted stale token or lost invocation");
 
     // Real concurrent readers race an exact delayed retirement under TSAN.
     ready.store(false, std::memory_order_release);
