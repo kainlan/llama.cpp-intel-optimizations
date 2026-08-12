@@ -724,13 +724,15 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
                                                             sycl::queue &    queue,
                                                             alloc_role       role,
                                                             runtime_category category,
-                                                            const char *     cohort_id);
+                                                            const char *     cohort_id,
+                                                            uint64_t         reserved_alloc_id = 0);
 static alloc_handle unified_cache_adopt_raw_device_allocation(void *           ptr,
                                                               size_t           size,
                                                               sycl::queue &    queue,
                                                               alloc_role       role,
                                                               runtime_category category,
-                                                              const char *     cohort_id);
+                                                              const char *     cohort_id,
+                                                              uint64_t         reserved_alloc_id = 0);
 
 struct offload_pool_key {
     int                 device    = -1;
@@ -2638,12 +2640,16 @@ uint64_t unified_cache_mint_retention_identity() noexcept {
 }
 
 #ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
-void unified_cache_exhaust_retention_identities_for_test() noexcept {
+void unified_cache_advance_retention_identity_counter_for_test(uint64_t next) noexcept {
     uint64_t value = g_retention_identity_counter.load(std::memory_order_relaxed);
-    while (value != UINT64_MAX &&
+    while (value < next &&
            !g_retention_identity_counter.compare_exchange_weak(
-               value, UINT64_MAX, std::memory_order_relaxed, std::memory_order_relaxed)) {
+               value, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
     }
+}
+
+void unified_cache_exhaust_retention_identities_for_test() noexcept {
+    unified_cache_advance_retention_identity_counter_for_test(UINT64_MAX);
 }
 #endif
 
@@ -4093,6 +4099,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         entry.ready_event        = last_event;
         entry.host_resident      = false;
         entry.location           = cache_location::DEVICE;
+        entry.owner_device       = cache_device;
         entry.pool_allocated     = false;
         entry.direct_alloc_owner = direct_alloc_owner;
         entry.last_write_event   = last_event;
@@ -4467,6 +4474,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         entry.ready_event        = last_event;
         entry.host_resident      = false;
         entry.location           = cache_location::DEVICE;
+        entry.owner_device       = cache_device;
         entry.pool_allocated     = false;
         entry.direct_alloc_owner = direct_alloc_owner;
         entry.last_write_event   = last_event;
@@ -4741,6 +4749,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             entry.ready_event      = fill_event;
             entry.host_resident    = false;
             entry.location         = cache_location::DEVICE;
+            entry.owner_device     = cache_device;
             entry.pool_allocated   = false;
             entry.last_write_event = fill_event;
             entry.has_write_event  = true;
@@ -4924,8 +4933,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         return result;
     }
 
-    const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
-    auto      apply_miss   = [&result](expert_resolve_reason reason) {
+    auto apply_miss = [&result](expert_resolve_reason reason) {
         if (result.reason == expert_resolve_reason::NOT_FOUND) {
             result.reason = reason;
         }
@@ -4951,7 +4959,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                 apply_miss(expert_resolve_reason::NOT_FOUND);
             } else if (entry.layout != req.requested_layout) {
                 apply_miss(expert_resolve_reason::LAYOUT_MISMATCH);
-            } else if (!entry.device_ptr) {
+            } else if (!entry.device_ptr || !entry.has_retention_identity()) {
                 apply_miss(expert_resolve_reason::NOT_FOUND);
             } else if (entry.state == cache_entry_state::EVICTING || entry.state == cache_entry_state::FAILED) {
                 apply_miss(expert_resolve_reason::NOT_READY);
@@ -4962,12 +4970,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                 }
             }
 
-            if (!entry.retired && (entry_ready || entry_in_progress_allowed) && entry.device_ptr &&
-                entry.layout == req.requested_layout) {
+            if (!entry.retired && entry.has_retention_identity() && (entry_ready || entry_in_progress_allowed) &&
+                entry.device_ptr && entry.layout == req.requested_layout) {
                 const cache_location  location      = entry.location;
                 const bool            on_device     = location == cache_location::DEVICE;
-                const int             owner         = on_device ? cache_device : mem_handle::HOST_DEVICE;
-                const int             handle_owner  = cache_device;
+                const int             owner         = on_device ? entry.owner_device : mem_handle::HOST_DEVICE;
+                const int             handle_owner  = entry.owner_device;
+                if (on_device && owner < 0) {
+                    result.reason = expert_resolve_reason::DEVICE_MISMATCH;
+                    return result;
+                }
                 expert_resolve_reason reject_reason = expert_resolve_reason::FOUND;
                 if (expert_resolution_allowed(req, location, owner, &reject_reason)) {
                     entry.in_use_count.fetch_add(1);
@@ -4985,10 +4997,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
                         result.ready_event = entry.ready_event;
                     }
                     auto lease_owner = entry.storage_owner;
-                    result.reason    = expert_resolve_reason::FOUND;
-                    result.lifetime  = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
+                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
                         entry_it->first, handle_owner, entry.device_ptr, entry.layout, on_device, &entry,
                         std::move(lease_owner), result.has_ready_event, result.ready_event));
+                    if (!result.lifetime || !result.lifetime->valid() ||
+                        !result.lifetime->has_stable_owner_identity()) {
+                        result = {};
+                        result.reason = expert_resolve_reason::NOT_FOUND;
+                        return result;
+                    }
+                    result.reason = expert_resolve_reason::FOUND;
                     return result;
                 }
                 apply_miss(reject_reason);
@@ -5022,8 +5040,9 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         }
 
         const bool                  on_device     = entry.location == cache_location::DEVICE;
-        const int                   owner         = on_device ? cache_device : mem_handle::HOST_DEVICE;
-        const int                   handle_owner  = cache_device;
+        const int                   owner         = on_device && entry.handle ? entry.handle->device() :
+                                                    mem_handle::HOST_DEVICE;
+        const int                   handle_owner  = owner;
         expert_resolve_reason       reject_reason = expert_resolve_reason::FOUND;
         std::shared_ptr<mem_handle> direct_handle = entry.handle;
         result.tier                               = expert_tier_from_location(entry.location);
@@ -5041,6 +5060,13 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         }
 
         if (direct_handle) {
+            const mem_handle_debug_info identity = direct_handle->debug_info();
+            if (!direct_handle->valid() || !direct_handle->has_stable_owner_identity() ||
+                identity.canonical_allocation_id == 0 || identity.canonical_generation == 0 ||
+                (on_device && (owner < 0 || direct_handle->device() != owner))) {
+                result.reason = expert_resolve_reason::NOT_FOUND;
+                return result;
+            }
             resolved_ptr resolved = direct_handle->resolve(req.current_device);
             if (!resolved.ptr) {
                 result.reason = expert_resolve_reason::NOT_FOUND;
@@ -5081,10 +5107,16 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             if (lease.has_ready_event) {
                 result.ready_event = lease.ready_event;
             }
-            result.reason   = expert_resolve_reason::FOUND;
             result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease_snapshot(
                 mirror_key, handle_owner, lease.ptr, lease.layout, lease.on_device, lease.entry,
                 std::move(lease.storage_owner), lease.has_ready_event, lease.ready_event));
+            if (!result.lifetime || !result.lifetime->valid() ||
+                !result.lifetime->has_stable_owner_identity()) {
+                result = {};
+                result.reason = expert_resolve_reason::NOT_FOUND;
+                return result;
+            }
+            result.reason = expert_resolve_reason::FOUND;
             return result;
         }
 
@@ -14022,7 +14054,8 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
                                                             sycl::queue &    queue,
                                                             alloc_role       role,
                                                             runtime_category category,
-                                                            const char *     cohort_id) {
+                                                            const char *     cohort_id,
+                                                            uint64_t         reserved_alloc_id) {
     alloc_handle handle{};
     if (ptr == nullptr || size == 0) {
         return handle;
@@ -14034,8 +14067,10 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     handle.tier     = alloc_tier::HOST_PINNED;
     handle.role     = role;
     handle.category = category;
-    handle.alloc_id = unified_cache_mint_retention_identity();
+    handle.alloc_id = reserved_alloc_id != 0 ? reserved_alloc_id : unified_cache_mint_retention_identity();
     if (handle.alloc_id == 0) {
+        alloc_registry::instance().unregister_alloc(ptr);
+        sycl::free(ptr, queue);
         return {};
     }
 
@@ -14062,7 +14097,8 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
                                                               sycl::queue &    queue,
                                                               alloc_role       role,
                                                               runtime_category category,
-                                                              const char *     cohort_id) {
+                                                              const char *     cohort_id,
+                                                              uint64_t         reserved_alloc_id) {
     alloc_handle handle{};
     if (ptr == nullptr || size == 0) {
         return handle;
@@ -14074,8 +14110,10 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     handle.tier     = alloc_tier::DEVICE_VRAM;
     handle.role     = role;
     handle.category = category;
-    handle.alloc_id = unified_cache_mint_retention_identity();
+    handle.alloc_id = reserved_alloc_id != 0 ? reserved_alloc_id : unified_cache_mint_retention_identity();
     if (handle.alloc_id == 0) {
+        alloc_registry::instance().unregister_alloc(ptr);
+        sycl::free(ptr, queue);
         return {};
     }
 
@@ -14451,7 +14489,18 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     unified_cache_key key{ type, key_id, layer_id, expert_id };
     const uint64_t    new_hash = compute_content_hash(src_ptr, src_size);
 
-    auto it = entries_.find(key);
+    // This test seam intentionally models the hardest transaction: reserve
+    // both the cache capability pair and the raw allocation capability before
+    // eviction, allocation, or mutation. Burned reservations are safe; a late
+    // mint or reused identity is not.
+    unified_cache_entry reserved_entry{};
+    const uint64_t      reserved_raw_id = unified_cache_mint_retention_identity();
+    if (!reserved_entry.has_retention_identity() || reserved_raw_id == 0) {
+        return nullptr;
+    }
+
+    auto it               = entries_.find(key);
+    bool force_reallocate = false;
     if (it != entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
@@ -14506,15 +14555,15 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                             layer_id, expert_id, (int) it->second.layout, (int) layout, it->second.size,
                             it->second.pinned ? 1 : 0, (int) it->second.state);
                 }
-                release_entry_allocation_locked(it->second);
-                entries_.erase(it);
-                it = entries_.end();
+                // Keep old backing published until replacement allocation,
+                // ownership and capability are all ready for atomic commit.
+                force_reallocate = true;
             }
         }
         if (it == entries_.end()) {
             // Fall through to allocation path below
         } else {
-            bool need_realloc = (alloc_size != it->second.size);
+            bool need_realloc = force_reallocate || (alloc_size != it->second.size);
             bool content_changed =
                 validate_content || (it->second.src_ptr != src_ptr) || (it->second.content_hash != new_hash);
 
@@ -14560,9 +14609,9 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                     }
                     return nullptr;
                 }
-                alloc_handle new_owner =
-                    unified_cache_adopt_raw_device_allocation(new_device_ptr, alloc_size, queue_, alloc_role::WEIGHT,
-                                                              runtime_category::EXPERT_CACHE, "unified_cache:alloc");
+                alloc_handle new_owner = unified_cache_adopt_raw_device_allocation(
+                    new_device_ptr, alloc_size, queue_, alloc_role::WEIGHT, runtime_category::EXPERT_CACHE,
+                    "unified_cache:alloc", reserved_raw_id);
                 if (!new_owner.ptr) {
                     GGML_LOG_ERROR("[UNIFIED-CACHE] alloc failed to adopt direct device allocation ptr=%p size=%zu\n",
                                    new_device_ptr, alloc_size);
@@ -14575,17 +14624,21 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 }
                 new_direct_alloc_owner = mem_handle::from_owned_alloc(std::move(new_owner), layout);
 
-                it->second.pinned = was_pinned;
-                release_entry_allocation_locked(it->second);
-                if (!it->second.renew_allocation_identity()) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention identity exhausted during alloc replacement\n");
-                    return nullptr;
-                }
+                // Commit pointer/extent/capability under rw_mutex_, then release
+                // the copied old owner. Until this point every failure rolls the
+                // new backing back through new_direct_alloc_owner.
+                unified_cache_entry old_backing = it->second;
+                it->second.pinned                = was_pinned;
+                it->second.allocation_id_          = reserved_entry.allocation_identity();
+                it->second.replacement_generation_ = reserved_entry.replacement_identity();
                 it->second.device_ptr           = new_device_ptr;
                 it->second.size                 = alloc_size;
+                it->second.layout               = layout;
                 it->second.direct_alloc_owner   = new_direct_alloc_owner;
                 it->second.cache_budget_charged = true;
+                it->second.owner_device         = get_device_id_from_queue(queue_);
                 used_.fetch_add(alloc_size, std::memory_order_relaxed);
+                release_entry_allocation_locked(old_backing);
                 content_changed = true;
             }
 
@@ -14596,10 +14649,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                     }
                     return nullptr;
                 }
-                if (!it->second.renew_replacement_generation()) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] retention generation exhausted during alloc recopy\n");
-                    return nullptr;
-                }
+                it->second.replacement_generation_ = reserved_entry.replacement_identity();
             }
 
             it->second.src_ptr      = src_ptr;
@@ -14637,7 +14687,8 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
         return nullptr;
     }
     alloc_handle owner = unified_cache_adopt_raw_device_allocation(
-        device_ptr, alloc_size, queue_, alloc_role::WEIGHT, runtime_category::EXPERT_CACHE, "unified_cache:alloc");
+        device_ptr, alloc_size, queue_, alloc_role::WEIGHT, runtime_category::EXPERT_CACHE, "unified_cache:alloc",
+        reserved_raw_id);
     if (!owner.ptr) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] alloc failed to adopt direct device allocation ptr=%p size=%zu\n", device_ptr,
                        alloc_size);
@@ -14646,7 +14697,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     }
     direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
 
-    unified_cache_entry entry{};
+    unified_cache_entry entry = reserved_entry;
     entry.device_ptr           = device_ptr;
     entry.src_ptr              = src_ptr;
     entry.content_hash         = new_hash;
@@ -14663,6 +14714,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     entry.has_ready_event      = false;
     entry.host_resident        = false;
     entry.location             = cache_location::DEVICE;
+    entry.owner_device         = get_device_id_from_queue(queue_);
     entry.direct_alloc_owner   = direct_alloc_owner;
     entry.cache_budget_charged = true;
 

@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -639,6 +640,20 @@ static bool test_retention_transitions_and_exhaustion(sycl::queue & q) {
 
     const size_t cache_used_before = cache.used();
     const size_t host_used_before  = ggml_sycl::unified_cache_get_runtime_host_bytes();
+
+    // Exact boundary: UINT64_MAX is a sentinel, while MAX-2 and MAX-1 may each
+    // be issued exactly once. The monotonic seam cannot rewind afterwards.
+    constexpr uint64_t max_id = std::numeric_limits<uint64_t>::max();
+    ggml_sycl::unified_cache_advance_retention_identity_counter_for_test(max_id - 2);
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == max_id - 2,
+                "near-exhaustion must issue MAX-2 exactly once");
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == max_id - 1,
+                "near-exhaustion must issue MAX-1 exactly once");
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
+                "UINT64_MAX sentinel must never be issued");
+    ggml_sycl::unified_cache_advance_retention_identity_counter_for_test(1);
+    TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0,
+                "test seam must not rewind an exhausted minter");
     ggml_sycl::unified_cache_exhaust_retention_identities_for_test();
     TEST_ASSERT(ggml_sycl::unified_cache_mint_retention_identity() == 0 &&
                     ggml_sycl::unified_cache_mint_retention_identity() == 0,

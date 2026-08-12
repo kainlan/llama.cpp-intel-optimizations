@@ -102,6 +102,11 @@ if (GGML_SYCL_QUANTIZER_DEBUG)
 endif()
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+if (BUILD_TESTING)
+    # Exposes only the monotonic near-exhaustion seam; production builds do not
+    # contain a counter-control symbol.
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_RETENTION_IDENTITY_TESTING=1)
+endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
 # contains no SYCL headers, device calls, or GPU fixture dependency.
@@ -1809,10 +1814,6 @@ endif() # direct-source static SYCL fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-wrong-device
     tests/test-mem-handle-wrong-device.cpp
-    unified-cache.cpp
-    model-lifecycle.cpp
-    pinned-pool.cpp
-    mem-handle.cpp
 )
 target_include_directories(test-mem-handle-wrong-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -1827,7 +1828,7 @@ target_compile_definitions(test-mem-handle-wrong-device PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_RETENTION_IDENTITY_TESTING=1
 )
-target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml)
+target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -1988,10 +1989,6 @@ endif() # static SYCL backend fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-mem-handle-concurrent-resolve
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-concurrent-resolve.cpp
-    unified-cache.cpp
-    model-lifecycle.cpp
-    pinned-pool.cpp
-    mem-handle.cpp
 )
 target_include_directories(test-sycl-mem-handle-concurrent-resolve PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -2005,7 +2002,7 @@ target_compile_definitions(test-sycl-mem-handle-concurrent-resolve PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
-target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml)
+target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml ggml-sycl)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE IntelSYCL::SYCL_CXX)
 endif()

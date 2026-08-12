@@ -1646,6 +1646,7 @@ uint64_t unified_cache_mint_retention_identity() noexcept;
 #ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
 // Test-only, monotonic seam: may advance the default minter toward exhaustion,
 // but can never rewind it or make an issued identity reusable.
+void unified_cache_advance_retention_identity_counter_for_test(uint64_t next) noexcept;
 void unified_cache_exhaust_retention_identities_for_test() noexcept;
 #endif
 
