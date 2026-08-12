@@ -105,9 +105,7 @@ target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 if (BUILD_TESTING)
     # Exposes only the monotonic near-exhaustion seam; production builds do not
     # contain a counter-control symbol.
-    target_compile_definitions(ggml-sycl PRIVATE
-        GGML_SYCL_RETENTION_IDENTITY_TESTING=1
-        GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1)
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_RETENTION_IDENTITY_TESTING=1)
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
@@ -4380,33 +4378,29 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
 # script that only asserted this deleted file contained certain case names were
 # removed with it.
 
-# Allocation-free admitted Q1/NVFP4 adapter device regression. It links the
-# production backend so the real quantizer and ID MMVQ kernels execute; exit 77
-# is a device-unavailable skip, not a pass.
+# Keep the allocation-free admitted-adapter regression separate from the
+# production-route test below. It links the ordinary, seam-free backend.
 if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
-    add_executable(test-sycl-q1-nvfp4-admitted-device
-        tests/test-q1-nvfp4-admitted-device.cpp
-    )
-    target_include_directories(test-sycl-q1-nvfp4-admitted-device PRIVATE
+    add_executable(test-sycl-q1-nvfp4-adapter-device
+        tests/test-q1-nvfp4-adapter-device.cpp)
+    target_include_directories(test-sycl-q1-nvfp4-adapter-device PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl")
-    target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE ggml-base ggml-sycl ggml-cpu)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_options(test-sycl-q1-nvfp4-adapter-device PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-q1-nvfp4-adapter-device PRIVATE "-fsycl")
+    target_link_libraries(test-sycl-q1-nvfp4-adapter-device PRIVATE ggml-base ggml-sycl ggml-cpu)
     if (TARGET IntelSYCL::SYCL_CXX)
-        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-q1-nvfp4-adapter-device PRIVATE IntelSYCL::SYCL_CXX)
     endif()
-    set_target_properties(test-sycl-q1-nvfp4-admitted-device PROPERTIES
+    set_target_properties(test-sycl-q1-nvfp4-adapter-device PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    add_test(NAME sycl-q1-nvfp4-admitted-device COMMAND test-sycl-q1-nvfp4-admitted-device)
-    set_tests_properties(sycl-q1-nvfp4-admitted-device PROPERTIES
-        LABELS "sycl;moe;mmvq;device;B70;B50"
+    add_test(NAME sycl-q1-nvfp4-adapter-device COMMAND test-sycl-q1-nvfp4-adapter-device)
+    set_tests_properties(sycl-q1-nvfp4-adapter-device PROPERTIES
+        LABELS "sycl;moe;mmvq;adapter;device;B70;B50"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 120
-    )
+        TIMEOUT 120)
 endif()
 
 # MMVQ sub-group-per-row launch geometry (llama.cpp-99ke).
@@ -4576,4 +4570,49 @@ if (Python3_Interpreter_FOUND)
     )
 else()
     message(STATUS "ggml-sycl: Python3 not found; layer-stream ownership contract test is not registered")
+endif()
+
+# The closed production-route seam is never compiled into ordinary ggml-sycl,
+# including BUILD_TESTING=ON builds. Clone its finalized private build settings
+# onto an object-library backend used by this executable only.
+if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
+    get_target_property(_q1_backend_sources ggml-sycl SOURCES)
+    add_library(ggml-sycl-q1-route-test-objects OBJECT ${_q1_backend_sources})
+    foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_LIBRARIES)
+        get_target_property(_value ggml-sycl ${_property})
+        if (_value AND NOT _value STREQUAL "_value-NOTFOUND")
+            set_property(TARGET ggml-sycl-q1-route-test-objects PROPERTY ${_property} "${_value}")
+        endif()
+    endforeach()
+    target_compile_definitions(ggml-sycl-q1-route-test-objects PRIVATE GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1)
+
+    add_executable(test-sycl-q1-nvfp4-admitted-device
+        tests/test-q1-nvfp4-admitted-device.cpp)
+    target_include_directories(test-sycl-q1-nvfp4-admitted-device PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl")
+    get_target_property(_q1_route_link_options ggml-sycl LINK_OPTIONS)
+    if (_q1_route_link_options AND NOT _q1_route_link_options STREQUAL "_q1_route_link_options-NOTFOUND")
+        target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_options})
+    endif()
+    target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE
+        ggml-sycl-q1-route-test-objects ggml-base ggml-cpu)
+    get_target_property(_q1_route_link_libraries ggml-sycl LINK_LIBRARIES)
+    if (_q1_route_link_libraries AND NOT _q1_route_link_libraries STREQUAL "_q1_route_link_libraries-NOTFOUND")
+        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_libraries})
+    endif()
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-sycl-q1-nvfp4-admitted-device PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-q1-nvfp4-admitted-device COMMAND test-sycl-q1-nvfp4-admitted-device)
+    set_tests_properties(sycl-q1-nvfp4-admitted-device PROPERTIES
+        LABELS "sycl;moe;mmvq;production-route;device;B70;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 120)
 endif()

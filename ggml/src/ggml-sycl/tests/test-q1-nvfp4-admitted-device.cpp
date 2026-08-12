@@ -8,7 +8,9 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <sycl/sycl.hpp>
@@ -73,16 +75,25 @@ struct lifecycle_fixture {
                 require(workspace.valid && workspace.owner_device >= 0, "invalid candidate MMID owner");
                 owner_devices.insert(workspace.owner_device);
             }
+            retained_backends.reserve(owner_devices.size());
             for (int device : owner_devices) {
-                ggml_backend_t retained = ggml_backend_sycl_init(device);
+                using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
+                backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
                 require(retained != nullptr, "candidate owner backend initialization failed");
-                retained_backends.push_back(retained);
-                if (!backend || device == candidate->plan->device_id) backend = retained;
+                retained_backends.push_back(retained.get());
+                if (!backend || device == candidate->plan->device_id) backend = retained.get();
+                retained.release();
             }
             require(backend != nullptr, "no primary candidate owner backend");
 
+            // Same-device registry is a stack: a short-lived newer backend B
+            // must not erase the retained backend A selected above.
+            ggml_backend_t shadow = ggml_backend_sycl_init(candidate->plan->device_id);
+            require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
+            ggml_backend_free(shadow);
+
             const auto commit_result = ggml_backend_sycl_model_load_end(load, true, &model);
-            load_open = false;
+            if (commit_result != GGML_SYCL_LIFECYCLE_BUSY) load_open = false;
             std::cerr << "synthetic lifecycle load_end result=" << static_cast<int>(commit_result) << '\n';
             if (commit_result != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error("synthetic lifecycle load commit result=" +
@@ -217,7 +228,7 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
 
 void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
-    ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     for (int pass = 0; pass < 2; ++pass) {
         require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS, "production graph compute failed");
         ggml_backend_synchronize(life.backend);
@@ -226,8 +237,13 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
             const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
             require(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance, "CPU oracle mismatch");
         }
+        if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require(first.workspace_slot != UINT32_MAX && first.workspace_generation != 0 &&
+            after.workspace_slot == first.workspace_slot &&
+            after.workspace_generation == first.workspace_generation,
+            "second submission did not reuse the same workspace slot generation");
     require(after.candidate >= before.candidate + 2 && after.admit >= before.admit + 2 &&
             after.submit >= before.submit + 2 && after.terminal >= before.terminal + 2 &&
             after.recycle >= before.recycle + 2, "two-submit lifecycle counters did not prove slot reuse");
@@ -245,8 +261,27 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
     require(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
             state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED, "failure graph was not terminal/quarantined");
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    if (expect_quarantine) require(after.quarantine == before.quarantine + 1, "post-mark quarantine not counted");
-    else require(after.quarantine == before.quarantine, "pre-mark refusal incorrectly quarantined workspace");
+    require(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once");
+    require(after.candidate == before.candidate + 1 && after.admit == before.admit + 1,
+            "failure admission deltas were not exact");
+    require(after.submit == before.submit, "injected failure reached kernel submit");
+    require(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
+            "failure quarantine delta was not exact");
+}
+
+void injected_async_terminal_failure_case() {
+    lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
+    auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
+    require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+            "async terminal fixture failed before submission");
+    ggml_backend_synchronize(life.backend);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+            "async failpoint did not reach exactly one submitted terminal");
+    require(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
+            "failed asynchronous terminal recycled its workspace");
 }
 } // namespace
 
@@ -261,6 +296,7 @@ int main() {
           successful_reuse_case(life, GGML_TYPE_NVFP4, 3); }
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
+        injected_async_terminal_failure_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return 77; }
       catch (const std::exception & e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

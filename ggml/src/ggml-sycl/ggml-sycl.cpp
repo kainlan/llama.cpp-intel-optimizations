@@ -9932,6 +9932,9 @@ std::atomic<uint64_t> g_q1_nvfp4_test_submit{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_terminal{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_recycle{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_failure_consumed{ 0 };
+std::atomic<uint32_t> g_q1_nvfp4_test_workspace_slot{ UINT32_MAX };
+std::atomic<uint64_t> g_q1_nvfp4_test_workspace_generation{ 0 };
 
 bool ggml_sycl_q1_nvfp4_test_model_matches(ggml_sycl_model_token a, ggml_sycl_model_token b) {
     return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id &&
@@ -9964,8 +9967,10 @@ void ggml_sycl_q1_nvfp4_test_revoke_backend(ggml_backend_t backend) {
 
 bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure failure) {
     uint32_t expected = static_cast<uint32_t>(failure);
-    return g_q1_nvfp4_test_failure.compare_exchange_strong(
+    const bool consumed = g_q1_nvfp4_test_failure.compare_exchange_strong(
         expected, GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE, std::memory_order_acq_rel);
+    if (consumed) g_q1_nvfp4_test_failure_consumed.fetch_add(1, std::memory_order_relaxed);
+    return consumed;
 }
 } // namespace
 
@@ -10015,7 +10020,10 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
              g_q1_nvfp4_test_submit.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_terminal.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_recycle.load(std::memory_order_relaxed),
-             g_q1_nvfp4_test_quarantine.load(std::memory_order_relaxed) };
+             g_q1_nvfp4_test_quarantine.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_failure_consumed.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_workspace_slot.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_workspace_generation.load(std::memory_order_relaxed) };
 }
 
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
@@ -11440,7 +11448,11 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
         if (cookie == 0) {
             return false;
         }
-        bindings.push_back({ workspace.owner_device, queue, cookie });
+        auto lifetime = backend->backend_queue_lifetime;
+        if (!lifetime) return false;
+        bindings.push_back({ workspace.owner_device, queue, cookie,
+                             ggml_sycl::workspace_admission_authority_issuer::queue(
+                                 workspace.owner_device, queue, cookie, std::move(lifetime)) });
     }
     const ggml_sycl::moe_mmid_model_token owner{
         token.model.value, token.load.value, token.owner.generation };
@@ -21304,15 +21316,14 @@ struct ggml_backend_sycl_buffer_context {
     }
 };
 
-static std::mutex                  g_backend_context_by_device_mutex;
-static ggml_backend_sycl_context * g_backend_context_by_device[GGML_SYCL_MAX_DEVICES] = {};
+static std::mutex g_backend_context_by_device_mutex;
+static std::vector<ggml_backend_sycl_context *> g_backend_context_by_device[GGML_SYCL_MAX_DEVICES];
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        return nullptr;
-    }
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) return nullptr;
     std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-    return g_backend_context_by_device[device];
+    const auto & contexts = g_backend_context_by_device[device];
+    return contexts.empty() ? nullptr : contexts.back();
 }
 
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).
@@ -22788,7 +22799,9 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
 static moe_route_capability ggml_sycl_moe_query_route_capability(
     ggml_type type, layout_mode layout, moe_route_phase phase, int64_t K, int64_t N, size_t rows,
     int route_device, moe_layer_route_residency residency, int submit_device,
-    const ggml_sycl::mem_handle * direct_recipe_candidate = nullptr) {
+    const ggml_sycl::mem_handle * direct_recipe_candidate = nullptr,
+    const void * invocation_backend = nullptr, const void * invocation_queue = nullptr,
+    const ggml_sycl::moe_mmid_queue_capability * queue_capability = nullptr) {
     moe_route_capability cap;
     cap.phase        = phase;
     cap.local_device = route_device >= 0 && route_device == submit_device;
@@ -22835,22 +22848,12 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
                                       direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT &&
                                       direct_recipe_candidate->has_stable_owner_identity() && K % qk == 0 &&
                                       K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
-        bool authoritative_candidate = false;
-        if (static_candidate) {
-            const auto exec = ggml_sycl_take_execution_state_snapshot(
-                ggml_sycl_get_backend_context_for_device(submit_device));
-            ggml_sycl::lifecycle::ModelToken root{};
-            auto * backend = ggml_sycl_get_backend_context_for_device(submit_device);
-            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(submit_device);
-            const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;
-            if (backend && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
-                exec.invocation_id && ggml_sycl_execution_current_owner(backend, root) && plan && plan->plan) {
-                const ggml_sycl::moe_mmid_model_token token{
-                    root.model.value, root.load.value, root.owner.generation };
-                authoritative_candidate = ggml_sycl::unified_cache_moe_mmid_exact_queue(
-                    token, plan, submit_device, submit_device, backend->stream()).valid();
-            }
-        }
+        // Authority belongs to the invocation that is building this batch.
+        // Never rediscover a same-device backend/queue through global state:
+        // multiple contexts may legitimately coexist on one device.
+        const bool authoritative_candidate = static_candidate && invocation_backend && invocation_queue &&
+                                             queue_capability && queue_capability->valid() &&
+                                             queue_capability->owner_device() == submit_device;
         if (authoritative_candidate) {
             cap.supported = true;
             cap.kernel = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
@@ -23447,7 +23450,10 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                                                              size_t              count,
                                                              size_t              slots_per_token,
                                                              ggml_layout_mode    requested_layout,
-                                                             bool                allow_materialize) {
+                                                             bool                allow_materialize,
+                                                             const void *        invocation_backend,
+                                                             const void *        invocation_queue,
+                                                             const moe_mmid_queue_capability * queue_capability) {
     return build_moe_resolved_batch(ids, count, slots_per_token, submit_device, [&](int32_t expert_id) {
         // This is the single canonical resolver seam for both future decode and
         // prompt consumers.  No raw fallback or residency inference is allowed
@@ -23508,7 +23514,8 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         } else if (normalized.residency != moe_batch_residency::UNAVAILABLE) {
             const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                 src0->type, normalized.actual_layout, normalized.recipe.request.phase, src0->ne[0], src0->ne[1], rows,
-                normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device, &normalized.lease);
+                normalized.owning_device, moe_layer_route_residency::DEVICE, submit_device, &normalized.lease,
+                invocation_backend, invocation_queue, queue_capability);
             if (cap.supported) {
                 normalized.recipe.kind = normalized.residency == moe_batch_residency::PRIMARY_DEVICE ?
                                              moe_batch_executor::PRIMARY_DEVICE :
@@ -37493,8 +37500,9 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && g_backend_context_by_device[device] == this) {
-            g_backend_context_by_device[device] = nullptr;
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            auto & contexts = g_backend_context_by_device[device];
+            contexts.erase(std::remove(contexts.begin(), contexts.end(), this), contexts.end());
         }
     }
     ggml_sycl::drain_retained_handles(true);
@@ -59716,14 +59724,27 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     bool ready() const noexcept override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (quiescent_) return true;
-        if (!event_) return false;
+        std::optional<sycl::event> event;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (quiescent_) return true;
+            if (failed_ || !event_) return false;
+            event = event_;
+        }
         try {
-            return event_->get_info<sycl::info::event::command_execution_status>() ==
-                   sycl::info::event_command_status::complete;
-        } catch (...) { return false; }
+            if (event->get_info<sycl::info::event::command_execution_status>() !=
+                sycl::info::event_command_status::complete) return false;
+            event->wait_and_throw();
+            std::lock_guard<std::mutex> lock(mutex_);
+            succeeded_ = true;
+            return true;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failed_ = true;
+            return false;
+        }
     }
+    bool observe_success() noexcept { return ready(); }
     void wait() noexcept override {
         std::optional<sycl::event> event;
         { std::lock_guard<std::mutex> lock(mutex_); event = event_; }
@@ -59741,6 +59762,8 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
     mutable std::mutex mutex_;
     std::optional<sycl::event> event_;
     bool quiescent_ = false;
+    mutable bool succeeded_ = false;
+    mutable bool failed_ = false;
 };
 
 struct moe_direct_bundle_completion {
@@ -63573,9 +63596,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
         ggml_sycl_moe_log_canonical_publish_pre_admission(
             src0, canonical_published, published_kind, published_stable);
+        const auto recipe_exec = ggml_sycl_take_execution_state_snapshot(&ctx);
+        ggml_sycl::lifecycle::ModelToken recipe_root{};
+        const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
+        sycl::queue * recipe_queue = ctx.stream();
+        ggml_sycl::moe_mmid_queue_capability recipe_queue_capability;
+        if (recipe_queue && recipe_plan && recipe_plan->plan && recipe_exec.context_id && recipe_exec.session_id &&
+            recipe_exec.reset_epoch && recipe_exec.graph_epoch && recipe_exec.invocation_id &&
+            ggml_sycl_execution_current_owner(&ctx, recipe_root)) {
+            recipe_queue_capability = ggml_sycl::unified_cache_moe_mmid_exact_queue(
+                { recipe_root.model.value, recipe_root.load.value, recipe_root.owner.generation }, recipe_plan,
+                ctx.device, ctx.device, recipe_queue);
+        }
         retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
-            /*allow_materialize=*/false);
+            /*allow_materialize=*/false, &ctx, recipe_queue,
+            recipe_queue_capability.valid() ? &recipe_queue_capability : nullptr);
         if (!retained_decode_batch_result) {
             ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
             GGML_LOG_ERROR("[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
@@ -63693,6 +63729,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // completion-owned bundle.
                     completion->bundle = std::move(admitted.bundle);
                     const auto * lease = completion->bundle.owner_leases();
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                    g_q1_nvfp4_test_workspace_slot.store(lease[0].slot(), std::memory_order_relaxed);
+                    g_q1_nvfp4_test_workspace_generation.store(lease[0].generation(), std::memory_order_relaxed);
+#endif
                     const auto & slices = lease[0].slices();
                     auto * activation = static_cast<float *>(slices.activation_f32.ptr);
                     auto * ids_device = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
@@ -63730,14 +63770,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 h.depends_on(kernel);
                                 h.memcpy(dst_device_base, slices.output_f32.ptr, output_bytes);
                             });
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                            if (ggml_sycl_q1_nvfp4_test_consume_failure(
+                                    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL)) {
+                                final = exact_queue->submit([final](sycl::handler & h) {
+                                    h.depends_on(final);
+                                    h.host_task([] {
+                                        g_q1_nvfp4_test_quarantine.fetch_add(1, std::memory_order_relaxed);
+                                        throw std::runtime_error("injected Q1/NVFP4 asynchronous terminal failure");
+                                    });
+                                });
+                            }
+#endif
                             terminal->arm(final);
-                            exact_queue->submit([completion, final](sycl::handler & h) {
+                            exact_queue->submit([completion, terminal, final](sycl::handler & h) {
                                 h.depends_on(final);
-                                h.host_task([completion] {
+                                h.host_task([completion, terminal] {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     g_q1_nvfp4_test_terminal.fetch_add(1, std::memory_order_relaxed);
 #endif
-                                    const bool recycled = completion->bundle.terminal_release();
+                                    const bool recycled = terminal->observe_success() &&
+                                                          completion->bundle.terminal_release();
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     if (recycled) g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -63756,12 +63809,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // it has drained. A non-throwing exact-queue wait is the
                             // finalizer: only after it returns do we publish an
                             // explicit quiescent terminal and recover the quarantine.
-                            try { exact_queue->wait_and_throw(); } catch (...) {}
                             bool quiescent = false;
                             try {
-                                exact_queue->wait();
+                                exact_queue->wait_and_throw();
                                 quiescent = true;
-                            } catch (...) {}
+                            } catch (...) {
+                                // An asynchronously failed event is not terminal
+                                // success. Outer graph/synchronize drain owns the
+                                // exact recovery attempt; keep this bundle quarantined.
+                            }
                             if (quiescent) {
                                 terminal->confirm_quiescent();
                                 (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
@@ -70690,6 +70746,16 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend, const ggm
     std::exit(1);
 }
 
+static void ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx) return;
+    ggml_sycl::lifecycle::ModelToken root{};
+    auto * cache = ggml_sycl::get_existing_unified_cache_for_device(ctx->device);
+    const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;
+    if (!plan || !plan->plan || !ggml_sycl_execution_current_owner(ctx, root)) return;
+    (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
+        { root.model.value, root.load.value, root.owner.generation }, plan->version, true);
+}
+
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
     try {
@@ -70707,6 +70773,10 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
                                                CHECK_TRY_ERROR(stream->wait_and_throw());
         if (err != 0) {
+            // The throwing drain is the outer async-failure boundary. Exact
+            // recovery observes terminal success/quiescence and leaves failed
+            // events quarantined rather than recycling them as completion.
+            ggml_sycl_recover_exact_mmid_after_drain(sycl_ctx);
             const int dev          = sycl_ctx->device;
             size_t    cache_used   = 0;
             size_t    cache_budget = 0;
@@ -91554,6 +91624,7 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
         }
         try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
         try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
+        try { ggml_sycl_recover_exact_mmid_after_drain(cleanup_ctx); } catch (...) {}
         try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
         try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
         cleanup_ctx->last_graph_event.reset();
@@ -91589,6 +91660,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             }
             try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
             try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
+            try { ggml_sycl_recover_exact_mmid_after_drain(cleanup_ctx); } catch (...) {}
             try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
             try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
             cleanup_ctx->last_graph_event.reset();
@@ -93924,7 +93996,7 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         // backend owns ctx and the admission count represents a reachable object.
         {
             std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-            g_backend_context_by_device[device] = ctx.get();
+            g_backend_context_by_device[device].push_back(ctx.get());
         }
         g_sycl_backend_refcount.fetch_add(1, std::memory_order_acq_rel);
         admission.committed = true;
