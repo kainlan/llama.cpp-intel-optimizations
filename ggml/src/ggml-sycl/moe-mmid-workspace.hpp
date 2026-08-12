@@ -216,6 +216,7 @@ class moe_mmid_registry_lease {
     uint64_t                             generation() const noexcept;
     uint64_t                             plan_identity() const noexcept;
     uint64_t                             queue_cookie() const noexcept;
+    uint64_t                             epoch() const noexcept;
     int                                  submit_device() const noexcept;
     int                                  owner_device() const noexcept;
     const moe_mmid_workspace_geometry &  geometry() const noexcept;
@@ -227,7 +228,83 @@ class moe_mmid_registry_lease {
     std::shared_ptr<authority> authority_;
     uint64_t                   generation_   = 0;
     uint64_t                   queue_cookie_ = 0;
+    uint64_t                   epoch_        = 0;
     friend class moe_mmid_workspace_registry;
+    friend class moe_admitted_workspace_bundle;
+};
+
+// Stable identities are scalar registry inputs, never raw pointers. One entry
+// is retained for every routed occurrence; repeated entries are significant.
+struct moe_mmid_retained_identity {
+    uint64_t weight = 0;
+    uint64_t table  = 0;
+};
+
+struct moe_mmid_admission_owner {
+    int      owner_device = -1;
+    uint64_t queue_cookie = 0;
+};
+
+struct moe_mmid_admission_request {
+    moe_mmid_model_token                    token;
+    uint64_t                                plan_identity = 0;
+    int                                     submit_device = -1;
+    uint64_t                                epoch = 0;
+    size_t                                  top_k = 0;
+    size_t                                  ne11 = 0;
+    int64_t                                 K = 0;
+    int64_t                                 N = 0;
+    int32_t                                 type = -1;
+    std::vector<moe_mmid_admission_owner>   owners;
+    std::vector<moe_mmid_retained_identity> retained_occurrences;
+};
+
+class moe_admitted_workspace_bundle {
+  public:
+    moe_admitted_workspace_bundle() = default;
+    ~moe_admitted_workspace_bundle();
+    moe_admitted_workspace_bundle(const moe_admitted_workspace_bundle &) = delete;
+    moe_admitted_workspace_bundle & operator=(const moe_admitted_workspace_bundle &) = delete;
+    moe_admitted_workspace_bundle(moe_admitted_workspace_bundle && other) noexcept;
+    moe_admitted_workspace_bundle & operator=(moe_admitted_workspace_bundle && other) noexcept;
+
+    bool valid() const noexcept;
+    bool matches(int submit_device, int owner_device, int64_t K, int64_t N, int32_t type) const noexcept;
+    uint64_t identity_digest() const noexcept { return identity_digest_; }
+    uint64_t epoch() const noexcept { return epoch_; }
+    uint64_t plan_identity() const noexcept { return plan_identity_; }
+    const std::vector<moe_mmid_registry_lease> & owner_leases() const noexcept { return leases_; }
+    const std::vector<moe_mmid_admission_owner> & graph_owners() const noexcept { return owners_; }
+    const std::vector<moe_mmid_retained_identity> & retained_occurrences() const noexcept { return identities_; }
+
+    // Must be called before any queue submission. Once possible submission is
+    // recorded, destruction quarantines the slots; only terminal_release after
+    // the caller has drained the queues may recycle them.
+    bool mark_possible_submit() noexcept;
+    bool terminal_release() noexcept;
+    bool quarantined() const noexcept { return possible_submit_ && admitted_; }
+
+  private:
+    bool release_all() noexcept;
+    bool                                    admitted_       = false;
+    bool                                    possible_submit_ = false;
+    uint64_t                                capability_     = 0;
+    uint64_t                                identity_digest_ = 0;
+    uint64_t                                epoch_          = 0;
+    uint64_t                                plan_identity_  = 0;
+    int                                     submit_device_  = -1;
+    int64_t                                 K_              = 0;
+    int64_t                                 N_              = 0;
+    int32_t                                 type_           = -1;
+    std::vector<moe_mmid_registry_lease>    leases_;
+    std::vector<moe_mmid_admission_owner>   owners_;
+    std::vector<moe_mmid_retained_identity> identities_;
+    friend class moe_mmid_workspace_registry;
+};
+
+struct moe_mmid_admitted_result {
+    moe_mmid_lease_status          status = moe_mmid_lease_status::INVALID;
+    moe_admitted_workspace_bundle bundle;
 };
 
 struct moe_mmid_registry_context_info {
@@ -259,6 +336,7 @@ class moe_mmid_workspace_registry {
                                            int                          submit_device,
                                            int                          owner_device,
                                            uint64_t                     queue_cookie) noexcept;
+    moe_mmid_admitted_result       admit(const moe_mmid_admission_request & request) noexcept;
     bool                           retire(const moe_mmid_model_token & token, uint64_t plan_identity = 0) noexcept;
     size_t                         published_contexts() const noexcept;
     std::vector<moe_mmid_registry_context_info> list() const;

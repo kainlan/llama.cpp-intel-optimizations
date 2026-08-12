@@ -577,6 +577,153 @@ static void registry_retirement_retains_outstanding_lease() {
     check(destroyed.load() == 2, "device/host blobs were not destroyed after final lease");
 }
 
+static moe_mmid_admission_request admission_request(const moe_mmid_model_token & token, uint64_t plan,
+                                                     std::vector<moe_mmid_admission_owner> owners,
+                                                     uint64_t epoch = 900) {
+    moe_mmid_admission_request request;
+    request.token = token;
+    request.plan_identity = plan;
+    request.submit_device = 0;
+    request.epoch = epoch;
+    request.top_k = 2;
+    request.ne11 = 2;
+    request.K = 64;
+    request.N = 96;
+    request.type = 1;
+    request.owners = std::move(owners);
+    request.retained_occurrences = { { 101, 201 }, { 102, 202 }, { 101, 201 }, { 103, 203 }, { 104, 204 }, { 101, 201 } };
+    return request;
+}
+
+static void registry_atomic_bundle_authority() {
+    const moe_mmid_model_token token{ 51, 52, 53 };
+    moe_mmid_workspace_registry registry;
+    std::atomic<int> destroyed{ 0 };
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 700, 0, { owner_plan(0, 701), owner_plan(1, 702, true) }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "atomic bundle context publication failed");
+    auto request = admission_request(token, 700, { { 1, 702 }, { 0, 701 } });
+    auto admitted = registry.admit(request);
+    check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid(),
+          "all-owner atomic admission failed");
+    check(admitted.bundle.graph_owners().size() == 2 && admitted.bundle.graph_owners()[0].owner_device == 1 &&
+              admitted.bundle.owner_leases()[0].owner_device() == 1 && admitted.bundle.owner_leases()[1].owner_device() == 0,
+          "graph owner enumeration lost request order");
+    check(admitted.bundle.retained_occurrences().size() == 6 &&
+              admitted.bundle.retained_occurrences()[0].weight == admitted.bundle.retained_occurrences()[2].weight &&
+              admitted.bundle.identity_digest() != 0,
+          "repeated occurrence identity was deduplicated or digest missing");
+    for (const auto & lease : admitted.bundle.owner_leases()) {
+        check(lease.epoch() == request.epoch && lease.slices().activation_f32.valid() && lease.slices().output_q8.valid(),
+              "bundle lease omitted epoch or exact slices");
+    }
+    auto second = registry.admit(request);
+    check(second.status == moe_mmid_lease_status::ACQUIRED, "second depth slot unavailable");
+    check(registry.admit(request).status == moe_mmid_lease_status::BUSY, "all-owner depth exhaustion not BUSY");
+    check(admitted.bundle.terminal_release(), "exact all-owner terminal release failed");
+    check(second.bundle.terminal_release(), "second all-owner terminal release failed");
+
+    auto wrong = request;
+    wrong.owners[0].queue_cookie++;
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "wrong queue admitted");
+    wrong = request; wrong.plan_identity++;
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "wrong plan admitted");
+    wrong = request; wrong.submit_device = 1;
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "wrong submit device admitted");
+    wrong = request; wrong.token.generation++;
+    check(registry.admit(wrong).status == moe_mmid_lease_status::INVALID, "stale model generation admitted");
+}
+
+static void registry_bundle_rollback_move_oom_and_quarantine() {
+    const moe_mmid_model_token token{ 61, 62, 63 };
+    moe_mmid_workspace_registry registry;
+    std::atomic<int> destroyed{ 0 };
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 800, 0, { owner_plan(0, 801), owner_plan(1, 802, true) }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "rollback context publication failed");
+    auto both = admission_request(token, 800, { { 0, 801 }, { 1, 802 } });
+    auto owner1_only = both;
+    owner1_only.owners.erase(owner1_only.owners.begin());
+    // Exact owner-set mismatch cannot partially acquire owner 0.
+    check(registry.admit(owner1_only).status == moe_mmid_lease_status::INVALID, "missing owner admitted");
+
+    // Exhaust only the second deterministic owner through the legacy exact-pool
+    // API. Atomic admission must inspect owner 0 but leave it completely free.
+    auto owner1_a = registry.acquire(token, 800, 0, 1, 802);
+    auto owner1_b = registry.acquire(token, 800, 0, 1, 802);
+    check(owner1_a.status == moe_mmid_lease_status::ACQUIRED && owner1_b.status == moe_mmid_lease_status::ACQUIRED,
+          "second-owner BUSY setup failed");
+    check(registry.admit(both).status == moe_mmid_lease_status::BUSY, "second-owner BUSY did not reject bundle");
+    auto owner0_a = registry.acquire(token, 800, 0, 0, 801);
+    auto owner0_b = registry.acquire(token, 800, 0, 0, 801);
+    check(owner0_a.status == moe_mmid_lease_status::ACQUIRED && owner0_b.status == moe_mmid_lease_status::ACQUIRED,
+          "second-owner BUSY partially consumed first-owner slot");
+    check(owner0_a.lease.terminal_release(801, owner0_a.lease.generation()) == moe_mmid_release_status::RELEASED &&
+              owner0_b.lease.terminal_release(801, owner0_b.lease.generation()) == moe_mmid_release_status::RELEASED &&
+              owner1_a.lease.terminal_release(802, owner1_a.lease.generation()) == moe_mmid_release_status::RELEASED &&
+              owner1_b.lease.terminal_release(802, owner1_b.lease.generation()) == moe_mmid_release_status::RELEASED,
+          "BUSY rollback setup cleanup failed");
+    {
+        auto first = registry.admit(both);
+        check(first.status == moe_mmid_lease_status::ACQUIRED, "pre-BUSY admission failed");
+        moe_admitted_workspace_bundle moved(std::move(first.bundle));
+        check(moved.valid() && !first.bundle.valid(), "bundle move duplicated authority");
+        // Scope destruction before possible submit releases every owner.
+    }
+    auto reusable = registry.admit(both);
+    check(reusable.status == moe_mmid_lease_status::ACQUIRED, "pre-submit destruction did not release owners");
+    check(reusable.bundle.mark_possible_submit() && reusable.bundle.quarantined(), "possible-submit quarantine absent");
+    check(reusable.bundle.terminal_release(), "drained quarantine did not terminally release");
+
+#ifndef MMID_TSAN_BUILD
+    g_fail_heap_allocations.store(true);
+    auto oom = registry.admit(both);
+    g_fail_heap_allocations.store(false);
+    check(oom.status == moe_mmid_lease_status::INVALID && !oom.bundle.valid(), "OOM assembly escaped or admitted");
+    auto after_oom = registry.admit(both);
+    check(after_oom.status == moe_mmid_lease_status::ACQUIRED, "OOM assembly mutated owner slots");
+    check(after_oom.bundle.terminal_release(), "post-OOM bundle release failed");
+#endif
+}
+
+static void registry_atomic_concurrency_multi_owner() {
+    const moe_mmid_model_token token{ 71, 72, 73 };
+    moe_mmid_workspace_registry registry;
+    std::atomic<int> destroyed{ 0 };
+    auto allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    check(registry.materialize(token, 810, 0, { owner_plan(0, 811), owner_plan(1, 812, true) }, allocator) ==
+              moe_mmid_materialize_status::PUBLISHED,
+          "concurrent atomic context publication failed");
+    auto request = admission_request(token, 810, { { 0, 811 }, { 1, 812 } });
+    std::atomic<int> ready{ 0 }, acquired{ 0 }, busy{ 0 };
+    std::atomic<bool> go{ false };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&] {
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            auto result = registry.admit(request);
+            if (result.status == moe_mmid_lease_status::ACQUIRED) acquired.fetch_add(1);
+            if (result.status == moe_mmid_lease_status::BUSY) busy.fetch_add(1);
+            while (acquired.load() + busy.load() < 8) std::this_thread::yield();
+        });
+    }
+    while (ready.load() != 8) std::this_thread::yield();
+    go.store(true);
+    for (auto & thread : threads) thread.join();
+    check(acquired.load() == 2 && busy.load() == 6, "multi-owner admission was not atomic at fixed depth");
+    auto reusable = registry.admit(request);
+    check(reusable.status == moe_mmid_lease_status::ACQUIRED, "concurrent bundle destruction did not release");
+}
+
 static void concurrent_depth_busy_and_reuse() {
     moe_mmid_workspace_pool  pool;
     std::atomic<int>         ready{ 0 };
@@ -636,6 +783,9 @@ int main() {
         registry_replacement_and_queue_reset();
         registry_concurrent_depth_busy();
         registry_retirement_retains_outstanding_lease();
+        registry_atomic_bundle_authority();
+        registry_bundle_rollback_move_oom_and_quarantine();
+        registry_atomic_concurrency_multi_owner();
         std::cout << "moe-mmid-workspace-plan: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

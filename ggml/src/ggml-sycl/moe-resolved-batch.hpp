@@ -7,6 +7,7 @@
 
 #include "mem-handle.hpp"
 #include "moe-layer-plan.hpp"
+#include "moe-mmid-workspace.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -608,21 +609,6 @@ struct moe_batch_executor_choice {
     explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
 };
 
-class moe_mmid_workspace_registry;
-
-// Non-forgeable proof that admission atomically acquired every owner workspace
-// needed by one MMID submission. Until the registry mints this authority,
-// callers cannot enable the Q1_0/NVFP4 device executor by merely reporting a
-// byte count or reconstructing recipe metadata.
-class moe_admitted_workspace_bundle {
-  public:
-    bool valid() const noexcept { return admitted_; }
-
-  private:
-    bool admitted_ = false;
-    friend class moe_mmid_workspace_registry;
-};
-
 // Executor selection is deliberately metadata-only. Callers supply capability
 // and owning-queue facts; pointer address spaces are never consulted.
 inline moe_batch_executor_choice choose_moe_batch_executor(
@@ -635,7 +621,10 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     const bool direct_q1_nvfp4 = operand.recipe.kind != moe_batch_executor::HOST_CPU &&
                                  (operand.recipe.request.type == GGML_TYPE_Q1_0 ||
                                   operand.recipe.request.type == GGML_TYPE_NVFP4);
-    if (direct_q1_nvfp4 && (!workspace_bundle || !workspace_bundle->valid())) {
+    if (direct_q1_nvfp4 &&
+        (!workspace_bundle ||
+         !workspace_bundle->matches(submit_device, operand.recipe.owner_device, operand.recipe.request.K,
+                                    operand.recipe.request.N, static_cast<int32_t>(operand.recipe.request.type)))) {
         out.reject = moe_batch_reject_reason::WORKSPACE_LEASE_MISSING;
         return out;
     }
