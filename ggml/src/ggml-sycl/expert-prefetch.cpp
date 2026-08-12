@@ -26,14 +26,11 @@ namespace ggml_sycl {
 // ============================================================================
 
 ExpertPrefetcher::~ExpertPrefetcher() {
-    if (initialized_ && !ggml_sycl_is_shutting_down()) {
+    // Source and destination leases may only be released after their terminal
+    // DMA. This remains true during module shutdown; leaking the queue while
+    // dropping leases would turn orderly teardown into a use-after-free.
+    if (initialized_) {
         shutdown();
-    }
-    // During static destruction, intentionally leak the queue handle.
-    // The OS reclaims all process memory at exit.
-    // All VRAM is owned by the unified cache — nothing to free here.
-    if (ggml_sycl_is_shutting_down() && dma_queue_) {
-        (void) dma_queue_.release();
     }
 }
 
@@ -91,25 +88,25 @@ bool ExpertPrefetcher::hint(int layer_idx, int expert_idx) {
 
 // Internal implementation of hint(). Caller must hold mutex_.
 //
-// Uses moe_get_expert_stage_info() to read metadata, then submits async DMA +
+// Acquires an ownership-safe descriptor, then submits async DMA +
 // AOS->SOA reorder via direct_stage_expert(). Returns immediately after DMA
 // submission -- does NOT block on DMA completion.
 //
 // The returned sycl::event is stored in inflight_ and waited on in await().
 bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
-    expert_key key{ layer_idx, expert_idx };
-
-    // Already in-flight -- skip.
-    if (inflight_.count(key)) {
-        return false;
-    }
-
-    // Garbage-collect completed in-flight entries.
+    // Garbage-collect completed in-flight entries before acquiring another pair
+    // of source/destination leases.
     gc_completed();
 
-    // Step 1: Get expert metadata via read-only accessor.
-    expert_stage_info info;
-    if (!moe_get_expert_stage_info(layer_idx, expert_idx, device_id_, info)) {
+    // Step 1: atomically acquire model identity, source owner and ready deps.
+    expert_stage_descriptor info;
+    if (!moe_acquire_expert_stage_descriptor(layer_idx, expert_idx, device_id_, info)) {
+        return false;
+    }
+    const expert_prefetch_cache_key key{ info.cache_key, info.layout };
+
+    // Layer/expert coordinates are not identity: model switches may reuse them.
+    if (inflight_.count(key)) {
         return false;
     }
     if (!info.valid || !info.src_ptr || info.src_size == 0 || info.dst_size == 0 || info.layout != GGML_LAYOUT_SOA) {
@@ -144,8 +141,9 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     rctx.nbytes        = info.src_size;
     rctx.dst_bytes     = info.dst_size;
     rctx.layout        = info.layout;
-    rctx.src_is_device = false;
-    rctx.device_id     = device_id_;
+    rctx.src_is_device    = info.source_device_id >= 0;
+    rctx.device_id        = device_id_;
+    rctx.source_device_id = info.source_device_id;
 
     // Step 4: Submit async DMA via direct_stage_expert.
     // Route H2D to BCS (copy-only) queue so prefetch DMA doesn't monopolize
@@ -153,22 +151,27 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     sycl::queue * bcs_q = &cache->get_bcs_queue();
 
     direct_stage_result sr;
+    mem_handle          destination_owner;
     try {
         sr = cache->direct_stage_expert(info.cache_key, info.src_ptr, info.src_size, info.dst_size, info.layout,
-                                        fill_reordered_host, &rctx, bcs_q);
+                                        fill_reordered_host, &rctx, bcs_q, &destination_owner, info.deps);
     } catch (...) {
+        try { bcs_q->wait_and_throw(); } catch (...) {}
         return false;
     }
 
-    if (!sr.ok || !sr.ptr) {
+    if (!sr.ok || !sr.ptr || !destination_owner.valid()) {
+        try { sr.event.wait_and_throw(); } catch (...) {}
         return false;
     }
 
-    // DMA submitted -- track in-flight for await().
+    // DMA submitted -- request owns both endpoints until await/cancel/GC.
     prefetch_request req;
-    req.key        = key;
-    req.event      = sr.event;
-    req.device_ptr = sr.ptr;
+    req.key               = key;
+    req.event             = sr.event;
+    req.device_ptr        = sr.ptr;
+    req.source_owner      = std::move(info.source_owner);
+    req.destination_owner = std::move(destination_owner);
     req.completed  = false;
     req.cache_key  = info.cache_key;
     req.layout     = info.layout;
@@ -176,7 +179,12 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     req.layer_id   = info.layer_id;
     req.expert_id  = info.expert_id;
 
-    inflight_[key] = std::move(req);
+    try {
+        inflight_.emplace(key, std::move(req));
+    } catch (...) {
+        try { sr.event.wait_and_throw(); } catch (...) {}
+        return false;
+    }
     GGML_SYCL_DEBUG("[PREFETCH] hint L%d E%d: async DMA submitted, dev=%d ptr=%p\n", layer_idx, expert_idx, device_id_,
                     sr.ptr);
     return true;
@@ -236,63 +244,77 @@ std::vector<int> ExpertPrefetcher::hint_batch_adaptive(int                      
 // Await: block until a specific expert's DMA completes, return VRAM ptr
 // ============================================================================
 
-void * ExpertPrefetcher::await(int layer_idx, int expert_idx) {
+ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned(int layer_idx, int expert_idx) {
+    owned_result result{};
     if (!initialized_) {
-        return nullptr;
+        return result;
     }
 
-    expert_key key{ layer_idx, expert_idx };
+    expert_stage_descriptor descriptor;
+    const bool have_descriptor =
+        moe_acquire_expert_stage_descriptor(layer_idx, expert_idx, device_id_, descriptor);
+    expert_prefetch_cache_key key{};
+    if (have_descriptor) {
+        key = { descriptor.cache_key, descriptor.layout };
+    }
 
-    // Phase 1: Check in-flight completed or extract event.
-    // Release mutex before blocking on event.wait() to avoid deadlock.
     sycl::event ev_copy;
-    bool        need_wait = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-
+        // Registry withdrawal after hint is safe: the request itself owns the
+        // source and carries the copied coordinates needed to find it.
+        if (!have_descriptor) {
+            auto match = inflight_.end();
+            for (auto it = inflight_.begin(); it != inflight_.end(); ++it) {
+                if (it->second.layer_id == layer_idx && it->second.expert_id == expert_idx) {
+                    if (match != inflight_.end()) {
+                        return result; // ambiguous across model identities: fail closed
+                    }
+                    match = it;
+                }
+            }
+            if (match == inflight_.end()) {
+                return result;
+            }
+            key = match->first;
+        }
         auto it = inflight_.find(key);
         if (it == inflight_.end()) {
-            return nullptr;
+            return result;
         }
-        if (it->second.completed) {
-            return it->second.device_ptr;
-        }
-        ev_copy   = it->second.event;
-        need_wait = true;
+        ev_copy = it->second.event;
     }
 
-    // Phase 2: Wait on event WITHOUT holding the lock.
-    if (need_wait) {
-        try {
-            ev_copy.wait();
-        } catch (const sycl::exception & e) {
-            GGML_LOG_WARN("[SYCL] Prefetch await failed for L%d E%d: %s\n", layer_idx, expert_idx, e.what());
-            std::lock_guard<std::mutex> lock(mutex_);
-            inflight_.erase(key);
-            return nullptr;
-        }
+    try {
+        ev_copy.wait_and_throw();
+    } catch (const sycl::exception & e) {
+        GGML_LOG_WARN("[SYCL] Prefetch await failed for L%d E%d: %s\n", layer_idx, expert_idx, e.what());
+        std::lock_guard<std::mutex> lock(mutex_);
+        inflight_.erase(key);
+        return result;
     }
 
-    // Phase 3: Re-acquire lock, finalize cache entry, and update state.
     std::lock_guard<std::mutex> lock(mutex_);
-    auto                        it = inflight_.find(key);
-    if (it == inflight_.end()) {
+    auto it = inflight_.find(key);
+    if (it == inflight_.end() || !it->second.destination_owner.valid()) {
+        return result;
+    }
+    completed_count_++;
+    result.ptr   = it->second.device_ptr;
+    result.owner = std::move(it->second.destination_owner);
+    result.ready = it->second.event;
+    inflight_.erase(it);
+    return result;
+}
+
+void * ExpertPrefetcher::await(int layer_idx, int expert_idx) {
+    owned_result result = await_owned(layer_idx, expert_idx);
+    if (!result) {
         return nullptr;
     }
-
-    if (!it->second.completed) {
-        it->second.completed = true;
-        completed_count_++;
-
-        // Entry is already stored in direct_expert_entries_ by
-        // direct_stage_expert() and findable via lookup_expert().
-        // No register_ready() call needed.
-
-        GGML_SYCL_DEBUG("[PREFETCH] await L%d E%d: DMA complete, device_ptr=%p\n", layer_idx, expert_idx,
-                        it->second.device_ptr);
-    }
-
-    return it->second.device_ptr;
+    void * ptr = result.ptr;
+    retain_handles_until_event({ std::move(result.owner) }, result.ready);
+    return ptr;
 }
 
 // ============================================================================
@@ -337,8 +359,8 @@ void * ExpertPrefetcher::get_cached_ptr(int layer_idx, int expert_idx) const {
 
     // Query the unified cache for this expert's device pointer.
     // The prefetcher no longer maintains a private pool.
-    expert_stage_info info;
-    if (!moe_get_expert_stage_info(layer_idx, expert_idx, device_id_, info)) {
+    expert_stage_descriptor info;
+    if (!moe_acquire_expert_stage_descriptor(layer_idx, expert_idx, device_id_, info)) {
         return nullptr;
     }
 

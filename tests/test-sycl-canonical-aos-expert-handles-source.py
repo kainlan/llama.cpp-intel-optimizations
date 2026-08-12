@@ -139,11 +139,19 @@ def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> N
     assert "meta_value = m" in materialize
     assert "ggml_sycl_resolve_moe_meta_source(*meta, device)" in materialize
 
-    # Legacy pointer-only bridges cannot represent ownership and must fail closed.
+    # The legacy name lookup remains fail-closed. Prefetch uses a value-owned
+    # descriptor whose source lease and readiness dependency survive lock exit.
     lookup = function(source, "bool ggml_sycl_lookup_moe_expert_source_by_name")
-    stage = function(source, "bool moe_get_expert_stage_info")
+    stage = function(source, "bool moe_acquire_expert_stage_descriptor")
     assert "return false;" in lookup and "g_moe_expert_meta" not in lookup
-    assert "return false;" in stage and "g_moe_expert_meta" not in stage
+    for witness in (
+        "meta = candidate",
+        "ggml_sycl_resolve_moe_meta_source(meta, device_id)",
+        "out.source_owner = std::move(source.handle)",
+        "out.deps.push_back(source.ready)",
+        "out.valid = out.source_owner.valid()",
+    ):
+        assert witness in stage, witness
 
 
 def test_private_production_route_has_graph_churn_regression() -> None:

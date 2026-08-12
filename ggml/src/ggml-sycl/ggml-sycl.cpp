@@ -5953,15 +5953,58 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
     return {};
 }
 
-bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out) {
-    // expert_stage_info has no ownership slot for its src_ptr. Publishing a
-    // pointer here would let background work outlive the local cache lease.
-    // Fail closed until that public descriptor can carry a mem_handle.
-    GGML_UNUSED(layer_idx);
-    GGML_UNUSED(expert_idx);
-    GGML_UNUSED(device_id);
+bool moe_acquire_expert_stage_descriptor(int layer_idx, int expert_idx, int device_id,
+                                         expert_stage_descriptor & out) {
     out = {};
-    return false;
+
+    // Copy model-scoped identity and shape while the registry is stable. The
+    // registry itself contains no pointers, so model teardown cannot invalidate
+    // anything in the value after this lock is released.
+    moe_expert_meta meta{};
+    bool found = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
+        for (const auto & candidate : g_moe_expert_meta) {
+            if (candidate.layer_id == layer_idx && candidate.expert_idx == expert_idx) {
+                meta = candidate;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found || !meta.canonical_key.valid || meta.bytes == 0 ||
+        !ggml_sycl_layout_supports_soa(meta.type)) {
+        return false;
+    }
+
+    moe_expert_source source = ggml_sycl_resolve_moe_meta_source(meta, device_id);
+    if (!source || !source.handle.has_stable_owner_identity()) {
+        return false;
+    }
+
+    const size_t soa_bytes =
+        ggml_sycl_layout_bytes_for_dims(meta.type, meta.ne0, meta.ne1, GGML_LAYOUT_SOA, device_id);
+    if (soa_bytes == 0) {
+        return false;
+    }
+
+    out.cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(meta.canonical_key, GGML_LAYOUT_SOA);
+    out.source_owner = std::move(source.handle);
+    out.src_ptr = source.ptr;
+    out.src_size = meta.bytes;
+    out.dst_size = soa_bytes;
+    out.layout = GGML_LAYOUT_SOA;
+    out.type = meta.type;
+    out.ncols = meta.ne0;
+    out.nrows = meta.ne1;
+    out.layer_id = meta.layer_id;
+    out.expert_id = meta.expert_idx;
+    out.source_device_id = source.owning_device;
+    if (source.has_ready) {
+        out.deps.push_back(source.ready);
+    }
+    out.valid = out.source_owner.valid() && out.src_ptr != nullptr;
+    return out.valid;
 }
 
 sycl::event fill_reordered_host(sycl::queue &                    queue,

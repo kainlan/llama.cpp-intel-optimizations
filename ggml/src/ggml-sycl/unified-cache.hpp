@@ -2055,7 +2055,8 @@ class unified_cache {
                                             cache_layout_fill_fn fill_fn,
                                             const void *         fill_ctx,
                                             sycl::queue *        queue,
-                                            mem_handle *         out_handle = nullptr);
+                                            mem_handle *         out_handle = nullptr,
+                                            const std::vector<sycl::event> & deps = {});
 
     // Stage a contiguous run of experts from one MoE tensor into one
     // cache-owned WEIGHT allocation, then publish per-expert smart handles as

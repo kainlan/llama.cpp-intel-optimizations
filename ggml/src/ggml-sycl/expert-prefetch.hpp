@@ -46,11 +46,13 @@ namespace ggml_sycl {
 // Thread-safe: acquires g_moe_expert_meta_mutex and unified cache locks internally.
 void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id);
 
-// Metadata needed to stage an expert's weights asynchronously.
-// Returned by moe_get_expert_stage_info() -- read-only accessor into g_moe_expert_meta.
-struct expert_stage_info {
+// Value-owned description of one expert staging operation. Metadata is copied
+// under the model registry lock; source_owner pins the canonical AOS entry and
+// deps carries any publication event that must precede the reorder submission.
+struct expert_stage_descriptor {
     ggml_sycl_cache_id cache_key = {};               // Stable cache key (model_id + tensor hash)
-    const void *       src_ptr   = nullptr;          // Host-accessible AOS weight data
+    mem_handle         source_owner{};                // Lease on the canonical AOS source
+    const void *       src_ptr   = nullptr;           // View valid while source_owner is retained
     size_t             src_size  = 0;                // AOS byte count
     size_t             dst_size  = 0;                // SOA byte count (may differ due to reorder padding)
     ggml_layout_mode   layout    = GGML_LAYOUT_AOS;  // Optimal layout for this expert
@@ -59,14 +61,15 @@ struct expert_stage_info {
     int64_t            nrows     = 0;                // Weight rows (N dimension)
     int                layer_id  = -1;               // Hash-based layer ID
     int                expert_id = -1;               // Expert index within layer
-    bool               valid     = false;            // True if metadata was found
+    int                source_device_id = mem_handle::HOST_DEVICE;
+    std::vector<sycl::event> deps;                    // Source readiness dependencies
+    bool               valid     = false;             // True only with a stable source owner
 };
 
-// Read-only metadata accessor for expert staging.
-// Looks up g_moe_expert_meta, computes cache key and optimal layout.
-// Does NOT allocate VRAM, submit DMA, or modify any state.
-// Thread-safe: acquires g_moe_expert_meta_mutex (shared lock).
-bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out);
+// Acquire canonical metadata and its source lease by value. No graph/tensor or
+// borrowed cache-entry pointer escapes the registry/cache locks.
+bool moe_acquire_expert_stage_descriptor(int layer_idx, int expert_idx, int device_id,
+                                         expert_stage_descriptor & out);
 
 // Context for AOS->SOA reorder fill function (used with cache_layout_request::fill_ctx).
 struct reorder_fill_ctx {
@@ -100,10 +103,28 @@ uint32_t get_expert_frequency(int layer_hash, int expert_id);
 // Tracks a single in-flight async DMA prefetch operation.
 // The event is from direct_stage_expert() and completes when H2D DMA +
 // AOS->SOA reorder finish on the cache's DMA queue.
+struct expert_prefetch_cache_key {
+    ggml_sycl_cache_id id{};
+    ggml_layout_mode   layout = GGML_LAYOUT_AOS;
+
+    bool operator==(const expert_prefetch_cache_key & other) const {
+        return detail::cache_id_equal(id, other.id) && layout == other.layout;
+    }
+};
+
+struct expert_prefetch_cache_key_hash {
+    size_t operator()(const expert_prefetch_cache_key & key) const {
+        size_t h = detail::cache_id_hash{}(key.id);
+        return h ^ (std::hash<int>{}(static_cast<int>(key.layout)) + 0x9e3779b9U + (h << 6) + (h >> 2));
+    }
+};
+
 struct prefetch_request {
-    expert_key         key;
+    expert_prefetch_cache_key key;
     sycl::event        event;                 // DMA completion event from cache DMA queue
-    void *             device_ptr = nullptr;  // VRAM destination (from unified cache)
+    void *             device_ptr = nullptr;  // ABI view, valid while destination_owner lives
+    mem_handle         source_owner{};        // Pins source through terminal DMA
+    mem_handle         destination_owner{};   // Pins destination through handoff/await
     bool               completed  = false;
     // Unified cache tracking for async finalization in await().
     ggml_sycl_cache_id cache_key  = {};               // Cache key for register_ready
@@ -172,6 +193,18 @@ class ExpertPrefetcher {
     // Waits on the per-expert sycl::event (not a global queue wait).
     // If the expert is already cached (no in-flight prefetch), returns the
     // cached ptr from the unified cache. Returns nullptr if not registered.
+    struct owned_result {
+        void *      ptr = nullptr;
+        mem_handle  owner{};
+        sycl::event ready{};
+        explicit operator bool() const { return ptr != nullptr && owner.valid(); }
+    };
+
+    // Preferred API: transfers the destination lease to the caller.
+    owned_result await_owned(int layer_idx, int expert_idx);
+
+    // Compatibility ABI. The transferred lease is published to graph/event
+    // retention before the pointer is returned.
     void * await(int layer_idx, int expert_idx);
 
     // Cancel all pending prefetches and wait for in-flight DMAs to complete.
@@ -214,10 +247,10 @@ class ExpertPrefetcher {
     // saturation to avoid starving the compute engine.
     static constexpr int max_concurrent_dma_ = 32;
 
-    // In-flight prefetch tracking. Key = expert_key.
+    // In-flight prefetch tracking. Key = canonical model cache ID + layout.
     // All VRAM allocation is delegated to the unified cache — the prefetcher
     // only tracks scheduling state (events + completion flags).
-    std::unordered_map<expert_key, prefetch_request, expert_key_hash> inflight_;
+    std::unordered_map<expert_prefetch_cache_key, prefetch_request, expert_prefetch_cache_key_hash> inflight_;
 
     mutable std::mutex mutex_;
 

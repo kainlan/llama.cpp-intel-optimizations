@@ -4295,7 +4295,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        cache_layout_fill_fn fill_fn,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
-                                                       mem_handle *         out_handle) {
+                                                       mem_handle *         out_handle,
+                                                       const std::vector<sycl::event> & deps) {
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -4529,17 +4530,18 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         ptr = nullptr;
     };
 
-    // 2. Fill: reorder or plain memcpy
+    // 2. Fill: reorder or plain memcpy. Source readiness is part of the
+    // submission rather than a host-side wait, preserving DMA overlap.
     mem_handle dst_handle =
         direct_alloc_owner.valid() ? direct_alloc_owner : make_copy_handle_for_raw_ptr(ptr, layout, cache_device);
     sycl::event fill_event;
     try {
         if (fill_fn) {
-            fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, {});
+            fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, deps);
         } else {
             mem_handle src_handle =
                 make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device);
-            fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, src_size, *queue, {});
+            fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, src_size, *queue, deps);
         }
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR(
