@@ -157,6 +157,8 @@ static void broadcast_and_occurrences() {
           "occurrence descriptors must not depend on activation broadcast");
     check(expanded.secondary_bounce_bytes == 0, "primary owner got secondary bounces");
     check(!moe_mmid_plan_workspace({ 64, 96, 3, 2, 3 }, false, &expanded), "invalid ne11 admitted");
+    check(!moe_mmid_plan_workspace({ 64, 5, 1, 2, 3 }, false, &expanded),
+          "N=5 partial Q8_1 output row admitted");
 }
 
 static void maxima_and_overflow() {

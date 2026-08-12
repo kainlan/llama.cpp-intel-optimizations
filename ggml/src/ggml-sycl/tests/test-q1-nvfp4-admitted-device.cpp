@@ -16,6 +16,8 @@
 #include <sycl/sycl.hpp>
 
 namespace {
+constexpr int gate_output_n = 96;
+
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 struct synthetic_inventory {
@@ -25,10 +27,11 @@ struct synthetic_inventory {
     synthetic_inventory() {
         constexpr const char * names[] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
                                            "blk.0.ffn_down_exps.weight" };
-        constexpr int experts = 4, K = QK1_0, N = 96;
+        constexpr int experts = 4, K = QK1_0;
         for (size_t i = 0; i < 3; ++i) {
             tensors[i].name = names[i]; tensors[i].type = GGML_TYPE_Q1_0;
-            tensors[i].ne[0] = i == 2 ? N : K; tensors[i].ne[1] = i == 2 ? K : N;
+            tensors[i].ne[0] = i == 2 ? gate_output_n : K;
+            tensors[i].ne[1] = i == 2 ? K : gate_output_n;
             tensors[i].ne[2] = experts; tensors[i].ne[3] = 1;
             tensors[i].size = ggml_row_size(tensors[i].type, tensors[i].ne[0]) * tensors[i].ne[1] * experts;
             inventory.total_size += tensors[i].size;
@@ -178,11 +181,11 @@ struct graph_case {
 
 graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
                       std::vector<float> & oracle, size_t & output_count) {
-    constexpr int experts = 4, top_k = 3, tokens = 1, rows = 5;
+    constexpr int experts = 4, top_k = 3, tokens = 1;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
-    auto * weights = ggml_new_tensor_3d(c.ctx, type, K, rows, experts);
+    auto * weights = ggml_new_tensor_3d(c.ctx, type, K, gate_output_n, experts);
     auto * input = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, K, ne11, tokens);
     auto * ids = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, top_k, tokens);
     ggml_set_name(weights, "blk.0.ffn_gate_exps.weight"); ggml_set_name(input, "route_input");
@@ -197,13 +200,14 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
             "tensor buffer allocation failed");
     ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
 
-    std::vector<float> source(static_cast<size_t>(experts) * rows * K), dequant(source.size());
+    std::vector<float> source(static_cast<size_t>(experts) * gate_output_n * K), dequant(source.size());
     for (size_t i = 0; i < source.size(); ++i) source[i] = 0.15f + float((i * 7) % 23) / 29.0f;
     std::vector<unsigned char> packed(ggml_nbytes(weights));
-    for (int e = 0; e < experts; ++e) for (int r = 0; r < rows; ++r) {
-        const float * src = source.data() + (static_cast<size_t>(e) * rows + r) * K;
-        void * dst = packed.data() + (static_cast<size_t>(e) * rows + r) * ggml_row_size(type, K);
-        float * dq = dequant.data() + (static_cast<size_t>(e) * rows + r) * K;
+    for (int e = 0; e < experts; ++e) for (int n = 0; n < gate_output_n; ++n) {
+        const float * src = source.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
+        void * dst = packed.data() +
+                     (static_cast<size_t>(e) * gate_output_n + n) * ggml_row_size(type, K);
+        float * dq = dequant.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
         if (type == GGML_TYPE_Q1_0) { quantize_row_q1_0_ref(src, static_cast<block_q1_0 *>(dst), K);
                                       dequantize_row_q1_0(static_cast<block_q1_0 *>(dst), dq, K); }
         else { quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
@@ -216,12 +220,13 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
     ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
     c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
-    output_count = static_cast<size_t>(rows) * top_k; oracle.resize(output_count);
-    for (int slot = 0; slot < top_k; ++slot) for (int r = 0; r < rows; ++r) {
-        const float * w = dequant.data() + (static_cast<size_t>(selected[slot]) * rows + r) * K;
+    output_count = static_cast<size_t>(gate_output_n) * top_k; oracle.resize(output_count);
+    for (int slot = 0; slot < top_k; ++slot) for (int n = 0; n < gate_output_n; ++n) {
+        const float * w = dequant.data() +
+                          (static_cast<size_t>(selected[slot]) * gate_output_n + n) * K;
         const float * a = activation.data() + static_cast<size_t>(ne11 == 1 ? 0 : slot) * K;
         float sum = 0; for (int k = 0; k < K; ++k) sum += w[k] * a[k];
-        oracle[static_cast<size_t>(slot) * rows + r] = sum;
+        oracle[static_cast<size_t>(slot) * gate_output_n + n] = sum;
     }
     return c;
 }
