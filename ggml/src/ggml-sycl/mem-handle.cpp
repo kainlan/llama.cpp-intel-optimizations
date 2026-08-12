@@ -1033,30 +1033,30 @@ static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
 // other contexts resolve them.  So the copy reads the source's mutable state
 // under the SOURCE's lock, then finishes (chunk lease, publish) with no handle
 // lock held — bump_chunk_lease_for_copy() calls into unified_cache.
-mem_handle::mem_handle(const mem_handle & other) :
-    kind_(other.kind_),
-    device_(other.device_),
-    key_(other.key_),
-    zone_id_(other.zone_id_),
-    offset_(other.offset_),
-    size_(other.size_),
-    arena_gen_(other.arena_gen_),
-    owned_alloc_(other.owned_alloc_),
-    host_chunk_handle_(UINT64_MAX),
-    vram_chunk_idx_(-1),
-    debug_owner_tag_(other.debug_owner_tag_) {
+mem_handle::mem_handle(const mem_handle & other) {
     {
-        // Read `other`'s mutable resolve state under its lock, and bump the
-        // cache_entry lease refcount there too so each handle independently
-        // keeps the entry alive.  fetch_add on copyable_atomic_u32 is lock-free
-        // and touches no cache lock, so it is safe inside the critical section.
+        // Snapshot identity, range, owner, and resolved state in one critical
+        // section.  A canonical capability is valid only as that complete tuple;
+        // publishing an owner with zero/stale identity would create a forged view.
         mem_handle_lock_guard g(other.lock_);
-        gen_          = other.gen_;
-        cached_       = other.cached_;
-        leased_entry_         = other.leased_entry_;
-        leased_storage_owner_ = other.leased_storage_owner_;
-        chunk_source_         = other.chunk_source_;
-        chunk_device_ = other.chunk_device_;
+        kind_                    = other.kind_;
+        device_                  = other.device_;
+        key_                     = other.key_;
+        zone_id_                 = other.zone_id_;
+        offset_                  = other.offset_;
+        size_                    = other.size_;
+        arena_gen_               = other.arena_gen_;
+        canonical_allocation_id_ = other.canonical_allocation_id_;
+        canonical_generation_    = other.canonical_generation_;
+        canonical_extent_        = other.canonical_extent_;
+        owned_alloc_             = other.owned_alloc_;
+        debug_owner_tag_         = other.debug_owner_tag_;
+        gen_                     = other.gen_;
+        cached_                  = other.cached_;
+        leased_entry_            = other.leased_entry_;
+        leased_storage_owner_    = other.leased_storage_owner_;
+        chunk_source_            = other.chunk_source_;
+        chunk_device_            = other.chunk_device_;
         if (leased_entry_) {
             leased_entry_->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: a copy takes its own lease, so it -- not whoever
@@ -1081,29 +1081,46 @@ mem_handle::mem_handle(const mem_handle & other) :
     }
 }
 
-mem_handle::mem_handle(mem_handle && other) noexcept :
-    kind_(other.kind_),
-    device_(other.device_),
-    key_(other.key_),
-    zone_id_(other.zone_id_),
-    offset_(other.offset_),
-    size_(other.size_),
-    arena_gen_(other.arena_gen_),
-    owned_alloc_(std::move(other.owned_alloc_)),
-    debug_owner_tag_(other.debug_owner_tag_) {
-    // Transfer ownership — no refcount change.  `other` is left with no leases
-    // so its dtor does not release ours.  Held under `other`'s lock so a
-    // concurrent resolve() on it cannot observe or write a half-moved state.
+mem_handle::mem_handle(mem_handle && other) noexcept {
+    // Transfer the complete capability under one lock, then leave `other` as a
+    // normal invalid handle.  In particular it must not retain a canonical ID
+    // or cached pointer after its allocation owner has moved away.
     mem_handle_lock_guard g(other.lock_);
-    gen_                 = other.gen_;
-    cached_              = other.cached_;
-    const lease_state st = other.take_lease_state_locked();
-    leased_entry_         = st.entry;
-    leased_storage_owner_ = std::move(st.storage_owner);
-    chunk_source_         = st.chunk_source;
-    host_chunk_handle_   = st.host_chunk_handle;
-    vram_chunk_idx_      = st.vram_chunk_idx;
-    chunk_device_        = st.chunk_device;
+    kind_                    = other.kind_;
+    device_                  = other.device_;
+    key_                     = other.key_;
+    zone_id_                 = other.zone_id_;
+    offset_                  = other.offset_;
+    size_                    = other.size_;
+    arena_gen_               = other.arena_gen_;
+    canonical_allocation_id_ = other.canonical_allocation_id_;
+    canonical_generation_    = other.canonical_generation_;
+    canonical_extent_        = other.canonical_extent_;
+    owned_alloc_             = std::move(other.owned_alloc_);
+    debug_owner_tag_         = other.debug_owner_tag_;
+    gen_                     = other.gen_;
+    cached_                  = std::move(other.cached_);
+    const lease_state st     = other.take_lease_state_locked();
+    leased_entry_            = st.entry;
+    leased_storage_owner_    = std::move(st.storage_owner);
+    chunk_source_            = st.chunk_source;
+    host_chunk_handle_       = st.host_chunk_handle;
+    vram_chunk_idx_          = st.vram_chunk_idx;
+    chunk_device_            = st.chunk_device;
+
+    other.kind_                    = mem_handle_kind::DIRECT;
+    other.device_                  = HOST_DEVICE;
+    other.key_                     = {};
+    other.zone_id_                 = 0;
+    other.offset_                  = 0;
+    other.size_                    = 0;
+    other.arena_gen_               = 0;
+    other.canonical_allocation_id_ = 0;
+    other.canonical_generation_    = 0;
+    other.canonical_extent_        = 0;
+    other.debug_owner_tag_         = "";
+    other.gen_                     = 0;
+    other.cached_                  = {};
 }
 
 mem_handle & mem_handle::operator=(const mem_handle & other) {
@@ -1113,19 +1130,43 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
 
     // 1. Snapshot the source under ITS lock and take our own entry lease.
     resolved_ptr          new_cached;
-    uint64_t              new_gen          = 0;
-    unified_cache_entry * new_entry        = nullptr;
-    uint8_t               new_chunk_source = 0;
-    int                   new_chunk_device = -1;
+    uint64_t              new_gen                    = 0;
+    mem_handle_kind       new_kind                   = mem_handle_kind::DIRECT;
+    int                   new_device                 = HOST_DEVICE;
+    unified_cache_key     new_key                    = {};
+    int                   new_zone_id                = 0;
+    size_t                new_offset                 = 0;
+    size_t                new_size                   = 0;
+    uint64_t              new_arena_gen              = 0;
+    uint64_t              new_canonical_allocation_id = 0;
+    uint64_t              new_canonical_generation   = 0;
+    size_t                new_canonical_extent       = 0;
+    std::shared_ptr<alloc_handle> new_owned_alloc;
+    const char *          new_debug_owner_tag        = "";
+    unified_cache_entry * new_entry                  = nullptr;
+    uint8_t               new_chunk_source           = 0;
+    int                   new_chunk_device           = -1;
     std::shared_ptr<void> new_storage_owner;
     {
         mem_handle_lock_guard g(other.lock_);
-        new_gen          = other.gen_;
-        new_cached       = other.cached_;
-        new_entry        = other.leased_entry_;
-        new_chunk_source = other.chunk_source_;
-        new_chunk_device  = other.chunk_device_;
-        new_storage_owner = other.leased_storage_owner_;
+        new_kind                    = other.kind_;
+        new_device                  = other.device_;
+        new_key                     = other.key_;
+        new_zone_id                 = other.zone_id_;
+        new_offset                  = other.offset_;
+        new_size                    = other.size_;
+        new_arena_gen               = other.arena_gen_;
+        new_canonical_allocation_id = other.canonical_allocation_id_;
+        new_canonical_generation    = other.canonical_generation_;
+        new_canonical_extent        = other.canonical_extent_;
+        new_owned_alloc             = other.owned_alloc_;
+        new_debug_owner_tag         = other.debug_owner_tag_;
+        new_gen                     = other.gen_;
+        new_cached                  = other.cached_;
+        new_entry                   = other.leased_entry_;
+        new_chunk_source            = other.chunk_source_;
+        new_chunk_device            = other.chunk_device_;
+        new_storage_owner           = other.leased_storage_owner_;
         if (new_entry) {
             new_entry->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: see the copy ctor -- the copy holds the lease it
@@ -1153,18 +1194,21 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     lease_state stale;
     {
         mem_handle_lock_guard g(lock_);
-        stale            = take_lease_state_locked();
-        kind_            = other.kind_;
-        device_          = other.device_;
-        key_             = other.key_;
-        zone_id_         = other.zone_id_;
-        offset_          = other.offset_;
-        size_            = other.size_;
-        arena_gen_       = other.arena_gen_;
-        owned_alloc_     = other.owned_alloc_;
-        debug_owner_tag_ = other.debug_owner_tag_;
-        gen_             = new_gen;
-        cached_          = new_cached;
+        stale                    = take_lease_state_locked();
+        kind_                    = new_kind;
+        device_                  = new_device;
+        key_                     = new_key;
+        zone_id_                 = new_zone_id;
+        offset_                  = new_offset;
+        size_                    = new_size;
+        arena_gen_               = new_arena_gen;
+        canonical_allocation_id_ = new_canonical_allocation_id;
+        canonical_generation_    = new_canonical_generation;
+        canonical_extent_        = new_canonical_extent;
+        owned_alloc_             = std::move(new_owned_alloc);
+        debug_owner_tag_         = new_debug_owner_tag;
+        gen_                     = new_gen;
+        cached_                  = new_cached;
         lease_state fresh;
         fresh.entry             = new_entry;
         fresh.chunk_source      = new_chunk_source;
@@ -1185,31 +1229,72 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         return *this;
     }
 
-    resolved_ptr new_cached;
-    uint64_t     new_gen = 0;
-    lease_state  fresh;
+    resolved_ptr          new_cached;
+    uint64_t              new_gen                     = 0;
+    mem_handle_kind       new_kind                    = mem_handle_kind::DIRECT;
+    int                   new_device                  = HOST_DEVICE;
+    unified_cache_key     new_key                     = {};
+    int                   new_zone_id                 = 0;
+    size_t                new_offset                  = 0;
+    size_t                new_size                    = 0;
+    uint64_t              new_arena_gen               = 0;
+    uint64_t              new_canonical_allocation_id = 0;
+    uint64_t              new_canonical_generation    = 0;
+    size_t                new_canonical_extent        = 0;
+    std::shared_ptr<alloc_handle> new_owned_alloc;
+    const char *          new_debug_owner_tag = "";
+    lease_state           fresh;
     {
         mem_handle_lock_guard g(other.lock_);
-        new_gen    = other.gen_;
-        new_cached = other.cached_;
-        fresh      = other.take_lease_state_locked();
+        new_kind                    = other.kind_;
+        new_device                  = other.device_;
+        new_key                     = other.key_;
+        new_zone_id                 = other.zone_id_;
+        new_offset                  = other.offset_;
+        new_size                    = other.size_;
+        new_arena_gen               = other.arena_gen_;
+        new_canonical_allocation_id = other.canonical_allocation_id_;
+        new_canonical_generation    = other.canonical_generation_;
+        new_canonical_extent        = other.canonical_extent_;
+        new_owned_alloc             = std::move(other.owned_alloc_);
+        new_debug_owner_tag         = other.debug_owner_tag_;
+        new_gen                     = other.gen_;
+        new_cached                  = std::move(other.cached_);
+        fresh                      = other.take_lease_state_locked();
+
+        other.kind_                    = mem_handle_kind::DIRECT;
+        other.device_                  = HOST_DEVICE;
+        other.key_                     = {};
+        other.zone_id_                 = 0;
+        other.offset_                  = 0;
+        other.size_                    = 0;
+        other.arena_gen_               = 0;
+        other.canonical_allocation_id_ = 0;
+        other.canonical_generation_    = 0;
+        other.canonical_extent_        = 0;
+        other.debug_owner_tag_         = "";
+        other.gen_                     = 0;
+        other.cached_                  = {};
     }
 
     lease_state stale;
     {
         mem_handle_lock_guard g(lock_);
-        stale            = take_lease_state_locked();
-        kind_            = other.kind_;
-        device_          = other.device_;
-        key_             = other.key_;
-        zone_id_         = other.zone_id_;
-        offset_          = other.offset_;
-        size_            = other.size_;
-        arena_gen_       = other.arena_gen_;
-        owned_alloc_     = std::move(other.owned_alloc_);
-        debug_owner_tag_ = other.debug_owner_tag_;
-        gen_             = new_gen;
-        cached_          = new_cached;
+        stale                    = take_lease_state_locked();
+        kind_                    = new_kind;
+        device_                  = new_device;
+        key_                     = new_key;
+        zone_id_                 = new_zone_id;
+        offset_                  = new_offset;
+        size_                    = new_size;
+        arena_gen_               = new_arena_gen;
+        canonical_allocation_id_ = new_canonical_allocation_id;
+        canonical_generation_    = new_canonical_generation;
+        canonical_extent_        = new_canonical_extent;
+        owned_alloc_             = std::move(new_owned_alloc);
+        debug_owner_tag_         = new_debug_owner_tag;
+        gen_                     = new_gen;
+        cached_                  = std::move(new_cached);
         store_lease_state_locked(fresh);
     }
 

@@ -171,8 +171,37 @@ static bool test_canonical_bind_is_zero_based_and_exact() {
     CHECK(first && first->identity.occurrence == 0);
     CHECK(first->identity.allocation_id == key_for(321).aux_id && first->identity.generation != 0);
     CHECK(first->identity.byte_offset == 64 && first->identity.byte_size == 256);
-    auto second = ggml_sycl::moe::canonical_allocation_integration::bind(handle, GGML_LAYOUT_AOS + 1, 1);
-    CHECK(second && second->identity.occurrence == 1);
+    const auto expected = handle.debug_info();
+    auto check_copy = [&](const ggml_sycl::mem_handle & copy, uint32_t occurrence) {
+        const auto info = copy.debug_info();
+        CHECK(info.canonical_allocation_id == expected.canonical_allocation_id);
+        CHECK(info.canonical_generation == expected.canonical_generation);
+        CHECK(info.canonical_extent == expected.canonical_extent);
+        CHECK(info.offset == expected.offset && info.size == expected.size);
+        auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(
+            copy, GGML_LAYOUT_AOS + 1, occurrence);
+        CHECK(binding && binding->identity.allocation_id == expected.canonical_allocation_id);
+        CHECK(binding->identity.generation == expected.canonical_generation);
+        CHECK(binding->owner.extent() == expected.canonical_extent);
+        CHECK(binding->identity.byte_offset == expected.offset && binding->identity.byte_size == expected.size);
+        CHECK(binding->identity.occurrence == occurrence);
+        return true;
+    };
+
+    ggml_sycl::mem_handle copy_constructed(handle);
+    CHECK(check_copy(copy_constructed, 1));
+    ggml_sycl::mem_handle copy_assigned;
+    copy_assigned = handle;
+    CHECK(check_copy(copy_assigned, 2));
+    ggml_sycl::mem_handle nested_copy(copy_assigned);
+    CHECK(check_copy(nested_copy, 3));
+    ggml_sycl::mem_handle move_constructed(std::move(copy_constructed));
+    CHECK(check_copy(move_constructed, 4));
+    CHECK(!copy_constructed.valid() && !copy_constructed.has_stable_owner_identity());
+    ggml_sycl::mem_handle move_assigned;
+    move_assigned = std::move(copy_assigned);
+    CHECK(check_copy(move_assigned, 5));
+    CHECK(!copy_assigned.valid() && !copy_assigned.has_stable_owner_identity());
     return true;
 }
 
@@ -251,7 +280,53 @@ static bool test_owned_direct_slice_route_acceptance() {
     ggml_sycl::alloc_handle allocation{};
     CHECK(ggml_sycl::unified_alloc(req, &allocation));
     auto owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
-    auto slice = owner.slice(128, 256);
+
+    // Every special member must preserve the allocator-minted capability as one
+    // tuple with the owner and range.  This is deliberately a real unified_alloc
+    // handle: synthetic pointer/key identity would not exercise direct binding.
+    const auto expected = owner.debug_info();
+    CHECK(expected.canonical_allocation_id != 0 && expected.canonical_generation != 0 &&
+          expected.canonical_extent == req.size && expected.offset == 0 && expected.size == req.size);
+    auto check_identity = [&](const ggml_sycl::mem_handle & handle, size_t offset, size_t size) {
+        const auto info = handle.debug_info();
+        CHECK(info.canonical_allocation_id == expected.canonical_allocation_id);
+        CHECK(info.canonical_generation == expected.canonical_generation);
+        CHECK(info.canonical_extent == expected.canonical_extent);
+        CHECK(info.offset == offset && info.size == size && handle.has_stable_owner_identity());
+        auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(handle, 0xabc, 7);
+        CHECK(binding && binding->identity.allocation_id == expected.canonical_allocation_id);
+        CHECK(binding->identity.generation == expected.canonical_generation);
+        CHECK(binding->owner.extent() == expected.canonical_extent);
+        CHECK(binding->identity.byte_offset == offset && binding->identity.byte_size == size);
+        CHECK(binding->identity.occurrence == 7);
+        return true;
+    };
+
+    ggml_sycl::mem_handle copy_constructed(owner);
+    CHECK(check_identity(copy_constructed, 0, 512));
+    ggml_sycl::mem_handle copy_assigned;
+    copy_assigned = owner;
+    CHECK(check_identity(copy_assigned, 0, 512));
+    ggml_sycl::mem_handle nested_copy(copy_assigned);
+    CHECK(check_identity(nested_copy, 0, 512));
+
+    ggml_sycl::mem_handle move_source(owner);
+    ggml_sycl::mem_handle move_constructed(std::move(move_source));
+    CHECK(check_identity(move_constructed, 0, 512));
+    CHECK(!move_source.valid() && !move_source.has_stable_owner_identity());
+    ggml_sycl::mem_handle move_assign_source(owner);
+    ggml_sycl::mem_handle move_assigned = ggml_sycl::mem_handle::from_direct(&req, GGML_LAYOUT_AOS, false);
+    move_assigned = std::move(move_assign_source);
+    CHECK(check_identity(move_assigned, 0, 512));
+    CHECK(!move_assign_source.valid() && !move_assign_source.has_stable_owner_identity());
+
+    auto slice = nested_copy.slice(128, 256);
+    auto nested_slice = slice.slice(32, 64);
+    CHECK(check_identity(slice, 128, 256));
+    CHECK(check_identity(nested_slice, 160, 64));
+    ggml_sycl::mem_handle slice_copy = nested_slice;
+    CHECK(check_identity(slice_copy, 160, 64));
+
     const auto resolved = slice.resolve(0);
     CHECK(slice.kind() == ggml_sycl::mem_handle_kind::DIRECT);
     CHECK(slice.has_stable_owner_identity() && resolved.ptr && resolved.on_device);
@@ -262,6 +337,11 @@ static bool test_owned_direct_slice_route_acceptance() {
     auto accepted = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
     CHECK(accepted);
     CHECK(accepted.batch.operands[0].lease.stable_identity_equal(slice));
+
+    int raw = 0;
+    auto ownerless = ggml_sycl::mem_handle::from_direct(&raw, GGML_LAYOUT_AOS, false);
+    CHECK(!ownerless.has_stable_owner_identity());
+    CHECK(!ggml_sycl::moe::canonical_allocation_integration::bind(ownerless, 0xabc, 0));
     return true;
 }
 
