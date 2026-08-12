@@ -621,10 +621,10 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     const bool direct_q1_nvfp4 = operand.recipe.kind != moe_batch_executor::HOST_CPU &&
                                  (operand.recipe.request.type == GGML_TYPE_Q1_0 ||
                                   operand.recipe.request.type == GGML_TYPE_NVFP4);
-    if (direct_q1_nvfp4 &&
-        (!workspace_bundle || !workspace_bundle->valid() ||
-         !workspace_bundle->matches(submit_device, operand.owning_device, operand.recipe.request.K,
-                                    operand.recipe.request.N, operand.recipe.request.type))) {
+    if (direct_q1_nvfp4) {
+        // Production capability remains closed until all four B70 oracle cases
+        // pass. A matching bundle is necessary but not sufficient to advertise.
+        (void) workspace_bundle;
         out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
         return out;
     }

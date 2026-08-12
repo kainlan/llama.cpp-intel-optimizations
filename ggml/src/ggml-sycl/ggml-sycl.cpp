@@ -11300,6 +11300,8 @@ static uint64_t ggml_sycl_next_mmid_queue_cookie() {
     return ggml_sycl::moe_mmid_mint_monotonic_cookie(last_issued);
 }
 
+static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
+
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken & token,
     const ggml_sycl::lifecycle_plan_snapshot & snapshot) {
@@ -11314,7 +11316,14 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     std::vector<ggml_sycl::moe_mmid_queue_binding> bindings;
     bindings.reserve(snapshot.plan->moe_mmid_workspaces.size());
     for (const auto & workspace : snapshot.plan->moe_mmid_workspaces) {
-        sycl::queue * queue = &ggml_sycl_get_device(workspace.owner_device).default_queue();
+        // Runtime admission uses backend-context streams, not device defaults.
+        // Materialization must bind the identical queue object or exact-queue
+        // authority will (correctly) refuse every ordinary invocation.
+        ggml_backend_sycl_context * backend = ggml_sycl_get_backend_context_for_device(workspace.owner_device);
+        sycl::queue * queue = backend ? backend->stream() : nullptr;
+        if (!queue) {
+            return false;
+        }
         const uint64_t cookie = ggml_sycl_next_mmid_queue_cookie();
         if (cookie == 0) {
             return false;
@@ -21522,8 +21531,12 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
 // reconstructs authority from tensor->data or an allocation registry.
 static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
     if (!ctx || !tensor || tensor->view_src != nullptr || !tensor->extra ||
-        ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid() ||
-        ggml_sycl_get_tensor_usage(tensor) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid()) {
+        return false;
+    }
+    const bool classified_expert = ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
+    const bool structural_expert = tensor->ne[2] > 1;
+    if (!classified_expert && !structural_expert) {
         return false;
     }
 
@@ -59569,6 +59582,7 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     bool ready() const noexcept override {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (quiescent_) return true;
         if (!event_) return false;
         try {
             return event_->get_info<sycl::info::event::command_execution_status>() ==
@@ -59584,14 +59598,22 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         std::lock_guard<std::mutex> lock(mutex_);
         event_ = std::move(event);
     }
+    void confirm_quiescent() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        quiescent_ = true;
+    }
   private:
     mutable std::mutex mutex_;
     std::optional<sycl::event> event_;
+    bool quiescent_ = false;
 };
 
 struct moe_direct_bundle_completion {
     ggml_sycl::moe_admitted_workspace_bundle bundle;
+    std::shared_ptr<const std::vector<int32_t>> retained_ids;
 };
+
+struct moe_direct_submit_failure final {};
 
 static bool ggml_sycl_moe_row_agg_debug_enabled() {
     static std::atomic<int> cached{ -1 };
@@ -63369,11 +63391,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
     // Decode admits one canonical occurrence batch before any route-mode
-    // selection. Every decode dispatcher below consumes this exact batch; a
-    // missing, stale, or incompatible handle is a graph failure.
+    // selection. Ordinary backend allocations (including test-backend-ops)
+    // may bypass model preload, so publish checked allocation-owned expert
+    // slices here before the non-materializing retained resolver runs.
     ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
     if (ne12 == 1) {
         ctx.moe_graphs_disabled_once = true;
+        if (route_layout == GGML_LAYOUT_AOS && src0->buffer && src0->buffer->context &&
+            !ggml_backend_buffer_is_host(src0->buffer)) {
+            (void) ggml_sycl_publish_backend_aos_expert_handles(
+                static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context),
+                const_cast<ggml_tensor *>(src0));
+        }
         retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
             /*allow_materialize=*/false);
@@ -63391,8 +63420,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and
     // secondary residency remain outside this route. All fall-throughs are
     // pre-submit refusals; once marked, the exact queue is drained/recovered.
-    if (ne12 == 1 && (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
-        route_layout == GGML_LAYOUT_AOS && retained_decode_batch_result) {
+    constexpr bool q1_nvfp4_direct_b70_validated = false;
+    if (q1_nvfp4_direct_b70_validated && ne12 == 1 &&
+        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) && route_layout == GGML_LAYOUT_AOS &&
+        retained_decode_batch_result) {
         const auto & decode = retained_decode_batch_result.batch;
         bool all_primary = !decode.operands.empty();
         for (const auto & operand : decode.operands) {
@@ -63442,8 +63473,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 execution_registry.mint_authoritative_invocation_snapshot(
                     { exec.context_id }, { exec.session_id }, { exec.reset_epoch }, { exec.graph_epoch },
                     { exec.invocation_id }, root, &invocation) == ggml_sycl::execution::error::OK;
-            auto terminal = snapshot_ok ? std::make_shared<moe_direct_event_terminal>() : nullptr;
-            auto completion = snapshot_ok ? std::make_shared<moe_direct_bundle_completion>() : nullptr;
+            // Every fallible owner needed after admission is prepared first.
+            // In particular the adapter's host upload source is immutable and
+            // retained by the final host task, never borrowed from a local batch.
+            auto retained_ids = snapshot_ok ?
+                std::make_shared<const std::vector<int32_t>>(decode.expert_ids) : nullptr;
+            auto terminal = snapshot_ok && retained_ids ? std::make_shared<moe_direct_event_terminal>() : nullptr;
+            auto completion = terminal ? std::make_shared<moe_direct_bundle_completion>() : nullptr;
+            if (completion) completion->retained_ids = retained_ids;
             ggml_sycl::workspace_admission_authority authority;
             std::vector<ggml_sycl::moe_mmid_admission_owner> owners;
             std::vector<ggml_sycl::moe_mmid_queue_capability> queues;
@@ -63465,7 +63502,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                   static_cast<int32_t>(src0->type) };
                 auto admitted = ggml_sycl::unified_cache_admit_moe_mmid_workspace(std::move(request));
                 if (admitted.status == ggml_sycl::moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid()) {
-                    const auto * lease = admitted.bundle.owner_leases();
+                    // Move authority first. Any lease/slice reference into the
+                    // moved-from result is invalid; reacquire solely from the
+                    // completion-owned bundle.
+                    completion->bundle = std::move(admitted.bundle);
+                    const auto * lease = completion->bundle.owner_leases();
                     const auto & slices = lease[0].slices();
                     auto * activation = static_cast<float *>(slices.activation_f32.ptr);
                     auto * ids_device = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
@@ -63473,8 +63514,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ne01) * sizeof(float);
                     if (activation && ids_device && src1_device_base && dst_device_base &&
                         slices.activation_f32.bytes == activation_bytes && slices.output_f32.bytes == output_bytes &&
-                        admitted.bundle.mark_possible_submit()) {
-                        completion->bundle = std::move(admitted.bundle);
+                        completion->bundle.mark_possible_submit()) {
                         try {
                             sycl::event dependency = retained_table.has_ready_event ?
                                 exact_queue->submit([&](sycl::handler & h) {
@@ -63487,10 +63527,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             sycl::event kernel;
                             if (!mmvq_submit_q1_nvfp4_aos_id_admitted(
                                     *exact_queue, src0->type, GGML_LAYOUT_AOS, table_ptr, activation, ids_device,
-                                    decode.expert_ids.data(), static_cast<int>(n_experts), static_cast<int>(ne00),
+                                    completion->retained_ids->data(), static_cast<int>(n_experts), static_cast<int>(ne00),
                                     static_cast<int>(ne01), static_cast<int>(ids->ne[0]), 1, static_cast<int>(ne11),
                                     sizeof(int32_t), ids->ne[0] * sizeof(int32_t), buffers, &dependency, &kernel)) {
-                                throw ggml_sycl_fallback_error("Q1/NVFP4 admitted adapter refused exact slices");
+                                throw moe_direct_submit_failure{};
                             }
                             sycl::event final = exact_queue->submit([&](sycl::handler & h) {
                                 h.depends_on(kernel);
@@ -63501,18 +63541,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 h.depends_on(final);
                                 h.host_task([completion] { (void) completion->bundle.terminal_release(); });
                             });
-                            // The admitted authority retains the canonical table and every weight owner
-                            // through the completion host task; no post-admit retention allocation is needed.
-                            record_moe_gpu_path("mmvq_q1_nvfp4_direct_authority", GGML_LAYOUT_AOS, ids->ne[0]);
+                            // No diagnostics or ownership construction is allowed
+                            // after admission. The B70 validation gate remains shut,
+                            // so a future enabling commit must place its marker before
+                            // this boundary or use preallocated counters.
                             return;
                         } catch (...) {
+                            // wait_and_throw may report an asynchronous error after
+                            // it has drained. A non-throwing exact-queue wait is the
+                            // finalizer: only after it returns do we publish an
+                            // explicit quiescent terminal and recover the quarantine.
+                            try { exact_queue->wait_and_throw(); } catch (...) {}
+                            bool quiescent = false;
                             try {
-                                exact_queue->wait_and_throw();
-                                terminal->arm(exact_queue->ext_oneapi_submit_barrier());
-                                exact_queue->wait_and_throw();
+                                exact_queue->wait();
+                                quiescent = true;
                             } catch (...) {}
-                            (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
-                                model_token, plan_snapshot->version, true);
+                            if (quiescent) {
+                                terminal->confirm_quiescent();
+                                (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
+                                    model_token, plan_snapshot->version, true);
+                            }
+                            // If even the non-throwing drain could not prove
+                            // quiescence, destruction intentionally leaves the
+                            // bundle quarantined; an unarmed terminal is never
+                            // treated as completion authority.
                             throw;
                         }
                     }

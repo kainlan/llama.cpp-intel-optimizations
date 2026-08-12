@@ -372,6 +372,38 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     return failures
 
 
+def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
+    source = SOURCE.read_text()
+    mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
+    start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = false")
+    end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
+    direct = mmid[start:end]
+    assert "q1_nvfp4_direct_b70_validated && ne12 == 1" in direct
+    assert mmid.index("ggml_sycl_publish_backend_aos_expert_handles(") < mmid.index(
+        "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
+    assert "std::make_shared<const std::vector<int32_t>>(decode.expert_ids)" in direct
+    assert "completion->retained_ids = retained_ids" in direct
+    move = direct.index("completion->bundle = std::move(admitted.bundle)")
+    slices = direct.index("const auto * lease = completion->bundle.owner_leases()")
+    assert move < slices
+    assert "completion->retained_ids->data()" in direct
+    assert "terminal->confirm_quiescent()" in direct
+    assert "unified_cache_recover_moe_mmid_workspaces" in direct
+    post_mark = direct[direct.index("completion->bundle.mark_possible_submit()") :]
+    assert "record_moe_gpu_path" not in post_mark
+    assert "ggml_sycl_fallback_error" not in post_mark
+    assert "std::make_shared" not in post_mark
+    assert "std::vector<" not in post_mark
+
+    materialize_start = source.index("static bool ggml_sycl_materialize_published_mmid_workspaces(")
+    materialize_end = source.index("ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end", materialize_start)
+    materialize = source[materialize_start:materialize_end]
+    assert "ggml_sycl_get_backend_context_for_device(workspace.owner_device)" in materialize
+    assert "backend ? backend->stream() : nullptr" in materialize
+    assert ".default_queue()" not in materialize
+    assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot.version" in materialize
+
+
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
     # Behavioral model of the production exception chain: MMID ready guard
     # observes unwinding, compute_forward rethrows, and graph boundary fails.

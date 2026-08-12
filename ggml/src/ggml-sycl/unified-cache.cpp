@@ -21600,9 +21600,13 @@ static void populate_host_zone_sizing(placement_plan &                          
     // not counted here.
     size_t host_scratch_total = 0;
     bool host_scratch_valid   = true;
+    const size_t moe_host_scratch =
+        plan.moe_cpu_expert_staging_bytes + plan.moe_host_recipe_workspace_bytes;
+    if (moe_host_scratch < plan.moe_cpu_expert_staging_bytes) {
+        host_scratch_valid = false;
+    }
     for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, plan.onednn_reorder_bytes,
-                          plan.moe_q8_workspace_bytes, plan.moe_cpu_expert_staging_bytes,
-                          plan.moe_host_recipe_workspace_bytes, plan.moe_vram_runtime_bytes,
+                          plan.moe_q8_workspace_bytes, moe_host_scratch, plan.moe_vram_runtime_bytes,
                           plan.tp_vram_runtime_bytes, plan.dma_staging_pool_bytes, plan.pp_pipeline_scratch_bytes,
                           plan.pp_moe_onednn_scratch_bytes }) {
         size_t next = 0;

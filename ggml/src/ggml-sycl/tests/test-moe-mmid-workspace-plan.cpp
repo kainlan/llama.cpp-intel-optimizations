@@ -842,6 +842,14 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     };
     check(registry.materialize(token, 1700, plan, 0, { owner }, allocator) ==
               moe_mmid_materialize_status::PUBLISHED, "authoritative context publication failed");
+    check(registry.exact_queue(token, plan, 0, 0, &exact_queue).valid(),
+          "materialized exact shared plan/queue was not discoverable");
+    int substituted_queue = 0;
+    check(!registry.exact_queue(token, plan, 0, 0, &substituted_queue).valid(),
+          "different queue object acquired exact capability");
+    auto equal_but_foreign_plan = std::make_shared<const lifecycle_plan_snapshot>();
+    check(!registry.exact_queue(token, equal_but_foreign_plan, 0, 0, &exact_queue).valid(),
+          "equal-metadata foreign plan acquired exact capability");
 
     auto graph = admission_request(token, 1700, { { 0, 1701 } }, 1702);
     auto pin = std::make_shared<int>(9); std::weak_ptr<int> weak_pin = pin;
