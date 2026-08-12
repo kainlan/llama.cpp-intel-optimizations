@@ -196,6 +196,35 @@ bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_byt
     return true;
 }
 
+bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & charges,
+                                    std::vector<moe_mmid_owner_accounting> *    owners,
+                                    size_t *                                    total_vram_bytes) noexcept {
+    if (owners == nullptr || total_vram_bytes == nullptr) {
+        return false;
+    }
+    std::vector<moe_mmid_owner_accounting> merged = *owners;
+    size_t                                 total  = *total_vram_bytes;
+    for (const auto & charge : charges) {
+        auto   owner     = std::find_if(merged.begin(), merged.end(), [&](const moe_mmid_owner_accounting & candidate) {
+            return candidate.owner_device == charge.first;
+        });
+        size_t next_used = 0;
+        size_t next_workspace = 0;
+        size_t next_total     = 0;
+        if (owner == merged.end() || !checked_add(owner->used_bytes, charge.second, &next_used) ||
+            next_used > owner->budget_bytes || !checked_add(owner->workspace_bytes, charge.second, &next_workspace) ||
+            !checked_add(total, charge.second, &next_total)) {
+            return false;
+        }
+        owner->used_bytes      = next_used;
+        owner->workspace_bytes = next_workspace;
+        total                  = next_total;
+    }
+    *owners           = std::move(merged);
+    *total_vram_bytes = total;
+    return true;
+}
+
 struct moe_mmid_workspace_pool::state {
     struct slot_state {
         uint64_t generation = 0;

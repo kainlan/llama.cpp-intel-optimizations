@@ -47,6 +47,14 @@ static void geometry_exact_and_boundary() {
     check(!moe_mmid_checked_pool_bytes(g, MOE_MMID_WORKSPACE_DEPTH - 1, &device, &host), "T-1 depth silently clamped");
 }
 
+static void exact_256_slice_start_after_128_bytes() {
+    moe_mmid_workspace_geometry geometry;
+    check(moe_mmid_plan_workspace({ 32, 32, 1, 1, 1 }, false, &geometry), "128-byte geometry rejected");
+    check(geometry.activation_f32_bytes == 128, "geometry did not produce 128-byte first slice");
+    check(geometry.activation_q8_offset == 256, "128-byte end was not advanced to exact 256-byte slice start");
+    check(geometry.activation_q8_offset != 128, "128-byte alignment mutant survived");
+}
+
 static void broadcast_and_occurrences() {
     moe_mmid_workspace_geometry broadcast, expanded;
     check(moe_mmid_plan_workspace({ 64, 96, 1, 2, 3 }, false, &broadcast), "ne11=1 rejected");
@@ -176,6 +184,46 @@ static moe_mmid_materialized_owner_plan owner_plan(int device, uint64_t queue, b
                                       &owner.host_pool_bytes),
           "owner pool failed");
     return owner;
+}
+
+static void finalized_owner_accounting() {
+    std::vector<moe_mmid_owner_accounting> owners = {
+        { 0, 1000, 600, 0 },
+        { 1, 8,    7,   0 },
+    };
+    size_t total = 607;
+    // Device 1 is eligible but unused: absence from finalized charges means its
+    // deliberately tiny budget cannot poison primary acceptance.
+    check(moe_mmid_account_actual_owners(
+              {
+                  { 0, 100 }
+    },
+              &owners, &total),
+          "unused low-budget secondary was charged speculatively");
+    check(owners[0].used_bytes == 700 && owners[0].workspace_bytes == 100 && owners[1].used_bytes == 7 &&
+              owners[1].workspace_bytes == 0 && total == 707,
+          "finalized primary totals mismatch");
+
+    auto   before       = owners;
+    size_t before_total = total;
+    check(!moe_mmid_account_actual_owners(
+              {
+                  { 1, 2 }
+    },
+              &owners, &total),
+          "actual alternate over budget was accepted");
+    check(owners[1].used_bytes == before[1].used_bytes && total == before_total,
+          "failed actual-alternate charge was not atomic");
+
+    owners[1].budget_bytes = 20;
+    check(moe_mmid_account_actual_owners(
+              {
+                  { 1, 2 }
+    },
+              &owners, &total),
+          "actual alternate workspace was not charged");
+    check(owners[1].used_bytes == 9 && owners[1].workspace_bytes == 2 && total == 709,
+          "actual alternate/per-device/global totals mismatch");
 }
 
 static void registry_materialization_and_rollback() {
@@ -357,10 +405,12 @@ static void concurrent_depth_busy_and_reuse() {
 int main() {
     try {
         geometry_exact_and_boundary();
+        exact_256_slice_start_after_128_bytes();
         broadcast_and_occurrences();
         maxima_and_overflow();
         pool_identity_generation_and_terminal_release();
         concurrent_depth_busy_and_reuse();
+        finalized_owner_accounting();
         registry_materialization_and_rollback();
         registry_multi_owner_context_and_identity();
         registry_concurrent_depth_busy();

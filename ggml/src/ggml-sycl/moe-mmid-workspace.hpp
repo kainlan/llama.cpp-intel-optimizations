@@ -74,6 +74,19 @@ bool moe_mmid_checked_zone_total(size_t base_bytes, size_t workspace_bytes, size
 bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept;
 bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept;
 
+struct moe_mmid_owner_accounting {
+    int    owner_device    = -1;
+    size_t budget_bytes    = 0;
+    size_t used_bytes      = 0;
+    size_t workspace_bytes = 0;
+};
+
+// Atomically adds finalized actual-owner workspace charges. Owners absent from
+// `charges` are untouched; failure writes neither per-owner usage nor total.
+bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & charges,
+                                    std::vector<moe_mmid_owner_accounting> *    owners,
+                                    size_t *                                    total_vram_bytes) noexcept;
+
 enum class moe_mmid_lease_status : uint8_t { ACQUIRED, BUSY, INVALID };
 enum class moe_mmid_release_status : uint8_t { RELEASED, STALE, WRONG_QUEUE, WRONG_EPOCH, INVALID };
 
