@@ -255,11 +255,8 @@ static bool test_owned_direct_slice_route_acceptance() {
     const auto resolved = slice.resolve(0);
     CHECK(slice.kind() == ggml_sycl::mem_handle_kind::DIRECT);
     CHECK(slice.has_stable_owner_identity() && resolved.ptr && resolved.on_device);
-    ggml_sycl::moe_batch_route route{};
-    route.residency = ggml_sycl::moe_batch_residency::PRIMARY_DEVICE;
-    route.transient_ptr = resolved.ptr;
-    route.owning_device = 0;
-    route.actual_layout = GGML_LAYOUT_AOS;
+    auto route = route_for(resolved.ptr, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE,
+                           GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 1);
     route.lease = slice;
     const int32_t ids[] = { 1 };
     auto accepted = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
