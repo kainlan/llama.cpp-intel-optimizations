@@ -412,9 +412,20 @@ int main() {
     // of which side reaches the shared control mutex first, terminal state is
     // stable and every later mutator returns BUSY without touching reset state.
     for (int operation = 0; operation < 6; ++operation) {
+        // Callback storage precedes registry/fixture/transaction declarations,
+        // so retained proofs can never outlive their ASAN-visible stack state.
+        std::atomic<bool>     wrapper_ready{ true };
+        std::atomic<bool>     wrapper_succeeds{ true };
+        std::atomic<unsigned> wrapper_waits{ 0 };
+        auto wrapper_proof_state = std::make_shared<drain_state>(
+            drain_state{ &wrapper_ready, &wrapper_succeeds, &wrapper_waits });
         graph_retention_registry wrapper_registry;
         fixture                  wrapper_fixture(wrapper_registry);
         auto                     wrapper_tx = begin_tx(wrapper_fixture);
+        require(wrapper_tx.set_quiescence_proof(
+                    0, queue_quiescence_test_factory::mint(wrapper_proof_state, drain_ready_callback,
+                                                           drain_wait_callback)) == retention_error::OK,
+                "immediate-abort baseline proof setup failed");
         auto                     wrapper_owner = std::make_shared<int>(2200 + operation);
         auto wrapper_table = graph_private_table_owner::create(
             wrapper_tx.key(), 2300 + operation, 1, 0, { owner_capability(2400 + operation, wrapper_owner) });
@@ -429,10 +440,8 @@ int main() {
                 case 3: return wrapper_tx.set_terminal(0, std::make_shared<test_terminal>(child_ready, child_waits));
                 case 4: return wrapper_tx.note_submission(0, submit_outcome::UNKNOWN);
                 default: {
-                    auto proof_state = std::make_shared<drain_state>(
-                        drain_state{ &wrapper_go, &wrapper_go, &child_waits });
                     return wrapper_tx.set_quiescence_proof(
-                        0, queue_quiescence_test_factory::mint(proof_state, drain_ready_callback,
+                        1, queue_quiescence_test_factory::mint(wrapper_proof_state, drain_ready_callback,
                                                                drain_wait_callback));
                 }
             }
@@ -499,6 +508,59 @@ int main() {
     std::thread moved_destroyer([&] { move_target.reset(); });
     moved_destroyer.join();
     require(move_registry.size() == 0, "moved transaction destructor did not settle shared control");
+
+    // Re-begin atomically replaces wrapper control even across independent
+    // fixtures. The old transaction is settled outside the handle lock and
+    // both registries/lifecycles return to baseline.
+    graph_retention_registry rebegin_old_registry;
+    fixture                  rebegin_old_fixture(rebegin_old_registry);
+    graph_retention_registry rebegin_new_registry;
+    fixture                  rebegin_new_fixture(rebegin_new_registry);
+    graph_recording_transaction rebegin_tx = begin_tx(rebegin_old_fixture);
+    const auto rebegin_old_key = rebegin_tx.key();
+    require(graph_recording_transaction::begin(
+                rebegin_new_registry, rebegin_new_fixture.execution, rebegin_new_fixture.context,
+                rebegin_new_fixture.session, rebegin_new_fixture.reset, token(), &rebegin_tx) == retention_error::OK &&
+                rebegin_old_registry.size() == 0 && rebegin_new_registry.size() == 1,
+            "cross-fixture re-begin did not settle old registry");
+    epoch_snapshot rebegin_old_epoch{};
+    require(rebegin_old_fixture.execution.child_extract_epoch(
+                rebegin_old_fixture.context, rebegin_old_fixture.session, rebegin_old_fixture.reset,
+                rebegin_old_key.epoch, token(), &rebegin_old_epoch) == error::STALE &&
+                rebegin_tx.abort_partial() == retention_error::OK && rebegin_new_registry.size() == 0,
+            "cross-fixture re-begin did not restore lifecycle/registry baselines");
+
+    // If old cleanup cannot settle, begin rolls back and detaches the newly
+    // installed control. Callback state is declared before fixtures so it
+    // outlives every retained proof under normal ASAN destruction ordering.
+    std::atomic<bool>     rebegin_drain_ready{ true };
+    std::atomic<bool>     rebegin_drain_succeeds{ false };
+    std::atomic<unsigned> rebegin_drain_waits{ 0 };
+    auto rebegin_drain_state = std::make_shared<drain_state>(
+        drain_state{ &rebegin_drain_ready, &rebegin_drain_succeeds, &rebegin_drain_waits });
+    graph_retention_registry rebegin_fail_old_registry;
+    fixture                  rebegin_fail_old_fixture(rebegin_fail_old_registry);
+    graph_retention_registry rebegin_fail_new_registry;
+    fixture                  rebegin_fail_new_fixture(rebegin_fail_new_registry);
+    graph_recording_transaction rebegin_fail_tx = begin_tx(rebegin_fail_old_fixture);
+    const auto rebegin_fail_old_key = rebegin_fail_tx.key();
+    require(rebegin_fail_tx.note_submission(1, submit_outcome::UNKNOWN) == retention_error::OK &&
+                rebegin_fail_tx.set_quiescence_proof(
+                    1, queue_quiescence_test_factory::mint(rebegin_drain_state, drain_ready_callback,
+                                                           drain_wait_callback)) == retention_error::OK,
+            "failing re-begin old transaction setup failed");
+    require(graph_recording_transaction::begin(
+                rebegin_fail_new_registry, rebegin_fail_new_fixture.execution, rebegin_fail_new_fixture.context,
+                rebegin_fail_new_fixture.session, rebegin_fail_new_fixture.reset, token(), &rebegin_fail_tx) ==
+                    retention_error::MISSING_QUIESCENCE_PROOF &&
+                rebegin_fail_new_registry.size() == 0 && rebegin_fail_old_registry.size() == 1 &&
+                rebegin_fail_tx.add_owner(owner_capability(2700, std::make_shared<int>(2700))) ==
+                    retention_error::BUSY,
+            "failed re-begin leaked wrapper/new transaction or dropped old quarantine");
+    rebegin_drain_succeeds.store(true, std::memory_order_release);
+    require(rebegin_fail_old_registry.abort_partial(rebegin_fail_old_key) == retention_error::OK &&
+                rebegin_fail_old_registry.size() == 0,
+            "failed re-begin durable old quarantine was not retryable");
 
     // A failed partial drain remains quarantined with all owners and can be
     // retried after the exact queue proof succeeds.

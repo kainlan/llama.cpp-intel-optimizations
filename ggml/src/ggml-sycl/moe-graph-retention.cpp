@@ -682,9 +682,25 @@ retention_error graph_recording_transaction::begin(graph_retention_registry &   
     control->record = std::move(record);
     control->key = control->record->key;
     control->phase = control_phase::OPEN;
+    std::shared_ptr<control_state> old;
+    std::shared_ptr<control_state> installed = control;
     {
         std::lock_guard<std::mutex> lock(out->handle_mutex_);
+        old = std::move(out->control_);
         out->control_ = std::move(control);
+    }
+    // Never wait/drain while holding the wrapper handle mutex: terminals may
+    // re-enter public transaction/registry APIs. If replacement cleanup cannot
+    // settle, roll back the newly installed transaction and detach it; either
+    // failed abort remains durably registry-owned and exactly retryable.
+    if (old) {
+        const auto old_rc = abort_control(old);
+        if (old_rc != retention_error::OK && old_rc != retention_error::BUSY) {
+            (void) abort_control(installed);
+            std::lock_guard<std::mutex> lock(out->handle_mutex_);
+            if (out->control_ == installed) out->control_.reset();
+            return old_rc;
+        }
     }
     return retention_error::OK;
 }
