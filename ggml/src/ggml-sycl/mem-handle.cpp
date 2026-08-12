@@ -1190,11 +1190,15 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_chunk_device = -1;
     }
 
-    // 3. Publish, detaching the leases we are dropping.
-    lease_state stale;
+    // 3. Publish, detaching every releasable owner we are dropping. Moving
+    // owned_alloc_ out first is essential: its deleter calls unified_free(),
+    // which may re-enter handle/cache code and must never run under this leaf lock.
+    lease_state                   stale;
+    std::shared_ptr<alloc_handle> stale_owned_alloc;
     {
         mem_handle_lock_guard g(lock_);
         stale                    = take_lease_state_locked();
+        stale_owned_alloc        = std::move(owned_alloc_);
         kind_                    = new_kind;
         device_                  = new_device;
         key_                     = new_key;
@@ -1219,8 +1223,9 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         store_lease_state_locked(fresh);
     }
 
-    // 4. Release the old leases outside the lock.
+    // 4. Release the old leases and allocation owner outside the lock.
     release_lease_state(stale);
+    stale_owned_alloc.reset();
     return *this;
 }
 
@@ -1277,10 +1282,12 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.cached_                  = {};
     }
 
-    lease_state stale;
+    lease_state                   stale;
+    std::shared_ptr<alloc_handle> stale_owned_alloc;
     {
         mem_handle_lock_guard g(lock_);
         stale                    = take_lease_state_locked();
+        stale_owned_alloc        = std::move(owned_alloc_);
         kind_                    = new_kind;
         device_                  = new_device;
         key_                     = new_key;
@@ -1299,6 +1306,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     }
 
     release_lease_state(stale);
+    stale_owned_alloc.reset();
     return *this;
 }
 

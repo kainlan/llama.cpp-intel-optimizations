@@ -56,6 +56,36 @@
 #include <thread>
 #include <vector>
 
+namespace ggml_sycl {
+
+// Test-target-only owned handle whose final owner invokes an arbitrary callback.
+// This makes leaf-lock deleter re-entry deterministic without requiring a GPU or
+// registering a fake allocation with unified_free().
+mem_handle test_make_owned_assignment_handle(void * ptr, uint64_t allocation_id, std::function<void()> on_delete) {
+    mem_handle h;
+    h.kind_                    = mem_handle_kind::DIRECT;
+    h.device_                  = mem_handle::HOST_DEVICE;
+    h.cached_                  = { ptr, GGML_LAYOUT_AOS, false, false, sycl::event{} };
+    h.offset_                  = 0;
+    h.size_                    = sizeof(uint64_t);
+    h.canonical_allocation_id_ = allocation_id;
+    h.canonical_generation_    = 1;
+    h.canonical_extent_        = sizeof(uint64_t);
+    auto * allocation          = new alloc_handle{};
+    allocation->ptr            = ptr;
+    allocation->size           = sizeof(uint64_t);
+    allocation->alloc_id       = allocation_id;
+    h.owned_alloc_ = std::shared_ptr<alloc_handle>(allocation, [callback = std::move(on_delete)](alloc_handle * p) {
+        if (callback) {
+            callback();
+        }
+        delete p;
+    });
+    return h;
+}
+
+}  // namespace ggml_sycl
+
 namespace {
 
 // Kept small enough to finish in a couple of seconds, large enough that an
@@ -252,6 +282,78 @@ int test_lease_is_released_exactly_once() {
 // not a double release but no release at all, leaving in_use_count permanently
 // above zero so the entry could never be evicted.  The handle is seeded with a
 // lease here so the leak is observable as a count that never reaches 0.
+int test_owned_assignment_releases_after_unlock() {
+    uint64_t first_storage = 1;
+    uint64_t next_storage  = 2;
+    std::atomic<int> reentries{ 0 };
+
+    ggml_sycl::mem_handle destination;
+    destination = ggml_sycl::test_make_owned_assignment_handle(&first_storage, 1001, [&] {
+        // Deadlocks if the overwritten final owner is destroyed under lock_.
+        (void) destination.debug_info();
+        reentries.fetch_add(1, std::memory_order_relaxed);
+    });
+    auto copy_source = ggml_sycl::test_make_owned_assignment_handle(&next_storage, 1002, [] {});
+    destination = copy_source;
+    if (reentries.load(std::memory_order_relaxed) != 1 || destination.resolve().ptr != &next_storage) {
+        std::fprintf(stderr, "FAIL: copy assignment did not release stale owned allocation after unlocking\n");
+        return 1;
+    }
+
+    destination = ggml_sycl::test_make_owned_assignment_handle(&first_storage, 1003, [&] {
+        (void) destination.debug_info();
+        reentries.fetch_add(1, std::memory_order_relaxed);
+    });
+    auto move_source = ggml_sycl::test_make_owned_assignment_handle(&next_storage, 1004, [] {});
+    destination = std::move(move_source);
+    if (reentries.load(std::memory_order_relaxed) != 2 || destination.resolve().ptr != &next_storage ||
+        move_source.valid()) {
+        std::fprintf(stderr, "FAIL: move assignment did not release stale owned allocation after unlocking\n");
+        return 1;
+    }
+
+    const auto before = destination.debug_info();
+    auto * self = &destination;
+    destination = *self;
+    destination = std::move(*self);
+    const auto after = destination.debug_info();
+    if (!destination.valid() || before.canonical_allocation_id != after.canonical_allocation_id ||
+        before.canonical_generation != after.canonical_generation || before.canonical_extent != after.canonical_extent) {
+        std::fprintf(stderr, "FAIL: self-copy/self-move changed owned handle identity\n");
+        return 1;
+    }
+
+    // Reciprocal assignment is the lock-order/TSAN regression: neither operation
+    // holds one handle lock while acquiring the other, and stale-owner deleters
+    // run only after publication unlocks.
+    uint64_t left_storage = 3;
+    uint64_t right_storage = 4;
+    std::atomic<int> deletes{ 0 };
+    auto left = ggml_sycl::test_make_owned_assignment_handle(
+        &left_storage, 2001, [&] { deletes.fetch_add(1, std::memory_order_relaxed); });
+    auto right = ggml_sycl::test_make_owned_assignment_handle(
+        &right_storage, 2002, [&] { deletes.fetch_add(1, std::memory_order_relaxed); });
+    std::thread left_to_right([&] {
+        for (int i = 0; i < 20000; ++i) {
+            left = right;
+        }
+    });
+    std::thread right_to_left([&] {
+        for (int i = 0; i < 20000; ++i) {
+            right = left;
+        }
+    });
+    left_to_right.join();
+    right_to_left.join();
+    if (!left.valid() || !right.valid() || !left.stable_identity_equal(right)) {
+        std::fprintf(stderr, "FAIL: reciprocal concurrent assignment published invalid/mismatched owners\n");
+        return 1;
+    }
+
+    std::puts("PASS: owned assignment releases after unlock; self and reciprocal assignment are stable");
+    return 0;
+}
+
 int test_concurrent_resolve_under_generation_churn() {
     alignas(64) std::uint8_t buf[64] = {};
 
@@ -310,8 +412,9 @@ int main(int argc, char ** argv) {
         return !only || std::strcmp(only, name) == 0;
     };
 
-    if (only && !selected("mixed-state") && !selected("lease-once") && !selected("gen-churn")) {
-        std::fprintf(stderr, "unknown test '%s' (mixed-state | lease-once | gen-churn)\n", only);
+    if (only && !selected("mixed-state") && !selected("lease-once") && !selected("owned-assign") &&
+        !selected("gen-churn")) {
+        std::fprintf(stderr, "unknown test '%s' (mixed-state | lease-once | owned-assign | gen-churn)\n", only);
         return 2;
     }
 
@@ -322,6 +425,11 @@ int main(int argc, char ** argv) {
     }
     if (selected("lease-once")) {
         if (int rc = test_lease_is_released_exactly_once()) {
+            return rc;
+        }
+    }
+    if (selected("owned-assign")) {
+        if (int rc = test_owned_assignment_releases_after_unlock()) {
             return rc;
         }
     }

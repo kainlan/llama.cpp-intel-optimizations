@@ -382,6 +382,9 @@ class mem_handle {
                                                     ggml_layout_mode,
                                                     bool,
                                                     std::shared_ptr<void>);
+    // Test-only friend used to prove that assignment never invokes an owned
+    // allocation deleter while holding the destination's leaf lock.
+    friend mem_handle test_make_owned_assignment_handle(void *, uint64_t, std::function<void()>);
 
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;
