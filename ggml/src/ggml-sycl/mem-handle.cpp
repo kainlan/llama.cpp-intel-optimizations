@@ -16,6 +16,7 @@
 #include <exception>
 #include <iterator>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -60,6 +61,7 @@ struct retained_handle_state {
 // static objects.  Keep the synchronization state alive until process exit.
 retained_handle_state *                g_retained_handles_state = new retained_handle_state();
 std::once_flag                         g_retained_drain_worker_once;
+std::atomic<bool>                      g_fail_next_retained_handle_publication{ false };
 thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
 
 // Whether THIS thread's retained handles belong to a command graph.
@@ -1503,14 +1505,13 @@ void release_graph_retained_handles() {
     GGML_SYCL_DEBUG("[MEM-HANDLE] released %zu command-graph retained leases\n", n);
 }
 
-void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
-    retain_handles_until_event(std::move(handles), std::move(event), retained_handle_publish_ticket{});
-}
-
-void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
-                                retained_handle_publish_ticket ticket) {
+static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
     if (handles.empty()) {
         return;
+    }
+
+    if (g_fail_next_retained_handle_publication.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
     }
 
     if (graph_lifetime_retention_active()) {
@@ -1525,8 +1526,27 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
         std::lock_guard<std::mutex> lock(state.mutex);
         state.queue.push_back({ std::move(handles), std::move(event) });
     }
-    GGML_UNUSED(ticket);
     g_retained_handles_state->cv.notify_one();
+}
+
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
+    publish_handles_until_event(std::move(handles), std::move(event));
+}
+
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
+                                retained_handle_publish_ticket ticket) {
+    publish_handles_until_event(std::move(handles), std::move(event));
+    GGML_UNUSED(ticket);
+}
+
+void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
+                                              retained_handle_publish_ticket & ticket) {
+    publish_handles_until_event(std::move(handles), std::move(event));
+    ticket.reset();
+}
+
+void fail_next_retained_handle_publication_for_test() {
+    g_fail_next_retained_handle_publication.store(true, std::memory_order_release);
 }
 
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {

@@ -40,10 +40,17 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <new>
+#include <thread>
+#include <vector>
 #include <sycl/sycl.hpp>
 
 #include "../unified-cache.hpp"
@@ -441,6 +448,79 @@ static bool test_async_eviction_finalize_bumps_gen(sycl::queue & q) {
 }
 
 // =============================================================================
+// Test 5: failed retained publication leaves the caller's ticket active until
+// the exact submission queue has drained. A concurrent graph-boundary drain
+// must observe that ticket throughout the failure cleanup window.
+// =============================================================================
+static bool test_retained_publication_failure_is_transactional(sycl::queue & q) {
+    TEST_BEGIN("retained_publication_failure_is_transactional");
+
+    TEST_ASSERT(ggml_sycl::drain_retained_handles(true, 1000), "retainer must start empty");
+
+    std::mutex              gate_mutex;
+    std::condition_variable gate_cv;
+    bool                    gate_open = false;
+    sycl::event submitted = q.submit([&](sycl::handler & cgh) {
+        cgh.host_task([&]() {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            gate_cv.wait(lock, [&]() { return gate_open; });
+        });
+    });
+
+    int marker = 0;
+    std::vector<ggml_sycl::mem_handle> owners{
+        ggml_sycl::mem_handle::from_direct(&marker, GGML_LAYOUT_AOS, false),
+    };
+    auto ticket = ggml_sycl::begin_retained_handle_publish();
+
+    ggml_sycl::fail_next_retained_handle_publication_for_test();
+    bool publication_threw = false;
+    try {
+        ggml_sycl::retain_handles_until_event_transactional(owners, submitted, ticket);
+    } catch (const std::bad_alloc &) {
+        publication_threw = true;
+    }
+
+    std::atomic<bool> drain_started{ false };
+    std::atomic<bool> drain_done{ false };
+    bool              drain_result = false;
+    std::thread drainer([&]() {
+        drain_started.store(true, std::memory_order_release);
+        drain_result = ggml_sycl::drain_retained_handles(true, 1000);
+        drain_done.store(true, std::memory_order_release);
+    });
+    while (!drain_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool blocked_before_queue_drain = !drain_done.load(std::memory_order_acquire);
+
+    // This is the failure catch's required ordering: drain the same queue while
+    // both owners and the publication ticket remain alive.
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_cv.notify_all();
+    q.wait_and_throw();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool blocked_after_queue_drain = !drain_done.load(std::memory_order_acquire);
+    const bool ticket_survived_failure   = static_cast<bool>(ticket);
+
+    ticket = {};
+    drainer.join();
+
+    TEST_ASSERT(publication_threw, "fault injection did not fail publication");
+    TEST_ASSERT(ticket_survived_failure, "failed publication consumed caller-owned ticket");
+    TEST_ASSERT(blocked_before_queue_drain, "concurrent drain cleared while failed-stage queue was blocked");
+    TEST_ASSERT(blocked_after_queue_drain, "concurrent drain cleared before caller released its ticket");
+    TEST_ASSERT(drain_result, "concurrent drain did not clear after queue drain and ticket release");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -473,6 +553,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_explicit_evict_bumps_gen_and_removes_entry(q);
     all_passed &= test_reinsert_after_evict_recovers_lookup(q);
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
+    all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);

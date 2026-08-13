@@ -576,6 +576,8 @@ class retained_handle_publish_ticket {
 
   private:
     friend retained_handle_publish_ticket begin_retained_handle_publish();
+    friend void retain_handles_until_event_transactional(std::vector<mem_handle>, sycl::event,
+                                                          retained_handle_publish_ticket &);
     explicit retained_handle_publish_ticket(bool active) : active_(active) {}
 
     void reset() noexcept;
@@ -595,6 +597,17 @@ retained_handle_publish_ticket begin_retained_handle_publish();
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
                                 retained_handle_publish_ticket ticket);
+
+// Transactional publication for submit→retain handoffs. The caller keeps
+// ownership of ticket across this call. It is consumed only after the handles
+// have been published; if publication throws, ticket remains active so the
+// caller can drain the exact submission queue before releasing its owners.
+void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
+                                              retained_handle_publish_ticket & ticket);
+
+// Fail the next retained-handle publication before it becomes visible. This is
+// a deterministic concurrency-test seam; production callers must not use it.
+void fail_next_retained_handle_publication_for_test();
 
 // During SYCL command-graph recording, events produced by recorded commands are
 // not waitable. The active backend context installs a per-thread sink so those

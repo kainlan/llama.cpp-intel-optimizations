@@ -2887,7 +2887,8 @@ static void ggml_sycl_retain_direct_stage_owners(ggml_sycl_direct_stage_owner_ha
                                                  sycl::queue & queue) {
     if (result.ok && result.ptr) {
         try {
-            ggml_sycl::retain_handles_until_event(handoff.owners, result.event, std::move(handoff.publish_ticket));
+            ggml_sycl::retain_handles_until_event_transactional(handoff.owners, result.event,
+                                                                 handoff.publish_ticket);
             return;
         } catch (...) {
             ggml_sycl_drain_direct_stage_queue(queue);
