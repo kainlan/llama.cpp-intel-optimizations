@@ -72894,6 +72894,10 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     split_merge_drain();
     ggml_sycl_router_f32_bias_argsort_sycl(*ctx.stream(), weight_ptr, act_ptr, bias_ptr, probs_ptr, sort_ptr,
                                            static_cast<int>(n_expert), static_cast<int>(k_dim), local_size);
+    // The router launcher does not return an event. Publish the cache fallback
+    // authority against a queue marker after its terminal submission.
+    ggml_sycl::record_terminal_retention(
+        ggml_sycl_submit_marker<class ggml_sycl_router_fusion_terminal_kernel>(*ctx.stream()), { resolved });
     if (extra_skip_nodes) {
         *extra_skip_nodes = skip;
     }
@@ -72992,14 +72996,19 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
         ggml_sycl_mmvq_fused_add{ addend_ptr, addend->ne[0], addend->nb[0] > 0 ? addend->nb[0] : sizeof(float) });
     fused_add_scope clear_fused_add;
 
+    bool submitted = false;
     if (has_soa_reorder || has_reorder) {
-        return ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q,
-                                                                   dispatch_layout);
+        submitted = ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(
+            ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, dispatch_layout);
+    } else if (act->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        submitted = ggml_sycl_op_mul_mat<quantize_q8_1>(
+            ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, GGML_LAYOUT_AOS);
     }
-    if (act->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
-        return ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, GGML_LAYOUT_AOS);
+    if (submitted) {
+        ggml_sycl::record_terminal_retention(
+            ggml_sycl_submit_marker<class ggml_sycl_tg_mul_mat_add_terminal_kernel>(*ctx.stream()), { resolved });
     }
-    return false;
+    return submitted;
 }
 
 // Execute per-projection fusion: fuse RMS_NORM into each MUL_MAT independently

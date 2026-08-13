@@ -3976,6 +3976,7 @@ inline const ggml_tensor * ggml_sycl_view_root_and_offset(const ggml_tensor * te
 // Compute the maximum byte reachable through tensor strides, including the
 // complete element/block at that address. False means malformed shape or
 // arithmetic overflow; callers must reject rather than treating it as empty.
+// This common helper is shared by the core backend and bounded binbcast submit.
 inline bool ggml_sycl_checked_tensor_span_bytes(const ggml_tensor * tensor, size_t & span) {
     span = 0;
     if (!tensor) return false;

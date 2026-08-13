@@ -115,7 +115,7 @@ int main() {
     // are rejected before any queue submission.
     ggml_sycl::mem_copy(host_b_h, size - 1, host_a_h, size - 1, 1, q);
     failed += !expect_fatal("source extent overflow", [&] {
-        ggml_sycl::mem_copy(host_b_h, host_a_h, size - 1, 2, q);
+        ggml_sycl::mem_copy(host_b_h, 0, host_a_h, size - 1, 2, q);
     });
     failed += !expect_fatal("destination offset overflow", [&] {
         ggml_sycl::mem_fill(host_b_h, SIZE_MAX, 0, 1, q);
