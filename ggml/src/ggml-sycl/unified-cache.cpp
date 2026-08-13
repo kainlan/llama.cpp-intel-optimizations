@@ -17276,7 +17276,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                 }
             }
 
-            arena_publish_authority();
+            arena_publish_authorities();
             return true;
         }
     }
@@ -17490,7 +17490,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         }
     }
 
-    arena_publish_authority();
+    arena_publish_authorities();
     return true;
 }
 
@@ -17526,6 +17526,7 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     // dividend until a config actually triggers N>=2.
     if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
         std::lock_guard<std::mutex> lock(z.alloc_mutex);
+        if (!arena_zone_open(zone)) return nullptr;
         if (zone == vram_zone_id::KV && z.allocator) {
             const size_t before = z.allocator->used();
             const size_t offset = z.allocator->allocate(size, align);
@@ -17604,6 +17605,7 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
                                           arena_zones_[static_cast<int>(vram_zone_id::KV)].alloc_mutex :
                                           z.alloc_mutex;
     std::lock_guard<std::mutex> lock(mtx);
+    if (!arena_zone_open(zone)) return nullptr;
 
     // TLSF returns OFFSET into the managed region; convert to device pointer.
     size_t offset = alloc->allocate(size, align);
@@ -17789,19 +17791,20 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         return;
     }
 
-    // Close admission and drain terminal leases without holding the allocator
-    // lock. mem_handle release only touches arena_authority and can therefore
-    // make progress while settle waits. Reacquire only for the TLSF reset.
+    // Close this zone while holding its allocator/lifecycle lock. Allocation
+    // therefore linearizes strictly before close or fails after it. Drain only
+    // this incarnation outside the TLSF mutex so unrelated zones keep running.
+    std::shared_ptr<arena_authority> retired_authority = arena_close_authority(zone);
     lock.unlock();
-    arena_invalidate_authority();
+    if (retired_authority) retired_authority->wait_for_terminal_leases();
     lock.lock();
     if (z.allocator) {
         z.allocator->reset();
     }
     z.used.store(0, std::memory_order_relaxed);
-    // A reset is a new arena incarnation even when physical chunks remain.
-    // Reopen only after TLSF has completed the reset.
-    arena_publish_authority();
+    // A reset is a new zone incarnation even when physical chunks remain.
+    // Reopen only after TLSF has completed the reset, under the same lock.
+    arena_publish_authority(zone);
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_reset_calls[idx]++;
@@ -18167,9 +18170,23 @@ void unified_cache_test_fail_next_shutdown_clean() {
 
 bool unified_cache::arena_destroy() {
     if (!arena_queue_) return true;
-    // Invalidate before queue drain/free; operation-retained handles keep a
-    // chunk lease and the free loop waits for those terminal leases.
-    arena_invalidate_authority();
+
+    // Fixed-order close is the arena-wide lifecycle transaction. Holding every
+    // zone allocator lock prevents a late allocation from slipping between
+    // closes; authority mirrors are cleared before any drain or physical free.
+    std::vector<std::unique_lock<std::mutex>> lifecycle_locks;
+    lifecycle_locks.reserve(static_cast<size_t>(vram_zone_id::COUNT));
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        lifecycle_locks.emplace_back(arena_zones_[i].alloc_mutex);
+    }
+    std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> retired{};
+    for (size_t i = 0; i < retired.size(); ++i) {
+        retired[i] = arena_close_authority(static_cast<vram_zone_id>(i));
+    }
+    lifecycle_locks.clear();
+    for (const auto & authority : retired) {
+        if (authority) authority->wait_for_terminal_leases();
+    }
     try {
         arena_queue_->wait_and_throw();
     } catch (const sycl::exception & e) {
@@ -18238,7 +18255,6 @@ bool unified_cache::arena_destroy() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    arena_generation_bump();
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto &                      z = arena_zones_[i];
@@ -18251,34 +18267,55 @@ bool unified_cache::arena_destroy() {
     return true;
 }
 
-std::shared_ptr<arena_authority> unified_cache::arena_authority_snapshot() const {
-    std::lock_guard<std::mutex> guard(arena_authority_mutex_);
-    return arena_authority_;
+std::shared_ptr<arena_authority> unified_cache::arena_authority_snapshot(vram_zone_id zone) const {
+    const size_t index = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> guard(arena_authority_mutexes_[index]);
+    return arena_authorities_[index];
 }
-void unified_cache::arena_publish_authority() {
+
+bool unified_cache::arena_zone_open(vram_zone_id zone) const {
+    const auto authority = arena_authority_snapshot(zone);
+    return authority && authority->accepts(arena_generation(zone));
+}
+
+void unified_cache::arena_publish_authority(vram_zone_id zone) {
+    const size_t index = static_cast<size_t>(zone);
     auto authority = std::make_shared<arena_authority>();
-    authority->generation = arena_generation();
+    authority->generation = arena_generation(zone);
+    authority->zone_id = static_cast<int>(zone);
     for (const auto & chunk : arena_chunks_) authority->chunks.emplace_back(chunk.ptr, chunk.size);
     authority->lease_counts.resize(authority->chunks.size(), 0);
-    std::lock_guard<std::mutex> guard(arena_authority_mutex_);
-    arena_authority_ = std::move(authority);
+    const vram_zone & z = arena_zones_[index];
+    if (zone == vram_zone_id::KV || zone == vram_zone_id::WEIGHT) {
+        authority->allowed_ranges.emplace_back(0, arena_size_);
+    } else if (z.size != 0) {
+        authority->allowed_ranges.emplace_back(z.start, z.size);
+    }
+    std::lock_guard<std::mutex> guard(arena_authority_mutexes_[index]);
+    arena_authorities_[index] = std::move(authority);
 }
-void unified_cache::arena_generation_bump() {
-    const uint64_t next = arena_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    const auto authority = arena_authority_snapshot();
-    if (authority) authority->bump_generation(next);
+
+void unified_cache::arena_publish_authorities() {
+    std::vector<std::unique_lock<std::mutex>> lifecycle_locks;
+    lifecycle_locks.reserve(static_cast<size_t>(vram_zone_id::COUNT));
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        lifecycle_locks.emplace_back(arena_zones_[i].alloc_mutex);
+    }
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        arena_publish_authority(static_cast<vram_zone_id>(i));
+    }
 }
-void unified_cache::arena_invalidate_authority() {
-    const uint64_t next = arena_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+std::shared_ptr<arena_authority> unified_cache::arena_close_authority(vram_zone_id zone) {
+    const size_t index = static_cast<size_t>(zone);
+    const uint64_t next = arena_generations_[index].fetch_add(1, std::memory_order_acq_rel) + 1;
     std::shared_ptr<arena_authority> authority;
     {
-        std::lock_guard<std::mutex> guard(arena_authority_mutex_);
-        authority = std::move(arena_authority_);
+        std::lock_guard<std::mutex> guard(arena_authority_mutexes_[index]);
+        authority = std::move(arena_authorities_[index]);
     }
-    if (authority) {
-        authority->close_and_invalidate(next);
-        authority->wait_for_terminal_leases();
-    }
+    if (authority) authority->close_and_invalidate(next);
+    return authority;
 }
 
 // === Arena chunk lease API (llama.cpp-dyhdl) ===
@@ -18347,7 +18384,17 @@ void unified_cache::host_release_chunk_lease(uint64_t handle) {
 }
 
 void unified_cache::arena_abandon() {
-    arena_invalidate_authority();
+    // Null everything without calling sycl::free — used during shutdown
+    // when the SYCL context is already invalid. Close every zone under the
+    // same fixed lifecycle order as destroy, but do not wait for terminal work.
+    std::vector<std::unique_lock<std::mutex>> lifecycle_locks;
+    lifecycle_locks.reserve(static_cast<size_t>(vram_zone_id::COUNT));
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        lifecycle_locks.emplace_back(arena_zones_[i].alloc_mutex);
+    }
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        (void) arena_close_authority(static_cast<vram_zone_id>(i));
+    }
     // Null everything without calling sycl::free — used during shutdown
     // when the SYCL context is already invalid.
     weight_chunk_allocators_.clear();

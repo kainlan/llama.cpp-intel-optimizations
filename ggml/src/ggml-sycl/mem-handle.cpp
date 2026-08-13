@@ -175,6 +175,18 @@ void start_retained_handle_drain_worker() {
 
 namespace {
 
+bool arena_range_contains(const std::vector<std::pair<size_t, size_t>> & ranges,
+                          size_t offset, size_t extent) {
+    if (extent == 0 || offset > SIZE_MAX - extent) return false;
+    for (const auto & range : ranges) {
+        if (range.first <= offset && range.second <= SIZE_MAX - range.first &&
+            offset - range.first <= range.second && extent <= range.second - (offset - range.first)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool arena_locate_offset(const std::vector<std::pair<void *, size_t>> & chunks,
                          size_t offset, size_t extent, size_t & chunk_index, void *& ptr) {
     size_t logical = 0;
@@ -197,7 +209,8 @@ bool arena_locate_offset(const std::vector<std::pair<void *, size_t>> & chunks,
 
 arena_authority::admission arena_authority::acquire_offset(uint64_t expected, size_t offset, size_t extent) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (!alive || !admission_open || generation != expected || extent == 0) return {};
+    if (!alive || !admission_open || generation != expected ||
+        !arena_range_contains(allowed_ranges, offset, extent)) return {};
     size_t chunk_index = 0;
     void * ptr = nullptr;
     if (!arena_locate_offset(chunks, offset, extent, chunk_index, ptr)) return {};
@@ -218,7 +231,7 @@ arena_authority::admission arena_authority::acquire_offset(uint64_t expected, si
 
 void * arena_authority::resolve_offset(uint64_t expected, size_t offset, size_t extent) const {
     std::lock_guard<std::mutex> guard(mutex);
-    if (!alive || generation != expected) return nullptr;
+    if (!alive || generation != expected || !arena_range_contains(allowed_ranges, offset, extent)) return nullptr;
     size_t chunk_index = 0;
     void * ptr = nullptr;
     return arena_locate_offset(chunks, offset, extent, chunk_index, ptr) ? ptr : nullptr;
@@ -252,6 +265,18 @@ void arena_authority::bump_generation(uint64_t next) {
     admission_open = false;
     alive = false;
     generation = next;
+}
+
+bool arena_authority::accepts(uint64_t expected) const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return alive && admission_open && generation == expected;
+}
+
+size_t arena_authority::terminal_lease_count() const {
+    std::lock_guard<std::mutex> guard(mutex);
+    size_t total = 0;
+    for (uint32_t count : lease_counts) total += count;
+    return total;
 }
 
 static size_t mem_handle_hash_combine(size_t seed, size_t value) {
@@ -470,8 +495,11 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
     h.canonical_extent_ = allocation_extent;
     h.gen_                = 0;  // Force first resolve
     h.cached_    = {};
-    unified_cache * cache = valid_cache_device_id(device) ? get_existing_unified_cache_for_device(device) : nullptr;
-    if (!h.arena_authority_ && cache) h.arena_authority_ = cache->arena_authority_snapshot();
+    unified_cache * cache = !h.arena_authority_ && valid_cache_device_id(device) ?
+                              get_existing_unified_cache_for_device(device) : nullptr;
+    if (cache && zone_id >= 0 && zone_id < static_cast<int>(vram_zone_id::COUNT)) {
+        h.arena_authority_ = cache->arena_authority_snapshot(static_cast<vram_zone_id>(zone_id));
+    }
     if (h.arena_authority_) {
         auto admitted = h.arena_authority_->acquire_offset(generation, offset, size);
         if (!admitted) {

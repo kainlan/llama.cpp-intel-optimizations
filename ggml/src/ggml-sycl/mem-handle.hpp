@@ -97,8 +97,13 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
     bool                            alive          = true;
     bool                            admission_open = true;
     uint64_t                        generation     = 0;
+    int                             zone_id        = -1;
     std::vector<std::pair<void *, size_t>> chunks;
-    std::vector<uint32_t>                 lease_counts;
+    // Logical arena ranges this zone incarnation may authorize. A range is
+    // [offset, offset + size); shared KV/WEIGHT authorities may cover all
+    // chunks while still remaining separate lifecycle incarnations.
+    std::vector<std::pair<size_t, size_t>> allowed_ranges;
+    std::vector<uint32_t>                  lease_counts;
 
     // Validation and lease admission are one lifecycle-mutex transaction. A
     // successful result therefore cannot race a close/invalidate and free.
@@ -107,6 +112,8 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
     void close_and_invalidate(uint64_t replacement_generation);
     void wait_for_terminal_leases() const;
     void bump_generation(uint64_t replacement_generation);
+    bool accepts(uint64_t expected_generation) const;
+    size_t terminal_lease_count() const;
 
   private:
     void release_lease(size_t chunk_index);

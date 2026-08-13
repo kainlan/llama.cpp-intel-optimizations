@@ -2604,12 +2604,12 @@ class unified_cache {
     // Abandon arena without freeing (for shutdown when SYCL context is invalid).
     void arena_abandon();
 
-    // Arena generation: monotonically increasing counter, bumped when the arena
-    // is destroyed/recreated.  Used by mem_handle to detect stale arena handles.
-    uint64_t arena_generation() const { return arena_generation_.load(std::memory_order_acquire); }
-    std::shared_ptr<arena_authority> arena_authority_snapshot() const;
-
-    void arena_generation_bump();
+    // Each zone has an independent incarnation. Settling one zone cannot make
+    // handles in an unrelated zone stale.
+    uint64_t arena_generation(vram_zone_id zone = vram_zone_id::RUNTIME) const {
+        return arena_generations_[static_cast<size_t>(zone)].load(std::memory_order_acquire);
+    }
+    std::shared_ptr<arena_authority> arena_authority_snapshot(vram_zone_id zone) const;
 
     // Register the compute queue so deferred frees wait for in-flight kernels.
     // Without this, evicted VRAM pointers can be freed while GPU kernels on the
@@ -3300,14 +3300,17 @@ class unified_cache {
     std::vector<weight_chunk_alloc> weight_chunk_allocators_;
     vram_zone                       arena_zones_[static_cast<int>(vram_zone_id::COUNT)];
 
-    // Arena generation counter: incremented when the arena is destroyed/recreated.
-    // mem_handle arena handles store the generation at creation time; on resolve(),
-    // a mismatch means the handle is stale (arena was recycled).
-    std::atomic<uint64_t> arena_generation_{ 0 };
-    mutable std::mutex arena_authority_mutex_;
-    std::shared_ptr<arena_authority> arena_authority_;
-    void arena_publish_authority();
-    void arena_invalidate_authority();
+    // Zone incarnation table. arena_zones_[i].alloc_mutex is the lifecycle
+    // serializer for allocation/reset/destroy/publication in zone i. The
+    // mirror mutex only protects lock-free handle-mint snapshots; authority
+    // admission itself is checked under arena_authority::mutex.
+    std::array<std::atomic<uint64_t>, static_cast<size_t>(vram_zone_id::COUNT)> arena_generations_{};
+    mutable std::array<std::mutex, static_cast<size_t>(vram_zone_id::COUNT)> arena_authority_mutexes_;
+    std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> arena_authorities_;
+    void arena_publish_authority(vram_zone_id zone);
+    void arena_publish_authorities();
+    std::shared_ptr<arena_authority> arena_close_authority(vram_zone_id zone);
+    bool arena_zone_open(vram_zone_id zone) const;
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.
