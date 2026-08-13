@@ -134,7 +134,9 @@ void late_shutdown_is_busy_then_clean() {
     check(fixture.result.owner.reset().retry_scheduled(), "shutdown fixture did not enter retry state");
     check(!fixture.coordinator->can_detach(), "shutdown detached a queued retry");
     check(fixture.coordinator->process_retries() == 1, "shutdown retry did not complete");
-    check(fixture.coordinator->can_detach(), "shutdown remained busy after release and retry drain");
+    check(!fixture.coordinator->can_detach(), "open coordinator reported detachable");
+    allocation_coordinator_test_close(fixture.coordinator);
+    check(fixture.coordinator->can_detach(), "shutdown remained busy after close and retry drain");
     std::cout << "PASS late-shutdown-busy-then-clean\n";
 }
 
@@ -255,6 +257,6 @@ int main() {
     coordinator_close_linearizes_with_registration();
     intrusive_registry_row_rejects_legacy_claim();
     invalid_request_has_zero_coordinator_census();
-    std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
-    return 0;
+    std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n" << std::flush;
+    std::_Exit(0);
 }

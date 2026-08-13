@@ -4277,6 +4277,8 @@ allocation_owner_test_fixture allocation_owner_test_create(
 // ownership protocols. They perform no physical allocation or release.
 std::shared_ptr<allocation_release_coordinator> allocation_coordinator_test_lookup(int device);
 void allocation_coordinator_test_close_all() noexcept;
+void allocation_coordinator_test_close(
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 size_t allocation_coordinator_test_count() noexcept;
 bool allocation_coordinator_test_try_register(
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;

@@ -12351,6 +12351,11 @@ void allocation_coordinator_test_close_all() noexcept {
     }
 }
 
+void allocation_coordinator_test_close(
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
+    if (coordinator) coordinator->close();
+}
+
 size_t allocation_coordinator_test_count() noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
