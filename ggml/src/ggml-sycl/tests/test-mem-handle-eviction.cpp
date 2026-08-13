@@ -613,7 +613,26 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     TEST_BEGIN("device_publication_fault_phases");
 
     constexpr size_t bytes = 4096;
-    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    // B50/B70 serial geometry: the fixed runtime/oneDNN/scratch tail is 1280
+    // MiB, so 2 GiB is the minimal round geometry with a useful WEIGHT region.
+    ggml_sycl::unified_cache cache(q, 2ull * 1024 * 1024 * 1024);
+
+    ggml_sycl::alloc_handle geometry{};
+    const int device = ggml_sycl_get_device_id_from_queue(q);
+    TEST_ASSERT(ggml_sycl::unified_cache_zone_allocate(
+                    device, ggml_sycl::vram_zone_id::WEIGHT, bytes, &geometry, 256),
+                "exact WEIGHT geometry allocation failed");
+    TEST_ASSERT(geometry.alloc_id != 0 && geometry.arena_generation != 0,
+                "exact allocation omitted id/generation");
+    TEST_ASSERT(geometry.vram_zone == ggml_sycl::vram_zone_id::WEIGHT && geometry.arena_extent == bytes,
+                "exact allocation omitted zone/extent");
+    ggml_sycl::mem_handle geometry_owner =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(geometry), GGML_LAYOUT_AOS);
+    const auto geometry_info = geometry_owner.debug_info();
+    TEST_ASSERT(geometry_info.valid && geometry_info.canonical_allocation_id != 0 &&
+                    geometry_info.canonical_generation != 0 && geometry_info.canonical_extent == bytes,
+                "allocation-time tuple was not preserved by mem_handle");
+    geometry_owner = {};
     // direct_stage_expert() is given the exact source capacity.  Use ordinary
     // owned host storage so its raw-pointer bridge mints a bounded DIRECT view;
     // an external sycl::malloc_host pointer is classified as HOST_PINNED and

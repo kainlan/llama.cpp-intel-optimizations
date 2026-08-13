@@ -4138,8 +4138,13 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // 1. Allocate from WEIGHT zone.  Non-planned/test caches may not have an
     // arena reservation, so fall back to a direct device allocation outside
     // placement-plan mode only.
-    void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
+    void *     ptr = nullptr;
     mem_handle direct_alloc_owner;
+    alloc_handle exact_owner{};
+    if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
+        ptr                = exact_owner.ptr;
+        direct_alloc_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+    }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
@@ -4446,8 +4451,13 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // 1. Allocate from WEIGHT zone.  Non-planned/test caches may not have an
     // arena reservation, so fall back to a direct device allocation outside
     // placement-plan mode only.
-    void *     ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
+    void *     ptr = nullptr;
     mem_handle direct_alloc_owner;
+    alloc_handle exact_owner{};
+    if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
+        ptr                = exact_owner.ptr;
+        direct_alloc_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+    }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
         req.queue                          = queue;
@@ -4505,21 +4515,33 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         const sycl::context & ctx   = queue->get_context();
         sycl::usm::alloc      atype = sycl::get_pointer_type(src_ptr, ctx);
 
-        void *         host_ptr      = nullptr;
+        void *         host_ptr       = nullptr;
         bool           host_allocated = false;
-        cache_location loc           = cache_location::HOST_MMAP;
+        mem_handle     host_alloc_owner;
+        cache_location loc            = cache_location::HOST_MMAP;
 
         if (atype == sycl::usm::alloc::host) {
             host_ptr = const_cast<void *>(src_ptr);
             loc      = cache_location::HOST_PINNED;
         } else {
-            host_ptr = host_zone_alloc(host_zone_id::WEIGHT, src_size, 256);
-            if (host_ptr) {
-                host_allocated = true;
-                mem_handle dst_handle = make_copy_handle_for_raw_ptr(host_ptr, GGML_LAYOUT_AOS, cache_device, src_size);
+            alloc_request host_req{};
+            host_req.queue                                      = queue;
+            host_req.device                                     = cache_device;
+            host_req.size                                       = src_size;
+            host_req.alignment                                  = 256;
+            host_req.intent.role                                = alloc_role::WEIGHT;
+            host_req.intent.category                            = runtime_category::EXPERT_CACHE;
+            host_req.intent.cohort_id                           = "direct_stage_expert_host";
+            host_req.intent.constraints.must_host_pinned        = true;
+            host_req.intent.constraints.use_pinned_pool         = true;
+            alloc_handle host_owner{};
+            if (unified_alloc(host_req, &host_owner) && host_owner.ptr) {
+                host_ptr         = host_owner.ptr;
+                host_allocated   = true;
+                host_alloc_owner = mem_handle::from_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
                 mem_handle src_handle =
                     make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
-                mem_copy(dst_handle, src_handle, src_size, *queue, {});
+                mem_copy(host_alloc_owner, src_handle, src_size, *queue, {});
                 loc = cache_location::HOST_PINNED;
             } else {
                 host_ptr = const_cast<void *>(src_ptr);
@@ -4552,8 +4574,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.has_ready_event  = false;
             entry.host_resident    = loc != cache_location::DEVICE;
             entry.location         = loc;
-            entry.pool_allocated   = false;
-            entry.last_write_event = {};
+            entry.pool_allocated     = false;
+            entry.direct_alloc_owner = host_alloc_owner;
+            entry.last_write_event   = {};
             entry.has_write_event  = false;
             auto old = entries_.find(cache_key);
             if (old != entries_.end()) {
@@ -4565,9 +4588,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                     old->second.layout != GGML_LAYOUT_AOS) {
                     if (!can_replace_cache_entry_locked(cache_key, old->second,
                                                         "direct_stage_expert/host-fallback")) {
-                        if (host_allocated) {
-                            host_zone_free(host_zone_id::WEIGHT, host_ptr);
-                        }
+                        if (host_allocated) host_alloc_owner = {};
                         return result;
                     }
                     release_entry_allocation_locked(old->second);
@@ -4879,18 +4900,20 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         }
     }
 
-    void * ptr = zone_alloc(vram_zone_id::WEIGHT, total_dst_size);
-    if (!ptr) {
-        GGML_LOG_ERROR("[DIRECT-STAGE] tensor-bulk expert zone_alloc failed for %zu bytes (%zu experts)\n",
+    void * ptr = nullptr;
+    alloc_handle exact_owner{};
+    if (!unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, total_dst_size, &exact_owner)) {
+        GGML_LOG_ERROR("[DIRECT-STAGE] tensor-bulk exact expert zone allocation failed for %zu bytes (%zu experts)\n",
                        total_dst_size, expert_count);
         return result;
     }
+    ptr = exact_owner.ptr;
+    mem_handle bulk_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+    if (!bulk_owner.valid()) return result;
 
     auto release_unpublished_ptr = [&]() {
-        if (!ptr) {
-            return;
-        }
-        zone_free(vram_zone_id::WEIGHT, ptr);
+        if (!ptr) return;
+        bulk_owner = {};
         ptr = nullptr;
     };
 
@@ -4904,10 +4927,9 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         if (fill_fn) {
             fill_event = fill_fn(*queue, ptr, total_dst_size, src_ptr, src_size, fill_ctx, {});
         } else {
-            mem_handle dst_handle = make_copy_handle_for_raw_ptr(ptr, layout, cache_device, total_dst_size);
             mem_handle src_handle =
                 make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
-            fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, src_size, *queue, {});
+            fill_event = mem_copy_async(bulk_owner, 0, src_handle, 0, src_size, *queue, {});
         }
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[DIRECT-STAGE] tensor-bulk expert fill failed layout=%d experts=%zu bytes=%zu: %s\n",
@@ -4934,10 +4956,13 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
 
     void * allocation_base                    = ptr;
     auto   defer_unpublished_bulk_until_event = [&]() {
-        if (!allocation_base) {
-            return;
-        }
-        enqueue_deferred_zone_free(vram_zone_id::WEIGHT, allocation_base, total_dst_size, fill_event);
+        if (!allocation_base) return;
+        managed_alloc_ref ref{};
+        ref.ptr    = allocation_base;
+        ref.size   = total_dst_size;
+        ref.device = bulk_owner.device();
+        ref.owner  = std::move(bulk_owner);
+        enqueue_deferred_free(ref, fill_event);
         allocation_base = nullptr;
         ptr             = nullptr;
     };
@@ -4984,17 +5009,11 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                 return result;
             }
         }
-        auto storage_owner =
-            std::shared_ptr<void>(allocation_base, [device = cache_device, fill_event](void * p) mutable {
-                if (!p || g_sycl_shutting_down.load(std::memory_order_acquire)) {
-                    return;
-                }
-                try {
-                    fill_event.wait_and_throw();
-                } catch (...) {
-                }
-                unified_cache_zone_free(device, vram_zone_id::WEIGHT, p);
-            });
+        // Every published slice retains the same allocation-time exact owner.
+        // The copy operation separately retains that owner through fill_event;
+        // publication therefore never reconstructs authority from a view ptr.
+        auto storage_owner = std::static_pointer_cast<void>(
+            std::make_shared<mem_handle>(bulk_owner));
         for (size_t i = 0; i < expert_count; ++i) {
             const ggml_sycl_cache_id & key      = keys[i];
             void *                     view_ptr = static_cast<uint8_t *>(allocation_base) + i * expert_dst_size;
@@ -6430,11 +6449,14 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     }
 
     if (!device_ptr && arena_active()) {
-        // VRAM arena path: sub-allocate from the weight zone.
-        device_ptr = zone_alloc(vram_zone_id::WEIGHT, size);
-        if (device_ptr) {
-            is_pool_alloc = true;  // Arena-owned: don't free individually.
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: arena weight zone alloc %zu bytes\n", size);
+        // Allocation-time exact arena owner: stage_expert_group copies and the
+        // published entry retain this same capability through terminal use.
+        alloc_handle owner{};
+        if (unified_cache_zone_allocate(get_device_id_from_queue(queue_), vram_zone_id::WEIGHT, size, &owner)) {
+            device_ptr        = owner.ptr;
+            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            is_pool_alloc     = true; // arena bytes are accounted by the zone
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: exact arena weight alloc %zu bytes\n", size);
         }
     }
 
@@ -6625,19 +6647,20 @@ bool unified_cache::stage_expert_group(int                          block_id,
         const cache_layout_request * req;
         void *                       ptr;
         bool                         was_existing;
+        mem_handle                   allocation_owner;
     };
 
     std::vector<slot_info> slots;
     slots.reserve(3);
 
     if (keys.has_gate && gate_data.src_ptr && gate_data.dst_size > 0) {
-        slots.push_back({ &keys.gate_key, &gate_data, gate_req, nullptr, false });
+        slots.push_back({ &keys.gate_key, &gate_data, gate_req, nullptr, false, {} });
     }
     if (keys.has_up && up_data.src_ptr && up_data.dst_size > 0) {
-        slots.push_back({ &keys.up_key, &up_data, up_req, nullptr, false });
+        slots.push_back({ &keys.up_key, &up_data, up_req, nullptr, false, {} });
     }
     if (keys.has_down && down_data.src_ptr && down_data.dst_size > 0) {
-        slots.push_back({ &keys.down_key, &down_data, down_req, nullptr, false });
+        slots.push_back({ &keys.down_key, &down_data, down_req, nullptr, false, {} });
     }
 
     if (slots.empty()) {
@@ -6709,6 +6732,18 @@ bool unified_cache::stage_expert_group(int                          block_id,
             return false;
         }
 
+        // Capture the allocation-time owner from each slot before submitting
+        // copies. Arena staging must never recover a lease from its raw ptr.
+        {
+            std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+            for (auto & s : slots) {
+                if (s.was_existing) continue;
+                unified_cache_key ckey{ cache_entry_type::MOE_EXPERT, *s.key, s.data->layer_id, s.data->expert_id };
+                auto it = entries_.find(ckey);
+                if (it != entries_.end()) s.allocation_owner = it->second.direct_alloc_owner;
+            }
+        }
+
         // 2. Fill all slots (DMA + optional reorder via fill_fn from request).
         //    Fills are submitted WITHOUT a per-expert dq.wait().  This allows
         //    BCS H2D copies and CCS reorder kernels to pipeline across experts.
@@ -6748,7 +6783,8 @@ bool unified_cache::stage_expert_group(int                          block_id,
                 // sides into smart handles so mem-ops owns queue selection,
                 // staging, and async lifetime retention.
                 const size_t copy_size  = std::min(s.data->dst_size, s.data->src_size);
-                auto         dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
+                auto         dst_handle = s.allocation_owner.valid() ? s.allocation_owner :
+                                      make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
                 auto         src_handle =
                     make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
                 std::vector<sycl::event> copy_deps;
@@ -6849,7 +6885,8 @@ bool unified_cache::stage_expert_group(int                          block_id,
 
         try {
             size_t copy_size  = std::min(s.data->src_size, s.data->dst_size);
-            auto   dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
+            auto   dst_handle = s.allocation_owner.valid() ? s.allocation_owner :
+                                    make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
             auto   src_handle =
                 make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
             last_event = mem_copy_async(dst_handle, src_handle, copy_size, bcs);
@@ -8542,6 +8579,19 @@ void unified_cache::release_entry_allocation_locked(unified_cache_entry & entry,
         return;
     }
 
+    if (entry.direct_alloc_owner.valid()) {
+        managed_alloc_ref ref{};
+        ref.ptr      = entry.device_ptr;
+        ref.size     = entry.size;
+        ref.device   = entry.direct_alloc_owner.device();
+        ref.alloc_id = entry.direct_alloc_owner.debug_info().canonical_allocation_id;
+        ref.owner    = entry.direct_alloc_owner;
+        if (entry.has_write_event) enqueue_deferred_free(ref, entry.last_write_event);
+        else                       enqueue_deferred_free(ref);
+        if (entry.cache_budget_charged) saturating_sub_used(entry.size);
+        return;
+    }
+
     if (entry.host_resident || entry.location == cache_location::HOST_PINNED) {
         if (host_zones_configured()) {
             host_zone_free(host_zone_id::WEIGHT, ptr);
@@ -8567,20 +8617,6 @@ void unified_cache::release_entry_allocation_locked(unified_cache_entry & entry,
         GGML_LOG_ERROR("[UNIFIED-CACHE] pool_allocated entry not owned by layout_pool ptr=%p size=%zu\n", ptr,
                        entry.size);
         GGML_ASSERT(false && "pool_allocated cache entry missing pool owner");
-        return;
-    }
-
-    if (entry.direct_alloc_owner.valid()) {
-        managed_alloc_ref ref{};
-        ref.ptr      = entry.device_ptr;
-        ref.size     = entry.size;
-        ref.device   = entry.direct_alloc_owner.device();
-        ref.alloc_id = 0;
-        ref.owner    = entry.direct_alloc_owner;
-        enqueue_deferred_free(ref);
-        if (entry.cache_budget_charged) {
-            saturating_sub_used(entry.size);
-        }
         return;
     }
 
@@ -8646,12 +8682,8 @@ void unified_cache::enqueue_deferred_free(const managed_alloc_ref & handle) {
         return;
     }
 
-    if (vram_owns(handle.ptr)) {
-        GGML_SYCL_DEBUG("[UNIFIED-CACHE] skipping deferred free for arena-owned managed ptr=%p size=%zu\n", handle.ptr,
-                        handle.size);
-        return;
-    }
-
+    // Managed arena allocations carry an exact owning mem_handle. Queue that
+    // owner just like a direct allocation; dropping it is the sole reclaim path.
     deferred_free_entry entry{};
     entry.ptr     = handle.ptr;
     entry.size    = handle.size;
@@ -11139,11 +11171,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     bool         reserve_device = (tier == alloc_tier::DEVICE_VRAM);
     bool         reserve_host   = (tier == alloc_tier::HOST_PINNED);
 
-    bool   uses_pinned_pool = false;
-    bool   zone_managed     = false;
-    bool   from_arena       = false;
-    bool   kv_spill_to_host = false;
-    void * ptr              = nullptr;
+    bool                               uses_pinned_pool = false;
+    bool                               zone_managed     = false;
+    bool                               from_arena       = false;
+    bool                               kv_spill_to_host = false;
+    void *                             ptr              = nullptr;
+    arena_authority::allocation_record exact_arena{};
     if (tier == alloc_tier::DEVICE_VRAM) {
         // Guard against Level Zero overcommit: if this allocation would exceed
         // the device's total VRAM, fail early so the caller can retry with
@@ -11203,7 +11236,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
                 ptr                    = cache->zone_alloc(zid, alloc_size,
                                                            req.alignment != 0 ? req.alignment : 64,
-                                                           reserved_alloc_id);
+                                                           reserved_alloc_id, &exact_arena);
                 if (ptr) {
                     from_arena        = true;
                     out->zone_managed = true;
@@ -11220,7 +11253,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         if (!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
-                ptr = cache->zone_alloc(vram_zone_id::KV, alloc_size, 256, reserved_alloc_id);
+                ptr = cache->zone_alloc(vram_zone_id::KV, alloc_size, 256, reserved_alloc_id, &exact_arena);
                 if (ptr) {
                     from_arena        = true;
                     out->zone_managed = true;
@@ -11454,6 +11487,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.role         = req.intent.role;
     rec.handle.category     = cat;
     rec.handle.alloc_id     = reserved_alloc_id;
+    rec.handle.arena_generation = exact_arena.generation;
+    rec.handle.arena_offset     = exact_arena.offset;
+    rec.handle.arena_extent     = exact_arena.extent;
     rec.handle.vram_zone    = out->vram_zone;  // Propagate zone routing set by zone_alloc paths above
     rec.handle.zone_managed = out->zone_managed;
     rec.handle.host_zone    = out->host_zone;
@@ -11894,19 +11930,21 @@ size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
 }
 
 mem_handle scoped_unified_alloc::as_mem_handle() const {
-    if (!handle_.ptr) {
-        return mem_handle{};
-    }
-    bool on_device = (handle_.tier == alloc_tier::DEVICE_VRAM);
-    return mem_handle::from_chunk_ptr(handle_.ptr, handle_.device, GGML_LAYOUT_AOS, on_device);
+    return handle_.as_mem_handle();
 }
 
 mem_handle alloc_handle::as_mem_handle() const {
-    if (!ptr) {
-        return mem_handle{};
+    if (!ptr) return {};
+    if (tier == alloc_tier::DEVICE_VRAM && zone_managed && vram_zone != vram_zone_id::COUNT &&
+        arena_generation != 0 && arena_extent != 0) {
+        unified_cache * cache = get_existing_unified_cache_for_device(device);
+        if (!cache) return {};
+        return mem_handle::from_arena_zone(static_cast<int>(vram_zone), arena_offset, size, device,
+                                           arena_generation, alloc_id, arena_extent,
+                                           cache->arena_authority_snapshot(vram_zone));
     }
-    bool on_device = (tier == alloc_tier::DEVICE_VRAM);
-    return mem_handle::from_chunk_ptr(ptr, device, GGML_LAYOUT_AOS, on_device);
+    return mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, tier == alloc_tier::DEVICE_VRAM,
+                                   tier == alloc_tier::DEVICE_VRAM ? device : mem_handle::HOST_DEVICE, size);
 }
 
 bool unified_lookup(void * ptr, alloc_handle * out) {
@@ -16788,6 +16826,30 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
     return cache->zone_alloc(zone, size, align);
 }
 
+bool unified_cache_zone_allocate(int device_id, vram_zone_id zone, size_t size, alloc_handle * out, size_t align) {
+    if (!out) return false;
+    *out = {};
+    alloc_request req{};
+    req.device                             = device_id;
+    req.size                               = size;
+    req.alignment                          = align;
+    req.intent.role                        = zone == vram_zone_id::KV ? alloc_role::KV : alloc_role::WEIGHT;
+    req.intent.category                    = zone == vram_zone_id::WEIGHT ? runtime_category::EXPERT_CACHE :
+                                                                           runtime_category::OTHER;
+    req.intent.cohort_id                   = "exact_zone_allocate";
+    req.intent.constraints.must_device     = true;
+    req.intent.constraints.prefer_vram_zone = zone;
+    alloc_handle handle{};
+    if (!unified_alloc(req, &handle)) return false;
+    if (!handle.zone_managed || handle.vram_zone != zone || handle.arena_generation == 0 ||
+        handle.arena_extent != size) {
+        (void) unified_free(handle);
+        return false;
+    }
+    *out = std::move(handle);
+    return true;
+}
+
 void unified_cache_zone_reclaim(int device_id, vram_zone_id zone) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (cache) {
@@ -17668,10 +17730,20 @@ void unified_cache::arena_unregister_exact(vram_zone_id zone, size_t offset) noe
     if (authority) (void) authority->unregister_allocation(static_cast<int>(zone), offset);
 }
 
-void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align, uint64_t allocation_id) {
+void * unified_cache::zone_alloc(vram_zone_id                       zone,
+                                 size_t                             size,
+                                 size_t                             align,
+                                 uint64_t                           allocation_id,
+                                 arena_authority::allocation_record * exact) {
+    if (exact) *exact = {};
     if (!arena_base_ || size == 0) {
         return nullptr;
     }
+    // Mint before taking the physical allocator-group lock. Registration and
+    // exact tuple publication then happen while that lock still excludes free,
+    // reset, and sibling-zone allocation.
+    if (allocation_id == 0) allocation_id = unified_cache_mint_retention_identity();
+    if (allocation_id == 0) return nullptr;
 
     // Audit-only: measure whether alloc/free time is even visible against graph
     // execution. Per the pre-registered rule (llama.cpp-iiff c-c1n3), if it is
@@ -17724,6 +17796,8 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align, u
                     z.used.fetch_sub(delta, std::memory_order_relaxed);
                     return nullptr;
                 }
+                if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
+                                      arena_generation(zone) };
                 return offset_to_ptr(logical_offset);
             }
         }
@@ -17756,6 +17830,8 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align, u
                 z.used.fetch_sub(delta, std::memory_order_relaxed);
                 return nullptr;
             }
+            if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
+                                  arena_generation(zone) };
             return offset_to_ptr(logical_offset);
         }
         if (profile_active) {
@@ -17811,6 +17887,8 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align, u
             z.used.store(alloc->used(), std::memory_order_relaxed);
             return nullptr;
         }
+        if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
+                              arena_generation(zone) };
         return offset_to_ptr(logical_offset);
     }
     if (profile_active) {

@@ -3123,7 +3123,11 @@ class unified_cache {
     // Sub-allocate from a zone. When allocation_id is non-zero, physical
     // allocation, exact authority registration, and token identity share the
     // same allocator-group transaction.
-    void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256, uint64_t allocation_id = 0);
+    void * zone_alloc(vram_zone_id                       zone,
+                      size_t                             size,
+                      size_t                             align = 256,
+                      uint64_t                           allocation_id = 0,
+                      arena_authority::allocation_record * exact = nullptr);
 
     // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
     // ptr must have been returned by zone_alloc. No size parameter —
@@ -3920,6 +3924,13 @@ struct alloc_handle {
     runtime_category category = runtime_category::OTHER;
     uint64_t         alloc_id = 0;
 
+    // Exact arena capability minted in the allocator transaction. These fields
+    // are zero for non-arena allocations. Consumers must propagate this tuple
+    // rather than reconstructing arena authority from ptr.
+    uint64_t arena_generation = 0;
+    size_t   arena_offset     = 0;
+    size_t   arena_extent     = 0;
+
     // Graph-boundary epoch this allocation was made in (iiff Option C step 2,
     // llama.cpp-lbm3). Stamped from the zone's current epoch counter at
     // allocation time; only meaningful for host_zone==SCRATCH|STAGING (0
@@ -4675,6 +4686,11 @@ void unified_cache_host_zone_reclaim(host_zone_id zone);
 // Sub-allocate from a VRAM zone (ONEDNN, RUNTIME, KV scratchpads).
 // Returns nullptr if the zone is full or the arena is inactive.
 void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align = 256);
+// Owning exact-handle variant. Unlike the compatibility raw API above, this
+// registers the allocation for unified_free() and returns its allocator-minted
+// id/generation/zone/offset/extent atomically.
+bool unified_cache_zone_allocate(int device_id, vram_zone_id zone, size_t size, alloc_handle * out,
+                                 size_t align = 256);
 
 // Free a sub-allocation from a VRAM zone (TLSF reclaim).
 void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);

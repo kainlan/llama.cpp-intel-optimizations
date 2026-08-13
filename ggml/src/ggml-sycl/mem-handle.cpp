@@ -641,11 +641,13 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
     if (on_device && handle.zone_managed && handle.vram_zone != vram_zone_id::COUNT &&
         valid_cache_device_id(handle.device)) {
         if (unified_cache * cache = get_existing_unified_cache_for_device(handle.device)) {
-            const size_t arena_offset = cache->ptr_to_offset(handle.ptr);
-            if (arena_offset != SIZE_MAX) {
-                h = from_arena_zone(static_cast<int>(handle.vram_zone), arena_offset, handle.size, handle.device,
-                                    cache->arena_generation(handle.vram_zone), handle.alloc_id, handle.size,
-                                    cache->arena_authority_snapshot(handle.vram_zone));
+            // Arena handles consume only the tuple returned by the allocation
+            // transaction. Never recover authority by mapping the raw pointer
+            // back into a chunk: that can admit the wrong generation after ABA.
+            if (handle.arena_generation != 0 && handle.arena_extent != 0) {
+                h = from_arena_zone(static_cast<int>(handle.vram_zone), handle.arena_offset, handle.size,
+                                    handle.device, handle.arena_generation, handle.alloc_id,
+                                    handle.arena_extent, cache->arena_authority_snapshot(handle.vram_zone));
             }
         }
         if (!h.valid()) return {};
@@ -655,9 +657,11 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
     h.offset_                   = 0;
     h.size_                     = handle.size;
     h.backing_extent_            = handle.size;
-    h.canonical_allocation_id_  = handle.alloc_id;
-    h.canonical_generation_     = handle.epoch_id ? handle.epoch_id : 1;
-    h.canonical_extent_         = handle.size;
+    h.canonical_allocation_id_ = handle.alloc_id;
+    if (!h.is_arena()) {
+        h.canonical_generation_ = handle.epoch_id ? handle.epoch_id : 1;
+        h.canonical_extent_     = handle.size;
+    }
     h.owned_alloc_ = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
     return h;
 }
