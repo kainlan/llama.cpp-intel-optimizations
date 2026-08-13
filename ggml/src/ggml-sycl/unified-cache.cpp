@@ -140,9 +140,11 @@ uint64_t lifecycle_next_plan_publication_id() noexcept {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
     g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
 }
+#endif
 
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
@@ -592,41 +594,25 @@ void residency_diagnostics_record_locked(residency_reject_reason reason,
 
 }  // namespace
 
-residency_plan evaluate_residency_request_for_test(const residency_request & req, const residency_budget & budget) {
+residency_plan evaluate_residency_request(const residency_request & req, const residency_budget & budget) {
     residency_plan plan = evaluate_residency_budget(req, budget);
     validate_residency_plan_handles(req, plan);
-    if (plan.accepted) {
-        residency_diagnostics_record_accept_for_test(plan.bytes_requested, plan.bytes_available,
-                                                     plan.largest_free_block);
-    } else {
-        residency_diagnostics_record_reject_for_test(plan.reason, plan.bytes_requested, plan.bytes_available,
-                                                     plan.largest_free_block);
-    }
     return plan;
 }
 
-void residency_diagnostics_reset_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    g_residency_diag = residency_diagnostics_snapshot{};
-}
-
-void residency_diagnostics_record_accept_for_test(size_t bytes_requested,
-                                                  size_t bytes_available,
-                                                  size_t largest_free_block) {
+void residency_diagnostics_note_accept(size_t bytes_requested, size_t bytes_available, size_t largest_free_block) {
     std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
     residency_diagnostics_record_locked(residency_reject_reason::NONE, bytes_requested, bytes_available,
                                         largest_free_block);
 }
 
-void residency_diagnostics_record_reject_for_test(residency_reject_reason reason,
-                                                  size_t                  bytes_requested,
-                                                  size_t                  bytes_available,
-                                                  size_t                  largest_free_block) {
+void residency_diagnostics_note_reject(residency_reject_reason reason, size_t bytes_requested,
+                                       size_t bytes_available, size_t largest_free_block) {
     std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
     residency_diagnostics_record_locked(reason, bytes_requested, bytes_available, largest_free_block);
 }
 
-void residency_diagnostics_record_live_handle_for_test(const char * owner_tag, const char * allocation_class, size_t) {
+void residency_diagnostics_note_live_handle(const char * owner_tag, const char * allocation_class, size_t) {
     std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
     ++g_residency_diag.live_handle_count;
     std::snprintf(g_residency_diag.last_live_owner_tag, sizeof(g_residency_diag.last_live_owner_tag), "%s",
@@ -635,40 +621,65 @@ void residency_diagnostics_record_live_handle_for_test(const char * owner_tag, c
                   "%s", allocation_class ? allocation_class : "");
 }
 
-void residency_diagnostics_record_stale_descriptor_for_test() {
+static void residency_diagnostics_note_stale(uint64_t residency_diagnostics_snapshot::* detail = nullptr) {
     std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
     ++g_residency_diag.stale_descriptor_rejects;
+    if (detail) ++(g_residency_diag.*detail);
 }
 
+void residency_diagnostics_note_stale_descriptor() { residency_diagnostics_note_stale(); }
+void residency_diagnostics_note_stale_descriptor_invalid_handle() {
+    residency_diagnostics_note_stale(&residency_diagnostics_snapshot::stale_descriptor_invalid_handle);
+}
+void residency_diagnostics_note_stale_descriptor_identity_mismatch() {
+    residency_diagnostics_note_stale(&residency_diagnostics_snapshot::stale_descriptor_identity_mismatch);
+}
+void residency_diagnostics_note_stale_descriptor_generation_mismatch() {
+    residency_diagnostics_note_stale(&residency_diagnostics_snapshot::stale_descriptor_generation_mismatch);
+}
+void residency_diagnostics_note_stale_descriptor_layout_mismatch() {
+    residency_diagnostics_note_stale(&residency_diagnostics_snapshot::stale_descriptor_layout_mismatch);
+}
+void residency_diagnostics_note_stale_descriptor_device_mismatch() {
+    residency_diagnostics_note_stale(&residency_diagnostics_snapshot::stale_descriptor_device_mismatch);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void residency_diagnostics_reset_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    g_residency_diag = residency_diagnostics_snapshot{};
+}
+void residency_diagnostics_record_accept_for_test(size_t a, size_t b, size_t c) {
+    residency_diagnostics_note_accept(a, b, c);
+}
+void residency_diagnostics_record_reject_for_test(residency_reject_reason r, size_t a, size_t b, size_t c) {
+    residency_diagnostics_note_reject(r, a, b, c);
+}
+void residency_diagnostics_record_live_handle_for_test(const char * a, const char * b, size_t c) {
+    residency_diagnostics_note_live_handle(a, b, c);
+}
+void residency_diagnostics_record_stale_descriptor_for_test() { residency_diagnostics_note_stale_descriptor(); }
 void residency_diagnostics_record_stale_descriptor_invalid_handle_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    ++g_residency_diag.stale_descriptor_rejects;
-    ++g_residency_diag.stale_descriptor_invalid_handle;
+    residency_diagnostics_note_stale_descriptor_invalid_handle();
 }
-
 void residency_diagnostics_record_stale_descriptor_identity_mismatch_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    ++g_residency_diag.stale_descriptor_rejects;
-    ++g_residency_diag.stale_descriptor_identity_mismatch;
+    residency_diagnostics_note_stale_descriptor_identity_mismatch();
 }
-
 void residency_diagnostics_record_stale_descriptor_generation_mismatch_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    ++g_residency_diag.stale_descriptor_rejects;
-    ++g_residency_diag.stale_descriptor_generation_mismatch;
+    residency_diagnostics_note_stale_descriptor_generation_mismatch();
 }
-
 void residency_diagnostics_record_stale_descriptor_layout_mismatch_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    ++g_residency_diag.stale_descriptor_rejects;
-    ++g_residency_diag.stale_descriptor_layout_mismatch;
+    residency_diagnostics_note_stale_descriptor_layout_mismatch();
 }
-
 void residency_diagnostics_record_stale_descriptor_device_mismatch_for_test() {
-    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
-    ++g_residency_diag.stale_descriptor_rejects;
-    ++g_residency_diag.stale_descriptor_device_mismatch;
+    residency_diagnostics_note_stale_descriptor_device_mismatch();
 }
+#endif
+
+// Production code below records events through non-test entry points.
+#define residency_diagnostics_record_accept_for_test residency_diagnostics_note_accept
+#define residency_diagnostics_record_reject_for_test residency_diagnostics_note_reject
+#define residency_diagnostics_record_live_handle_for_test residency_diagnostics_note_live_handle
 
 residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
     std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
@@ -712,7 +723,12 @@ static std::atomic<bool>     g_test_pause_zone_settle{ false };
 static std::atomic<bool>     g_test_zone_settle_reached{ false };
 static std::atomic<bool>     g_test_arena_destroy_closing_reached{ false };
 #endif
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static bool fail_expert_phase(expert_fault_phase phase) noexcept;
+#define GGML_SYCL_FAIL_EXPERT_PHASE(phase) fail_expert_phase(phase)
+#else
+#define GGML_SYCL_FAIL_EXPERT_PHASE(phase) false
+#endif
 
 static std::mutex            g_runtime_alloc_mutex;
 // One identity namespace for every backing that can enter retained caches.
@@ -3199,22 +3215,31 @@ bool unified_cache::shutdown_resources() {
 
     // Free scratch pool BEFORE destroying the VRAM arena (which would invalidate owns check).
     {
-        std::lock_guard<std::mutex> owner_lock(scratch_pool_mutex_);
+        std::unique_lock<std::mutex> owner_lock(scratch_pool_mutex_);
+        scratch_pool_cv_.wait(owner_lock, [this] { return !scratch_pool_release_in_progress_; });
         if (scratch_pool_ptr_) {
             const bool arena_owned = had_arena && vram_owns(scratch_pool_ptr_);
-            if (scratch_pool_owner_.valid()) {
-                // Release this cache's exact lease first. A copied owner can
-                // then force arena_destroy() to time out without losing chunks.
-                scratch_pool_owner_ = {};
-                if (arena_owned) {
-                    zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
-                } else {
-                    saturating_sub_used(scratch_pool_size_);
-                }
-            } else {
+            if (!scratch_pool_owner_.valid() && !arena_owned) {
                 GGML_LOG_ERROR("[UNIFIED-CACHE] scratch pool missing canonical owner ptr=%p arena=%d\n",
                                scratch_pool_ptr_, arena_owned ? 1 : 0);
                 GGML_ASSERT(false && "scratch pool missing canonical owner");
+            }
+            mem_handle canonical_owner = std::move(scratch_pool_owner_);
+            void * const old_ptr = scratch_pool_ptr_;
+            const size_t old_size = scratch_pool_size_;
+            scratch_pool_release_in_progress_ = true;
+            owner_lock.unlock();
+            canonical_owner = {};
+            const bool released = arena_owned ? zone_free(vram_zone_id::WEIGHT, old_ptr) : true;
+            if (!arena_owned && released) saturating_sub_used(old_size);
+            owner_lock.lock();
+            scratch_pool_release_in_progress_ = false;
+            scratch_pool_cv_.notify_all();
+            if (!released) {
+                // Keep the pointer, geometry, exact registry tuple and TLSF
+                // block intact. A later shutdown retries after external leases
+                // release; the canonical owner intentionally remains empty.
+                return false;
             }
         }
         scratch_pool_ptr_          = nullptr;
@@ -3313,7 +3338,7 @@ bool unified_cache::shutdown_resources() {
     }
     id_to_key_.clear();
 
-    if (fail_expert_phase(expert_fault_phase::SHUTDOWN_BEFORE_ARENA_DESTROY)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::SHUTDOWN_BEFORE_ARENA_DESTROY)) {
         return false;
     }
 
@@ -4133,6 +4158,7 @@ static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
     return false;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired) {
     ggml_sycl_cache_id id{};
     id.valid     = true;
@@ -4147,6 +4173,7 @@ bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired)
     entry.in_use_count.store(live_leases);
     return can_replace_cache_entry_locked(key, entry, "test-replacement");
 }
+#endif
 
 void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id,
                                                      const unified_cache_key &  removed_key) {
@@ -4435,6 +4462,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
 }
 
 static bool moe_direct_trace_enabled();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<expert_publication_test_hook> g_expert_publication_test_hook{ nullptr };
 static std::atomic<void *> g_expert_publication_test_context{ nullptr };
 static std::atomic<expert_fault_phase> g_expert_fault_phase{ expert_fault_phase::NONE };
@@ -4477,6 +4505,11 @@ static void run_expert_publication_test_hook() {
         hook(g_expert_publication_test_context.load(std::memory_order_acquire));
     }
 }
+#define GGML_SYCL_RUN_EXPERT_PUBLICATION_HOOK() run_expert_publication_test_hook()
+#else
+#define GGML_SYCL_RUN_EXPERT_PUBLICATION_HOOK() ((void) 0)
+#define run_expert_publication_test_hook() GGML_SYCL_RUN_EXPERT_PUBLICATION_HOOK()
+#endif
 
 static void moe_direct_trace_key(const char *               op,
                                  const ggml_sycl_cache_id & key,
@@ -4786,7 +4819,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         ptr = nullptr;
     };
 
-    if (fail_expert_phase(expert_fault_phase::SINGLE_AFTER_ALLOC)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::SINGLE_AFTER_ALLOC)) {
         release_unpublished_ptr();
         return result;
     }
@@ -4835,7 +4868,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         last_event = mem_fill_async(dst_handle, src_size, 0, dst_size - src_size, *queue, { fill_event });
     }
 
-    if (fail_expert_phase(expert_fault_phase::SINGLE_BEFORE_COMMIT)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::SINGLE_BEFORE_COMMIT)) {
         defer_unpublished_ptr_until_event(last_event);
         return result;
     }
@@ -5043,7 +5076,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         ptr = nullptr;
     };
 
-    if (fail_expert_phase(expert_fault_phase::BULK_AFTER_ALLOC)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::BULK_AFTER_ALLOC)) {
         release_unpublished_ptr();
         return result;
     }
@@ -5093,7 +5126,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         ptr             = nullptr;
     };
 
-    if (fail_expert_phase(expert_fault_phase::BULK_BEFORE_COMMIT)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::BULK_BEFORE_COMMIT)) {
         defer_unpublished_bulk_until_event();
         return result;
     }
@@ -5944,7 +5977,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         }
     }
 
-    if (fail_expert_phase(expert_fault_phase::HOST_BEFORE_COMMIT)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::HOST_BEFORE_COMMIT)) {
         return false;
     }
 
@@ -8948,7 +8981,7 @@ size_t unified_cache::finalize_retired_entries_locked() {
         if (entry.state == cache_entry_state::IN_PROGRESS && entry.has_ready_event) {
             bool complete = false;
             try {
-                if (fail_expert_phase(expert_fault_phase::GC_READY_EVENT)) {
+                if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::GC_READY_EVENT)) {
                     throw std::runtime_error("deterministic retired ready-event query failure");
                 }
                 complete = entry.ready_event.get_info<sycl::info::event::command_execution_status>() ==
@@ -9442,7 +9475,7 @@ uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml
 }
 
 bool unified_cache::note_model_load_abort(uint64_t load_txn_id) noexcept {
-    if (fail_expert_phase(expert_fault_phase::ABORT_BEFORE_RETIRE)) {
+    if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::ABORT_BEFORE_RETIRE)) {
         return false;
     }
 
@@ -10216,11 +10249,13 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
 
     if (src.location == cache_location::HOST_MMAP) {
         result.used_mmap_direct = true;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (std::getenv("GGML_SYCL_TEST_DMA_FAIL") != nullptr) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] DMA test override: forcing mmap DMA failure\n");
             result.mmap_direct_failed = true;
             return result;
         }
+#endif
     }
 
     dma_staging_buffers staging{};
@@ -16108,7 +16143,8 @@ size_t unified_cache::compute_arena_used() const {
 // --- Inference Scratch Pool ---
 
 bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
-    std::lock_guard<std::mutex> owner_lock(scratch_pool_mutex_);
+    std::unique_lock<std::mutex> owner_lock(scratch_pool_mutex_);
+    scratch_pool_cv_.wait(owner_lock, [this] { return !scratch_pool_release_in_progress_; });
 
     // `pool_bytes` is, and has always been, the sizing contract callers plan
     // against -- unified_cache_reserve_moe_q8_1_scratch() specs and unit-tests
@@ -16156,25 +16192,37 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
             return false;
         }
 
-        if (arena_active() && vram_owns(scratch_pool_ptr_)) {
-            // Drop the cache's exact authority lease before unregistering and
-            // returning the allocation to TLSF. External copies remain valid
-            // leases and will make arena teardown retry rather than free early.
-            scratch_pool_owner_ = {};
-            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
-        } else {
-            if (scratch_pool_owner_.valid()) {
-                scratch_pool_owner_ = {};
-            } else {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] direct scratch pool missing alloc_handle owner ptr=%p\n",
-                               scratch_pool_ptr_);
-                GGML_ASSERT(false && "direct scratch pool missing alloc_handle owner");
-            }
-            saturating_sub_used(scratch_pool_size_);
+        const bool arena_owned = arena_active() && vram_owns(scratch_pool_ptr_);
+        if (!scratch_pool_owner_.valid() && !arena_owned) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] direct scratch pool missing alloc_handle owner ptr=%p\n",
+                           scratch_pool_ptr_);
+            GGML_ASSERT(false && "direct scratch pool missing alloc_handle owner");
         }
-        scratch_pool_ptr_   = nullptr;
-        scratch_pool_size_  = 0;
-        scratch_pool_owner_ = {};
+
+        // Move the canonical owner while serialized, then destroy it without
+        // the scratch mutex held. Until this transaction completes reserve
+        // callers wait rather than mistaking the temporarily empty owner for
+        // missing metadata.
+        mem_handle canonical_owner = std::move(scratch_pool_owner_);
+        void * const old_ptr = scratch_pool_ptr_;
+        const size_t old_size = scratch_pool_size_;
+        scratch_pool_release_in_progress_ = true;
+        owner_lock.unlock();
+        canonical_owner = {};
+        const bool released = arena_owned ? zone_free(vram_zone_id::WEIGHT, old_ptr) : true;
+        if (!arena_owned && released) saturating_sub_used(old_size);
+        owner_lock.lock();
+        scratch_pool_release_in_progress_ = false;
+        scratch_pool_cv_.notify_all();
+        if (!released) {
+            // External exact leases still own the old allocation. Preserve all
+            // geometry and allocator metadata so resolve and a later retry use
+            // the same record/block; only the cache's canonical lease is gone.
+            return false;
+        }
+        scratch_pool_ptr_          = nullptr;
+        scratch_pool_size_         = 0;
+        scratch_pool_region_bytes_ = 0;
         scratch_pool_reset_regions();
     }
 
@@ -17979,6 +18027,16 @@ bool unified_cache::arena_record_allocation_locked(vram_zone_id zone, void * ptr
     return true;
 }
 
+bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept {
+    allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    const auto found = group.allocations.find(ptr);
+    if (found == group.allocations.end() || found->second.allocation_id == 0) return false;
+    const allocator_group_record & exact = found->second;
+    const auto authority = arena_authority_snapshot(exact.zone);
+    return authority && authority->unregister_allocation_if_unleased(
+                            static_cast<int>(exact.zone), exact.allocation_id, exact.offset);
+}
+
 void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     auto              found = group.allocations.find(ptr);
@@ -18488,9 +18546,9 @@ void unified_cache::zone_reclaim(vram_zone_id zone) {
     zone_settle(zone);
 }
 
-void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
+bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     if (!ptr || !arena_base_) {
-        return;
+        return false;
     }
 
     const zone_audit_timer audit_timer(zone_audit_vram_timing(zone), true);
@@ -18510,8 +18568,8 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             if (arena_offset != SIZE_MAX && arena_offset >= z.start && arena_offset < z.start + z.size) {
                 const size_t                zone_offset = arena_offset - z.start;
                 std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+                if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
                 arena_forget_allocation_locked(zone, ptr);
-                arena_unregister_exact(zone, arena_offset);
                 const size_t                before = z.allocator->used();
                 z.allocator->free(zone_offset);
                 const size_t after = z.allocator->used();
@@ -18521,12 +18579,12 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
                     t_arena_pp_profile.zone_free_calls[idx]++;
                     t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
                 }
-                return;
+                return true;
             }
         }
         const int chunk_idx = arena_find_chunk(ptr);
         if (chunk_idx < 0) {
-            return;
+            return false;
         }
         weight_chunk_alloc * target = nullptr;
         for (auto & wca : weight_chunk_allocators_) {
@@ -18536,11 +18594,11 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             }
         }
         if (!target) {
-            return;
+            return false;
         }
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
         arena_forget_allocation_locked(zone, ptr);
-        arena_unregister_exact(zone, ptr_to_offset(ptr));
         const auto                  chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
         const auto                  p          = reinterpret_cast<uintptr_t>(ptr);
         const size_t                chunk_off  = static_cast<size_t>(p - chunk_base);
@@ -18555,7 +18613,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             t_arena_pp_profile.zone_free_calls[idx]++;
             t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
         }
-        return;
+        return true;
     }
 
     tlsf_allocator * alloc = z.allocator.get();
@@ -18565,17 +18623,17 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
         alloc     = kv.allocator.get();
         if (!alloc) {
-            return;
+            return false;
         }
         // Convert device pointer to zone-relative offset for TLSF.
         size_t arena_offset = ptr_to_offset(ptr);
         if (arena_offset == SIZE_MAX || arena_offset < kv.start || arena_offset >= kv.start + kv.size) {
-            return;
+            return false;
         }
         size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
         arena_forget_allocation_locked(zone, ptr);
-        arena_unregister_exact(zone, arena_offset);
         alloc->free(zone_offset);
         kv.used.store(alloc->used(), std::memory_order_relaxed);
         if (profile_active) {
@@ -18583,22 +18641,22 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             t_arena_pp_profile.zone_free_calls[idx]++;
             t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
         }
-        return;
+        return true;
     }
     if (!alloc) {
-        return;
+        return false;
     }
 
     // Convert device pointer to zone-relative offset for TLSF.
     size_t arena_offset = ptr_to_offset(ptr);
     if (arena_offset == SIZE_MAX || arena_offset < z.start || arena_offset >= z.start + z.size) {
-        return;
+        return false;
     }
     size_t zone_offset = arena_offset - z.start;
 
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
     arena_forget_allocation_locked(zone, ptr);
-    arena_unregister_exact(zone, arena_offset);
     alloc->free(zone_offset);
     z.used.store(alloc->used(), std::memory_order_relaxed);
     if (profile_active) {
@@ -18606,6 +18664,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         t_arena_pp_profile.zone_free_calls[idx]++;
         t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
     }
+    return true;
 }
 
 bool unified_cache::vram_owns(const void * ptr) const {

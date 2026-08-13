@@ -130,18 +130,15 @@ class layer_stream_manager {
     // touch B's working set.
     bool release_if_owner(const layer_stream_owner & owner);
 
-    // Test seam. Installs the buffer bookkeeping a successful allocate_buffers()
-    // followed by two layer loads would leave behind, without a queue and
-    // without a device, so the owner-displacement path can be driven on a
-    // host-only runner. It allocates nothing: the pointers are opaque non-null
-    // tokens the caller owns and they are never dereferenced. Production code
-    // must not call this — allocate_buffers() is the only real installer.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Private host-only installer for the direct-source carrier fixture.
     void test_install_loaded_buffers(int    device,
                                      size_t buffer_size,
                                      void * buffer0,
                                      int    loaded_layer0,
                                      void * buffer1,
                                      int    loaded_layer1);
+#endif
 
   private:
     // Per-weight entry within a layer

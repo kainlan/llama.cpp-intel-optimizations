@@ -153,49 +153,49 @@ class moe_residency_descriptor {
         for (const moe_residency_descriptor_entry & entry : entries_) {
             if (!entry.handle.has_stable_owner_identity()) {
                 last_reject_ = moe_descriptor_reject_reason::INVALID_HANDLE;
-                residency_diagnostics_record_stale_descriptor_invalid_handle_for_test();
+                residency_diagnostics_note_stale_descriptor_invalid_handle();
                 return false;
             }
             if (entry.handle.is_arena() && entry.handle.generation() != entry.generation) {
                 last_reject_ = moe_descriptor_reject_reason::GENERATION_MISMATCH;
-                residency_diagnostics_record_stale_descriptor_generation_mismatch_for_test();
+                residency_diagnostics_note_stale_descriptor_generation_mismatch();
                 return false;
             }
             if (entry.expected_device != mem_handle::HOST_DEVICE && entry.handle.device() != entry.expected_device) {
                 last_reject_ = moe_descriptor_reject_reason::DEVICE_MISMATCH;
-                residency_diagnostics_record_stale_descriptor_device_mismatch_for_test();
+                residency_diagnostics_note_stale_descriptor_device_mismatch();
                 return false;
             }
             resolved_ptr resolved = entry.handle.resolve(entry.expected_device);
             if (!resolved.ptr) {
                 last_reject_ = moe_descriptor_reject_reason::INVALID_HANDLE;
-                residency_diagnostics_record_stale_descriptor_invalid_handle_for_test();
+                residency_diagnostics_note_stale_descriptor_invalid_handle();
                 return false;
             }
             if (entry.handle.stable_identity_hash() != entry.stable_identity_hash) {
                 last_reject_ = moe_descriptor_reject_reason::IDENTITY_MISMATCH;
-                residency_diagnostics_record_stale_descriptor_identity_mismatch_for_test();
+                residency_diagnostics_note_stale_descriptor_identity_mismatch();
                 return false;
             }
             if (entry.expected_device != mem_handle::HOST_DEVICE && !resolved.on_device) {
                 last_reject_ = moe_descriptor_reject_reason::DEVICE_MISMATCH;
-                residency_diagnostics_record_stale_descriptor_device_mismatch_for_test();
+                residency_diagnostics_note_stale_descriptor_device_mismatch();
                 return false;
             }
             if (resolved.layout != entry.expected_layout) {
                 last_reject_ = moe_descriptor_reject_reason::LAYOUT_MISMATCH;
-                residency_diagnostics_record_stale_descriptor_layout_mismatch_for_test();
+                residency_diagnostics_note_stale_descriptor_layout_mismatch();
                 return false;
             }
         }
         return true;
     }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     void replace_retained_handle_for_test(size_t idx, const mem_handle & handle) { entries_.at(idx).handle = handle; }
-
     void override_layout_for_test(size_t idx, ggml_layout_mode layout) { entries_.at(idx).expected_layout = layout; }
-
     void override_generation_for_test(size_t idx, uint64_t generation) { entries_.at(idx).generation = generation; }
+#endif
 
   private:
     std::vector<moe_residency_descriptor_entry> entries_;
@@ -238,7 +238,7 @@ inline moe_residency_preflight_result evaluate_moe_residency_preflight_for_test(
     }
     req.entries.push_back(entry);
 
-    residency_plan plan = evaluate_residency_request_for_test(req, input.budget);
+    residency_plan plan = evaluate_residency_request(req, input.budget);
 
     moe_residency_preflight_result result;
     result.accepted                 = plan.accepted;

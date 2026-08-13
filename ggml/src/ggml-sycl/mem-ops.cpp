@@ -14,19 +14,28 @@
 
 namespace ggml_sycl {
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<uint64_t> g_mem_fill_profile_error_after_submit_count{ 0 };
+static std::atomic<bool>     g_mem_fill_profile_error_after_submit{ false };
 
 uint64_t mem_fill_test_profile_error_after_submit_count() {
     return g_mem_fill_profile_error_after_submit_count.load(std::memory_order_relaxed);
 }
 
+void mem_fill_set_profile_error_after_submit_for_test(bool enabled) {
+    g_mem_fill_profile_error_after_submit.store(enabled, std::memory_order_release);
+}
+
 static void mem_fill_test_profile_error_after_submit() {
-    const char * selected = std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT");
-    if (selected != nullptr && selected[0] != '\0') {
+    if (g_mem_fill_profile_error_after_submit.load(std::memory_order_acquire)) {
         g_mem_fill_profile_error_after_submit_count.fetch_add(1, std::memory_order_relaxed);
         throw std::bad_alloc{};
     }
 }
+#define GGML_SYCL_MEM_FILL_TEST_CHECK() mem_fill_test_profile_error_after_submit()
+#else
+#define GGML_SYCL_MEM_FILL_TEST_CHECK() ((void) 0)
+#endif
 
 static bool resolved_range_contains(const resolved_ptr & resolved, size_t offset, size_t size) {
     if (!resolved.ptr) {
@@ -486,7 +495,7 @@ static sycl::event mem_fill_direct_submit(const mem_handle &               h,
                                                     .count()) :
                           0;
     try {
-        mem_fill_test_profile_error_after_submit();
+        GGML_SYCL_MEM_FILL_TEST_CHECK();
         if (profile_enabled) {
             ggml_sycl_kernel_profile_record_event(
                 profile_label, event, callsite, host_submit_begin_us, host_submit_end_us);

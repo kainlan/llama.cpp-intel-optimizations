@@ -445,6 +445,7 @@ moe_mmid_lease_result moe_mmid_workspace_pool::acquire(uint64_t queue, uint64_t 
     return result;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool moe_mmid_workspace_pool::set_generation_for_test(uint32_t slot, uint64_t generation) noexcept {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (slot >= state_->slots.size() || state_->slots[slot].busy) {
@@ -453,6 +454,7 @@ bool moe_mmid_workspace_pool::set_generation_for_test(uint32_t slot, uint64_t ge
     state_->slots[slot].generation = generation;
     return true;
 }
+#endif
 
 moe_mmid_release_status moe_mmid_workspace_pool::terminal_release(const moe_mmid_workspace_lease & lease,
                                                                   uint64_t                         queue,

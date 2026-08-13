@@ -105,25 +105,42 @@ struct residency_diagnostics_snapshot {
     char     last_live_allocation_class[64]       = {};
 };
 
-residency_plan evaluate_residency_request_for_test(const residency_request & req, const residency_budget & budget);
+// Pure policy evaluation. Diagnostics are recorded only by production callers
+// that publish/use a plan, not by this read-only helper.
+residency_plan evaluate_residency_request(const residency_request & req, const residency_budget & budget);
 
-void                           residency_diagnostics_reset_for_test();
-void                           residency_diagnostics_record_accept_for_test(size_t bytes_requested,
-                                                                            size_t bytes_available,
-                                                                            size_t largest_free_block);
-void                           residency_diagnostics_record_reject_for_test(residency_reject_reason reason,
-                                                                            size_t                  bytes_requested,
-                                                                            size_t                  bytes_available,
-                                                                            size_t                  largest_free_block);
-void                           residency_diagnostics_record_live_handle_for_test(const char * owner_tag,
-                                                                                 const char * allocation_class,
-                                                                                 size_t       bytes);
-void                           residency_diagnostics_record_stale_descriptor_for_test();
-void                           residency_diagnostics_record_stale_descriptor_invalid_handle_for_test();
-void                           residency_diagnostics_record_stale_descriptor_identity_mismatch_for_test();
-void                           residency_diagnostics_record_stale_descriptor_generation_mismatch_for_test();
-void                           residency_diagnostics_record_stale_descriptor_layout_mismatch_for_test();
-void                           residency_diagnostics_record_stale_descriptor_device_mismatch_for_test();
+// Production event sinks and read-only diagnostic snapshot.
+void residency_diagnostics_note_accept(size_t bytes_requested, size_t bytes_available, size_t largest_free_block);
+void residency_diagnostics_note_reject(residency_reject_reason reason, size_t bytes_requested,
+                                       size_t bytes_available, size_t largest_free_block);
+void residency_diagnostics_note_live_handle(const char * owner_tag, const char * allocation_class, size_t bytes);
+void residency_diagnostics_note_stale_descriptor();
+void residency_diagnostics_note_stale_descriptor_invalid_handle();
+void residency_diagnostics_note_stale_descriptor_identity_mismatch();
+void residency_diagnostics_note_stale_descriptor_generation_mismatch();
+void residency_diagnostics_note_stale_descriptor_layout_mismatch();
+void residency_diagnostics_note_stale_descriptor_device_mismatch();
 residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test();
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Mutable diagnostic controls are available only to the private source carrier.
+void residency_diagnostics_reset_for_test();
+void residency_diagnostics_record_accept_for_test(size_t bytes_requested,
+                                                   size_t bytes_available,
+                                                   size_t largest_free_block);
+void residency_diagnostics_record_reject_for_test(residency_reject_reason reason,
+                                                   size_t                  bytes_requested,
+                                                   size_t                  bytes_available,
+                                                   size_t                  largest_free_block);
+void residency_diagnostics_record_live_handle_for_test(const char * owner_tag,
+                                                        const char * allocation_class,
+                                                        size_t       bytes);
+void residency_diagnostics_record_stale_descriptor_for_test();
+void residency_diagnostics_record_stale_descriptor_invalid_handle_for_test();
+void residency_diagnostics_record_stale_descriptor_identity_mismatch_for_test();
+void residency_diagnostics_record_stale_descriptor_generation_mismatch_for_test();
+void residency_diagnostics_record_stale_descriptor_layout_mismatch_for_test();
+void residency_diagnostics_record_stale_descriptor_device_mismatch_for_test();
+#endif
 
 }  // namespace ggml_sycl

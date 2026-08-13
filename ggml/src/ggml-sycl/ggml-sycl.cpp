@@ -26673,7 +26673,7 @@ static void persistent_tg_fill_residency_descriptor(ggml_sycl::moe_layer_persist
 
 static bool persistent_tg_validate_residency_descriptor(const ggml_sycl::moe_layer_persistent_descriptor & descriptor) {
     if (descriptor.residency.retained_handle_count() == 0) {
-        ggml_sycl::residency_diagnostics_record_stale_descriptor_invalid_handle_for_test();
+        ggml_sycl::residency_diagnostics_note_stale_descriptor_invalid_handle();
         return false;
     }
     if (descriptor.residency.validate_for_replay()) {

@@ -747,8 +747,8 @@ static bool arena_shutdown_drains_dma_and_bcs(sycl::queue & q) {
     return true;
 }
 
-static bool arena_destroy_timeout_preserves_authority_for_retry(sycl::queue & q) {
-    TEST_BEGIN("B70_arena_destroy_timeout_preserves_authority_for_retry");
+static bool exact_scratch_shutdown_record_survives_for_retry(sycl::queue & q) {
+    TEST_BEGIN("B50_exact_scratch_shutdown_record_survives_for_retry");
     constexpr size_t mib = 1024ull * 1024ull;
     const size_t max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
     unified_cache cache(q, 64ull * mib, 0, 0, 0);
@@ -769,14 +769,56 @@ static bool arena_destroy_timeout_preserves_authority_for_retry(sycl::queue & q)
     TEST_ASSERT(owner.canonical_extent == 2ull * mib && owner.size == owner.canonical_extent,
                 "scratch fixture returned the wrong exact allocation extent");
 
+    const size_t exact_block_used = cache.zone_used(vram_zone_id::WEIGHT);
     unified_cache_test_set_arena_drain_timeout_ms(10);
-    TEST_ASSERT(!cache.shutdown_resources(), "destroy unexpectedly freed an arena with a retained lease");
+    TEST_ASSERT(!cache.shutdown_resources(), "shutdown unexpectedly freed an exact allocation with a retained lease");
     TEST_ASSERT(cache.arena_active() && cache.chunk_count() > 0,
-                "timed-out destroy discarded physical chunks needed by retry");
+                "refused shutdown discarded physical chunks needed by retry");
+    TEST_ASSERT(cache.scratch_pool_capacity() == 1ull * mib,
+                "refused shutdown discarded scratch allocation geometry");
+    TEST_ASSERT(cache.zone_used(vram_zone_id::WEIGHT) == exact_block_used,
+                "refused shutdown returned the exact TLSF block to the allocator");
+    TEST_ASSERT(retained.resolve(), "refused shutdown removed the exact authority record");
     retained = {};
     unified_cache_test_set_arena_drain_timeout_ms(5000);
     TEST_ASSERT(cache.shutdown_resources(), "destroy retry did not drain the persisted authority");
     TEST_ASSERT(!cache.arena_active(), "successful retry left physical arena chunks live");
+    TEST_PASS();
+    return true;
+}
+
+static bool scratch_regrow_refusal_preserves_exact_record(sycl::queue & q) {
+    TEST_BEGIN("B70_scratch_regrow_refusal_preserves_exact_record");
+    constexpr size_t mib = 1024ull * 1024ull;
+    const size_t max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_PASS();
+        return true;
+    }
+    TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "initial scratch reserve failed");
+    mem_handle external = cache.test_scratch_pool_owner();
+    resolved_ptr old = external.resolve();
+    TEST_ASSERT(old && old.extent == 2ull * mib, "external scratch owner did not resolve exact allocation");
+    const size_t exact_block_used = cache.zone_used(vram_zone_id::WEIGHT);
+
+    TEST_ASSERT(!cache.reserve_scratch_pool(2ull * mib),
+                "scratch regrow replaced an allocation with an external exact lease");
+    TEST_ASSERT(cache.scratch_pool_capacity() == 1ull * mib,
+                "refused regrow published new scratch geometry");
+    TEST_ASSERT(cache.zone_used(vram_zone_id::WEIGHT) == exact_block_used,
+                "refused regrow released or duplicated the TLSF block");
+    TEST_ASSERT(external.resolve().ptr == old.ptr,
+                "refused regrow removed the exact record or changed its pointer");
+    void * still_usable = cache.get_scratch(256);
+    TEST_ASSERT(still_usable != nullptr, "old scratch allocation became unusable after refused regrow");
+    cache.return_scratch(still_usable, 256);
+
+    external = {};
+    TEST_ASSERT(cache.reserve_scratch_pool(2ull * mib), "scratch regrow retry failed after external lease release");
+    TEST_ASSERT(cache.scratch_pool_capacity() == 2ull * mib,
+                "successful regrow did not publish the requested geometry");
+    TEST_ASSERT(cache.shutdown_resources(), "scratch regrow fixture did not shut down cleanly");
     TEST_PASS();
     return true;
 }
@@ -930,7 +972,8 @@ int main(int argc, char ** argv) {
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
     ok &= arena_shutdown_drains_dma_and_bcs(q);
-    ok &= arena_destroy_timeout_preserves_authority_for_retry(q);
+    ok &= exact_scratch_shutdown_record_survives_for_retry(q);
+    ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // The fixture owns a process-global cache, so drain it while q and the SYCL

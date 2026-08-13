@@ -169,7 +169,9 @@ class moe_mmid_workspace_pool {
     moe_mmid_release_status terminal_release(const moe_mmid_workspace_lease & lease,
                                              uint64_t                         queue_identity,
                                              uint64_t                         terminal_epoch) noexcept;
-    bool                    set_generation_for_test(uint32_t slot, uint64_t generation) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    bool set_generation_for_test(uint32_t slot, uint64_t generation) noexcept;
+#endif
 
   private:
     struct state;

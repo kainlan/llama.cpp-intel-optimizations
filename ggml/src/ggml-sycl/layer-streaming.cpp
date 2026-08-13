@@ -251,6 +251,7 @@ void layer_stream_manager::shutdown() {
     owner_gate_.forget();
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void layer_stream_manager::test_install_loaded_buffers(int    device,
                                                        size_t buffer_size,
                                                        void * buffer0,
@@ -265,6 +266,7 @@ void layer_stream_manager::test_install_loaded_buffers(int    device,
     loaded_layers_[0] = loaded_layer0;
     loaded_layers_[1] = loaded_layer1;
 }
+#endif
 
 void layer_stream_manager::register_host_ptr(const char * tensor_name, const void * host_ptr, size_t size) {
     if (!tensor_name || !host_ptr) {

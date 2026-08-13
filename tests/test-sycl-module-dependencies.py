@@ -71,6 +71,12 @@ try:
     if sys.platform == "win32":
         ctypes.WinDLL(str(module))
     else:
+        # Build-tree modules keep ggml-base beside the backend, but an install
+        # RPATH configuration need not make that sibling discoverable. Preload
+        # it by absolute path without weakening eager resolution of the module.
+        base_candidates = sorted(module.parent.glob("libggml-base.*"))
+        if base_candidates:
+            ctypes.CDLL(str(base_candidates[0]), mode=os.RTLD_NOW | os.RTLD_GLOBAL)
         ctypes.CDLL(str(module), mode=os.RTLD_NOW | os.RTLD_LOCAL)
 except OSError as exc:
     raise SystemExit(f"eager dynamic load failed for {module}: {exc}") from exc

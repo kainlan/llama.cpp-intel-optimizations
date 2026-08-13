@@ -99,9 +99,9 @@ def production_contract(
         "address >= begin && address < begin + size",
     )
     mem_fill_needles = (
-        'std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
+        "g_mem_fill_profile_error_after_submit.load(std::memory_order_acquire)",
         "sycl::event event = queue.submit",
-        "mem_fill_test_profile_error_after_submit();",
+        "GGML_SYCL_MEM_FILL_TEST_CHECK();",
         "ggml_sycl_kernel_profile_record_event(",
         "mem_fill profiler bookkeeping failed after accepted submit",
         "begin_retained_handle_publish()",
@@ -661,11 +661,11 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
             "first_profile_label, first_event, merge_callsite,", 1))
     assert not production_contract(
         FATTN, XMX,
-        mem_ops=MEM_OPS.replace('std::getenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT")',
-                                "/* mutation removed fill seam */", 1))
+        mem_ops=MEM_OPS.replace("g_mem_fill_profile_error_after_submit.load(std::memory_order_acquire)",
+                                "false /* mutation removed fill seam */", 1))
     for needle in (
         "sycl::event event = queue.submit",
-        "mem_fill_test_profile_error_after_submit();",
+        "GGML_SYCL_MEM_FILL_TEST_CHECK();",
         "mem_fill profiler bookkeeping failed after accepted submit",
     ):
         mutated_mem_ops = replace_in_section(

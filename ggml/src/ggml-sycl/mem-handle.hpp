@@ -91,6 +91,10 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
         size_t   offset        = 0;
         size_t   extent        = 0;
         uint64_t generation    = 0;
+        // Number of independently admitted canonical leases for this exact
+        // allocation. Copies of one mem_handle share a lease control block,
+        // so they keep this count non-zero until the final copy is destroyed.
+        uint32_t lease_count   = 0;
     };
 
     struct admission {
@@ -120,6 +124,10 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
     // tuple; a logical sibling cannot mint authority over the same bytes.
     bool register_allocation(int allocation_zone, uint64_t allocation_id, size_t offset, size_t extent);
     bool unregister_allocation(int allocation_zone, size_t offset);
+    // Atomically refuse unregistration while this exact allocation has an
+    // admitted lease. This is allocation-specific: leases on sibling records
+    // in the same authority do not block release.
+    bool unregister_allocation_if_unleased(int allocation_zone, uint64_t allocation_id, size_t offset);
     admission acquire_allocation(int allocation_zone, uint64_t expected_generation,
                                  uint64_t expected_allocation_id, size_t offset, size_t extent);
     void * resolve_allocation(int allocation_zone, uint64_t expected_generation,
@@ -131,7 +139,7 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
     size_t terminal_lease_count() const;
 
   private:
-    void release_lease(size_t chunk_index);
+    void release_lease(size_t chunk_index, uint64_t allocation_id);
 };
 
 struct mem_handle_debug_info;

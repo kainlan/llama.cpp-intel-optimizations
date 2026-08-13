@@ -68,15 +68,7 @@ void set_profile_error_after_submit(const char * checkpoint) {
 }
 
 void set_mem_fill_profile_error_after_submit(bool enabled) {
-#if defined(_WIN32)
-    (void) _putenv_s("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT", enabled ? "1" : "");
-#else
-    if (enabled) {
-        (void) setenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT", "1", 1);
-    } else {
-        (void) unsetenv("GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT");
-    }
-#endif
+    ggml_sycl::mem_fill_set_profile_error_after_submit_for_test(enabled);
 }
 
 void require(bool condition, const char * message) {

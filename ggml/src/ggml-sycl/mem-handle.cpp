@@ -237,6 +237,17 @@ bool arena_authority::unregister_allocation(int allocation_zone, size_t offset) 
     return true;
 }
 
+bool arena_authority::unregister_allocation_if_unleased(int allocation_zone, uint64_t allocation_id,
+                                                         size_t offset) {
+    std::lock_guard<std::mutex> guard(mutex);
+    const auto it = std::find_if(allocations.begin(), allocations.end(), [&](const allocation_record & record) {
+        return record.zone_id == allocation_zone && record.allocation_id == allocation_id && record.offset == offset;
+    });
+    if (it == allocations.end() || it->lease_count != 0) return false;
+    allocations.erase(it);
+    return true;
+}
+
 arena_authority::admission arena_authority::acquire_allocation(int allocation_zone, uint64_t expected,
                                                                uint64_t expected_id, size_t offset, size_t extent) {
     std::lock_guard<std::mutex> guard(mutex);
@@ -250,13 +261,15 @@ arena_authority::admission arena_authority::acquire_allocation(int allocation_zo
     void * ptr = nullptr;
     if (!arena_locate_offset(chunks, offset, extent, chunk_index, ptr)) return {};
     if (lease_counts.size() != chunks.size()) lease_counts.resize(chunks.size(), 0);
-    if (lease_counts[chunk_index] == UINT32_MAX) return {};
+    if (lease_counts[chunk_index] == UINT32_MAX || it->lease_count == UINT32_MAX) return {};
 
     auto self = shared_from_this();
-    std::shared_ptr<void> lease(ptr, [self = std::move(self), chunk_index](void *) {
-        self->release_lease(chunk_index);
+    const uint64_t allocation_id = it->allocation_id;
+    std::shared_ptr<void> lease(ptr, [self = std::move(self), chunk_index, allocation_id](void *) {
+        self->release_lease(chunk_index, allocation_id);
     });
     ++lease_counts[chunk_index];
+    ++it->lease_count;
     return { ptr, std::move(lease), *it };
 }
 
@@ -274,10 +287,14 @@ void * arena_authority::resolve_allocation(int allocation_zone, uint64_t expecte
     return arena_locate_offset(chunks, offset, extent, chunk_index, ptr) ? ptr : nullptr;
 }
 
-void arena_authority::release_lease(size_t chunk_index) {
+void arena_authority::release_lease(size_t chunk_index, uint64_t allocation_id) {
     std::lock_guard<std::mutex> guard(mutex);
     if (chunk_index >= lease_counts.size() || lease_counts[chunk_index] == 0) return;
     --lease_counts[chunk_index];
+    const auto allocation = std::find_if(allocations.begin(), allocations.end(), [&](allocation_record & record) {
+        return record.allocation_id == allocation_id;
+    });
+    if (allocation != allocations.end() && allocation->lease_count != 0) --allocation->lease_count;
     if (std::all_of(lease_counts.begin(), lease_counts.end(), [](uint32_t count) { return count == 0; })) {
         leases_drained.notify_all();
     }
@@ -1313,6 +1330,12 @@ mem_handle_debug_info mem_handle::debug_info() const {
 
 mem_handle::~mem_handle() {
     release_lease();
+    // For arena-backed owned_alloc_ handles, unified_free() now refuses while
+    // this exact authority lease exists. Drop the allocation-specific lease
+    // before the alloc_handle deleter attempts zone_free(). Copies share both
+    // control blocks, so only the final owner reaches either terminal action.
+    arena_lease_.reset();
+    owned_alloc_.reset();
 }
 
 // llama.cpp-dyhdl helper: re-acquire a chunk lease when a handle is copied.

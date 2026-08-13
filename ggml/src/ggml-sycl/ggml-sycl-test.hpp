@@ -483,8 +483,10 @@ void test_clear_kv_placement_plan();
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 #endif
-int  test_physical_device_count();
+int test_physical_device_count();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
+#endif
 
 inline ggml_sycl_cache_id test_make_cache_id(const void * tag, uint64_t model_id = 1) {
     ggml_sycl_cache_id id{};

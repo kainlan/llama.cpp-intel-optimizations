@@ -1200,7 +1200,9 @@ void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) n
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
-void   lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
+#endif
 
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.
@@ -1338,9 +1340,10 @@ inline size_t cache_guard_page_size() {
 #endif
 }
 
-// Implemented in unified-cache.cpp. Kept at the allocator boundary so tests
-// exercise actual unordered-map and allocate_shared allocation failures.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Kept at the allocator boundary so private fixtures exercise real map/control-block failures.
 bool cache_guard_allocation_should_fail_for_test() noexcept;
+#endif
 
 template <typename T> struct cache_guard_allocator {
     using value_type = T;
@@ -1350,9 +1353,9 @@ template <typename T> struct cache_guard_allocator {
     template <typename U> cache_guard_allocator(const cache_guard_allocator<U> &) noexcept {}
 
     T * allocate(std::size_t n) {
-        if (cache_guard_allocation_should_fail_for_test()) {
-            throw std::bad_alloc();
-        }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (cache_guard_allocation_should_fail_for_test()) throw std::bad_alloc();
+#endif
         if (!cache_guard_pages_enabled()) {
             return std::allocator<T>{}.allocate(n);
         }
@@ -1561,26 +1564,17 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
-// Deterministic publication/lifecycle test seams.  The legacy hook pauses at
-// the joint-lock commit point; fault phases fail before any visible mutation.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Deterministic publication/lifecycle controls exist only in private fixtures.
 using expert_publication_test_hook = void (*)(void * context);
 void unified_cache_set_expert_publication_test_hook(expert_publication_test_hook hook, void * context);
-
 enum class expert_fault_phase : uint8_t {
-    NONE,
-    SINGLE_AFTER_ALLOC,
-    SINGLE_BEFORE_COMMIT,
-    BULK_AFTER_ALLOC,
-    BULK_BEFORE_COMMIT,
-    HOST_BEFORE_COMMIT,
-    ABORT_BEFORE_RETIRE,
-    GC_READY_EVENT,
-    SHUTDOWN_BEFORE_ARENA_DESTROY,
+    NONE, SINGLE_AFTER_ALLOC, SINGLE_BEFORE_COMMIT, BULK_AFTER_ALLOC, BULK_BEFORE_COMMIT,
+    HOST_BEFORE_COMMIT, ABORT_BEFORE_RETIRE, GC_READY_EVENT, SHUTDOWN_BEFORE_ARENA_DESTROY,
 };
 void unified_cache_fail_next_expert_phase_for_test(expert_fault_phase phase) noexcept;
-// Fail the Nth allocation made through cache_guard_allocator. Zero disables the seam.
-// This exercises the real node/control-block allocator used by publication preparation.
 void unified_cache_fail_expert_allocation_after_for_test(size_t nth) noexcept;
+#endif
 
 enum class expert_resolve_device_policy : uint8_t {
     ANY            = 0,  // Accept any owning device or allowed host tier
@@ -3143,7 +3137,9 @@ class unified_cache {
     // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
     // ptr must have been returned by zone_alloc. No size parameter —
     // TLSF recovers block size from the inline block_header.
-    void zone_free(vram_zone_id zone, void * ptr);
+    // Returns false without unregistering or freeing when the exact allocation
+    // still has an admitted authority lease.
+    bool zone_free(vram_zone_id zone, void * ptr);
 
     // Shared implementation: refuse if the zone (or, for the shared
     // KV+WEIGHT arena, KV specifically) still holds a live allocation,
@@ -3383,6 +3379,7 @@ class unified_cache {
     bool arena_record_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id,
                                         size_t offset, size_t extent,
                                         zone_registry_commit_fn registry_commit, void * registry_context) noexcept;
+    bool arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept;
     void arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id = 0) noexcept;
 
     // Zone incarnation table. The physical-group mutex above is the lifecycle
@@ -3489,8 +3486,13 @@ class unified_cache {
     // Canonical owner for either allocation path. Arena reservations retain
     // the exact allocation-time id/generation/zone/offset/extent capability;
     // direct reservations retain the owning unified_alloc handle.
-    mem_handle         scratch_pool_owner_;
-    mutable std::mutex scratch_pool_mutex_;
+    mem_handle              scratch_pool_owner_;
+    mutable std::mutex      scratch_pool_mutex_;
+    std::condition_variable scratch_pool_cv_;
+    // Canonical owner destruction may run arbitrary allocation teardown and is
+    // therefore performed outside scratch_pool_mutex_. This flag keeps reserve
+    // and shutdown transactions from observing the owner in transit.
+    bool                    scratch_pool_release_in_progress_ = false;
 
     std::array<scratch_pool_region, kScratchPoolRegionCount> scratch_pool_regions_;
     // Per-region (one-epoch) capacity, i.e. the reserve_scratch_pool(pool_bytes)

@@ -116,6 +116,14 @@ if (GGML_BACKEND_DL)
 endif()
 # BUILD_TESTING must never change the ordinary backend object code. Mutable
 # controls are enabled only on direct-source/private object fixtures below.
+if (BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME sycl-unified-private-seams
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-private-seams.py
+                $<TARGET_FILE:ggml-sycl>)
+    set_tests_properties(sycl-unified-private-seams PROPERTIES LABELS "sycl;source-contract;artifact")
+endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
 # contains no SYCL headers, device calls, or GPU fixture dependency.
@@ -288,8 +296,9 @@ if (BUILD_TESTING)
         # The mutable lifecycle controls live only in the private full-source
         # object fixture declared below. The ordinary ggml-sycl DSO remains on
         # ggml's production dependency graph but contributes no test seams.
+        target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE GGML_SYCL_PRIVATE_CARRIER=1)
         target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE
-            ggml ggml-sycl-q1-route-test-objects)
+            ggml-sycl-private-fixtures)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
@@ -1759,8 +1768,9 @@ target_link_options(test-unified-cache-bugs PRIVATE ${SYCL_LINK_ONLY_TEST_OPTION
 target_compile_definitions(test-unified-cache-bugs PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-unified-cache-bugs PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-unified-cache-bugs PRIVATE ggml-sycl-private-fixtures)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -1830,6 +1840,7 @@ target_compile_definitions(test-mem-handle-eviction PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_RETAINED_PUBLICATION_TESTING=1
+    GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
@@ -2434,8 +2445,9 @@ target_link_options(test-tensor-placement PRIVATE "-fsycl")
 target_compile_definitions(test-tensor-placement PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-tensor-placement PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-tensor-placement PRIVATE ggml-sycl-private-fixtures)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-tensor-placement PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -2488,8 +2500,9 @@ foreach(_residency_test
     target_compile_definitions(${_residency_test} PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        GGML_SYCL_PRIVATE_TESTING=1
     )
-    target_link_libraries(${_residency_test} PRIVATE ggml-base ggml ggml-sycl)
+    target_link_libraries(${_residency_test} PRIVATE ggml-sycl-private-fixtures)
     if (IntelSYCL_FOUND)
         target_link_libraries(${_residency_test} PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -4418,6 +4431,7 @@ add_executable(test-moe-mmid-workspace-plan
 target_include_directories(test-moe-mmid-workspace-plan PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test-moe-mmid-workspace-plan PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
 target_link_libraries(test-moe-mmid-workspace-plan PRIVATE Threads::Threads)
 set_target_properties(test-moe-mmid-workspace-plan PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -4602,8 +4616,9 @@ target_link_options(test-layer-stream-owner-lifecycle PRIVATE ${SYCL_LINK_ONLY_T
 target_compile_definitions(test-layer-stream-owner-lifecycle PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE ggml-sycl-private-fixtures)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -4674,28 +4689,42 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1
         GGML_SYCL_PRIVATE_TESTING=1)
 
+    add_library(ggml-sycl-private-fixtures INTERFACE)
+    target_link_libraries(ggml-sycl-private-fixtures INTERFACE
+        $<TARGET_OBJECTS:ggml-sycl-q1-route-test-objects>)
+    foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_LIBRARIES)
+        get_target_property(_value ggml-sycl-q1-route-test-objects ${_property})
+        if (_value AND NOT _value STREQUAL "_value-NOTFOUND")
+            if (_property STREQUAL "INCLUDE_DIRECTORIES")
+                target_include_directories(ggml-sycl-private-fixtures INTERFACE ${_value})
+            elseif (_property STREQUAL "COMPILE_DEFINITIONS")
+                target_compile_definitions(ggml-sycl-private-fixtures INTERFACE ${_value})
+            elseif (_property STREQUAL "COMPILE_OPTIONS")
+                target_compile_options(ggml-sycl-private-fixtures INTERFACE ${_value})
+            elseif (_property STREQUAL "LINK_OPTIONS")
+                target_link_options(ggml-sycl-private-fixtures INTERFACE ${_value})
+            elseif (_property STREQUAL "LINK_LIBRARIES")
+                target_link_libraries(ggml-sycl-private-fixtures INTERFACE ${_value})
+            endif()
+        endif()
+    endforeach()
+    target_include_directories(ggml-sycl-private-fixtures INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR})
+    target_compile_definitions(ggml-sycl-private-fixtures INTERFACE
+        GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1
+        GGML_SYCL_PRIVATE_TESTING=1)
+
     add_executable(test-sycl-q1-nvfp4-admitted-device
         tests/test-q1-nvfp4-admitted-device.cpp)
     target_include_directories(test-sycl-q1-nvfp4-admitted-device PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
-    target_compile_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE "-fsycl")
-    get_target_property(_q1_route_link_options ggml-sycl LINK_OPTIONS)
-    if (_q1_route_link_options AND NOT _q1_route_link_options STREQUAL "_q1_route_link_options-NOTFOUND")
-        target_link_options(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_options})
-    endif()
     target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE
-        ggml-sycl-q1-route-test-objects)
-    # Derive the complete dependency closure (ggml base/CPU, oneDNN, oneMKL,
-    # oneCCL and the selected SYCL runtime) from the canonical backend. Do not
-    # link ggml-sycl itself: that would introduce a second backend implementation
-    # beside the private object variant and defeat seam isolation.
-    get_target_property(_q1_route_link_libraries ggml-sycl LINK_LIBRARIES)
-    if (_q1_route_link_libraries AND NOT _q1_route_link_libraries STREQUAL "_q1_route_link_libraries-NOTFOUND")
-        target_link_libraries(test-sycl-q1-nvfp4-admitted-device PRIVATE ${_q1_route_link_libraries})
-    endif()
+        ggml-sycl-private-fixtures)
     set_target_properties(test-sycl-q1-nvfp4-admitted-device PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-q1-nvfp4-admitted-device COMMAND test-sycl-q1-nvfp4-admitted-device)

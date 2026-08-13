@@ -907,7 +907,7 @@ checks = {
         (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
     "runtime wrapper uses private seam object only for static test builds":
         "target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})" in sycl_cmake
-        and "ggml ggml-sycl-q1-route-test-objects" in sycl_cmake
+        and "ggml-sycl-private-fixtures" in sycl_cmake
         and "GGML_SYCL_PRIVATE_TESTING=1" in sycl_cmake
         and "ordinary ggml-sycl DSO remains" in sycl_cmake,
     "registry builtins initialize after object construction": "ggml_backend_registry() = default" in registry_backend

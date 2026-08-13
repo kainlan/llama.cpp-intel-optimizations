@@ -748,6 +748,8 @@ int main() {
         std::fprintf(stderr, "failed to seed global runtime/pinned owner fixture\n");
         return 1;
     }
+    size_t measured_cache_drop = 0;
+#if defined(GGML_SYCL_PRIVATE_CARRIER)
     auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_allocate_predictor_scores"));
     if (!allocate_predictor_scores || !allocate_predictor_scores()) {
@@ -763,7 +765,8 @@ int main() {
                      free_before_cache, free_with_cache);
         return 1;
     }
-    const size_t measured_cache_drop = free_before_cache - free_with_cache;
+    measured_cache_drop = free_before_cache - free_with_cache;
+#endif
     auto saved_model_load_begin = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_begin)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
     auto saved_host_compute = reinterpret_cast<decltype(&ggml_backend_sycl_host_compute_buffer_type)>(
