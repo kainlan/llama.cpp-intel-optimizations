@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -1553,11 +1554,23 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
-// Deterministic test seam invoked while both expert publication locks are held,
-// after canonical insertion and before direct-mirror insertion. Production
-// callers leave it null.
+// Deterministic publication/lifecycle test seams.  The legacy hook pauses at
+// the joint-lock commit point; fault phases fail before any visible mutation.
 using expert_publication_test_hook = void (*)(void * context);
 void unified_cache_set_expert_publication_test_hook(expert_publication_test_hook hook, void * context);
+
+enum class expert_fault_phase : uint8_t {
+    NONE,
+    SINGLE_AFTER_ALLOC,
+    SINGLE_BEFORE_COMMIT,
+    BULK_AFTER_ALLOC,
+    BULK_BEFORE_COMMIT,
+    HOST_BEFORE_COMMIT,
+    ABORT_BEFORE_RETIRE,
+    GC_READY_EVENT,
+    SHUTDOWN_BEFORE_ARENA_DESTROY,
+};
+void unified_cache_fail_next_expert_phase_for_test(expert_fault_phase phase) noexcept;
 
 enum class expert_resolve_device_policy : uint8_t {
     ANY            = 0,  // Accept any owning device or allowed host tier
@@ -2636,6 +2649,9 @@ class unified_cache {
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
     bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
     uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
+    size_t   retired_pending_count_for_test() const noexcept {
+        return retired_pending_count_.load(std::memory_order_acquire);
+    }
 
     void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
     void note_model_load_abort(uint64_t load_txn_id);
@@ -3174,6 +3190,13 @@ class unified_cache {
         sycl::event       event;
     };
 
+    using entry_map = std::unordered_map<
+        unified_cache_key,
+        unified_cache_entry,
+        unified_cache_key_hash,
+        std::equal_to<unified_cache_key>,
+        detail::cache_guard_allocator<std::pair<const unified_cache_key, unified_cache_entry>>>;
+
     // Compute eviction score: higher = more valuable (keep longer)
     // score = access_count * exp(-decay * age)
     float compute_score(const unified_cache_entry & entry) const;
@@ -3192,6 +3215,9 @@ class unified_cache {
     // internal cache mutations call the locked form to avoid recursive locking.
     void        process_deferred_frees_locked();
     size_t      finalize_retired_entries_locked();
+    bool        transition_to_retired_locked(unified_cache_entry & entry) noexcept;
+    entry_map::iterator erase_entry_locked(entry_map::iterator it) noexcept;
+    size_t              erase_entry_locked(const unified_cache_key & key) noexcept;
     void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
     void        enqueue_deferred_free(void * ptr, size_t size);
     void        enqueue_deferred_free(const managed_alloc_ref & handle);
@@ -3232,12 +3258,7 @@ class unified_cache {
     std::atomic<int>             evictions_in_flight_{ 0 };     // Count of EVICTING entries
 
     // Cache storage: (identity, type, layer/expert) -> entry
-    std::unordered_map<unified_cache_key,
-                       unified_cache_entry,
-                       unified_cache_key_hash,
-                       std::equal_to<unified_cache_key>,
-                       detail::cache_guard_allocator<std::pair<const unified_cache_key, unified_cache_entry>>>
-        entries_;
+    entry_map entries_;
     std::unordered_map<ggml_sycl_cache_id, unified_cache_key, detail::cache_id_hash, detail::cache_id_equal_fn>
         id_to_key_;
 

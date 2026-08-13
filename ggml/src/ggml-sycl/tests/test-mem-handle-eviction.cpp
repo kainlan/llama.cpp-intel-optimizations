@@ -473,6 +473,13 @@ static bool test_expert_retirement_with_live_lease(sycl::queue & q) {
     const auto retired = cache.retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-live-lease");
     TEST_ASSERT(retired == ggml_sycl::expert_retire_status::DEFERRED,
                 "live lease retirement should defer reclamation");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1,
+                "false->true retirement must increment pending exactly once");
+    TEST_ASSERT(cache.retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-idempotent-retire") ==
+                    ggml_sycl::expert_retire_status::DEFERRED,
+                "repeat retirement should remain deferred");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1,
+                "repeat retirement must not double-count pending entries");
 
     ggml_sycl::expert_resolve_request request{};
     request.key              = key;
@@ -483,6 +490,8 @@ static bool test_expert_retirement_with_live_lease(sycl::queue & q) {
     old_lease = {};
     cache.process_deferred_frees_public();
     TEST_ASSERT(cache.lookup_expert(key) == nullptr, "retired expert survived final lease release");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0,
+                "retirement finalization did not balance the pending counter");
     sycl::free(src_host, q);
 
     TEST_PASS();
@@ -562,7 +571,129 @@ static bool test_expert_publication_retirement_linearization(sycl::queue & q) {
 }
 
 // =============================================================================
-// Test 7: failed retained publication leaves the caller's ticket active until
+// Test 7: host publication commit failure is all-or-nothing.
+// =============================================================================
+static bool test_host_publication_fault_is_transactional(sycl::queue & q) {
+    TEST_BEGIN("host_publication_fault_is_transactional");
+
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    std::vector<uint8_t>     bytes(4096, 0x44);
+    const auto key = make_test_cache_id(707, 8, bytes.size());
+
+    ggml_sycl::unified_cache_fail_next_expert_phase_for_test(
+        ggml_sycl::expert_fault_phase::HOST_BEFORE_COMMIT);
+    TEST_ASSERT(!cache.register_host_expert(key, bytes.data(), bytes.size(), GGML_LAYOUT_AOS),
+                "faulted host publisher unexpectedly committed");
+    ggml_sycl::expert_resolve_request request{};
+    request.key              = key;
+    request.requested_layout = GGML_LAYOUT_AOS;
+    TEST_ASSERT(!cache.resolve_expert(request), "faulted host publisher leaked canonical state");
+    TEST_ASSERT(cache.lookup_expert(key) == nullptr, "faulted host publisher leaked direct mirror");
+    TEST_ASSERT(cache.validate(), "faulted host publisher left inconsistent maps");
+
+    TEST_ASSERT(cache.register_host_expert(key, bytes.data(), bytes.size(), GGML_LAYOUT_AOS),
+                "host publisher did not recover after one-shot fault");
+    TEST_ASSERT(cache.resolve_expert(request), "successful retry was not discoverable");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 8: every device publication fault before the commit point leaves both
+// indices empty, releases/defer-releases backing, and permits a clean retry.
+// =============================================================================
+static bool test_device_publication_fault_phases(sycl::queue & q) {
+    TEST_BEGIN("device_publication_fault_phases");
+
+    constexpr size_t bytes = 4096;
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    void * src = sycl::malloc_host(bytes * 2, q);
+    TEST_ASSERT(src != nullptr, "malloc_host for fault phases failed");
+    std::memset(src, 0x61, bytes * 2);
+
+    const ggml_sycl::expert_fault_phase single_phases[] = {
+        ggml_sycl::expert_fault_phase::SINGLE_AFTER_ALLOC,
+        ggml_sycl::expert_fault_phase::SINGLE_BEFORE_COMMIT,
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        const auto key = make_test_cache_id(710 + i, 20 + i, bytes);
+        ggml_sycl::unified_cache_fail_next_expert_phase_for_test(single_phases[i]);
+        const auto failed = cache.direct_stage_expert(
+            key, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+        TEST_ASSERT(!failed.ok, "faulted single publication committed");
+        TEST_ASSERT(cache.lookup_expert(key) == nullptr, "faulted single publication leaked a mirror");
+        TEST_ASSERT(cache.register_host_expert(key, src, bytes, GGML_LAYOUT_AOS),
+                    "single publication did not recover after fault");
+    }
+
+    const ggml_sycl::expert_fault_phase bulk_phases[] = {
+        ggml_sycl::expert_fault_phase::BULK_AFTER_ALLOC,
+        ggml_sycl::expert_fault_phase::BULK_BEFORE_COMMIT,
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        std::vector<ggml_sycl_cache_id> keys{
+            make_test_cache_id(720 + i * 2, 30 + i * 2, bytes),
+            make_test_cache_id(721 + i * 2, 31 + i * 2, bytes),
+        };
+        ggml_sycl::unified_cache_fail_next_expert_phase_for_test(bulk_phases[i]);
+        const auto failed = cache.direct_stage_expert_tensor(
+            keys, src, bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+        TEST_ASSERT(!failed.ok, "faulted bulk publication committed");
+        TEST_ASSERT(cache.lookup_expert(keys[0]) == nullptr && cache.lookup_expert(keys[1]) == nullptr,
+                    "faulted bulk publication leaked a mirror");
+    }
+
+    const auto duplicate = make_test_cache_id(730, 40, bytes);
+    std::vector<ggml_sycl_cache_id> duplicates{ duplicate, duplicate };
+    TEST_ASSERT(!cache.direct_stage_expert_tensor(
+                     duplicates, src, bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr).ok,
+                "bulk publication accepted duplicate keys");
+    TEST_ASSERT(cache.lookup_expert(duplicate) == nullptr, "duplicate bulk request partially published");
+
+    q.wait_and_throw();
+    cache.process_deferred_frees_public();
+    TEST_ASSERT(cache.validate(), "device fault phases left inconsistent bookkeeping");
+    sycl::free(src, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 9: a ready-event status query exception is unknown and therefore keeps
+// retired backing deferred until a later successful query proves completion.
+// =============================================================================
+static bool test_retired_status_query_failure_is_deferred(sycl::queue & q) {
+    TEST_BEGIN("retired_status_query_failure_is_deferred");
+
+    constexpr size_t bytes = 4096;
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    void * src = sycl::malloc_host(bytes, q);
+    TEST_ASSERT(src != nullptr, "malloc_host for GC status test failed");
+    const auto key = make_test_cache_id(740, 50, bytes);
+    auto staged = cache.direct_stage_expert(
+        key, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+    TEST_ASSERT(staged.ok, "GC status test stage failed");
+
+    ggml_sycl::unified_cache_fail_next_expert_phase_for_test(
+        ggml_sycl::expert_fault_phase::GC_READY_EVENT);
+    TEST_ASSERT(cache.retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-status-query") ==
+                    ggml_sycl::expert_retire_status::DEFERRED,
+                "status-query failure was incorrectly treated as terminal");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1,
+                "status-query failure released retired backing");
+
+    staged.event.wait_and_throw();
+    cache.process_deferred_frees_public();
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0,
+                "retired backing was not reclaimed after terminal proof");
+    sycl::free(src, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 10: failed retained publication leaves the caller's ticket active until
 // the exact submission queue has drained. A concurrent graph-boundary drain
 // must observe that ticket throughout the failure cleanup window.
 // =============================================================================
@@ -669,6 +800,9 @@ int main(int argc, char ** argv) {
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
     all_passed &= test_expert_retirement_with_live_lease(q);
     all_passed &= test_expert_publication_retirement_linearization(q);
+    all_passed &= test_host_publication_fault_is_transactional(q);
+    all_passed &= test_device_publication_fault_phases(q);
+    all_passed &= test_retired_status_query_failure_is_deferred(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");

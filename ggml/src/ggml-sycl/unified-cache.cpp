@@ -705,6 +705,7 @@ static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 static std::atomic<bool>     g_test_fail_next_arena_free{ false };
+static bool fail_expert_phase(expert_fault_phase phase) noexcept;
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
@@ -3048,6 +3049,30 @@ bool unified_cache::shutdown_resources() {
         return true;
     }
 
+    // Direct mirrors are leases on canonical entries.  Detach them first and
+    // destroy the handles with no map lock held, while canonical entries and
+    // the arena they reference are still alive.
+    std::vector<std::shared_ptr<mem_handle>> mirror_handles;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+        try {
+            mirror_handles.reserve(direct_weight_entries_.size() + direct_expert_entries_.size());
+        } catch (...) {
+            // Shutdown is retryable; do not begin detachment unless all
+            // bookkeeping storage is already available.
+            return false;
+        }
+        for (auto & pair : direct_weight_entries_) {
+            if (pair.second.handle) mirror_handles.push_back(std::move(pair.second.handle));
+        }
+        for (auto & pair : direct_expert_entries_) {
+            if (pair.second.handle) mirror_handles.push_back(std::move(pair.second.handle));
+        }
+        direct_weight_entries_.clear();
+        direct_expert_entries_.clear();
+    }
+    mirror_handles.clear();
+
     // Check arena state before destroying anything.
     const bool had_arena = arena_active();
 
@@ -3153,6 +3178,19 @@ bool unified_cache::shutdown_resources() {
         }
     }
     persistent_scratches_.clear();
+
+    // Canonical entry destructors may release shared bulk-allocation owners;
+    // run them before arena_destroy(), after their mirror leases are gone.
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        GGML_ASSERT(it->second.in_use_count.load() == 0 &&
+                    "cache shutdown with an external weight lease");
+        it = erase_entry_locked(it);
+    }
+    id_to_key_.clear();
+
+    if (fail_expert_phase(expert_fault_phase::SHUTDOWN_BEFORE_ARENA_DESTROY)) {
+        return false;
+    }
 
     // Destroy the VRAM arena (frees the pre-allocated chunks). A failed free
     // keeps the cache object and chunk registration intact for unload retry.
@@ -4268,6 +4306,17 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
 static bool moe_direct_trace_enabled();
 static std::atomic<expert_publication_test_hook> g_expert_publication_test_hook{ nullptr };
 static std::atomic<void *> g_expert_publication_test_context{ nullptr };
+static std::atomic<expert_fault_phase> g_expert_fault_phase{ expert_fault_phase::NONE };
+
+void unified_cache_fail_next_expert_phase_for_test(expert_fault_phase phase) noexcept {
+    g_expert_fault_phase.store(phase, std::memory_order_release);
+}
+
+static bool fail_expert_phase(expert_fault_phase phase) noexcept {
+    expert_fault_phase expected = phase;
+    return g_expert_fault_phase.compare_exchange_strong(expected, expert_fault_phase::NONE,
+                                                         std::memory_order_acq_rel);
+}
 
 void unified_cache_set_expert_publication_test_hook(expert_publication_test_hook hook, void * context) {
     g_expert_publication_test_context.store(context, std::memory_order_release);
@@ -4438,8 +4487,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         const sycl::context & ctx   = queue->get_context();
         sycl::usm::alloc      atype = sycl::get_pointer_type(src_ptr, ctx);
 
-        void *         host_ptr = nullptr;
-        cache_location loc      = cache_location::HOST_MMAP;
+        void *         host_ptr      = nullptr;
+        bool           host_allocated = false;
+        cache_location loc           = cache_location::HOST_MMAP;
 
         if (atype == sycl::usm::alloc::host) {
             host_ptr = const_cast<void *>(src_ptr);
@@ -4447,6 +4497,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         } else {
             host_ptr = host_zone_alloc(host_zone_id::WEIGHT, src_size, 256);
             if (host_ptr) {
+                host_allocated = true;
                 mem_handle dst_handle = make_copy_handle_for_raw_ptr(host_ptr, GGML_LAYOUT_AOS, cache_device, src_size);
                 mem_handle src_handle =
                     make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
@@ -4486,6 +4537,24 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.pool_allocated   = false;
             entry.last_write_event = {};
             entry.has_write_event  = false;
+            auto old = entries_.find(cache_key);
+            if (old != entries_.end()) {
+                // Host fallback obeys the same replacement policy as device
+                // publication.  In particular, never overwrite a live or
+                // retired canonical entry merely because device allocation
+                // failed.
+                if (old->second.device_ptr != host_ptr || old->second.size != src_size ||
+                    old->second.layout != GGML_LAYOUT_AOS) {
+                    if (!can_replace_cache_entry_locked(cache_key, old->second,
+                                                        "direct_stage_expert/host-fallback")) {
+                        if (host_allocated) {
+                            host_zone_free(host_zone_id::WEIGHT, host_ptr);
+                        }
+                        return result;
+                    }
+                    release_entry_allocation_locked(old->second);
+                }
+            }
             stamp_pending_owner(entry, load_effect_guard);
             entries_[cache_key]    = entry;
             auto & stored          = entries_[cache_key];
@@ -4552,6 +4621,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         ptr = nullptr;
     };
 
+    if (fail_expert_phase(expert_fault_phase::SINGLE_AFTER_ALLOC)) {
+        release_unpublished_ptr();
+        return result;
+    }
+
     // 2. Fill: reorder or plain memcpy. Source readiness is part of the
     // submission rather than a host-side wait, preserving DMA overlap.
     mem_handle dst_handle =
@@ -4594,6 +4668,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     sycl::event last_event = fill_event;
     if (dst_size > src_size && !fill_fn) {
         last_event = mem_fill_async(dst_handle, src_size, 0, dst_size - src_size, *queue, { fill_event });
+    }
+
+    if (fail_expert_phase(expert_fault_phase::SINGLE_BEFORE_COMMIT)) {
+        defer_unpublished_ptr_until_event(last_event);
+        return result;
     }
 
     // 4. Publish canonical cache entry and direct mirror as one transaction.
@@ -4699,10 +4778,16 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         GGML_LOG_ERROR("[DIRECT-STAGE] null queue for tensor-bulk expert staging\n");
         return result;
     }
-    for (const ggml_sycl_cache_id & key : keys) {
-        if (!key.valid) {
-            return result;
+    std::unordered_set<ggml_sycl_cache_id, detail::cache_id_hash, detail::cache_id_equal_fn> unique_keys;
+    try {
+        unique_keys.reserve(keys.size());
+        for (const ggml_sycl_cache_id & key : keys) {
+            if (!key.valid || !unique_keys.insert(key).second) {
+                return result;
+            }
         }
+    } catch (...) {
+        return result;
     }
 
     const size_t expert_count = keys.size();
@@ -4791,6 +4876,11 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         ptr = nullptr;
     };
 
+    if (fail_expert_phase(expert_fault_phase::BULK_AFTER_ALLOC)) {
+        release_unpublished_ptr();
+        return result;
+    }
+
     sycl::event fill_event;
     try {
         if (fill_fn) {
@@ -4833,6 +4923,11 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         allocation_base = nullptr;
         ptr             = nullptr;
     };
+
+    if (fail_expert_phase(expert_fault_phase::BULK_BEFORE_COMMIT)) {
+        defer_unpublished_bulk_until_event();
+        return result;
+    }
 
     if (out_handles) {
         out_handles->clear();
@@ -5431,7 +5526,7 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
                         has_evictions_.store(true, std::memory_order_release);
                     }
 
-                    entries_.erase(it);
+                    erase_entry_locked(it);
                     cache_generation_bump();
                     dropped_any = true;
                     if (moe_direct_trace_enabled()) {
@@ -5527,10 +5622,8 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
                 !detail::cache_id_equal(pair.first.id, key)) {
                 continue;
             }
-            if (!pair.second.retired) {
-                pair.second.retired = true;
+            if (transition_to_retired_locked(pair.second)) {
                 retired_count++;
-                retired_pending_count_.fetch_add(1, std::memory_order_release);
             }
             remap_or_erase_id_mapping_locked(key, pair.first);
         }
@@ -5638,7 +5731,7 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
                     has_evictions_.store(true, std::memory_order_release);
                 }
                 remap_or_erase_id_mapping_locked(key, ckey);
-                entries_.erase(it);
+                erase_entry_locked(it);
                 dropped++;
             }
         }
@@ -5687,6 +5780,10 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         }
     }
 
+    if (fail_expert_phase(expert_fault_phase::HOST_BEFORE_COMMIT)) {
+        return false;
+    }
+
     std::shared_ptr<mem_handle> direct_handle;
     std::shared_ptr<mem_handle> replaced_direct_handle;
     bool                        cache_inserted = false;
@@ -5727,9 +5824,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_expert")) {
                 return false;
             }
-            entries_.erase(old);
+            erase_entry_locked(old);
         }
-        unified_cache_entry cache_entry{};
         cache_entry.device_ptr       = ptr;
         cache_entry.src_ptr          = ptr;
         cache_entry.content_hash     = 0;
@@ -5778,7 +5874,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                 *out_handle = {};
             }
             direct_handle.reset();
-            entries_.erase(cache_key);
+            erase_entry_locked(cache_key);
             return false;
         }
 
@@ -5805,11 +5901,10 @@ publish_host_expert_direct:
         if (!cache_inserted) {
             return false;
         }
-        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
-        unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        unified_cache_key cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
         auto                                it = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr == ptr) {
-            entries_.erase(it);
+            erase_entry_locked(it);
         }
         auto id = id_to_key_.find(key);
         if (id != id_to_key_.end() && id->second == cache_key) {
@@ -5882,7 +5977,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
             if (!can_replace_cache_entry_locked(cache_key, old->second, "register_host_weight")) {
                 return false;
             }
-            entries_.erase(old);
+            erase_entry_locked(old);
         }
         unified_cache_entry cache_entry{};
         cache_entry.device_ptr       = ptr;
@@ -5932,7 +6027,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
                 *out_handle = {};
             }
             direct_handle.reset();
-            entries_.erase(cache_key);
+            erase_entry_locked(cache_key);
             return false;
         }
     }
@@ -5960,7 +6055,7 @@ publish_host_weight_direct:
         unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
         auto                                it = entries_.find(cache_key);
         if (it != entries_.end() && it->second.device_ptr == ptr) {
-            entries_.erase(it);
+            erase_entry_locked(it);
         }
         auto id = id_to_key_.find(key);
         if (id != id_to_key_.end() && id->second == cache_key) {
@@ -6289,7 +6384,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                     layer_id, expert_id, (int) entry.layout, (int) layout, entry.size, entry.pinned ? 1 : 0,
                     (int) entry.state);
         }
-        entries_.erase(it);
+        erase_entry_locked(it);
     }
 
     if (!reserved_entry.has_retention_identity()) {
@@ -7399,7 +7494,7 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
                 (int) it->second.state);
     }
     remap_or_erase_id_mapping_locked(key_id, key);
-    entries_.erase(it);
+    erase_entry_locked(it);
 }
 
 // NOTE: mark_reordered/is_reordered removed - reorder state tracked in tensor->extra->optimized_feature
@@ -8166,7 +8261,7 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
         }
 
         // Remove from entries — invalidates iterator, must not dereference `it` after this
-        entries_.erase(it);
+        erase_entry_locked(it);
 
         // Bump generation so all mem_handles see that pointers may have moved.
         // Coverage: see tests/test-mem-handle-eviction.cpp.
@@ -8245,7 +8340,7 @@ size_t unified_cache::finalize_evictions_locked() {
     // Remove finalized entries
     for (const auto & key : finalized_keys) {
         remap_or_erase_id_mapping_locked(key.id, key);
-        entries_.erase(key);
+        erase_entry_locked(key);
         evictions_in_flight_--;
     }
 
@@ -8639,57 +8734,76 @@ void unified_cache::defer_host_free(void * ptr, size_t size, const sycl::event &
     enqueue_deferred_host_free(ptr, size, event);
 }
 
-size_t unified_cache::finalize_retired_entries_locked() {
-    std::vector<unified_cache_key> finalized;
-    finalized.reserve(16);
+bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {
+    if (entry.retired) {
+        return false;
+    }
+    entry.retired = true;
+    retired_pending_count_.fetch_add(1, std::memory_order_release);
+    return true;
+}
 
-    for (auto & pair : entries_) {
-        unified_cache_entry & entry = pair.second;
-        if (!entry.retired) {
+unified_cache::entry_map::iterator unified_cache::erase_entry_locked(entry_map::iterator it) noexcept {
+    if (it->second.retired) {
+        const size_t previous = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
+        GGML_ASSERT(previous != 0 && "retired entry erased without matching retirement count");
+    }
+    return entries_.erase(it);
+}
+
+size_t unified_cache::erase_entry_locked(const unified_cache_key & key) noexcept {
+    auto it = entries_.find(key);
+    if (it == entries_.end()) {
+        return 0;
+    }
+    (void) erase_entry_locked(it);
+    return 1;
+}
+
+size_t unified_cache::finalize_retired_entries_locked() {
+    size_t finalized = 0;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        unified_cache_entry & entry = it->second;
+        if (!entry.retired || entry.in_use_count.load() != 0 || entry.state == cache_entry_state::EVICTING) {
+            ++it;
             continue;
         }
-        const uint32_t live = entry.in_use_count.load();
-        if (live != 0) {
-            residency_diagnostics_record_live_handle_for_test("finalize-retired-entry", "WEIGHT", entry.size);
-            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
-                                                         zone_available(vram_zone_id::WEIGHT),
-                                                         zone_largest_free(vram_zone_id::WEIGHT));
-            continue;
-        }
-        if (entry.state == cache_entry_state::IN_PROGRESS) {
-            if (entry.has_ready_event && event_complete(entry.ready_event)) {
-                entry.state           = cache_entry_state::READY;
-                entry.has_ready_event = false;
-            } else {
+        if (entry.state == cache_entry_state::IN_PROGRESS && entry.has_ready_event) {
+            bool complete = false;
+            try {
+                if (fail_expert_phase(expert_fault_phase::GC_READY_EVENT)) {
+                    throw std::runtime_error("deterministic retired ready-event query failure");
+                }
+                complete = entry.ready_event.get_info<sycl::info::event::command_execution_status>() ==
+                           sycl::info::event_command_status::complete;
+            } catch (...) {
+                // A status-query failure is unknown, not evidence that the
+                // command is terminal.  Keep the allocation until a later
+                // query succeeds (or shutdown has separately drained queue_).
+                ++it;
                 continue;
             }
-        }
-        if (entry.state == cache_entry_state::EVICTING) {
-            continue;
+            if (!complete) {
+                ++it;
+                continue;
+            }
+            entry.state           = cache_entry_state::READY;
+            entry.has_ready_event = false;
         }
 
         release_entry_allocation_locked(entry);
         if (!entry.storage_owner && entry.device_ptr && !entry.host_resident) {
             has_evictions_.store(true, std::memory_order_release);
         }
-        finalized.push_back(pair.first);
-    }
-
-    if (finalized.empty()) {
-        return 0;
-    }
-
-    // Exact retirement erased the direct mirror at its joint-lock
-    // linearization point. Finalization therefore needs only rw_mutex_ and
-    // never nests direct_stage_mutex_, avoiding rw->direct inversion.
-    for (const unified_cache_key & key : finalized) {
+        const unified_cache_key key = it->first;
         remap_or_erase_id_mapping_locked(key.id, key);
-        entries_.erase(key);
+        it = erase_entry_locked(it);
+        ++finalized;
     }
-    const size_t previous = retired_pending_count_.fetch_sub(finalized.size(), std::memory_order_acq_rel);
-    GGML_ASSERT(previous >= finalized.size());
-    cache_generation_bump();
-    return finalized.size();
+    if (finalized != 0) {
+        cache_generation_bump();
+    }
+    return finalized;
 }
 
 void unified_cache::process_deferred_frees_public() {
@@ -9138,53 +9252,61 @@ uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml
 }
 
 void unified_cache::note_model_load_abort(uint64_t load_txn_id) {
-    // End admission has already drained producers. Drop direct leases before
-    // erasing their canonical cache entries so no mem_handle can dangle.
+    if (fail_expert_phase(expert_fault_phase::ABORT_BEFORE_RETIRE)) {
+        return;
+    }
+
+    // Withdraw mirrors and mark unowned canonical entries under the same lock
+    // pair used by publication.  Mirror handles are moved, not destroyed,
+    // while locked: their release path touches canonical lease accounting.
+    std::vector<std::shared_ptr<mem_handle>> released_mirror_handles;
     {
-        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
-        for (auto it = direct_expert_entries_.begin(); it != direct_expert_entries_.end();) {
-            it = it->second.pending_load_txn_id == load_txn_id ? direct_expert_entries_.erase(it) : std::next(it);
+        // Admission is drained before abort, so this snapshot is an upper
+        // bound. Reserve before mutation: push_back below is then nonthrowing.
+        std::shared_lock<std::shared_mutex> direct_read(direct_stage_mutex_);
+        try {
+            released_mirror_handles.reserve(direct_expert_entries_.size() + direct_weight_entries_.size());
+        } catch (...) {
+            return;
         }
-        for (auto it = direct_weight_entries_.begin(); it != direct_weight_entries_.end();) {
-            it = it->second.pending_load_txn_id == load_txn_id ? direct_weight_entries_.erase(it) : std::next(it);
+    }
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+
+        auto withdraw = [&](auto & table) {
+            for (auto it = table.begin(); it != table.end();) {
+                if (it->second.pending_load_txn_id != load_txn_id) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.handle) {
+                    released_mirror_handles.push_back(std::move(it->second.handle));
+                }
+                it = table.erase(it);
+            }
+        };
+        withdraw(direct_expert_entries_);
+        withdraw(direct_weight_entries_);
+
+        for (auto & pair : entries_) {
+            auto & entry = pair.second;
+            if (entry.pending_load_txn_id != load_txn_id) {
+                continue;
+            }
+            entry.pending_load_txn_id = 0;
+            if (entry.owner_mask != 0) {
+                continue; // shared/pre-existing ownership survives the abort
+            }
+            (void) transition_to_retired_locked(entry);
+            remap_or_erase_id_mapping_locked(pair.first.id, pair.first);
         }
     }
 
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    for (auto it = entries_.begin(); it != entries_.end();) {
-        auto & entry = it->second;
-        if (entry.pending_load_txn_id != load_txn_id) {
-            ++it;
-            continue;
-        }
-        if (entry.owner_mask != 0) {
-            // Shared/pre-existing ownership survives; remove only B's touch.
-            entry.pending_load_txn_id = 0;
-            ++it;
-            continue;
-        }
-        auto mapped = id_to_key_.find(it->first.id);
-        if (mapped != id_to_key_.end() && mapped->second == it->first) {
-            id_to_key_.erase(mapped);
-        }
-        if (entry.in_use_count.load() != 0) {
-            entry.retired             = true;
-            entry.pending_load_txn_id = 0;
-            if (entry.storage_owner) {
-                entry.storage_owner.reset();
-                entry.allocation_released_via_owner = true;
-            }
-            ++it;
-            continue;
-        }
-        if (entry.storage_owner) {
-            entry.storage_owner.reset();
-            entry.allocation_released_via_owner = true;
-        } else if (!entry.non_owning_external_host) {
-            release_entry_allocation_locked(entry);
-        }
-        it = entries_.erase(it);
-    }
+    released_mirror_handles.clear();
+    std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+    (void) finalize_retired_entries_locked();
 }
 
 void unified_cache::note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
@@ -9557,7 +9679,7 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
             } else {
                 id_to_key_.erase(it->first.id);
             }
-            it = entries_.erase(it);
+            it = erase_entry_locked(it);
             entries_erased++;
         }
         if (entries_preserved > 0) {
@@ -14021,8 +14143,7 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
     // Complete the AOS upload before the synchronous reorder publication API;
     // queue_ may be out-of-order.
     mem_handle partial_src =
-        mem_handle::from_direct(
-        const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, partial_bytes);
+        mem_handle::from_direct(const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, partial_bytes);
     mem_copy(partial_handle, partial_src, partial_bytes, queue_, {});
 
     // Apply the synchronous in-place SOA reorder only after upload submission.
