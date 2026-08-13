@@ -662,8 +662,8 @@ static test_result test_expert_prefetch_integration() {
         return test_result::FAIL;
     }
 
-    if (prefetcher.await(0, 2) != nullptr) {
-        printf("  FAIL: await should return nullptr before init\n");
+    if (prefetcher.await_ready(0, 2)) {
+        printf("  FAIL: await_ready should return false before init\n");
         return test_result::FAIL;
     }
 

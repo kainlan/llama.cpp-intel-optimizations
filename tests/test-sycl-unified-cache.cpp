@@ -503,9 +503,8 @@ static bool test_prefetch_through_unified() {
         return false;
     }
 
-    void * ptr = prefetcher.await(0, 0);
-    if (ptr != nullptr) {
-        printf("  FAIL: await should return nullptr before init\n");
+    if (prefetcher.await_ready(0, 0)) {
+        printf("  FAIL: await_ready should return false before init\n");
         return false;
     }
 

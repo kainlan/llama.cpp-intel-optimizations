@@ -1694,6 +1694,37 @@ set_tests_properties(unified-cache-fast-path PROPERTIES
 )
 endif() # direct-source static SYCL fixture
 
+# ExpertPrefetcher ownership handoff, model identity, dependency, cancellation,
+# and completed-request GC. The fixture injects already-submitted requests and
+# therefore does not need a model or the B70 certification device.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-expert-prefetch-runtime
+    tests/test-expert-prefetch-runtime.cpp
+)
+target_include_directories(test-expert-prefetch-runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-expert-prefetch-runtime PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-expert-prefetch-runtime PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-expert-prefetch-runtime PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-expert-prefetch-runtime PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-expert-prefetch-runtime PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME expert-prefetch-runtime COMMAND test-expert-prefetch-runtime)
+set_tests_properties(expert-prefetch-runtime PROPERTIES
+    LABELS "sycl;expert;prefetch;handle;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+)
+endif()
+
 # Evict accounting, realloc failure handling, unaligned hash.
 # LABELS drop the old "cache" -- see rule 2 above.
 if (NOT GGML_BACKEND_DL)
