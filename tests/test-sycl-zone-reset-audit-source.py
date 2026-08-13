@@ -174,6 +174,8 @@ def evaluate(cache, backend, common, header):
     graph_compute = body_of(backend, "static void ggml_backend_sycl_graph_compute_impl(")
     watchdog = body_of(common, "static void watchdog_thread_fn(")
     reserve_onednn = body_of(cache, "bool unified_cache::reserve_onednn_scratch(")
+    arena_forget = body_of(cache, "void unified_cache::arena_forget_allocation_locked(")
+    arena_destroy = body_of(cache, "bool unified_cache::arena_destroy(")
 
     # llama.cpp-37ba: the segment of host_zone_settle() between its level-2
     # suppression check and the real bulk host_arena_->zone_reset(zone) call.
@@ -245,6 +247,8 @@ def evaluate(cache, backend, common, header):
         "ggml_backend_sycl_graph_compute_impl body": graph_compute,
         "watchdog_thread_fn body": watchdog,
         "unified_cache::reserve_onednn_scratch body": reserve_onednn,
+        "unified_cache::arena_forget_allocation_locked body": arena_forget,
+        "unified_cache::arena_destroy body": arena_destroy,
     }
 
     checks = {
@@ -269,14 +273,45 @@ def evaluate(cache, backend, common, header):
         # 2. Lock order (canonical §12.5): the audit mutex is isolated D and must
         #    not be co-held with L1-L5. Reverse destruction order is the whole
         #    mechanism, and it is invisible at the call site.
-        'the VRAM reset hook is declared before the zone allocator lock':
-            precedes(zone_reset, "zone_audit_site_visit audit(", "lock(z.alloc_mutex)"),
+        'the VRAM reset hook is declared before the allocator-group lock':
+            precedes(zone_reset, "zone_audit_site_visit audit(", "lock(arena_allocator_group_mutex(zone))"),
         'the VRAM reset hook is declared before the registry lock':
             precedes(zone_reset, "zone_audit_site_visit audit(", "lock(g_runtime_alloc_mutex)"),
         'the host reset hook is declared before the registry lock':
             precedes(host_reset, "zone_audit_site_visit audit(", "lock(g_runtime_alloc_mutex)"),
         'the weight reclaim hook is declared before the cache lock':
             precedes(reclaim, "zone_audit_site_visit audit(", "lock(rw_mutex_)"),
+
+        # The allocator lifecycle is a per-physical-group transaction, not a
+        # logical-zone mutex plus a blind generation bump. RESETTING excludes
+        # allocation/destroy while the terminal authority drain runs unlocked;
+        # state and epoch must both be revalidated before reset/publication.
+        'allocator groups carry mutex CV state and epoch':
+            all(needle in header for needle in
+                ("enum class allocator_group_state", "OPEN, RESETTING, CLOSING",
+                 "std::mutex", "std::condition_variable lifecycle_cv;", "uint64_t lifecycle_epoch")),
+        'zone settle claims OPEN to RESETTING under the group lock':
+            "std::unique_lock<std::mutex> lock(arena_allocator_group_mutex(zone))" in zone_reset
+            and precedes(zone_reset, "physical_group.state != allocator_group_state::OPEN",
+                         "physical_group.state = allocator_group_state::RESETTING"),
+        'zone settle revalidates exact group state and epoch after authority drain':
+            "const uint64_t settle_epoch = ++physical_group.lifecycle_epoch" in zone_reset
+            and "physical_group.state != allocator_group_state::RESETTING" in zone_reset
+            and "physical_group.lifecycle_epoch != settle_epoch" in zone_reset
+            and precedes(zone_reset, "wait_for_terminal_leases()", "physical_group.lifecycle_epoch != settle_epoch"),
+        'zone settle publishes before reopening and notifying the group':
+            precedes(zone_reset, "arena_publish_prebuilt(", "physical_group.state = allocator_group_state::OPEN")
+            and precedes(zone_reset, "physical_group.state = allocator_group_state::OPEN",
+                         "physical_group.lifecycle_cv.notify_all()"),
+        'exact allocation ownership is erased by allocation id':
+            "found->second.allocation_id == allocation_id" in arena_forget
+            and "runtime->second.handle.alloc_id == exact_id" in arena_forget
+            and "group.allocations.erase(found)" in arena_forget,
+        'arena destroy refuses owned groups before physical free and never raw-clears first':
+            precedes(arena_destroy, "if (!group.allocations.empty())", "sycl::free(c.ptr")
+            and precedes(arena_destroy, "sycl::free(c.ptr", "group.allocations.clear()"),
+        'legacy arena generation bump helper is absent':
+            "arena_generation_bump" not in cache and "arena_generation_bump" not in header,
 
         # An early-return placed BEFORE the hook makes the site vanish from
         # the inventory entirely on that path, rather than reading as
@@ -453,14 +488,31 @@ def evaluate(cache, backend, common, header):
 # a list because reordering two statements that are not adjacent in the STRIPPED
 # source -- a comment between them leaves a blank line -- takes two edits.
 MUTANTS = {
-    "the VRAM reset hook is declared before the zone allocator lock": (
+    "the VRAM reset hook is declared before the allocator-group lock": (
         "cache",
         [('    zone_audit_site_visit audit("device-zone-reset", vram_zone_name(zone), '
           'ggml_sycl_get_device_id_from_queue(queue_));\n', ''),
-         ('    std::lock_guard<std::mutex> lock(z.alloc_mutex);',
-          '    std::lock_guard<std::mutex> lock(z.alloc_mutex);\n'
+         ('    std::unique_lock<std::mutex> lock(arena_allocator_group_mutex(zone));',
+          '    std::unique_lock<std::mutex> lock(arena_allocator_group_mutex(zone));\n'
           '    zone_audit_site_visit audit("device-zone-reset", vram_zone_name(zone), '
           'ggml_sycl_get_device_id_from_queue(queue_));')]),
+    "allocator groups carry mutex CV state and epoch": (
+        "header", [("lifecycle_epoch = 0;", "unused_epoch = 0;")]),
+    "zone settle claims OPEN to RESETTING under the group lock": (
+        "cache", [("physical_group.state = allocator_group_state::RESETTING;",
+                   "physical_group.state = allocator_group_state::OPEN;")]),
+    "zone settle revalidates exact group state and epoch after authority drain": (
+        "cache", [("physical_group.lifecycle_epoch != settle_epoch", "false")]),
+    "zone settle publishes before reopening and notifying the group": (
+        "cache", [("physical_group.state = allocator_group_state::OPEN;",
+                   "physical_group.lifecycle_cv.notify_all();\n    physical_group.state = allocator_group_state::OPEN;")]),
+    "exact allocation ownership is erased by allocation id": (
+        "cache", [(" && (allocation_id == 0 || found->second.allocation_id == allocation_id)", "")]),
+    "arena destroy refuses owned groups before physical free and never raw-clears first": (
+        "cache", [("if (!group.allocations.empty()) {", "if (false) {")]),
+    "legacy arena generation bump helper is absent": (
+        "cache", [("void unified_cache::zone_settle(vram_zone_id zone) {",
+                   "void unified_cache::zone_settle(vram_zone_id zone) {\n    arena_generation_bump();")]),
     "the emit path uses WARN, not INFO": (
         "cache",
         [('    GGML_LOG_WARN("%s", line.c_str());', '    GGML_LOG_INFO("%s", line.c_str());')]),
