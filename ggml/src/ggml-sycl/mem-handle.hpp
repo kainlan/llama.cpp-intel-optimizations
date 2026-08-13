@@ -258,9 +258,10 @@ class mem_handle {
     // queue submission.
     static mem_handle from_owned_alloc(alloc_handle handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 
-    // Return a retained view into an owning allocation.  The slice shares the
-    // same allocation owner but resolves to base + byte_offset and carries its
-    // own stable offset/size identity for replay tables.
+    // Return a bounded retained view into any stable backing handle (owning
+    // allocation, WEIGHT lease, arena allocation, or chunk lease). The view
+    // retains the original owner/lease and applies its checked byte offset on
+    // every resolve, after the backing handle's generation/stale checks.
     mem_handle slice(size_t byte_offset, size_t byte_size) const;
 
     void set_ready_event(const sycl::event & event);
@@ -424,6 +425,10 @@ class mem_handle {
     // stable_identity_hash() body, for callers that already hold lock_.
     size_t stable_identity_hash_locked() const;
 
+    // Apply the immutable derived-view range to cached_. Caller holds lock_.
+    // cached_ always stores the backing resolver's unsliced pointer.
+    resolved_ptr resolved_view_locked() const;
+
     // Guards the mutable resolve state below (cached_, gen_, leased_entry_,
     // chunk_source_, host_chunk_handle_, vram_chunk_idx_, chunk_device_).
     // The immutable-after-construction fields are not covered: reassigning or
@@ -437,8 +442,13 @@ class mem_handle {
 
     // Arena-specific fields (only used for ARENA_* kinds).
     int      zone_id_   = 0;  // Which zone (maps to vram_zone_id)
-    mutable size_t offset_ = 0;  // GUARDED by lock_ for WEIGHT; immutable arena slice offset
-    mutable size_t size_   = 0;  // GUARDED by lock_ for WEIGHT; immutable arena slice size
+    mutable size_t offset_ = 0;  // GUARDED by lock_; canonical allocation-relative view offset
+    mutable size_t size_   = 0;  // GUARDED by lock_; bounded view size
+    // Derived views never cache a manufactured raw pointer. cached_ remains the
+    // backing resolver's pointer and these fields are applied on every resolve.
+    mutable size_t backing_extent_ = 0;  // GUARDED by lock_; 0 means unknown (raw chunk bridge)
+    size_t         slice_offset_   = 0;  // immutable-after-construction offset from backing pointer
+    bool           is_slice_       = false;
     uint64_t arena_gen_ = 0;  // Arena generation (for invalidation)
 
     // Exact allocator-minted retention identity. Cache WEIGHT constructors do

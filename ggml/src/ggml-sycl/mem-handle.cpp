@@ -183,7 +183,7 @@ static bool mem_handle_cache_identity_equal(const mem_handle & a, const mem_hand
     }
 
     if (a.is_weight()) {
-        return a.key() == b.key();
+        return a.stable_identity_equal(b);
     }
 
     if (a.is_arena() || a.kind() == mem_handle_kind::CHUNK_LEASE) {
@@ -288,6 +288,7 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
         h.canonical_extent_        = entry->size;
         h.offset_                  = 0;
         h.size_                    = entry->size;
+        h.backing_extent_          = entry->size;
     }
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
@@ -362,6 +363,7 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
     h.zone_id_   = zone_id;
     h.offset_    = offset;
     h.size_      = size;
+    h.backing_extent_ = size;
     h.arena_gen_              = generation;
     h.canonical_allocation_id_ = allocation_id;
     h.canonical_generation_    = generation;
@@ -444,6 +446,7 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
     mem_handle h         = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE);
     h.offset_                   = 0;
     h.size_                     = handle.size;
+    h.backing_extent_            = handle.size;
     h.canonical_allocation_id_  = handle.alloc_id;
     h.canonical_generation_     = handle.epoch_id ? handle.epoch_id : 1;
     h.canonical_extent_         = handle.size;
@@ -452,24 +455,68 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
 }
 
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
-    if (!owned_alloc_) {
-        return {};
-    }
-    if (byte_offset > size_ || byte_size > size_ - byte_offset) {
+    // Raw external DIRECT pointers have no retained owner and no trustworthy
+    // extent. Slicing them would manufacture a capability rather than derive one.
+    if (!owned_alloc_ && kind_ != mem_handle_kind::WEIGHT && !is_arena() &&
+        kind_ != mem_handle_kind::CHUNK_LEASE) {
         return {};
     }
 
-    resolved_ptr base = resolve();
-    if (!base.ptr) {
+    // Unresolved key-only weights learn their logical storage range through
+    // the normal generation-checked resolver before deriving a view.
+    if (kind_ == mem_handle_kind::WEIGHT && size() == 0 && !resolve()) {
+        return {};
+    }
+
+    size_t parent_size = 0;
+    size_t parent_offset = 0;
+    size_t parent_slice_offset = 0;
+    {
+        mem_handle_lock_guard g(lock_);
+        parent_size         = size_;
+        parent_offset       = offset_;
+        parent_slice_offset = slice_offset_;
+    }
+
+    // A compatibility CHUNK_LEASE has no allocation-size metadata. Its first
+    // slice establishes the caller-provided bounded view; all nested slices are
+    // then checked against that extent. All other stable handles must have a
+    // known parent range before a slice can be derived.
+    const bool unbounded_chunk_root = kind_ == mem_handle_kind::CHUNK_LEASE && !is_slice_ && parent_size == 0;
+    if ((!unbounded_chunk_root && (byte_offset > parent_size || byte_size > parent_size - byte_offset)) ||
+        byte_offset > SIZE_MAX - parent_slice_offset || byte_offset > SIZE_MAX - parent_offset) {
         return {};
     }
 
     mem_handle h = *this;
-    h.cached_    = base;
-    h.cached_.ptr = static_cast<void *>(static_cast<uint8_t *>(base.ptr) + byte_offset);
-    h.offset_ += byte_offset;
-    h.size_ = byte_size;
+    {
+        mem_handle_lock_guard g(h.lock_);
+        h.slice_offset_ = parent_slice_offset + byte_offset;
+        h.offset_       = parent_offset + byte_offset;
+        h.size_         = byte_size;
+        h.is_slice_     = true;
+        if (unbounded_chunk_root) {
+            if (byte_size > SIZE_MAX - h.slice_offset_) {
+                return {};
+            }
+            h.backing_extent_ = h.slice_offset_ + byte_size;
+        }
+    }
     return h;
+}
+
+resolved_ptr mem_handle::resolved_view_locked() const {
+    resolved_ptr view = cached_;
+    if (!view.ptr || !is_slice_) {
+        return view;
+    }
+    if ((backing_extent_ != 0 &&
+         (slice_offset_ > backing_extent_ || size_ > backing_extent_ - slice_offset_)) ||
+        slice_offset_ > UINTPTR_MAX - reinterpret_cast<uintptr_t>(view.ptr)) {
+        return {};
+    }
+    view.ptr = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(view.ptr) + slice_offset_);
+    return view;
 }
 
 #ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
@@ -575,7 +622,7 @@ resolved_ptr mem_handle::resolve() const {
         // pointer that is kept alive by either the caller's lifetime (DIRECT)
         // or by the chunk lease refcount (CHUNK_LEASE, dyhdl).
         if (kind_ == mem_handle_kind::DIRECT || kind_ == mem_handle_kind::CHUNK_LEASE) {
-            return cached_;
+            return resolved_view_locked();
         }
 
         // Arena handles: check arena generation, then resolve base + offset.
@@ -583,12 +630,12 @@ resolved_ptr mem_handle::resolve() const {
             // If we have a cached pointer and the generation hasn't changed,
             // return immediately.
             if (cached_.ptr != nullptr && gen_ == arena_gen_) {
-                return cached_;
+                return resolved_view_locked();
             }
         } else {
             // WEIGHT handle: compare cached generation against global.
             if (gen_ == cache_generation() && cached_.ptr != nullptr) {
-                return cached_;
+                return resolved_view_locked();
             }
         }
     }
@@ -711,21 +758,36 @@ resolved_ptr mem_handle::resolve_slow() const {
     }
 
     lease_state stale;
+    resolved_ptr view;
     {
         mem_handle_lock_guard g(lock_);
         stale = take_lease_state_locked();
         store_lease_state_locked(fresh);
-        cached_                  = resolved;
+        cached_                   = resolved;
         canonical_allocation_id_ = result.allocation_id;
         canonical_generation_    = result.replacement_generation;
         canonical_extent_        = result.allocation_extent;
-        offset_                   = result.byte_offset;
-        size_                     = result.byte_size;
-        gen_                      = cache_generation();
+        backing_extent_          = result.byte_size;
+        if (is_slice_) {
+            // Preserve the derived range across cache generation changes. The
+            // cache resolver supplies the current logical-storage base/range;
+            // the view is valid only when it still fits that replacement.
+            if (slice_offset_ <= result.byte_size && size_ <= result.byte_size - slice_offset_ &&
+                slice_offset_ <= SIZE_MAX - result.byte_offset) {
+                offset_ = result.byte_offset + slice_offset_;
+            } else {
+                cached_ = {};
+            }
+        } else {
+            offset_ = result.byte_offset;
+            size_   = result.byte_size;
+        }
+        gen_ = cache_generation();
+        view = resolved_view_locked();
     }
     release_lease_state(stale);
 
-    return resolved;
+    return view;
 }
 
 // === lease_state helpers ===
@@ -836,6 +898,11 @@ size_t mem_handle::hash() const {
 
     if (is_weight()) {
         h = mem_handle_hash_combine(h, unified_cache_key_hash{}(key_));
+        mem_handle_lock_guard g(lock_);
+        if (is_slice_) {
+            h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
+            h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+        }
     } else if (is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE) {
         h = mem_handle_hash_combine(h, std::hash<int>()(zone_id_));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
@@ -858,6 +925,10 @@ size_t mem_handle::stable_identity_hash_locked() const {
 
     if (is_weight()) {
         h = mem_handle_hash_combine(h, unified_cache_key_hash{}(key_));
+        if (is_slice_) {
+            h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
+            h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+        }
     } else if (is_arena()) {
         h = mem_handle_hash_combine(h, std::hash<uint64_t>()(canonical_allocation_id_));
         h = mem_handle_hash_combine(h, std::hash<uint64_t>()(canonical_generation_));
@@ -872,6 +943,7 @@ size_t mem_handle::stable_identity_hash_locked() const {
         h = mem_handle_hash_combine(h, std::hash<uint64_t>()(host_chunk_handle_));
         h = mem_handle_hash_combine(h, std::hash<int32_t>()(vram_chunk_idx_));
         h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
     } else if (owned_alloc_) {
         h = mem_handle_hash_combine(h, std::hash<uint64_t>()(owned_alloc_->alloc_id));
@@ -896,7 +968,22 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
     }
 
     if (is_weight()) {
-        return key_ == other.key_;
+        if (!(key_ == other.key_)) {
+            return false;
+        }
+        struct weight_view_identity {
+            bool   sliced;
+            size_t offset;
+            size_t size;
+        };
+        auto snapshot_weight = [](const mem_handle & h) {
+            mem_handle_lock_guard g(h.lock_);
+            return weight_view_identity{ h.is_slice_, h.offset_, h.size_ };
+        };
+        const auto self   = snapshot_weight(*this);
+        const auto theirs = snapshot_weight(other);
+        return (!self.sliced && !theirs.sliced) ||
+               (self.sliced && theirs.sliced && self.offset == theirs.offset && self.size == theirs.size);
     }
 
     if (is_arena()) {
@@ -933,7 +1020,7 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
     if (kind_ == mem_handle_kind::CHUNK_LEASE) {
         return self.chunk_device == theirs.chunk_device && self.chunk_source == theirs.chunk_source &&
                self.host_chunk_handle == theirs.host_chunk_handle && self.vram_chunk_idx == theirs.vram_chunk_idx &&
-               self.ptr == theirs.ptr && size_ == other.size_;
+               self.ptr == theirs.ptr && offset_ == other.offset_ && size_ == other.size_;
     }
 
     if (owned_alloc_ || other.owned_alloc_) {
@@ -1049,6 +1136,9 @@ mem_handle::mem_handle(const mem_handle & other) {
         zone_id_                 = other.zone_id_;
         offset_                  = other.offset_;
         size_                    = other.size_;
+        backing_extent_          = other.backing_extent_;
+        slice_offset_            = other.slice_offset_;
+        is_slice_                = other.is_slice_;
         arena_gen_               = other.arena_gen_;
         canonical_allocation_id_ = other.canonical_allocation_id_;
         canonical_generation_    = other.canonical_generation_;
@@ -1096,6 +1186,9 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     zone_id_                 = other.zone_id_;
     offset_                  = other.offset_;
     size_                    = other.size_;
+    backing_extent_          = other.backing_extent_;
+    slice_offset_            = other.slice_offset_;
+    is_slice_                = other.is_slice_;
     arena_gen_               = other.arena_gen_;
     canonical_allocation_id_ = other.canonical_allocation_id_;
     canonical_generation_    = other.canonical_generation_;
@@ -1118,6 +1211,9 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     other.zone_id_                 = 0;
     other.offset_                  = 0;
     other.size_                    = 0;
+    other.backing_extent_          = 0;
+    other.slice_offset_            = 0;
+    other.is_slice_                = false;
     other.arena_gen_               = 0;
     other.canonical_allocation_id_ = 0;
     other.canonical_generation_    = 0;
@@ -1141,6 +1237,9 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     int                   new_zone_id                = 0;
     size_t                new_offset                 = 0;
     size_t                new_size                   = 0;
+    size_t                new_backing_extent         = 0;
+    size_t                new_slice_offset           = 0;
+    bool                  new_is_slice               = false;
     uint64_t              new_arena_gen              = 0;
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation   = 0;
@@ -1159,6 +1258,9 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_zone_id                 = other.zone_id_;
         new_offset                  = other.offset_;
         new_size                    = other.size_;
+        new_backing_extent          = other.backing_extent_;
+        new_slice_offset            = other.slice_offset_;
+        new_is_slice                = other.is_slice_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -1209,6 +1311,9 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         zone_id_                 = new_zone_id;
         offset_                  = new_offset;
         size_                    = new_size;
+        backing_extent_          = new_backing_extent;
+        slice_offset_            = new_slice_offset;
+        is_slice_                = new_is_slice;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
@@ -1246,6 +1351,9 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     int                   new_zone_id                 = 0;
     size_t                new_offset                  = 0;
     size_t                new_size                    = 0;
+    size_t                new_backing_extent          = 0;
+    size_t                new_slice_offset            = 0;
+    bool                  new_is_slice                = false;
     uint64_t              new_arena_gen               = 0;
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation    = 0;
@@ -1261,6 +1369,9 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         new_zone_id                 = other.zone_id_;
         new_offset                  = other.offset_;
         new_size                    = other.size_;
+        new_backing_extent          = other.backing_extent_;
+        new_slice_offset            = other.slice_offset_;
+        new_is_slice                = other.is_slice_;
         new_arena_gen               = other.arena_gen_;
         new_canonical_allocation_id = other.canonical_allocation_id_;
         new_canonical_generation    = other.canonical_generation_;
@@ -1277,6 +1388,9 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.zone_id_                 = 0;
         other.offset_                  = 0;
         other.size_                    = 0;
+        other.backing_extent_          = 0;
+        other.slice_offset_            = 0;
+        other.is_slice_                = false;
         other.arena_gen_               = 0;
         other.canonical_allocation_id_ = 0;
         other.canonical_generation_    = 0;
@@ -1298,6 +1412,9 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         zone_id_                 = new_zone_id;
         offset_                  = new_offset;
         size_                    = new_size;
+        backing_extent_          = new_backing_extent;
+        slice_offset_            = new_slice_offset;
+        is_slice_                = new_is_slice;
         arena_gen_               = new_arena_gen;
         canonical_allocation_id_ = new_canonical_allocation_id;
         canonical_generation_    = new_canonical_generation;
@@ -1341,23 +1458,35 @@ resolved_ptr mem_handle::resolve_arena() const {
         return {};
     }
 
-    // Resolve: zone_alloc returned an offset within the arena, but our offset_
-    // is the raw arena offset (base-relative).  Use offset_to_ptr directly.
-    void * ptr = cache->offset_to_ptr(offset_);
+    // Resolve the original arena allocation, not a manufactured slice pointer;
+    // resolved_view_locked() applies the derived offset after the generation
+    // check on every call.
+    size_t backing_offset = 0;
+    {
+        mem_handle_lock_guard g(lock_);
+        if (slice_offset_ > offset_ ||
+            (backing_extent_ != 0 &&
+             (slice_offset_ > backing_extent_ || size_ > backing_extent_ - slice_offset_))) {
+            return {};
+        }
+        backing_offset = offset_ - slice_offset_;
+    }
+    void * ptr = cache->offset_to_ptr(backing_offset);
     if (!ptr) {
         return {};
     }
 
-    // Cache the resolved pointer.  Arena handles are always on-device with
-    // AOS layout (arena zones hold raw allocations, not cache-managed weights).
-    // Published under the lock; the cache queries above ran without it.
+    // Cache the unsliced backing pointer. Arena handles are always on-device
+    // with AOS layout (arena zones hold raw allocations, not managed weights).
     const resolved_ptr resolved = { ptr, GGML_LAYOUT_AOS, true };
+    resolved_ptr       view;
     {
         mem_handle_lock_guard g(lock_);
         cached_ = resolved;
         gen_    = arena_gen_;
+        view    = resolved_view_locked();
     }
-    return resolved;
+    return view;
 }
 
 // === layer_weight_handles ===

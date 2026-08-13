@@ -161,7 +161,24 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
                                            nullptr, &q, &stage_handle);
     }
     TEST_ASSERT(stage.ok && stage.ptr != nullptr, "direct_stage_expert failed");
+    TEST_ASSERT(stage_handle.kind() == ggml_sycl::mem_handle_kind::WEIGHT,
+                "direct_stage_expert must return a cache-managed WEIGHT lease");
     TEST_ASSERT(stage_handle.resolve(0).ptr == stage.ptr, "direct_stage_expert should return allocation-time handle");
+
+    // Regression: logical-storage views must remain WEIGHT handles and resolve
+    // through the cache lease rather than freezing a derived raw pointer.
+    auto logical = stage_handle.slice(32, 96);
+    auto nested  = logical.slice(16, 32);
+    TEST_ASSERT(logical.kind() == ggml_sycl::mem_handle_kind::WEIGHT,
+                "WEIGHT slice must preserve cache-managed representation");
+    TEST_ASSERT(logical.resolve(0).ptr == static_cast<uint8_t *>(stage.ptr) + 32,
+                "direct-stage WEIGHT logical storage offset mismatch");
+    TEST_ASSERT(nested.resolve(0).ptr == static_cast<uint8_t *>(stage.ptr) + 48,
+                "nested WEIGHT slices must compose offsets exactly once");
+    TEST_ASSERT(!logical.slice(80, 32).valid(), "nested WEIGHT slice must reject parent-range overflow");
+    TEST_ASSERT(!logical.resolve(1), "WEIGHT slice must preserve wrong-device rejection");
+    TEST_ASSERT(!logical.stable_identity_equal(stage_handle),
+                "WEIGHT logical storage identity must include the derived range");
 
     auto res = cache->resolve_expert(make_request(key, GGML_LAYOUT_SOA));
     TEST_ASSERT(res.reason == ggml_sycl::expert_resolve_reason::FOUND, "direct staged expert should resolve");

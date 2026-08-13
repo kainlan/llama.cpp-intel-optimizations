@@ -241,9 +241,22 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
     TEST_ASSERT(h.stable_identity_hash() != h_offset.stable_identity_hash(),
                 "CHUNK_LEASE stable hash must distinguish different ptrs inside the same leased chunk");
 
-    // Same-device resolve must return the pointer.
+    // Same-device resolve must return the pointer. A derived view takes its own
+    // chunk lease, so it remains valid after the root handle is released.
     ggml_sycl::resolved_ptr r0 = h.resolve(0);
     TEST_ASSERT(r0.ptr == host_ptr, "same-device CHUNK_LEASE resolve must return the ptr");
+    ggml_sycl::mem_handle chunk_slice = h.slice(32, 96);
+    TEST_ASSERT(chunk_slice.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
+                "chunk slice must retain CHUNK_LEASE ownership");
+    TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
+                "chunk slice pointer mismatch");
+    auto nested_chunk_slice = chunk_slice.slice(16, 32);
+    TEST_ASSERT(nested_chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 48,
+                "nested chunk slice must compose offsets exactly once");
+    TEST_ASSERT(!chunk_slice.slice(80, 32).valid(), "nested chunk slice must enforce parent bounds");
+    h = {};
+    TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
+                "chunk slice must retain owner lifetime independently of parent");
 
     if (n_gpu_devices < 2) {
         // Wrong-device resolve can only be tested when a second device exists
@@ -252,12 +265,46 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
     } else {
         // Wrong-device resolve must return null (explicit-fail policy).
         // handle's device_=0 != caller device_id=1, so the check fires and returns null.
-        ggml_sycl::resolved_ptr r1 = h.resolve(1);
-        TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK_LEASE resolve must return null");
+        ggml_sycl::resolved_ptr r1 = chunk_slice.resolve(1);
+        TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK_LEASE slice resolve must return null");
     }
 
     // Note: host_ptr lives in the SCRATCH zone which is reset-only (no per-alloc
     // free). The handle dtor releases the chunk lease; the pool reclaims on zone reset.
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Arena slices resolve through the arena generation check and reject stale owners.
+// =============================================================================
+static bool test_arena_slice_generation_and_bounds(sycl::queue & q) {
+    TEST_BEGIN("arena_slice_generation_and_bounds");
+    auto * cache = ggml_sycl::get_existing_unified_cache_for_device(0);
+    if (!cache || !cache->arena_active()) {
+        TEST_SKIP("device arena unavailable");
+    }
+
+    constexpr size_t bytes = 256;
+    void * ptr = ggml_sycl::unified_cache_zone_alloc(0, ggml_sycl::vram_zone_id::RUNTIME, bytes, 64);
+    if (!ptr) {
+        TEST_SKIP("RUNTIME arena zone has no test capacity");
+    }
+    const size_t   offset = cache->ptr_to_offset(ptr);
+    const uint64_t gen    = cache->arena_generation();
+    auto arena = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen, 0x6ec, bytes);
+    auto view = arena.slice(64, 96);
+    TEST_ASSERT(view.resolve(0).ptr == static_cast<char *>(ptr) + 64, "arena slice pointer mismatch");
+    TEST_ASSERT(view.slice(16, 32).resolve(0).ptr == static_cast<char *>(ptr) + 80,
+                "nested arena slice must compose offsets exactly once");
+    TEST_ASSERT(!view.slice(80, 32).valid(), "arena slice must enforce parent bounds");
+    TEST_ASSERT(!view.resolve(1), "arena slice must preserve wrong-device rejection");
+
+    auto stale = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen + 1, 0x6ec, bytes).slice(64, 96);
+    TEST_ASSERT(!stale.resolve(0), "arena slice must remain stale when parent generation mismatches");
+    (void) q;
     TEST_PASS();
     return true;
 }
@@ -756,6 +803,7 @@ int main(int argc, char ** argv) {
     if (n_gpu_devices > 0) {
         try {
             sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order{});
+            all_passed &= test_arena_slice_generation_and_bounds(q);
             all_passed &= test_retention_transitions_and_exhaustion(q);
         } catch (const sycl::exception & e) {
             fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
