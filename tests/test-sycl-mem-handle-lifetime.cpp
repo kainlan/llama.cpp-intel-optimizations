@@ -77,17 +77,23 @@ static int test_arena_authority_invalidation_and_chunk_bounds() {
     authority->zone_id = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
     authority->chunks = { { a, sizeof(a) }, { b, sizeof(b) } };
     authority->allowed_ranges = { { 0, sizeof(a) + sizeof(b) } };
+    CHECK(authority->register_allocation(authority->zone_id, 101, 48, 16),
+          "first fake allocator record must register");
+    CHECK(authority->register_allocation(authority->zone_id, 102, 64, 8),
+          "second fake allocator record must register");
     auto first = ggml_sycl::mem_handle::from_arena_zone(
         static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 48, 16, 0, 11, 101, 16, authority);
     auto second = ggml_sycl::mem_handle::from_arena_zone(
         static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 64, 8, 0, 11, 102, 8, authority);
     CHECK(first.resolve().ptr == a + 48 && first.resolve().extent == 16, "first exact extent");
     CHECK(second.resolve().ptr == b && second.resolve().extent == 8, "second physical chunk boundary");
-    CHECK(authority->resolve_offset(11, 60, 8) == nullptr, "cross-chunk extent rejected");
+    CHECK(authority->resolve_allocation(authority->zone_id, 11, 101, 60, 8) == nullptr,
+          "non-exact sibling/cross-chunk tuple rejected");
     std::atomic<bool> stop{ false }, stale{ false };
     std::thread resolver([&] { while (!stop.load()) (void) first.resolve(); if (first.resolve()) stale = true; });
     authority->close_and_invalidate(12);
-    CHECK(!authority->acquire_offset(11, 0, 1), "closed incarnation admitted a new lease");
+    CHECK(!authority->acquire_allocation(authority->zone_id, 11, 101, 48, 16),
+          "closed incarnation admitted a new exact lease");
     stop = true;
     resolver.join();
     CHECK(!stale.load() && !first.resolve() && !second.resolve(), "concurrent invalidation is terminal");
@@ -99,6 +105,8 @@ static int test_arena_authority_invalidation_and_chunk_bounds() {
     second = {};
     CHECK(drain.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
           "terminal lease release did not unblock settle");
+    CHECK(authority->unregister_allocation(authority->zone_id, 48), "first fake record must unregister");
+    CHECK(authority->unregister_allocation(authority->zone_id, 64), "second fake record must unregister");
     return 0;
 }
 
@@ -113,6 +121,15 @@ static std::shared_ptr<ggml_sycl::arena_authority> make_authority(
     return authority;
 }
 
+static uint32_t allocation_lease_count(const std::shared_ptr<ggml_sycl::arena_authority> & authority,
+                                       uint64_t allocation_id) {
+    std::lock_guard<std::mutex> guard(authority->mutex);
+    for (const auto & record : authority->allocations) {
+        if (record.allocation_id == allocation_id) return record.lease_count;
+    }
+    return 0;
+}
+
 static int test_arena_allocation_vs_settle_linearization() {
     alignas(64) unsigned char storage[64] = {};
     auto authority = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 3,
@@ -120,8 +137,14 @@ static int test_arena_allocation_vs_settle_linearization() {
 
     // Allocation/mint wins: close observes its lease and settle cannot finish
     // until the alias is released.
-    auto admitted = authority->acquire_offset(3, 0, 16);
-    CHECK(admitted, "pre-close allocation must be admitted");
+    constexpr uint64_t allocation_id = 201;
+    const int zone = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
+    CHECK(authority->register_allocation(zone, allocation_id, 0, 16),
+          "linearization fake allocator record must register");
+    auto admitted = authority->acquire_allocation(zone, 3, allocation_id, 0, 16);
+    CHECK(admitted, "pre-close exact allocation must be admitted");
+    CHECK(allocation_lease_count(authority, allocation_id) == 1 && authority->terminal_lease_count() == 1,
+          "exact admission must increment allocation and chunk counts once");
     authority->close_and_invalidate(4);
     auto drain = std::async(std::launch::async, [&] { authority->wait_for_terminal_leases(); });
     CHECK(drain.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout,
@@ -129,9 +152,13 @@ static int test_arena_allocation_vs_settle_linearization() {
     admitted.lease.reset();
     CHECK(drain.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
           "settle did not complete after terminal allocation lease");
+    CHECK(allocation_lease_count(authority, allocation_id) == 0 && authority->terminal_lease_count() == 0,
+          "exact lease release must decrement allocation and chunk counts");
 
     // Settle wins: no allocation or handle mint is admitted after close.
-    CHECK(!authority->acquire_offset(3, 0, 16), "allocation admitted after close");
+    CHECK(!authority->acquire_allocation(zone, 3, allocation_id, 0, 16),
+          "exact allocation admitted after close");
+    CHECK(authority->unregister_allocation(zone, 0), "linearization fake record must unregister");
     return 0;
 }
 
@@ -141,6 +168,11 @@ static int test_unrelated_zone_incarnations_are_independent() {
                                   runtime_bytes, sizeof(runtime_bytes));
     auto scratch = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH), 13,
                                   scratch_bytes, sizeof(scratch_bytes));
+    const int runtime_zone = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
+    const int scratch_zone = static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH);
+    CHECK(runtime->register_allocation(runtime_zone, 1, 0, 8), "runtime fake record must register");
+    CHECK(scratch->register_allocation(scratch_zone, 2, 0, 8), "scratch root fake record must register");
+    CHECK(scratch->register_allocation(scratch_zone, 4, 8, 8), "scratch sibling fake record must register");
     auto runtime_handle = ggml_sycl::mem_handle::from_arena_zone(
         static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 0, 8, 0, 8, 1, 8, runtime);
     auto scratch_handle = ggml_sycl::mem_handle::from_arena_zone(
@@ -149,7 +181,14 @@ static int test_unrelated_zone_incarnations_are_independent() {
     CHECK(!runtime_handle.resolve(), "settled zone handle remained valid");
     CHECK(scratch_handle.resolve().ptr == scratch_bytes,
           "settling runtime invalidated unrelated scratch incarnation");
-    CHECK(scratch->acquire_offset(13, 8, 8), "unrelated zone admission was blocked");
+    auto sibling = scratch->acquire_allocation(scratch_zone, 13, 4, 8, 8);
+    CHECK(sibling, "unrelated zone exact admission was blocked");
+    sibling.lease.reset();
+    runtime_handle = {};
+    scratch_handle = {};
+    CHECK(runtime->unregister_allocation(runtime_zone, 0), "runtime fake record must unregister");
+    CHECK(scratch->unregister_allocation(scratch_zone, 0), "scratch root fake record must unregister");
+    CHECK(scratch->unregister_allocation(scratch_zone, 8), "scratch sibling fake record must unregister");
     return 0;
 }
 
@@ -157,12 +196,15 @@ static int test_arena_alias_count_and_publish_race() {
     alignas(64) unsigned char storage[64] = {};
     auto old_authority = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH), 21,
                                         storage, sizeof(storage));
+    const int scratch_zone = static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH);
+    CHECK(old_authority->register_allocation(scratch_zone, 3, 0, 16),
+          "old fake allocator record must register");
     auto root = ggml_sycl::mem_handle::from_arena_zone(
         static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH), 0, 16, 0, 21, 3, 16, old_authority);
     auto alias_a = root;
     auto alias_b = alias_a.slice(4, 4);
-    CHECK(old_authority->terminal_lease_count() == 1,
-          "handle aliases must share one authority lease, not double-count");
+    CHECK(old_authority->terminal_lease_count() == 1 && allocation_lease_count(old_authority, 3) == 1,
+          "handle aliases must share one allocation/chunk lease, not double-count");
 
     std::mutex mirror_mutex;
     std::shared_ptr<ggml_sycl::arena_authority> mirror = old_authority;
@@ -172,7 +214,8 @@ static int test_arena_alias_count_and_publish_race() {
             std::shared_ptr<ggml_sycl::arena_authority> snapshot;
             { std::lock_guard<std::mutex> lock(mirror_mutex); snapshot = mirror; }
             const bool observed_closed = close_complete.load(std::memory_order_acquire);
-            if (observed_closed && snapshot == old_authority && snapshot->acquire_offset(21, 0, 1)) {
+            if (observed_closed && snapshot == old_authority &&
+                snapshot->acquire_allocation(scratch_zone, 21, 3, 0, 16)) {
                 stale_admission.store(true, std::memory_order_release);
             }
         }
@@ -181,13 +224,25 @@ static int test_arena_alias_count_and_publish_race() {
     close_complete.store(true, std::memory_order_release);
     auto fresh = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH), 22,
                                 storage, sizeof(storage));
+    CHECK(fresh->register_allocation(scratch_zone, 4, 0, 1),
+          "fresh fake allocator record must register before publication");
     { std::lock_guard<std::mutex> lock(mirror_mutex); mirror = fresh; }
     stop.store(true, std::memory_order_release);
     minter.join();
-    CHECK(!old_authority->acquire_offset(21, 0, 1), "stale authority published an admission");
-    CHECK(fresh->acquire_offset(22, 0, 1), "fresh incarnation was not publishable");
+    CHECK(!old_authority->acquire_allocation(scratch_zone, 21, 3, 0, 16),
+          "stale authority published an exact admission");
+    auto fresh_admission = fresh->acquire_allocation(scratch_zone, 22, 4, 0, 1);
+    CHECK(fresh_admission, "fresh incarnation exact record was not publishable");
     CHECK(!stale_admission.load(std::memory_order_acquire),
           "concurrent publication admitted through the closed incarnation");
+    fresh_admission.lease.reset();
+    alias_b = {};
+    alias_a = {};
+    root = {};
+    CHECK(old_authority->terminal_lease_count() == 0 && allocation_lease_count(old_authority, 3) == 0,
+          "final alias release must clear allocation and chunk counts");
+    CHECK(old_authority->unregister_allocation(scratch_zone, 0), "old fake record must unregister");
+    CHECK(fresh->unregister_allocation(scratch_zone, 0), "fresh fake record must unregister");
     return 0;
 }
 
