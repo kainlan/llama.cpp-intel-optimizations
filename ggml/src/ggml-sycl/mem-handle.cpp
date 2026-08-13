@@ -640,63 +640,42 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
     return h;
 }
 
-namespace {
+mem_handle mem_handle::from_owned_alloc(alloc_owner && owner, ggml_layout_mode layout) {
+    if (!owner) return {};
+    const alloc_metadata metadata = owner.metadata();
+    if (!metadata.ptr || metadata.size == 0) return {};
 
-void release_owned_alloc_handle(alloc_handle * handle) {
-    if (!handle) {
-        return;
-    }
-    if (handle->ptr && !ggml_sycl_is_shutting_down()) {
-        const bool released = unified_free(*handle);
-        if (!released) {
-            // shared_ptr deleters cannot propagate refusal. Transfer ownership
-            // to the cache's durable retry queue; do not recurse through
-            // another mem_handle owner and do not discard the runtime record.
-            if (unified_defer_free(handle)) {
-                return;
-            }
-            GGML_LOG_WARN("[MEM-HANDLE] owning alloc release refused without a live retry cache ptr=%p size=%zu device=%d\n",
-                          handle->ptr, handle->size, handle->device);
-        }
-    }
-    delete handle;
-}
-
-}  // namespace
-
-mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode layout) {
-    if (!handle.ptr) {
-        return {};
-    }
-
-    const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
+    const bool on_device = metadata.tier == alloc_tier::DEVICE_VRAM;
     mem_handle h;
-    if (on_device && handle.zone_managed && handle.vram_zone != vram_zone_id::COUNT &&
-        valid_cache_device_id(handle.device)) {
-        if (unified_cache * cache = get_existing_unified_cache_for_device(handle.device)) {
-            // Arena handles consume only the tuple returned by the allocation
-            // transaction. Never recover authority by mapping the raw pointer
-            // back into a chunk: that can admit the wrong generation after ABA.
-            if (handle.alloc_id != 0 && handle.arena_generation != 0 && handle.arena_extent != 0) {
-                h = from_arena_zone(static_cast<int>(handle.vram_zone), handle.arena_offset, handle.size,
-                                    handle.device, handle.arena_generation, handle.alloc_id,
-                                    handle.arena_extent, cache->arena_authority_snapshot(handle.vram_zone));
+    if (on_device && metadata.zone_managed && metadata.vram_zone != vram_zone_id::COUNT &&
+        valid_cache_device_id(metadata.device)) {
+        if (unified_cache * cache = get_existing_unified_cache_for_device(metadata.device)) {
+            if (metadata.alloc_id != 0 && metadata.arena_generation != 0 && metadata.arena_extent != 0) {
+                h = from_arena_zone(static_cast<int>(metadata.vram_zone), metadata.arena_offset, metadata.size,
+                                    metadata.device, metadata.arena_generation, metadata.alloc_id,
+                                    metadata.arena_extent, cache->arena_authority_snapshot(metadata.vram_zone));
             }
         }
         if (!h.valid()) return {};
     } else {
-        h = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE, handle.size);
+        h = from_direct(metadata.ptr, layout, on_device,
+                        on_device ? metadata.device : HOST_DEVICE, metadata.size);
     }
     h.offset_                   = 0;
-    h.size_                     = handle.size;
-    h.backing_extent_            = handle.size;
-    h.canonical_allocation_id_ = handle.alloc_id;
+    h.size_                     = metadata.size;
+    h.backing_extent_           = metadata.size;
+    h.canonical_allocation_id_ = metadata.alloc_id;
     if (!h.is_arena()) {
-        h.canonical_generation_ = handle.epoch_id ? handle.epoch_id : 1;
-        h.canonical_extent_     = handle.size;
+        h.canonical_generation_ = metadata.epoch_id ? metadata.epoch_id : 1;
+        h.canonical_extent_     = metadata.size;
     }
-    h.owned_alloc_ = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
+    h.owned_alloc_ = std::move(owner).into_shared();
     return h;
+}
+
+mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout) {
+    alloc_owner owner = promote_legacy_alloc_owner(std::move(handle));
+    return owner ? mem_handle::from_owned_alloc(std::move(owner), layout) : mem_handle{};
 }
 
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
@@ -788,7 +767,7 @@ std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integrat
             if (!handle.cached_.ptr) {
                 return std::nullopt;
             }
-            device        = handle.owned_alloc_ ? handle.owned_alloc_->device : handle.device_;
+            device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
             allocation_id = handle.canonical_allocation_id_;
             generation    = handle.canonical_generation_;
             extent        = handle.canonical_extent_;
@@ -1192,12 +1171,12 @@ size_t mem_handle::stable_identity_hash_locked() const {
         h = mem_handle_hash_combine(h, std::hash<uintptr_t>()(absolute));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
     } else if (owned_alloc_) {
-        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(owned_alloc_->alloc_id));
-        h = mem_handle_hash_combine(h, std::hash<int>()(owned_alloc_->device));
-        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->tier)));
-        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->role)));
-        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->category)));
-        h = mem_handle_hash_combine(h, std::hash<size_t>()(owned_alloc_->size));
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(owned_alloc_.metadata().alloc_id));
+        h = mem_handle_hash_combine(h, std::hash<int>()(owned_alloc_.metadata().device));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_.metadata().tier)));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_.metadata().role)));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_.metadata().category)));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(owned_alloc_.metadata().size));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
     } else {
@@ -1277,10 +1256,10 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
     }
 
     if (owned_alloc_ || other.owned_alloc_) {
-        return owned_alloc_ && other.owned_alloc_ && owned_alloc_->alloc_id == other.owned_alloc_->alloc_id &&
-               owned_alloc_->device == other.owned_alloc_->device && owned_alloc_->tier == other.owned_alloc_->tier &&
-               owned_alloc_->role == other.owned_alloc_->role &&
-               owned_alloc_->category == other.owned_alloc_->category && owned_alloc_->size == other.owned_alloc_->size &&
+        return owned_alloc_ && other.owned_alloc_ && owned_alloc_.metadata().alloc_id == other.owned_alloc_.metadata().alloc_id &&
+               owned_alloc_.metadata().device == other.owned_alloc_.metadata().device && owned_alloc_.metadata().tier == other.owned_alloc_.metadata().tier &&
+               owned_alloc_.metadata().role == other.owned_alloc_.metadata().role &&
+               owned_alloc_.metadata().category == other.owned_alloc_.metadata().category && owned_alloc_.metadata().size == other.owned_alloc_.metadata().size &&
                offset_ == other.offset_ && size_ == other.size_;
     }
 
@@ -1288,7 +1267,7 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
 }
 
 bool mem_handle::has_stable_owner_identity() const {
-    return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || owned_alloc_ != nullptr;
+    return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || static_cast<bool>(owned_alloc_);
 }
 
 void mem_handle::set_debug_owner(const char * owner_tag) {
@@ -1515,7 +1494,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation   = 0;
     size_t                new_canonical_extent       = 0;
-    std::shared_ptr<alloc_handle> new_owned_alloc;
+    shared_alloc_owner new_owned_alloc;
     const char *          new_debug_owner_tag        = "";
     unified_cache_entry * new_entry                  = nullptr;
     uint8_t               new_chunk_source           = 0;
@@ -1573,11 +1552,13 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     // 3. Publish, detaching every releasable owner we are dropping. Moving
     // owned_alloc_ out first is essential: its deleter calls unified_free(),
     // which may re-enter handle/cache code and must never run under this leaf lock.
-    lease_state                   stale;
-    std::shared_ptr<alloc_handle> stale_owned_alloc;
+    lease_state           stale;
+    std::shared_ptr<void> stale_arena_lease;
+    shared_alloc_owner    stale_owned_alloc;
     {
         mem_handle_lock_guard g(lock_);
         stale                    = take_lease_state_locked();
+        stale_arena_lease        = std::move(arena_lease_);
         stale_owned_alloc        = std::move(owned_alloc_);
         kind_                    = new_kind;
         device_                  = new_device;
@@ -1611,7 +1592,8 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
 
     // 4. Release the old leases and allocation owner outside the lock.
     release_lease_state(stale);
-    stale_owned_alloc.reset();
+    stale_arena_lease.reset();
+    (void) stale_owned_alloc.reset();
     return *this;
 }
 
@@ -1638,7 +1620,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation    = 0;
     size_t                new_canonical_extent        = 0;
-    std::shared_ptr<alloc_handle> new_owned_alloc;
+    shared_alloc_owner new_owned_alloc;
     const char *          new_debug_owner_tag = "";
     lease_state           fresh;
     {
@@ -1686,11 +1668,13 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.cached_                  = {};
     }
 
-    lease_state                   stale;
-    std::shared_ptr<alloc_handle> stale_owned_alloc;
+    lease_state           stale;
+    std::shared_ptr<void> stale_arena_lease;
+    shared_alloc_owner    stale_owned_alloc;
     {
         mem_handle_lock_guard g(lock_);
         stale                    = take_lease_state_locked();
+        stale_arena_lease        = std::move(arena_lease_);
         stale_owned_alloc        = std::move(owned_alloc_);
         kind_                    = new_kind;
         device_                  = new_device;
@@ -1716,7 +1700,8 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     }
 
     release_lease_state(stale);
-    stale_owned_alloc.reset();
+    stale_arena_lease.reset();
+    (void) stale_owned_alloc.reset();
     return *this;
 }
 

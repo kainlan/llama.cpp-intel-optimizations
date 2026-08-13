@@ -325,7 +325,7 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
         return {};
     }
 
-    mem_handle weights_owner = mem_handle::from_owned_alloc(std::move(weights_alloc), GGML_LAYOUT_AOS);
+    mem_handle weights_owner = detail::from_legacy_owned_alloc(std::move(weights_alloc), GGML_LAYOUT_AOS);
     auto       weights_ptr   = weights_owner.resolve(req.device);
     if (!weights_ptr || !weights_ptr.on_device) {
         GGML_LOG_WARN("[PERSISTENT-TG] Failed to resolve resolved weight table on device %d\n", req.device);

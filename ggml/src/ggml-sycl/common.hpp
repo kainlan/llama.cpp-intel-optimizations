@@ -2624,7 +2624,7 @@ struct staging_buffer_pool {
             new_slot.context          = queue_context;
             new_slot.in_use           = true;
             new_slot.from_pinned_pool = from_pool;
-            new_slot.unified_handle   = ggml_sycl::mem_handle::from_owned_alloc(std::move(unified_handle));
+            new_slot.unified_handle   = ggml_sycl::detail::from_legacy_owned_alloc(std::move(unified_handle));
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 slots_.push_back(std::move(new_slot));
@@ -3208,7 +3208,7 @@ struct ggml_tensor_extra_gpu {
             return false;
         }
 
-        data_handle[dev] = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), layout);
+        data_handle[dev] = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), layout);
         auto resolved    = data_handle[dev].resolve(dev);
         if (!resolved) {
             data_handle[dev] = ggml_sycl::mem_handle{};
@@ -4982,7 +4982,7 @@ struct ggml_backend_sycl_context {
         }
 
         ggml_sycl::mem_handle handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(scratchpad_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(scratchpad_owner), GGML_LAYOUT_AOS);
         auto resolved = handle.resolve(device);
         if (!resolved.ptr || !resolved.on_device) {
             GGML_LOG_WARN("%s allocation resolved off-device (%zu bytes) — falling back to non-oneDNN path\n",
@@ -5431,7 +5431,7 @@ struct ggml_backend_sycl_context {
         }
 
         ggml_sycl::mem_handle handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(graph_input_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(graph_input_owner), GGML_LAYOUT_AOS);
         auto resolved = handle.resolve(dev_id);
         if (!resolved.ptr || !resolved.on_device) {
             return nullptr;
@@ -5653,7 +5653,7 @@ struct ggml_backend_sycl_context {
             }
             backing_capacity = backing_owner.size;
             backing_device   = device;
-            backing_handle   = ggml_sycl::mem_handle::from_owned_alloc(std::move(backing_owner), GGML_LAYOUT_AOS);
+            backing_handle   = ggml_sycl::detail::from_legacy_owned_alloc(std::move(backing_owner), GGML_LAYOUT_AOS);
 
             auto resolved = backing_handle.resolve(device);
             if (!resolved) {
@@ -5830,7 +5830,7 @@ struct ggml_backend_sycl_context {
             if (!ggml_sycl::unified_alloc(req, &buffer_owner) || !buffer_owner.ptr) {
                 return false;
             }
-            handle        = ggml_sycl::mem_handle::from_owned_alloc(std::move(buffer_owner));
+            handle        = ggml_sycl::detail::from_legacy_owned_alloc(std::move(buffer_owner));
             auto resolved = handle.resolve(req.device);
             if (!resolved || !resolved.on_device) {
                 handle = {};
@@ -5862,7 +5862,7 @@ struct ggml_backend_sycl_context {
             if (!ggml_sycl::unified_alloc(req, &buffer_owner) || !buffer_owner.ptr) {
                 return false;
             }
-            handle        = ggml_sycl::mem_handle::from_owned_alloc(std::move(buffer_owner));
+            handle        = ggml_sycl::detail::from_legacy_owned_alloc(std::move(buffer_owner));
             auto resolved = handle.resolve(req.device);
             if (!resolved || !resolved.on_device) {
                 handle = {};

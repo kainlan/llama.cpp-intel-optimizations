@@ -98,7 +98,7 @@ request_fixture make_request(sycl::queue & queue,
         require(ggml_sycl::unified_alloc(allocation_request, &allocation), "fixture allocation failed");
         void * ptr = allocation.ptr;
         return std::pair{ ptr,
-                          ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_SOA) };
+                          ggml_sycl::detail::from_legacy_owned_alloc(std::move(allocation), GGML_LAYOUT_SOA) };
     };
 
     auto [source_ptr, source_owner]           = allocate();

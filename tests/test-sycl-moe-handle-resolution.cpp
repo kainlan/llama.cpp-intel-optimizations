@@ -320,7 +320,7 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     TEST_ASSERT(ggml_sycl::unified_alloc(req, &allocation), "canonical device allocation failed");
     void * const          base     = allocation.ptr;
     const uint64_t        alloc_id = allocation.alloc_id;
-    ggml_sycl::mem_handle owner    = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
+    ggml_sycl::mem_handle owner    = ggml_sycl::detail::from_legacy_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
     auto                  expert   = owner.slice(expert_bytes, expert_bytes);
     auto                  resolved = expert.resolve(0);
     TEST_ASSERT(resolved.ptr == static_cast<char *>(base) + expert_bytes, "padded expert slice pointer mismatch");
@@ -367,7 +367,7 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
 
     ggml_sycl::alloc_handle replacement{};
     TEST_ASSERT(ggml_sycl::unified_alloc(req, &replacement), "replacement device allocation failed");
-    auto replacement_owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(replacement), GGML_LAYOUT_AOS);
+    auto replacement_owner = ggml_sycl::detail::from_legacy_owned_alloc(std::move(replacement), GGML_LAYOUT_AOS);
     auto replacement_slice = replacement_owner.slice(expert_bytes, expert_bytes);
     TEST_ASSERT(replacement_slice.stable_identity_hash() != old_identity,
                 "replacement generation must not alias stale lease identity");

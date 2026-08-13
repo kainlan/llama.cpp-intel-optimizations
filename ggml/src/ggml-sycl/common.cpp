@@ -374,7 +374,7 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         ggml_sycl::alloc_handle owner{};
         if (ggml_sycl::unified_alloc(req, &owner) && owner.ptr) {
             void *                staged     = owner.ptr;
-            ggml_sycl::mem_handle dst_handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner));
+            ggml_sycl::mem_handle dst_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner));
             ggml_sycl::mem_handle src_handle =
                 ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS,
                                                    /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
@@ -1335,7 +1335,7 @@ static bool tp_alloc_device_buffer(ggml_sycl::alloc_request & req,
         return false;
     }
     ptr    = static_cast<T *>(owner.ptr);
-    handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
     return ptr != nullptr;
 }
 
@@ -1725,7 +1725,7 @@ float * ggml_sycl_tp_ensure_host_staging(size_t size, queue_ptr stream) {
     ggml_sycl::alloc_handle host_staging_owner{};
     if (ggml_sycl::unified_alloc(req, &host_staging_owner) && host_staging_owner.ptr) {
         g_tp_host_staging.handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(host_staging_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_staging_owner), GGML_LAYOUT_AOS);
         auto resolved         = g_tp_host_staging.handle.resolve(req.device);
         g_tp_host_staging.buf = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
     } else {
@@ -1839,14 +1839,14 @@ static void ggml_sycl_tp_init_quant_comm_buffers_locked(size_t initial_size) {
     ggml_sycl::alloc_handle host_q0_owner{};
     if (ggml_sycl::unified_alloc(host_req, &host_q0_owner) && host_q0_owner.ptr) {
         g_tp_quant_comm_bufs.host_q0_handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(host_q0_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_q0_owner), GGML_LAYOUT_AOS);
         auto resolved                = g_tp_quant_comm_bufs.host_q0_handle.resolve(host_req.device);
         g_tp_quant_comm_bufs.host_q0 = resolved ? static_cast<int16_t *>(resolved.ptr) : nullptr;
     }
     ggml_sycl::alloc_handle host_q1_owner{};
     if (ggml_sycl::unified_alloc(host_req, &host_q1_owner) && host_q1_owner.ptr) {
         g_tp_quant_comm_bufs.host_q1_handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(host_q1_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_q1_owner), GGML_LAYOUT_AOS);
         auto resolved                = g_tp_quant_comm_bufs.host_q1_handle.resolve(host_req.device);
         g_tp_quant_comm_bufs.host_q1 = resolved ? static_cast<int16_t *>(resolved.ptr) : nullptr;
     }
@@ -1854,7 +1854,7 @@ static void ggml_sycl_tp_init_quant_comm_buffers_locked(size_t initial_size) {
     ggml_sycl::alloc_handle host_result_owner{};
     if (ggml_sycl::unified_alloc(host_req, &host_result_owner) && host_result_owner.ptr) {
         g_tp_quant_comm_bufs.host_result_handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(host_result_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_result_owner), GGML_LAYOUT_AOS);
         auto resolved                    = g_tp_quant_comm_bufs.host_result_handle.resolve(host_req.device);
         g_tp_quant_comm_bufs.host_result = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
     }
@@ -1886,7 +1886,7 @@ static void ggml_sycl_tp_init_quant_comm_buffers_locked(size_t initial_size) {
         ggml_sycl::alloc_handle dev_q_owner{};
         if (ggml_sycl::unified_alloc(req, &dev_q_owner) && dev_q_owner.ptr) {
             g_tp_quant_comm_bufs.dev_q_handle[i] =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(dev_q_owner), GGML_LAYOUT_AOS);
+                ggml_sycl::detail::from_legacy_owned_alloc(std::move(dev_q_owner), GGML_LAYOUT_AOS);
             auto resolved                 = g_tp_quant_comm_bufs.dev_q_handle[i].resolve(dev);
             g_tp_quant_comm_bufs.dev_q[i] = resolved ? static_cast<int16_t *>(resolved.ptr) : nullptr;
         }
@@ -1895,7 +1895,7 @@ static void ggml_sycl_tp_init_quant_comm_buffers_locked(size_t initial_size) {
         ggml_sycl::alloc_handle dev_minmax_owner{};
         if (ggml_sycl::unified_alloc(req, &dev_minmax_owner) && dev_minmax_owner.ptr) {
             g_tp_quant_comm_bufs.dev_minmax_handle[i] =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(dev_minmax_owner), GGML_LAYOUT_AOS);
+                ggml_sycl::detail::from_legacy_owned_alloc(std::move(dev_minmax_owner), GGML_LAYOUT_AOS);
             auto resolved                      = g_tp_quant_comm_bufs.dev_minmax_handle[i].resolve(dev);
             g_tp_quant_comm_bufs.dev_minmax[i] = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
         }
@@ -2033,7 +2033,7 @@ float * ggml_sycl_tp_ensure_shared_reduce_buffer(size_t bytes) {
     ggml_sycl::alloc_handle shared_reduce_owner{};
     if (ggml_sycl::unified_alloc(req, &shared_reduce_owner) && shared_reduce_owner.ptr) {
         g_tp_shared_reduce_handle =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(shared_reduce_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(shared_reduce_owner), GGML_LAYOUT_AOS);
         auto resolved          = g_tp_shared_reduce_handle.resolve(req.device);
         g_tp_shared_reduce_buf = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
     } else {
@@ -2081,13 +2081,13 @@ void ggml_sycl_tp_get_host_reduce_buffers(size_t bytes, float ** buf0, float ** 
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::alloc_handle alloc0{};
     if (ggml_sycl::unified_alloc(req, &alloc0) && alloc0.ptr) {
-        g_tp_host_buf0_handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(alloc0), GGML_LAYOUT_AOS);
+        g_tp_host_buf0_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(alloc0), GGML_LAYOUT_AOS);
         auto resolved         = g_tp_host_buf0_handle.resolve(req.device);
         g_tp_host_buf0        = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
     }
     ggml_sycl::alloc_handle alloc1{};
     if (ggml_sycl::unified_alloc(req, &alloc1) && alloc1.ptr) {
-        g_tp_host_buf1_handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(alloc1), GGML_LAYOUT_AOS);
+        g_tp_host_buf1_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(alloc1), GGML_LAYOUT_AOS);
         auto resolved         = g_tp_host_buf1_handle.resolve(req.device);
         g_tp_host_buf1        = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
     }
@@ -2528,7 +2528,7 @@ void * ggml_sycl_pp_ensure_stage_buffer(int stage, size_t size) {
     ggml_sycl::alloc_handle stage_output_owner{};
     if (ggml_sycl::unified_alloc(req, &stage_output_owner) && stage_output_owner.ptr) {
         g_sycl_pp_config.stage_output_handle[stage] =
-            ggml_sycl::mem_handle::from_owned_alloc(std::move(stage_output_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::detail::from_legacy_owned_alloc(std::move(stage_output_owner), GGML_LAYOUT_AOS);
     }
     void * stage_output = resolve_stage_output(stage);
     if (!stage_output) {

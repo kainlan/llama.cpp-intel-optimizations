@@ -350,7 +350,7 @@ void ggml_sycl_ccl_allreduce_sum_f32(const float * send_buf, float * recv_buf, s
                 return;
             }
             ggml_sycl::mem_handle staging_handle =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(staging_owner), GGML_LAYOUT_AOS);
+                ggml_sycl::detail::from_legacy_owned_alloc(std::move(staging_owner), GGML_LAYOUT_AOS);
             auto    resolved = staging_handle.resolve(staging_req.device);
             float * staging  = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
             if (!staging) {

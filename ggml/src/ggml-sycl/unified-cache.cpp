@@ -829,6 +829,9 @@ const alloc_metadata & shared_alloc_owner::metadata() const noexcept {
     static const alloc_metadata empty{};
     return control_ ? control_->metadata() : empty;
 }
+uint32_t shared_alloc_owner::use_count() const noexcept {
+    return control_ ? control_->use_count() : 0;
+}
 release_attempt shared_alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
     return control ? control->release_ref() : release_attempt{};
@@ -2881,7 +2884,7 @@ unified_cache::unified_cache(sycl::queue & queue,
             alloc_handle owner =
                 unified_cache_adopt_raw_host_allocation(staging_, staging_size_, queue_, alloc_role::STAGING,
                                                         runtime_category::STAGING, "unified_cache:staging");
-            staging_owner_ = mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+            staging_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
             staging_       = staging_owner_.resolve().ptr;
             if (!staging_) {
                 GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to resolve staging owner ptr size=%.1f MB\n",
@@ -4002,7 +4005,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                                 new_device_ptr, size);
                             GGML_ASSERT(false && "ensure_cached realloc direct allocation adoption failed");
                         }
-                        new_direct_alloc_owner = mem_handle::from_owned_alloc(std::move(new_owner), layout);
+                        new_direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(new_owner), layout);
                     }
                 }
 
@@ -4198,7 +4201,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 GGML_LOG_ERROR("[UNIFIED-CACHE] failed to adopt device allocation ptr=%p size=%zu\n", device_ptr, size);
                 GGML_ASSERT(false && "ensure_cached direct allocation adoption failed");
             }
-            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
         }
     }
 
@@ -4534,7 +4537,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     alloc_handle exact_owner{};
     if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
         ptr                = exact_owner.ptr;
-        direct_alloc_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+        direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
     }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
@@ -4548,7 +4551,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         alloc_handle owner{};
         if (unified_alloc(req, &owner) && owner.ptr) {
             ptr                = owner.ptr;
-            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
         }
     }
     if (!ptr) {
@@ -4853,7 +4856,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     alloc_handle exact_owner{};
     if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
         ptr                = exact_owner.ptr;
-        direct_alloc_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+        direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
     }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
@@ -4867,7 +4870,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         alloc_handle owner{};
         if (unified_alloc(req, &owner) && owner.ptr) {
             ptr                = owner.ptr;
-            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
         }
     }
     if (!ptr) {
@@ -4935,7 +4938,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (unified_alloc(host_req, &host_owner) && host_owner.ptr) {
                 host_ptr         = host_owner.ptr;
                 host_allocated   = true;
-                host_alloc_owner = mem_handle::from_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
+                host_alloc_owner = detail::from_legacy_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
                 mem_handle src_handle =
                     make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
                 mem_copy(host_alloc_owner, src_handle, src_size, *queue, {});
@@ -5305,7 +5308,7 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         return result;
     }
     ptr = exact_owner.ptr;
-    mem_handle bulk_owner = mem_handle::from_owned_alloc(std::move(exact_owner), layout);
+    mem_handle bulk_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
     if (!bulk_owner.valid()) return result;
 
     auto release_unpublished_ptr = [&]() {
@@ -6851,7 +6854,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
         alloc_handle owner{};
         if (unified_cache_zone_allocate(get_device_id_from_queue(queue_), vram_zone_id::WEIGHT, size, &owner)) {
             device_ptr        = owner.ptr;
-            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
             is_pool_alloc     = true; // arena bytes are accounted by the zone
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: exact arena weight alloc %zu bytes\n", size);
         }
@@ -6902,7 +6905,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                 GGML_ASSERT(false && "allocate_slot direct allocation adoption failed");
                 return nullptr;
             }
-            direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
         }
         if (!device_ptr) {
             return nullptr;
@@ -10435,7 +10438,7 @@ bool unified_cache::get_dma_staging_buffers(size_t slice_bytes, size_t count, dm
         const size_t   owner_size     = handle.size;
         const int      owner_device   = handle.device;
         const uint64_t owner_alloc_id = handle.alloc_id;
-        mem_handle     owner_handle   = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+        mem_handle     owner_handle   = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
         void *         owner_ptr      = owner_handle.resolve().ptr;
         if (!owner_ptr) {
             owner_handle = {};
@@ -12374,6 +12377,31 @@ bool allocation_coordinator_test_try_register(
 }
 #endif
 
+alloc_owner detail::promote_legacy_alloc_owner(alloc_handle && handle) noexcept {
+    if (!handle.ptr || handle.device < 0 || handle.device >= GGML_SYCL_MAX_DEVICES) return {};
+    alloc_owner_control * control = nullptr;
+    try {
+        auto coordinator = unified_allocation_release_coordinator(handle.device);
+        control = allocation_owner_internal_access::create(coordinator);
+        if (!control) return {};
+        {
+            std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+            auto it = g_runtime_alloc_registry.find(handle.ptr);
+            if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+                it->second.ownership != runtime_alloc_ownership::LEGACY || it->second.handle != handle.metadata() ||
+                !allocation_owner_internal_access::publish(control, it->second.handle)) {
+                allocation_owner_internal_access::abandon(control);
+                return {};
+            }
+            it->second.ownership = runtime_alloc_ownership::INTRUSIVE;
+        }
+        return allocation_owner_internal_access::adopt(control);
+    } catch (...) {
+        if (control) allocation_owner_internal_access::abandon(control);
+        return {};
+    }
+}
+
 allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
     allocation_result result;
     alloc_owner_control * control = nullptr;
@@ -12437,11 +12465,9 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
 }
 
 mem_handle unified_allocate(const alloc_request & req) {
-    alloc_handle handle;
-    if (!unified_alloc(req, &handle) || !handle.ptr) {
-        return mem_handle{};
-    }
-    return mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+    allocation_result allocation = unified_allocate_owner(req);
+    if (!allocation) return {};
+    return mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
 static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
@@ -13798,7 +13824,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
             return nullptr;
         }
-        owner         = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+        owner         = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
         auto resolved = owner.resolve(req.device);
         if (!resolved || !resolved.on_device) {
             owner = {};
@@ -14292,7 +14318,7 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
             return nullptr;
         }
-        owner         = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+        owner         = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
         auto resolved = owner.resolve(req.device);
         if (!resolved || !resolved.on_device) {
             owner = {};
@@ -14488,7 +14514,7 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
                           size_bytes / (1024.0f * 1024.0f));
             return false;
         }
-        reorder_temp_owner_ = mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+        reorder_temp_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
         auto resolved       = reorder_temp_owner_.resolve(req.device);
         if (!resolved || !resolved.on_device) {
             GGML_LOG_WARN("[UNIFIED-CACHE] failed to resolve GPU reorder temp buffer owner (%.1f MB)\n",
@@ -14681,7 +14707,7 @@ bool unified_cache::reserve_persistent_scratch(const std::string & buffer_name, 
                            buffer_name.c_str(), size_bytes / (1024.0f * 1024.0f));
             return false;
         }
-        owner = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+        owner = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
         ptr   = owner.resolve().ptr;
         if (!ptr) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to resolve persistent scratch '%s' owner (%.1f MB)\n",
@@ -14897,7 +14923,7 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
                        partial_bytes / (1024.0f * 1024.0f));
         return nullptr;
     }
-    mem_handle partial_handle = mem_handle::from_owned_alloc(std::move(partial_owner), GGML_LAYOUT_SOA);
+    mem_handle partial_handle = detail::from_legacy_owned_alloc(std::move(partial_owner), GGML_LAYOUT_SOA);
     void *     dev_ptr        = partial_handle.resolve().ptr;
     if (!dev_ptr) {
         GGML_LOG_ERROR("[PARTIAL-ROWS] failed to resolve allocation handle for '%s' device %d (%.2f MB)\n", tensor_name,
@@ -15802,7 +15828,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                     }
                     return nullptr;
                 }
-                new_direct_alloc_owner = mem_handle::from_owned_alloc(std::move(new_owner), layout);
+                new_direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(new_owner), layout);
 
                 // Commit pointer/extent/capability under rw_mutex_, then release
                 // the copied old owner. Until this point every failure rolls the
@@ -15875,7 +15901,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
         GGML_ASSERT(false && "ensure_cached_alloc direct allocation adoption failed");
         return nullptr;
     }
-    direct_alloc_owner = mem_handle::from_owned_alloc(std::move(owner), layout);
+    direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
 
     unified_cache_entry entry = reserved_entry;
     entry.device_ptr           = device_ptr;
@@ -16512,7 +16538,7 @@ bool unified_cache::reserve_compute_arena(size_t arena_bytes) {
         return false;
     }
 
-    compute_arena_owner_ = mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    compute_arena_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
     compute_arena_ptr_   = compute_arena_owner_.resolve().ptr;
     if (!compute_arena_ptr_) {
         GGML_LOG_ERROR("[COMPUTE-ARENA] Failed to resolve direct compute arena owner for %.1f MB\n",
@@ -16795,7 +16821,7 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
         return false;
     }
 
-    scratch_pool_owner_ = mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    scratch_pool_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
     scratch_pool_ptr_   = scratch_pool_owner_.resolve().ptr;
     if (!scratch_pool_ptr_) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] reserve_scratch_pool: failed to resolve direct owner for %.1f MB\n",
@@ -17076,7 +17102,7 @@ bool unified_cache_fill_with_host_copy(int           device_id,
         return false;
     }
 
-    mem_handle src_handle = mem_handle::from_owned_alloc(std::move(host_stage_owner), GGML_LAYOUT_AOS);
+    mem_handle src_handle = detail::from_legacy_owned_alloc(std::move(host_stage_owner), GGML_LAYOUT_AOS);
     mem_fill(src_handle, value, chunk_bytes, queue);
     size_t offset = 0;
     try {
@@ -17831,7 +17857,7 @@ bool moe_preallocate_inference_buffers(int device_id, const moe_buffer_params & 
             return false;
         }
         on_device = moe_owner.tier == alloc_tier::DEVICE_VRAM;
-        out       = std::make_shared<mem_handle>(mem_handle::from_owned_alloc(std::move(moe_owner)));
+        out       = std::make_shared<mem_handle>(detail::from_legacy_owned_alloc(std::move(moe_owner)));
         return out->valid();
     };
 

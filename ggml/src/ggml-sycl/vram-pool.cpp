@@ -87,7 +87,7 @@ void * vram_pool::allocate(size_t size, uint64_t tensor_id, size_t alignment) {
     }
 
     void *     ptr          = handle.ptr;
-    mem_handle owner        = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+    mem_handle owner        = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
     allocations_[tensor_id] = { std::move(owner), size };
     used_ += size;
 

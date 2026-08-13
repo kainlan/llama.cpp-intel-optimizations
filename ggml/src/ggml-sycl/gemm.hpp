@@ -564,7 +564,7 @@ class DnnlGemmWrapper {
                 ggml_sycl::alloc_handle b_packed_alloc_owner{};
                 if (ggml_sycl::unified_alloc(req, &b_packed_alloc_owner) && b_packed_alloc_owner.ptr) {
                     b_packed_owner =
-                        ggml_sycl::mem_handle::from_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
+                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
                     auto resolved = b_packed_owner.resolve(req.device);
                     b_packed_dev  = resolved && resolved.on_device ? resolved.ptr : nullptr;
                     if (!b_packed_dev) {

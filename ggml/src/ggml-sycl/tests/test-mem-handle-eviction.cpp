@@ -655,7 +655,7 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     TEST_ASSERT(geometry.vram_zone == ggml_sycl::vram_zone_id::WEIGHT && geometry.arena_extent == bytes,
                 "exact allocation omitted zone/extent");
     ggml_sycl::mem_handle geometry_owner =
-        ggml_sycl::mem_handle::from_owned_alloc(std::move(geometry), GGML_LAYOUT_AOS);
+        ggml_sycl::detail::from_legacy_owned_alloc(std::move(geometry), GGML_LAYOUT_AOS);
     const auto geometry_info = geometry_owner.debug_info();
     TEST_ASSERT(geometry_info.valid && geometry_info.canonical_allocation_id != 0 &&
                     geometry_info.canonical_generation != 0 && geometry_info.canonical_extent == bytes,

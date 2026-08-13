@@ -56,7 +56,7 @@ static void * fused_moe_esimd_alloc_device_scratch(size_t                  bytes
         return nullptr;
     }
 
-    owner         = ggml_sycl::mem_handle::from_owned_alloc(std::move(fused_scratch_owner), GGML_LAYOUT_AOS);
+    owner         = ggml_sycl::detail::from_legacy_owned_alloc(std::move(fused_scratch_owner), GGML_LAYOUT_AOS);
     auto resolved = owner.resolve(req.device);
     if (!resolved || !resolved.on_device) {
         owner = {};

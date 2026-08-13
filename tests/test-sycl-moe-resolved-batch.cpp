@@ -281,7 +281,7 @@ static bool test_owned_direct_slice_route_acceptance() {
     req.intent.constraints.must_device = true;
     ggml_sycl::alloc_handle allocation{};
     CHECK(ggml_sycl::unified_alloc(req, &allocation));
-    auto owner = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
+    auto owner = ggml_sycl::detail::from_legacy_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
 
     // Every special member must preserve the allocator-minted capability as one
     // tuple with the owner and range.  This is deliberately a real unified_alloc

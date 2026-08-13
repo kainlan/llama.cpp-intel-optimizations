@@ -4022,7 +4022,6 @@ struct release_attempt {
 };
 
 class allocation_release_coordinator;
-class shared_alloc_owner;
 
 // Preallocated, intrusive allocation ownership state. The control is created
 // before physical allocation, then becomes the sole source of published
@@ -4052,46 +4051,6 @@ class alloc_owner_control final {
     std::shared_ptr<allocation_release_coordinator> coordinator_;
     alloc_owner_control * retry_next_ = nullptr;
     bool published_ = false;
-};
-
-class alloc_owner {
-  public:
-    alloc_owner() = default;
-    ~alloc_owner();
-    alloc_owner(const alloc_owner &) = delete;
-    alloc_owner & operator=(const alloc_owner &) = delete;
-    alloc_owner(alloc_owner && other) noexcept;
-    alloc_owner & operator=(alloc_owner && other) noexcept;
-
-    explicit operator bool() const noexcept { return control_ != nullptr; }
-    const alloc_metadata & metadata() const noexcept;
-    release_attempt reset() noexcept;
-    shared_alloc_owner into_shared() && noexcept;
-
-  private:
-    friend struct allocation_owner_internal_access;
-    explicit alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
-    alloc_owner_control * control_ = nullptr;
-};
-
-class shared_alloc_owner {
-  public:
-    shared_alloc_owner() = default;
-    ~shared_alloc_owner();
-    shared_alloc_owner(const shared_alloc_owner & other) noexcept;
-    shared_alloc_owner & operator=(const shared_alloc_owner & other) noexcept;
-    shared_alloc_owner(shared_alloc_owner && other) noexcept;
-    shared_alloc_owner & operator=(shared_alloc_owner && other) noexcept;
-
-    explicit operator bool() const noexcept { return control_ != nullptr; }
-    const alloc_metadata & metadata() const noexcept;
-    uint32_t use_count() const noexcept { return control_ ? control_->use_count() : 0; }
-    release_attempt reset() noexcept;
-
-  private:
-    friend class alloc_owner;
-    explicit shared_alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
-    alloc_owner_control * control_ = nullptr;
 };
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -4291,6 +4250,11 @@ void allocation_registry_test_erase(void * ptr) noexcept;
 // allocation. The legacy alloc_handle adapter remains inside the allocator;
 // broad caller migration is intentionally deferred.
 allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
+namespace detail {
+// Narrow compatibility bridge for allocation sites still returning alloc_handle.
+// Atomically promotes the exact legacy registry row to intrusive ownership.
+alloc_owner promote_legacy_alloc_owner(alloc_handle && handle) noexcept;
+}
 std::shared_ptr<allocation_release_coordinator> unified_allocation_release_coordinator(int device);
 bool unified_allocation_release_coordinator_detach(int device) noexcept;
 

@@ -562,7 +562,7 @@ bool ExpertPredictor::test_allocate_scores(sycl::queue & queue, int count) {
     scores_dev_    = static_cast<float *>(owner.ptr);
     scores_dev_n_  = count;
     scores_queue_  = &queue;
-    scores_handle_ = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    scores_handle_ = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
     return scores_handle_.valid();
 }
 
@@ -918,7 +918,7 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
             ggml_sycl::alloc_handle owner{};
             if (ggml_sycl::unified_alloc(req, &owner) && owner.ptr) {
                 scores_dev_    = static_cast<float *>(owner.ptr);
-                scores_handle_ = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+                scores_handle_ = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
             }
         }
         scores_dev_n_ = M;

@@ -39,6 +39,9 @@ alloc_metadata metadata(uint64_t id) {
     value.size = 256;
     value.device = 0;
     value.id = id;
+    value.alloc_id = id;
+    value.epoch_id = 1;
+    value.tier = alloc_tier::HOST_PINNED;
     return value;
 }
 
@@ -68,6 +71,42 @@ void unique_to_shared_preserves_identity() {
     check(shared.reset().released(), "shared final release did not complete");
     check(backend.releases == 1 && fixture.coordinator->live_controls() == 0, "identity conversion duplicated release");
     std::cout << "PASS unique-to-shared-identity\n";
+}
+
+void mem_handle_shares_intrusive_control_and_retries() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 20);
+    const alloc_metadata exact = fixture.result.owner.metadata();
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    check(root.valid(), "mem_handle rejected intrusive allocation owner");
+    const auto identity = root.debug_info();
+    check(identity.canonical_allocation_id == exact.alloc_id && identity.canonical_extent == exact.size,
+          "mem_handle changed intrusive control identity");
+    {
+        mem_handle copy(root);
+        mem_handle assigned;
+        assigned = root;
+        mem_handle slice = copy.slice(32, 64);
+        check(slice.valid() && slice.debug_info().canonical_allocation_id == identity.canonical_allocation_id,
+              "copy/slice did not retain one intrusive control identity");
+        root = mem_handle{};
+        check(backend.attempts == 0, "assignment released allocation with live copies");
+    }
+    check(backend.attempts == 1 && backend.releases == 1,
+          "mem_handle copies did not release intrusive control exactly once");
+
+    fake_release_backend refusing;
+    refusing.refusals_remaining = 1;
+    auto retry_fixture = make_owner(refusing, 21);
+    mem_handle retry = mem_handle::from_owned_alloc(std::move(retry_fixture.result.owner));
+    retry = mem_handle{};
+    check(refusing.attempts == 1 && retry_fixture.coordinator->retry_count() == 1,
+          "external lease refusal was not transferred to coordinator retry");
+    check(retry_fixture.coordinator->process_retries() == 1 && refusing.releases == 1,
+          "coordinator retry did not complete refused mem_handle release");
+    std::cout << "PASS mem-handle-intrusive-control-identity\n"
+                 "PASS mem-handle-assignment-exactly-once\n"
+                 "PASS mem-handle-refusal-coordinator-retry\n";
 }
 
 void concurrent_final_release_exactly_once() {
@@ -250,6 +289,7 @@ static_assert(!std::is_constructible_v<shared_alloc_owner, alloc_metadata>);
 
 int main() {
     unique_to_shared_preserves_identity();
+    mem_handle_shares_intrusive_control_and_retries();
     concurrent_final_release_exactly_once();
     refusal_is_allocation_free_and_retries_without_duplicates();
     late_shutdown_is_busy_then_clean();
@@ -257,6 +297,6 @@ int main() {
     coordinator_close_linearizes_with_registration();
     intrusive_registry_row_rejects_legacy_claim();
     invalid_request_has_zero_coordinator_census();
-    std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n" << std::flush;
-    std::_Exit(0);
+    std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
+    return 0;
 }

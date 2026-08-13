@@ -134,7 +134,7 @@ int main() {
         std::fprintf(stderr, "FAIL: unified_alloc device buffer failed\n");
         failed++;
     } else {
-        ggml_sycl::mem_handle unified_h    = ggml_sycl::mem_handle::from_owned_alloc(std::move(unified_alloc));
+        ggml_sycl::mem_handle unified_h    = ggml_sycl::detail::from_legacy_owned_alloc(std::move(unified_alloc));
         auto                  unified_fill = ggml_sycl::mem_fill_async(unified_h, 0x55, size, q);
         auto                  unified_back = ggml_sycl::mem_copy_async(host_b_h, unified_h, size, q, { unified_fill });
         unified_back.wait_and_throw();

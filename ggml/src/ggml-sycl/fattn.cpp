@@ -582,7 +582,7 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                 return debug_reject("sidecar-alloc-failed", root);
             }
             packed.ptr    = sidecar_owner.ptr;
-            packed.handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(sidecar_owner), GGML_LAYOUT_AOS);
+            packed.handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(sidecar_owner), GGML_LAYOUT_AOS);
             if (!packed.handle.valid()) {
                 packed.reset();
                 return debug_reject("sidecar-handle-invalid", root);
@@ -765,7 +765,7 @@ static bool ggml_sycl_fattn_alloc_device_owner(size_t                      bytes
     }
 
     ggml_sycl::mem_handle handle =
-        ggml_sycl::mem_handle::from_owned_alloc(std::move(device_buffer_owner), GGML_LAYOUT_AOS);
+        ggml_sycl::detail::from_legacy_owned_alloc(std::move(device_buffer_owner), GGML_LAYOUT_AOS);
     auto resolved = handle.resolve(req.device);
     if (!resolved || !resolved.on_device || !resolved.ptr) {
         handle = {};
@@ -1659,7 +1659,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
             return false;
         }
         out->ptr         = packed_k_owner.ptr;
-        out->handle      = ggml_sycl::mem_handle::from_owned_alloc(std::move(packed_k_owner), GGML_LAYOUT_AOS);
+        out->handle      = ggml_sycl::detail::from_legacy_owned_alloc(std::move(packed_k_owner), GGML_LAYOUT_AOS);
         out->total_bytes = desc.total_packed_bytes;
         if (!out->handle.valid()) {
             out->reset();
@@ -1822,7 +1822,7 @@ static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(dpct::queue_ptr 
         }
         return false;
     }
-    *out = ggml_sycl::mem_handle::from_owned_alloc(std::move(workspace_owner), GGML_LAYOUT_AOS);
+    *out = ggml_sycl::detail::from_legacy_owned_alloc(std::move(workspace_owner), GGML_LAYOUT_AOS);
     return out->valid();
 }
 

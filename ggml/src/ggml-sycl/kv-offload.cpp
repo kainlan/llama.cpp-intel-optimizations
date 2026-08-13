@@ -498,7 +498,7 @@ bool kv_offload_manager::allocate_cpu_block(kv_block & block) {
         return false;
     }
 
-    mem_handle owner    = mem_handle::from_owned_alloc(std::move(cpu_block_owner), GGML_LAYOUT_AOS);
+    mem_handle owner    = detail::from_legacy_owned_alloc(std::move(cpu_block_owner), GGML_LAYOUT_AOS);
     auto       resolved = owner.resolve(device);
     if (!resolved.ptr || resolved.on_device) {
         return false;

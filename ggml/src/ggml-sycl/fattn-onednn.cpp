@@ -860,7 +860,7 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     }
 
     ggml_sycl::mem_handle scale_owner =
-        ggml_sycl::mem_handle::from_owned_alloc(std::move(scale_alloc), GGML_LAYOUT_AOS);
+        ggml_sycl::detail::from_legacy_owned_alloc(std::move(scale_alloc), GGML_LAYOUT_AOS);
     auto scale_r = scale_owner.resolve(device);
     if (!scale_r.ptr || scale_r.on_device) {
         throw std::runtime_error("oneDNN SDPA: scale buffer is not host-pinned USM");

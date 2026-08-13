@@ -724,7 +724,7 @@ static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
 
     void * const ptr         = allocation.ptr;
     const size_t used_before = cache->zone_used(allocation.vram_zone);
-    mem_handle owner         = mem_handle::from_owned_alloc(allocation);
+    mem_handle owner         = detail::from_legacy_owned_alloc(allocation);
     TEST_ASSERT(owner.valid(), "owning arena handle construction failed");
     mem_handle independent = mem_handle::from_arena_zone(
         static_cast<int>(allocation.vram_zone), allocation.arena_offset, allocation.size, allocation.device,

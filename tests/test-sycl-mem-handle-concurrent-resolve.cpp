@@ -72,17 +72,27 @@ mem_handle test_make_owned_assignment_handle(void * ptr, uint64_t allocation_id,
     h.canonical_allocation_id_ = allocation_id;
     h.canonical_generation_    = 1;
     h.canonical_extent_        = sizeof(uint64_t);
-    auto * allocation          = new alloc_handle{};
-    allocation->ptr            = ptr;
-    allocation->size           = sizeof(uint64_t);
-    allocation->alloc_id       = allocation_id;
-    h.owned_alloc_ = std::shared_ptr<alloc_handle>(allocation, [callback = std::move(on_delete)](alloc_handle * p) {
-        if (callback) {
-            callback();
-        }
-        delete p;
-    });
-    return h;
+    struct callback_box { std::function<void()> callback; };
+    auto * box = new callback_box{ std::move(on_delete) };
+    alloc_metadata metadata{};
+    metadata.ptr = ptr;
+    metadata.size = sizeof(uint64_t);
+    metadata.device = 0;
+    metadata.id = allocation_id;
+    metadata.alloc_id = allocation_id;
+    metadata.epoch_id = 1;
+    metadata.tier = alloc_tier::HOST_PINNED;
+    auto release = [](const alloc_metadata &, void * opaque) noexcept {
+        std::unique_ptr<callback_box> owned(static_cast<callback_box *>(opaque));
+        if (owned->callback) owned->callback();
+        return release_attempt{ release_attempt_status::RELEASED };
+    };
+    auto fixture = allocation_owner_test_create(metadata, release, box);
+    if (!fixture.result) {
+        delete box;
+        return {};
+    }
+    return mem_handle::from_owned_alloc(std::move(fixture.result.owner));
 }
 
 }  // namespace ggml_sycl

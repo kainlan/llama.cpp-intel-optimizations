@@ -40,6 +40,62 @@ uint64_t cache_generation();
 void cache_generation_bump();
 
 class mem_handle;
+struct alloc_metadata;
+class alloc_owner_control;
+class allocation_release_coordinator;
+struct release_attempt;
+
+// Move-only allocation owner returned by unified_allocate_owner().  Its
+// intrusive control is the sole physical-release authority.
+class alloc_owner {
+  public:
+    alloc_owner() = default;
+    ~alloc_owner();
+    alloc_owner(const alloc_owner &) = delete;
+    alloc_owner & operator=(const alloc_owner &) = delete;
+    alloc_owner(alloc_owner && other) noexcept;
+    alloc_owner & operator=(alloc_owner && other) noexcept;
+
+    explicit operator bool() const noexcept { return control_ != nullptr; }
+    const alloc_metadata & metadata() const noexcept;
+    release_attempt reset() noexcept;
+    class shared_alloc_owner into_shared() && noexcept;
+
+  private:
+    friend struct allocation_owner_internal_access;
+    explicit alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
+    alloc_owner_control * control_ = nullptr;
+};
+
+// Copyable intrusive reference to one allocation owner control.  Copies and
+// mem_handle slices retain this exact control rather than allocating a second
+// std::shared_ptr control block.
+class shared_alloc_owner {
+  public:
+    shared_alloc_owner() = default;
+    ~shared_alloc_owner();
+    shared_alloc_owner(const shared_alloc_owner & other) noexcept;
+    shared_alloc_owner & operator=(const shared_alloc_owner & other) noexcept;
+    shared_alloc_owner(shared_alloc_owner && other) noexcept;
+    shared_alloc_owner & operator=(shared_alloc_owner && other) noexcept;
+
+    explicit operator bool() const noexcept { return control_ != nullptr; }
+    const alloc_metadata & metadata() const noexcept;
+    uint32_t use_count() const noexcept;
+    release_attempt reset() noexcept;
+
+  private:
+    friend class alloc_owner;
+    explicit shared_alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
+    alloc_owner_control * control_ = nullptr;
+};
+
+namespace detail {
+// Allocator-private compatibility adapter.  It cannot be selected through the
+// public from_owned_alloc API and is only for legacy allocation sites awaiting
+// conversion to unified_allocate_owner().
+mem_handle from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
+} // namespace detail
 
 // === Resolved pointer ===
 // The result of resolving a mem_handle.  Contains the current pointer and
@@ -331,7 +387,7 @@ class mem_handle {
     // unified_free() when the last copy is destroyed.  This is the canonical
     // bridge for runtime allocations whose lifetime must survive asynchronous
     // queue submission.
-    static mem_handle from_owned_alloc(alloc_handle handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
+    static mem_handle from_owned_alloc(alloc_owner && owner, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 
     // Return a bounded retained view into any stable backing handle (owning
     // allocation, WEIGHT lease, arena allocation, or chunk lease). The view
@@ -447,6 +503,7 @@ class mem_handle {
 
   private:
     friend class moe::canonical_allocation_integration;
+    friend mem_handle detail::from_legacy_owned_alloc(alloc_handle &&, ggml_layout_mode);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     void set_canonical_identity_for_test(uint64_t allocation_id, uint64_t generation, size_t extent,
                                          size_t offset, size_t size) noexcept;
@@ -550,7 +607,7 @@ class mem_handle {
     // Optional runtime allocation owner.  DIRECT handles that wrap scratch,
     // staging, or runtime allocations can carry this shared owner so copies are
     // true ref-counted leases rather than raw pointer aliases.
-    std::shared_ptr<alloc_handle> owned_alloc_;
+    shared_alloc_owner owned_alloc_;
 
     // Lease-protected backing entry pointer (llama.cpp-vtf7f).  When non-null,
     // this handle has incremented the entry's in_use_count, guaranteeing the
