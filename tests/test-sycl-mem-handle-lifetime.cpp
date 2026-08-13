@@ -2,7 +2,9 @@
 #include "unified-cache.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <future>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -82,10 +84,19 @@ static int test_arena_authority_invalidation_and_chunk_bounds() {
     CHECK(authority->resolve_offset(11, 60, 8) == nullptr, "cross-chunk extent rejected");
     std::atomic<bool> stop{ false }, stale{ false };
     std::thread resolver([&] { while (!stop.load()) (void) first.resolve(); if (first.resolve()) stale = true; });
-    authority->invalidate(12);
+    authority->close_and_invalidate(12);
+    CHECK(!authority->acquire_offset(11, 0, 1), "closed incarnation admitted a new lease");
     stop = true;
     resolver.join();
     CHECK(!stale.load() && !first.resolve() && !second.resolve(), "concurrent invalidation is terminal");
+
+    auto drain = std::async(std::launch::async, [&] { authority->wait_for_terminal_leases(); });
+    CHECK(drain.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout,
+          "settle did not wait for retained terminal leases");
+    first = {};
+    second = {};
+    CHECK(drain.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "terminal lease release did not unblock settle");
     return 0;
 }
 

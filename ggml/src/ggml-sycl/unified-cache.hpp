@@ -1928,8 +1928,11 @@ class unified_cache {
         bool             on_device       = false;
         bool             has_ready_event = false;
         sycl::event      ready_event;
+        // Canonical cache/chunk authority for fallback users. A raw ptr result
+        // without this token is forbidden.
+        std::shared_ptr<mem_handle> retained_handle;
 
-        explicit operator bool() const { return ptr != nullptr; }
+        explicit operator bool() const { return ptr != nullptr && retained_handle != nullptr; }
     };
 
     // Fast O(1) weight lookup.  Tries the entry for this key regardless of layout.

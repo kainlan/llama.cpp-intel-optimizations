@@ -3922,11 +3922,28 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
+inline bool ggml_sycl_checked_size_add(size_t a, size_t b, size_t & out) {
+    if (b > SIZE_MAX - a) return false;
+    out = a + b;
+    return true;
+}
+
+inline bool ggml_sycl_checked_size_mul(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    out = a * b;
+    return true;
+}
+
 inline const ggml_tensor * ggml_sycl_view_root_and_offset(const ggml_tensor * tensor, size_t & view_offs) {
     view_offs               = 0;
     const ggml_tensor * cur = tensor;
+    size_t              next = 0;
     while (cur && cur->view_src) {
-        view_offs += cur->view_offs;
+        if (!ggml_sycl_checked_size_add(view_offs, cur->view_offs, next)) {
+            view_offs = 0;
+            return nullptr;
+        }
+        view_offs = next;
         cur = cur->view_src;
     }
     return cur;
@@ -3945,6 +3962,7 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     if (tensor->view_src != nullptr) {
         size_t              view_offs = 0;
         const ggml_tensor * base      = ggml_sycl_view_root_and_offset(tensor, view_offs);
+        if (!base) return nullptr;
 
         void * base_ptr             = nullptr;
         bool   base_on_device       = false;
@@ -4384,20 +4402,15 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                 if (wpr) {
                     // Validate COALESCED compatibility
                     if (wpr.layout == GGML_LAYOUT_COALESCED && !ggml_sycl_layout_supports_coalesced(tensor)) {
-                        auto soa_ptr = cache->lookup(key, GGML_LAYOUT_SOA);
-                        if (soa_ptr) {
-                            result.ptr       = soa_ptr;
-                            result.extent    = ggml_nbytes(tensor);
-                            result.layout    = GGML_LAYOUT_SOA;
-                            result.on_device = wpr.on_device;
-                            return result;
-                        }
-                        // No compatible layout — fall through to raw pointer
+                        // A differently laid-out raw cache pointer has no
+                        // matching retained authority. Do not return it; fall
+                        // through to another owned/materialized route.
                     } else {
                         result.ptr       = wpr.ptr;
                         result.extent    = wpr.byte_size;
                         result.layout    = wpr.layout;
                         result.on_device = wpr.on_device;
+                        result.retention = std::move(wpr.retained_handle);
                         if (wpr.has_ready_event) {
                             result.has_ready_event = true;
                             result.ready_event     = wpr.ready_event;
@@ -4513,6 +4526,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
                     result.extent    = tensor_extent;
                     result.layout    = wpr.layout;
                     result.on_device = wpr.on_device;
+                    result.retention = std::move(wpr.retained_handle);
                     if (wpr.has_ready_event) {
                         result.has_ready_event = true;
                         result.ready_event     = wpr.ready_event;

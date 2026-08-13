@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -37,6 +38,8 @@ uint64_t cache_generation();
 // have moved: evict_one, promote_to_device, finalize_evictions_locked.
 void cache_generation_bump();
 
+class mem_handle;
+
 // === Resolved pointer ===
 // The result of resolving a mem_handle.  Contains the current pointer and
 // metadata needed by the caller.
@@ -50,6 +53,9 @@ struct resolved_ptr {
     bool             on_device       = false;
     bool             has_ready_event = false;
     sycl::event      ready_event;
+    // Optional authority retained with a fallback resolution. Consumers that
+    // outlive this value must transfer it to graph/event retention.
+    std::shared_ptr<mem_handle> retention;
 
     explicit operator bool() const { return ptr != nullptr; }
 };
@@ -77,15 +83,32 @@ enum class mem_handle_kind : uint8_t {
                         // handle is alive.
 };
 
-struct arena_authority {
-    mutable std::mutex mutex;
-    bool alive = true;
-    uint64_t generation = 0;
-    std::vector<std::pair<void *, size_t>> chunks;
+struct arena_authority : std::enable_shared_from_this<arena_authority> {
+    struct admission {
+        void *                ptr = nullptr;
+        std::shared_ptr<void> lease;
 
+        explicit operator bool() const { return ptr != nullptr && lease != nullptr; }
+    };
+
+    mutable std::mutex              mutex;
+    mutable std::condition_variable leases_drained;
+    bool                            alive          = true;
+    bool                            admission_open = true;
+    uint64_t                        generation     = 0;
+    std::vector<std::pair<void *, size_t>> chunks;
+    std::vector<uint32_t>                 lease_counts;
+
+    // Validation and lease admission are one lifecycle-mutex transaction. A
+    // successful result therefore cannot race a close/invalidate and free.
+    admission acquire_offset(uint64_t expected_generation, size_t offset, size_t extent);
     void * resolve_offset(uint64_t expected_generation, size_t offset, size_t extent) const;
-    void invalidate(uint64_t replacement_generation);
+    void close_and_invalidate(uint64_t replacement_generation);
+    void wait_for_terminal_leases() const;
     void bump_generation(uint64_t replacement_generation);
+
+  private:
+    void release_lease(size_t chunk_index);
 };
 
 struct mem_handle_debug_info;
@@ -473,6 +496,7 @@ class mem_handle {
     bool           is_slice_       = false;
     uint64_t arena_gen_ = 0;  // Mint-time arena generation (checked against owner every resolve)
     std::shared_ptr<arena_authority> arena_authority_; // retained incarnation authority
+    std::shared_ptr<void>            arena_lease_;     // admitted lease; releases without cache access
 
     // Exact allocator-minted retention identity. Cache WEIGHT constructors do
     // not populate these until unified-cache propagation lands; graph retention

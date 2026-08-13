@@ -173,22 +173,81 @@ void start_retained_handle_drain_worker() {
 
 }  // namespace
 
+namespace {
+
+bool arena_locate_offset(const std::vector<std::pair<void *, size_t>> & chunks,
+                         size_t offset, size_t extent, size_t & chunk_index, void *& ptr) {
+    size_t logical = 0;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto & chunk = chunks[i];
+        if (offset >= logical && offset - logical < chunk.second) {
+            const size_t in_chunk = offset - logical;
+            if (extent > chunk.second - in_chunk) return false;
+            chunk_index = i;
+            ptr = static_cast<unsigned char *>(chunk.first) + in_chunk;
+            return ptr != nullptr;
+        }
+        if (chunk.second > SIZE_MAX - logical) return false;
+        logical += chunk.second;
+    }
+    return false;
+}
+
+} // namespace
+
+arena_authority::admission arena_authority::acquire_offset(uint64_t expected, size_t offset, size_t extent) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (!alive || !admission_open || generation != expected || extent == 0) return {};
+    size_t chunk_index = 0;
+    void * ptr = nullptr;
+    if (!arena_locate_offset(chunks, offset, extent, chunk_index, ptr)) return {};
+    if (lease_counts.size() != chunks.size()) lease_counts.resize(chunks.size(), 0);
+    if (lease_counts[chunk_index] == UINT32_MAX) return {};
+    ++lease_counts[chunk_index];
+    auto self = shared_from_this();
+    std::shared_ptr<void> lease(ptr, [self = std::move(self), chunk_index](void *) {
+        self->release_lease(chunk_index);
+    });
+    return { ptr, std::move(lease) };
+}
+
 void * arena_authority::resolve_offset(uint64_t expected, size_t offset, size_t extent) const {
     std::lock_guard<std::mutex> guard(mutex);
     if (!alive || generation != expected) return nullptr;
-    size_t logical = 0;
-    for (const auto & chunk : chunks) {
-        if (offset >= logical && offset - logical < chunk.second) {
-            const size_t in_chunk = offset - logical;
-            return extent <= chunk.second - in_chunk ? static_cast<unsigned char *>(chunk.first) + in_chunk : nullptr;
-        }
-        if (chunk.second > SIZE_MAX - logical) return nullptr;
-        logical += chunk.second;
-    }
-    return nullptr;
+    size_t chunk_index = 0;
+    void * ptr = nullptr;
+    return arena_locate_offset(chunks, offset, extent, chunk_index, ptr) ? ptr : nullptr;
 }
-void arena_authority::invalidate(uint64_t next) { std::lock_guard<std::mutex> g(mutex); alive = false; generation = next; }
-void arena_authority::bump_generation(uint64_t next) { std::lock_guard<std::mutex> g(mutex); generation = next; }
+
+void arena_authority::release_lease(size_t chunk_index) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (chunk_index >= lease_counts.size() || lease_counts[chunk_index] == 0) return;
+    --lease_counts[chunk_index];
+    if (std::all_of(lease_counts.begin(), lease_counts.end(), [](uint32_t count) { return count == 0; })) {
+        leases_drained.notify_all();
+    }
+}
+
+void arena_authority::close_and_invalidate(uint64_t next) {
+    std::lock_guard<std::mutex> guard(mutex);
+    admission_open = false;
+    alive = false;
+    generation = next;
+}
+
+void arena_authority::wait_for_terminal_leases() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    leases_drained.wait(lock, [this] {
+        return std::all_of(lease_counts.begin(), lease_counts.end(), [](uint32_t count) { return count == 0; });
+    });
+}
+
+void arena_authority::bump_generation(uint64_t next) {
+    std::lock_guard<std::mutex> g(mutex);
+    admission_open = false;
+    alive = false;
+    generation = next;
+}
 
 static size_t mem_handle_hash_combine(size_t seed, size_t value) {
     return detail::cache_hash_combine(seed, value);
@@ -409,13 +468,13 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
     unified_cache * cache = valid_cache_device_id(device) ? get_existing_unified_cache_for_device(device) : nullptr;
     if (!h.arena_authority_ && cache) h.arena_authority_ = cache->arena_authority_snapshot();
     if (h.arena_authority_) {
-        void * backing = h.arena_authority_->resolve_offset(generation, offset, size);
-        if (!backing) { h.arena_authority_.reset(); return h; }
-        h.cached_ = { backing, size, GGML_LAYOUT_AOS, true };
-        if (cache) {
-            const int chunk = cache->arena_acquire_chunk_lease(backing);
-            if (chunk >= 0) { h.chunk_source_ = 2; h.chunk_device_ = device; h.vram_chunk_idx_ = chunk; }
+        auto admitted = h.arena_authority_->acquire_offset(generation, offset, size);
+        if (!admitted) {
+            h.arena_authority_.reset();
+            return h;
         }
+        h.cached_      = { admitted.ptr, size, GGML_LAYOUT_AOS, true };
+        h.arena_lease_ = std::move(admitted.lease);
     }
     return h;
 }
@@ -522,10 +581,14 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
 }
 
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
-    // Raw external DIRECT pointers have no retained owner and no trustworthy
-    // extent. Slicing them would manufacture a capability rather than derive one.
-    if (!owned_alloc_ && kind_ != mem_handle_kind::WEIGHT && !is_arena() &&
-        kind_ != mem_handle_kind::CHUNK_LEASE) {
+    // An ownerless DIRECT may derive a view only when its creator explicitly
+    // minted a finite extent. This is bounded address authority, not lifetime
+    // ownership: callers must still keep the external allocation alive.
+    if (!owned_alloc_ && kind_ == mem_handle_kind::DIRECT) {
+        mem_handle_lock_guard g(lock_);
+        if (backing_extent_ == 0) return {};
+    } else if (!owned_alloc_ && kind_ != mem_handle_kind::WEIGHT && !is_arena() &&
+               kind_ != mem_handle_kind::CHUNK_LEASE) {
         return {};
     }
 
@@ -1213,6 +1276,7 @@ mem_handle::mem_handle(const mem_handle & other) {
         is_slice_                = other.is_slice_;
         arena_gen_               = other.arena_gen_;
         arena_authority_         = other.arena_authority_;
+        arena_lease_             = other.arena_lease_;
         canonical_allocation_id_ = other.canonical_allocation_id_;
         canonical_generation_    = other.canonical_generation_;
         canonical_extent_        = other.canonical_extent_;
@@ -1265,6 +1329,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     is_slice_                = other.is_slice_;
     arena_gen_               = other.arena_gen_;
     arena_authority_         = std::move(other.arena_authority_);
+    arena_lease_             = std::move(other.arena_lease_);
     canonical_allocation_id_ = other.canonical_allocation_id_;
     canonical_generation_    = other.canonical_generation_;
     canonical_extent_        = other.canonical_extent_;
@@ -1292,6 +1357,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     other.is_slice_                = false;
     other.arena_gen_               = 0;
     other.arena_authority_.reset();
+    other.arena_lease_.reset();
     other.canonical_allocation_id_ = 0;
     other.canonical_generation_    = 0;
     other.canonical_extent_        = 0;
@@ -1320,6 +1386,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     bool                  new_is_slice               = false;
     uint64_t              new_arena_gen              = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
+    std::shared_ptr<void>            new_arena_lease;
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation   = 0;
     size_t                new_canonical_extent       = 0;
@@ -1346,6 +1413,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_canonical_generation    = other.canonical_generation_;
         new_canonical_extent        = other.canonical_extent_;
         new_arena_authority         = other.arena_authority_;
+        new_arena_lease             = other.arena_lease_;
         new_owned_alloc             = other.owned_alloc_;
         new_debug_owner_tag         = other.debug_owner_tag_;
         new_gen                     = other.gen_;
@@ -1401,6 +1469,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         canonical_generation_    = new_canonical_generation;
         canonical_extent_        = new_canonical_extent;
         arena_authority_         = std::move(new_arena_authority);
+        arena_lease_             = std::move(new_arena_lease);
         owned_alloc_             = std::move(new_owned_alloc);
         debug_owner_tag_         = new_debug_owner_tag;
         gen_                     = new_gen;
@@ -1440,6 +1509,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     bool                  new_is_slice                = false;
     uint64_t              new_arena_gen               = 0;
     std::shared_ptr<arena_authority> new_arena_authority;
+    std::shared_ptr<void>            new_arena_lease;
     uint64_t              new_canonical_allocation_id = 0;
     uint64_t              new_canonical_generation    = 0;
     size_t                new_canonical_extent        = 0;
@@ -1463,6 +1533,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         new_canonical_generation    = other.canonical_generation_;
         new_canonical_extent        = other.canonical_extent_;
         new_arena_authority         = std::move(other.arena_authority_);
+        new_arena_lease             = std::move(other.arena_lease_);
         new_owned_alloc             = std::move(other.owned_alloc_);
         new_debug_owner_tag         = other.debug_owner_tag_;
         new_gen                     = other.gen_;
@@ -1481,6 +1552,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         other.is_slice_                = false;
         other.arena_gen_               = 0;
         other.arena_authority_.reset();
+        other.arena_lease_.reset();
         other.canonical_allocation_id_ = 0;
         other.canonical_generation_    = 0;
         other.canonical_extent_        = 0;
@@ -1510,6 +1582,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
         canonical_generation_    = new_canonical_generation;
         canonical_extent_        = new_canonical_extent;
         arena_authority_         = std::move(new_arena_authority);
+        arena_lease_             = std::move(new_arena_lease);
         owned_alloc_             = std::move(new_owned_alloc);
         debug_owner_tag_         = new_debug_owner_tag;
         gen_                     = new_gen;
