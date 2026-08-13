@@ -201,11 +201,24 @@ struct underestimate_record {
     size_t observations = 0;
 };
 
-std::mutex g_underestimate_mutex;
+struct underestimate_state {
+    std::mutex                                  mutex;
+    std::map<std::string, underestimate_record> table;
+};
 
-std::map<std::string, underestimate_record> & underestimates() {
-    static std::map<std::string, underestimate_record> table;
-    return table;
+// Process-lifetime diagnostic state. A unified_cache can be destroyed from the
+// global cache registry during static destruction, after function-local static
+// destructors registered later in main have already run. Giving this tiny
+// accounting table a destructor therefore makes a late cache shutdown read a
+// destroyed std::map (and used to produce exit 139 after every test passed).
+//
+// Leak the state deliberately: it owns no SYCL resources, remains bounded by
+// the handful of sizing path names, and must also survive ordinary DSO teardown
+// until every cache destructor has reported. Keeping the mutex and table in one
+// process-lifetime object removes both destructor-order dependencies.
+underestimate_state & underestimates() {
+    static underestimate_state * state = new underestimate_state();
+    return *state;
 }
 
 const char * path_key(const char * path) {
@@ -213,16 +226,18 @@ const char * path_key(const char * path) {
 }
 
 size_t underestimate_field(const char * path, size_t underestimate_record::* field) {
-    std::lock_guard<std::mutex>                                 lock(g_underestimate_mutex);
-    std::map<std::string, underestimate_record>::const_iterator it = underestimates().find(path_key(path));
-    return it == underestimates().end() ? 0 : it->second.*field;
+    underestimate_state &                                      state = underestimates();
+    std::lock_guard<std::mutex>                                 lock(state.mutex);
+    std::map<std::string, underestimate_record>::const_iterator it = state.table.find(path_key(path));
+    return it == state.table.end() ? 0 : it->second.*field;
 }
 
 }  // namespace
 
 void zone_sizing_record_underestimate(const char * path, size_t requested_bytes, size_t planned_bytes) {
-    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
-    underestimate_record &      record = underestimates()[path_key(path)];
+    underestimate_state &       state = underestimates();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    underestimate_record &      record = state.table[path_key(path)];
     record.count += 1;
     if (requested_bytes > record.max_requested) {
         record.max_requested  = requested_bytes;
@@ -239,8 +254,9 @@ size_t zone_sizing_max_underestimate_bytes(const char * path) {
 }
 
 void zone_sizing_record_observation(const char * path) {
-    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
-    underestimates()[path_key(path)].observations += 1;
+    underestimate_state &       state = underestimates();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.table[path_key(path)].observations += 1;
 }
 
 size_t zone_sizing_observation_count(const char * path) {
@@ -248,8 +264,9 @@ size_t zone_sizing_observation_count(const char * path) {
 }
 
 void zone_sizing_reset_underestimates() {
-    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
-    underestimates().clear();
+    underestimate_state &       state = underestimates();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.table.clear();
 }
 
 bool zone_sizing_log_underestimate_summary() {
@@ -257,8 +274,9 @@ bool zone_sizing_log_underestimate_summary() {
     // code that must not run while this unit's mutex is held.
     std::map<std::string, underestimate_record> snapshot;
     {
-        std::lock_guard<std::mutex> lock(g_underestimate_mutex);
-        snapshot = underestimates();
+        underestimate_state &       state = underestimates();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        snapshot = state.table;
     }
 
     bool reported = false;

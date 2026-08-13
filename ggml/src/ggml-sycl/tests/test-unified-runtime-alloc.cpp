@@ -8,6 +8,7 @@
 
 #include "../unified-cache.hpp"
 #include "../ggml-sycl-test.hpp"
+#include "../zone-sizing.hpp"
 
 #include "sycl-test-skip.hpp"
 
@@ -661,6 +662,39 @@ static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
     return true;
 }
 
+static std::string shell_quote(const char * value) {
+#if defined(_WIN32)
+    return std::string("\"") + value + "\"";
+#else
+    std::string quoted("'");
+    for (const char * p = value; *p; ++p) {
+        if (*p == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += *p;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+#endif
+}
+
+static bool global_cache_static_destruction_exits_cleanly(const char * self) {
+    TEST_BEGIN("global_cache_static_destruction_exits_cleanly");
+    const std::string command = shell_quote(self) + " --static-destruction-child";
+    TEST_ASSERT(std::system(command.c_str()) == 0, "cache subprocess did not exit cleanly");
+    TEST_PASS();
+    return true;
+}
+
+static bool explicit_global_cache_shutdown_is_clean() {
+    TEST_BEGIN("explicit_global_cache_shutdown_is_clean");
+    TEST_ASSERT(shutdown_unified_cache(), "explicit global cache shutdown failed");
+    TEST_ASSERT(unified_cache_shutdown_state_clean(), "global cache retained owners after explicit shutdown");
+    TEST_PASS();
+    return true;
+}
+
 static bool arena_owned_shutdown_and_lifecycle_serialization(sycl::queue & q) {
     TEST_BEGIN("arena_owned_shutdown_and_lifecycle_serialization");
     constexpr size_t mib = 1024ull * 1024ull;
@@ -737,7 +771,7 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     return true;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
     fprintf(stderr, "===========================================\n");
@@ -759,6 +793,15 @@ int main() {
     }
     sycl::device & dev = *dev_opt;
     sycl::queue q(dev, sycl::property::queue::in_order{});
+
+    // This child intentionally omits explicit shutdown. Its ordinary return
+    // exercises the production fallback where g_device_caches destroys its
+    // cache after main. Initializing the zone-sizing diagnostics after the
+    // global cache registry reproduces the historical destructor-order crash.
+    if (argc == 2 && std::strcmp(argv[1], "--static-destruction-child") == 0) {
+        zone_sizing_record_observation("static-destruction-child");
+        return get_unified_cache(q) ? 0 : 1;
+    }
 
     bool ok = true;
     enable_strict_mode_env();
@@ -791,6 +834,10 @@ int main() {
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
+    ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
+    // The fixture owns a process-global cache, so drain it while q and the SYCL
+    // runtime are still alive rather than relying on static destruction.
+    ok &= explicit_global_cache_shutdown_is_clean();
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
