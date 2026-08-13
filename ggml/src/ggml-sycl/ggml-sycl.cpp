@@ -4997,6 +4997,34 @@ static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue & 
                                                                   sycl::event                          staged_event,
                                                                   bool                                 stage_from_soa);
 
+static void ggml_sycl_reject_expert_publication(ggml_sycl::unified_cache * cache,
+                                                ggml_sycl_cache_id         key,
+                                                ggml_layout_mode           layout,
+                                                sycl::event                terminal,
+                                                const char *               reason) {
+    std::exception_ptr async_error;
+    try {
+        terminal.wait_and_throw();
+    } catch (...) {
+        async_error = std::current_exception();
+    }
+
+    // C++ has no finally: retirement is deliberately outside the catch so it
+    // runs for both successful and exceptional terminals. Retirement hides the
+    // publication immediately and defers storage release for any live lease.
+    const auto retired = cache ? cache->retire_expert_entry_exact(key, layout, reason) :
+                                 ggml_sycl::expert_retire_status::INVALID;
+    if (cache) {
+        cache->process_deferred_frees_public();
+    }
+    if (async_error) {
+        std::rethrow_exception(async_error);
+    }
+    if (!ggml_sycl::expert_retire_succeeded(retired)) {
+        throw std::runtime_error("SYCL expert publication cleanup failed");
+    }
+}
+
 static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0,
                                                         ggml_sycl_cache_id  key,
                                                         int                 expert_id,
@@ -5283,8 +5311,8 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     if (remember_storage_handle && extra &&
         !extra->remember_moe_storage_handle(expert_id, layout, std::move(storage_handle), &staged.event,
                                             /*logical_offset=*/0, dst_bytes)) {
-        staged.event.wait_and_throw();
-        cache->drop_expert_entries_for_tensor_layout({ key }, layout, "materialize-publish-rejected");
+        ggml_sycl_reject_expert_publication(
+            cache, key, layout, staged.event, "materialize-publish-rejected");
         log_fail("logical-range-publication-failed", meta);
         return false;
     }
@@ -15557,8 +15585,8 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
 
     if (!extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(storage_handle), &stage.event,
                                            /*logical_offset=*/0, size)) {
-        stage.event.wait_and_throw();
-        cache->drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_SOA, "test-publish-rejected");
+        ggml_sycl_reject_expert_publication(
+            cache, key, GGML_LAYOUT_SOA, stage.event, "test-publish-rejected");
         return false;
     }
     if (out_ptr) {
@@ -28774,6 +28802,9 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
                 }
                 if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle),
                                                         nullptr, /*logical_offset=*/0, expert_size)) {
+                    (void) cache->retire_expert_entry_exact(
+                        base_key, GGML_LAYOUT_AOS, "host-preload-publish-rejected");
+                    cache->process_deferred_frees_public();
                     throw std::runtime_error("SYCL host expert logical range publication failed during preload");
                 }
                 host_registered++;
@@ -28807,8 +28838,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
                                                    /*logical_offset=*/0, logical_bytes)) {
                 cached++;
             } else {
-                result.event.wait_and_throw();
-                cache->drop_expert_entries_for_tensor_layout({ key }, layout, "preload-publish-rejected");
+                ggml_sycl_reject_expert_publication(
+                    cache, key, layout, result.event, "preload-publish-rejected");
                 failed++;
             }
         } else {
@@ -29125,7 +29156,7 @@ static void ggml_sycl_preload_model_weights() {
                     }
                     ~s1_watchdog_wait_guard() { ggml_sycl_watchdog_non_graph_end(); }
                 } watchdog_wait_guard;
-                pending.event.wait();
+                pending.event.wait_and_throw();
                 const auto   wait_end = std::chrono::steady_clock::now();
                 const double wait_ms  = std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
                 if (s1_event_trace || wait_ms > 10000.0) {
@@ -29494,6 +29525,9 @@ static void ggml_sycl_preload_model_weights() {
                                 if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
                                                                        std::move(handle), nullptr,
                                                                        /*logical_offset=*/0, expert_size)) {
+                                    (void) cache->retire_expert_entry_exact(
+                                        key, GGML_LAYOUT_AOS, "host-preload-publish-rejected");
+                                    cache->process_deferred_frees_public();
                                     throw std::runtime_error("SYCL host expert logical range publication failed");
                                 }
                                 remembered_handle = true;
@@ -29820,9 +29854,8 @@ static void ggml_sycl_preload_model_weights() {
                             if (!extra->remember_moe_storage_handle(static_cast<int>(e), expert_preload_layout,
                                                                    std::move(handle), &result.event,
                                                                    /*logical_offset=*/0, logical_bytes)) {
-                                result.event.wait_and_throw();
-                                cache->drop_expert_entries_for_tensor_layout(
-                                    { key }, expert_preload_layout, "preload-publish-rejected");
+                                ggml_sycl_reject_expert_publication(
+                                    cache, key, expert_preload_layout, result.event, "preload-publish-rejected");
                                 throw std::runtime_error("SYCL expert logical range publication failed");
                             }
                             any_cached = true;
@@ -29879,7 +29912,11 @@ static void ggml_sycl_preload_model_weights() {
                                         if (!extra->remember_moe_storage_handle(static_cast<int>(e), alt_preload_layout,
                                                                                std::move(alt_handle), &alt_result.event,
                                                                                /*logical_offset=*/0, alt_preload_bytes)) {
-                                            throw std::runtime_error("SYCL alternate expert logical range publication failed");
+                                            ggml_sycl_reject_expert_publication(
+                                                cache, alt_key, alt_preload_layout, alt_result.event,
+                                                "alternate-preload-publish-rejected");
+                                            throw std::runtime_error(
+                                                "SYCL alternate expert logical range publication failed");
                                         }
                                     }
                                     total_bytes += alt_preload_bytes;
@@ -30358,120 +30395,191 @@ static void ggml_sycl_preload_model_weights() {
 
                     std::vector<int> staged_experts;
                     staged_experts.reserve(local_experts.size());
-                    bool all_staged = true;
-                    for (int e : local_experts) {
-                        const uint8_t *    expert_aos = static_cast<const uint8_t *>(tensor->data) + e * tensor->nb[2];
-                        ggml_sycl_cache_id key        = ggml_sycl_layout_specific_moe_expert_cache_key(
-                            ggml_sycl_get_moe_expert_cache_key(tensor, extra, e), GGML_LAYOUT_MXFP4_DPAS);
-                        if (!expert_aos || !key.valid) {
-                            all_staged = false;
-                            break;
-                        }
-                        ggml_sycl::mem_handle handle;
-                        auto                  result = ggml_sycl::unified_cache_direct_stage_expert(
-                            device, key, expert_aos, tensor->nb[2], expert_dpas_bytes, GGML_LAYOUT_MXFP4_DPAS,
-                            ggml_sycl_fill_reordered_host, &reorder_ctx, s1_preload_q, &handle);
-                        if (!result.ok || !result.ptr) {
-                            all_staged = false;
-                            break;
-                        }
-                        if (handle.resolve().ptr) {
-                            if (!extra->remember_moe_storage_handle(e, GGML_LAYOUT_MXFP4_DPAS, std::move(handle),
-                                                                   &result.event, /*logical_offset=*/0,
-                                                                   expert_dpas_bytes)) {
+                    bool               all_staged = true;
+                    std::exception_ptr promotion_async_error;
+                    try {
+                        for (int e : local_experts) {
+                            const uint8_t * expert_aos =
+                                static_cast<const uint8_t *>(tensor->data) + e * tensor->nb[2];
+                            ggml_sycl_cache_id key = ggml_sycl_layout_specific_moe_expert_cache_key(
+                                ggml_sycl_get_moe_expert_cache_key(tensor, extra, e), GGML_LAYOUT_MXFP4_DPAS);
+                            if (!expert_aos || !key.valid) {
                                 all_staged = false;
                                 break;
                             }
+                            ggml_sycl::mem_handle handle;
+                            auto result = ggml_sycl::unified_cache_direct_stage_expert(
+                                device, key, expert_aos, tensor->nb[2], expert_dpas_bytes, GGML_LAYOUT_MXFP4_DPAS,
+                                ggml_sycl_fill_reordered_host, &reorder_ctx, s1_preload_q, &handle);
+                            if (!result.ok || !result.ptr) {
+                                all_staged = false;
+                                break;
+                            }
+                            if (handle.resolve().ptr) {
+                                if (!extra->remember_moe_storage_handle(e, GGML_LAYOUT_MXFP4_DPAS, std::move(handle),
+                                                                       &result.event, /*logical_offset=*/0,
+                                                                       expert_dpas_bytes)) {
+                                    all_staged = false;
+                                    break;
+                                }
+                            }
+                            staged_experts.push_back(e);
+                            s1_push_event(
+                                result.event,
+                                tname + " expert=" + std::to_string(e) +
+                                    " action=stage-dpas-down layout=MXFP4_DPAS",
+                                expert_dpas_bytes);
+                            while (s1_in_flight.size() >= s1_max_in_flight) {
+                                s1_drain_oldest("dpas-window");
+                            }
                         }
-                        staged_experts.push_back(e);
-                        s1_push_event(
-                            result.event,
-                            tname + " expert=" + std::to_string(e) + " action=stage-dpas-down layout=MXFP4_DPAS",
-                            expert_dpas_bytes);
-                        while (s1_in_flight.size() >= s1_max_in_flight) {
-                            s1_drain_oldest("dpas-window");
-                        }
+                    } catch (...) {
+                        // The target may have reached an exceptional terminal
+                        // while filling the bounded window. Rollback still owns
+                        // every publication and event below.
+                        promotion_async_error = std::current_exception();
+                        all_staged            = false;
                     }
 
                     if (!all_staged || staged_experts.size() != local_experts.size()) {
                         dpas_down_failed++;
 
                         // Transaction rollback state machine:
-                        // DRAIN -> WITHDRAW_TARGET -> RESTORE_BASE -> DRAIN_RESTORE -> COMMITTED_BASE.
-                        // No target record remains discoverable after a failed promotion.
-                        for (auto & pending : s1_in_flight) {
-                            s1_wait_event(pending, "dpas-rollback-drain-target");
-                        }
-                        s1_in_flight.clear();
-
+                        // WITHDRAW_TARGET -> RETIRE_TARGET -> DRAIN_TARGET -> RESTORE_BASE
+                        // -> DRAIN_RESTORE -> VALIDATE_BASE -> COMMITTED_BASE. Retirement
+                        // is a publication transition, not a free: old leases remain valid
+                        // while every new resolution fails immediately.
                         std::vector<ggml_sycl_cache_id> target_keys;
                         target_keys.reserve(local_experts.size());
+                        bool target_withdrawn = true;
                         for (int e : local_experts) {
                             extra->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_MXFP4_DPAS, device);
                             const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(tensor, extra, e);
-                            if (base_key.valid) {
-                                target_keys.push_back(ggml_sycl_layout_specific_moe_expert_cache_key(
-                                    base_key, GGML_LAYOUT_MXFP4_DPAS));
+                            if (!base_key.valid) {
+                                target_withdrawn = false;
+                                continue;
                             }
+                            const ggml_sycl_cache_id target_key =
+                                ggml_sycl_layout_specific_moe_expert_cache_key(base_key, GGML_LAYOUT_MXFP4_DPAS);
+                            target_keys.push_back(target_key);
+                            target_withdrawn = target_withdrawn && ggml_sycl::expert_retire_succeeded(
+                                cache->retire_expert_entry_exact(
+                                    target_key, GGML_LAYOUT_MXFP4_DPAS, "dpas-promotion-rollback"));
                         }
-                        cache->drop_expert_entries_for_tensor_layout(
-                            target_keys, GGML_LAYOUT_MXFP4_DPAS, "dpas-promotion-rollback");
                         ggml_sycl_invalidate_moe_layout_caches(extra, device);
 
-                        bool base_restored = true;
-                        for (int e : local_experts) {
-                            if (e < 0 || static_cast<size_t>(e) > SIZE_MAX / static_cast<size_t>(tensor->nb[2])) {
-                                base_restored = false;
-                                break;
-                            }
-                            const uint8_t * expert_aos = static_cast<const uint8_t *>(tensor->data) +
-                                                         static_cast<size_t>(e) * tensor->nb[2];
-                            ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(tensor, extra, e);
-                            if (!expert_aos || !key.valid) {
-                                base_restored = false;
-                                break;
-                            }
-                            key = ggml_sycl_layout_specific_moe_expert_cache_key(key, base_layout);
-                            ggml_sycl_reorder_fill_ctx rollback_ctx = reorder_ctx;
-                            rollback_ctx.dst_bytes                  = expert_base_bytes;
-                            rollback_ctx.layout                     = base_layout;
-                            ggml_sycl::mem_handle rollback_handle;
-                            auto rollback = ggml_sycl::unified_cache_direct_stage_expert(
-                                device, key, expert_aos, tensor->nb[2], expert_base_bytes, base_layout,
-                                ggml_sycl_fill_reordered_host, &rollback_ctx, s1_preload_q, &rollback_handle);
-                            const size_t rollback_logical_bytes = base_layout == GGML_LAYOUT_AOS ?
-                                                                      static_cast<size_t>(tensor->nb[2]) :
-                                                                      expert_base_bytes;
-                            if (!rollback.ok || !rollback.ptr || !rollback_handle.resolve(device).ptr ||
-                                !extra->remember_moe_storage_handle(e, base_layout, std::move(rollback_handle),
-                                                                   &rollback.event, /*logical_offset=*/0,
-                                                                   rollback_logical_bytes)) {
-                                base_restored = false;
-                                break;
-                            }
-                            s1_push_event(
-                                rollback.event,
-                                tname + " expert=" + std::to_string(e) +
-                                    " action=stage-dpas-rollback layout=" + ggml_sycl_layout_mode_name(base_layout),
-                                expert_base_bytes);
-                        }
+                        // Every submitted target reaches terminal even after the
+                        // first asynchronous failure. Cleanup has already made
+                        // all target state undiscoverable before errors propagate.
                         for (auto & pending : s1_in_flight) {
-                            s1_wait_event(pending, "dpas-rollback-drain-base");
+                            try {
+                                s1_wait_event(pending, "dpas-rollback-drain-target");
+                            } catch (...) {
+                                if (!promotion_async_error) {
+                                    promotion_async_error = std::current_exception();
+                                }
+                            }
                         }
                         s1_in_flight.clear();
+                        cache->process_deferred_frees_public();
+
+                        bool                                  base_restored = target_withdrawn;
+                        std::exception_ptr                    restore_async_error;
+                        std::vector<ggml_sycl_cache_id>       restore_keys;
+                        restore_keys.reserve(local_experts.size());
+                        for (int e : local_experts) {
+                            try {
+                                if (e < 0 || tensor->nb[2] == 0 ||
+                                    static_cast<size_t>(e) > SIZE_MAX / static_cast<size_t>(tensor->nb[2])) {
+                                    base_restored = false;
+                                    break;
+                                }
+                                const uint8_t * expert_aos = static_cast<const uint8_t *>(tensor->data) +
+                                                             static_cast<size_t>(e) * tensor->nb[2];
+                                ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(tensor, extra, e);
+                                if (!expert_aos || !key.valid) {
+                                    base_restored = false;
+                                    break;
+                                }
+                                key = ggml_sycl_layout_specific_moe_expert_cache_key(key, base_layout);
+                                restore_keys.push_back(key);
+                                ggml_sycl_reorder_fill_ctx rollback_ctx = reorder_ctx;
+                                rollback_ctx.dst_bytes                  = expert_base_bytes;
+                                rollback_ctx.layout                     = base_layout;
+                                ggml_sycl::mem_handle rollback_handle;
+                                auto rollback = ggml_sycl::unified_cache_direct_stage_expert(
+                                    device, key, expert_aos, tensor->nb[2], expert_base_bytes, base_layout,
+                                    ggml_sycl_fill_reordered_host, &rollback_ctx, s1_preload_q, &rollback_handle);
+                                if (rollback.ok && rollback.ptr) {
+                                    // Track the event before publication checks: rejection must
+                                    // not let an exceptional terminal escape the cleanup drain.
+                                    s1_push_event(
+                                        rollback.event,
+                                        tname + " expert=" + std::to_string(e) +
+                                            " action=stage-dpas-rollback layout=" +
+                                            ggml_sycl_layout_mode_name(base_layout),
+                                        expert_base_bytes);
+                                }
+                                const size_t rollback_logical_bytes = base_layout == GGML_LAYOUT_AOS ?
+                                                                          static_cast<size_t>(tensor->nb[2]) :
+                                                                          expert_base_bytes;
+                                if (!rollback.ok || !rollback.ptr || !rollback_handle.resolve(device).ptr ||
+                                    !extra->remember_moe_storage_handle(e, base_layout, std::move(rollback_handle),
+                                                                       &rollback.event, /*logical_offset=*/0,
+                                                                       rollback_logical_bytes)) {
+                                    base_restored = false;
+                                    break;
+                                }
+                            } catch (...) {
+                                restore_async_error = std::current_exception();
+                                base_restored       = false;
+                                break;
+                            }
+                        }
+                        for (auto & pending : s1_in_flight) {
+                            try {
+                                s1_wait_event(pending, "dpas-rollback-drain-base");
+                            } catch (...) {
+                                if (!restore_async_error) {
+                                    restore_async_error = std::current_exception();
+                                }
+                                base_restored = false;
+                            }
+                        }
+                        s1_in_flight.clear();
+
                         const size_t restored_expected_bytes = base_layout == GGML_LAYOUT_AOS ?
                                                                    static_cast<size_t>(tensor->nb[2]) :
                                                                    expert_base_bytes;
-                        for (int e : local_experts) {
-                            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record restored{};
-                            if (!extra->resolve_moe_storage_record(e, base_layout, device, restored_expected_bytes,
-                                                                   &restored) || !restored.on_device) {
-                                base_restored = false;
-                                break;
+                        if (base_restored) {
+                            for (int e : local_experts) {
+                                ggml_tensor_extra_gpu::resolved_moe_expert_storage_record restored{};
+                                if (!extra->resolve_moe_storage_record(e, base_layout, device,
+                                                                       restored_expected_bytes, &restored) ||
+                                    !restored.on_device) {
+                                    base_restored = false;
+                                    break;
+                                }
                             }
                         }
                         if (!base_restored) {
+                            // Failed restore publications are withdrawn only after every
+                            // restore event is terminal; hard failure is last.
+                            for (int e : local_experts) {
+                                extra->forget_moe_storage_handle_on_device(e, base_layout, device);
+                            }
+                            for (const ggml_sycl_cache_id & key : restore_keys) {
+                                (void) cache->retire_expert_entry_exact(
+                                    key, base_layout, "dpas-base-restore-failed");
+                            }
+                            ggml_sycl_invalidate_moe_layout_caches(extra, device);
+                            cache->process_deferred_frees_public();
+                            (void) restore_async_error;
                             GGML_ABORT("SYCL DPAS promotion rollback could not restore complete base discovery");
+                        }
+                        cache->process_deferred_frees_public();
+                        if (promotion_async_error) {
+                            std::rethrow_exception(promotion_async_error);
                         }
                         continue;
                     }

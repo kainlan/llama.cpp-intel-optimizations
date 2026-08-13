@@ -1538,6 +1538,21 @@ struct direct_stage_result {
     bool        fill_failed = false;  // A submitted fill/copy/reorder threw; caller must not continue inference.
 };
 
+// Exact publication withdrawal result. DEFERRED means the entry is already
+// undiscoverable, but a previously acquired lease or an incomplete write event
+// still owns its storage. WITHDRAWN means storage was reclaimed immediately.
+enum class expert_retire_status : uint8_t {
+    INVALID   = 0,
+    NOT_FOUND = 1,
+    WITHDRAWN = 2,
+    DEFERRED  = 3,
+};
+
+inline bool expert_retire_succeeded(expert_retire_status status) {
+    return status == expert_retire_status::WITHDRAWN || status == expert_retire_status::DEFERRED ||
+           status == expert_retire_status::NOT_FOUND;
+}
+
 enum class expert_resolve_device_policy : uint8_t {
     ANY            = 0,  // Accept any owning device or allowed host tier
     PREFER_CURRENT = 1,  // Prefer current_device, but do not reject other devices
@@ -2086,6 +2101,13 @@ class unified_cache {
     size_t drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
                                                  ggml_layout_mode                        layout,
                                                  const char *                            reason = nullptr);
+
+    // Withdraw one exact expert publication immediately, even when live leases
+    // or an incomplete write prevent reclamation. New resolution fails as soon
+    // as this returns; existing leases retain the allocation until release.
+    expert_retire_status retire_expert_entry_exact(ggml_sycl_cache_id key,
+                                                   ggml_layout_mode   layout,
+                                                   const char *       reason = nullptr);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.

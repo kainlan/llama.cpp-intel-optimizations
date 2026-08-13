@@ -6,6 +6,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
+UNIFIED_CACHE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
 MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
 PREFETCH_HEADER = ROOT / "ggml/src/ggml-sycl/expert-prefetch.hpp"
@@ -341,12 +342,13 @@ def test_dpas_mid_loop_failure_is_transactional_failpoint_contract() -> None:
     end = source.index("dpas_down_tensors++", start)
     rollback = source[start:end]
     ordered = (
-        "dpas-rollback-drain-target",
         "forget_moe_storage_handle_on_device",
-        "dpas-promotion-rollback",
+        "retire_expert_entry_exact",
+        "dpas-rollback-drain-target",
         "stage-dpas-rollback",
         "dpas-rollback-drain-base",
         "resolve_moe_storage_record",
+        "dpas-base-restore-failed",
         "GGML_ABORT",
     )
     positions = [rollback.index(token) for token in ordered]
@@ -356,10 +358,42 @@ def test_dpas_mid_loop_failure_is_transactional_failpoint_contract() -> None:
     assert "SIZE_MAX / expert_dpas_bytes" in source
     assert "SIZE_MAX - expert_dpas_bytes" in source
 
-    # Source-level failpoint: deleting target withdrawal must be witnessed.
+    # Source-level failpoints: deleting logical withdrawal or exact cache
+    # retirement must be witnessed by this contract.
     mutated = rollback.replace("extra->forget_moe_storage_handle_on_device", "/* failpoint: retained target */", 1)
-    assert "forget_moe_storage_handle_on_device" not in mutated
+    assert mutated.count("forget_moe_storage_handle_on_device") == rollback.count(
+        "forget_moe_storage_handle_on_device") - 1
     assert "forget_moe_storage_handle_on_device" in rollback
+    mutated = rollback.replace("cache->retire_expert_entry_exact", "/* failpoint: discoverable cache */", 1)
+    assert mutated != rollback and "cache->retire_expert_entry_exact" in rollback
+
+
+def test_rejected_publication_cleanup_and_retirement_ordering() -> None:
+    source = SOURCE.read_text()
+    cache = UNIFIED_CACHE.read_text()
+
+    reject = function(source, "static void ggml_sycl_reject_expert_publication")
+    assert "wait_and_throw()" in reject
+    assert "catch (...)" in reject
+    assert reject.index("catch (...)") < reject.index("retire_expert_entry_exact")
+    assert reject.index("retire_expert_entry_exact") < reject.index("rethrow_exception")
+
+    retire = function(cache, "expert_retire_status unified_cache::retire_expert_entry_exact")
+    for witness in (
+        "std::lock(direct_lock, cache_lock)",
+        "pair.second.retired = true",
+        "direct_expert_entries_.erase",
+        "released_mirror_handles.clear()",
+        "finalize_retired_entries_locked",
+    ):
+        assert witness in retire, witness
+    assert "cache_generation_bump" not in retire
+
+    start = source.index("// Transaction rollback state machine:")
+    rollback = source[start:source.index("dpas_down_tensors++", start)]
+    assert "catch (...)" in rollback
+    assert rollback.count("s1_wait_event") >= 2
+    assert rollback.index("dpas-base-restore-failed") < rollback.index("GGML_ABORT")
 
 
 def test_mutations_are_witnessed() -> None:

@@ -448,7 +448,49 @@ static bool test_async_eviction_finalize_bumps_gen(sycl::queue & q) {
 }
 
 // =============================================================================
-// Test 5: failed retained publication leaves the caller's ticket active until
+// Test 5: exact retirement is an immediate discovery transition but a deferred
+// lifetime transition. A live lease remains usable until release.
+// =============================================================================
+static bool test_expert_retirement_with_live_lease(sycl::queue & q) {
+    TEST_BEGIN("expert_retirement_with_live_lease");
+
+    constexpr size_t         entry_bytes = 4 * 1024;
+    constexpr size_t         budget      = 16 * 1024 * 1024;
+    ggml_sycl::unified_cache cache(q, budget);
+    void *                   src_host = sycl::malloc_host(entry_bytes, q);
+    TEST_ASSERT(src_host != nullptr, "malloc_host for retirement source should succeed");
+    std::memset(src_host, 0x5A, entry_bytes);
+
+    ggml_sycl_cache_id   key = make_test_cache_id(705, 6, entry_bytes);
+    ggml_sycl::mem_handle old_lease;
+    auto staged = cache.direct_stage_expert(key, src_host, entry_bytes, entry_bytes, GGML_LAYOUT_AOS,
+                                            nullptr, nullptr, &q, &old_lease);
+    TEST_ASSERT(staged.ok && staged.ptr && old_lease.valid(), "expert stage should publish a lease");
+    staged.event.wait_and_throw();
+    const auto before = old_lease.resolve();
+    TEST_ASSERT(before.ptr == staged.ptr, "old lease did not resolve staged storage");
+
+    const auto retired = cache.retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-live-lease");
+    TEST_ASSERT(retired == ggml_sycl::expert_retire_status::DEFERRED,
+                "live lease retirement should defer reclamation");
+
+    ggml_sycl::expert_resolve_request request{};
+    request.key              = key;
+    request.requested_layout = GGML_LAYOUT_AOS;
+    TEST_ASSERT(!cache.resolve_expert(request), "new resolve discovered retired expert");
+    TEST_ASSERT(old_lease.resolve().ptr == before.ptr, "retirement invalidated the already acquired lease");
+
+    old_lease = {};
+    cache.process_deferred_frees_public();
+    TEST_ASSERT(cache.lookup_expert(key) == nullptr, "retired expert survived final lease release");
+    sycl::free(src_host, q);
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 6: failed retained publication leaves the caller's ticket active until
 // the exact submission queue has drained. A concurrent graph-boundary drain
 // must observe that ticket throughout the failure cleanup window.
 // =============================================================================
@@ -553,6 +595,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_explicit_evict_bumps_gen_and_removes_entry(q);
     all_passed &= test_reinsert_after_evict_recovers_lookup(q);
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
+    all_passed &= test_expert_retirement_with_live_lease(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");

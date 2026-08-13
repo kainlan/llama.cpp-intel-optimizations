@@ -5458,6 +5458,80 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
     return dropped_any;
 }
 
+expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id key,
+                                                               ggml_layout_mode   layout,
+                                                               const char *       reason) {
+    if (!key.valid) {
+        return expert_retire_status::INVALID;
+    }
+
+    // Publish withdrawal across both discovery tables as one transition. A
+    // resolver that observed the canonical table before this lock can only
+    // reach the direct table after its mirror has been erased; a resolver that
+    // arrives afterwards sees retired and fails closed.
+    std::vector<std::shared_ptr<mem_handle>> released_mirror_handles;
+    size_t                                   retired_count = 0;
+    bool                                     removed_mirror = false;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+
+        auto direct = direct_expert_entries_.find(key);
+        if (direct != direct_expert_entries_.end() && direct->second.layout == layout) {
+            if (direct->second.handle) {
+                released_mirror_handles.push_back(std::move(direct->second.handle));
+            }
+            direct_expert_entries_.erase(direct);
+            removed_mirror = true;
+        }
+
+        for (auto & pair : entries_) {
+            if (pair.first.type != cache_entry_type::MOE_EXPERT || pair.second.layout != layout ||
+                !detail::cache_id_equal(pair.first.id, key)) {
+                continue;
+            }
+            if (!pair.second.retired) {
+                pair.second.retired = true;
+                retired_count++;
+            }
+            remap_or_erase_id_mapping_locked(key, pair.first);
+        }
+    }
+
+    // Mirror handles own ordinary cache leases. Destroy them with neither map
+    // lock held, then attempt immediate reclamation. Live external leases and
+    // incomplete ready events leave the retired entry for deferred GC.
+    released_mirror_handles.clear();
+    {
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        (void) finalize_retired_entries_locked();
+    }
+
+    bool deferred = false;
+    {
+        std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        for (const auto & pair : entries_) {
+            if (pair.first.type == cache_entry_type::MOE_EXPERT && pair.second.layout == layout &&
+                pair.second.retired && detail::cache_id_equal(pair.first.id, key)) {
+                deferred = true;
+                break;
+            }
+        }
+    }
+    if (moe_direct_trace_enabled() && (retired_count != 0 || removed_mirror)) {
+        fprintf(stderr,
+                "[MOE-RETIRE] model=%llu name_hash=0x%llx layout=%d state=%s reason=%s\n",
+                (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout,
+                deferred ? "deferred" : "withdrawn", reason ? reason : "");
+    }
+    if (deferred) {
+        return expert_retire_status::DEFERRED;
+    }
+    return retired_count != 0 || removed_mirror ? expert_retire_status::WITHDRAWN :
+                                                  expert_retire_status::NOT_FOUND;
+}
+
 size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
                                                             ggml_layout_mode                        layout,
                                                             const char *                            reason) {
