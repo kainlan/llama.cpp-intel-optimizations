@@ -46,3 +46,25 @@ for token in (
     require(HEADER + SOURCE, token)
 
 print("intrusive allocation owner foundation source contracts: PASS")
+
+# Legacy handle is composition-only and metadata cannot mint ownership.
+for token in (
+    "class alloc_handle final",
+    "static_assert(!std::is_base_of<alloc_metadata, alloc_handle>::value",
+    "static_assert(!std::is_constructible<alloc_handle, alloc_metadata>::value",
+    "static_assert(!std::is_convertible<alloc_handle *, alloc_metadata *>::value",
+    "registered_release_status release_registered_allocation",
+    "runtime_alloc_state::RELEASING",
+):
+    require(HEADER + SOURCE, token)
+
+# No lookup-to-owner reconstruction remains in production sources.
+for forbidden in (
+    "alloc_handle(tracked)",
+    "alloc_handle(looked_up)",
+    "alloc_handle(metadata)",
+    "static_cast<alloc_metadata &>(*out)",
+):
+    assert forbidden not in HEADER + SOURCE, f"forbidden metadata owner reconstruction: {forbidden}"
+
+print("owner mint and exact registry release source contracts: PASS")

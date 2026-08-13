@@ -49,6 +49,7 @@ enum class graph_phase { IDLE, OPEN, SEALED, COMPLETE, QUARANTINED, RETIRED };
 enum class epoch_phase { RECORDING, ACTIVE, RETIRING, RETIRED };
 enum class token_root_phase { OPEN, SEALED, COMPLETE, QUARANTINED };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 enum class test_mutation {
     NONE,
     M4_CONTEXT_ID_OVERFLOW,
@@ -65,6 +66,7 @@ enum class test_mutation {
     M8d_TERMINAL_ALLOCATION_FAILURE,
     M9_PERSISTENT_ALLOCATION_UNDER_LOCK,
 };
+#endif
 
 struct snapshot {
     ContextId            context{};
@@ -194,7 +196,10 @@ struct epoch_snapshot {
 
 class Registry {
   public:
-    explicit Registry(test_mutation mutation = test_mutation::NONE);
+    Registry();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    explicit Registry(test_mutation mutation);
+#endif
     ~Registry();
     Registry(const Registry &) = delete;
     Registry & operator=(const Registry &) = delete;
@@ -440,7 +445,9 @@ class Registry {
                               bool                  no_resources,
                               uint64_t              proof_serial,
                               RetireTicket *        ticket) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     error persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept;
+#endif
     error validate_root(const lifecycle::ModelToken & expected, const lifecycle::ModelToken & actual) const noexcept;
     error validate_session(const context_entry & entry, SessionId session, SessionResetEpoch reset_epoch) const noexcept;
     bool  graph_terminal_unretired(const graph_entry & graph) const noexcept;
@@ -458,7 +465,9 @@ class Registry {
 
     mutable std::mutex                          mutex_;
     std::shared_ptr<registry_control>            control_;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     test_mutation                               mutation_ = test_mutation::NONE;
+#endif
     uint64_t                                    next_context_id_ = 1;
     uint64_t                                    next_session_id_ = 1;
     uint64_t                                    next_graph_epoch_ = 1;

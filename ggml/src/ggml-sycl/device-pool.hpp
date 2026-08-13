@@ -31,7 +31,7 @@ namespace ggml_sycl {
 
 // Forward-declare to avoid circular include with unified-cache.hpp
 size_t unified_cache_total_available_bytes(int device);
-struct alloc_handle;
+class alloc_handle;
 class unified_cache;
 enum class vram_zone_id : uint8_t;
 

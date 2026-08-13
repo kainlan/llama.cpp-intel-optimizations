@@ -1691,7 +1691,7 @@ struct copyable_atomic_u32 {
 
 // Forward declarations needed by cache entry owner fields and friend function
 // signatures inside unified_cache.
-struct alloc_handle;
+class alloc_handle;
 struct alloc_request;
 
 // Slot identifying one live llama_model to the backend (llama.cpp-0qlw).
@@ -4094,28 +4094,46 @@ class shared_alloc_owner {
     alloc_owner_control * control_ = nullptr;
 };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+using allocation_release_test_backend = release_attempt (*)(const alloc_metadata &, void *) noexcept;
+#endif
+
 class allocation_release_coordinator : public std::enable_shared_from_this<allocation_release_coordinator> {
   public:
     explicit allocation_release_coordinator(int device) noexcept : device_(device) {}
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    allocation_release_coordinator(int device, allocation_release_test_backend backend, void * context) noexcept :
+        device_(device), test_backend_(backend), test_backend_context_(context) {}
+#endif
 
     int device() const noexcept { return device_; }
     size_t live_controls() const noexcept { return live_controls_.load(std::memory_order_acquire); }
     size_t retry_count() const noexcept { return retry_count_.load(std::memory_order_acquire); }
-    bool can_detach() const noexcept { return live_controls() == 0 && retry_count() == 0; }
+    bool can_detach() const noexcept;
     size_t process_retries() noexcept;
+    // Internal lifecycle gate used by detach/shutdown and private fixtures.
+    void close() noexcept;
 
   private:
     friend class alloc_owner_control;
     friend struct allocation_owner_internal_access;
     release_attempt retire(alloc_owner_control * control) noexcept;
-    void register_control() noexcept { live_controls_.fetch_add(1, std::memory_order_acq_rel); }
+    release_attempt release_physical(alloc_owner_control * control) noexcept;
+    bool try_register_control() noexcept;
     void abandon_control(alloc_owner_control * control) noexcept;
 
+    enum class admission_state : uint8_t { OPEN = 0, CLOSING };
     int device_ = -1;
+    mutable std::mutex admission_mutex_;
+    admission_state admission_state_ = admission_state::OPEN;
     mutable std::mutex retry_mutex_;
     alloc_owner_control * retry_head_ = nullptr;
     std::atomic<size_t> live_controls_{ 0 };
     std::atomic<size_t> retry_count_{ 0 };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    allocation_release_test_backend test_backend_ = nullptr;
+    void * test_backend_context_ = nullptr;
+#endif
 };
 
 static_assert(!std::is_copy_constructible<alloc_owner>::value, "alloc_owner must be move-only");
@@ -4123,23 +4141,82 @@ static_assert(!std::is_copy_assignable<alloc_owner>::value, "alloc_owner must be
 static_assert(std::is_nothrow_move_constructible<alloc_owner>::value, "alloc_owner moves must not throw");
 static_assert(std::is_copy_constructible<shared_alloc_owner>::value, "shared_alloc_owner must be copyable");
 
-// Temporary copyable legacy owner token. Only allocator-internal adapters and
-// unmigrated callers responsible for unified_free() may use it. It cannot mint
-// metadata; observation and indexing use alloc_metadata.
-struct alloc_handle : alloc_metadata {
-    alloc_handle() = default;
-    explicit alloc_handle(const alloc_metadata & value) : alloc_metadata(value) {}
+// Temporary copyable legacy owner token. Metadata is composed privately, so a
+// lookup result cannot be converted into (or used to construct) an owner. The
+// public aliases are const observation-only compatibility views.
+class alloc_handle final {
+  public:
+    alloc_handle() noexcept :
+        ptr(metadata_.ptr), size(metadata_.size), device(metadata_.device), kind(metadata_.kind), tier(metadata_.tier),
+        role(metadata_.role), category(metadata_.category), id(metadata_.id), alloc_id(metadata_.alloc_id),
+        generation(metadata_.generation), arena_generation(metadata_.arena_generation), zone(metadata_.zone),
+        vram_zone(metadata_.vram_zone), offset(metadata_.offset), arena_offset(metadata_.arena_offset),
+        extent(metadata_.extent), arena_extent(metadata_.arena_extent), epoch_id(metadata_.epoch_id),
+        zone_managed(metadata_.zone_managed), host_zone(metadata_.host_zone) {}
+    alloc_handle(const alloc_handle & other) : alloc_handle() {
+        metadata_ = other.metadata_;
+        all_segments_ = other.all_segments_;
+    }
+    alloc_handle(alloc_handle && other) noexcept : alloc_handle() {
+        metadata_ = other.metadata_;
+        all_segments_ = std::move(other.all_segments_);
+        other.metadata_ = {};
+    }
+    alloc_handle & operator=(const alloc_handle & other) {
+        if (this != &other) {
+            metadata_ = other.metadata_;
+            all_segments_ = other.all_segments_;
+        }
+        return *this;
+    }
+    alloc_handle & operator=(alloc_handle && other) noexcept {
+        if (this != &other) {
+            metadata_ = other.metadata_;
+            all_segments_ = std::move(other.all_segments_);
+            other.metadata_ = {};
+        }
+        return *this;
+    }
 
-    // Release-only bookkeeping for segmented allocations. This is deliberately
-    // absent from alloc_metadata.
-    std::vector<buffer_segment> all_segments;
+    void * const & ptr;
+    const size_t & size;
+    const int & device;
+    const alloc_tier & kind;
+    const alloc_tier & tier;
+    const alloc_role & role;
+    const runtime_category & category;
+    const uint64_t & id;
+    const uint64_t & alloc_id;
+    const uint64_t & generation;
+    const uint64_t & arena_generation;
+    const vram_zone_id & zone;
+    const vram_zone_id & vram_zone;
+    const size_t & offset;
+    const size_t & arena_offset;
+    const size_t & extent;
+    const size_t & arena_extent;
+    const uint64_t & epoch_id;
+    const bool & zone_managed;
+    const host_zone_id & host_zone;
 
-    alloc_metadata metadata() const { return static_cast<const alloc_metadata &>(*this); }
+    const alloc_metadata & metadata() const noexcept { return metadata_; }
+    const std::vector<buffer_segment> & segments() const noexcept { return all_segments_; }
 
     // Returns a DIRECT mem_handle view over this allocation. The view is
     // non-owning; the alloc_handle owner remains responsible for unified_free().
     mem_handle as_mem_handle() const;
+
+  private:
+    friend struct allocation_owner_internal_access;
+    alloc_metadata metadata_{};
+    std::vector<buffer_segment> all_segments_;
 };
+
+static_assert(!std::is_base_of<alloc_metadata, alloc_handle>::value, "alloc_handle must use composition");
+static_assert(!std::is_constructible<alloc_handle, alloc_metadata>::value,
+              "metadata must never mint an allocation owner");
+static_assert(!std::is_convertible<alloc_handle *, alloc_metadata *>::value,
+              "owner pointers must not convert to metadata pointers");
 
 struct offload_buffer_request {
     sycl::queue *       queue     = nullptr;
@@ -4154,6 +4231,15 @@ struct offload_buffer_lease {
     alloc_handle handle{};
     uint64_t     lease_id = 0;
     bool         valid    = false;
+};
+
+enum class registered_release_status : uint8_t {
+    RELEASED = 0,
+    BUSY,
+    NOT_FOUND,
+    KEY_MISMATCH,
+    OWNERSHIP_MISMATCH,
+    LEASE_REFUSED,
 };
 
 enum class allocation_error : uint8_t {
@@ -4171,6 +4257,34 @@ struct allocation_result {
     explicit operator bool() const noexcept { return error == allocation_error::NONE && static_cast<bool>(owner); }
 };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+struct allocation_owner_test_fixture {
+    allocation_result result{};
+    std::shared_ptr<allocation_release_coordinator> coordinator;
+};
+
+// Host-only deterministic factory. It mints the same private intrusive control
+// used by unified_allocate_owner while replacing physical release with an
+// injected backend. Failure injection happens after coordinator creation so
+// live-control accounting can be checked without a SYCL device.
+allocation_owner_test_fixture allocation_owner_test_create(
+    const alloc_metadata & metadata,
+    allocation_release_test_backend backend,
+    void * context,
+    allocation_error injected_failure = allocation_error::NONE) noexcept;
+
+// Deterministic host-only seams for the coordinator admission and registry
+// ownership protocols. They perform no physical allocation or release.
+std::shared_ptr<allocation_release_coordinator> allocation_coordinator_test_lookup(int device);
+void allocation_coordinator_test_close_all() noexcept;
+size_t allocation_coordinator_test_count() noexcept;
+bool allocation_coordinator_test_try_register(
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
+bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intrusive) noexcept;
+registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
+void allocation_registry_test_erase(void * ptr) noexcept;
+#endif
+
 // Foundation owner path. The intrusive control is allocated before any physical
 // allocation. The legacy alloc_handle adapter remains inside the allocator;
 // broad caller migration is intentionally deferred.
@@ -4183,6 +4297,9 @@ bool       unified_alloc(const alloc_request & req, alloc_handle * out);
 mem_handle unified_allocate(const alloc_request & req);
 bool       unified_free(const alloc_handle & handle);
 bool       unified_free_ptr(void * ptr, int expected_device = -1);
+// Claims the exact LIVE registry row before physical release. The row is
+// RELEASING while detached release adjuncts are in use; refusal restores LIVE.
+registered_release_status release_registered_allocation(const alloc_metadata & exact_key);
 // Transfer a refused owning handle to its device cache's durable retry queue.
 // Returns false without taking ownership when no live cache can accept it.
 bool       unified_defer_free(alloc_handle * handle);

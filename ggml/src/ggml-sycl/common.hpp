@@ -794,7 +794,8 @@ static inline void ggml_sycl_release_layout(tensor_layout_info & layout, sycl::q
     if (layout.owns_memory && layout.data_ptr) {
         ggml_sycl::alloc_metadata metadata{};
         if (ggml_sycl::unified_lookup(layout.data_ptr, &metadata)) {
-            if (!ggml_sycl::unified_free(ggml_sycl::alloc_handle(metadata))) {
+            if (ggml_sycl::release_registered_allocation(metadata) !=
+                ggml_sycl::registered_release_status::RELEASED) {
                 GGML_LOG_ERROR("[LAYOUT] unified free failed ptr=%p size=%zu device=%d\n", layout.data_ptr, layout.size,
                                layout.device_id);
             }

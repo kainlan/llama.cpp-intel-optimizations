@@ -150,10 +150,20 @@ size_t quarantine_queue::size() const noexcept {
     }
 }
 
+Registry::Registry() :
+    id_limit_(std::numeric_limits<uint64_t>::max()),
+    depth_limit_(std::numeric_limits<uint64_t>::max())
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    , mutation_(test_mutation::NONE)
+#endif
+{}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 Registry::Registry(uint64_t id_limit, uint64_t depth_limit, test_mutation mutation) :
     id_limit_(id_limit),
     depth_limit_(depth_limit),
     mutation_(mutation) {}
+#endif
 
 void Registry::poison_active_locked() {
     auto active = txns_.find(active_txn_);
@@ -188,9 +198,12 @@ begin_result Registry::begin_outer() noexcept {
         if (next_model_id_ == 0 || next_model_id_ > id_limit_ || next_load_id_ == 0 || next_load_id_ > id_limit_) {
             return { error::ID_EXHAUSTED };
         }
-        const uint64_t   generation = mutation_ == test_mutation::M1_SKIP_GENERATION && slots_[slot].generation != 0 ?
-                                          slots_[slot].generation :
-                                          slots_[slot].generation + 1;
+        uint64_t generation = slots_[slot].generation + 1;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (mutation_ == test_mutation::M1_SKIP_GENERATION && slots_[slot].generation != 0) {
+            generation = slots_[slot].generation;
+        }
+#endif
         const ModelToken token{
             { next_model_id_ },
             { next_load_id_ },
@@ -544,17 +557,21 @@ finish_ticket Registry::prepare_end(LoadTxnId id, bool success, bool output_avai
         if (!success) {
             txn.poisoned = true;
         }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (mutation_ == test_mutation::M3_CLEAR_POISON) {
             txn.poisoned = false;
         }
+#endif
 
         if (txn.depth > 1) {
             --txn.depth;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
             if (mutation_ == test_mutation::M2_NESTED_COMMIT) {
                 return {
                     error::OK, txn.token, 0, false, false, true, { error::OK, txn.token, false, true }
                 };
             }
+#endif
             const error code = txn.poisoned ? error::POISONED : error::NESTED;
             return {
                 code, txn.token, 0, false, false, false, { code, txn.token, false, false }

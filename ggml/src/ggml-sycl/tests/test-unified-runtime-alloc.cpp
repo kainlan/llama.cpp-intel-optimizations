@@ -86,7 +86,7 @@ static bool reserve_allocate_success_registers_pointer(sycl::queue & q) {
     TEST_ASSERT(unified_alloc(req, &h), "unified_alloc failed");
     TEST_ASSERT(h.ptr != nullptr, "allocated pointer is null");
 
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(h.ptr, &looked), "lookup failed");
     TEST_ASSERT(looked.ptr == h.ptr, "lookup ptr mismatch");
     TEST_ASSERT(looked.size == h.size, "lookup size mismatch");
@@ -199,7 +199,7 @@ static bool lookup_returns_correct_metadata(sycl::queue & q) {
 
     alloc_handle h{};
     TEST_ASSERT(unified_alloc(req, &h), "alloc failed");
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(h.ptr, &looked), "lookup failed");
     TEST_ASSERT(looked.tier == alloc_tier::HOST_PINNED, "tier mismatch");
     TEST_ASSERT(looked.role == alloc_role::COMPUTE, "role mismatch");
@@ -296,7 +296,7 @@ static bool strict_device_mismatch_fails(sycl::queue & q) {
     alloc_handle h{};
     TEST_ASSERT(unified_alloc(req, &h), "alloc failed");
     TEST_ASSERT(!unified_free_ptr(h.ptr, h.device + 1), "device mismatch free should fail");
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(h.ptr, &looked), "allocation should remain registered after mismatch");
     TEST_ASSERT(unified_free(h), "cleanup free failed");
     TEST_PASS();
@@ -318,10 +318,10 @@ static bool scoped_unified_alloc_frees_on_scope_exit(sycl::queue & q) {
         TEST_ASSERT(scoped, "scoped allocation failed");
         ptr = scoped.get();
         TEST_ASSERT(ptr != nullptr, "scoped pointer null");
-        alloc_handle looked{};
+        alloc_metadata looked{};
         TEST_ASSERT(unified_lookup(ptr, &looked), "lookup should succeed while in scope");
     }
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(!unified_lookup(ptr, &looked), "lookup should fail after scope exit");
     TEST_PASS();
     return true;
@@ -734,7 +734,7 @@ static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
                 "independent exact token admission failed");
 
     owner = {};
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(ptr, &looked), "refused owner release erased the runtime record");
     TEST_ASSERT(cache->has_pending_deferred_frees(), "refused owner release lost durable retry ownership");
     TEST_ASSERT(cache->zone_used(allocation.vram_zone) == used_before,
@@ -946,7 +946,7 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_ASSERT(lease.handle.host_zone == host_zone_id::STAGING, "expected staging host-zone allocation");
 
     void *       ptr = lease.handle.ptr;
-    alloc_handle looked{};
+    alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(ptr, &looked), "released lease should be registered before boundary check");
     TEST_ASSERT(release_offload_buffer(lease), "release failed");
 

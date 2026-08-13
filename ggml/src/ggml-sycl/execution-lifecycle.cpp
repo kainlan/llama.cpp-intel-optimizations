@@ -16,6 +16,14 @@ static int participant_index(const std::vector<int> & participants, int particip
 
 namespace ggml_sycl::execution {
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+#define GGML_SYCL_EXEC_MUTATION(site) (mutation_ == (site))
+#define GGML_SYCL_EXEC_ALLOCATION_CHECK(site) persistent_allocation_checkpoint(site)
+#else
+#define GGML_SYCL_EXEC_MUTATION(site) false
+#define GGML_SYCL_EXEC_ALLOCATION_CHECK(site) error::OK
+#endif
+
 struct registry_control {
     std::mutex mutex;
     Registry * registry    = nullptr;
@@ -88,12 +96,20 @@ error AuthoritativeInvocationSnapshot::finish_capability() noexcept {
     return control->registry->finish_authoritative_invocation_snapshot_locked(this);
 }
 
+Registry::Registry() : control_(std::make_shared<registry_control>()) {
+    control_->registry    = this;
+    control_->incarnation = mint_registry_incarnation();
+    control_->alive       = control_->incarnation != 0;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 Registry::Registry(test_mutation mutation) : control_(std::make_shared<registry_control>()), mutation_(mutation) {
     control_->registry = this;
     control_->incarnation =
         mutation == test_mutation::M6f_REGISTRY_INCARNATION_OVERFLOW ? 0 : mint_registry_incarnation();
     control_->alive = control_->incarnation != 0;
 }
+#endif
 
 Registry::~Registry() {
     std::lock_guard<std::mutex> gate(control_->mutex);
@@ -102,6 +118,7 @@ Registry::~Registry() {
     control_->registry = nullptr;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 error Registry::persistent_allocation_checkpoint(test_mutation allocation_site) const noexcept {
     if (mutation_ == allocation_site) {
         return error::ALLOCATION_FAILED;
@@ -111,6 +128,7 @@ error Registry::persistent_allocation_checkpoint(test_mutation allocation_site) 
     }
     return error::OK;
 }
+#endif
 
 error Registry::next_id(uint64_t & counter, error overflow, bool inject_overflow, uint64_t & out) noexcept {
     if (inject_overflow || counter == 0 || counter == UINT64_MAX) {
@@ -152,7 +170,7 @@ bool Registry::child_invocations_target(const session_entry & session, GraphEpoc
 ContextId Registry::create_context(error & out) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t value = 0;
-    out = next_id(next_context_id_, error::OVERFLOW, mutation_ == test_mutation::M4_CONTEXT_ID_OVERFLOW, value);
+    out = next_id(next_context_id_, error::OVERFLOW, GGML_SYCL_EXEC_MUTATION(test_mutation::M4_CONTEXT_ID_OVERFLOW), value);
     if (out != error::OK) return {};
     context_entry entry;
     entry.id = { value };
@@ -183,7 +201,7 @@ error Registry::attach_root(ContextId context, lifecycle::ModelToken root, Sessi
     if (entry.session.id.value == 0) {
         uint64_t session_value = 0;
         const auto rc = next_id(next_session_id_, error::OVERFLOW,
-                                mutation_ == test_mutation::M5_SESSION_ID_OVERFLOW, session_value);
+                                GGML_SYCL_EXEC_MUTATION(test_mutation::M5_SESSION_ID_OVERFLOW), session_value);
         if (rc != error::OK) return rc;
         entry.session.id = { session_value };
         entry.session.reset_epoch = { 1 };
@@ -207,7 +225,7 @@ error Registry::begin_record(ContextId             context,
     if (!graph_epoch) {
         return error::NULL_OUTPUT;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -240,7 +258,7 @@ error Registry::begin_record(ContextId             context,
     }
     uint64_t   value = 0;
     const auto rc =
-        next_id(next_graph_epoch_, error::OVERFLOW, mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, value);
+        next_id(next_graph_epoch_, error::OVERFLOW, GGML_SYCL_EXEC_MUTATION(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW), value);
     if (rc != error::OK) {
         return rc;
     }
@@ -301,7 +319,7 @@ error Registry::begin_invocation(ContextId             context,
     if (!invocation) {
         return error::NULL_OUTPUT;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -335,7 +353,7 @@ error Registry::begin_invocation(ContextId             context,
     }
     uint64_t   value = 0;
     const auto rc =
-        next_id(next_invocation_id_, error::OVERFLOW, mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, value);
+        next_id(next_invocation_id_, error::OVERFLOW, GGML_SYCL_EXEC_MUTATION(test_mutation::M6e_INVOCATION_ID_OVERFLOW), value);
     if (rc != error::OK) {
         return rc;
     }
@@ -501,7 +519,7 @@ error Registry::begin_retire(ContextId             context,
     if (!devices || device_count == 0) {
         return error::MISMATCH;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8c_RETIRE_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8c_RETIRE_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -592,7 +610,7 @@ error Registry::attach_retire_terminal(const RetireTicket &            ticket,
     if (!terminal) {
         return error::MISMATCH;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8d_TERMINAL_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8d_TERMINAL_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -743,7 +761,7 @@ error Registry::child_begin_record(ContextId context, SessionId session, Session
     if (!graph_epoch) {
         return error::NULL_OUTPUT;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8a_RECORD_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -779,7 +797,7 @@ error Registry::child_begin_record(ContextId context, SessionId session, Session
     }
     uint64_t   value = 0;
     const auto rc = next_id(next_graph_epoch_, error::OVERFLOW,
-                            mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, value);
+                            GGML_SYCL_EXEC_MUTATION(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW), value);
     if (rc != error::OK) {
         return rc;
     }
@@ -837,7 +855,7 @@ error Registry::child_begin_invocation(ContextId context, SessionId session, Ses
     if (!invocation) {
         return error::NULL_OUTPUT;
     }
-    const auto allocation_rc = persistent_allocation_checkpoint(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
+    const auto allocation_rc = GGML_SYCL_EXEC_ALLOCATION_CHECK(test_mutation::M8b_INVOCATION_ALLOCATION_FAILURE);
     if (allocation_rc != error::OK) {
         return allocation_rc;
     }
@@ -887,7 +905,7 @@ error Registry::child_begin_invocation(ContextId context, SessionId session, Ses
     }
     uint64_t value = 0;
     const auto rc = next_id(next_invocation_id_, error::OVERFLOW,
-                            mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, value);
+                            GGML_SYCL_EXEC_MUTATION(test_mutation::M6e_INVOCATION_ID_OVERFLOW), value);
     if (rc != error::OK) {
         return rc;
     }
@@ -1046,7 +1064,7 @@ error Registry::begin_graph(ContextId context, SessionId session, SessionResetEp
         return error::BUSY;
     }
     uint64_t graph_value = 0;
-    const auto rc = next_id(next_graph_epoch_, error::OVERFLOW, mutation_ == test_mutation::M6a_GRAPH_EPOCH_OVERFLOW, graph_value);
+    const auto rc = next_id(next_graph_epoch_, error::OVERFLOW, GGML_SYCL_EXEC_MUTATION(test_mutation::M6a_GRAPH_EPOCH_OVERFLOW), graph_value);
     if (rc != error::OK) return rc;
     entry.session.graph = {};
     entry.session.graph.id = { graph_value };
@@ -1111,7 +1129,7 @@ error Registry::begin_invocation(ContextId context, SessionId session, SessionRe
         }
         uint64_t invocation_value = 0;
         const auto rc = next_id(next_invocation_id_, error::OVERFLOW,
-                                mutation_ == test_mutation::M6e_INVOCATION_ID_OVERFLOW, invocation_value);
+                                GGML_SYCL_EXEC_MUTATION(test_mutation::M6e_INVOCATION_ID_OVERFLOW), invocation_value);
         if (rc != error::OK) return rc;
         graph.invocation = { invocation_value };
         graph.devices = canonical_devices;
@@ -1312,7 +1330,7 @@ error Registry::submit_invocation_locked(ContextId context, SessionId session, S
     }
     graph.state = graph.any_quarantined ? graph_phase::QUARANTINED : graph_phase::COMPLETE;
     graph.token_root_state = graph.any_quarantined ? token_root_phase::QUARANTINED : token_root_phase::COMPLETE;
-    if (mutation_ == test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY) {
+    if (GGML_SYCL_EXEC_MUTATION(test_mutation::M7_SUBMIT_RELEASES_DEVICES_EARLY)) {
         for (int claimed_device : graph.devices) {
             const auto & device_owner = device_owners_[claimed_device];
             if (device_owner.context == context && device_owner.session == session &&
@@ -1504,7 +1522,7 @@ error Registry::begin_drain(ContextId context, DrainTicket * ticket) noexcept {
         entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) {
         return error::BUSY;
     }
-    if (mutation_ == test_mutation::M6b_DRAIN_SERIAL_OVERFLOW || entry.next_drain_serial == 0 || entry.next_drain_serial == UINT64_MAX) return error::OVERFLOW;
+    if (GGML_SYCL_EXEC_MUTATION(test_mutation::M6b_DRAIN_SERIAL_OVERFLOW) || entry.next_drain_serial == 0 || entry.next_drain_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.next_drain_serial++;
     entry.active_drain_serial = serial;
     entry.state = context_phase::DRAINING;
@@ -1623,7 +1641,7 @@ error Registry::begin_reset(ContextId         context,
         entry.session.graph.state == graph_phase::SEALED || graph_terminal_unretired(entry.session.graph)) {
         return error::BUSY;
     }
-    if (mutation_ == test_mutation::M6c_RESET_SERIAL_OVERFLOW || entry.session.next_reset_serial == 0 || entry.session.next_reset_serial == UINT64_MAX) return error::OVERFLOW;
+    if (GGML_SYCL_EXEC_MUTATION(test_mutation::M6c_RESET_SERIAL_OVERFLOW) || entry.session.next_reset_serial == 0 || entry.session.next_reset_serial == UINT64_MAX) return error::OVERFLOW;
     const uint64_t serial = entry.session.next_reset_serial++;
     entry.session.active_reset_serial = serial;
     entry.state = context_phase::RESETTING;

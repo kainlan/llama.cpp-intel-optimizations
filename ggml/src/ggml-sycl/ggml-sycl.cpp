@@ -29556,8 +29556,8 @@ static void ggml_sycl_preload_model_weights() {
                         ggml_sycl_scoped_alloc_rollback host_alloc_guard{ host_handle };
 
                         void *       host_ptr  = host_handle.ptr;
-                        const size_t seg0_size = (!host_handle.all_segments.empty()) ?
-                                                     host_handle.all_segments[0].size :
+                        const size_t seg0_size = (!host_handle.segments().empty()) ?
+                                                     host_handle.segments()[0].size :
                                                      (host_ptr ? expert_size : 0);
                         if (host_ptr && seg0_size < expert_size) {
                             host_ptr = nullptr;
@@ -37979,16 +37979,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr == nullptr) {
                 auto it = active_handles.find(ptr);
-                if (it == active_handles.end()) {
-                    ggml_sycl::alloc_metadata looked_up{};
-                    if (ggml_sycl::unified_lookup(ptr, &looked_up)) {
-                        auto inserted = active_handles.emplace(
-                            ptr,
-                            ggml_sycl_pool_owned_buffer{ looked_up.size, ggml_sycl::mem_handle::from_owned_alloc(
-                                                                             ggml_sycl::alloc_handle(looked_up), GGML_LAYOUT_AOS) });
-                        it = inserted.first;
-                    }
-                }
+                // Ownership must have been retained at allocation time. A
+                // metadata lookup is observation-only and cannot mint it here.
                 if (it == active_handles.end() || !it->second.handle.valid()) {
                     GGML_ASSERT(false && "device pool free without unified allocation mem_handle");
                     return;
@@ -38002,15 +37994,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
         auto it = active_handles.find(ptr);
-        if (it == active_handles.end()) {
-            ggml_sycl::alloc_metadata looked_up{};
-            if (ggml_sycl::unified_lookup(ptr, &looked_up)) {
-                auto inserted = active_handles.emplace(
-                    ptr, ggml_sycl_pool_owned_buffer{ looked_up.size, ggml_sycl::mem_handle::from_owned_alloc(
-                                                                          ggml_sycl::alloc_handle(looked_up), GGML_LAYOUT_AOS) });
-                it = inserted.first;
-            }
-        }
+        // Fail closed when the allocation-time owner was not retained.
         if (it == active_handles.end() || !it->second.handle.valid()) {
             GGML_ASSERT(false && "device pool free without unified allocation mem_handle");
             return;

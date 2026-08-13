@@ -198,6 +198,7 @@ if (BUILD_TESTING)
         tests/test-sycl-lifecycle-event-lease.cpp
         execution-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-event-lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-lifecycle-event-lease PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
     target_link_libraries(test-sycl-lifecycle-event-lease PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-event-lease PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -231,6 +232,7 @@ if (BUILD_TESTING)
         tests/test-graph-epoch-lifecycle.cpp
         execution-lifecycle.cpp)
     target_include_directories(test-sycl-graph-epoch-lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-graph-epoch-lifecycle PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
     target_link_libraries(test-sycl-graph-epoch-lifecycle PRIVATE Threads::Threads)
     set_target_properties(test-sycl-graph-epoch-lifecycle PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -4701,7 +4703,19 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
         TIMEOUT 120)
 
+    add_executable(test-sycl-intrusive-allocation-owner
+        tests/test-intrusive-allocation-owner.cpp)
+    target_link_libraries(test-sycl-intrusive-allocation-owner PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-intrusive-allocation-owner PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-intrusive-allocation-owner COMMAND test-sycl-intrusive-allocation-owner)
+    set_tests_properties(sycl-intrusive-allocation-owner PROPERTIES
+        LABELS "sycl;allocator;owner;host;tsan-capable"
+        TIMEOUT 30)
+
     add_custom_target(ggml-sycl-private-fixtures-build DEPENDS
+        test-sycl-intrusive-allocation-owner
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle
         test-unified-cache-bugs

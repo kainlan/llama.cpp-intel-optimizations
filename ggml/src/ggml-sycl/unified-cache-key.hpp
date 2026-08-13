@@ -180,6 +180,6 @@ struct unified_cache_key_hash {
 struct layer_weight_set;
 struct layer_weight_pointers;
 struct unified_cache_entry;
-struct alloc_handle;
+class alloc_handle;
 
 }  // namespace ggml_sycl

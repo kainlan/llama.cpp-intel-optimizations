@@ -235,7 +235,9 @@ class quarantine_queue {
     size_t                                   count_ = 0;
 };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 enum class test_mutation { NONE, M1_SKIP_GENERATION, M2_NESTED_COMMIT, M3_CLEAR_POISON };
+#endif
 
 class CheckedCounter {
   public:
@@ -264,9 +266,12 @@ struct admission_diagnostics_snapshot {
 
 class Registry {
   public:
-    explicit Registry(uint64_t      id_limit    = std::numeric_limits<uint64_t>::max(),
+    Registry();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    explicit Registry(uint64_t      id_limit,
                       uint64_t      depth_limit = std::numeric_limits<uint64_t>::max(),
                       test_mutation mutation    = test_mutation::NONE);
+#endif
 
     begin_result begin_outer() noexcept;
     error        enter_nested(LoadTxnId txn);
@@ -389,7 +394,9 @@ class Registry {
     std::condition_variable                   cv_;
     const uint64_t                            id_limit_;
     const uint64_t                            depth_limit_;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     const test_mutation                       mutation_;
+#endif
     uint64_t                                  next_model_id_ = 1, next_load_id_ = 1, next_finish_serial_ = 1;
     uint64_t                                                   next_effect_serial_ = 1;
     uint64_t                                                   backend_context_count_ = 0;
