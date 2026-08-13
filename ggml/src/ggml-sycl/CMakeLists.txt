@@ -1947,6 +1947,7 @@ target_link_options(test-sycl-runtime-alloc PRIVATE ${SYCL_LINK_ONLY_TEST_OPTION
 target_compile_definitions(test-sycl-runtime-alloc PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING=1
 )
 target_link_libraries(test-sycl-runtime-alloc PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)

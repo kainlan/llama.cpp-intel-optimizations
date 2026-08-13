@@ -4881,6 +4881,12 @@ bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+// Private direct-source fixture seam; never compiled into the ordinary backend DSO.
+void unified_cache_test_fail_next_arena_registry_commit();
+void unified_cache_test_pause_arena_registry_commit(bool pause);
+bool unified_cache_test_arena_registry_commit_reached();
+#endif
 void prepare_unified_cache_for_module_use() noexcept;
 void rollback_unified_cache_module_use() noexcept;
 

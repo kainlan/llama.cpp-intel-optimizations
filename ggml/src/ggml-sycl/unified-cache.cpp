@@ -801,9 +801,9 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 
 struct arena_runtime_publication_context {
-    runtime_alloc_record record;
-    bool                 attempted = false;
-    bool                 published = false;
+    runtime_alloc_record * record    = nullptr;
+    bool                   attempted = false;
+    bool                   published = false;
 };
 
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
@@ -824,7 +824,8 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
     if (g_test_fail_next_arena_registry_commit.exchange(false, std::memory_order_acq_rel)) return false;
 #endif
     try {
-        runtime_alloc_record & rec       = context.record;
+        if (!context.record) return false;
+        runtime_alloc_record & rec       = *context.record;
         rec.handle.ptr                   = ptr;
         rec.handle.arena_generation      = exact.generation;
         rec.handle.arena_offset          = exact.offset;
@@ -3009,7 +3010,9 @@ bool unified_cache::ensure_planned_arena_zones() {
 
 unified_cache::~unified_cache() {
     if (!shutdown_resources()) {
-        arena_abandon();
+        GGML_LOG_ERROR(
+            "[UNIFIED-CACHE] destructor could not drain allocator owners; refusing to abandon live physical memory\n");
+        GGML_ABORT("unified_cache teardown failed before member destruction");
     }
 }
 
@@ -9320,23 +9323,36 @@ size_t unified_cache::owner_tagged_entry_count() const {
 }
 
 void unified_cache::test_mark_all_entries_touched_by_load(uint64_t load_txn_id) {
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    for (auto & pair : entries_) {
-        pair.second.pending_load_txn_id = load_txn_id;
-    }
+    std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    for (auto & pair : entries_) pair.second.pending_load_txn_id = load_txn_id;
+    for (auto & pair : direct_weight_entries_) pair.second.pending_load_txn_id = load_txn_id;
+    for (auto & pair : direct_expert_entries_) pair.second.pending_load_txn_id = load_txn_id;
 }
 
 bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
                                                     ggml_layout_mode   layout,
                                                     uint64_t           load_txn_id) {
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    bool                                found = false;
+    std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    bool found = false;
     for (auto & pair : entries_) {
         if (detail::cache_id_equal(pair.first.id, key) && pair.second.layout == layout) {
             pair.second.pending_load_txn_id = load_txn_id;
             found                           = true;
         }
     }
+    auto tag_mirror = [&](auto & table) {
+        auto it = table.find(key);
+        if (it != table.end() && it->second.layout == layout) {
+            it->second.pending_load_txn_id = load_txn_id;
+            found = true;
+        }
+    };
+    tag_mirror(direct_weight_entries_);
+    tag_mirror(direct_expert_entries_);
     return found;
 }
 
@@ -11249,6 +11265,32 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     bool                               kv_spill_to_host = false;
     void *                             ptr              = nullptr;
     arena_authority::allocation_record exact_arena{};
+    runtime_alloc_record               rec;
+    arena_runtime_publication_context  arena_publication{ &rec };
+    auto prepare_arena_publication = [&](vram_zone_id zid) -> bool {
+        try {
+            rec = {};
+            rec.handle.size         = alloc_size;
+            rec.handle.device       = req.device;
+            rec.handle.tier         = tier;
+            rec.handle.role         = req.intent.role;
+            rec.handle.category     = cat;
+            rec.handle.alloc_id     = reserved_alloc_id;
+            rec.handle.vram_zone    = zid;
+            rec.handle.zone_managed = true;
+            rec.queue               = req.queue;
+            if (req.queue) rec.queue_keepalive = *req.queue;
+            rec.zone_managed = true;
+            rec.from_arena   = true;
+            rec.vram_zone    = zid;
+            if (req.intent.cohort_id && req.intent.cohort_id[0] != '\0') rec.cohort_id = req.intent.cohort_id;
+            arena_publication.attempted = false;
+            arena_publication.published = false;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
     if (tier == alloc_tier::DEVICE_VRAM) {
         // Guard against Level Zero overcommit: if this allocation would exceed
         // the device's total VRAM, fail early so the caller can retry with
@@ -11306,9 +11348,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
-                ptr                    = cache->zone_alloc(zid, alloc_size,
-                                                           req.alignment != 0 ? req.alignment : 64,
-                                                           reserved_alloc_id, &exact_arena);
+                if (!prepare_arena_publication(zid)) return false;
+                ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64,
+                                        reserved_alloc_id, &exact_arena,
+                                        arena_runtime_registry_commit, &arena_publication);
+                if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
                     from_arena        = true;
                     out->zone_managed = true;
@@ -11325,7 +11369,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         if (!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
-                ptr = cache->zone_alloc(vram_zone_id::KV, alloc_size, 256, reserved_alloc_id, &exact_arena);
+                if (!prepare_arena_publication(vram_zone_id::KV)) return false;
+                ptr = cache->zone_alloc(vram_zone_id::KV, alloc_size, 256, reserved_alloc_id, &exact_arena,
+                                        arena_runtime_registry_commit, &arena_publication);
+                if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
                     from_arena        = true;
                     out->zone_managed = true;
@@ -11551,62 +11598,65 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // No separate counter bookkeeping needed — zones are the single source of truth.
     // Weight allocations are excluded from runtime tracking (they live in the WEIGHT zone).
 
-    runtime_alloc_record rec;
-    rec.handle.ptr          = ptr;
-    rec.handle.size         = alloc_size;
-    rec.handle.device       = req.device;
-    rec.handle.tier         = tier;
-    rec.handle.role         = req.intent.role;
-    rec.handle.category     = cat;
-    rec.handle.alloc_id     = reserved_alloc_id;
-    rec.handle.arena_generation = exact_arena.generation;
-    rec.handle.arena_offset     = exact_arena.offset;
-    rec.handle.arena_extent     = exact_arena.extent;
-    rec.handle.vram_zone    = out->vram_zone;  // Propagate zone routing set by zone_alloc paths above
-    rec.handle.zone_managed = out->zone_managed;
-    rec.handle.host_zone    = out->host_zone;
-    rec.handle.all_segments = std::move(out->all_segments);  // Preserve segments from zone alloc path
-    rec.queue               = req.queue;
-    if (req.queue != nullptr) {
-        rec.queue_keepalive = *req.queue;
-    }
-    rec.uses_pinned_pool = uses_pinned_pool;
-    rec.zone_managed     = zone_managed;
-    rec.from_arena       = from_arena;
-    rec.vram_zone        = out->vram_zone;
-    if (req.intent.cohort_id && req.intent.cohort_id[0] != '\0') {
-        rec.cohort_id = req.intent.cohort_id;
+    if (!arena_publication.published) {
+        rec.handle.ptr              = ptr;
+        rec.handle.size             = alloc_size;
+        rec.handle.device           = req.device;
+        rec.handle.tier             = tier;
+        rec.handle.role             = req.intent.role;
+        rec.handle.category         = cat;
+        rec.handle.alloc_id         = reserved_alloc_id;
+        rec.handle.arena_generation = exact_arena.generation;
+        rec.handle.arena_offset     = exact_arena.offset;
+        rec.handle.arena_extent     = exact_arena.extent;
+        rec.handle.vram_zone        = out->vram_zone;
+        rec.handle.zone_managed     = out->zone_managed;
+        rec.handle.host_zone        = out->host_zone;
+        rec.handle.all_segments     = std::move(out->all_segments);
+        rec.queue                   = req.queue;
+        try {
+            if (req.queue != nullptr) rec.queue_keepalive = *req.queue;
+            if (req.intent.cohort_id && req.intent.cohort_id[0] != '\0') rec.cohort_id = req.intent.cohort_id;
+        } catch (...) {
+            // Non-arena allocations have not published yet and can be released
+            // directly through their selected physical owner.
+            (void) unified_free_record(rec);
+            return false;
+        }
+        rec.uses_pinned_pool = uses_pinned_pool;
+        rec.zone_managed     = zone_managed;
+        rec.from_arena       = from_arena;
+        rec.vram_zone        = out->vram_zone;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        // Epoch-tag SCRATCH/STAGING allocations (iiff Option C step 2,
-        // llama.cpp-lbm3) under the same lock host_zone_settle() bumps
-        // g_host_zone_epoch under, so an allocation can never straddle a
-        // reset boundary and observe a torn epoch value. See the
-        // g_host_zone_epoch declaration above for what this id is for.
-        if (rec.handle.host_zone == host_zone_id::SCRATCH || rec.handle.host_zone == host_zone_id::STAGING) {
-            rec.handle.epoch_id =
-                g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
-        }
-        if (auto dup = g_runtime_alloc_registry.find(ptr); dup != g_runtime_alloc_registry.end()) {
-            const auto & old = dup->second.handle;
-            GGML_SYCL_DEBUG(
-                "[UNIFIED-ALLOC] replacing stale pointer registration ptr=%p new_size=%zu new_tier=%s new_role=%d "
-                "new_category=%d new_zone=%d old_size=%zu old_tier=%s old_role=%d old_category=%d old_zone=%d "
-                "old_alloc_id=%llu old_cohort=%s\n",
-                ptr, alloc_size, alloc_tier_name(tier), (int) req.intent.role, (int) cat, (int) rec.handle.vram_zone,
-                old.size, alloc_tier_name(old.tier), (int) old.role, (int) old.category, (int) old.vram_zone,
-                (unsigned long long) old.alloc_id,
-                dup->second.cohort_id.empty() ? "(none)" : dup->second.cohort_id.c_str());
-            if (!dup->second.cohort_id.empty()) {
-                g_runtime_cohort_tier.erase(dup->second.cohort_id);
+    if (!arena_publication.published) {
+        bool registered = false;
+        {
+            std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+            // Epoch and row publication share this mutex with host settle.
+            if (rec.handle.host_zone == host_zone_id::SCRATCH || rec.handle.host_zone == host_zone_id::STAGING) {
+                rec.handle.epoch_id =
+                    g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
             }
-            g_runtime_alloc_registry.erase(dup);
+            try {
+                if (g_runtime_alloc_registry.find(ptr) == g_runtime_alloc_registry.end()) {
+                    auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+                    if (inserted.second) {
+                        try {
+                            if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
+                            registered = true;
+                        } catch (...) {
+                            g_runtime_alloc_registry.erase(inserted.first);
+                        }
+                    }
+                }
+            } catch (...) {
+                registered = false;
+            }
         }
-        g_runtime_alloc_registry.emplace(ptr, rec);
-        if (!rec.cohort_id.empty()) {
-            g_runtime_cohort_tier[rec.cohort_id] = tier;
+        if (!registered) {
+            (void) unified_free_record(rec);
+            return false;
         }
     }
     if (unified_alloc_lifetime_trace_enabled()) {
@@ -17789,7 +17839,7 @@ std::mutex & unified_cache::arena_allocator_group_mutex(vram_zone_id zone) noexc
 bool unified_cache::arena_register_exact(vram_zone_id zone, uint64_t allocation_id,
                                          size_t offset, size_t extent) noexcept {
     try {
-        if (allocation_id == 0) allocation_id = unified_cache_mint_retention_identity();
+        if (allocation_id == 0) return false;
         const auto authority = arena_authority_snapshot(zone);
         return authority && authority->register_allocation(static_cast<int>(zone), allocation_id, offset, extent);
     } catch (...) {
@@ -17802,11 +17852,50 @@ void unified_cache::arena_unregister_exact(vram_zone_id zone, size_t offset) noe
     if (authority) (void) authority->unregister_allocation(static_cast<int>(zone), offset);
 }
 
-void * unified_cache::zone_alloc(vram_zone_id                       zone,
-                                 size_t                             size,
-                                 size_t                             align,
-                                 uint64_t                           allocation_id,
-                                 arena_authority::allocation_record * exact) {
+bool unified_cache::arena_record_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id,
+                                                    size_t offset, size_t extent,
+                                                    zone_registry_commit_fn registry_commit,
+                                                    void * registry_context) noexcept {
+    allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    try {
+        if (!group.allocations.emplace(ptr, allocator_group_record{ zone, allocation_id, offset, extent }).second) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    const arena_authority::allocation_record exact{ allocation_id, static_cast<int>(zone), offset, extent,
+                                                     arena_generation(zone) };
+    if (registry_commit && !registry_commit(ptr, exact, registry_context)) {
+        group.allocations.erase(ptr);
+        return false;
+    }
+    return true;
+}
+
+void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {
+    allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    auto              found = group.allocations.find(ptr);
+    if (found != group.allocations.end() && (allocation_id == 0 || found->second.allocation_id == allocation_id)) {
+        const uint64_t exact_id = found->second.allocation_id;
+        group.allocations.erase(found);
+        // Lock order is always physical allocator group -> runtime registry.
+        std::lock_guard<std::mutex> registry_lock(g_runtime_alloc_mutex);
+        auto runtime = g_runtime_alloc_registry.find(ptr);
+        if (runtime != g_runtime_alloc_registry.end() && runtime->second.handle.alloc_id == exact_id) {
+            if (!runtime->second.cohort_id.empty()) g_runtime_cohort_tier.erase(runtime->second.cohort_id);
+            g_runtime_alloc_registry.erase(runtime);
+        }
+    }
+}
+
+void * unified_cache::zone_alloc(vram_zone_id                         zone,
+                                 size_t                               size,
+                                 size_t                               align,
+                                 uint64_t                             allocation_id,
+                                 arena_authority::allocation_record * exact,
+                                 zone_registry_commit_fn              registry_commit,
+                                 void *                               registry_context) {
     if (exact) *exact = {};
     if (!arena_base_ || size == 0) {
         return nullptr;
@@ -17868,9 +17957,18 @@ void * unified_cache::zone_alloc(vram_zone_id                       zone,
                     z.used.fetch_sub(delta, std::memory_order_relaxed);
                     return nullptr;
                 }
-                if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
-                                      arena_generation(zone) };
-                return offset_to_ptr(logical_offset);
+                const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
+                                                                     logical_offset, size, arena_generation(zone) };
+                void * ptr = offset_to_ptr(logical_offset);
+                if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
+                                                    registry_commit, registry_context)) {
+                    arena_unregister_exact(zone, logical_offset);
+                    z.allocator->free(offset);
+                    z.used.fetch_sub(delta, std::memory_order_relaxed);
+                    return nullptr;
+                }
+                if (exact) *exact = committed;
+                return ptr;
             }
         }
         for (auto & wca : weight_chunk_allocators_) {
@@ -17902,9 +18000,18 @@ void * unified_cache::zone_alloc(vram_zone_id                       zone,
                 z.used.fetch_sub(delta, std::memory_order_relaxed);
                 return nullptr;
             }
-            if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
-                                  arena_generation(zone) };
-            return offset_to_ptr(logical_offset);
+            const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
+                                                                 logical_offset, size, arena_generation(zone) };
+            void * ptr = offset_to_ptr(logical_offset);
+            if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
+                                                registry_commit, registry_context)) {
+                arena_unregister_exact(zone, logical_offset);
+                wca.allocator->free(offset);
+                z.used.fetch_sub(delta, std::memory_order_relaxed);
+                return nullptr;
+            }
+            if (exact) *exact = committed;
+            return ptr;
         }
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
@@ -17959,9 +18066,18 @@ void * unified_cache::zone_alloc(vram_zone_id                       zone,
             z.used.store(alloc->used(), std::memory_order_relaxed);
             return nullptr;
         }
-        if (exact) *exact = { allocation_id, static_cast<int>(zone), logical_offset, size,
-                              arena_generation(zone) };
-        return offset_to_ptr(logical_offset);
+        const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
+                                                             logical_offset, size, arena_generation(zone) };
+        void * ptr = offset_to_ptr(logical_offset);
+        if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
+                                            registry_commit, registry_context)) {
+            arena_unregister_exact(zone, logical_offset);
+            alloc->free(offset);
+            z.used.store(alloc->used(), std::memory_order_relaxed);
+            return nullptr;
+        }
+        if (exact) *exact = committed;
+        return ptr;
     }
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
@@ -18061,6 +18177,18 @@ void unified_cache::zone_settle(vram_zone_id zone) {
     auto &                      z  = arena_zones_[static_cast<int>(zone)];
 
     std::unique_lock<std::mutex> lock(arena_allocator_group_mutex(zone));
+    allocator_group & physical_group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    if (!physical_group.allocations.empty()) {
+        static std::atomic<int> group_refusal_logs[ARENA_ALLOCATOR_GROUP_COUNT]{};
+        std::atomic<int> & logs = group_refusal_logs[arena_allocator_group_index(zone)];
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] refusing zone_settle of allocator group %zu (%s) with %zu live TLSF allocations; "
+                "all raw and managed owners must release before physical reset\n",
+                arena_allocator_group_index(zone), vram_zone_name(zone), physical_group.allocations.size());
+        }
+        return;
+    }
 
     // Purge registry entries whose pointer falls within this zone's address
     // range.  Without this, TLSF reset recycles addresses while the registry
@@ -18129,34 +18257,54 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         return;
     }
 
-    // Prebuild the next authority before close. Publication after reset is a
-    // no-throw shared_ptr swap, so allocation failure cannot strand the group
-    // closed after its TLSF state has already changed.
-    std::shared_ptr<arena_authority> next_authority;
+    // Group 0 is physically shared: a clean KV settle drains and reinitializes
+    // both logical authorities and every shared chunk allocator. It must never
+    // invalidate only KV while a WEIGHT/KV chunk remains live.
+    const bool shared_group0 = arena_allocator_group_index(zone) == 0;
+    std::array<vram_zone_id, 2> reset_zones{ zone, zone };
+    size_t reset_zone_count = 1;
+    if (shared_group0) {
+        reset_zones = { vram_zone_id::KV, vram_zone_id::WEIGHT };
+        reset_zone_count = 2;
+    }
+    std::array<std::shared_ptr<arena_authority>, 2> next_authorities{};
+    std::array<std::shared_ptr<arena_authority>, 2> retired_authorities{};
     try {
-        next_authority = arena_make_authority(zone, arena_generation(zone) + 1);
+        for (size_t i = 0; i < reset_zone_count; ++i) {
+            next_authorities[i] = arena_make_authority(reset_zones[i], arena_generation(reset_zones[i]) + 1);
+        }
     } catch (...) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] could not prebuild %s authority; refusing reset\n", vram_zone_name(zone));
+        GGML_LOG_ERROR("[UNIFIED-CACHE] could not prebuild %s allocator-group authority; refusing reset\n",
+                       vram_zone_name(zone));
         return;
     }
-    std::shared_ptr<arena_authority> retired_authority = arena_close_authority(zone);
+    for (size_t i = 0; i < reset_zone_count; ++i) retired_authorities[i] = arena_close_authority(reset_zones[i]);
     lock.unlock();
-    if (retired_authority && !retired_authority->wait_for_terminal_leases()) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] timed out draining %s allocator-group authority; refusing reset\n",
-                       vram_zone_name(zone));
-        // Keep the closed incarnation reachable so a later retry must drain it
-        // rather than observing an empty mirror and resetting underneath it.
-        arena_publish_prebuilt(zone, std::move(retired_authority));
-        return;
+    for (size_t i = 0; i < reset_zone_count; ++i) {
+        if (retired_authorities[i] && !retired_authorities[i]->wait_for_terminal_leases()) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] timed out draining %s allocator-group authority; refusing reset\n",
+                           vram_zone_name(reset_zones[i]));
+            for (size_t j = 0; j < reset_zone_count; ++j) {
+                if (retired_authorities[j]) arena_publish_prebuilt(reset_zones[j], retired_authorities[j]);
+            }
+            return;
+        }
     }
     lock.lock();
-    if (z.allocator) {
-        z.allocator->reset();
+    if (shared_group0) {
+        if (arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator) {
+            arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator->reset();
+        }
+        for (auto & wca : weight_chunk_allocators_) wca.allocator->reset();
+        arena_zones_[static_cast<int>(vram_zone_id::KV)].used.store(0, std::memory_order_relaxed);
+        arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)].used.store(0, std::memory_order_relaxed);
+    } else {
+        if (z.allocator) z.allocator->reset();
+        z.used.store(0, std::memory_order_relaxed);
     }
-    z.used.store(0, std::memory_order_relaxed);
-    // A reset is a new zone incarnation even when physical chunks remain.
-    // Reopen only after TLSF has completed the reset, under the same lock.
-    arena_publish_prebuilt(zone, std::move(next_authority));
+    for (size_t i = 0; i < reset_zone_count; ++i) {
+        arena_publish_prebuilt(reset_zones[i], std::move(next_authorities[i]));
+    }
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_reset_calls[idx]++;
@@ -18206,6 +18354,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             if (arena_offset != SIZE_MAX && arena_offset >= z.start && arena_offset < z.start + z.size) {
                 const size_t                zone_offset = arena_offset - z.start;
                 std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+                arena_forget_allocation_locked(zone, ptr);
                 arena_unregister_exact(zone, arena_offset);
                 const size_t                before = z.allocator->used();
                 z.allocator->free(zone_offset);
@@ -18234,6 +18383,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             return;
         }
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+        arena_forget_allocation_locked(zone, ptr);
         arena_unregister_exact(zone, ptr_to_offset(ptr));
         const auto                  chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
         const auto                  p          = reinterpret_cast<uintptr_t>(ptr);
@@ -18268,6 +18418,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+        arena_forget_allocation_locked(zone, ptr);
         arena_unregister_exact(zone, arena_offset);
         alloc->free(zone_offset);
         kv.used.store(alloc->used(), std::memory_order_relaxed);
@@ -18290,6 +18441,7 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     size_t zone_offset = arena_offset - z.start;
 
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    arena_forget_allocation_locked(zone, ptr);
     arena_unregister_exact(zone, arena_offset);
     alloc->free(zone_offset);
     z.used.store(alloc->used(), std::memory_order_relaxed);
@@ -18524,6 +18676,21 @@ void unified_cache_test_fail_next_shutdown_clean() {
     g_test_fail_next_shutdown_clean.store(true, std::memory_order_release);
 }
 
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+void unified_cache_test_fail_next_arena_registry_commit() {
+    g_test_fail_next_arena_registry_commit.store(true, std::memory_order_release);
+}
+
+void unified_cache_test_pause_arena_registry_commit(bool pause) {
+    if (pause) g_test_arena_registry_commit_reached.store(false, std::memory_order_release);
+    g_test_pause_arena_registry_commit.store(pause, std::memory_order_release);
+}
+
+bool unified_cache_test_arena_registry_commit_reached() {
+    return g_test_arena_registry_commit_reached.load(std::memory_order_acquire);
+}
+#endif
+
 bool unified_cache::arena_destroy() {
     if (!arena_queue_) return true;
 
@@ -18533,6 +18700,11 @@ bool unified_cache::arena_destroy() {
     lifecycle_locks.reserve(ARENA_ALLOCATOR_GROUP_COUNT);
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
+        if (!arena_allocator_groups_[i].allocations.empty()) {
+            GGML_LOG_ERROR("[VRAM-ARENA] allocator group %zu still owns %zu live TLSF allocations; refusing destroy\n",
+                           i, arena_allocator_groups_[i].allocations.size());
+            return false;
+        }
         arena_allocator_groups_[i].state = allocator_group_state::CLOSING;
     }
     std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> retired{};
@@ -18616,6 +18788,7 @@ bool unified_cache::arena_destroy() {
         return false;
     }
     weight_chunk_allocators_.clear();
+    for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
     arena_size_ = 0;

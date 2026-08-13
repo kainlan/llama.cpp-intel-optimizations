@@ -92,6 +92,39 @@ static bool reserve_allocate_success_registers_pointer(sycl::queue & q) {
     return true;
 }
 
+static bool arena_registry_commit_failure_rolls_back(sycl::queue & q) {
+    TEST_BEGIN("arena_registry_commit_failure_rolls_back");
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    if (!cache->arena_active()) {
+        TEST_PASS();
+        return true;
+    }
+
+    alloc_request req{};
+    req.queue                                      = &q;
+    req.size                                       = 4096;
+    req.intent.role                                = alloc_role::GRAPH_TMP;
+    req.intent.category                            = runtime_category::GRAPH;
+    req.intent.constraints.must_device             = true;
+    req.intent.constraints.prefer_vram_zone         = vram_zone_id::RUNTIME;
+
+    const size_t before = cache->zone_used(vram_zone_id::RUNTIME);
+    unified_cache_test_fail_next_arena_registry_commit();
+    alloc_handle failed{};
+    TEST_ASSERT(!unified_alloc(req, &failed), "faulted registry publication unexpectedly succeeded");
+    TEST_ASSERT(failed.ptr == nullptr, "faulted allocation returned a pointer");
+    TEST_ASSERT(cache->zone_used(vram_zone_id::RUNTIME) == before,
+                "registry insertion failure leaked TLSF bytes");
+
+    alloc_handle retry{};
+    TEST_ASSERT(unified_alloc(req, &retry), "allocator did not recover after publication rollback");
+    TEST_ASSERT(retry.alloc_id != 0, "retry omitted exact allocation identity");
+    TEST_ASSERT(unified_free(retry), "retry cleanup failed");
+    TEST_PASS();
+    return true;
+}
+
 static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
     TEST_BEGIN("allocate_failure_rolls_back_budget");
     const int    device = 0;
@@ -701,6 +734,7 @@ int main() {
     bool ok = true;
     enable_strict_mode_env();
     ok &= reserve_allocate_success_registers_pointer(q);
+    ok &= arena_registry_commit_failure_rolls_back(q);
     ok &= allocate_failure_rolls_back_budget(q);
     ok &= free_unknown_pointer_fails();
     ok &= strict_unknown_free_fails();

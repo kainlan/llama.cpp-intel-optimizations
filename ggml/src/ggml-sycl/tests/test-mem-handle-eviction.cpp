@@ -49,6 +49,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <vector>
 #include <sycl/sycl.hpp>
@@ -613,9 +614,33 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     TEST_BEGIN("device_publication_fault_phases");
 
     constexpr size_t bytes = 4096;
-    // B50/B70 serial geometry: the fixed runtime/oneDNN/scratch tail is 1280
-    // MiB, so 2 GiB is the minimal round geometry with a useful WEIGHT region.
-    ggml_sycl::unified_cache cache(q, 2ull * 1024 * 1024 * 1024);
+    // Configure the fixture geometry before cache construction instead of
+    // assuming the production 1280 MiB tail (which made a 512 MiB assertion
+    // impossible on constrained B50/B70 test runs). oneDNN retains its 256 MiB
+    // minimum; 1 MiB runtime + scratch leaves a real WEIGHT region.
+    const char * old_compute = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    const char * old_runtime = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB");
+    const bool had_compute = old_compute != nullptr;
+    const bool had_runtime = old_runtime != nullptr;
+    const std::string saved_compute = old_compute ? old_compute : "";
+    const std::string saved_runtime = old_runtime ? old_runtime : "";
+#if defined(_WIN32)
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", "1");
+    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", "1");
+#else
+    setenv("GGML_SYCL_COMPUTE_ARENA_MB", "1", 1);
+    setenv("GGML_SYCL_RUNTIME_ARENA_MB", "1", 1);
+#endif
+    ggml_sycl::unified_cache cache(q, 512ull * 1024 * 1024);
+#if defined(_WIN32)
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", had_compute ? saved_compute.c_str() : "");
+    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", had_runtime ? saved_runtime.c_str() : "");
+#else
+    had_compute ? (void) setenv("GGML_SYCL_COMPUTE_ARENA_MB", saved_compute.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    had_runtime ? (void) setenv("GGML_SYCL_RUNTIME_ARENA_MB", saved_runtime.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_RUNTIME_ARENA_MB");
+#endif
 
     ggml_sycl::alloc_handle geometry{};
     const int device = ggml_sycl_get_device_id_from_queue(q);

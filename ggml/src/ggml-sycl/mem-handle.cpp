@@ -498,6 +498,9 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
                                        uint64_t allocation_id,
                                        size_t   allocation_extent,
                                        std::shared_ptr<arena_authority> authority) {
+    // Exact arena capabilities are never wildcard queries. ID zero used to be
+    // accepted by some fixture paths and could bind a pointer by geometry alone.
+    if (allocation_id == 0 || generation == 0 || allocation_extent == 0) return {};
     mem_handle h;
     // Map zone_id to the appropriate arena handle kind.
     // vram_zone_id: KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4
@@ -651,7 +654,7 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
             // Arena handles consume only the tuple returned by the allocation
             // transaction. Never recover authority by mapping the raw pointer
             // back into a chunk: that can admit the wrong generation after ABA.
-            if (handle.arena_generation != 0 && handle.arena_extent != 0) {
+            if (handle.alloc_id != 0 && handle.arena_generation != 0 && handle.arena_extent != 0) {
                 h = from_arena_zone(static_cast<int>(handle.vram_zone), handle.arena_offset, handle.size,
                                     handle.device, handle.arena_generation, handle.alloc_id,
                                     handle.arena_extent, cache->arena_authority_snapshot(handle.vram_zone));
