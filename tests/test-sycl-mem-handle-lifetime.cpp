@@ -1,8 +1,11 @@
 #include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <thread>
 #include <utility>
 
 #define CHECK(cond, msg)                             \
@@ -65,6 +68,27 @@ static int test_copy_move_preserve_stable_identity_and_owner() {
     return 0;
 }
 
+static int test_arena_authority_invalidation_and_chunk_bounds() {
+    alignas(64) unsigned char a[64] = {}, b[64] = {};
+    auto authority = std::make_shared<ggml_sycl::arena_authority>();
+    authority->generation = 11;
+    authority->chunks = { { a, sizeof(a) }, { b, sizeof(b) } };
+    auto first = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 48, 16, 0, 11, 101, 16, authority);
+    auto second = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 64, 8, 0, 11, 102, 8, authority);
+    CHECK(first.resolve().ptr == a + 48 && first.resolve().extent == 16, "first exact extent");
+    CHECK(second.resolve().ptr == b && second.resolve().extent == 8, "second physical chunk boundary");
+    CHECK(authority->resolve_offset(11, 60, 8) == nullptr, "cross-chunk extent rejected");
+    std::atomic<bool> stop{ false }, stale{ false };
+    std::thread resolver([&] { while (!stop.load()) (void) first.resolve(); if (first.resolve()) stale = true; });
+    authority->invalidate(12);
+    stop = true;
+    resolver.join();
+    CHECK(!stale.load() && !first.resolve() && !second.resolve(), "concurrent invalidation is terminal");
+    return 0;
+}
+
 static int test_arena_debug_identity_includes_generation() {
     ggml_sycl::mem_handle a =
         ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 1024, 0, 7);
@@ -92,9 +116,8 @@ int main() {
     if (int rc = test_copy_move_preserve_stable_identity_and_owner()) {
         return rc;
     }
-    if (int rc = test_arena_debug_identity_includes_generation()) {
-        return rc;
-    }
+    if (int rc = test_arena_debug_identity_includes_generation()) return rc;
+    if (int rc = test_arena_authority_invalidation_and_chunk_bounds()) return rc;
     std::puts("PASS: mem_handle lifetime diagnostics");
     return 0;
 }

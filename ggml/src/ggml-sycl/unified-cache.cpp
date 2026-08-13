@@ -6963,6 +6963,7 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
         }
         stamp_pending_owner(entry_it->second, load_effect_guard);
         result.ptr       = entry.device_ptr;
+        result.byte_size = entry.size;
         result.layout    = entry.layout;
         result.on_device = !entry.host_resident;
         if (entry.has_ready_event) {
@@ -17195,6 +17196,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                 }
             }
 
+            arena_publish_authority();
             return true;
         }
     }
@@ -17408,6 +17410,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         }
     }
 
+    arena_publish_authority();
     return true;
 }
 
@@ -17706,11 +17709,14 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         return;
     }
 
+    // Revoke all arena resolution authority before TLSF can recycle an
+    // address. resolve_offset() uses the same authority mutex, so no resolve
+    // can straddle this invalidation point.
+    arena_generation_bump();
     if (z.allocator) {
         z.allocator->reset();
     }
     z.used.store(0, std::memory_order_relaxed);
-    arena_generation_bump();
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_reset_calls[idx]++;
@@ -18075,9 +18081,10 @@ void unified_cache_test_fail_next_shutdown_clean() {
 }
 
 bool unified_cache::arena_destroy() {
-    if (!arena_queue_) {
-        return true;
-    }
+    if (!arena_queue_) return true;
+    // Invalidate before queue drain/free; operation-retained handles keep a
+    // chunk lease and the free loop waits for those terminal leases.
+    arena_invalidate_authority();
     try {
         arena_queue_->wait_and_throw();
     } catch (const sycl::exception & e) {
@@ -18159,6 +18166,29 @@ bool unified_cache::arena_destroy() {
     return true;
 }
 
+std::shared_ptr<arena_authority> unified_cache::arena_authority_snapshot() const {
+    std::lock_guard<std::mutex> guard(arena_authority_mutex_);
+    return arena_authority_;
+}
+void unified_cache::arena_publish_authority() {
+    auto authority = std::make_shared<arena_authority>();
+    authority->generation = arena_generation();
+    for (const auto & chunk : arena_chunks_) authority->chunks.emplace_back(chunk.ptr, chunk.size);
+    std::lock_guard<std::mutex> guard(arena_authority_mutex_);
+    arena_authority_ = std::move(authority);
+}
+void unified_cache::arena_generation_bump() {
+    const uint64_t next = arena_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto authority = arena_authority_snapshot();
+    if (authority) authority->bump_generation(next);
+}
+void unified_cache::arena_invalidate_authority() {
+    const uint64_t next = arena_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::shared_ptr<arena_authority> authority;
+    { std::lock_guard<std::mutex> guard(arena_authority_mutex_); authority = std::move(arena_authority_); }
+    if (authority) authority->invalidate(next);
+}
+
 // === Arena chunk lease API (llama.cpp-dyhdl) ===
 
 int unified_cache::arena_find_chunk(const void * ptr) const {
@@ -18225,6 +18255,7 @@ void unified_cache::host_release_chunk_lease(uint64_t handle) {
 }
 
 void unified_cache::arena_abandon() {
+    arena_invalidate_authority();
     // Null everything without calling sycl::free — used during shutdown
     // when the SYCL context is already invalid.
     weight_chunk_allocators_.clear();

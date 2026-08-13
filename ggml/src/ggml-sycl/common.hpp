@@ -4395,7 +4395,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                         // No compatible layout — fall through to raw pointer
                     } else {
                         result.ptr       = wpr.ptr;
-                        result.extent    = ggml_nbytes(tensor);
+                        result.extent    = wpr.byte_size;
                         result.layout    = wpr.layout;
                         result.on_device = wpr.on_device;
                         if (wpr.has_ready_event) {
@@ -4455,33 +4455,26 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
         return result;
     }
 
-    auto set_registered_ptr = [&](void * ptr, layout_mode layout, size_t offset) -> bool {
-        if (!ptr) {
-            return false;
-        }
-        const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ptr);
-        if (!info) {
-            return false;
-        }
-        const bool on_device =
-            info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device;
-        const bool host_accessible =
-            info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED;
-        if (!on_device && !host_accessible) {
-            return false;
-        }
+    auto set_registered_ptr = [&](void * ptr, layout_mode layout, size_t offset, size_t logical_extent) -> bool {
+        if (!ptr || logical_extent == 0) return false;
+        ggml_sycl::alloc_handle allocation{};
+        if (!ggml_sycl::unified_lookup_runtime_allocation(ptr, &allocation, nullptr) || !allocation.ptr ||
+            allocation.size == 0) return false;
         const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        if (addr < info->base || addr - info->base > info->size || offset > info->size - (addr - info->base)) {
-            return false;
-        }
-        result.ptr       = static_cast<char *>(ptr) + offset;
-        result.extent    = info->size - static_cast<size_t>(addr - info->base) - offset;
-        result.layout    = layout;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(allocation.ptr);
+        if (addr < base || addr - base > allocation.size || offset > allocation.size - (addr - base) ||
+            logical_extent > allocation.size - (addr - base) - offset) return false;
+        const bool on_device = allocation.tier == ggml_sycl::alloc_tier::DEVICE_VRAM && allocation.device == device;
+        const bool host_accessible = allocation.tier == ggml_sycl::alloc_tier::HOST_PINNED;
+        if (!on_device && !host_accessible) return false;
+        result.ptr = static_cast<char *>(ptr) + offset;
+        result.extent = logical_extent;
+        result.layout = layout;
         result.on_device = on_device;
         return true;
     };
 
-    auto resolve_extra = [&](const ggml_tensor * candidate, size_t offset) -> bool {
+    auto resolve_extra = [&](const ggml_tensor * candidate, size_t offset, size_t logical_extent) -> bool {
         if (!candidate || !candidate->extra) {
             return false;
         }
@@ -4490,25 +4483,21 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
         if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
             auto resolved = handle.resolve(device);
             if (resolved) {
-                if (offset > resolved.extent) {
+                if (logical_extent == 0 || offset > resolved.extent || logical_extent > resolved.extent - offset)
                     return false;
-                }
-                result        = resolved;
-                result.ptr    = static_cast<char *>(resolved.ptr) + offset;
-                result.extent = resolved.extent - offset;
+                result = resolved;
+                result.ptr = static_cast<char *>(resolved.ptr) + offset;
+                result.extent = logical_extent;
                 return true;
             }
         }
-        return set_registered_ptr(extra->data_device[device], get_effective_layout_mode(extra), offset);
+        return set_registered_ptr(extra->data_device[device], get_effective_layout_mode(extra), offset, logical_extent);
     };
 
-    if (resolve_extra(root, view_offset)) {
-        return result;
-    }
-    if (root != tensor && resolve_extra(tensor, 0)) {
-        return result;
-    }
-    if (set_registered_ptr(root->data, GGML_LAYOUT_AOS, view_offset)) {
+    const size_t tensor_extent = ggml_nbytes(tensor);
+    if (resolve_extra(root, view_offset, tensor_extent)) return result;
+    if (root != tensor && resolve_extra(tensor, 0, tensor_extent)) return result;
+    if (set_registered_ptr(root->data, GGML_LAYOUT_AOS, view_offset, tensor_extent)) {
         return result;
     }
 
@@ -4519,8 +4508,9 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
             ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(weight_tensor, device);
             if (key.valid) {
                 auto wpr = cache->get_weight_ptr(key);
-                if (wpr) {
-                    result.ptr       = wpr.ptr;
+                if (wpr && view_offset <= wpr.byte_size && tensor_extent <= wpr.byte_size - view_offset) {
+                    result.ptr       = static_cast<char *>(wpr.ptr) + view_offset;
+                    result.extent    = tensor_extent;
                     result.layout    = wpr.layout;
                     result.on_device = wpr.on_device;
                     if (wpr.has_ready_event) {

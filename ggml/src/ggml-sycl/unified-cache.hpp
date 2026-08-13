@@ -1917,6 +1917,7 @@ class unified_cache {
     // Result of a layout-agnostic weight pointer lookup.
     struct weight_ptr_result {
         void *           ptr             = nullptr;
+        size_t           byte_size       = 0;
         ggml_layout_mode layout          = GGML_LAYOUT_AOS;
         bool             on_device       = false;
         bool             has_ready_event = false;
@@ -2602,8 +2603,9 @@ class unified_cache {
     // Arena generation: monotonically increasing counter, bumped when the arena
     // is destroyed/recreated.  Used by mem_handle to detect stale arena handles.
     uint64_t arena_generation() const { return arena_generation_.load(std::memory_order_acquire); }
+    std::shared_ptr<arena_authority> arena_authority_snapshot() const;
 
-    void arena_generation_bump() { arena_generation_.fetch_add(1, std::memory_order_acq_rel); }
+    void arena_generation_bump();
 
     // Register the compute queue so deferred frees wait for in-flight kernels.
     // Without this, evicted VRAM pointers can be freed while GPU kernels on the
@@ -3296,6 +3298,10 @@ class unified_cache {
     // mem_handle arena handles store the generation at creation time; on resolve(),
     // a mismatch means the handle is stale (arena was recycled).
     std::atomic<uint64_t> arena_generation_{ 0 };
+    mutable std::mutex arena_authority_mutex_;
+    std::shared_ptr<arena_authority> arena_authority_;
+    void arena_publish_authority();
+    void arena_invalidate_authority();
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.

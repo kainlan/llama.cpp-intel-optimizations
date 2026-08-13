@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sycl/sycl.hpp>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
@@ -73,6 +75,17 @@ enum class mem_handle_kind : uint8_t {
                         // chunks (e.g. tensor->data from host_arena) against
                         // sycl::free of the underlying chunk while this
                         // handle is alive.
+};
+
+struct arena_authority {
+    mutable std::mutex mutex;
+    bool alive = true;
+    uint64_t generation = 0;
+    std::vector<std::pair<void *, size_t>> chunks;
+
+    void * resolve_offset(uint64_t expected_generation, size_t offset, size_t extent) const;
+    void invalidate(uint64_t replacement_generation);
+    void bump_generation(uint64_t replacement_generation);
 };
 
 struct mem_handle_debug_info;
@@ -235,7 +248,8 @@ class mem_handle {
                                       int device,
                                       uint64_t generation,
                                       uint64_t allocation_id = 0,
-                                      size_t allocation_extent = 0);
+                                      size_t allocation_extent = 0,
+                                      std::shared_ptr<arena_authority> authority = {});
 
     // Compatibility/test bridge for legacy raw pointers whose arena-chunk
     // ownership must be protected while callers are migrated to allocation-time
@@ -458,6 +472,7 @@ class mem_handle {
     size_t         slice_offset_   = 0;  // immutable-after-construction offset from backing pointer
     bool           is_slice_       = false;
     uint64_t arena_gen_ = 0;  // Mint-time arena generation (checked against owner every resolve)
+    std::shared_ptr<arena_authority> arena_authority_; // retained incarnation authority
 
     // Exact allocator-minted retention identity. Cache WEIGHT constructors do
     // not populate these until unified-cache propagation lands; graph retention
