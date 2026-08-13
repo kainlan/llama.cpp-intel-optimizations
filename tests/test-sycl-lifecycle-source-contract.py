@@ -113,6 +113,134 @@ raw_snapshot_reader_allowlist = (
     "const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
     "const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
 )
+
+
+def _balanced_body(source, brace):
+    """Return the brace-delimited body starting at brace (comments already stripped)."""
+    depth = 0
+    quote = None
+    pos = brace
+    while pos < len(source):
+        ch = source[pos]
+        if quote:
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace:pos + 1]
+        pos += 1
+    return ""
+
+
+def _strip_cpp_comments(source):
+    return re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), source, flags=re.S)
+
+
+def _function_containing(source, position):
+    """Lightweight function parser: choose the smallest definition containing position."""
+    candidates = []
+    definition = re.compile(
+        r"(?:^|\n)(?P<signature>[^;{}\n]*(?:\n[^;{}\n]*){0,8}?\([^;{}]*?\)\s*)"
+        r"(?:const\s*)?(?:noexcept\s*)?(?:try\s*)?\{", re.M)
+    for match in definition.finditer(source):
+        signature = match.group("signature").strip()
+        if re.match(r"(?:if|for|while|switch|catch)\s*\(", signature) or "=" in signature:
+            continue
+        brace = match.end() - 1
+        body = _balanced_body(source, brace)
+        if body and brace <= position < brace + len(body):
+            candidates.append((len(body), signature + body))
+    return min(candidates)[1] if candidates else ""
+
+
+def _raw_snapshot_escape_failures(source):
+    """Reject raw descendants that outlive a synchronous snapshot-reader function."""
+    active = _strip_cpp_comments(source)
+    failures = []
+    parsed_functions = set()
+    for call in raw_snapshot_reader_re.finditer(active):
+        function = _function_containing(active, call.start())
+        if not function:
+            failures.append("snapshot reader is not inside a parsed function")
+            continue
+        if function in parsed_functions:
+            continue
+        parsed_functions.add(function)
+        assignments = list(re.finditer(
+            r"\b(?:const\s+)?auto\s+(?P<owner>[A-Za-z_]\w*)\s*=\s*[^;]*"
+            r"get_placement_plan_snapshot\s*\(\s*\)[^;]*;", function))
+        if not assignments:
+            failures.append("snapshot owner assignment is not structurally recognized")
+            continue
+        for assignment in assignments:
+            owner = assignment.group("owner")
+            raw = set()
+            changed = True
+            while changed:
+                changed = False
+                for declaration in re.finditer(
+                    r"\b(?:const\s+)?(?:auto|[A-Za-z_:][\w:]*)\s*\*\s*(?P<name>\w+)\s*=\s*(?P<expr>[^;]+);",
+                    function):
+                    expr = declaration.group("expr")
+                    ancestors = {owner, *raw}
+                    if any(re.search(r"\b" + re.escape(name) + r"\b", expr) for name in ancestors):
+                        if declaration.group("name") not in raw:
+                            raw.add(declaration.group("name"))
+                            changed = True
+            descendant = r"(?:" + "|".join(map(re.escape, sorted(raw))) + r")" if raw else r"(?!)"
+            direct_raw = re.escape(owner) + r"\s*(?:\.get\s*\(\s*\)|->)"
+            if re.search(r"\breturn\s+(?:[^;]*\b" + descendant + r"\b|[^;]*" + direct_raw + r")[^;]*;", function):
+                failures.append(owner + ": raw descendant returned")
+            if re.search(r"(?:\bg_\w+|\b\w+::\w+)\s*=\s*(?:[^;]*\b" + descendant + r"\b|[^;]*" + direct_raw + r")", function):
+                failures.append(owner + ": raw descendant stored globally")
+            lambda_capture = re.compile(r"\[[^\]]*(?:\b" + descendant + r"\b|" + direct_raw + r")[^\]]*\]")
+            if lambda_capture.search(function):
+                failures.append(owner + ": raw descendant captured by lambda/thread")
+    return failures
+
+
+def _retirement_storage_release_failures(source):
+    """Walk retirement's helper graph; only gated map erase may destroy storage owners."""
+    active = _strip_cpp_comments(source)
+    definitions = {}
+    definition = re.compile(
+        r"(?:^|\n)[^;{}\n]*\bunified_cache::(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*?\)\s*"
+        r"(?:const\s*)?(?:noexcept\s*)?\{", re.M)
+    for match in definition.finditer(active):
+        body = _balanced_body(active, match.end() - 1)
+        if body:
+            definitions[match.group("name")] = body
+    roots = {"note_model_load_abort", "transition_to_retired_locked", "finalize_retired_entries_locked"}
+    failures = ["missing retirement helper " + name for name in sorted(roots - definitions.keys())]
+    reachable = set()
+    pending = list(roots & definitions.keys())
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        body = definitions[name]
+        for callee in definitions:
+            if callee not in reachable and re.search(r"\b" + re.escape(callee) + r"\s*\(", body):
+                pending.append(callee)
+    destructive = re.compile(
+        r"(?:\b(?:entry|candidate|it->second)\s*\.\s*storage_owner\s*"
+        r"(?:\.reset\s*\(|=\s*(?:\{|nullptr))|"
+        r"std::move\s*\(\s*(?:entry|candidate|it->second)\s*\.\s*storage_owner\s*\))")
+    for name in sorted(reachable - {"erase_entry_locked"}):
+        if destructive.search(definitions[name]):
+            failures.append(name + ": releases storage_owner before gated erase")
+    return failures
+
+
 # Positive controls prove the census expressions still detect both prohibited
 # reader families rather than passing because of an accidentally-empty regex.
 census_fixture = (
@@ -703,6 +831,8 @@ checks = {
     and "acquire_load_effect(registry.bound_candidate())" in register_usage_body
     and "catch (...)" in register_usage_body
     and "usage-effect-abort-drain" in (root / "tests/test-sycl-lifecycle-load-txn.cpp").read_text(),
+    "raw snapshot descendants cannot escape their reader function": not _raw_snapshot_escape_failures(backend),
+    "retirement helpers cannot release storage before gated erase": not _retirement_storage_release_failures(cache_cpp),
     "lease result snapshots storage ownership": "std::shared_ptr<void> storage_owner" in cache_hpp
     and re.search(r"result\.storage_owner\s*=\s*entry\.storage_owner", cache_cpp)
     and "fresh.storage_owner = std::move(result.storage_owner)" in
@@ -1207,4 +1337,32 @@ failed = [name for name, ok in checks.items() if not ok]
 if failed:
     print("lifecycle source contract failed: " + ", ".join(failed), file=sys.stderr)
     raise SystemExit(1)
+
+if "--self-test" in sys.argv:
+    mutants = (
+        ("raw lambda/thread escape", "backend", raw_snapshot_reader_allowlist[0],
+         raw_snapshot_reader_allowlist[0] + "\n    auto * escaped_plan = cached.get();\n"
+         "    std::thread escaped_worker([escaped_plan] { (void) escaped_plan; });"),
+        ("raw return escape", "backend", raw_snapshot_reader_allowlist[0],
+         raw_snapshot_reader_allowlist[0] + "\n    return cached.get();"),
+        ("retirement helper early storage release", "cache",
+         "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {",
+         "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {\n"
+         "    entry.storage_owner.reset();"),
+    )
+    mutant_failures = []
+    for name, target, anchor, replacement in mutants:
+        original = backend if target == "backend" else cache_cpp
+        if anchor not in original:
+            mutant_failures.append(name + ": anchor missing")
+            continue
+        mutated = original.replace(anchor, replacement, 1)
+        caught = (_raw_snapshot_escape_failures(mutated) if target == "backend"
+                  else _retirement_storage_release_failures(mutated))
+        if not caught:
+            mutant_failures.append(name + ": bypass was not detected")
+    if mutant_failures:
+        print("lifecycle source self-test failed: " + ", ".join(mutant_failures), file=sys.stderr)
+        raise SystemExit(1)
+    print("lifecycle source contract: self-test PASS (3 bypass insertion mutants)")
 print("lifecycle source contract: PASS")

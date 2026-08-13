@@ -416,12 +416,13 @@ if (BUILD_TESTING)
     # Deliberately NOT labelled "cache": that label is in the memory-hazard
     # denylist the full sweep excludes, and this gate allocates nothing.
     set_tests_properties(sycl-tiered-verdict-contract PROPERTIES LABELS "sycl;tiered;host;source-contract")
-    # The 32dg claim/release source contract. Like the lifecycle executable
-    # above it was written and never registered; it pins the generation-keyed
-    # release and retired-slot protocol that the admission port must not regress.
+    # The 32dg claim/release source contract pins the generation-keyed release
+    # and retired-slot protocol. --self-test proves its ordering/guard checks
+    # reject bypass insertions instead of passing vacuously on production code.
     add_test(NAME sycl-pp-moe-scratch-source
         COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-source.py)
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-source.py
+            --self-test)
     set_tests_properties(sycl-pp-moe-scratch-source PROPERTIES LABELS "sycl;moe;lifecycle;host;source-contract")
     # The n3pw physical-identity ruling for weight cache keys. The three
     # executable tests (weight-key-stability, weight-key-uniqueness,

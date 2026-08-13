@@ -9,6 +9,7 @@ arena_generation_bump helper is not an acceptable substitute.
 """
 import argparse
 from pathlib import Path
+import re
 import sys
 
 root = Path(__file__).resolve().parents[1]
@@ -60,6 +61,22 @@ def enclosing_block_ends_before(text, needle, later):
     return False
 
 
+def exact_generation_guard_dominates_refcount_mutation(cache_release):
+    """All destructive refcount writes must follow the exact slot+generation reject guard."""
+    release_match = function_body(cache_release, "auto release_match =")
+    if not release_match:
+        return False
+    guard = re.search(
+        r"if\s*\(\s*candidate\.slot\s*!=\s*slot\s*\|\|\s*"
+        r"candidate\.generation\s*!=\s*generation\s*\)\s*\{\s*continue\s*;\s*\}",
+        release_match, re.S)
+    if not guard:
+        return False
+    mutations = list(re.finditer(
+        r"(?:candidate\.refcount\s*(?:--|\-=|=(?!=))|--\s*candidate\.refcount)", release_match))
+    return bool(mutations) and all(guard.end() < mutation.start() for mutation in mutations)
+
+
 def evaluate(header, cache, backend):
     claim = function_body(backend, "static bool pp_moe_onednn_claim_scratch_slot(")
     drain = function_body(backend, "static void pp_moe_onednn_drain_scratch_slots(")
@@ -96,6 +113,8 @@ def evaluate(header, cache, backend):
                          "release_pp_moe_onednn_scratch_slot(wait_slot, wait_generation)"),
         "cache release matches both slot and generation":
             "candidate.slot != slot || candidate.generation != generation" in cache_release,
+        "exact generation guard dominates every refcount mutation":
+            exact_generation_guard_dominates_refcount_mutation(cache_release),
         "retired owners are destroyed before pointer metadata is cleared":
             precedes(cache_release, "retired.weight_owner     = {};",
                      "retired.weight = retired.activation = retired.output = nullptr")
@@ -131,6 +150,9 @@ MUTANTS = {
          "if (false) {"),
     "cache release matches both slot and generation":
         ("cache", "candidate.slot != slot || candidate.generation != generation", "candidate.slot != slot"),
+    "exact generation guard dominates every refcount mutation":
+        ("cache", "auto & candidate = slots[i];",
+         "auto & candidate = slots[i];\n                candidate.refcount--;"),
     "retired owners are destroyed before pointer metadata is cleared":
         ("cache", "retired.weight_owner     = {};", ""),
     "legacy arena generation bump helper is absent":

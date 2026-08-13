@@ -150,6 +150,26 @@ def precedes(text, first, second):
     return a >= 0 and b >= 0 and a < b
 
 
+def guard_block_contains(text, guard_pattern, mutation_pattern):
+    """Lightweight control-flow check: every mutation is lexically inside the guard block."""
+    guard = re.search(guard_pattern + r"\s*\{", text, re.S)
+    mutations = list(re.finditer(mutation_pattern, text))
+    if not guard or not mutations:
+        return False
+    brace = guard.end() - 1
+    depth = 0
+    end = -1
+    for pos in range(brace, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                end = pos
+                break
+    return end >= 0 and all(brace < mutation.start() < end for mutation in mutations)
+
+
 def evaluate(cache, backend, common, header):
     cache, backend, common, header = squeeze(cache), squeeze(backend), squeeze(common), squeeze(header)
 
@@ -298,7 +318,8 @@ def evaluate(cache, backend, common, header):
             "const uint64_t settle_epoch = ++physical_group.lifecycle_epoch" in zone_reset
             and "physical_group.state != allocator_group_state::RESETTING" in zone_reset
             and "physical_group.lifecycle_epoch != settle_epoch" in zone_reset
-            and precedes(zone_reset, "wait_for_terminal_leases()", "physical_group.lifecycle_epoch != settle_epoch"),
+            and precedes(zone_reset, "wait_for_terminal_leases(", "lock.lock()")
+            and precedes(zone_reset, "lock.lock()", "physical_group.lifecycle_epoch != settle_epoch"),
         'zone settle publishes before reopening and notifying the group':
             precedes(zone_reset, "arena_publish_prebuilt(", "physical_group.state = allocator_group_state::OPEN")
             and precedes(zone_reset, "physical_group.state = allocator_group_state::OPEN",
@@ -306,10 +327,17 @@ def evaluate(cache, backend, common, header):
         'exact allocation ownership is erased by allocation id':
             "found->second.allocation_id == allocation_id" in arena_forget
             and "runtime->second.handle.alloc_id == exact_id" in arena_forget
-            and "group.allocations.erase(found)" in arena_forget,
+            and "group.allocations.erase(found)" in arena_forget
+            and guard_block_contains(
+                arena_forget,
+                r"if\s*\(\s*runtime\s*!=\s*g_runtime_alloc_registry\.end\(\)\s*&&\s*"
+                r"runtime->second\.handle\.alloc_id\s*==\s*exact_id\s*\)",
+                r"g_runtime_alloc_registry\.erase\s*\([^)]*\)"),
         'arena destroy refuses owned groups before physical free and never raw-clears first':
-            precedes(arena_destroy, "if (!group.allocations.empty())", "sycl::free(c.ptr")
-            and precedes(arena_destroy, "sycl::free(c.ptr", "group.allocations.clear()"),
+            arena_destroy.count("if (!group.allocations.empty())") == 1
+            and re.search(r"sycl::free\s*\(", arena_destroy) is not None
+            and arena_destroy.find("if (!group.allocations.empty())") < re.search(r"sycl::free\s*\(", arena_destroy).start()
+            and re.search(r"sycl::free\s*\(", arena_destroy).start() < arena_destroy.find("group.allocations.clear()"),
         'legacy arena generation bump helper is absent':
             "arena_generation_bump" not in cache and "arena_generation_bump" not in header,
 
@@ -507,9 +535,14 @@ MUTANTS = {
         "cache", [("physical_group.state = allocator_group_state::OPEN;",
                    "physical_group.lifecycle_cv.notify_all();\n    physical_group.state = allocator_group_state::OPEN;")]),
     "exact allocation ownership is erased by allocation id": (
-        "cache", [(" && (allocation_id == 0 || found->second.allocation_id == allocation_id)", "")]),
+        "cache", [("void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {",
+                   "void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {\n"
+                   "    auto bypass = g_runtime_alloc_registry.find(ptr);\n"
+                   "    if (bypass != g_runtime_alloc_registry.end()) g_runtime_alloc_registry.erase(bypass);")]),
     "arena destroy refuses owned groups before physical free and never raw-clears first": (
-        "cache", [("if (!group.allocations.empty()) {", "if (false) {")]),
+        "cache", [("bool unified_cache::arena_destroy() {",
+                   "bool unified_cache::arena_destroy() {\n"
+                   "    if (!arena_chunks_.empty()) sycl::free(arena_chunks_[0].ptr, arena_queue_->get_context());")]),
     "legacy arena generation bump helper is absent": (
         "cache", [("void unified_cache::zone_settle(vram_zone_id zone) {",
                    "void unified_cache::zone_settle(vram_zone_id zone) {\n    arena_generation_bump();")]),
