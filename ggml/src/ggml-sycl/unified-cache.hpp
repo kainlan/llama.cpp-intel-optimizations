@@ -1553,6 +1553,12 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
+// Deterministic test seam invoked while both expert publication locks are held,
+// after canonical insertion and before direct-mirror insertion. Production
+// callers leave it null.
+using expert_publication_test_hook = void (*)(void * context);
+void unified_cache_set_expert_publication_test_hook(expert_publication_test_hook hook, void * context);
+
 enum class expert_resolve_device_policy : uint8_t {
     ANY            = 0,  // Accept any owning device or allowed host tier
     PREFER_CURRENT = 1,  // Prefer current_device, but do not reject other devices
@@ -2352,12 +2358,7 @@ class unified_cache {
     // entries while in-flight kernels may still reference those addresses.
     // The ONLY safe time is after queue.wait() in ggml_backend_sycl_synchronize()
     // or during prestage yield loops (outside graph_compute_impl).
-    void process_deferred_frees_public() {
-        if (unified_cache_is_graph_compute_active()) {
-            return;  // Kernels in-flight — defer until synchronize()
-        }
-        process_deferred_frees();
-    }
+    void process_deferred_frees_public();
 
     // Check if there are any pending deferred frees (device or host)
     bool has_pending_deferred_frees() const;
@@ -3184,7 +3185,9 @@ class unified_cache {
     static bool event_complete(const sycl::event & evt);
     sycl::event submit_barrier(const std::vector<sycl::event> & deps);
     sycl::event submit_barrier_all();
-    void        process_deferred_frees();
+    // Both helpers require rw_mutex_ exclusively. The public drain acquires it;
+    // internal cache mutations call the locked form to avoid recursive locking.
+    void        process_deferred_frees_locked();
     size_t      finalize_retired_entries_locked();
     void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
     void        enqueue_deferred_free(void * ptr, size_t size);
@@ -3436,9 +3439,15 @@ class unified_cache {
     // Safety margin subtracted from L0-reported free VRAM to avoid driver OOM.
     static constexpr size_t VRAM_SAFETY_MARGIN = 128 * 1024 * 1024;  // 128 MB
 
-    // Deferred frees to avoid releasing buffers while in flight.
+    // Deferred frees to avoid releasing buffers while in flight. The vectors
+    // have their own mutex because enqueue can run outside rw_mutex_. Retired
+    // entry state remains protected by rw_mutex_; the atomic count lets an
+    // ordinary backend synchronize notice final-lease work without touching an
+    // entry or a potentially destroyed cache from mem_handle's destructor.
+    mutable std::mutex                    deferred_frees_mutex_;
     std::vector<deferred_free_entry>      deferred_frees_;
     std::vector<deferred_host_free_entry> deferred_host_frees_;
+    std::atomic<size_t>                   retired_pending_count_{ 0 };
 
     struct inflight_unpin_entry {
         ggml_sycl_cache_id key       = {};

@@ -490,7 +490,79 @@ static bool test_expert_retirement_with_live_lease(sycl::queue & q) {
 }
 
 // =============================================================================
-// Test 6: failed retained publication leaves the caller's ticket active until
+// Test 6: publication and exact retirement linearize under the same joint lock.
+// The hook pauses after canonical insertion but before direct-mirror insertion;
+// retirement must block, then withdraw both views without a mirror ABA.
+// =============================================================================
+static bool test_expert_publication_retirement_linearization(sycl::queue & q) {
+    TEST_BEGIN("expert_publication_retirement_linearization");
+
+    struct hook_state {
+        std::mutex              mutex;
+        std::condition_variable cv;
+        bool                    entered = false;
+        bool                    release = false;
+    } state;
+    auto hook = [](void * opaque) {
+        auto & s = *static_cast<hook_state *>(opaque);
+        std::unique_lock<std::mutex> lock(s.mutex);
+        s.entered = true;
+        s.cv.notify_all();
+        s.cv.wait(lock, [&] { return s.release; });
+    };
+
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    std::vector<uint8_t>     first(4096, 0x31);
+    std::vector<uint8_t>     second(4096, 0x72);
+    const auto key = make_test_cache_id(706, 7, first.size());
+    std::atomic<bool> publish_ok{ false };
+    std::atomic<bool> retire_done{ false };
+    ggml_sycl::expert_retire_status retire_status = ggml_sycl::expert_retire_status::INVALID;
+
+    ggml_sycl::unified_cache_set_expert_publication_test_hook(hook, &state);
+    std::thread publisher([&] {
+        publish_ok.store(cache.register_host_expert(key, first.data(), first.size(), GGML_LAYOUT_AOS),
+                         std::memory_order_release);
+    });
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.cv.wait(lock, [&] { return state.entered; });
+    }
+    std::thread retiree([&] {
+        retire_status = cache.retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-publication-race");
+        retire_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool retirement_blocked_at_joint_lock = !retire_done.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.release = true;
+    }
+    state.cv.notify_all();
+    publisher.join();
+    retiree.join();
+    ggml_sycl::unified_cache_set_expert_publication_test_hook(nullptr, nullptr);
+
+    ggml_sycl::expert_resolve_request request{};
+    request.key              = key;
+    request.requested_layout = GGML_LAYOUT_AOS;
+    TEST_ASSERT(publish_ok.load(std::memory_order_acquire), "host expert publisher failed");
+    TEST_ASSERT(retirement_blocked_at_joint_lock, "retirement crossed a partial publication");
+    TEST_ASSERT(ggml_sycl::expert_retire_succeeded(retire_status), "exact retirement failed");
+    TEST_ASSERT(!cache.resolve_expert(request), "canonical expert remained discoverable after retirement");
+    TEST_ASSERT(cache.lookup_expert(key) == nullptr, "direct mirror ABA survived retirement");
+
+    cache.process_deferred_frees_public();
+    TEST_ASSERT(cache.register_host_expert(key, second.data(), second.size(), GGML_LAYOUT_AOS),
+                "same-key restage did not progress after synchronize/GC");
+    TEST_ASSERT(cache.resolve_expert(request), "restaged expert was not discoverable");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 7: failed retained publication leaves the caller's ticket active until
 // the exact submission queue has drained. A concurrent graph-boundary drain
 // must observe that ticket throughout the failure cleanup window.
 // =============================================================================
@@ -596,6 +668,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_reinsert_after_evict_recovers_lookup(q);
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
     all_passed &= test_expert_retirement_with_live_lease(q);
+    all_passed &= test_expert_publication_retirement_linearization(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");

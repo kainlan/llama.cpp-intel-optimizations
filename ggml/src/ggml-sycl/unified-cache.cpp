@@ -3441,7 +3441,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     // referenced by earlier MUL_MAT_ID kernels — processing frees here
     // causes GPU page faults (DEVICE_LOST).
     if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
+        process_deferred_frees_locked();
     }
 
     // Create key for lookup (identity-only, no layout)
@@ -4267,6 +4267,20 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
 }
 
 static bool moe_direct_trace_enabled();
+static std::atomic<expert_publication_test_hook> g_expert_publication_test_hook{ nullptr };
+static std::atomic<void *> g_expert_publication_test_context{ nullptr };
+
+void unified_cache_set_expert_publication_test_hook(expert_publication_test_hook hook, void * context) {
+    g_expert_publication_test_context.store(context, std::memory_order_release);
+    g_expert_publication_test_hook.store(hook, std::memory_order_release);
+}
+
+static void run_expert_publication_test_hook() {
+    if (auto hook = g_expert_publication_test_hook.load(std::memory_order_acquire)) {
+        hook(g_expert_publication_test_context.load(std::memory_order_acquire));
+    }
+}
+
 static void moe_direct_trace_key(const char *               op,
                                  const ggml_sycl_cache_id & key,
                                  ggml_layout_mode           layout,
@@ -4447,8 +4461,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
 
         std::shared_ptr<mem_handle> direct_handle;
+        std::shared_ptr<mem_handle> replaced_direct_handle;
         {
-            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+            std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+            std::lock(direct_lock, cache_lock);
             unified_cache_key   cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);
             unified_cache_entry entry{};
             entry.device_ptr       = host_ptr;
@@ -4484,20 +4501,25 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                          stored.location == cache_location::DEVICE, &stored);
             }
             id_to_key_[key] = cache_key;
-        }
-        {
-            std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-            weight_entry                        entry{};
-            entry.ptr                   = host_ptr;
-            entry.size                  = src_size;
-            entry.layout                = GGML_LAYOUT_AOS;
-            entry.location              = loc;
-            entry.handle                = std::move(direct_handle);
-            entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
-            direct_expert_entries_[key] = std::move(entry);
+            run_expert_publication_test_hook();
+            weight_entry mirror_entry{};
+            mirror_entry.ptr                 = host_ptr;
+            mirror_entry.size                = src_size;
+            mirror_entry.layout              = GGML_LAYOUT_AOS;
+            mirror_entry.location            = loc;
+            mirror_entry.handle              = std::move(direct_handle);
+            mirror_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+            auto old_direct = direct_expert_entries_.find(key);
+            if (old_direct != direct_expert_entries_.end()) {
+                replaced_direct_handle = std::move(old_direct->second.handle);
+            }
+            direct_expert_entries_[key] = std::move(mirror_entry);
             moe_direct_trace_key("insert-host", key, GGML_LAYOUT_AOS, "zone-full", direct_expert_entries_.size(),
                                  &direct_expert_entries_.find(key)->second);
         }
+        // Lease destruction may trigger diagnostics/callbacks; never run it
+        // while either publication lock is held.
+        replaced_direct_handle.reset();
         result.ptr = host_ptr;
         result.ok  = true;
         return result;
@@ -4575,10 +4597,14 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         last_event = mem_fill_async(dst_handle, src_size, 0, dst_size - src_size, *queue, { fill_event });
     }
 
-    // 4. Store canonical cache entry, then publish the direct mirror.
+    // 4. Publish canonical cache entry and direct mirror as one transaction.
+    // Exact retirement takes the same pair; neither table can win an ABA race.
     std::shared_ptr<mem_handle> direct_handle;
+    std::shared_ptr<mem_handle> replaced_direct_handle;
     {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
         unified_cache_key   cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
         unified_cache_entry entry{};
         entry.device_ptr         = ptr;
@@ -4623,10 +4649,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                                stored.layout, !stored.host_resident, &stored);
         }
         id_to_key_[key] = cache_key;
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        weight_entry                        direct_entry{};
+        run_expert_publication_test_hook();
+        weight_entry direct_entry{};
         direct_entry.ptr             = ptr;
         direct_entry.size            = dst_size;
         direct_entry.layout          = layout;
@@ -4635,10 +4659,15 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         direct_entry.ready_event     = last_event;
         direct_entry.handle              = std::move(direct_handle);
         direct_entry.pending_load_txn_id = load_effect_guard.load_txn_id();
-        direct_expert_entries_[key]      = std::move(direct_entry);
+        auto old_direct = direct_expert_entries_.find(key);
+        if (old_direct != direct_expert_entries_.end()) {
+            replaced_direct_handle = std::move(old_direct->second.handle);
+        }
+        direct_expert_entries_[key] = std::move(direct_entry);
         moe_direct_trace_key("insert-device", key, layout, "", direct_expert_entries_.size(),
                              &direct_expert_entries_.find(key)->second);
     }
+    replaced_direct_handle.reset();
 
     result.ptr   = ptr;
     result.event = last_event;
@@ -4811,9 +4840,13 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         out_handles->reserve(keys.size());
     }
     std::vector<weight_entry> direct_entries;
+    std::vector<std::shared_ptr<mem_handle>> replaced_direct_handles;
     direct_entries.reserve(expert_count);
+    replaced_direct_handles.reserve(expert_count);
     {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
         for (size_t i = 0; i < expert_count; ++i) {
             const ggml_sycl_cache_id & key       = keys[i];
             const unified_cache_key    cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
@@ -4906,16 +4939,19 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             }
             id_to_key_[key] = cache_key;
         }
-    }
-    {
-        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+        run_expert_publication_test_hook();
         for (size_t i = 0; i < expert_count; ++i) {
             const ggml_sycl_cache_id & key = keys[i];
-            direct_expert_entries_[key]    = std::move(direct_entries[i]);
+            auto old_direct = direct_expert_entries_.find(key);
+            if (old_direct != direct_expert_entries_.end() && old_direct->second.handle) {
+                replaced_direct_handles.push_back(std::move(old_direct->second.handle));
+            }
+            direct_expert_entries_[key] = std::move(direct_entries[i]);
             moe_direct_trace_key("insert-device-bulk", key, layout, "", direct_expert_entries_.size(),
                                  &direct_expert_entries_.find(key)->second);
         }
     }
+    replaced_direct_handles.clear();
 
     ptr          = nullptr;
     result.ptr   = allocation_base;
@@ -5495,6 +5531,7 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
             if (!pair.second.retired) {
                 pair.second.retired = true;
                 retired_count++;
+                retired_pending_count_.fetch_add(1, std::memory_order_release);
             }
             remap_or_erase_id_mapping_locked(key, pair.first);
         }
@@ -5652,11 +5689,15 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
     }
 
     std::shared_ptr<mem_handle> direct_handle;
+    std::shared_ptr<mem_handle> replaced_direct_handle;
     bool                        cache_inserted = false;
     {
-        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
-        unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
-        auto                                old = entries_.find(cache_key);
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        unified_cache_key   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        unified_cache_entry cache_entry{};
+        auto                old = entries_.find(cache_key);
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
                 !old->second.retired) {
@@ -5741,18 +5782,21 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
             entries_.erase(cache_key);
             return false;
         }
-    }
 
 publish_host_expert_direct:
+    run_expert_publication_test_hook();
     try {
-        std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        weight_entry                        entry{};
+        weight_entry entry{};
         entry.ptr                   = ptr;
         entry.size                  = size;
         entry.layout                = layout;
         entry.location              = cache_loc;
         entry.handle                = std::move(direct_handle);
-        entry.pending_load_txn_id   = load_effect_guard.load_txn_id();
+        entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+        auto old_direct = direct_expert_entries_.find(key);
+        if (old_direct != direct_expert_entries_.end()) {
+            replaced_direct_handle = std::move(old_direct->second.handle);
+        }
         direct_expert_entries_[key] = std::move(entry);
     } catch (...) {
         if (out_handle) {
@@ -5774,6 +5818,8 @@ publish_host_expert_direct:
         }
         return false;
     }
+    }
+    replaced_direct_handle.reset();
     return true;
 }
 
@@ -6196,7 +6242,7 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
 
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
+        process_deferred_frees_locked();
     }
 
     // Reserve the complete capability before any old-entry destruction or
@@ -7299,7 +7345,7 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
+        process_deferred_frees_locked();
     }
     unified_cache_key key{ type, key_id, layer_id, expert_id };
 
@@ -7803,7 +7849,7 @@ void unified_cache::stop_prefetch_worker() {
 size_t unified_cache::evict(size_t bytes_needed) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
+        process_deferred_frees_locked();
     }
 
     size_t freed = 0;
@@ -7853,7 +7899,7 @@ size_t unified_cache::evict_and_flush(size_t bytes_needed) {
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-            process_deferred_frees();
+            process_deferred_frees_locked();
         }
     }
 
@@ -8467,7 +8513,10 @@ void unified_cache::enqueue_deferred_free(void * ptr, size_t size) {
         entry.has_event = false;
     }
 
-    deferred_frees_.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        deferred_frees_.push_back(entry);
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free: ptr=%p size=%zu\n", ptr, size);
 }
 
@@ -8494,7 +8543,10 @@ void unified_cache::enqueue_deferred_free(const managed_alloc_ref & handle) {
         entry.has_event = false;
     }
 
-    deferred_frees_.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        deferred_frees_.push_back(entry);
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred managed free: ptr=%p size=%zu\n", handle.ptr, handle.size);
 }
 
@@ -8516,7 +8568,10 @@ void unified_cache::enqueue_deferred_free(const managed_alloc_ref & handle, cons
         entry.has_event = false;
     }
 
-    deferred_frees_.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        deferred_frees_.push_back(entry);
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred managed free after event: ptr=%p size=%zu alloc_id=%llu\n", handle.ptr,
                     handle.size, static_cast<unsigned long long>(handle.alloc_id));
 }
@@ -8539,7 +8594,10 @@ void unified_cache::enqueue_deferred_zone_free(vram_zone_id zone, void * ptr, si
         entry.has_event = false;
     }
 
-    deferred_frees_.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        deferred_frees_.push_back(entry);
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred zone free after event: zone=%s ptr=%p size=%zu\n", arena_zone_name(zone),
                     ptr, size);
 }
@@ -8563,7 +8621,10 @@ void unified_cache::enqueue_deferred_host_free(void * ptr, size_t size, const sy
         entry.managed         = true;
     }
 
-    deferred_host_frees_.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        deferred_host_frees_.push_back(entry);
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred host free: ptr=%p managed=%d\n", ptr, entry.managed ? 1 : 0);
 }
 
@@ -8611,23 +8672,28 @@ size_t unified_cache::finalize_retired_entries_locked() {
         return 0;
     }
 
-    {
-        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
-        for (const unified_cache_key & key : finalized) {
-            remap_or_erase_id_mapping_locked(key.id, key);
-            if (key.type == cache_entry_type::MOE_EXPERT) {
-                direct_expert_entries_.erase(key.id);
-            } else if (key.type == cache_entry_type::DENSE_WEIGHT) {
-                direct_weight_entries_.erase(key.id);
-            }
-            entries_.erase(key);
-        }
+    // Exact retirement erased the direct mirror at its joint-lock
+    // linearization point. Finalization therefore needs only rw_mutex_ and
+    // never nests direct_stage_mutex_, avoiding rw->direct inversion.
+    for (const unified_cache_key & key : finalized) {
+        remap_or_erase_id_mapping_locked(key.id, key);
+        entries_.erase(key);
     }
+    const size_t previous = retired_pending_count_.fetch_sub(finalized.size(), std::memory_order_acq_rel);
+    GGML_ASSERT(previous >= finalized.size());
     cache_generation_bump();
     return finalized.size();
 }
 
-void unified_cache::process_deferred_frees() {
+void unified_cache::process_deferred_frees_public() {
+    if (unified_cache_is_graph_compute_active()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    process_deferred_frees_locked();
+}
+
+void unified_cache::process_deferred_frees_locked() {
     // P7: finalize any completed async D2H evictions first.
     // This reclaims VRAM from entries whose D2H copies have completed.
     // NOTE: Use _locked variant — caller already holds rw_mutex_.
@@ -8636,6 +8702,9 @@ void unified_cache::process_deferred_frees() {
     }
     (void) finalize_retired_entries_locked();
 
+    // Enqueue paths do not necessarily hold rw_mutex_, so serialize all vector
+    // iteration/erasure separately. No queue wait is performed while pending.
+    std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
     auto it = deferred_frees_.begin();
     while (it != deferred_frees_.end()) {
         const bool ready = !it->has_event || event_complete(it->event);
@@ -8804,6 +8873,10 @@ void unified_cache::process_deferred_frees() {
 }
 
 bool unified_cache::has_pending_deferred_frees() const {
+    if (retired_pending_count_.load(std::memory_order_acquire) != 0) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
     return !deferred_frees_.empty() || !deferred_host_frees_.empty();
 }
 
@@ -14657,7 +14730,7 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
 
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
+        process_deferred_frees_locked();
     }
 
     unified_cache_key key{ type, key_id, layer_id, expert_id };
