@@ -104,6 +104,15 @@ legacy_cache_re = re.compile(
 )
 raw_snapshot_reader_re = re.compile(r"(?:->|\.)\s*get_placement_plan_snapshot\s*\(")
 raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*\(")
+# Cache snapshot reads return shared_ptr owners, despite the historical "raw
+# snapshot" contract name. Keep the four synchronous roles explicit so a new
+# cache-authority read cannot enter production merely by incrementing a count.
+raw_snapshot_reader_allowlist = (
+    "const auto cached = cache->get_placement_plan_snapshot();",
+    "const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
+    "const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
+    "const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
+)
 # Positive controls prove the census expressions still detect both prohibited
 # reader families rather than passing because of an accidentally-empty regex.
 census_fixture = (
@@ -158,6 +167,14 @@ execution_quarantine_body = re.search(
 execution_complete_body = re.search(
     r"static bool ggml_sycl_execution_release_graph\(.*?^}\n",
     backend, re.S | re.M
+).group(0)
+cache_abort_body = re.search(
+    r"bool unified_cache::note_model_load_abort\(.*?^}\n",
+    cache_cpp, re.S | re.M
+).group(0)
+cache_finalize_retired_body = re.search(
+    r"size_t unified_cache::finalize_retired_entries_locked\(.*?^}\n",
+    cache_cpp, re.S | re.M
 ).group(0)
 backend_destructor_body = re.search(
     r"ggml_backend_sycl_context::~ggml_backend_sycl_context\(\) \{.*?^}\n",
@@ -304,7 +321,10 @@ checks = {
     }
     == {
         "ggml/src/ggml-sycl/common.hpp": 3,
-        "ggml/src/ggml-sycl/expert-prefetch.cpp": 2,
+        # b8bb8562 removed demand_load's raw-pointer return and its second
+        # placement read; hint_locked is now the sole policy reader while
+        # await/is_cached resolve ownership-carrying cache leases.
+        "ggml/src/ggml-sycl/expert-prefetch.cpp": 1,
         "ggml/src/ggml-sycl/ggml-sycl.cpp": 8,
         "ggml/src/ggml-sycl/mmvq.cpp": 1,
         "ggml/src/ggml-sycl/unified-cache.cpp": 14,
@@ -320,7 +340,10 @@ checks = {
         )
     }
     == {
-        "ggml_sycl_cache_plan_owner": 127,
+        # The seven-reader reduction is deliberate: abecb785 removed six
+        # retired prompt-fusion routes and 90a3f2a removed two decode bypasses,
+        # after 75883a6 added one owned host-recipe reader (127 + 1 - 6 - 2).
+        "ggml_sycl_cache_plan_owner": 120,
         "ggml_sycl_global_plan_owner": 16,
         "ggml_sycl_global_plan_snapshot": 8,
         "ggml_sycl_has_global_plan": 26,
@@ -334,7 +357,8 @@ checks = {
         for path, text in placement_sources.items()
         if raw_snapshot_reader_re.search(text)
     }
-    == {"ggml/src/ggml-sycl/ggml-sycl.cpp": 1},
+    == {"ggml/src/ggml-sycl/ggml-sycl.cpp": 4}
+    and all(backend.count(site) == 1 for site in raw_snapshot_reader_allowlist),
     "raw snapshot writer whitelist": len(raw_snapshot_writer_re.findall(placement_production)) == 1,
     "same snapshot cache publication": backend.count("set_placement_plan_snapshot") == 1,
     "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
@@ -691,7 +715,18 @@ checks = {
     "cache-owned preload allocation lifetime": "allocation_released_via_owner" in cache_hpp
     and "ggml_sycl_transfer_alloc_owner" in backend
     and "leased_storage_owner_" in (root / "ggml/src/ggml-sycl/mem-handle.hpp").read_text()
-    and "entry.storage_owner.reset()" in cache_cpp,
+    # Abort first withdraws and destroys direct mirror leases outside both map
+    # locks. Canonical entries are then retired; finalize refuses to erase (and
+    # therefore refuses to drop storage_owner) until every lease is gone and
+    # any ready event is terminal. An eager storage_owner.reset() here would
+    # regress that ordering.
+    and cache_abort_body.index("released.reset();") < cache_abort_body.index("cache_lock(rw_mutex_)")
+    and cache_abort_body.index("transition_to_retired_locked(entry)") < cache_abort_body.index("finalize_retired_entries_locked()")
+    and "entry.storage_owner.reset()" not in cache_abort_body
+    and "entry.in_use_count.load() != 0" in cache_finalize_retired_body
+    and "entry.ready_event.get_info<sycl::info::event::command_execution_status>()" in cache_finalize_retired_body
+    and "if (!complete)" in cache_finalize_retired_body
+    and "erase_entry_locked(it)" in cache_finalize_retired_body,
     "abort removes exact pending cache ownership": "direct_expert_entries_.erase(it)" in cache_cpp
     and "direct_weight_entries_.erase(it)" in cache_cpp
     and "entry.owner_mask != 0" in cache_cpp
