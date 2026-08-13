@@ -6995,7 +6995,8 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
     int64_t             layout_row_low = 0;
 
     layout_mode chosen      = GGML_LAYOUT_AOS;
-    auto        resolved_lc = ggml_sycl_resolve(src0, device_id);
+    auto                    resolved_lc = ggml_sycl_resolve(src0, device_id);
+    ggml_sycl::resolved_ptr dispatch_resolved = resolved_lc;
     if (resolved_lc) {
         chosen = static_cast<layout_mode>(resolved_lc.layout);
     }
@@ -7033,8 +7034,9 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
         storage       = get_storage_tensor(src0);
         auto resolved = ggml_sycl_resolve(storage, device_id);
         if (resolved && (resolved.layout == GGML_LAYOUT_SOA || resolved.layout == GGML_LAYOUT_COALESCED)) {
-            layout      = resolved.layout;
-            layout_base = resolved.ptr;
+            layout            = resolved.layout;
+            layout_base       = resolved.ptr;
+            dispatch_resolved = resolved;
             mode        = (layout == GGML_LAYOUT_SOA) ? reorder_mode::SOA : reorder_mode::COALESCED;
             layout_rows = storage->ne[1];
             if (src0->view_src != nullptr) {
@@ -7182,36 +7184,39 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
         return;
     }
 
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ dispatch_resolved });
+    auto commit_terminal = [&]() {
+        retention.mark_submitted(*stream);
+        retention.commit(ggml_sycl_submit_marker<ggml_sycl_mmq_marker_kernel>(*stream));
+    };
+
     if (dispatch_layout == GGML_LAYOUT_AOS && src0->type == GGML_TYPE_Q4_0 && mmq_esimd_enabled() &&
         mmq_esimd_available()) {
         const int esimd_ver = mmq_esimd_version();
+        bool esimd_launched = false;
         if (esimd_ver == 3) {
-            bool esimd_launched = launch_mmq_q4_0_esimd_v3(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
-                                                           reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
-                                                           row_diff, src1_ncols, ne00, nrows_dst, *stream);
-            if (esimd_launched) {
-                return;
-            }
+            esimd_launched = launch_mmq_q4_0_esimd_v3(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
+                                                       reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
+                                                       row_diff, src1_ncols, ne00, nrows_dst, *stream);
         } else if (esimd_ver == 2) {
-            bool esimd_launched = launch_mmq_q4_0_esimd_v2(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
-                                                           reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
-                                                           row_diff, src1_ncols, ne00, nrows_dst, *stream);
-            if (esimd_launched) {
-                return;
-            }
+            esimd_launched = launch_mmq_q4_0_esimd_v2(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
+                                                       reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
+                                                       row_diff, src1_ncols, ne00, nrows_dst, *stream);
         } else {
-            bool esimd_launched = launch_mmq_q4_0_esimd(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
-                                                        reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
-                                                        row_diff, src1_ncols, ne00, nrows_dst, *stream);
-            if (esimd_launched) {
-                return;
-            }
+            esimd_launched = launch_mmq_q4_0_esimd(reinterpret_cast<const block_q4_0 *>(src0_dd_i),
+                                                    reinterpret_cast<const block_q8_1 *>(src1_ddq_i), dst_dd_i,
+                                                    row_diff, src1_ncols, ne00, nrows_dst, *stream);
+        }
+        if (esimd_launched) {
+            commit_terminal();
+            return;
         }
     }
 
     ggml_sycl_mmq_dispatch(src0, dispatch_ptr, dispatch_base, dispatch_layout, device_id, ne00, build_rows, ne10,
                            row_low, row_high, src1_ncols, src1_padded_row_size, src1_ddq_i, dst_dd_i, nrows_dst,
                            layout_row_low, stream);
+    commit_terminal();
 
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);

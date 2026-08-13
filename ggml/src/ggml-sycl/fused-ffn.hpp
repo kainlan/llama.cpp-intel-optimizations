@@ -354,6 +354,9 @@ static bool try_fused_ffn_gate_up_swiglu(
     const void * up_data   = up_resolved.ptr;
     float * dst_data = (float *) ggml_sycl_get_data_ptr(dst, device);
 
+    // Reserve/copy resolved authority before any asynchronous submit.
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ gate_resolved, up_resolved });
+
     // Use multi-row kernel by default (better GPU utilization via SLM caching)
     // Falls back to single-row kernel if GGML_SYCL_FFN_SINGLE_ROW=1
     static bool use_single_row = getenv("GGML_SYCL_FFN_SINGLE_ROW") != nullptr;
@@ -368,8 +371,9 @@ static bool try_fused_ffn_gate_up_swiglu(
             gate_data, up_data, input_q8, dst_data, ncols_in, nrows_out, batch_size, stream);
     }
 
+    retention.mark_submitted(*stream);
     sycl::event done = ggml_sycl_submit_marker<class ggml_sycl_fused_ffn_terminal_kernel>(*stream);
-    ggml_sycl::record_terminal_retention(std::move(done), { gate_resolved, up_resolved });
+    retention.commit(std::move(done));
     return true;
 }
 

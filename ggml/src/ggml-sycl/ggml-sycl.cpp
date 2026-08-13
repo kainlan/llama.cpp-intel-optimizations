@@ -1971,7 +1971,8 @@ static void pp_dequant_bench_dump_and_reset(const char * reason) {
 // ============================================================================
 
 struct pp_pipeline_entry {
-    const void *   src0_data                   = nullptr;  // Host-pinned weight pointer
+    const void *             src0_data = nullptr;  // Alias into src0_resolved; never owned raw-only.
+    ggml_sycl::resolved_ptr  src0_resolved{};      // Retains resolved authority through pipeline terminal.
     to_fp16_sycl_t dequant_fn                  = nullptr;  // Dequant function for this weight type
     int64_t        n_elems                     = 0;        // N * K elements to dequant
     size_t         weight_bytes                = 0;        // n_elems * sizeof(half)
@@ -72891,13 +72892,12 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
         return reject("null-ptr");
     }
 
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ resolved });
     split_merge_drain();
     ggml_sycl_router_f32_bias_argsort_sycl(*ctx.stream(), weight_ptr, act_ptr, bias_ptr, probs_ptr, sort_ptr,
                                            static_cast<int>(n_expert), static_cast<int>(k_dim), local_size);
-    // The router launcher does not return an event. Publish the cache fallback
-    // authority against a queue marker after its terminal submission.
-    ggml_sycl::record_terminal_retention(
-        ggml_sycl_submit_marker<class ggml_sycl_router_fusion_terminal_kernel>(*ctx.stream()), { resolved });
+    retention.mark_submitted(*ctx.stream());
+    retention.commit(ggml_sycl_submit_marker<class ggml_sycl_router_fusion_terminal_kernel>(*ctx.stream()));
     if (extra_skip_nodes) {
         *extra_skip_nodes = skip;
     }
@@ -72996,6 +72996,7 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
         ggml_sycl_mmvq_fused_add{ addend_ptr, addend->ne[0], addend->nb[0] > 0 ? addend->nb[0] : sizeof(float) });
     fused_add_scope clear_fused_add;
 
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ resolved });
     bool submitted = false;
     if (has_soa_reorder || has_reorder) {
         submitted = ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(
@@ -73005,8 +73006,8 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
             ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, GGML_LAYOUT_AOS);
     }
     if (submitted) {
-        ggml_sycl::record_terminal_retention(
-            ggml_sycl_submit_marker<class ggml_sycl_tg_mul_mat_add_terminal_kernel>(*ctx.stream()), { resolved });
+        retention.mark_submitted(*ctx.stream());
+        retention.commit(ggml_sycl_submit_marker<class ggml_sycl_tg_mul_mat_add_terminal_kernel>(*ctx.stream()));
     }
     return submitted;
 }
@@ -78529,8 +78530,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const size_t  wt_bytes = static_cast<size_t>(n_elems) * sizeof(sycl::half);
 
             pp_pipeline_entry entry;
-            entry.src0_data    = resolved.ptr;
-            entry.dequant_fn   = dequant_fn;
+            entry.src0_resolved = resolved;
+            entry.src0_data     = entry.src0_resolved.ptr;
+            entry.dequant_fn    = dequant_fn;
             entry.n_elems      = n_elems;
             entry.weight_bytes = wt_bytes;
             entry.type         = src0->type;

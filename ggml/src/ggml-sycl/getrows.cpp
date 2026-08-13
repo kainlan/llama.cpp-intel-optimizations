@@ -200,7 +200,7 @@ static bool ggml_sycl_get_rows_alloc_host_stage(size_t                  bytes,
 
 template <typename T> struct ggml_sycl_get_rows_device_temp {
     ggml_sycl::mem_handle                     handle{};
-    ggml_sycl::retained_handle_publish_ticket publish_ticket{};
+    ggml_sycl::terminal_retention_ticket       retention_ticket{};
     T *                                       ptr    = nullptr;
     sycl::queue *                             queue  = nullptr;
     int                                       device = -1;
@@ -242,8 +242,8 @@ template <typename T> struct ggml_sycl_get_rows_device_temp {
             return nullptr;
         }
 
-        publish_ticket = ggml_sycl::begin_retained_handle_publish();
-        ptr            = static_cast<T *>(resolved.ptr);
+        retention_ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { handle });
+        ptr              = static_cast<T *>(resolved.ptr);
         queue          = &q;
         device         = target;
         return ptr;
@@ -257,13 +257,12 @@ template <typename T> struct ggml_sycl_get_rows_device_temp {
             return;
         }
 
-        auto ticket = std::move(publish_ticket);
+        auto ticket = std::move(retention_ticket);
         if (queue) {
             try {
+                ticket.mark_submitted(*queue);
                 sycl::event done = ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(*queue);
-                std::vector<ggml_sycl::mem_handle> retained;
-                retained.push_back(std::move(handle));
-                ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done), std::move(ticket));
+                ticket.commit(std::move(done));
             } catch (...) {
                 try {
                     queue->wait_and_throw();
@@ -491,7 +490,7 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
                                              const ggml_tensor *                      src1,
                                              const int32_t *                          src,
                                              ggml_sycl::mem_handle &                  out_handle,
-                                             ggml_sycl::retained_handle_publish_ticket & out_publish_ticket,
+                                             ggml_sycl::terminal_retention_ticket & out_publish_ticket,
                                              const int32_t *&                         out_device_ptr) {
     out_handle         = {};
     out_publish_ticket = {};
@@ -512,7 +511,7 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
     if (ggml_sycl_graph_recording_active() && src1 && src1->name && src1->name[0] != '\0') {
         void * staged_ptr = nullptr;
         if (ctx.graph_input_stage_lookup(src1->name, bytes, ctx.device, &out_handle, &staged_ptr) && staged_ptr) {
-            out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+            out_publish_ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { out_handle });
             out_device_ptr     = static_cast<const int32_t *>(staged_ptr);
             if (ggml_sycl_get_rows_trace_enabled()) {
                 GGML_LOG_INFO("[GET_ROWS] using pre-staged graph input indices: tensor=%s bytes=%zu dst=%p\n",
@@ -542,7 +541,7 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
             return false;
         }
         std::memcpy(host_resolved.ptr, src, bytes);
-        out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+        out_publish_ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { host_handle });
         out_device_ptr     = static_cast<const int32_t *>(host_resolved.ptr);
         out_handle         = std::move(host_handle);
         if (ggml_sycl_get_rows_trace_enabled()) {
@@ -596,7 +595,7 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
     sycl::event copy_event = ggml_sycl::mem_copy_async(handle, host_stage_handle, bytes, *ctx.stream());
     copy_event.wait_and_throw();
 
-    out_publish_ticket = ggml_sycl::begin_retained_handle_publish();
+    out_publish_ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { handle });
     out_device_ptr     = static_cast<const int32_t *>(r.ptr);
     out_handle         = std::move(handle);
     if (ggml_sycl_get_rows_trace_enabled()) {
@@ -2790,7 +2789,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     }
 
     ggml_sycl::mem_handle                     staged_indices_handle;
-    ggml_sycl::retained_handle_publish_ticket staged_indices_publish_ticket;
+    ggml_sycl::terminal_retention_ticket       staged_indices_publish_ticket;
     const int32_t *                           staged_src1_i32 = src1_i32;
     const sycl::usm::alloc index_alloc =
         src1_i32 ? ggml_sycl_get_alloc_type(const_cast<int32_t *>(src1_i32)) : sycl::usm::alloc::unknown;
@@ -2912,12 +2911,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     }
 
     if (staged_indices_handle.valid()) {
+        staged_indices_publish_ticket.mark_submitted(*ctx.stream());
         sycl::event done = ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
             *ctx.stream(), {}, "sycl.get_rows.marker", "role=get_rows;kind=marker;path=indices_release");
-        std::vector<ggml_sycl::mem_handle> retained;
-        retained.push_back(std::move(staged_indices_handle));
-        ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done),
-                                              std::move(staged_indices_publish_ticket));
+        staged_indices_publish_ticket.commit(std::move(done));
     }
 
     // DEBUG: Check output after kernel for token embedding batch=1

@@ -670,6 +670,46 @@ class retained_handle_publish_ticket {
 // either publishes into retain_handles_until_event() or unwinds.
 retained_handle_publish_ticket begin_retained_handle_publish();
 
+// Transactional resolve-to-terminal handoff. Authority is copied and publication
+// capacity is reserved before submission. A submitted ticket owns its handles
+// until commit reaches the exact event (or the per-recording sink captured by
+// prepare). If commit fails, the exact submission queue is drained before the
+// owners are released.
+class terminal_retention_ticket {
+  public:
+    enum class state : uint8_t { EMPTY, PREPARED, SUBMITTED, COMMITTED, DRAINED };
+
+    terminal_retention_ticket() = default;
+    terminal_retention_ticket(terminal_retention_ticket &&) noexcept;
+    terminal_retention_ticket & operator=(terminal_retention_ticket &&) noexcept;
+    terminal_retention_ticket(const terminal_retention_ticket &)             = delete;
+    terminal_retention_ticket & operator=(const terminal_retention_ticket &) = delete;
+    ~terminal_retention_ticket() noexcept;
+
+    static terminal_retention_ticket prepare(std::initializer_list<resolved_ptr> resolved,
+                                             std::vector<mem_handle> owners = {});
+
+    // Call immediately after the async submit returns, before marker/profiling
+    // work that can throw. The queue must outlive commit/the ticket.
+    void mark_submitted(sycl::queue & queue) noexcept;
+    void commit(sycl::event terminal_event);
+    state current_state() const noexcept { return state_; }
+    size_t owner_count() const noexcept { return owners_.size(); }
+
+  private:
+    void drain_submitted_noexcept() noexcept;
+
+    state                            state_ = state::EMPTY;
+    std::vector<mem_handle>          owners_;
+    // Prepared publication copies; owners_ remains the failure-cleanup escrow.
+    std::vector<mem_handle>          publication_;
+    retained_handle_publish_ticket  publisher_;
+    sycl::queue *                    queue_ = nullptr;
+    // Non-null only while recording. Capturing this at prepare time makes
+    // publication attempt/epoch scoped rather than context-global.
+    std::vector<mem_handle> *        graph_sink_ = nullptr;
+};
+
 // Keep handle leases alive until submitted SYCL work completes.  This bridges
 // the gap between C++ handle lifetime and asynchronous queue lifetime: callers
 // may pass temporary handles to a queue operation, then release their local

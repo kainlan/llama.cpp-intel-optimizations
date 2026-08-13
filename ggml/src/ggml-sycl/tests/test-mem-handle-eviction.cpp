@@ -729,7 +729,32 @@ static bool test_retired_status_query_failure_is_deferred(sycl::queue & q) {
 }
 
 // =============================================================================
-// Test 10: failed retained publication leaves the caller's ticket active until
+// Test 10: terminal ticket state transitions commit exact event authority.
+// =============================================================================
+static bool test_terminal_retention_ticket_state_machine(sycl::queue & q) {
+    TEST_BEGIN("terminal_retention_ticket_state_machine");
+
+    int marker = 0;
+    auto owner = ggml_sycl::mem_handle::from_direct(&marker, GGML_LAYOUT_AOS, false);
+    auto ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { owner });
+    TEST_ASSERT(ticket.current_state() == ggml_sycl::terminal_retention_ticket::state::PREPARED,
+                "ticket did not enter PREPARED");
+    TEST_ASSERT(ticket.owner_count() == 1, "ticket did not escrow owner before submit");
+    sycl::event terminal = q.submit([&](sycl::handler & cgh) { cgh.host_task([]() {}); });
+    ticket.mark_submitted(q);
+    TEST_ASSERT(ticket.current_state() == ggml_sycl::terminal_retention_ticket::state::SUBMITTED,
+                "ticket did not enter SUBMITTED");
+    ticket.commit(terminal);
+    TEST_ASSERT(ticket.current_state() == ggml_sycl::terminal_retention_ticket::state::COMMITTED,
+                "ticket did not enter COMMITTED");
+    TEST_ASSERT(ggml_sycl::drain_retained_handles(true, 1000), "committed terminal did not drain");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 11: failed retained publication leaves the caller's ticket active until
 // the exact submission queue has drained. A concurrent graph-boundary drain
 // must observe that ticket throughout the failure cleanup window.
 // =============================================================================
@@ -859,6 +884,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_device_publication_fault_phases(q);
     all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
+    all_passed &= test_terminal_retention_ticket_state_machine(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");

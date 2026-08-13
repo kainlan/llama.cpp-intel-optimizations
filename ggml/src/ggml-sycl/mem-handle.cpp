@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -1799,6 +1800,101 @@ retained_handle_publish_ticket begin_retained_handle_publish() {
     std::lock_guard<std::mutex> lock(state.mutex);
     ++state.publishers;
     return retained_handle_publish_ticket(true);
+}
+
+terminal_retention_ticket terminal_retention_ticket::prepare(std::initializer_list<resolved_ptr> resolved,
+                                                               std::vector<mem_handle> owners) {
+    size_t count = owners.size();
+    for (const auto & ptr : resolved) count += ptr.retention ? 1 : 0;
+    owners.reserve(count);
+    for (const auto & ptr : resolved) {
+        if (ptr.retention) owners.push_back(*ptr.retention);
+    }
+
+    terminal_retention_ticket ticket;
+    ticket.owners_     = std::move(owners);
+    ticket.publication_ = ticket.owners_; // failure-cleanup escrow remains independently owned
+    ticket.graph_sink_ = g_graph_retained_handle_sink;
+    if (ticket.graph_sink_) {
+        // The later move-insert is allocation-free for this recording attempt.
+        ticket.graph_sink_->reserve(ticket.graph_sink_->size() + ticket.publication_.size());
+    }
+    if (!ticket.publication_.empty()) ticket.publisher_ = begin_retained_handle_publish();
+    ticket.state_ = state::PREPARED;
+    return ticket;
+}
+
+terminal_retention_ticket::terminal_retention_ticket(terminal_retention_ticket && other) noexcept :
+    state_(std::exchange(other.state_, state::EMPTY)), owners_(std::move(other.owners_)),
+    publication_(std::move(other.publication_)), publisher_(std::move(other.publisher_)),
+    queue_(std::exchange(other.queue_, nullptr)), graph_sink_(std::exchange(other.graph_sink_, nullptr)) {}
+
+terminal_retention_ticket & terminal_retention_ticket::operator=(terminal_retention_ticket && other) noexcept {
+    if (this != &other) {
+        if (state_ == state::SUBMITTED) drain_submitted_noexcept();
+        state_       = std::exchange(other.state_, state::EMPTY);
+        owners_      = std::move(other.owners_);
+        publication_ = std::move(other.publication_);
+        publisher_   = std::move(other.publisher_);
+        queue_       = std::exchange(other.queue_, nullptr);
+        graph_sink_  = std::exchange(other.graph_sink_, nullptr);
+    }
+    return *this;
+}
+
+terminal_retention_ticket::~terminal_retention_ticket() noexcept {
+    if (state_ == state::SUBMITTED) drain_submitted_noexcept();
+}
+
+void terminal_retention_ticket::mark_submitted(sycl::queue & queue) noexcept {
+    GGML_ASSERT(state_ == state::PREPARED);
+    queue_ = &queue;
+    state_ = state::SUBMITTED;
+}
+
+void terminal_retention_ticket::drain_submitted_noexcept() noexcept {
+    if (state_ != state::SUBMITTED) return;
+    if (queue_ && !graph_sink_) {
+        try { queue_->wait_and_throw(); } catch (...) {}
+    }
+    publication_.clear();
+    owners_.clear();
+    publisher_ = {};
+    state_ = state::DRAINED;
+}
+
+void terminal_retention_ticket::commit(sycl::event terminal_event) {
+    GGML_ASSERT(state_ == state::SUBMITTED);
+    try {
+#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
+        if (g_fail_next_retained_handle_publication.exchange(false, std::memory_order_acq_rel)) {
+            throw std::bad_alloc();
+        }
+#endif
+        if (graph_sink_) {
+            if (g_graph_retained_handle_sink != graph_sink_) {
+                throw std::runtime_error("terminal retention graph epoch changed before commit");
+            }
+            graph_sink_->insert(graph_sink_->end(), std::make_move_iterator(publication_.begin()),
+                                std::make_move_iterator(publication_.end()));
+            publication_.clear();
+            publisher_ = {};
+        } else if (!publication_.empty()) {
+            // The private failpoint was consumed above; use the transactional
+            // publisher while owners_ remains the failure escrow.
+            retain_handles_until_event_transactional(std::move(publication_), terminal_event, publisher_);
+        }
+        owners_.clear();
+        queue_ = nullptr;
+        state_ = state::COMMITTED;
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        if (!graph_sink_) {
+            try { terminal_event.wait_and_throw(); } catch (...) {}
+        }
+        drain_submitted_noexcept();
+        std::rethrow_exception(failure);
+    }
 }
 
 retained_handle_publish_ticket::retained_handle_publish_ticket(retained_handle_publish_ticket && other) noexcept :

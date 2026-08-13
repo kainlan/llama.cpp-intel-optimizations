@@ -22583,9 +22583,12 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
     if (mmvq_inner_timing) {
         mmvq_inner_dispatch_t0 = std::chrono::steady_clock::now();
     }
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ resolved });
     ggml_sycl_mmvq_dispatch(src0, dispatch_ptr, dispatch_base, mmvq_mode, device_id, ne00, ne01, ne10, row_low,
                             row_high, src1_ncols, src1_padded_col_size, src1_ddq_i, dst_dd_i, dst_row_stride, stream,
                             fused_add.active() ? fused_add.data : nullptr, fused_add.ne0, fused_add.nb0, row_low);
+    retention.mark_submitted(*stream);
+    retention.commit(ggml_sycl_submit_marker<ggml_sycl_mmvq_marker_kernel>(*stream));
     if (mmvq_inner_timing) {
         stream->wait();
         const auto   mmvq_inner_t1 = std::chrono::steady_clock::now();

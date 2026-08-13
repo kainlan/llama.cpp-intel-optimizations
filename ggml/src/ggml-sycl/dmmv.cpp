@@ -3661,10 +3661,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
 
     ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src0->extra;
     layout_mode             mode  = GGML_LAYOUT_AOS;
-    {
-        auto resolved_lc = ggml_sycl_resolve(src0, device_id);
-        mode = resolved_lc ? static_cast<layout_mode>(resolved_lc.layout) : get_effective_layout_mode(extra);
-    }
+    auto dispatch_resolved = ggml_sycl_resolve(src0, device_id);
+    mode = dispatch_resolved ? static_cast<layout_mode>(dispatch_resolved.layout) : get_effective_layout_mode(extra);
 
     if (src0->type == GGML_TYPE_Q4_0) {
         static int q4_0_dispatch_count = 0;
@@ -3711,6 +3709,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
             layout                  = resolved.layout;
             layout_rows             = ggml_nrows(storage);
             layout_base             = resolved.ptr;
+            dispatch_resolved       = resolved;
             int64_t view_row_offset = 0;
             if (src0->view_src != nullptr) {
                 view_row_offset = src0->view_offs / src0->nb[1];
@@ -3800,20 +3799,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         if (!cache) {
             GGML_ABORT("DMMV streaming requires unified cache");
         }
-        auto retain_dmmv_temps_until = [&](sycl::event done) {
-            std::vector<ggml_sycl::mem_handle> retained;
-            if (src1_dfloat_owner.valid()) {
-                retained.push_back(std::move(src1_dfloat_owner));
-            }
-            if (!retained.empty()) {
-                ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
-            }
-        };
-        auto retain_dmmv_temps = [&]() {
-            if (src1_dfloat_owner.valid()) {
-                retain_dmmv_temps_until(ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream));
-            }
-        };
+        std::vector<ggml_sycl::mem_handle> dmmv_owners;
+        if (src1_dfloat_owner.valid()) dmmv_owners.push_back(std::move(src1_dfloat_owner));
+        auto retention = ggml_sycl::terminal_retention_ticket::prepare({ dispatch_resolved }, std::move(dmmv_owners));
         size_t slice_bytes  = 0;
         size_t buffer_count = 0;
         dmmv_resolve_dma_params(stream_ctx.row_total_bytes, slice_bytes, buffer_count);
@@ -3829,6 +3817,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         auto result = cache->stream_dma(view, total_bytes, slice_bytes, buffer_count, dmmv_stream_slice, &stream_ctx,
                                         {}, custom_copy ? dmmv_stream_copy : nullptr);
         if (result.ok) {
+            retention.mark_submitted(*stream);
             std::vector<sycl::event> done_deps{ result.event };
             result.event = ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream, done_deps);
         }
@@ -3844,7 +3833,6 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
                 GGML_LOG_WARN("[DMMV] DMA from mmap failed, falling back to CPU (%s)\n",
                               src0->name ? src0->name : "unknown");
                 if (ggml_sycl_cpu_fallback_graph(ctx, dst, "dmmv streaming")) {
-                    retain_dmmv_temps();
                     return;
                 }
             }
@@ -3855,7 +3843,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         GGML_UNUSED(src1_ncols);
         GGML_UNUSED(src1_padded_row_size);
         GGML_UNUSED(ctx);
-        retain_dmmv_temps_until(result.event);
+        retention.commit(result.event);
         return;
     }
 
@@ -3890,22 +3878,16 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         }
     }
 
+    std::vector<ggml_sycl::mem_handle> dmmv_owners;
+    if (src1_dfloat_owner.valid()) dmmv_owners.push_back(std::move(src1_dfloat_owner));
+    if (src1_q8_owner.valid()) dmmv_owners.push_back(std::move(src1_q8_owner));
+    auto retention = ggml_sycl::terminal_retention_ticket::prepare({ dispatch_resolved }, std::move(dmmv_owners));
     ggml_sycl_dmmv_dispatch(src0, dispatch_ptr, dispatch_base, dispatch_layout, src1_q8, src1_dfloat, src1_ddf_i,
                             dst_dd_i, row_low, row_high, layout_rows, layout_row_low, stream,
                             dmmv_deps.empty() ? nullptr : &dmmv_deps);
-    {
-        std::vector<ggml_sycl::mem_handle> retained;
-        if (src1_dfloat_owner.valid()) {
-            retained.push_back(std::move(src1_dfloat_owner));
-        }
-        if (src1_q8_owner.valid()) {
-            retained.push_back(std::move(src1_q8_owner));
-        }
-        if (!retained.empty()) {
-            sycl::event done = ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream);
-            ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
-        }
-    }
+    retention.mark_submitted(*stream);
+    sycl::event done = ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream);
+    retention.commit(std::move(done));
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddq_i);
