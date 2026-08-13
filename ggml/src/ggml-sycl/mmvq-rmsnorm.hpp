@@ -296,6 +296,7 @@ static void mul_mat_vec_q4_0_f32_rmsnorm_sycl(
     ggml_sycl::mem_fill(dst_handle, 0, nrows * batch_size * sizeof(float), *stream);
 }
 
+template <typename SubmittedFn>
 static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
     const void * vx,
     const float * f32_input,
@@ -305,7 +306,8 @@ static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
     const int ncols,
     const int nrows,
     const int batch_size,
-    dpct::queue_ptr stream
+    dpct::queue_ptr stream,
+    SubmittedFn && on_submitted
 ) {
     GGML_ASSERT(ncols % QK8_0 == 0);
 
@@ -347,6 +349,10 @@ static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
                 }
             );
         });
+        // The callback runs only after submit returned successfully. Marking
+        // after every batch is intentional: terminal_retention_ticket makes it
+        // idempotent, while a later batch throw leaves the first submit owned.
+        on_submitted();
     }
 }
 
@@ -421,7 +427,8 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q8_0_f32_rmsnorm_sycl(
                 W_data, f32_input, gamma_data, scales_buf,
-                dst_data, ncols, nrows, batch_size, stream
+                dst_data, ncols, nrows, batch_size, stream,
+                [&] { terminal_ticket.mark_submitted(*stream); }
             );
             break;
         default:

@@ -10,11 +10,15 @@
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <sycl/sycl.hpp>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -609,6 +613,115 @@ static bool test_stream_dma_mmap_fail(sycl::queue & q) {
     return true;
 }
 
+struct dma_later_failure_fixture {
+    std::atomic<int>  submit_count{ 0 };
+    std::atomic<bool> release_first_slot{ false };
+    std::atomic<bool> failure_reached{ false };
+};
+
+class stream_dma_fixture_copy_kernel;
+
+static sycl::event stream_dma_fixture_submit(sycl::queue &                    q,
+                                             void *,
+                                             size_t,
+                                             size_t,
+                                             const void *,
+                                             size_t,
+                                             const void *                     opaque,
+                                             const std::vector<sycl::event> & deps) {
+    auto * fixture = const_cast<dma_later_failure_fixture *>(
+        static_cast<const dma_later_failure_fixture *>(opaque));
+    const int nth = fixture->submit_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (nth == 5) {
+        fixture->failure_reached.store(true, std::memory_order_release);
+        throw std::runtime_error("fixture fifth submit failure");
+    }
+    return q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(deps);
+        cgh.single_task<stream_dma_fixture_copy_kernel>([]() {});
+    });
+}
+
+class stream_dma_fixture_slice_kernel;
+
+static sycl::event stream_dma_fixture_slice(sycl::queue &                    q,
+                                            void *,
+                                            size_t,
+                                            size_t,
+                                            const void *                     opaque,
+                                            const std::vector<sycl::event> & deps) {
+    auto * fixture = const_cast<dma_later_failure_fixture *>(
+        static_cast<const dma_later_failure_fixture *>(opaque));
+    const int nth = fixture->submit_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (nth == 5) {
+        fixture->failure_reached.store(true, std::memory_order_release);
+        throw std::runtime_error("fixture fifth submit failure");
+    }
+    const bool block_first_slot = nth == 2;
+    return q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(deps);
+        cgh.host_task([fixture, block_first_slot]() {
+            while (block_first_slot && !fixture->release_first_slot.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+    });
+}
+
+static bool test_stream_dma_later_failure_drains_all_ooo_slots(sycl::queue & q) {
+    printf("\n=== Test: stream_dma later failure drains every OOO slot ===\n");
+
+    // No in_order property: slot 1 can finish while slot 0 remains blocked.
+    sycl::queue dma_q(q.get_context(), q.get_device());
+    ggml_sycl::unified_cache cache(dma_q, 1024 * 1024);
+    std::vector<uint8_t> data(192, 0x6b);
+    ggml_sycl::cache_ptr_view view{};
+    view.ptr      = data.data();
+    view.size     = data.size();
+    view.layout   = GGML_LAYOUT_AOS;
+    view.type     = ggml_sycl::cache_entry_type::DENSE_WEIGHT;
+    view.location = ggml_sycl::cache_location::HOST_PINNED;
+
+    dma_later_failure_fixture fixture;
+    std::atomic<bool> returned{ false };
+    ggml_sycl::unified_cache::dma_stream_result result{};
+    std::thread worker([&] {
+        result = cache.stream_dma(view, data.size(), 64, 3, stream_dma_fixture_slice, &fixture, {},
+                                  stream_dma_fixture_submit);
+        returned.store(true, std::memory_order_release);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!fixture.failure_reached.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!fixture.failure_reached.load(std::memory_order_acquire)) {
+        fixture.release_first_slot.store(true, std::memory_order_release);
+        worker.join();
+        fprintf(stderr, "DMA fifth-submit failpoint was not reached\n");
+        return false;
+    }
+
+    // The old latest-event-only cleanup returns here because slot 1 is already
+    // terminal. Exact queue draining cannot return until slot 0 is released.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const bool returned_before_release = returned.load(std::memory_order_acquire);
+    fixture.release_first_slot.store(true, std::memory_order_release);
+    worker.join();
+
+    if (returned_before_release) {
+        fprintf(stderr, "Partial DMA failure returned while an earlier OOO slot was still live\n");
+        return false;
+    }
+    if (result.ok || !result.submitted || fixture.submit_count.load() != 5) {
+        fprintf(stderr, "Unexpected later-failure state (ok=%d submitted=%d submits=%d)\n",
+                result.ok ? 1 : 0, result.submitted ? 1 : 0, fixture.submit_count.load());
+        return false;
+    }
+    return true;
+}
+
 static bool test_all_pinned_eviction_failure_new_entry(sycl::queue & q) {
     printf("\n=== Test: all-pinned eviction failure on new entry ===\n");
 
@@ -999,6 +1112,7 @@ int main() {
     ok &= test_planned_materialization_guard(q);
     ok &= test_graph_pins_host_weights();
     ok &= test_stream_dma_mmap_fail(q);
+    ok &= test_stream_dma_later_failure_drains_all_ooo_slots(q);
     ok &= test_all_pinned_eviction_failure_new_entry(q);
     ok &= test_partial_eviction_insufficient(q);
     ok &= test_allocation_failure_new_entry(q);

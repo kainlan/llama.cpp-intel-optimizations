@@ -49,6 +49,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -797,6 +798,58 @@ static bool test_terminal_retention_ticket_state_machine(sycl::queue & q) {
     return true;
 }
 
+static bool test_mmvq_rmsnorm_second_batch_failure_drains_first(sycl::queue & q) {
+    TEST_BEGIN("mmvq_rmsnorm_second_batch_failure_drains_first");
+
+    std::atomic<bool> release_first{ false };
+    std::atomic<bool> first_submitted{ false };
+    std::atomic<bool> returned{ false };
+    std::atomic<bool> caught_second_failure{ false };
+    int marker = 0;
+
+    std::thread worker([&] {
+        try {
+            auto ticket = ggml_sycl::terminal_retention_ticket::prepare(
+                {}, { ggml_sycl::mem_handle::from_direct(&marker, GGML_LAYOUT_AOS, false) });
+            for (int batch = 0; batch < 2; ++batch) {
+                if (batch == 1) throw std::runtime_error("fixture second-batch submit failure");
+                q.submit([&](sycl::handler & cgh) {
+                    cgh.host_task([&] {
+                        while (!release_first.load(std::memory_order_acquire)) std::this_thread::yield();
+                    });
+                });
+                // Mirrors the Q8 RMSNorm callback: it runs immediately after a
+                // successful batch submit and is safe to call for every batch.
+                ticket.mark_submitted(q);
+                first_submitted.store(true, std::memory_order_release);
+            }
+        } catch (const std::runtime_error &) {
+            caught_second_failure.store(true, std::memory_order_release);
+        }
+        returned.store(true, std::memory_order_release);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!first_submitted.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!first_submitted.load(std::memory_order_acquire)) {
+        release_first.store(true, std::memory_order_release);
+        worker.join();
+        fprintf(stderr, "FAIL: first RMSNorm batch was not submitted\n");
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const bool returned_before_release = returned.load(std::memory_order_acquire);
+    release_first.store(true, std::memory_order_release);
+    worker.join();
+
+    TEST_ASSERT(!returned_before_release, "second-batch failure released ticket owners before first batch drained");
+    TEST_ASSERT(caught_second_failure.load(std::memory_order_acquire), "second-batch submit failure was not observed");
+    TEST_PASS();
+    return true;
+}
+
 static bool test_graph_recording_epoch_reuse_rejected(sycl::queue & q) {
     TEST_BEGIN("graph_recording_epoch_reuse_rejected");
 
@@ -955,6 +1008,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
     all_passed &= test_terminal_retention_ticket_state_machine(q);
+    all_passed &= test_mmvq_rmsnorm_second_batch_failure_drains_first(q);
     all_passed &= test_graph_recording_epoch_reuse_rejected(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
