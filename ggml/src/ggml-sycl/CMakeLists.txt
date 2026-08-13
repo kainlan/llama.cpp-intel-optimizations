@@ -102,11 +102,8 @@ if (GGML_SYCL_QUANTIZER_DEBUG)
 endif()
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
-if (BUILD_TESTING)
-    # Exposes only the monotonic near-exhaustion seam; production builds do not
-    # contain a counter-control symbol.
-    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_RETENTION_IDENTITY_TESTING=1)
-endif()
+# BUILD_TESTING must never change the ordinary backend object code. Mutable
+# controls are enabled only on direct-source/private object fixtures below.
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
 # contains no SYCL headers, device calls, or GPU fixture dependency.
@@ -139,6 +136,7 @@ if (BUILD_TESTING)
         model-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-load-txn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     find_package(Threads REQUIRED)
+    target_compile_definitions(test-sycl-lifecycle-load-txn PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
     target_link_libraries(test-sycl-lifecycle-load-txn PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -147,6 +145,7 @@ if (BUILD_TESTING)
         tests/test-model-lifecycle-runtime.cpp
         model-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-runtime-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-lifecycle-runtime-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
     target_link_libraries(test-sycl-lifecycle-runtime-host PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-runtime-host PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -157,6 +156,7 @@ if (BUILD_TESTING)
         execution-lifecycle.cpp
         model-lifecycle.cpp)
     target_include_directories(test-sycl-lifecycle-owner-reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-lifecycle-owner-reset PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
     target_link_libraries(test-sycl-lifecycle-owner-reset PRIVATE Threads::Threads)
     set_target_properties(test-sycl-lifecycle-owner-reset PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -273,11 +273,11 @@ if (BUILD_TESTING)
         target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})
         add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
     else()
-        # The wrapper exercises both generic registry APIs and direct static
-        # SYCL APIs. Link the aggregate target once: it owns the registry TUs
-        # and propagates the selected SYCL/CPU backend libraries without
-        # introducing duplicate backend objects.
-        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml)
+        # The mutable lifecycle controls live only in the private full-source
+        # object fixture declared below. The ordinary ggml-sycl DSO remains on
+        # ggml's production dependency graph but contributes no test seams.
+        target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE
+            ggml ggml-sycl-q1-route-test-objects)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
     set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
@@ -1590,8 +1590,10 @@ endif()
 target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl ${LEVEL_ZERO_LOADER})
+target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE
+    ggml-base ggml ggml-sycl-q1-route-test-objects ${LEVEL_ZERO_LOADER})
 if (IntelSYCL_FOUND)
     target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -1864,6 +1866,10 @@ endif() # direct-source static SYCL fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-wrong-device
     tests/test-mem-handle-wrong-device.cpp
+    unified-cache.cpp
+    model-lifecycle.cpp
+    pinned-pool.cpp
+    mem-handle.cpp
 )
 target_include_directories(test-mem-handle-wrong-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -1876,9 +1882,12 @@ target_link_options(test-mem-handle-wrong-device PRIVATE ${SYCL_LINK_ONLY_TEST_O
 target_compile_definitions(test-mem-handle-wrong-device PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
     GGML_SYCL_RETENTION_IDENTITY_TESTING=1
 )
-target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
+# Direct sources provide the seam-bearing TUs; linking ggml-sycl here would
+# add a second implementation and silently exercise the ordinary DSO instead.
+target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -1948,6 +1957,7 @@ target_compile_definitions(test-sycl-runtime-alloc PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING=1
+    GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-sycl-runtime-alloc PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
@@ -2990,8 +3000,10 @@ target_link_options(test-fattn-thread-local PRIVATE "-fsycl")
 target_compile_definitions(test-fattn-thread-local PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-fattn-thread-local PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-fattn-thread-local PRIVATE
+    ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-fattn-thread-local PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -4033,6 +4045,7 @@ target_include_directories(test-sycl-e2e-profile PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
+target_compile_definitions(test-sycl-e2e-profile PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
 add_test(NAME test-sycl-e2e-profile COMMAND test-sycl-e2e-profile)
 set_tests_properties(test-sycl-e2e-profile PROPERTIES
     LABELS "sycl;profile;tdd"
@@ -4049,6 +4062,7 @@ target_include_directories(test-sycl-timeline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
+target_compile_definitions(test-sycl-timeline PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
 add_test(NAME test-sycl-timeline COMMAND test-sycl-timeline)
 set_tests_properties(test-sycl-timeline PROPERTIES
     LABELS "sycl;profile;timeline;tdd"
@@ -4635,7 +4649,9 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             set_property(TARGET ggml-sycl-q1-route-test-objects PROPERTY ${_property} "${_value}")
         endif()
     endforeach()
-    target_compile_definitions(ggml-sycl-q1-route-test-objects PRIVATE GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1)
+    target_compile_definitions(ggml-sycl-q1-route-test-objects PRIVATE
+        GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1
+        GGML_SYCL_PRIVATE_TESTING=1)
 
     add_executable(test-sycl-q1-nvfp4-admitted-device
         tests/test-q1-nvfp4-admitted-device.cpp)

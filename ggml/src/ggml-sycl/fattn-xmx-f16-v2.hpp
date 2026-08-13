@@ -2121,7 +2121,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                           0;
     try {
         if constexpr (PACKED_K) {
-            ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first");
+            GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-first");
         }
         if (profile_enabled) {
             ggml_sycl_kernel_profile_record_event(
@@ -2132,7 +2132,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     }
     if constexpr (PACKED_K) {
         if (packed_k_ready_event != nullptr) {
-            ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge");
+            GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge");
         }
     }
 
@@ -2171,7 +2171,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                           0;
     try {
         if constexpr (PACKED_K) {
-            ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge");
+            GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-merge");
         }
         if (profile_enabled) {
             ggml_sycl_kernel_profile_record_event(

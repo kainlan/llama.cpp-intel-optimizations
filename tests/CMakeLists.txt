@@ -1472,7 +1472,12 @@ endif()
 
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-kernel-profiler.cpp)
+    target_sources(test-sycl-kernel-profiler PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/src/ggml-sycl/sycl-kernel-profiler.cpp)
     target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-kernel-profiler PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+    # The seam-bearing profiler TU is compiled directly; ggml-sycl supplies
+    # only its production timeline/runtime dependencies.
     target_link_libraries(test-sycl-kernel-profiler PRIVATE ggml-sycl)
     if (TARGET IntelSYCL::SYCL_CXX)
         target_link_libraries(test-sycl-kernel-profiler PRIVATE IntelSYCL::SYCL_CXX)

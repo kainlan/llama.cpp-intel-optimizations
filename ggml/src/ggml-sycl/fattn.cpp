@@ -53,6 +53,7 @@ static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES == XMX_V2_DECODE_ACTIVE_
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK == fattn_v2_decode_gqa_slm<64>::K_PACKED_ELEMS,
               "Packed-K materializer byte count must match the proven ext_intel_packed ABI");
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<uint64_t> g_packed_k_profile_error_after_submit_count{ 0 };
 
 void ggml_sycl_fattn_xmx_test_profile_error_after_submit(const char * checkpoint) {
@@ -73,6 +74,7 @@ void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime), "packed-K partial-submit test failpoint");
     }
 }
+#endif
 
 ggml_sycl_fattn_xmx_packed_k::~ggml_sycl_fattn_xmx_packed_k() {
     reset();
@@ -373,7 +375,7 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
                                                     .count()) :
                           0;
     try {
-        ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update");
+        GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("sidecar-update");
         if (profile_enabled) {
             ggml_sycl_kernel_profile_record_event(
                 profile_label, event, callsite, host_submit_begin_us, host_submit_end_us);
@@ -586,7 +588,7 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                 return debug_reject("sidecar-handle-invalid", root);
             }
             try {
-                ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill");
+                GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill");
                 zero_event = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
             } catch (const sycl::exception & e) {
                 GGML_LOG_WARN("[SYCL] packed-K sidecar initial fill submit failed: %s\n", e.what());
@@ -609,7 +611,7 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             packed.batch       = batch;
             packed.n_blocks    = n_blocks;
             packed.total_bytes = total_bytes;
-            ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update");
+            GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update");
             add_zero_dep = ggml_sycl_should_add_dependency(zero_event);
         } else {
             try {
@@ -1065,6 +1067,7 @@ extern "C" int ggml_sycl_test_seq_id_buffer_allocs() {
     return g_seq_id_buffer_allocs.load();
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" void ggml_sycl_test_fattn_set_shutdown(int value) {
     g_fattn_shutting_down.store(value != 0, std::memory_order_release);
 }
@@ -1102,6 +1105,7 @@ extern "C" bool ggml_sycl_test_seq_id_buffers_touch(sycl::queue * stream) {
     return g_tl_seq_buffers.q_seq_ids_dev && g_tl_seq_buffers.kv_seq_ids_dev && g_tl_seq_buffers.seq_q_offsets_dev &&
            g_tl_seq_buffers.seq_kv_offsets_dev;
 }
+#endif
 
 // Pre-allocate V2 buffers before SYCL graph recording starts.
 // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
@@ -1699,7 +1703,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         zero_event       = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
         out->ready_event = zero_event;
         zero_published   = true;
-        ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack");
+        GGML_SYCL_FATTN_PRIVATE_FAILPOINT("materializer-zero-to-pack");
         ggml_sycl_profile_label profile_label{};
         profile_label.name       = "fattn.pack";
         profile_label.category   = "fattn";
@@ -1754,7 +1758,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                                    0;
         out->ready_event = pack_event;
         try {
-            ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack");
+            GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("materializer-pack");
             if (pack_profile_enabled) {
                 ggml_sycl_kernel_profile_record_event(
                     profile_label, pack_event,

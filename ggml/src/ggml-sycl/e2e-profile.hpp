@@ -55,9 +55,12 @@ void         e2e_tg_profile_record_cache_event(const char * path, uint64_t bytes
 void         e2e_tg_profile_record_transfer(const char * path, uint64_t bytes, double host_us, double device_us);
 void         e2e_tg_profile_flush_if_ready(FILE * out = stderr);
 void         e2e_tg_profile_force_flush(FILE * out = stderr);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void         e2e_tg_profile_reset_for_tests();
+void         e2e_tg_profile_flush_for_tests(FILE * out);
+#endif
+// Read-only diagnostic snapshot: safe ABI allowlist entry.
 e2e_tg_profile_snapshot e2e_tg_profile_snapshot_for_tests();
-void                    e2e_tg_profile_flush_for_tests(FILE * out);
 
 class e2e_tg_scope {
   public:

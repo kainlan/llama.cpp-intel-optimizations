@@ -704,9 +704,11 @@ static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool>     g_test_fail_next_arena_free{ false };
-static bool fail_expert_phase(expert_fault_phase phase) noexcept;
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
+#endif
+static bool fail_expert_phase(expert_fault_phase phase) noexcept;
 
 static std::mutex            g_runtime_alloc_mutex;
 // One identity namespace for every backing that can enter retained caches.
@@ -2810,7 +2812,7 @@ uint64_t unified_cache_mint_retention_identity() noexcept {
     return 0;
 }
 
-#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_advance_retention_identity_counter_for_test(uint64_t next) noexcept {
     uint64_t value = g_retention_identity_counter.load(std::memory_order_relaxed);
     while (value < next &&
@@ -14832,10 +14834,12 @@ static bool runtime_allocation_owned_by_live_cache(const runtime_alloc_record & 
 static bool unified_cache_shutdown_retryable_postconditions_clean(
     const runtime_allocation_owner_snapshot & owner_snapshot) noexcept {
     try {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (g_test_fail_next_shutdown_clean.exchange(false, std::memory_order_acq_rel)) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] deterministic dirty shutdown postcondition; retaining owners for retry\n");
             return false;
         }
+#endif
         {
             std::lock_guard<std::mutex> runtime_lock(g_runtime_alloc_mutex);
             for (const auto & kv : g_runtime_alloc_registry) {
@@ -18747,6 +18751,7 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     return zone_available(zone);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free() {
     g_test_fail_next_arena_free.store(true, std::memory_order_release);
 }
@@ -18754,6 +18759,7 @@ void unified_cache_test_fail_next_arena_free() {
 void unified_cache_test_fail_next_shutdown_clean() {
     g_test_fail_next_shutdown_clean.store(true, std::memory_order_release);
 }
+#endif
 
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 void unified_cache_test_fail_next_arena_registry_commit() {
@@ -18859,9 +18865,12 @@ bool unified_cache::arena_destroy() {
                 }
             }
             bool freed = false;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
             if (g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel)) {
                 GGML_LOG_ERROR("[VRAM-ARENA] deterministic test free failure for chunk %p\n", c.ptr);
-            } else try {
+            } else
+#endif
+            try {
                 sycl::free(c.ptr, arena_queue_->get_context());
                 freed = true;
             } catch (const sycl::exception & e) {

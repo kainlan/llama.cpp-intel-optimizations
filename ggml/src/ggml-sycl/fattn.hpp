@@ -263,14 +263,18 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
 
 void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size);
 
-// Test-only partial-submit failpoint. Inert unless
-// GGML_SYCL_TEST_PACKED_K_FAIL_AFTER names an exact lifecycle checkpoint.
-void ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint);
-
-// Deterministic post-submit profiler bookkeeping error hook for packed-K
-// lifecycle tests. Production remains inert unless its test env names checkpoint.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void     ggml_sycl_fattn_xmx_test_failpoint(const char * checkpoint);
 void     ggml_sycl_fattn_xmx_test_profile_error_after_submit(const char * checkpoint);
 uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count();
+#define GGML_SYCL_FATTN_PRIVATE_FAILPOINT(checkpoint) ggml_sycl_fattn_xmx_test_failpoint(checkpoint)
+#define GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR(checkpoint) \
+    ggml_sycl_fattn_xmx_test_profile_error_after_submit(checkpoint)
+#else
+// Production expansion contains neither mutable state nor an atomic/env branch.
+#define GGML_SYCL_FATTN_PRIVATE_FAILPOINT(checkpoint) ((void) 0)
+#define GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR(checkpoint) ((void) 0)
+#endif
 
 #if GGML_SYCL_DNNL
 enum class ggml_sycl_onednn_fa_layout_kind {

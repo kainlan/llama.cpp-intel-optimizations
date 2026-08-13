@@ -497,6 +497,7 @@ std::string sycl_timeline_format_json_for_tests() {
     return format_trace_json(state.events);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void sycl_timeline_reset_for_tests() {
     sycl_timeline_state &       state = get_timeline_state();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -530,5 +531,6 @@ void sycl_timeline_begin_decode_step_for_tests(int step) {
     g_current_graph_compute_step  = step;
     state.next_graph_compute_step = static_cast<int64_t>(step) + 1;
 }
+#endif
 
 }  // namespace ggml_sycl

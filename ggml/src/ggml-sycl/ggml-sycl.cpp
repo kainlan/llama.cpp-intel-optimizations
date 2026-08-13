@@ -11742,6 +11742,7 @@ extern "C" bool ggml_backend_sycl_test_seed_control_host_allocs(ggml_backend_t b
     return true;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return;
@@ -11763,6 +11764,7 @@ extern "C" void ggml_backend_sycl_test_release_candidate_binding_failure() {
     if (!module_guard) return;
     ggml_sycl::lifecycle::global_registry().test_release_candidate_binding_failure();
 }
+#endif
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_enter_nested(ggml_sycl_load_txn txn) {
     sycl_module_mutation_guard module_guard;
@@ -94226,6 +94228,7 @@ static void ggml_sycl_reset_moe_module_state() {
     g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_arena_free();
@@ -94252,6 +94255,7 @@ static void ggml_backend_sycl_test_fail_next_shutdown_clean_guarded() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) ggml_sycl::unified_cache_test_fail_next_shutdown_clean();
 }
+#endif
 
 static bool ggml_backend_sycl_test_shutdown_owner_census(uint64_t out[4]) {
     return ggml_sycl::unified_cache_shutdown_owner_census_for_test(out);
@@ -94538,18 +94542,23 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_get_device_memory") == 0) {
         return (void *) ggml_backend_sycl_get_device_memory;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_arena_free") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_arena_free_guarded;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_test_capture_canonical_checksum") == 0) {
         return (void *) ggml_backend_sycl_test_capture_canonical_checksum;
     }
     if (strcmp(name, "ggml_backend_sycl_test_lookup_canonical_checksum") == 0) {
         return (void *) ggml_backend_sycl_test_lookup_canonical_checksum;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_shutdown_clean") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_shutdown_clean_guarded;
     }
+#endif
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_block_finalize_reactivate") == 0) {
         return (void *) ggml_backend_sycl_test_block_finalize_reactivate;
     }
@@ -94559,6 +94568,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_release_finalize_reactivate") == 0) {
         return (void *) ggml_backend_sycl_test_release_finalize_reactivate;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_test_shutdown_owner_census") == 0) {
         return (void *) ggml_backend_sycl_test_shutdown_owner_census;
     }
@@ -94719,6 +94729,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
         return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_candidate_binding_allocation;
     }
@@ -94731,6 +94742,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_release_candidate_binding_failure") == 0) {
         return (void *) ggml_backend_sycl_test_release_candidate_binding_failure;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_activate_model_plan") == 0) {
         return (void *) ggml_backend_sycl_activate_model_plan;
     }

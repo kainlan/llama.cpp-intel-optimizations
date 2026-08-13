@@ -740,9 +740,11 @@ checks = {
     and "test_block_backend_context_release" in hpp
     and "checked unload crossed final backend destructor tail" in
         (root / "ggml/src/ggml-sycl/tests/test-model-lifecycle-runtime.cpp").read_text(),
-    "runtime wrapper links aggregate registry in static and DL builds":
-        sycl_cmake.count("target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml") == 2
-        and "propagates the selected SYCL/CPU backend libraries" in sycl_cmake,
+    "runtime wrapper uses private seam object only for static test builds":
+        "target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})" in sycl_cmake
+        and "ggml ggml-sycl-q1-route-test-objects" in sycl_cmake
+        and "GGML_SYCL_PRIVATE_TESTING=1" in sycl_cmake
+        and "ordinary ggml-sycl DSO remains" in sycl_cmake,
     "registry builtins initialize after object construction": "ggml_backend_registry() = default" in registry_backend
     and "void register_builtin_backends()" in registry_backend
     and "ggml_backend_reg_dev_count_unchecked(reg, &count)" in registry_backend
@@ -855,7 +857,13 @@ checks = {
     "backend construction publish rollback": "g_test_fail_next_backend_publish" in backend
     and "auto ctx = std::make_unique<ggml_backend_sycl_context>(device)" in backend
     and backend.index("auto sycl_backend = std::make_unique<ggml_backend>")
-    < backend.index("g_backend_context_by_device[device] = ctx.get()")
+    < backend.index("g_backend_context_by_device[device].push_back(ctx.get())")
+    # Per-device publication is an ordered vector registry: construction must
+    # finish before append, and the injected failure must run only after the
+    # exact appended row is visible to rollback.
+    and backend.index("g_test_fail_next_backend_publish.exchange(false")
+    < backend.index("auto sycl_backend = std::make_unique<ggml_backend>")
+    < backend.index("g_backend_context_by_device[device].push_back(ctx.get())")
     and "backend construction failure leaked publication or admission" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "ggml_backend_t failed_backend = ggml_backend_sycl_init(0)" in

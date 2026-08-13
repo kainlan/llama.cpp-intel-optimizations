@@ -333,6 +333,7 @@ class Registry {
     uint64_t                          publication_count() const;
     uint64_t                          rollback_count() const;
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     void test_set_next_ids(uint64_t model, uint64_t load);
     void test_set_slot_generation(uint32_t slot, uint64_t generation);
     void test_fail_next_begin_allocation();
@@ -345,6 +346,7 @@ class Registry {
     void test_block_backend_context_release();
     void test_wait_for_backend_context_release();
     void test_allow_backend_context_release();
+#endif
 
   private:
     struct txn_state {
@@ -403,6 +405,7 @@ class Registry {
     std::shared_ptr<const ModelState>                          last_success_;
     uint64_t                                                   active_txn_   = 0;
     uint64_t                                                   publications_ = 0, rollbacks_ = 0;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     bool                                                       fail_next_begin_allocation_             = false;
     bool                                                       fail_next_dead_allocation_              = false;
     bool                                                       fail_next_candidate_binding_allocation_ = false;
@@ -413,6 +416,7 @@ class Registry {
     bool                                                       backend_context_release_barrier_        = false;
     bool                                                       backend_context_release_blocked_        = false;
     bool                                                       backend_context_release_allowed_        = false;
+#endif
 };
 
 Registry & global_registry();

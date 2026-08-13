@@ -76,6 +76,7 @@ void                            ggml_sycl_kernel_profile_record_event(const ggml
                                                                       uint64_t                          host_submit_end_us = 0);
 void                            ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason);
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void ggml_sycl_kernel_profile_reset_for_test();
 void ggml_sycl_kernel_profile_set_config_for_test(const ggml_sycl_kernel_profile_config & cfg);
 void ggml_sycl_kernel_profile_add_sample_for_test(const ggml_sycl_profile_label & label, uint64_t duration_ns);
@@ -92,6 +93,9 @@ void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_lab
                                                      int                             line,
                                                      const char *                    function,
                                                      bool                            graph_recorded);
+#endif
+// Read-only diagnostic formatters are intentionally safe ABI: they snapshot
+// production profiler state but cannot mutate configuration or samples.
 std::string ggml_sycl_kernel_profile_format_csv_for_test();
 std::string ggml_sycl_kernel_profile_format_json_for_test();
 std::string ggml_sycl_kernel_profile_format_summary_for_test(int top_n);
@@ -129,6 +133,7 @@ inline sycl::event ggml_sycl_profile_submit(sycl::queue &                   q,
                                          ggml_sycl::sycl_timeline_callsite{ file, line, function });
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 // Test-only helper used by `tests/test-sycl-kernel-profiler.cpp` to verify wrapper semantics without
 // requiring a live SYCL queue or event profiling timestamps.
 template <typename Fn>
@@ -139,6 +144,7 @@ inline auto ggml_sycl_profile_submit_for_test(const ggml_sycl_profile_label & la
     }
     return value;
 }
+#endif
 
 inline sycl::event ggml_sycl_profile_record_returned_event(const ggml_sycl_profile_label & label,
                                                            const sycl::event &             event) {

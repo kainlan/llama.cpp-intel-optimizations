@@ -157,16 +157,20 @@ void e2e_tg_profile_flush_if_ready(FILE * out) {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void e2e_tg_profile_reset_for_tests() {
     g_e2e_tg_profile = {};
 }
+#endif
 
 e2e_tg_profile_snapshot e2e_tg_profile_snapshot_for_tests() {
     return g_e2e_tg_profile;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void e2e_tg_profile_flush_for_tests(FILE * out) {
     e2e_tg_profile_force_flush(out);
 }
+#endif
 
 }  // namespace ggml_sycl

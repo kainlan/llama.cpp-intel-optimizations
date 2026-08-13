@@ -741,7 +741,7 @@ resolved_ptr mem_handle::resolved_view_locked() const {
     return view;
 }
 
-#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_t generation, size_t extent,
                                                  size_t offset, size_t size) noexcept {
     mem_handle_lock_guard guard(lock_);

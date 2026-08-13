@@ -150,11 +150,13 @@ void sycl_itt_task_end() {
     itt_runtime_task_end();
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void sycl_itt_reset_for_tests() {
     g_begin_count.store(0, std::memory_order_relaxed);
     g_end_count.store(0, std::memory_order_relaxed);
     g_thread_task_depth = 0;
 }
+#endif
 
 uint64_t sycl_itt_begin_count_for_tests() {
     return g_begin_count.load(std::memory_order_relaxed);

@@ -196,10 +196,12 @@ begin_result Registry::begin_outer() noexcept {
             { next_load_id_ },
             { slot, generation }
         };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (fail_next_begin_allocation_) {
             fail_next_begin_allocation_ = false;
             throw std::bad_alloc();
         }
+#endif
         txn_state state;
         state.token = token;
         txns_.emplace(token.load.value, state);
@@ -259,6 +261,7 @@ error Registry::poison(LoadTxnId id) {
 }
 
 void Registry::bind_candidate(LoadTxnId id) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         if (fail_next_candidate_binding_allocation_) {
@@ -274,6 +277,7 @@ void Registry::bind_candidate(LoadTxnId id) {
             throw std::bad_alloc();
         }
     }
+#endif
     (void) bound_candidate();  // discard bindings invalidated by another thread
     candidate_bindings.push_back({ this, id });
 }
@@ -315,10 +319,12 @@ load_effect_lease Registry::acquire_load_effect(LoadTxnId id) noexcept {
             it->second.phase != finish_phase::ACTIVE) {
             return { error::WRONG_TRANSACTION, {}, 0, nullptr };
         }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (fail_next_load_effect_allocation_) {
             fail_next_load_effect_allocation_ = false;
             throw std::bad_alloc();
         }
+#endif
         uint64_t serial = next_effect_serial_++;
         if (next_effect_serial_ == 0) {
             next_effect_serial_ = 1;
@@ -854,10 +860,12 @@ teardown_ticket Registry::prepare_teardown(ModelToken token) {
     // live elsewhere and are erased after successful teardown.
     if (dead_.find(token.model.value) == dead_.end()) {
         try {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
             if (fail_next_dead_allocation_) {
                 fail_next_dead_allocation_ = false;
                 throw std::bad_alloc();
             }
+#endif
             dead_.emplace(token.model.value, std::make_pair(token, error::EFFECT_FAILED));
         } catch (...) {
             model->second.phase           = model_phase::QUARANTINED;
@@ -1062,6 +1070,7 @@ bool Registry::acquire_backend_context() noexcept {
 void Registry::release_backend_context() noexcept {
     try {
         std::unique_lock<std::mutex> lock(mutex_);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (backend_context_release_barrier_) {
             backend_context_release_blocked_ = true;
             cv_.notify_all();
@@ -1070,6 +1079,7 @@ void Registry::release_backend_context() noexcept {
             backend_context_release_blocked_ = false;
             backend_context_release_allowed_ = false;
         }
+#endif
         if (backend_context_count_ != 0) {
             --backend_context_count_;
             cv_.notify_all();
@@ -1133,6 +1143,7 @@ uint64_t Registry::rollback_count() const {
     return rollbacks_;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void Registry::test_set_next_ids(uint64_t model, uint64_t load) {
     std::lock_guard<std::mutex> lock(mutex_);
     next_model_id_ = model;
@@ -1203,6 +1214,7 @@ void Registry::test_release_candidate_binding_failure() {
     candidate_binding_failure_release_ = true;
     cv_.notify_all();
 }
+#endif
 
 Registry & global_registry() {
     static Registry registry;

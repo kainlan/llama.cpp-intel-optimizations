@@ -1734,7 +1734,7 @@ struct stale_weight_alloc {
 // Process-wide capability mint shared by runtime, arena and cache allocations.
 // It never returns zero and never wraps: zero means permanent exhaustion.
 uint64_t unified_cache_mint_retention_identity() noexcept;
-#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 // Test-only, monotonic seam: may advance the default minter toward exhaustion,
 // but can never rewind it or make an issued identity reusable.
 void unified_cache_advance_retention_identity_counter_for_test(uint64_t next) noexcept;
@@ -4886,8 +4886,10 @@ bool shutdown_unified_cache();
 bool unified_cache_shutdown_state_clean() noexcept;
 bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();
+#endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
 void unified_cache_test_fail_next_arena_registry_commit();

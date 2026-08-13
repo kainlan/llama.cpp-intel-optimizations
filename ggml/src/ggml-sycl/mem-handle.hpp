@@ -439,7 +439,7 @@ class mem_handle {
 
   private:
     friend class moe::canonical_allocation_integration;
-#ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     void set_canonical_identity_for_test(uint64_t allocation_id, uint64_t generation, size_t extent,
                                          size_t offset, size_t size) noexcept;
 #endif

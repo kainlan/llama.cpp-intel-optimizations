@@ -78,9 +78,11 @@ void                 sycl_timeline_record_span_for_step(const char *            
                                                         int64_t                               step);
 void                 sycl_timeline_flush(const char * reason);
 std::string          sycl_timeline_format_json_for_tests();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void                 sycl_timeline_reset_for_tests();
 void                 sycl_timeline_set_config_for_tests(const sycl_timeline_config & cfg);
 void                 sycl_timeline_begin_decode_step_for_tests(int step);
+#endif
 
 }  // namespace ggml_sycl
 

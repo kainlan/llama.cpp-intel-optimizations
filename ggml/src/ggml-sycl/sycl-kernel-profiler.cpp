@@ -822,6 +822,7 @@ void ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason) {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void ggml_sycl_kernel_profile_reset_for_test() {
     ggml_sycl_kernel_profile_clear_node_context();
 
@@ -889,6 +890,7 @@ void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_lab
     std::lock_guard<std::mutex> lock(state.mutex);
     add_raw_event_locked(state, std::move(raw_event));
 }
+#endif
 
 std::string ggml_sycl_kernel_profile_format_csv_for_test() {
     return format_csv_rows(collect_rows());
