@@ -335,7 +335,7 @@ static inline size_t ggml_sycl_available_bytes(const ggml_tensor * t) {
     // padded beyond their logical tensor span and views may legally address
     // that padding. Fall back to the checked logical root span.
     const void * root_data = ggml_sycl_host_data(root);
-    ggml_sycl::alloc_handle allocation{};
+    ggml_sycl::alloc_metadata allocation{};
     size_t total = root_span;
     if (root_data && ggml_sycl::unified_lookup_runtime_allocation(root_data, &allocation, nullptr) &&
         allocation.ptr && allocation.size != 0) {

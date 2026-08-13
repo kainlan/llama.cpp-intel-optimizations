@@ -805,8 +805,11 @@ size_t test_pp_moe_onednn_planned_scratch_bytes(size_t   weight_slot_bytes,
 }
 
 struct runtime_alloc_record {
-    alloc_handle               handle{};
-    sycl::queue *              queue = nullptr;
+    // Non-owning registry identity/geometry. Release-only segmented storage is
+    // marked separately below; the registry never retains an alloc_handle.
+    alloc_metadata              handle{};
+    std::vector<buffer_segment> owned_segments;
+    sycl::queue *               queue = nullptr;
     // Owning copy of *queue (sycl::queue is a shared handle). Frees can run
     // long after the allocating queue object was destroyed (e.g. mem_handle
     // owners released during backend-context teardown, or init-time probe
@@ -3400,9 +3403,9 @@ bool unified_cache::shutdown_resources() {
         if (!ptr) {
             continue;
         }
-        alloc_handle tracked{};
+        alloc_metadata tracked{};
         if (unified_lookup(ptr, &tracked)) {
-            if (!unified_free(tracked)) {
+            if (!unified_free(alloc_handle(tracked))) {
                 GGML_LOG_ERROR("[UNIFIED-CACHE] destructor failed to release tracked DMA staging ptr=%p\n", ptr);
                 GGML_ASSERT(false && "tracked DMA staging release failed");
             }
@@ -3449,9 +3452,9 @@ bool unified_cache::shutdown_resources() {
                     }
                 }
             } else {
-                alloc_handle tracked{};
+                alloc_metadata tracked{};
                 if (unified_lookup(entry.ptr, &tracked)) {
-                    if (!unified_free(tracked)) {
+                    if (!unified_free(alloc_handle(tracked))) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] destructor failed to release tracked deferred ptr=%p\n",
                                        entry.ptr);
                         GGML_ASSERT(false && "tracked deferred release failed");
@@ -8817,7 +8820,7 @@ void unified_cache::enqueue_deferred_free(void * ptr, size_t size) {
         return;
     }
 
-    alloc_handle tracked{};
+    alloc_metadata tracked{};
     if (unified_lookup(ptr, &tracked)) {
         managed_alloc_ref ref{};
         ref.ptr      = tracked.ptr;
@@ -8944,7 +8947,7 @@ void unified_cache::enqueue_deferred_host_free(void * ptr, size_t size, const sy
     entry.has_event = true;
     entry.event     = event;
 
-    alloc_handle tracked{};
+    alloc_metadata tracked{};
     if (unified_lookup(ptr, &tracked)) {
         entry.handle.ptr      = tracked.ptr;
         entry.handle.size     = tracked.size;
@@ -9138,9 +9141,9 @@ void unified_cache::process_deferred_frees_locked() {
                     ++it;
                     continue;
                 }
-                alloc_handle tracked{};
+                alloc_metadata tracked{};
                 if (unified_lookup(it->ptr, &tracked)) {
-                    if (!unified_free(tracked)) {
+                    if (!unified_free(alloc_handle(tracked))) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] deferred tracked free failed ptr=%p size=%zu\n", it->ptr,
                                        it->size);
                         GGML_ASSERT(false && "deferred tracked free failed");
@@ -9188,9 +9191,9 @@ void unified_cache::process_deferred_frees_locked() {
                     }
                 }
             } else {
-                alloc_handle tracked{};
+                alloc_metadata tracked{};
                 if (unified_lookup(host_it->ptr, &tracked)) {
-                    if (!unified_free(tracked)) {
+                    if (!unified_free(alloc_handle(tracked))) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host lookup free failed ptr=%p size=%zu\n",
                                        host_it->ptr, host_it->size);
                         GGML_ASSERT(false && "deferred host lookup free failed");
@@ -11123,8 +11126,8 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                 // carve-outs already individually freed before this ticket.
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
-                    if (!rec.handle.all_segments.empty()) {
-                        for (const auto & seg : rec.handle.all_segments) {
+                    if (!rec.owned_segments.empty()) {
+                        for (const auto & seg : rec.owned_segments) {
                             cache->host_zone_free(rec.handle.host_zone, seg.ptr);
                         }
                     } else {
@@ -11158,8 +11161,8 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                 // purely for host_zone_boundary_check()'s refusal diagnostics.
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
-                    if (!rec.handle.all_segments.empty()) {
-                        for (const auto & seg : rec.handle.all_segments) {
+                    if (!rec.owned_segments.empty()) {
+                        for (const auto & seg : rec.owned_segments) {
                             cache->host_zone_free(rec.handle.host_zone, seg.ptr);
                         }
                     } else {
@@ -11178,12 +11181,12 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         }
 
         // Handle segmented allocations: release all segments
-        if (!rec.handle.all_segments.empty()) {
+        if (!rec.owned_segments.empty()) {
             if (rec.uses_pinned_pool) {
                 // Return all segments to the pinned pool (via unified_cache host_arena)
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
-                    for (const auto & seg : rec.handle.all_segments) {
+                    for (const auto & seg : rec.owned_segments) {
                         if (!rec.zone_managed) {
                             cache->host_pool_free(seg.ptr, seg.size);
                         }
@@ -11193,7 +11196,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
             } else {
                 // Non-pinned pool: free each segment individually.
                 // rec.queue may dangle by now; only the keepalive copy is safe.
-                for (const auto & seg : rec.handle.all_segments) {
+                for (const auto & seg : rec.owned_segments) {
                     if (rec.queue_keepalive.has_value() && seg.ptr != nullptr) {
                         sycl::free(seg.ptr, *rec.queue_keepalive);
                     } else if (seg.ptr != nullptr && rec.handle.device >= 0 &&
@@ -11260,7 +11263,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
 }
 
 static void runtime_reset_reclaimed_log_live_locked(const runtime_alloc_record & rec, const char * reset_scope) {
-    const alloc_handle & h = rec.handle;
+    const alloc_metadata & h = rec.handle;
     fprintf(stderr,
             "[UNIFIED-ALLOC] %s live allocation at reset ptr=%p alloc_id=%llu size=%zu device=%d tier=%s role=%d "
             "category=%d vram_zone=%d host_zone=%d zone_managed=%d cohort=%s\n",
@@ -11779,7 +11782,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.vram_zone        = out->vram_zone;
         rec.handle.zone_managed     = out->zone_managed;
         rec.handle.host_zone        = out->host_zone;
-        rec.handle.all_segments     = std::move(out->all_segments);
+        rec.owned_segments           = std::move(out->all_segments);
         rec.queue                   = req.queue;
         try {
             if (req.queue != nullptr) rec.queue_keepalive = *req.queue;
@@ -11836,7 +11839,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             rec.cohort_id.empty() ? "(none)" : rec.cohort_id.c_str());
     }
 
-    *out = rec.handle;
+    static_cast<alloc_metadata &>(*out) = rec.handle;
+    out->all_segments = rec.owned_segments;
     offload_stats_note_alloc(tier);
     return true;
 }
@@ -12236,7 +12240,7 @@ mem_handle alloc_handle::as_mem_handle() const {
                                    tier == alloc_tier::DEVICE_VRAM ? device : mem_handle::HOST_DEVICE, size);
 }
 
-bool unified_lookup(void * ptr, alloc_handle * out) {
+bool unified_lookup(void * ptr, alloc_metadata * out) {
     if (out == nullptr) {
         return false;
     }
@@ -12253,7 +12257,7 @@ bool unified_lookup(void * ptr, alloc_handle * out) {
     return true;
 }
 
-bool unified_lookup_runtime_allocation(const void * ptr, alloc_handle * out, sycl::queue ** queue_out) {
+bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out) {
     if (out != nullptr) {
         *out = {};
     }
@@ -12268,7 +12272,7 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_handle * out, syc
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     for (const auto & kv : g_runtime_alloc_registry) {
         const runtime_alloc_record & rec = kv.second;
-        const alloc_handle &         h   = rec.handle;
+        const alloc_metadata &       h   = rec.handle;
         if (h.ptr == nullptr || h.size == 0) {
             continue;
         }
@@ -12306,7 +12310,7 @@ bool unified_free_ptr(void * ptr, int expected_device) {
             return false;
         }
         if (unified_alloc_lifetime_trace_enabled()) {
-            const alloc_handle & h = it->second.handle;
+            const alloc_metadata & h = it->second.handle;
             GGML_LOG_WARN(
                 "[UNIFIED-ALLOC-LIFE] free-begin id=%llu ptr=%p size=%zu device=%d tier=%s role=%d category=%d "
                 "vram_zone=%d host_zone=%d zone_managed=%d from_arena=%d cohort=%s\n",
@@ -12390,7 +12394,7 @@ bool unified_free(const alloc_handle & handle) {
             return false;
         }
         if (unified_alloc_lifetime_trace_enabled()) {
-            const alloc_handle & live = it->second.handle;
+            const alloc_metadata & live = it->second.handle;
             GGML_LOG_WARN(
                 "[UNIFIED-ALLOC-LIFE] handle-free id=%llu ptr=%p size=%zu device=%d live_id=%llu live_size=%zu "
                 "tier=%s role=%d category=%d vram_zone=%d host_zone=%d cohort=%s\n",
@@ -12499,7 +12503,7 @@ unified_alloc_result unified_cache_allocate(int device, size_t size, alloc_categ
         result.ptr    = handle.ptr;
         result.tier   = handle.tier;
         result.size   = handle.size;
-        result.handle = handle;
+        result.metadata = handle.metadata();
         return result;
     }
 
@@ -12521,7 +12525,7 @@ unified_alloc_result unified_cache_allocate(int device, size_t size, alloc_categ
             result.ptr    = handle.ptr;
             result.tier   = handle.tier;
             result.size   = handle.size;
-            result.handle = handle;
+            result.metadata = handle.metadata();
             return result;
         }
     }
@@ -12546,7 +12550,7 @@ bool unified_alloc_validate_registry(int device, const char * where) {
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         for (const auto & kv : g_runtime_alloc_registry) {
-            const alloc_handle & h = kv.second.handle;
+            const alloc_metadata & h = kv.second.handle;
             if (h.tier == alloc_tier::DEVICE_VRAM) {
                 if (h.device >= 0 && h.device < GGML_SYCL_MAX_DEVICES) {
                     registry_device[h.device] += h.size;
@@ -14806,7 +14810,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     }
 
     runtime_alloc_record rec{};
-    rec.handle           = handle;
+    rec.handle           = handle.metadata();
     rec.queue            = &queue;
     rec.queue_keepalive  = queue;
     rec.uses_pinned_pool = false;
@@ -14849,7 +14853,7 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     }
 
     runtime_alloc_record rec{};
-    rec.handle           = handle;
+    rec.handle           = handle.metadata();
     rec.queue            = &queue;
     rec.queue_keepalive  = queue;
     rec.uses_pinned_pool = false;
@@ -14910,7 +14914,7 @@ static bool runtime_allocation_owned_by_cache_snapshot(const runtime_alloc_recor
                 cache.contains_pinned_backing_allocation(rec.handle.ptr, rec.handle.size)) {
                 return true;
             }
-            for (const auto & seg : rec.handle.all_segments) {
+            for (const auto & seg : rec.owned_segments) {
                 if (cache.contains_pinned(seg.ptr) ||
                     cache.contains_pinned_backing_allocation(seg.ptr, seg.size)) {
                     return true;
@@ -15583,7 +15587,7 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
                     // it sees exactly what the refusal saw, under the same lock.
                     // Attribution is READ from the handle (post-f9tg), never
                     // re-derived.
-                    const alloc_handle & h = it->second.handle;
+                    const alloc_metadata & h = it->second.handle;
                     audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
                                            static_cast<int>(h.tier), it->second.cohort_id });
                 }
@@ -15971,9 +15975,9 @@ void unified_cache::deallocate(void * ptr, size_t size, alloc_lifetime lifetime)
         return;
     }
 
-    alloc_handle tracked{};
+    alloc_metadata tracked{};
     if (unified_lookup(ptr, &tracked)) {
-        if (!unified_free(tracked)) {
+        if (!unified_free(alloc_handle(tracked))) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] deallocate: unified_free failed ptr=%p size=%zu\n", ptr, entry.size);
             GGML_ASSERT(false && "unified_cache::deallocate tracked free failed");
         }
@@ -16817,7 +16821,7 @@ bool query_registered_location(const void * ptr, memory_location * out) {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         auto                        it = g_runtime_alloc_registry.find(out->ptr);
         if (it != g_runtime_alloc_registry.end()) {
-            const alloc_handle & h = it->second.handle;
+            const alloc_metadata & h = it->second.handle;
             out->device            = h.device;
             out->tier              = h.tier;
             out->role              = h.role;
@@ -18472,7 +18476,7 @@ void unified_cache::zone_settle(vram_zone_id zone) {
                     // Uncapped, unlike the bounded refusal dump above; collected
                     // under the same lock so it sees exactly what the refusal
                     // saw. Attribution is READ from the handle (post-f9tg).
-                    const alloc_handle & h = it->second.handle;
+                    const alloc_metadata & h = it->second.handle;
                     audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
                                            static_cast<int>(h.tier), it->second.cohort_id });
                 }
@@ -18886,7 +18890,7 @@ void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * w
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     for (const auto & kv : g_runtime_alloc_registry) {
         const runtime_alloc_record & rec = kv.second;
-        const alloc_handle &         h   = rec.handle;
+        const alloc_metadata &       h   = rec.handle;
         if (!h.ptr) {
             continue;
         }

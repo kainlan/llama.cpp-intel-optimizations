@@ -792,9 +792,9 @@ using tensor_layout_info = ggml_tensor_layout;
 static inline void ggml_sycl_release_layout(tensor_layout_info & layout, sycl::queue & q) {
     GGML_UNUSED(q);
     if (layout.owns_memory && layout.data_ptr) {
-        ggml_sycl::alloc_handle handle{};
-        if (ggml_sycl::unified_lookup(layout.data_ptr, &handle)) {
-            if (!ggml_sycl::unified_free(handle)) {
+        ggml_sycl::alloc_metadata metadata{};
+        if (ggml_sycl::unified_lookup(layout.data_ptr, &metadata)) {
+            if (!ggml_sycl::unified_free(ggml_sycl::alloc_handle(metadata))) {
                 GGML_LOG_ERROR("[LAYOUT] unified free failed ptr=%p size=%zu device=%d\n", layout.data_ptr, layout.size,
                                layout.device_id);
             }
@@ -4522,7 +4522,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
 
     auto set_registered_ptr = [&](void * ptr, layout_mode layout, size_t offset, size_t logical_extent) -> bool {
         if (!ptr || logical_extent == 0) return false;
-        ggml_sycl::alloc_handle allocation{};
+        ggml_sycl::alloc_metadata allocation{};
         if (!ggml_sycl::unified_lookup_runtime_allocation(ptr, &allocation, nullptr) || !allocation.ptr ||
             allocation.size == 0) return false;
         const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);

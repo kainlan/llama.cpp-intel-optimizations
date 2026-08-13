@@ -592,7 +592,7 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
     // Only the runtime allocation registry may mint a range for this legacy
     // bridge. A containing arena chunk is physical lifetime ownership, not
     // authority over unrelated suballocations in that chunk.
-    alloc_handle allocation{};
+    alloc_metadata allocation{};
     if (unified_lookup_runtime_allocation(ptr, &allocation, nullptr) && allocation.ptr && allocation.size != 0) {
         const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t base = reinterpret_cast<uintptr_t>(allocation.ptr);

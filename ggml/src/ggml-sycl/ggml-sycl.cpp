@@ -37980,12 +37980,12 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             if (b.ptr == nullptr) {
                 auto it = active_handles.find(ptr);
                 if (it == active_handles.end()) {
-                    ggml_sycl::alloc_handle looked_up{};
+                    ggml_sycl::alloc_metadata looked_up{};
                     if (ggml_sycl::unified_lookup(ptr, &looked_up)) {
                         auto inserted = active_handles.emplace(
                             ptr,
                             ggml_sycl_pool_owned_buffer{ looked_up.size, ggml_sycl::mem_handle::from_owned_alloc(
-                                                                             std::move(looked_up), GGML_LAYOUT_AOS) });
+                                                                             ggml_sycl::alloc_handle(looked_up), GGML_LAYOUT_AOS) });
                         it = inserted.first;
                     }
                 }
@@ -38003,11 +38003,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
         auto it = active_handles.find(ptr);
         if (it == active_handles.end()) {
-            ggml_sycl::alloc_handle looked_up{};
+            ggml_sycl::alloc_metadata looked_up{};
             if (ggml_sycl::unified_lookup(ptr, &looked_up)) {
                 auto inserted = active_handles.emplace(
                     ptr, ggml_sycl_pool_owned_buffer{ looked_up.size, ggml_sycl::mem_handle::from_owned_alloc(
-                                                                          std::move(looked_up), GGML_LAYOUT_AOS) });
+                                                                          ggml_sycl::alloc_handle(looked_up), GGML_LAYOUT_AOS) });
                 it = inserted.first;
             }
         }
@@ -44973,8 +44973,8 @@ static bool ggml_sycl_routed_activation_device_ptr_live(const ggml_tensor *     
 static queue_ptr ggml_sycl_queue_for_runtime_allocation(ggml_backend_sycl_context & ctx,
                                                         const void *                ptr,
                                                         int                         fallback_device) {
-    sycl::queue *           owner_queue = nullptr;
-    ggml_sycl::alloc_handle owner_lookup{};
+    sycl::queue *             owner_queue = nullptr;
+    ggml_sycl::alloc_metadata owner_lookup{};
     if (ggml_sycl::unified_lookup_runtime_allocation(ptr, &owner_lookup, &owner_queue) && owner_queue != nullptr) {
         return owner_queue;
     }

@@ -37,6 +37,8 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #if !defined(_WIN32) && !defined(__SYCL_DEVICE_ONLY__)
@@ -3956,54 +3958,69 @@ struct alloc_request {
     alloc_intent  intent;
 };
 
-struct alloc_handle {
-    void *           ptr      = nullptr;  // First segment (caller-facing pointer)
-    size_t           size     = 0;        // Total size requested
-    int              device   = -1;
-    alloc_tier       tier     = alloc_tier::DEVICE_VRAM;
+// Copyable, non-owning exact allocation identity and geometry. Registry rows,
+// lookup results and diagnostics use this type; copying it never transfers or
+// duplicates release responsibility.
+struct alloc_metadata {
+    void * ptr    = nullptr;
+    size_t size   = 0;
+    int    device = -1;
+    union {
+        alloc_tier kind = alloc_tier::DEVICE_VRAM;
+        alloc_tier tier; // compatibility spelling while callers migrate
+    };
     alloc_role       role     = alloc_role::OTHER;
     runtime_category category = runtime_category::OTHER;
-    uint64_t         alloc_id = 0;
+    union {
+        uint64_t id = 0;
+        uint64_t alloc_id; // compatibility spelling
+    };
+    union {
+        uint64_t generation = 0;
+        uint64_t arena_generation; // compatibility spelling
+    };
+    union {
+        vram_zone_id zone = vram_zone_id::COUNT;
+        vram_zone_id vram_zone; // compatibility spelling
+    };
+    union {
+        size_t offset = 0;
+        size_t arena_offset; // compatibility spelling
+    };
+    union {
+        size_t extent = 0;
+        size_t arena_extent; // compatibility spelling
+    };
 
-    // Exact arena capability minted in the allocator transaction. These fields
-    // are zero for non-arena allocations. Consumers must propagate this tuple
-    // rather than reconstructing arena authority from ptr.
-    uint64_t arena_generation = 0;
-    size_t   arena_offset     = 0;
-    size_t   arena_extent     = 0;
-
-    // Graph-boundary epoch this allocation was made in (iiff Option C step 2,
-    // llama.cpp-lbm3). Stamped from the zone's current epoch counter at
-    // allocation time; only meaningful for host_zone==SCRATCH|STAGING (0
-    // elsewhere). Diagnostic only -- see g_host_zone_epoch and
-    // host_zone_settle() in unified-cache.cpp for how it is bumped and read.
-    uint64_t epoch_id = 0;
-
-    // Zone routing fields — set by unified_alloc when the allocation is routed
-    // through a zone sub-allocator instead of a raw sycl::malloc call.
-    // unified_free() uses these to dispatch the correct reclaim path:
-    //   zone_managed=true, vram_zone!=COUNT → cache->zone_free(vram_zone, ptr) [TLSF reclaim]
-    //   zone_managed=true, host_zone==WEIGHT|KV → cache->host_zone_free(zone, ptr) [TLSF reclaim]
-    //   zone_managed=true, host_zone==SCRATCH and role==EXPERT_STAGING → scoped TLSF reclaim
-    //   zone_managed=true, host_zone==STAGING and cohort=="staging_buffer_pool" → scoped TLSF reclaim
-    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → per-record TLSF reclaim
-    //       (iiff Option C step 2, llama.cpp-lbm3: was reset-only pre-C2, now
-    //       individually freed the instant this handle releases — see
-    //       unified_free_record())
-    //   zone_managed=false                  → registry lookup → sycl::free or pinned_pool free
+    uint64_t     epoch_id     = 0;
     bool         zone_managed = false;
-    vram_zone_id vram_zone    = vram_zone_id::COUNT;
     host_zone_id host_zone    = host_zone_id::COUNT;
 
-    // Internal tracking for segmented allocations.
-    // When a single allocation request exceeds the chunk size, multiple segments
-    // are allocated internally. The caller only sees ptr (first segment), but
-    // unified_free() uses all_segments to release all internal segments.
+    // Stable exact-allocation key. Routing/diagnostic fields are intentionally
+    // excluded: they do not change allocation identity or geometry.
+    auto key() const { return std::make_tuple(ptr, size, device, kind, id, generation, zone, offset, extent); }
+
+    friend bool operator==(const alloc_metadata & lhs, const alloc_metadata & rhs) { return lhs.key() == rhs.key(); }
+    friend bool operator!=(const alloc_metadata & lhs, const alloc_metadata & rhs) { return !(lhs == rhs); }
+};
+
+static_assert(std::is_copy_constructible<alloc_metadata>::value, "allocation metadata must be copyable");
+static_assert(std::is_copy_assignable<alloc_metadata>::value, "allocation metadata must be copy assignable");
+
+// Temporary copyable owner token. Only values retained by code responsible for
+// calling unified_free() are owners; observation and indexing must use metadata().
+struct alloc_handle : alloc_metadata {
+    alloc_handle() = default;
+    explicit alloc_handle(const alloc_metadata & value) : alloc_metadata(value) {}
+
+    // Release-only bookkeeping for segmented allocations. This is deliberately
+    // absent from alloc_metadata.
     std::vector<buffer_segment> all_segments;
 
-    // Returns a DIRECT mem_handle view over this allocation.
-    // The handle carries no ownership — unified_free(alloc_handle) must still
-    // be called when the memory is no longer needed.
+    alloc_metadata metadata() const { return static_cast<const alloc_metadata &>(*this); }
+
+    // Returns a DIRECT mem_handle view over this allocation. The view is
+    // non-owning; the alloc_handle owner remains responsible for unified_free().
     mem_handle as_mem_handle() const;
 };
 
@@ -4031,8 +4048,8 @@ bool       unified_free_ptr(void * ptr, int expected_device = -1);
 // Transfer a refused owning handle to its device cache's durable retry queue.
 // Returns false without taking ownership when no live cache can accept it.
 bool       unified_defer_free(alloc_handle * handle);
-bool       unified_lookup(void * ptr, alloc_handle * out);
-bool       unified_lookup_runtime_allocation(const void * ptr, alloc_handle * out, sycl::queue ** queue_out = nullptr);
+bool       unified_lookup(void * ptr, alloc_metadata * out);
+bool       unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
 bool       unified_alloc_validate_registry(int device = -1, const char * where = nullptr);
 bool       unified_alloc_strict_mode();
@@ -4062,10 +4079,10 @@ enum class alloc_category : uint8_t {
 int alloc_category_priority(alloc_category cat);
 
 struct unified_alloc_result {
-    void *       ptr  = nullptr;
-    alloc_tier   tier = alloc_tier::DEVICE_VRAM;
-    size_t       size = 0;
-    alloc_handle handle{};
+    void *         ptr  = nullptr;
+    alloc_tier     tier = alloc_tier::DEVICE_VRAM;
+    size_t         size = 0;
+    alloc_metadata metadata{};
 };
 
 // Allocate memory through the unified cache budget system.
