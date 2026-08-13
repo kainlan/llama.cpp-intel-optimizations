@@ -62687,13 +62687,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
                roles.gate.batch.operands.front().actual_layout == roles.up.batch.operands.front().actual_layout;
     }();
-    // Quarantine remains fail-closed: the current pair/GLU submit API returns
-    // only bool + optional event and cannot prove that a false/throw happened
-    // before destination writes, nor atomically install terminal retention and
-    // skip/readiness publication. Keep the retained unfused executor
-    // authoritative until that submit contract exists.
-    const bool prompt_pair_retained_roles_capable = false;
-    (void) prompt_pair_retained_roles_validated;
+    // Only the proven MXFP4 all-primary path is eligible. In particular this
+    // excludes the direct Q1/NVFP4 device gate, role bias owners, and every
+    // host/secondary/mixed bundle. Those cases continue through the retained
+    // unfused executor below.
+    const bool prompt_pair_retained_roles_capable =
+        prompt_pair_retained_roles_validated && src0->type == GGML_TYPE_MXFP4;
     const bool prompt_pair_current_node = [&]() {
         if (!retained_prompt_roles_result) {
             return false;
@@ -62707,203 +62706,285 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const int    layer   = src0->name ? parse_layer_id_from_name(src0->name) : -1;
         auto         pair_it = g_moe_gate_up_pairs.find(layer);
         if (pair_it != g_moe_gate_up_pairs.end()) {
-            const moe_gate_up_pair & pair            = pair_it->second;
-            const bool               current_is_gate = src0 == pair.gate_weight && dst == pair.gate_dst;
-            const bool               current_is_up   = src0 == pair.up_weight && dst == pair.up_dst;
-            ggml_tensor *            partner_dst     = current_is_gate ? pair.up_dst : pair.gate_dst;
-            const int                current_index   = current_is_gate ? pair.gate_index : pair.up_index;
-            const int                partner_index   = current_is_gate ? pair.up_index : pair.gate_index;
-            const bool               topology_ok =
-                (current_is_gate || current_is_up) && partner_dst && pair.glu_dst && pair.src1 == src1 &&
-                pair.ids == ids && current_index >= 0 && partner_index > current_index &&
-                pair.glu_index > partner_index &&
+            const moe_gate_up_pair & pair = pair_it->second;
+            // Admission is deliberately anchored at the first (gate) node. The
+            // complete gate/up/GLU/down chain must be ordered and bias-free:
+            // bias storage is not part of the exact ten-owner escrow contract.
+            const bool topology_ok =
+                src0 == pair.gate_weight && dst == pair.gate_dst && pair.up_dst && pair.glu_dst && pair.down_dst &&
+                pair.src1 == src1 && pair.ids == ids && pair.gate_index >= 0 && pair.up_index > pair.gate_index &&
+                pair.glu_index > pair.up_index && pair.down_index > pair.glu_index && !pair.gate_bias && !pair.up_bias &&
+                !pair.down_bias && pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
                 (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
-                !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, partner_dst, ctx.device);
+                !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device) &&
+                !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.down_dst, ctx.device);
             if (topology_ok) {
                 const layout_mode gate_layout = roles.gate.batch.operands.front().actual_layout;
                 const layout_mode up_layout   = roles.up.batch.operands.front().actual_layout;
                 const layout_mode down_layout = roles.down.batch.operands.front().actual_layout;
-                const int         gate_hash   = moe_cache_layer_id(pair.gate_weight->name);
-                const int         up_hash     = moe_cache_layer_id(pair.up_weight->name);
-                const int         down_hash   = moe_cache_layer_id(pair.down_weight->name);
-
-                // All fallible role-table work, including the optional down
-                // continuation's table, completes before the GLU destination can
-                // be written. Any refusal here cleanly selects the retained
-                // unfused executor and publishes no skips/readiness.
                 auto gate_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
-                    ctx, pair.gate_weight, roles.gate.batch, gate_hash, gate_layout);
-                auto up_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(ctx, pair.up_weight, roles.up.batch,
-                                                                                   up_hash, up_layout);
+                    ctx, pair.gate_weight, roles.gate.batch, moe_cache_layer_id(pair.gate_weight->name), gate_layout);
+                auto up_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
+                    ctx, pair.up_weight, roles.up.batch, moe_cache_layer_id(pair.up_weight->name), up_layout);
                 auto down_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
-                    ctx, pair.down_weight, roles.down.batch, down_hash, down_layout);
-                const void * const * gate_ptrs = gate_table.resolve_abi(ctx.device);
-                const void * const * up_ptrs   = up_table.resolve_abi(ctx.device);
-                if (gate_ptrs && up_ptrs && down_table.valid()) {
-                    ggml_sycl_tensor_storage_handle activation_storage{};
-                    ggml_sycl_tensor_storage_handle ids_storage{};
-                    ggml_sycl_tensor_storage_handle glu_storage{};
-                    ggml_sycl_tensor_storage_handle gate_bias_storage{};
-                    ggml_sycl_tensor_storage_handle up_bias_storage{};
-                    const bool                      artifacts_ok =
-                        ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &activation_storage) &&
-                        activation_storage.handle.has_stable_owner_identity() &&
-                        ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &ids_storage) &&
-                        ids_storage.handle.has_stable_owner_identity() &&
-                        ggml_sycl_find_tensor_storage_handle(pair.glu_dst, ctx.device, &glu_storage) &&
-                        glu_storage.handle.has_stable_owner_identity() &&
-                        (!pair.gate_bias ||
-                         (ggml_sycl_find_tensor_storage_handle(pair.gate_bias, ctx.device, &gate_bias_storage) &&
-                          gate_bias_storage.handle.has_stable_owner_identity())) &&
-                        (!pair.up_bias ||
-                         (ggml_sycl_find_tensor_storage_handle(pair.up_bias, ctx.device, &up_bias_storage) &&
-                          up_bias_storage.handle.has_stable_owner_identity()));
-                    if (artifacts_ok) {
-                        const auto gate_bias_resolved =
-                            pair.gate_bias ? gate_bias_storage.handle.resolve(ctx.device) : ggml_sycl::resolved_ptr{};
-                        const auto up_bias_resolved =
-                            pair.up_bias ? up_bias_storage.handle.resolve(ctx.device) : ggml_sycl::resolved_ptr{};
-                        const float * gate_bias_ptr = pair.gate_bias && gate_bias_resolved.on_device ?
-                                                          static_cast<const float *>(gate_bias_resolved.ptr) :
-                                                          nullptr;
-                        const float * up_bias_ptr   = pair.up_bias && up_bias_resolved.on_device ?
-                                                          static_cast<const float *>(up_bias_resolved.ptr) :
-                                                          nullptr;
-                        if ((!pair.gate_bias || gate_bias_ptr) && (!pair.up_bias || up_bias_ptr)) {
-                            sycl::event     ids_device_event;
-                            int64_t         ids_device_nb0 = ids->nb[0];
-                            int64_t         ids_device_nb1 = ids->nb[1];
-                            const int32_t * ids_device     = ggml_sycl_get_moe_ids_device_ptr(
-                                ctx, ids, &ids_device_event, &ids_device_nb0, &ids_device_nb1,
-                                /*allow_async=*/true);
-                            if (ids_device) {
-                                // Reserve and validate every publication key before
-                                // submit. Commit below cannot allocate, and rollback
-                                // is available if a non-allocation failure occurs.
-                                struct staged_skip_node {
-                                    moe_precomputed_skip_set *          set = nullptr;
-                                    moe_precomputed_skip_key            key{};
-                                    moe_precomputed_skip_set::node_type node;
-                                };
+                    ctx, pair.down_weight, roles.down.batch, moe_cache_layer_id(pair.down_weight->name), down_layout);
 
-                                std::vector<staged_skip_node> staged;
-                                auto stage_skip = [&](moe_precomputed_skip_set & set, const ggml_tensor * tensor) {
-                                    moe_precomputed_skip_key key{};
-                                    if (!tensor || !ggml_sycl_make_moe_precomputed_skip_key(tensor, ctx.device, &key)) {
-                                        return false;
-                                    }
-                                    auto inserted = set.insert(key);
-                                    if (!inserted.second) {
-                                        return false;
-                                    }
-                                    staged.push_back({ &set, key, set.extract(inserted.first) });
-                                    return true;
-                                };
-                                g_moe_precomputed_mmid_skip.reserve(g_moe_precomputed_mmid_skip.size() + 2);
-                                g_moe_precomputed_node_skip.reserve(g_moe_precomputed_node_skip.size() + 3);
-                                g_moe_precomputed_residual_add_id_skip.reserve(
-                                    g_moe_precomputed_residual_add_id_skip.size() + 2);
-                                bool publication_preflight = stage_skip(g_moe_precomputed_mmid_skip, dst) &&
-                                                             stage_skip(g_moe_precomputed_mmid_skip, partner_dst) &&
-                                                             stage_skip(g_moe_precomputed_node_skip, pair.glu_dst);
-                                if (publication_preflight && pair.gate_biased) {
-                                    publication_preflight =
-                                        stage_skip(g_moe_precomputed_node_skip, pair.gate_biased) &&
-                                        (!ggml_sycl_moe_skip_residual_add_id_enabled() ||
-                                         stage_skip(g_moe_precomputed_residual_add_id_skip, pair.gate_biased));
-                                }
-                                if (publication_preflight && pair.up_biased) {
-                                    publication_preflight =
-                                        stage_skip(g_moe_precomputed_node_skip, pair.up_biased) &&
-                                        (!ggml_sycl_moe_skip_residual_add_id_enabled() ||
-                                         stage_skip(g_moe_precomputed_residual_add_id_skip, pair.up_biased));
-                                }
-                                if (publication_preflight) {
-                                    ggml_sycl::moe_retained_terminal_bundle terminal;
-                                    terminal.roles = roles;
-                                    terminal.tables.push_back(std::move(gate_table));
-                                    terminal.tables.push_back(std::move(up_table));
-                                    terminal.tables.push_back(std::move(down_table));
-                                    terminal.intermediates.push_back(activation_storage.handle);
-                                    terminal.intermediates.push_back(ids_storage.handle);
-                                    terminal.intermediates.push_back(glu_storage.handle);
-                                    if (pair.gate_bias) {
-                                        terminal.intermediates.push_back(gate_bias_storage.handle);
-                                    }
-                                    if (pair.up_bias) {
-                                        terminal.intermediates.push_back(up_bias_storage.handle);
-                                    }
+                ggml_sycl_tensor_storage_handle activation_storage{};
+                ggml_sycl_tensor_storage_handle ids_storage{};
+                ggml_sycl_tensor_storage_handle glu_storage{};
+                ggml_sycl_tensor_storage_handle down_storage{};
+                const bool artifacts_ok = gate_table.valid() && up_table.valid() && down_table.valid() &&
+                    gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
+                    down_table.resolve_abi(ctx.device) &&
+                    ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &activation_storage) &&
+                    activation_storage.handle.has_stable_owner_identity() &&
+                    ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &ids_storage) &&
+                    ids_storage.handle.has_stable_owner_identity() &&
+                    ggml_sycl_find_tensor_storage_handle(pair.glu_dst, ctx.device, &glu_storage) &&
+                    glu_storage.handle.has_stable_owner_identity() &&
+                    ggml_sycl_find_tensor_storage_handle(pair.down_dst, ctx.device, &down_storage) &&
+                    down_storage.handle.has_stable_owner_identity();
+                if (artifacts_ok) {
+                    sycl::event     ids_device_event;
+                    int64_t         ids_device_nb0 = ids->nb[0];
+                    int64_t         ids_device_nb1 = ids->nb[1];
+                    const int32_t * ids_device = ggml_sycl_get_moe_ids_device_ptr(
+                        ctx, ids, &ids_device_event, &ids_device_nb0, &ids_device_nb1, /*allow_async=*/true);
 
-                                    const float alpha = ggml_get_op_params_f32(pair.glu_dst, 2);
-                                    const float limit = ggml_get_op_params_f32(pair.glu_dst, 3);
-                                    std::vector<std::pair<moe_precomputed_skip_set *, moe_precomputed_skip_key>>
-                                        committed;
-                                    committed.reserve(staged.size());
-                                    sycl::event terminal_event;
-                                    bool        terminal_event_set = false;
-                                    bool        submitted          = false;
-                                    try {
-                                        submitted = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
-                                            ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_ptrs,
-                                            up_ptrs, ids_device, gate_bias_ptr, up_bias_ptr,
-                                            pair.gate_bias ? pair.gate_bias->nb[1] : 0,
-                                            pair.up_bias ? pair.up_bias->nb[1] : 0,
-                                            static_cast<int>(roles.gate.batch.operands.size()), ids->ne[0],
-                                            ids_device_nb0, ids_device_nb1, pair.glu_op, alpha, limit, gate_layout,
-                                            &glu_storage.handle, /*direct_xmx=*/false, /*xmx_grouped=*/false, nullptr,
-                                            nullptr, roles.gate.batch.expert_ids.data(),
-                                            static_cast<int64_t>(roles.gate.batch.expert_ids.size()), &terminal_event,
-                                            &terminal_event_set);
-                                    } catch (...) {
-                                        ctx.stream()->wait_and_throw();
-                                        throw;
-                                    }
-                                    if (submitted) {
-                                        if (!terminal_event_set) {
-                                            ctx.stream()->wait_and_throw();
-                                            throw std::runtime_error(
-                                                "MoE prompt GLU submitted without a terminal event");
-                                        }
-                                        // This is the destination-write boundary. From
-                                        // here onward no gate/up fallback is legal. The
-                                        // optional down continuation deliberately
-                                        // declines and remains an ordinary executable
-                                        // graph node with no down skip/readiness.
-                                        try {
-                                            for (auto & entry : staged) {
-                                                auto inserted = entry.set->insert(std::move(entry.node));
-                                                if (!inserted.inserted) {
-                                                    throw std::runtime_error("MoE prompt skip transaction collision");
-                                                }
-                                                committed.emplace_back(entry.set, entry.key);
-                                            }
-                                            glu_storage.handle.set_ready_event(terminal_event);
-                                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, terminal_event);
-                                        } catch (...) {
-                                            for (const auto & entry : committed) {
-                                                entry.first->erase(entry.second);
-                                            }
-                                            terminal_event.wait();
-                                            throw;
-                                        }
-                                        terminal.terminal_event     = terminal_event;
-                                        terminal.terminal_submitted = true;
-                                        ggml_sycl_retain_moe_terminal_bundle(std::move(terminal));
-                                        if (g_moe_profile_enabled) {
-                                            const int64_t entries =
-                                                static_cast<int64_t>(roles.gate.batch.operands.size());
-                                            g_moe_profile.moe_route_stats(MOE_TENSOR_GATE, entries, 0, 0, 0, entries, 0,
-                                                                          0);
-                                            g_moe_profile.moe_route_stats(MOE_TENSOR_UP, entries, 0, 0, 0, entries, 0,
-                                                                          0);
-                                            g_moe_profile.moe_gpu_compute_done();
-                                            g_moe_profile.moe_compute_done(0, static_cast<int>(entries * 2));
-                                        }
-                                        return;
-                                    }
-                                }
-                            }
+                    struct staged_skip_node {
+                        moe_precomputed_skip_set *          set = nullptr;
+                        moe_precomputed_skip_key            key{};
+                        moe_precomputed_skip_set::node_type node;
+                    };
+                    std::vector<staged_skip_node> staged;
+                    auto stage_skip = [&](moe_precomputed_skip_set & set, const ggml_tensor * tensor) {
+                        moe_precomputed_skip_key key{};
+                        if (!tensor || !ggml_sycl_make_moe_precomputed_skip_key(tensor, ctx.device, &key)) {
+                            return false;
                         }
+                        auto inserted = set.insert(key);
+                        if (!inserted.second) {
+                            return false;
+                        }
+                        staged.push_back({ &set, key, set.extract(inserted.first) });
+                        return true;
+                    };
+                    g_moe_precomputed_mmid_skip.reserve(g_moe_precomputed_mmid_skip.size() + 3);
+                    g_moe_precomputed_node_skip.reserve(g_moe_precomputed_node_skip.size() + 1);
+                    const bool publication_preflight = ids_device &&
+                        stage_skip(g_moe_precomputed_mmid_skip, pair.gate_dst) &&
+                        stage_skip(g_moe_precomputed_mmid_skip, pair.up_dst) &&
+                        stage_skip(g_moe_precomputed_node_skip, pair.glu_dst) &&
+                        stage_skip(g_moe_precomputed_mmid_skip, pair.down_dst);
+
+                    if (publication_preflight) {
+                        namespace fused = ggml_sycl::moe_fused;
+                        auto identity = [](const ggml_sycl::mem_handle & handle) -> std::uintptr_t {
+                            return static_cast<std::uintptr_t>(handle.stable_identity_hash());
+                        };
+                        auto role_view = [&](const ggml_sycl::moe_retained_role_batch & role,
+                                             const ggml_sycl::moe_retained_pointer_table & table) {
+                            fused::RetainedRoleView view;
+                            view.present         = true;
+                            view.handle_identity = identity(role.batch.operands.front().lease);
+                            view.table_identity  = identity(table.table_handle);
+                            // Readiness is bound to the retained table owner; its
+                            // upload event and all role leases travel together.
+                            view.ready_identity = view.table_identity;
+                            view.occurrences.reserve(role.batch.operands.size());
+                            for (const auto & operand : role.batch.operands) {
+                                fused::OccurrenceResidency residency = fused::OccurrenceResidency::unavailable;
+                                if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
+                                    residency = fused::OccurrenceResidency::local;
+                                } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
+                                    residency = fused::OccurrenceResidency::secondary;
+                                } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
+                                    residency = fused::OccurrenceResidency::host;
+                                }
+                                view.occurrences.push_back({ operand.expert_id, operand.occurrence,
+                                    operand.token_index, operand.slot_index, identity(operand.lease),
+                                    static_cast<std::int64_t>(operand.actual_layout), residency });
+                            }
+                            return view;
+                        };
+
+                        fused::PromptFusionBundle fusion_bundle;
+                        fusion_bundle.gate                  = role_view(roles.gate, gate_table);
+                        fusion_bundle.up                    = role_view(roles.up, up_table);
+                        fusion_bundle.down                  = role_view(roles.down, down_table);
+                        fusion_bundle.activation_identity   = identity(activation_storage.handle);
+                        fusion_bundle.ids_identity          = identity(ids_storage.handle);
+                        fusion_bundle.glu_identity          = identity(glu_storage.handle);
+                        fusion_bundle.intermediate_identity = identity(down_storage.handle);
+
+                        struct HandleOwner final : fused::Owner {
+                            explicit HandleOwner(std::vector<ggml_sycl::mem_handle> value) : handles(std::move(value)) {}
+                            std::vector<ggml_sycl::mem_handle> handles;
+                        };
+                        struct EventOwner final : fused::TerminalEvent {
+                            explicit EventOwner(sycl::event value) : event(std::move(value)) {}
+                            void wait() noexcept override { try { event.wait_and_throw(); } catch (...) {} }
+                            sycl::event event;
+                        };
+                        struct QueueDrain final : fused::EmergencyDrain {
+                            explicit QueueDrain(sycl::queue * value) : queue(value) {}
+                            void drain() noexcept override { try { if (queue) queue->wait_and_throw(); } catch (...) {} }
+                            sycl::queue * queue;
+                        };
+                        struct PromptExecutor final : fused::PromptFusionExecutor {
+                            ggml_backend_sycl_context & ctx;
+                            const moe_gate_up_pair & pair;
+                            const ggml_sycl::moe_retained_role_bundle & roles;
+                            ggml_sycl::moe_retained_pointer_table gate_table;
+                            ggml_sycl::moe_retained_pointer_table up_table;
+                            ggml_sycl::moe_retained_pointer_table down_table;
+                            ggml_sycl::mem_handle activation;
+                            ggml_sycl::mem_handle ids;
+                            ggml_sycl::mem_handle glu;
+                            ggml_sycl::mem_handle intermediate;
+                            const int32_t * ids_device;
+                            int64_t ids_nb0;
+                            int64_t ids_nb1;
+                            layout_mode gate_layout;
+                            layout_mode down_layout;
+                            sycl::event glu_event;
+                            bool glu_event_set = false;
+                            sycl::event terminal_event;
+                            bool terminal_event_set = false;
+
+                            PromptExecutor(ggml_backend_sycl_context & ctx_arg,
+                                           const moe_gate_up_pair & pair_arg,
+                                           const ggml_sycl::moe_retained_role_bundle & roles_arg,
+                                           ggml_sycl::moe_retained_pointer_table gate_table_arg,
+                                           ggml_sycl::moe_retained_pointer_table up_table_arg,
+                                           ggml_sycl::moe_retained_pointer_table down_table_arg,
+                                           ggml_sycl::mem_handle activation_arg,
+                                           ggml_sycl::mem_handle ids_arg,
+                                           ggml_sycl::mem_handle glu_arg,
+                                           ggml_sycl::mem_handle intermediate_arg,
+                                           const int32_t * ids_device_arg,
+                                           int64_t ids_nb0_arg,
+                                           int64_t ids_nb1_arg,
+                                           layout_mode gate_layout_arg,
+                                           layout_mode down_layout_arg) :
+                                ctx(ctx_arg), pair(pair_arg), roles(roles_arg), gate_table(std::move(gate_table_arg)),
+                                up_table(std::move(up_table_arg)), down_table(std::move(down_table_arg)),
+                                activation(std::move(activation_arg)), ids(std::move(ids_arg)), glu(std::move(glu_arg)),
+                                intermediate(std::move(intermediate_arg)), ids_device(ids_device_arg),
+                                ids_nb0(ids_nb0_arg), ids_nb1(ids_nb1_arg), gate_layout(gate_layout_arg),
+                                down_layout(down_layout_arg) {}
+
+                            fused::Status preflight(const fused::PromptFusionBundle &) override {
+                                return gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
+                                               down_table.resolve_abi(ctx.device) && ids_device ?
+                                           fused::Status::ok() :
+                                           fused::Status{ fused::ErrorCode::preflight_failed,
+                                                          "retained prompt MMVQ ABI preflight failed" };
+                            }
+                            fused::OwnerBundle owners() override {
+                                auto role_handles = [](const ggml_sycl::moe_retained_role_batch & role) {
+                                    std::vector<ggml_sycl::mem_handle> out;
+                                    out.reserve(role.batch.operands.size());
+                                    for (const auto & operand : role.batch.operands) out.push_back(operand.lease);
+                                    return out;
+                                };
+                                auto table_handles = [](const ggml_sycl::moe_retained_pointer_table & table) {
+                                    std::vector<ggml_sycl::mem_handle> out = table.role_leases;
+                                    out.push_back(table.table_handle);
+                                    return out;
+                                };
+                                fused::OwnerBundle out;
+                                out.add(fused::OwnerRole::gate, std::make_unique<HandleOwner>(role_handles(roles.gate)));
+                                out.add(fused::OwnerRole::gate_table, std::make_unique<HandleOwner>(table_handles(gate_table)));
+                                out.add(fused::OwnerRole::up, std::make_unique<HandleOwner>(role_handles(roles.up)));
+                                out.add(fused::OwnerRole::up_table, std::make_unique<HandleOwner>(table_handles(up_table)));
+                                out.add(fused::OwnerRole::activation, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ activation }));
+                                out.add(fused::OwnerRole::ids, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ ids }));
+                                out.add(fused::OwnerRole::glu, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ glu }));
+                                out.add(fused::OwnerRole::intermediate, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ intermediate }));
+                                out.add(fused::OwnerRole::down, std::make_unique<HandleOwner>(role_handles(roles.down)));
+                                out.add(fused::OwnerRole::down_table, std::make_unique<HandleOwner>(table_handles(down_table)));
+                                return out;
+                            }
+                            fused::EmergencyToken emergency() override {
+                                return fused::EmergencyToken(std::make_unique<QueueDrain>(ctx.stream()));
+                            }
+                            fused::Status submit_writes(const fused::PromptFusionBundle &, fused::SubmitRecorder & recorder) override {
+                                fused::Status status = recorder.mark_write_started();
+                                if (!status) return status;
+                                const bool gate_up_ok = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
+                                    ctx, pair.gate_weight, pair.up_weight, pair.src1, pair.glu_dst,
+                                    gate_table.resolve_abi(ctx.device), up_table.resolve_abi(ctx.device), ids_device,
+                                    nullptr, nullptr, 0, 0, static_cast<int>(roles.gate.batch.operands.size()),
+                                    pair.ids->ne[0], ids_nb0, ids_nb1, pair.glu_op,
+                                    ggml_get_op_params_f32(pair.glu_dst, 2), ggml_get_op_params_f32(pair.glu_dst, 3),
+                                    gate_layout, &glu, false, false, nullptr, nullptr,
+                                    roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
+                                    &glu_event, &glu_event_set);
+                                if (!gate_up_ok || !glu_event_set) {
+                                    return { fused::ErrorCode::submitted_without_terminal,
+                                             "retained prompt gate/up GLU did not produce an event" };
+                                }
+                                std::vector<sycl::event> deps{ glu_event };
+                                const bool down_ok = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
+                                    ctx, pair.down_weight, pair.glu_dst, pair.down_dst,
+                                    down_table.resolve_abi(ctx.device), ids_device,
+                                    static_cast<int>(roles.down.batch.operands.size()), pair.ids->ne[0], ids_nb0,
+                                    ids_nb1, down_layout, &glu, &intermediate,
+                                    roles.down.batch.expert_ids.data(), roles.down.batch.expert_ids.size(), &deps,
+                                    &terminal_event, &terminal_event_set);
+                                if (!down_ok || !terminal_event_set) {
+                                    return { fused::ErrorCode::submitted_without_terminal,
+                                             "retained prompt down did not produce a terminal event" };
+                                }
+                                return recorder.install_terminal(
+                                    fused::TerminalToken(std::make_unique<EventOwner>(terminal_event)));
+                            }
+                        } executor{ ctx, pair, roles, std::move(gate_table), std::move(up_table),
+                                    std::move(down_table), activation_storage.handle, ids_storage.handle,
+                                    glu_storage.handle, down_storage.handle, ids_device, ids_device_nb0,
+                                    ids_device_nb1, gate_layout, down_layout };
+
+                        // The store is thread-local graph publication authority.
+                        // Replacing it retires the previous terminal owner only
+                        // after its exact owner-queue event has completed.
+                        static thread_local fused::PublicationStore publication_store;
+                        const auto before = publication_store.snapshot();
+                        const auto result = mmvq_submit_retained_prompt_fusion(
+                            fusion_bundle, executor, publication_store, before.publication.generation);
+                        if (result.status) {
+                            std::vector<std::pair<moe_precomputed_skip_set *, moe_precomputed_skip_key>> committed;
+                            try {
+                                committed.reserve(staged.size());
+                                for (auto & entry : staged) {
+                                    auto inserted = entry.set->insert(std::move(entry.node));
+                                    if (!inserted.inserted) throw std::runtime_error("prompt fusion publication collision");
+                                    committed.emplace_back(entry.set, entry.key);
+                                }
+                                glu_storage.handle.set_ready_event(executor.glu_event);
+                                down_storage.handle.set_ready_event(executor.terminal_event);
+                                ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, executor.glu_event);
+                                ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, executor.terminal_event);
+                            } catch (...) {
+                                for (const auto & entry : committed) entry.first->erase(entry.second);
+                                executor.terminal_event.wait();
+                                throw; // post-write quarantine: never enter the unfused path
+                            }
+                            ready_guard.published = true;
+                            if (g_moe_profile_enabled) {
+                                const int64_t entries = roles.gate.batch.operands.size();
+                                for (moe_tensor_type role : { MOE_TENSOR_GATE, MOE_TENSOR_UP, MOE_TENSOR_DOWN })
+                                    g_moe_profile.moe_route_stats(role, entries, 0, 0, 0, entries, 0, 0);
+                                g_moe_profile.moe_gpu_compute_done();
+                                g_moe_profile.moe_compute_done(0, static_cast<int>(entries * 3));
+                            }
+                            return;
+                        }
+                        if (!result.fallback_allowed) {
+                            throw std::runtime_error(result.status.detail); // submitted/write quarantine
+                        }
+                        // Pre-write refusal: staged nodes remain detached and
+                        // the exact retained role batches execute unfused below.
                     }
                 }
             }
