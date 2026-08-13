@@ -8490,14 +8490,16 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
                                          void **                    out_ptr,
                                          std::vector<sycl::event> * out_events);
 
-static bool test_register_moe_builder_identity(ggml_tensor & tensor, ggml_tensor_extra_gpu & extra) {
+static bool test_register_moe_builder_identity(ggml_tensor &          tensor,
+                                               ggml_tensor_extra_gpu & extra,
+                                               size_t                  file_offs = 0) {
     const auto token = lifecycle::global_registry().current_active_token();
     if (token.model.value == 0 || token.load.value == 0) {
         return false;
     }
     extra.model_id = token.model.value;
     tensor.extra   = &extra;
-    ggml_backend_sycl_register_weight_identity(&tensor, 0, 0, ggml_nbytes(&tensor), token.model.value);
+    ggml_backend_sycl_register_weight_identity(&tensor, 0, file_offs, ggml_nbytes(&tensor), token.model.value);
     return true;
 }
 
@@ -9144,28 +9146,50 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
 
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
-    auto init_tensor = [](ggml_tensor & tensor, ggml_tensor_extra_gpu & extra, const char * name, uint64_t model_id,
-                          std::vector<uint8_t> & data) {
+    auto init_tensor = [](ggml_tensor & tensor, const char * name, std::vector<uint8_t> & data) {
         test_init_q8_moe_tensor(tensor, name);
-        extra.model_id = model_id;
-        tensor.extra   = &extra;
-        tensor.data    = data.data();
+        data.resize(static_cast<size_t>(tensor.nb[2]), data.empty() ? 0 : data.front());
+        tensor.data = data.data();
     };
 
     ggml_tensor           gate_tensor{};
     ggml_tensor           up_tensor{};
+    ggml_tensor           down_tensor{};
+    ggml_tensor           tied_gate_tensor{};
     ggml_tensor_extra_gpu gate_extra{};
     ggml_tensor_extra_gpu up_extra{};
+    ggml_tensor_extra_gpu down_extra{};
+    ggml_tensor_extra_gpu tied_gate_extra{};
     std::vector<uint8_t>  gate_data(256, 0x83);
     std::vector<uint8_t>  up_data(256, 0x91);
-    init_tensor(gate_tensor, gate_extra, "blk.12.ffn_gate_exps.weight", 0x5a20, gate_data);
-    init_tensor(up_tensor, up_extra, "blk.12.ffn_up_exps.weight", 0x5a20, up_data);
-    gate_data.resize(static_cast<size_t>(gate_tensor.nb[2]), 0x83);
-    up_data.resize(static_cast<size_t>(up_tensor.nb[2]), 0x91);
-    gate_tensor.data = gate_data.data();
-    up_tensor.data   = up_data.data();
-    if (!test_register_moe_builder_identity(gate_tensor, gate_extra) ||
-        !test_register_moe_builder_identity(up_tensor, up_extra)) {
+    std::vector<uint8_t>  down_data(256, 0xa7);
+    std::vector<uint8_t>  tied_gate_data(256, 0x83);
+    init_tensor(gate_tensor, "blk.12.ffn_gate_exps.weight", gate_data);
+    init_tensor(up_tensor, "blk.12.ffn_up_exps.weight", up_data);
+    init_tensor(down_tensor, "blk.12.ffn_down_exps.weight", down_data);
+    init_tensor(tied_gate_tensor, "blk.12.ffn_gate_exps_tied.weight", tied_gate_data);
+
+    // Synthetic GGUF roles share one owner/file, but represent non-overlapping
+    // physical ranges. Distinct offsets are therefore part of this fixture's
+    // identity contract. The separately named tied tensor is the negative
+    // control: the same physical range must remain equal despite its name.
+    const size_t gate_offs = 0;
+    const size_t up_offs   = ggml_nbytes(&gate_tensor);
+    const size_t down_offs = up_offs + ggml_nbytes(&up_tensor);
+    if (!test_register_moe_builder_identity(gate_tensor, gate_extra, gate_offs) ||
+        !test_register_moe_builder_identity(up_tensor, up_extra, up_offs) ||
+        !test_register_moe_builder_identity(down_tensor, down_extra, down_offs) ||
+        !test_register_moe_builder_identity(tied_gate_tensor, tied_gate_extra, gate_offs)) {
+        return false;
+    }
+    const auto gate_role_key = ggml_backend_sycl_get_weight_cache_key(&gate_tensor, 0);
+    const auto up_role_key   = ggml_backend_sycl_get_weight_cache_key(&up_tensor, 0);
+    const auto down_role_key = ggml_backend_sycl_get_weight_cache_key(&down_tensor, 0);
+    const auto tied_gate_key = ggml_backend_sycl_get_weight_cache_key(&tied_gate_tensor, 0);
+    if (ggml_sycl::detail::cache_id_equal(gate_role_key, up_role_key) ||
+        ggml_sycl::detail::cache_id_equal(gate_role_key, down_role_key) ||
+        ggml_sycl::detail::cache_id_equal(up_role_key, down_role_key) ||
+        !ggml_sycl::detail::cache_id_equal(gate_role_key, tied_gate_key)) {
         return false;
     }
 
@@ -9177,6 +9201,9 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
         plan.entries.push_back({ "blk.12.ffn_up_exps.weight", up_data.size(), up_data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_UP, 12, e, ggml_sycl::expert_tensor_role::UP, true,
                                  0 });
+        plan.entries.push_back({ "blk.12.ffn_down_exps.weight", down_data.size(), down_data.size(), 0,
+                                 ggml_sycl::placement_priority::MOE_DOWN, 12, e,
+                                 ggml_sycl::expert_tensor_role::DOWN, true, 0 });
         plan.expert_device[12][e] = 0;
     }
     plan.build_index();
@@ -9186,6 +9213,7 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
     std::vector<sycl::event> stage_events;
     void *                   gate_ptr = nullptr;
     void *                   up_ptr   = nullptr;
+    void *                   down_ptr = nullptr;
     std::vector<int32_t>     ids_host;
     ids_host.reserve(static_cast<size_t>(gate_tensor.ne[2]));
     {
@@ -9193,30 +9221,39 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
         for (int e = 0; e < gate_tensor.ne[2]; ++e) {
             ggml_sycl_cache_id gate_key = ggml_sycl_get_moe_expert_cache_key(&gate_tensor, &gate_extra, e);
             ggml_sycl_cache_id up_key   = ggml_sycl_get_moe_expert_cache_key(&up_tensor, &up_extra, e);
-            if (!gate_key.valid || !up_key.valid) {
+            ggml_sycl_cache_id down_key = ggml_sycl_get_moe_expert_cache_key(&down_tensor, &down_extra, e);
+            if (!gate_key.valid || !up_key.valid || !down_key.valid ||
+                ggml_sycl::detail::cache_id_equal(gate_key, up_key) ||
+                ggml_sycl::detail::cache_id_equal(gate_key, down_key) ||
+                ggml_sycl::detail::cache_id_equal(up_key, down_key)) {
                 sycl::event::wait(stage_events);
                 return false;
             }
             gate_key            = ggml_sycl_layout_specific_moe_expert_cache_key(gate_key, GGML_LAYOUT_SOA);
             up_key              = ggml_sycl_layout_specific_moe_expert_cache_key(up_key, GGML_LAYOUT_SOA);
+            down_key            = ggml_sycl_layout_specific_moe_expert_cache_key(down_key, GGML_LAYOUT_SOA);
             void *     gate_out = nullptr;
             void *     up_out   = nullptr;
+            void *     down_out = nullptr;
             const bool gate_ok  = test_stage_soa_expert_handle(cache, q, gate_extra, gate_key, e, gate_data.data(),
                                                                gate_data.size(), &gate_out, &stage_events);
             const bool up_ok    = test_stage_soa_expert_handle(cache, q, up_extra, up_key, e, up_data.data(),
                                                                up_data.size(), &up_out, &stage_events);
-            if (!gate_ok || !up_ok) {
+            const bool down_ok  = test_stage_soa_expert_handle(cache, q, down_extra, down_key, e, down_data.data(),
+                                                               down_data.size(), &down_out, &stage_events);
+            if (!gate_ok || !up_ok || !down_ok) {
                 sycl::event::wait(stage_events);
                 return false;
             }
             if (e == expert_id) {
                 gate_ptr = gate_out;
                 up_ptr   = up_out;
+                down_ptr = down_out;
             }
             ids_host.push_back(e);
         }
     }
-    if (!gate_ptr || !up_ptr || gate_ptr == up_ptr) {
+    if (!gate_ptr || !up_ptr || !down_ptr || gate_ptr == up_ptr || gate_ptr == down_ptr || up_ptr == down_ptr) {
         sycl::event::wait(stage_events);
         return false;
     }
@@ -9252,14 +9289,39 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
     }
 
     std::vector<void *> up_payload;
-    up_extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(up_tensor.ne[2]), up_payload);
+    up_extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(up_tensor.ne[2]), up_data.size(), up_payload,
+                                                /*require_all=*/true, /*require_device=*/true,
+                                                /*require_layout=*/true, GGML_LAYOUT_SOA);
     const void * uploaded_up_ptr =
         static_cast<size_t>(expert_id) < up_payload.size() ? up_payload[static_cast<size_t>(expert_id)] : nullptr;
-    const bool dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
+    const bool up_dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
     up_table_event.wait();
+
+    ggml_tensor down_ids_tensor{};
+    sycl::event down_table_event;
+    g_test_moe_ptr_table_ready_event_deps.store(0, std::memory_order_relaxed);
+    const bool down_ok = ggml_sycl_update_moe_ptr_table(ctx, &down_tensor, &down_ids_tensor, GGML_LAYOUT_SOA,
+                                                        &down_table_event, moe_ptr_table_coverage::SELECTED_IDS, nullptr,
+                                                        /*skip_device_copy=*/false,
+                                                        /*force_cache_aos=*/false,
+                                                        /*skip_cpu_routed_experts=*/false,
+                                                        /*exact_layout_required=*/false);
+    if (!down_ok) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+    std::vector<void *> down_payload;
+    down_extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(down_tensor.ne[2]), down_data.size(),
+                                                  down_payload, /*require_all=*/true, /*require_device=*/true,
+                                                  /*require_layout=*/true, GGML_LAYOUT_SOA);
+    const void * uploaded_down_ptr = static_cast<size_t>(expert_id) < down_payload.size() ?
+        down_payload[static_cast<size_t>(expert_id)] : nullptr;
+    const bool down_dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
+    down_table_event.wait();
     sycl::event::wait(stage_events);
 
-    return uploaded_up_ptr == up_ptr && uploaded_up_ptr != gate_ptr && dep_chained;
+    return uploaded_up_ptr == up_ptr && uploaded_up_ptr != gate_ptr && uploaded_up_ptr != down_ptr &&
+           uploaded_down_ptr == down_ptr && uploaded_down_ptr != gate_ptr && up_dep_chained && down_dep_chained;
 }
 
 size_t test_layout_bytes(const ggml_tensor * tensor, ggml_layout_mode layout, int device) {
@@ -15499,14 +15561,10 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
 }
 
 bool test_moe_ptr_table_does_not_persist_pointer_cache() {
-    if (!test_moe_ptr_table_cached_reuse_is_tensor_specific()) {
-        return false;
-    }
-
-    auto it = g_moe_layer_ids_cache.find(12);
-    if (it == g_moe_layer_ids_cache.end() || it->second.ids_host.empty()) {
-        return false;
-    }
+    // This is an IDs-only cache contract test, not a sequel to the role-reuse
+    // fixture. Start from explicit local state so ordering cannot hide a stale
+    // pointer cache or make this test depend on another test's layer-12 IDs.
+    g_moe_layer_ids_cache.clear();
 
     unified_cache * cache = get_unified_cache_for_device(0);
     if (!cache) {
@@ -50268,14 +50326,13 @@ static uint64_t ggml_sycl_hash_ids(const std::vector<int32_t> & ids) {
     return hash;
 }
 
-const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
-
-                                                 const ggml_tensor * ids,
-                                                 sycl::event *       out_event,
-                                                 int64_t *           out_nb0,
-                                                 int64_t *           out_nb1,
-                                                 bool                allow_async,
-                                                 ggml_sycl::mem_handle * out_device_handle = nullptr) {
+static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_context & ctx,
+                                                              const ggml_tensor *         ids,
+                                                              sycl::event *               out_event,
+                                                              int64_t *                   out_nb0,
+                                                              int64_t *                   out_nb1,
+                                                              bool                        allow_async,
+                                                              ggml_sycl::mem_handle *     out_device_handle) {
     using moe_ids_clock                         = std::chrono::high_resolution_clock;
     static const bool ids_stage_profile_enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_IDS_STAGE_PROFILE");
@@ -50567,6 +50624,25 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
     retain_uncached_handles();
     return static_cast<const int32_t *>(entry.device_ids);
 }
+
+const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
+                                                 const ggml_tensor *         ids,
+                                                 sycl::event *               out_event,
+                                                 int64_t *                   out_nb0,
+                                                 int64_t *                   out_nb1,
+                                                 bool                        allow_async) {
+    return ggml_sycl_get_moe_ids_device_ptr_exact(ctx, ids, out_event, out_nb0, out_nb1, allow_async, nullptr);
+}
+
+namespace ggml_sycl {
+test_moe_ids_device_receipt test_stage_moe_ids_device(const ggml_tensor * ids, int device) {
+    test_moe_ids_device_receipt receipt{};
+    ggml_backend_sycl_context   ctx(device);
+    receipt.ptr = ggml_sycl_get_moe_ids_device_ptr_exact(ctx, ids, &receipt.ready_event, &receipt.nb0, &receipt.nb1,
+                                                          /*allow_async=*/true, &receipt.handle);
+    return receipt;
+}
+}  // namespace ggml_sycl
 
 static bool ggml_sycl_release_moe_tensor_layout(const ggml_tensor * src0, int device, layout_mode layout);
 
@@ -62894,7 +62970,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ggml_sycl::mem_handle ids_device_handle;
                     int64_t               ids_device_nb0 = ids->nb[0];
                     int64_t               ids_device_nb1 = ids->nb[1];
-                    const int32_t *       ids_device = ggml_sycl_get_moe_ids_device_ptr(
+                    const int32_t *       ids_device = ggml_sycl_get_moe_ids_device_ptr_exact(
                         ctx, ids, &ids_device_event, &ids_device_nb0, &ids_device_nb1, /*allow_async=*/true,
                         &ids_device_handle);
 

@@ -607,6 +607,35 @@ static bool test_moe_ptr_table_lease_covers_populated_slots() {
     return true;
 }
 
+static bool test_exact_staged_ids_receipt() {
+    printf("\n=== Test: exact staged IDs pointer/handle/event receipt ===\n");
+    std::vector<int32_t> ids_data = { 3, 1, 2, 0 };
+    ggml_tensor          ids{};
+    ids.type  = GGML_TYPE_I32;
+    ids.ne[0] = 2;
+    ids.ne[1] = 2;
+    ids.ne[2] = 1;
+    ids.ne[3] = 1;
+    ids.nb[0] = sizeof(int32_t);
+    ids.nb[1] = 2 * sizeof(int32_t);
+    ids.nb[2] = 4 * sizeof(int32_t);
+    ids.nb[3] = ids.nb[2];
+    ids.data  = ids_data.data();
+    ggml_set_name(&ids, "test.moe_ids");
+
+    auto receipt = ggml_sycl::test_stage_moe_ids_device(&ids, 0);
+    TEST_ASSERT(receipt.ptr != nullptr, "IDs seam returned no staged ABI pointer");
+    TEST_ASSERT(receipt.handle.has_stable_owner_identity(), "IDs seam returned no exact allocation lease");
+    const auto resolved = receipt.handle.resolve(0);
+    TEST_ASSERT(resolved && resolved.on_device && resolved.ptr == receipt.ptr,
+                "IDs receipt handle does not resolve to its exact ABI pointer");
+    TEST_ASSERT(receipt.nb0 == static_cast<int64_t>(sizeof(int32_t)) &&
+                    receipt.nb1 == static_cast<int64_t>(2 * sizeof(int32_t)),
+                "IDs receipt did not return normalized staged strides");
+    receipt.ready_event.wait_and_throw();
+    return true;
+}
+
 static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
     printf("\n=== Test: MoE dispatch bundle retains table/compact/missing backing until delayed event ===\n");
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing(),
@@ -657,6 +686,7 @@ int main() {
     // bound across unrelated cache tests makes their unowned keys look like
     // members of that load and contaminates every later authority decision.
     bool ok = test_exact_wrapper_owner_resolution();
+    ok &= test_exact_staged_ids_receipt();
     ok &= test_normal_cache_expert_resolution(*q);
     ok &= test_direct_staged_device_resolution(*q);
     // Keep the global-cache / ready-event chaining coverage ahead of the

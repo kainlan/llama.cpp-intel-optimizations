@@ -45,6 +45,18 @@ bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();
 bool               test_moe_ptr_table_does_not_persist_pointer_cache();
 bool               test_moe_ptr_table_lease_covers_populated_slots();
 bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
+
+// Exact test seam for the staged IDs ABI. The pointer, allocation lease, ready
+// event, and normalized strides are one receipt and must be consumed together.
+struct test_moe_ids_device_receipt {
+    const int32_t * ptr = nullptr;
+    mem_handle      handle;
+    sycl::event     ready_event;
+    int64_t         nb0 = 0;
+    int64_t         nb1 = 0;
+};
+test_moe_ids_device_receipt test_stage_moe_ids_device(const ggml_tensor * ids, int device);
+
 constexpr uint32_t TEST_GRAPH_BOUNDARY_DRAIN_RETAINED = 1u << 0;
 constexpr uint32_t TEST_GRAPH_BOUNDARY_CLEAR_ACTIVE   = 1u << 1;
 constexpr uint32_t TEST_GRAPH_BOUNDARY_RESET_ARENAS   = 1u << 2;
