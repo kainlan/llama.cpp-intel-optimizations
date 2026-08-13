@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <stdexcept>
 #include <sycl/sycl.hpp>
@@ -616,7 +617,23 @@ static bool test_stream_dma_mmap_fail(sycl::queue & q) {
 struct dma_later_failure_fixture {
     std::atomic<int>  submit_count{ 0 };
     std::atomic<bool> release_first_slot{ false };
-    std::atomic<bool> failure_reached{ false };
+    std::atomic<bool> cleanup_entered{ false };
+};
+
+class dma_submit_failure final : public std::runtime_error {
+public:
+    explicit dma_submit_failure(std::atomic<bool> & cleanup_entered) :
+        std::runtime_error("fixture fifth submit failure"), cleanup_entered_(cleanup_entered) {}
+
+    const char * what() const noexcept override {
+        // stream_dma calls what() in its std::exception catch immediately
+        // before entering the unconditional failure cleanup queue wait.
+        cleanup_entered_.store(true, std::memory_order_release);
+        return std::runtime_error::what();
+    }
+
+private:
+    std::atomic<bool> & cleanup_entered_;
 };
 
 class stream_dma_fixture_copy_kernel;
@@ -633,8 +650,7 @@ static sycl::event stream_dma_fixture_submit(sycl::queue &                    q,
         static_cast<const dma_later_failure_fixture *>(opaque));
     const int nth = fixture->submit_count.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (nth == 5) {
-        fixture->failure_reached.store(true, std::memory_order_release);
-        throw std::runtime_error("fixture fifth submit failure");
+        throw dma_submit_failure(fixture->cleanup_entered);
     }
     return q.submit([&](sycl::handler & cgh) {
         cgh.depends_on(deps);
@@ -654,8 +670,7 @@ static sycl::event stream_dma_fixture_slice(sycl::queue &                    q,
         static_cast<const dma_later_failure_fixture *>(opaque));
     const int nth = fixture->submit_count.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (nth == 5) {
-        fixture->failure_reached.store(true, std::memory_order_release);
-        throw std::runtime_error("fixture fifth submit failure");
+        throw dma_submit_failure(fixture->cleanup_entered);
     }
     const bool block_first_slot = nth == 2;
     return q.submit([&](sycl::handler & cgh) {
@@ -683,34 +698,31 @@ static bool test_stream_dma_later_failure_drains_all_ooo_slots(sycl::queue & q) 
     view.location = ggml_sycl::cache_location::HOST_PINNED;
 
     dma_later_failure_fixture fixture;
-    std::atomic<bool> returned{ false };
-    ggml_sycl::unified_cache::dma_stream_result result{};
-    std::thread worker([&] {
-        result = cache.stream_dma(view, data.size(), 64, 3, stream_dma_fixture_slice, &fixture, {},
-                                  stream_dma_fixture_submit);
-        returned.store(true, std::memory_order_release);
+    auto result_future = std::async(std::launch::async, [&] {
+        return cache.stream_dma(view, data.size(), 64, 3, stream_dma_fixture_slice, &fixture, {},
+                                stream_dma_fixture_submit);
     });
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!fixture.failure_reached.load(std::memory_order_acquire) &&
+    while (!fixture.cleanup_entered.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
-    if (!fixture.failure_reached.load(std::memory_order_acquire)) {
+    if (!fixture.cleanup_entered.load(std::memory_order_acquire)) {
         fixture.release_first_slot.store(true, std::memory_order_release);
-        worker.join();
-        fprintf(stderr, "DMA fifth-submit failpoint was not reached\n");
+        (void) result_future.get();
+        fprintf(stderr, "DMA failure cleanup did not reach its queue-wait barrier\n");
         return false;
     }
 
-    // The old latest-event-only cleanup returns here because slot 1 is already
-    // terminal. Exact queue draining cannot return until slot 0 is released.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    const bool returned_before_release = returned.load(std::memory_order_acquire);
+    // what() is the explicit cleanup-entered barrier immediately before the
+    // production queue wait. The future must remain blocked until the earlier
+    // OOO slot's independent release barrier opens; no timing inference.
+    const bool blocked_at_cleanup = result_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
     fixture.release_first_slot.store(true, std::memory_order_release);
-    worker.join();
+    auto result = result_future.get();
 
-    if (returned_before_release) {
+    if (!blocked_at_cleanup) {
         fprintf(stderr, "Partial DMA failure returned while an earlier OOO slot was still live\n");
         return false;
     }

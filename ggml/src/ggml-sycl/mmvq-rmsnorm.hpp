@@ -28,6 +28,11 @@
 #include <sycl/sycl.hpp>
 #include <utility>
 
+#if defined(GGML_SYCL_RETAINED_PUBLICATION_TESTING)
+#include <atomic>
+#include <stdexcept>
+#endif
+
 // Maximum SLM size for Q8 buffer (in bytes)
 // For 4096 hidden dim: 4096 + 128*4 = 4608 bytes
 // Max SLM on Intel Arc: 128KB - we're well within this
@@ -296,6 +301,38 @@ static void mul_mat_vec_q4_0_f32_rmsnorm_sycl(
     ggml_sycl::mem_fill(dst_handle, 0, nrows * batch_size * sizeof(float), *stream);
 }
 
+// Keep the batch loop and its post-submit ownership callback in one helper so
+// tests exercise the exact control flow used by production. In particular, a
+// submit-N exception must leave every earlier successful submission marked.
+template <typename SubmitBatchFn, typename SubmittedFn>
+static void ggml_sycl_mmvq_rmsnorm_submit_batches(
+    const int batch_size,
+    SubmitBatchFn && submit_batch,
+    SubmittedFn && on_submitted
+) {
+    for (int batch = 0; batch < batch_size; ++batch) {
+        submit_batch(batch);
+        on_submitted();
+    }
+}
+
+#if defined(GGML_SYCL_RETAINED_PUBLICATION_TESTING)
+// Header-internal failpoint: available only to the direct-source retention
+// fixture and never exported by the ordinary backend library.
+static void ggml_sycl_mmvq_rmsnorm_fail_submit_n_for_test(
+    const int batch,
+    const int fail_batch,
+    std::atomic<bool> & cleanup_entered
+) {
+    if (batch == fail_batch) {
+        // The throw immediately enters terminal_retention_ticket unwinding;
+        // its SUBMITTED destructor is the failure cleanup wait.
+        cleanup_entered.store(true, std::memory_order_release);
+        throw std::runtime_error("injected RMSNorm batch submit failure");
+    }
+}
+#endif
+
 template <typename SubmittedFn>
 static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
     const void * vx,
@@ -326,34 +363,36 @@ static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
 
-    for (int b = 0; b < batch_size; b++) {
-        const float * input_b = f32_input + b * ncols;
-        float * dst_b = dst + b * nrows;
-        const float rms_scale = rms_scales[b];
+    ggml_sycl_mmvq_rmsnorm_submit_batches(
+        batch_size,
+        [&](int b) {
+            const float * input_b = f32_input + b * ncols;
+            float * dst_b = dst + b * nrows;
+            const float rms_scale = rms_scales[b];
 
-        stream->submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<int8_t, 1> slm_qs_acc(sycl::range<1>(ncols), cgh);
-            sycl::local_accessor<sycl::half2, 1> slm_ds_acc(sycl::range<1>(num_blocks), cgh);
-            sycl::local_accessor<float, 1> slm_scratch_acc(sycl::range<1>(ncols), cgh);
+            stream->submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<int8_t, 1> slm_qs_acc(sycl::range<1>(ncols), cgh);
+                sycl::local_accessor<sycl::half2, 1> slm_ds_acc(sycl::range<1>(num_blocks), cgh);
+                sycl::local_accessor<float, 1> slm_scratch_acc(sycl::range<1>(ncols), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    mul_mat_vec_q8_0_f32_rmsnorm_slm(
-                        vx, input_b, gamma, rms_scale, dst_b,
-                        ncols, nrows,
-                        slm_qs_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        slm_ds_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        slm_scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
-                }
-            );
-        });
-        // The callback runs only after submit returned successfully. Marking
-        // after every batch is intentional: terminal_retention_ticket makes it
-        // idempotent, while a later batch throw leaves the first submit owned.
-        on_submitted();
-    }
+                cgh.parallel_for(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q8_0_f32_rmsnorm_slm(
+                            vx, input_b, gamma, rms_scale, dst_b,
+                            ncols, nrows,
+                            slm_qs_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                            slm_ds_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                            slm_scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                            item);
+                    }
+                );
+            });
+        },
+        // This runs only after submit returned successfully. Calling it after
+        // every batch is intentional: terminal_retention_ticket is idempotent,
+        // while a later batch throw leaves the first submit owned.
+        std::forward<SubmittedFn>(on_submitted));
 }
 
 // =============================================================================

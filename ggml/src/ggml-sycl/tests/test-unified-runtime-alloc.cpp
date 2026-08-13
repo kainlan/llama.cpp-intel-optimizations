@@ -12,6 +12,8 @@
 
 #include "sycl-test-skip.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -723,6 +725,90 @@ static bool arena_owned_shutdown_and_lifecycle_serialization(sycl::queue & q) {
     return true;
 }
 
+static bool arena_shutdown_drains_dma_and_bcs(sycl::queue & q) {
+    TEST_BEGIN("B50_shutdown_drains_dma_and_bcs");
+    constexpr size_t mib = 1024ull * 1024ull;
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    std::atomic<unsigned> completed{ 0 };
+    auto submit_marker = [&](sycl::queue & exact_queue) {
+        exact_queue.submit([&](sycl::handler & cgh) {
+            cgh.host_task([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                completed.fetch_add(1, std::memory_order_release);
+            });
+        });
+    };
+    submit_marker(cache.get_dma_queue());
+    submit_marker(cache.get_bcs_queue());
+    TEST_ASSERT(cache.shutdown_resources(), "shutdown failed while exact transfer queues were in flight");
+    TEST_ASSERT(completed.load(std::memory_order_acquire) == 2,
+                "shutdown released owners before DMA/BCS terminal work completed");
+    TEST_PASS();
+    return true;
+}
+
+static bool arena_destroy_timeout_preserves_authority_for_retry(sycl::queue & q) {
+    TEST_BEGIN("B70_arena_destroy_timeout_preserves_authority_for_retry");
+    constexpr size_t mib = 1024ull * 1024ull;
+    const size_t max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_PASS();
+        return true;
+    }
+    TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "scratch owner reserve failed");
+    mem_handle retained = cache.test_scratch_pool_owner();
+    TEST_ASSERT(retained.resolve(), "copied arena owner did not acquire its authority lease");
+
+    unified_cache_test_set_arena_drain_timeout_ms(10);
+    TEST_ASSERT(!cache.shutdown_resources(), "destroy unexpectedly freed an arena with a retained lease");
+    TEST_ASSERT(cache.arena_active() && cache.chunk_count() > 0,
+                "timed-out destroy discarded physical chunks needed by retry");
+    retained = {};
+    unified_cache_test_set_arena_drain_timeout_ms(5000);
+    TEST_ASSERT(cache.shutdown_resources(), "destroy retry did not drain the persisted authority");
+    TEST_ASSERT(!cache.arena_active(), "successful retry left physical arena chunks live");
+    TEST_PASS();
+    return true;
+}
+
+static bool concurrent_settle_destroy_closing_wins(sycl::queue & q) {
+    TEST_BEGIN("B70_concurrent_settle_destroy_closing_wins");
+    constexpr size_t mib = 1024ull * 1024ull;
+    const size_t max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_PASS();
+        return true;
+    }
+
+    unified_cache_test_pause_zone_settle(true);
+    std::thread settler([&] { cache.test_zone_boundary_check(vram_zone_id::ONEDNN); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!unified_cache_test_zone_settle_reached() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!unified_cache_test_zone_settle_reached()) {
+        unified_cache_test_pause_zone_settle(false);
+        settler.join();
+        TEST_FAIL("settle did not reach the deterministic RESETTING barrier");
+    }
+
+    bool destroyed = false;
+    std::thread destroyer([&] { destroyed = cache.shutdown_resources(); });
+    while (!unified_cache_test_arena_destroy_closing_reached() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool closing_won = unified_cache_test_arena_destroy_closing_reached();
+    unified_cache_test_pause_zone_settle(false);
+    settler.join();
+    destroyer.join();
+    TEST_ASSERT(closing_won, "destroy did not take ownership from the concurrent RESETTING transaction");
+    TEST_ASSERT(destroyed && !cache.arena_active(), "settler reopened the arena after CLOSING won");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -834,6 +920,9 @@ int main(int argc, char ** argv) {
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
+    ok &= arena_shutdown_drains_dma_and_bcs(q);
+    ok &= arena_destroy_timeout_preserves_authority_for_retry(q);
+    ok &= concurrent_settle_destroy_closing_wins(q);
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // The fixture owns a process-global cache, so drain it while q and the SYCL
     // runtime are still alive rather than relying on static destruction.

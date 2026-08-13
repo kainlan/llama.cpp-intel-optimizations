@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -58,6 +59,7 @@
 #include "../unified-cache.hpp"
 #include "../mem-handle.hpp"
 #include "../common.hpp"
+#include "../mmvq-rmsnorm.hpp"
 
 #include "sycl-test-skip.hpp"
 
@@ -802,50 +804,56 @@ static bool test_mmvq_rmsnorm_second_batch_failure_drains_first(sycl::queue & q)
     TEST_BEGIN("mmvq_rmsnorm_second_batch_failure_drains_first");
 
     std::atomic<bool> release_first{ false };
-    std::atomic<bool> first_submitted{ false };
-    std::atomic<bool> returned{ false };
-    std::atomic<bool> caught_second_failure{ false };
+    std::atomic<bool> cleanup_entered{ false };
+    std::atomic<int> submitted_callbacks{ 0 };
     int marker = 0;
 
-    std::thread worker([&] {
+    auto result = std::async(std::launch::async, [&] {
         try {
             auto ticket = ggml_sycl::terminal_retention_ticket::prepare(
                 {}, { ggml_sycl::mem_handle::from_direct(&marker, GGML_LAYOUT_AOS, false) });
-            for (int batch = 0; batch < 2; ++batch) {
-                if (batch == 1) throw std::runtime_error("fixture second-batch submit failure");
-                q.submit([&](sycl::handler & cgh) {
-                    cgh.host_task([&] {
-                        while (!release_first.load(std::memory_order_acquire)) std::this_thread::yield();
+            ggml_sycl_mmvq_rmsnorm_submit_batches(
+                2,
+                [&](int batch) {
+                    ggml_sycl_mmvq_rmsnorm_fail_submit_n_for_test(batch, 1, cleanup_entered);
+                    q.submit([&](sycl::handler & cgh) {
+                        cgh.host_task([&] {
+                            while (!release_first.load(std::memory_order_acquire)) std::this_thread::yield();
+                        });
                     });
+                },
+                [&] {
+                    ticket.mark_submitted(q);
+                    submitted_callbacks.fetch_add(1, std::memory_order_release);
                 });
-                // Mirrors the Q8 RMSNorm callback: it runs immediately after a
-                // successful batch submit and is safe to call for every batch.
-                ticket.mark_submitted(q);
-                first_submitted.store(true, std::memory_order_release);
-            }
         } catch (const std::runtime_error &) {
-            caught_second_failure.store(true, std::memory_order_release);
+            return true;
         }
-        returned.store(true, std::memory_order_release);
+        return false;
     });
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!first_submitted.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    while (!cleanup_entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
-    if (!first_submitted.load(std::memory_order_acquire)) {
+    if (!cleanup_entered.load(std::memory_order_acquire)) {
         release_first.store(true, std::memory_order_release);
-        worker.join();
-        fprintf(stderr, "FAIL: first RMSNorm batch was not submitted\n");
+        (void) result.get();
+        fprintf(stderr, "FAIL: RMSNorm second-submit cleanup barrier was not reached\n");
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    const bool returned_before_release = returned.load(std::memory_order_acquire);
-    release_first.store(true, std::memory_order_release);
-    worker.join();
 
-    TEST_ASSERT(!returned_before_release, "second-batch failure released ticket owners before first batch drained");
-    TEST_ASSERT(caught_second_failure.load(std::memory_order_acquire), "second-batch submit failure was not observed");
+    // The private failpoint signals immediately before exception unwinding
+    // enters the submitted ticket's queue wait. The future cannot complete
+    // until the independently controlled first-batch barrier is released.
+    const bool blocked_at_cleanup = result.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+    const int callbacks_before_release = submitted_callbacks.load(std::memory_order_acquire);
+    release_first.store(true, std::memory_order_release);
+    const bool caught_second_failure = result.get();
+
+    TEST_ASSERT(blocked_at_cleanup, "second-batch failure released ticket owners before first batch drained");
+    TEST_ASSERT(callbacks_before_release == 1, "production batch loop callback did not mark exactly the successful submit");
+    TEST_ASSERT(caught_second_failure, "second-batch submit failure was not observed");
     TEST_PASS();
     return true;
 }

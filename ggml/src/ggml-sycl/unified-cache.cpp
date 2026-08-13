@@ -707,6 +707,10 @@ static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool>     g_test_fail_next_arena_free{ false };
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
+static std::atomic<uint32_t> g_test_arena_drain_timeout_ms{ 5000 };
+static std::atomic<bool>     g_test_pause_zone_settle{ false };
+static std::atomic<bool>     g_test_zone_settle_reached{ false };
+static std::atomic<bool>     g_test_arena_destroy_closing_reached{ false };
 #endif
 static bool fail_expert_phase(expert_fault_phase phase) noexcept;
 
@@ -3018,6 +3022,31 @@ unified_cache::~unified_cache() {
     }
 }
 
+bool unified_cache::drain_all_queues_noexcept() noexcept {
+    bool ok = true;
+    std::array<sycl::queue *, 4> queues{ &queue_, compute_queue_, dma_queue_.get(), bcs_queue_.get() };
+    std::array<const char *, 4> names{ "main", "compute", "DMA", "BCS" };
+    for (size_t i = 0; i < queues.size(); ++i) {
+        sycl::queue * q = queues[i];
+        if (!q) continue;
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j) duplicate = duplicate || queues[j] == q;
+        if (duplicate) continue;
+        try {
+            q->wait_and_throw();
+        } catch (const sycl::exception & e) {
+            if (ok) GGML_LOG_ERROR("[UNIFIED-CACHE] %s queue shutdown drain failed first: %s\n", names[i], e.what());
+            else GGML_LOG_ERROR("[UNIFIED-CACHE] %s queue shutdown drain also failed: %s\n", names[i], e.what());
+            ok = false;
+        } catch (...) {
+            if (ok) GGML_LOG_ERROR("[UNIFIED-CACHE] %s queue shutdown drain failed first\n", names[i]);
+            else GGML_LOG_ERROR("[UNIFIED-CACHE] %s queue shutdown drain also failed\n", names[i]);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 bool unified_cache::shutdown_resources() {
     if (resources_shutdown_) {
         return true;
@@ -3102,18 +3131,10 @@ bool unified_cache::shutdown_resources() {
         return true;
     }
 
-    // Establish the shutdown boundary before releasing any owner. Event-bound
-    // work must be terminal before its exact zone_free/unified_free can run.
-    try {
-        queue_.wait_and_throw();
-        if (compute_queue_ && compute_queue_ != &queue_) compute_queue_->wait_and_throw();
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown queue drain failed: %s\n", e.what());
-        return false;
-    } catch (...) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown queue drain failed\n");
-        return false;
-    }
+    // Establish the terminal boundary across every exact submission queue
+    // before releasing scratch, staging, canonical, or arena owners. A failure
+    // on one queue never prevents the remaining queues from being drained.
+    if (!drain_all_queues_noexcept()) return false;
     {
         std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
         if (onednn_scratch_refcount_ != 0) {
@@ -18342,34 +18363,52 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         return;
     }
     // Claim the whole settle transaction before authority admission is closed.
+    // Preallocate the durable drain slots first: after close, no exception path
+    // may leave a retired authority only in this stack frame.
+    try {
+        physical_group.draining_authorities.reserve(physical_group.draining_authorities.size() + reset_zone_count);
+    } catch (...) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] could not reserve durable %s authority drains; refusing reset\n",
+                       vram_zone_name(zone));
+        return;
+    }
     // Allocations, another settle, and destroy all observe RESETTING while the
     // group mutex is released for the potentially slow terminal drain.
     physical_group.state = allocator_group_state::RESETTING;
     const uint64_t settle_epoch = ++physical_group.lifecycle_epoch;
-    for (size_t i = 0; i < reset_zone_count; ++i) retired_authorities[i] = arena_close_authority(reset_zones[i]);
-    lock.unlock();
     for (size_t i = 0; i < reset_zone_count; ++i) {
-        if (retired_authorities[i] && !retired_authorities[i]->wait_for_terminal_leases()) {
+        retired_authorities[i] = arena_close_authority(reset_zones[i]);
+        // Persist every retired authority before dropping the lifecycle lock.
+        // Destroy can now take over a concurrent RESETTING transaction without
+        // waiting for this stack frame or losing a still-live lease.
+        if (retired_authorities[i]) physical_group.draining_authorities.push_back(retired_authorities[i]);
+    }
+    lock.unlock();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_zone_settle_reached.store(true, std::memory_order_release);
+    while (g_test_pause_zone_settle.load(std::memory_order_acquire)) std::this_thread::yield();
+    const uint32_t drain_timeout_ms = g_test_arena_drain_timeout_ms.load(std::memory_order_acquire);
+#else
+    constexpr uint32_t drain_timeout_ms = 5000;
+#endif
+    bool all_drained = true;
+    for (size_t i = 0; i < reset_zone_count; ++i) {
+        if (retired_authorities[i] && !retired_authorities[i]->wait_for_terminal_leases(drain_timeout_ms)) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] timed out draining %s allocator-group authority; refusing reset\n",
                            vram_zone_name(reset_zones[i]));
-            // Keep RESETTING fail-closed and retain the exact old authorities.
-            // Explicit shutdown can take over the drain without losing sight of
-            // a lease merely because this stack frame returned.
-            lock.lock();
-            if (physical_group.state == allocator_group_state::RESETTING &&
-                physical_group.lifecycle_epoch == settle_epoch) {
-                physical_group.draining_authorities.clear();
-                for (size_t j = 0; j < reset_zone_count; ++j) {
-                    if (retired_authorities[j]) physical_group.draining_authorities.push_back(retired_authorities[j]);
-                }
-            }
-            return;
+            all_drained = false;
         }
     }
     lock.lock();
+    if (!all_drained) return; // exact authorities remain durable and RESETTING stays fail-closed
     if (physical_group.state != allocator_group_state::RESETTING ||
         physical_group.lifecycle_epoch != settle_epoch) {
-        return;
+        return; // CLOSING won; destroy owns publication and the persistent drains
+    }
+    for (const auto & retired : retired_authorities) {
+        if (!retired) continue;
+        auto & drains = physical_group.draining_authorities;
+        drains.erase(std::remove(drains.begin(), drains.end(), retired), drains.end());
     }
     if (shared_group0) {
         if (arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator) {
@@ -18759,6 +18798,26 @@ void unified_cache_test_fail_next_arena_free() {
 void unified_cache_test_fail_next_shutdown_clean() {
     g_test_fail_next_shutdown_clean.store(true, std::memory_order_release);
 }
+
+void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms) {
+    g_test_arena_drain_timeout_ms.store(timeout_ms, std::memory_order_release);
+}
+
+void unified_cache_test_pause_zone_settle(bool pause) {
+    if (pause) {
+        g_test_zone_settle_reached.store(false, std::memory_order_release);
+        g_test_arena_destroy_closing_reached.store(false, std::memory_order_release);
+    }
+    g_test_pause_zone_settle.store(pause, std::memory_order_release);
+}
+
+bool unified_cache_test_zone_settle_reached() {
+    return g_test_zone_settle_reached.load(std::memory_order_acquire);
+}
+
+bool unified_cache_test_arena_destroy_closing_reached() {
+    return g_test_arena_destroy_closing_reached.load(std::memory_order_acquire);
+}
 #endif
 
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
@@ -18786,51 +18845,85 @@ bool unified_cache::arena_destroy() {
     lifecycle_locks.reserve(ARENA_ALLOCATOR_GROUP_COUNT);
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
-        allocator_group & group = arena_allocator_groups_[i];
-        if (group.state == allocator_group_state::RESETTING) {
-            // A normal settle has a bounded five-second authority drain. Give
-            // it the first chance to finish; a timed-out RESETTING group is
-            // deliberately retryable here by explicit shutdown.
-            (void) group.lifecycle_cv.wait_for(lifecycle_locks.back(), std::chrono::milliseconds(5500), [&] {
-                return group.state != allocator_group_state::RESETTING;
-            });
+    }
+    // Preallocate durable slots before closing admission. Once an authority is
+    // retired, no allocation failure or refusal path may lose its identity.
+    try {
+        for (auto & group : arena_allocator_groups_) {
+            group.draining_authorities.reserve(group.draining_authorities.size() +
+                                               static_cast<size_t>(vram_zone_id::COUNT));
         }
-        // CLOSING is retryable by this serialized explicit destroy path after
-        // a prior physical free failure. No operation can reopen the group.
+    } catch (...) {
+        GGML_LOG_ERROR("[VRAM-ARENA] could not reserve durable authority drain state; refusing destroy\n");
+        return false;
+    }
+
+    // CLOSING wins over a concurrent RESETTING transaction. That settler
+    // already persisted its retired authorities before unlocking, so destroy
+    // can take ownership immediately and no later publication can reopen it.
+    for (auto & group : arena_allocator_groups_) {
+        group.state = allocator_group_state::CLOSING;
+        ++group.lifecycle_epoch;
+    }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_arena_destroy_closing_reached.store(true, std::memory_order_release);
+#endif
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        auto retired = arena_close_authority(static_cast<vram_zone_id>(i));
+        if (retired) {
+            arena_allocator_groups_[arena_allocator_group_index(static_cast<vram_zone_id>(i))]
+                .draining_authorities.push_back(std::move(retired));
+        }
+    }
+    // Allocation refusal is now retryable without authority loss: every
+    // current and inherited authority above is already member-persistent.
+    for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
+        const allocator_group & group = arena_allocator_groups_[i];
         if (!group.allocations.empty()) {
             GGML_LOG_ERROR("[VRAM-ARENA] allocator group %zu still owns %zu live TLSF allocations; refusing destroy\n",
                            i, group.allocations.size());
             return false;
         }
     }
-    std::vector<std::shared_ptr<arena_authority>> inherited_drains;
-    for (auto & group : arena_allocator_groups_) {
-        group.state = allocator_group_state::CLOSING;
-        ++group.lifecycle_epoch;
-        inherited_drains.insert(inherited_drains.end(), group.draining_authorities.begin(),
-                                group.draining_authorities.end());
-    }
-    std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> retired{};
-    for (size_t i = 0; i < retired.size(); ++i) {
-        retired[i] = arena_close_authority(static_cast<vram_zone_id>(i));
+    std::vector<std::shared_ptr<arena_authority>> drain_snapshot;
+    try {
+        size_t drain_count = 0;
+        for (const auto & group : arena_allocator_groups_) drain_count += group.draining_authorities.size();
+        drain_snapshot.reserve(drain_count);
+        for (const auto & group : arena_allocator_groups_) {
+            drain_snapshot.insert(drain_snapshot.end(), group.draining_authorities.begin(),
+                                  group.draining_authorities.end());
+        }
+    } catch (...) {
+        GGML_LOG_ERROR("[VRAM-ARENA] could not snapshot durable authority drains; refusing physical free\n");
+        return false;
     }
     lifecycle_locks.clear();
-    for (const auto & authority : inherited_drains) {
-        if (authority && !authority->wait_for_terminal_leases()) {
-            GGML_LOG_ERROR("[VRAM-ARENA] timed out draining inherited reset authority; refusing physical free\n");
-            return false;
-        }
-    }
-    for (size_t i = 0; i < retired.size(); ++i) {
-        const auto & authority = retired[i];
-        if (authority && !authority->wait_for_terminal_leases()) {
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const uint32_t drain_timeout_ms = g_test_arena_drain_timeout_ms.load(std::memory_order_acquire);
+#else
+    constexpr uint32_t drain_timeout_ms = 5000;
+#endif
+    bool all_authorities_drained = true;
+    // Await every durable authority on every attempt. Do not let one timeout
+    // hide another lease, and remove only authorities proven fully terminal.
+    for (const auto & authority : drain_snapshot) {
+        if (authority && !authority->wait_for_terminal_leases(drain_timeout_ms)) {
             GGML_LOG_ERROR("[VRAM-ARENA] timed out draining exact allocation authority; refusing physical free\n");
-            for (size_t j = 0; j < retired.size(); ++j) {
-                if (retired[j]) arena_publish_prebuilt(static_cast<vram_zone_id>(j), retired[j]);
-            }
-            return false;
+            all_authorities_drained = false;
         }
     }
+    for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
+        lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
+        auto & drains = arena_allocator_groups_[i].draining_authorities;
+        drains.erase(std::remove_if(drains.begin(), drains.end(), [](const auto & authority) {
+            return !authority || authority->terminal_lease_count() == 0;
+        }), drains.end());
+        if (!drains.empty()) all_authorities_drained = false;
+    }
+    if (!all_authorities_drained) return false;
+    lifecycle_locks.clear();
     try {
         arena_queue_->wait_and_throw();
     } catch (const sycl::exception & e) {

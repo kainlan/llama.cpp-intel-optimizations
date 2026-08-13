@@ -2624,8 +2624,10 @@ class unified_cache {
     bool arena_destroy();
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
+    mem_handle test_scratch_pool_owner() const { return scratch_pool_owner_; }
 #endif
     bool resources_shutdown_ = false;
+    bool drain_all_queues_noexcept() noexcept;
 
     // Abandon arena without freeing (for shutdown when SYCL context is invalid).
     void arena_abandon();
@@ -4889,6 +4891,10 @@ bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexc
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();
+void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
+void unified_cache_test_pause_zone_settle(bool pause);
+bool unified_cache_test_zone_settle_reached();
+bool unified_cache_test_arena_destroy_closing_reached();
 #endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
