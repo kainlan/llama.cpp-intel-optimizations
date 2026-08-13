@@ -3151,6 +3151,18 @@ bool unified_cache::shutdown_resources() {
     // before releasing scratch, staging, canonical, or arena owners. A failure
     // on one queue never prevents the remaining queues from being drained.
     if (!drain_all_queues_noexcept()) return false;
+
+    // Retry owning alloc_handle releases before dismantling any cache state.
+    // An independently admitted exact token may still refuse the free; in that
+    // case the durable queue remains the owner and teardown is retryable.
+    process_deferred_frees_public();
+    {
+        std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
+        if (std::any_of(deferred_frees_.begin(), deferred_frees_.end(),
+                        [](const deferred_free_entry & entry) { return entry.retry_handle != nullptr; })) {
+            return false;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
         if (onednn_scratch_refcount_ != 0) {
@@ -3410,7 +3422,15 @@ bool unified_cache::shutdown_resources() {
             } catch (...) {
             }
         }
-        if (entry.ptr) {
+        if (entry.retry_handle) {
+            if (!unified_free(*entry.retry_handle)) {
+                // Exact authority still owns a lease. Preserve both the raw
+                // owner and runtime registry row for a later shutdown retry.
+                return false;
+            }
+            delete entry.retry_handle;
+            entry.retry_handle = nullptr;
+        } else if (entry.ptr) {
             if (entry.zone_managed && entry.zone != vram_zone_id::COUNT) {
                 zone_free(entry.zone, entry.ptr);
             } else if (entry.managed) {
@@ -9024,6 +9044,30 @@ void unified_cache::process_deferred_frees_public() {
     process_deferred_frees_locked();
 }
 
+bool unified_cache::defer_owned_alloc_release(alloc_handle * handle) {
+    if (!handle || !handle->ptr) {
+        return false;
+    }
+    deferred_free_entry entry{};
+    entry.ptr          = handle->ptr;
+    entry.size         = handle->size;
+    entry.retry_handle = handle;
+    {
+        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
+        const auto duplicate = std::find_if(deferred_frees_.begin(), deferred_frees_.end(), [&](const auto & pending) {
+            return pending.retry_handle && pending.retry_handle->ptr == handle->ptr &&
+                   pending.retry_handle->alloc_id == handle->alloc_id;
+        });
+        if (duplicate != deferred_frees_.end()) {
+            return false;
+        }
+        deferred_frees_.push_back(entry);
+    }
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred refused owner: ptr=%p size=%zu alloc_id=%llu\n", handle->ptr,
+                    handle->size, static_cast<unsigned long long>(handle->alloc_id));
+    return true;
+}
+
 void unified_cache::process_deferred_frees_locked() {
     // P7: finalize any completed async D2H evictions first.
     // This reclaims VRAM from entries whose D2H copies have completed.
@@ -9045,7 +9089,17 @@ void unified_cache::process_deferred_frees_locked() {
             continue;
         }
 
-        if (it->ptr) {
+        if (it->retry_handle) {
+            if (!unified_free(*it->retry_handle)) {
+                GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred owner still leased: ptr=%p size=%zu alloc_id=%llu\n",
+                                it->ptr, it->size,
+                                static_cast<unsigned long long>(it->retry_handle->alloc_id));
+                ++it;
+                continue;
+            }
+            delete it->retry_handle;
+            it->retry_handle = nullptr;
+        } else if (it->ptr) {
             const bool is_arena = vram_owns(it->ptr);
             const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(it->ptr);
             if (it->zone_managed) {
@@ -11056,7 +11110,9 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         // Bump-arena device allocations (from_arena=true, vram_zone==COUNT): freed by arena_reset().
         if (rec.handle.zone_managed) {
             if (rec.handle.vram_zone != vram_zone_id::COUNT) {
-                unified_cache_zone_free(rec.handle.device, rec.handle.vram_zone, rec.handle.ptr);
+                if (!unified_cache_zone_free(rec.handle.device, rec.handle.vram_zone, rec.handle.ptr)) {
+                    return false;
+                }
             } else if (rec.handle.host_zone == host_zone_id::WEIGHT || rec.handle.host_zone == host_zone_id::KV ||
                        (rec.handle.host_zone == host_zone_id::SCRATCH &&
                         rec.handle.role == alloc_role::EXPERT_STAGING) ||
@@ -12291,6 +12347,14 @@ bool unified_free_ptr(void * ptr, int expected_device) {
     return true;
 }
 
+bool unified_defer_free(alloc_handle * handle) {
+    if (!handle || !handle->ptr) {
+        return false;
+    }
+    unified_cache * cache = get_existing_cache_for_device(handle->device);
+    return cache && cache->defer_owned_alloc_release(handle);
+}
+
 bool unified_free(const alloc_handle & handle) {
     if (handle.ptr == nullptr) {
         return true;
@@ -12470,7 +12534,10 @@ void unified_cache_deallocate(void * ptr, int device) {
     if (ptr == nullptr) {
         return;
     }
-    unified_free_ptr(ptr, device);
+    if (!unified_free_ptr(ptr, device)) {
+        GGML_LOG_WARN("[UNIFIED-CACHE] compatibility deallocate refused ptr=%p device=%d; allocation remains registered\n",
+                      ptr, device);
+    }
 }
 
 bool unified_alloc_validate_registry(int device, const char * where) {
@@ -17195,11 +17262,9 @@ size_t unified_cache_release_model_slot(uint32_t slot) {
     return reclaimed;
 }
 
-void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr) {
-    auto * cache = get_unified_cache_for_device(device_id);
-    if (cache) {
-        cache->zone_free(zone, ptr);
-    }
+bool unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr) {
+    auto * cache = get_existing_cache_for_device(device_id);
+    return cache && cache->zone_free(zone, ptr);
 }
 
 void unified_cache_host_zone_boundary_check(host_zone_id zone) {

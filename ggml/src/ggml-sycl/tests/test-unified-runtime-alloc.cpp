@@ -697,6 +697,60 @@ static bool explicit_global_cache_shutdown_is_clean() {
     return true;
 }
 
+static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
+    TEST_BEGIN("B50_B70_independent_exact_token_defers_owned_release");
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    if (!cache->arena_active()) {
+        TEST_PASS();
+        return true;
+    }
+
+    alloc_request req{};
+    req.queue                                      = &q;
+    req.size                                       = 4096;
+    req.intent.role                                = alloc_role::GRAPH_TMP;
+    req.intent.category                            = runtime_category::GRAPH;
+    req.intent.constraints.must_device             = true;
+    req.intent.constraints.prefer_vram_zone         = vram_zone_id::RUNTIME;
+
+    alloc_handle allocation{};
+    TEST_ASSERT(unified_alloc(req, &allocation), "exact arena allocation failed");
+    if (!allocation.zone_managed || allocation.vram_zone == vram_zone_id::COUNT) {
+        TEST_ASSERT(unified_free(allocation), "non-arena fixture cleanup failed");
+        TEST_PASS();
+        return true;
+    }
+
+    void * const ptr         = allocation.ptr;
+    const size_t used_before = cache->zone_used(allocation.vram_zone);
+    mem_handle owner         = mem_handle::from_owned_alloc(allocation);
+    TEST_ASSERT(owner.valid(), "owning arena handle construction failed");
+    mem_handle independent = mem_handle::from_arena_zone(
+        static_cast<int>(allocation.vram_zone), allocation.arena_offset, allocation.size, allocation.device,
+        allocation.arena_generation, allocation.alloc_id, allocation.arena_extent,
+        cache->arena_authority_snapshot(allocation.vram_zone));
+    TEST_ASSERT(independent.valid() && independent.resolve().ptr == ptr,
+                "independent exact token admission failed");
+
+    owner = {};
+    alloc_handle looked{};
+    TEST_ASSERT(unified_lookup(ptr, &looked), "refused owner release erased the runtime record");
+    TEST_ASSERT(cache->has_pending_deferred_frees(), "refused owner release lost durable retry ownership");
+    TEST_ASSERT(cache->zone_used(allocation.vram_zone) == used_before,
+                "refused owner release returned the TLSF block");
+
+    cache->process_deferred_frees_public();
+    TEST_ASSERT(unified_lookup(ptr, &looked), "retry freed allocation while independent token remained live");
+    independent = {};
+    cache->process_deferred_frees_public();
+    TEST_ASSERT(!unified_lookup(ptr, &looked), "final-token sync did not erase the runtime record");
+    TEST_ASSERT(cache->zone_used(allocation.vram_zone) < used_before,
+                "final-token sync did not reclaim the TLSF block");
+    TEST_PASS();
+    return true;
+}
+
 static bool arena_owned_shutdown_and_lifecycle_serialization(sycl::queue & q) {
     TEST_BEGIN("arena_owned_shutdown_and_lifecycle_serialization");
     constexpr size_t mib = 1024ull * 1024ull;
@@ -970,6 +1024,7 @@ int main(int argc, char ** argv) {
     ok &= direct_stage_host_fallback_counts_attempt(q);
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
+    ok &= independent_exact_token_defers_owned_release(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
     ok &= arena_shutdown_drains_dma_and_bcs(q);
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);

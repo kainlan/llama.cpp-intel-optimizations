@@ -2380,6 +2380,11 @@ class unified_cache {
     // or during prestage yield loops (outside graph_compute_impl).
     void process_deferred_frees_public();
 
+    // Take ownership of an alloc_handle whose deleter was refused by exact
+    // arena authority. The deferred queue retries the same allocation identity
+    // at subsequent safe synchronization points.
+    bool defer_owned_alloc_release(alloc_handle * handle);
+
     // Check if there are any pending deferred frees (device or host)
     bool has_pending_deferred_frees() const;
 
@@ -3176,7 +3181,7 @@ class unified_cache {
     friend void * unified_cache_arena_alloc_weight(int device_id, size_t size);
     friend void * unified_cache_kv_arena_alloc(int device_id, size_t size);
     friend void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align);
-    friend void   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+    friend bool   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
     friend void   unified_cache_zone_reclaim(int device_id, vram_zone_id zone);
     friend void   unified_cache_zone_boundary_check(int device_id, vram_zone_id zone);
     friend void * device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
@@ -3202,6 +3207,9 @@ class unified_cache {
         vram_zone_id      zone         = vram_zone_id::COUNT;
         bool              has_event    = false;
         sycl::event       event;
+        // Non-null only for a shared-owner deleter refusal. The queue owns this
+        // raw handle until unified_free() succeeds; refusal leaves it in place.
+        alloc_handle *    retry_handle = nullptr;
     };
 
     struct deferred_host_free_entry {
@@ -4020,6 +4028,9 @@ bool       unified_alloc(const alloc_request & req, alloc_handle * out);
 mem_handle unified_allocate(const alloc_request & req);
 bool       unified_free(const alloc_handle & handle);
 bool       unified_free_ptr(void * ptr, int expected_device = -1);
+// Transfer a refused owning handle to its device cache's durable retry queue.
+// Returns false without taking ownership when no live cache can accept it.
+bool       unified_defer_free(alloc_handle * handle);
 bool       unified_lookup(void * ptr, alloc_handle * out);
 bool       unified_lookup_runtime_allocation(const void * ptr, alloc_handle * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
@@ -4725,8 +4736,9 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
 bool unified_cache_zone_allocate(int device_id, vram_zone_id zone, size_t size, alloc_handle * out,
                                  size_t align = 256);
 
-// Free a sub-allocation from a VRAM zone (TLSF reclaim).
-void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+// Free a sub-allocation from a VRAM zone (TLSF reclaim). Returns false when
+// exact allocation authority still has an independently admitted lease.
+bool unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 
 // Real bulk reclaim of a VRAM zone (TLSF coalescing — all sub-allocations
 // become free), used on-demand for KV/RUNTIME (out of this epic's scope).

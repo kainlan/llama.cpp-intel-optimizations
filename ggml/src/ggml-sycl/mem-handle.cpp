@@ -647,10 +647,16 @@ void release_owned_alloc_handle(alloc_handle * handle) {
         return;
     }
     if (handle->ptr && !ggml_sycl_is_shutting_down()) {
-        bool released = unified_free(*handle);
+        const bool released = unified_free(*handle);
         if (!released) {
-            GGML_LOG_WARN("[MEM-HANDLE] owning alloc release failed ptr=%p size=%zu device=%d\n", handle->ptr,
-                          handle->size, handle->device);
+            // shared_ptr deleters cannot propagate refusal. Transfer ownership
+            // to the cache's durable retry queue; do not recurse through
+            // another mem_handle owner and do not discard the runtime record.
+            if (unified_defer_free(handle)) {
+                return;
+            }
+            GGML_LOG_WARN("[MEM-HANDLE] owning alloc release refused without a live retry cache ptr=%p size=%zu device=%d\n",
+                          handle->ptr, handle->size, handle->device);
         }
     }
     delete handle;
