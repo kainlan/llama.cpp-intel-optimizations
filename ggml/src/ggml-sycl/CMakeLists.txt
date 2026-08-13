@@ -4665,5 +4665,9 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;moe;mmvq;production-route;device;B70;B50"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
+        # Cold B70 AOT/submit can exceed the backend's 30 s default watchdog.
+        # Keep the inner watchdog 10 s below CTest's hard bound so a real hang
+        # is still diagnosed by the backend before CTest terminates the process.
+        ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
         TIMEOUT 120)
 endif()
