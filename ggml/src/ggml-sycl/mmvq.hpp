@@ -17,6 +17,7 @@
 #    include <cstdint>
 #else
 #    include "common.hpp"
+#    include "moe-fused-transaction.hpp"
 #endif
 
 inline bool mmvq_q1_nvfp4_aos_id_batch_shape_valid(int total_batches, int n_ids, int n_tokens) {
@@ -483,6 +484,17 @@ struct mmvq_q1_nvfp4_admitted_buffers {
     float * output_f32          = nullptr;
     size_t  output_f32_bytes    = 0;
 };
+
+// Deferred central-router hook. ggml-sycl.cpp must call this only after it has
+// converted its exact gate/up/down retained role batches into bundle metadata
+// and an executor which owns independent role tables/layouts/readiness events.
+// This function is the sole MMVQ entry to transactional prompt fusion.
+ggml_sycl::moe_fused::PromptFusionResult mmvq_submit_retained_prompt_fusion(
+    const ggml_sycl::moe_fused::PromptFusionBundle & bundle,
+    ggml_sycl::moe_fused::PromptFusionExecutor &     executor,
+    ggml_sycl::moe_fused::PublicationStore &         publication,
+    std::uint64_t                                    base_generation,
+    bool                                             inject_publication_failure = false) noexcept;
 
 bool mmvq_submit_q1_nvfp4_aos(sycl::queue &                    q,
                               ggml_type                        weight_type,

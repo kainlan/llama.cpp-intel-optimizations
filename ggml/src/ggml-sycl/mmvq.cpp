@@ -22082,6 +22082,16 @@ static sycl::event mmvq_submit_quantize_q8_1_aos_after(sycl::queue &       q,
     });
 }
 
+ggml_sycl::moe_fused::PromptFusionResult mmvq_submit_retained_prompt_fusion(
+    const ggml_sycl::moe_fused::PromptFusionBundle & bundle,
+    ggml_sycl::moe_fused::PromptFusionExecutor &     executor,
+    ggml_sycl::moe_fused::PublicationStore &         publication,
+    std::uint64_t                                    base_generation,
+    bool                                             inject_publication_failure) noexcept {
+    return ggml_sycl::moe_fused::submit_prompt_fusion(bundle, executor, publication, base_generation,
+                                                      inject_publication_failure);
+}
+
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,

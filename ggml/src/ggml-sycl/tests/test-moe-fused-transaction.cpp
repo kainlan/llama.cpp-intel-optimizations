@@ -407,6 +407,178 @@ void test_optional_down() {
     CHECK(store.snapshot().publication.skip_down);
 }
 
+PromptFusionBundle prompt_bundle() {
+    PromptFusionBundle bundle;
+    auto fill = [](RetainedRoleView & role, std::uintptr_t handle, std::uintptr_t table, std::uintptr_t ready,
+                   std::int64_t layout) {
+        role.present         = true;
+        role.handle_identity = handle;
+        role.table_identity  = table;
+        role.ready_identity  = ready;
+        role.occurrences     = {
+            { 7, 0, 0, 0, handle + 10, layout, OccurrenceResidency::local },
+            { 7, 1, 0, 1, handle + 10, layout, OccurrenceResidency::local },
+            { 3, 2, 1, 0, handle + 11, layout, OccurrenceResidency::local }
+        };
+    };
+    fill(bundle.gate, 11, 12, 13, 1);
+    fill(bundle.up, 21, 22, 23, 2);
+    fill(bundle.down, 31, 32, 33, 3);
+    bundle.activation_identity   = 41;
+    bundle.ids_identity          = 42;
+    bundle.glu_identity          = 43;
+    bundle.intermediate_identity = 44;
+    return bundle;
+}
+
+OwnerBundle prompt_owners(Trace & trace, bool omit_down_table = false) {
+    OwnerBundle owners;
+    auto        add = [&](OwnerRole role, const char * name) {
+        owners.add(role, std::make_unique<TraceOwner>(trace, name));
+    };
+    add(OwnerRole::gate, "gate");
+    add(OwnerRole::gate_table, "gate-table");
+    add(OwnerRole::up, "up");
+    add(OwnerRole::up_table, "up-table");
+    add(OwnerRole::activation, "activation");
+    add(OwnerRole::ids, "ids");
+    add(OwnerRole::glu, "glu");
+    add(OwnerRole::intermediate, "intermediate");
+    add(OwnerRole::down, "down");
+    if (!omit_down_table) {
+        add(OwnerRole::down_table, "down-table");
+    }
+    return owners;
+}
+
+enum class PromptBehavior { success, no_write, missing_terminal, exception_after_write, partial_down };
+
+struct PromptExecutor final : PromptFusionExecutor {
+    PromptExecutor(Trace & trace, PromptBehavior behavior = PromptBehavior::success) :
+        trace(trace),
+        behavior(behavior) {}
+
+    Status preflight(const PromptFusionBundle &) override {
+        ++preflight_calls;
+        return preflight_result;
+    }
+
+    OwnerBundle owners() override { return prompt_owners(trace, omit_down_table); }
+
+    EmergencyToken emergency() override { return EmergencyToken(std::make_unique<TraceDrain>(trace)); }
+
+    Status submit_writes(const PromptFusionBundle &, SubmitRecorder & recorder) override {
+        ++submit_calls;
+        if (behavior == PromptBehavior::no_write) {
+            return { ErrorCode::submit_failed_no_write, "refused" };
+        }
+        CHECK(recorder.mark_write_started());
+        if (behavior == PromptBehavior::exception_after_write) {
+            throw std::runtime_error("post-write");
+        }
+        if (behavior == PromptBehavior::missing_terminal || behavior == PromptBehavior::partial_down) {
+            return behavior == PromptBehavior::partial_down ?
+                       Status{ ErrorCode::submit_failed_no_write, "down failed" } :
+                       Status::ok();
+        }
+        return recorder.install_terminal(TerminalToken(std::make_unique<TraceEvent>(trace)));
+    }
+
+    Trace &        trace;
+    PromptBehavior behavior;
+    Status         preflight_result = Status::ok();
+    bool           omit_down_table  = false;
+    int            preflight_calls  = 0;
+    int            submit_calls     = 0;
+};
+
+void test_prompt_bundle_preflight_and_no_write() {
+    PublicationStore store;
+    for (int mutation = 0; mutation < 5; ++mutation) {
+        Trace              trace;
+        PromptFusionBundle bundle = prompt_bundle();
+        if (mutation == 0) {
+            bundle.up.present = false;
+        }
+        if (mutation == 1) {
+            bundle.down.occurrences[1].expert_id = 8;
+        }
+        if (mutation == 2) {
+            bundle.gate.occurrences[0].residency = OccurrenceResidency::host;
+        }
+        if (mutation == 3) {
+            bundle.up.occurrences[2].residency = OccurrenceResidency::secondary;
+        }
+        if (mutation == 4) {
+            bundle.ids_identity = 0;
+        }
+        PromptExecutor executor(trace);
+        const auto     result = submit_prompt_fusion(bundle, executor, store, 0);
+        CHECK(result.status.code == ErrorCode::preflight_failed);
+        CHECK(result.phase == Phase::rolled_back && result.fallback_allowed);
+        CHECK(executor.submit_calls == 0 && trace.copy().empty());
+    }
+
+    Trace          trace;
+    PromptExecutor refused(trace, PromptBehavior::no_write);
+    const auto     result = submit_prompt_fusion(prompt_bundle(), refused, store, 0);
+    CHECK(result.status.code == ErrorCode::submit_failed_no_write);
+    CHECK(result.phase == Phase::rolled_back && result.fallback_allowed);
+    const auto values = trace.copy();
+    CHECK(values.size() == 11 && values.front() == "drain");  // quiesce before releasing all ten owners
+}
+
+void test_prompt_postwrite_quarantine_failpoints() {
+    for (PromptBehavior behavior :
+         { PromptBehavior::missing_terminal, PromptBehavior::exception_after_write, PromptBehavior::partial_down }) {
+        Trace            trace;
+        PublicationStore store;
+        PromptExecutor   executor(trace, behavior);
+        const auto       result = submit_prompt_fusion(prompt_bundle(), executor, store, 0);
+        CHECK(!result.status);
+        CHECK(result.phase == Phase::quarantined && !result.fallback_allowed);
+        const auto values = trace.copy();
+        CHECK(!values.empty() && values.front() == "drain");
+        CHECK(!store.snapshot().publication.ready);
+    }
+
+    Trace            missing_owner_trace;
+    PublicationStore missing_owner_store;
+    PromptExecutor   missing_owner(missing_owner_trace);
+    missing_owner.omit_down_table = true;
+    const auto missing            = submit_prompt_fusion(prompt_bundle(), missing_owner, missing_owner_store, 0);
+    CHECK(missing.status.code == ErrorCode::owner_mismatch);
+    CHECK(missing.phase == Phase::rolled_back && missing.fallback_allowed);
+}
+
+void test_prompt_atomic_publish_stale_and_failure() {
+    Trace            trace;
+    PublicationStore store;
+    PromptExecutor   first(trace);
+    const auto       published = submit_prompt_fusion(prompt_bundle(), first, store, 0);
+    CHECK(published.status && published.phase == Phase::published && !published.fallback_allowed);
+    const auto snapshot = store.snapshot();
+    CHECK(snapshot.publication.ready && snapshot.publication.skip_gate && snapshot.publication.skip_up &&
+          snapshot.publication.skip_glu && snapshot.publication.skip_down && snapshot.ownership_lease);
+
+    Trace          stale_trace;
+    PromptExecutor stale(stale_trace);
+    const auto     stale_result = submit_prompt_fusion(prompt_bundle(), stale, store, 0);
+    CHECK(stale_result.status.code == ErrorCode::stale_commit);
+    CHECK(stale_result.phase == Phase::quarantined && !stale_result.fallback_allowed);
+    CHECK(!stale_trace.copy().empty() && stale_trace.copy().front() == "wait");
+    CHECK(store.snapshot().publication.generation == 1);
+
+    Trace            failure_trace;
+    PublicationStore failure_store;
+    PromptExecutor   failure(failure_trace);
+    const auto       failure_result = submit_prompt_fusion(prompt_bundle(), failure, failure_store, 0, true);
+    CHECK(failure_result.status.code == ErrorCode::publication_failed);
+    CHECK(failure_result.phase == Phase::quarantined && !failure_result.fallback_allowed);
+    CHECK(!failure_store.snapshot().publication.ready);
+    CHECK(!failure_trace.copy().empty() && failure_trace.copy().front() == "wait");
+}
+
 }  // namespace
 
 int main() {
@@ -416,6 +588,9 @@ int main() {
     test_publication_lifetime_and_failure();
     test_wait_reentry_and_contended_publication();
     test_optional_down();
+    test_prompt_bundle_preflight_and_no_write();
+    test_prompt_postwrite_quarantine_failpoints();
+    test_prompt_atomic_publish_stale_and_failure();
     if (failures) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

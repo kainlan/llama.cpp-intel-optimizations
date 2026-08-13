@@ -25,6 +25,9 @@ enum class ErrorCode {
     invalid_state,
     stale_commit,
     publication_failed,
+    role_alignment_mismatch,
+    nonlocal_role,
+    incomplete_bundle,
 };
 
 struct Status {
@@ -36,7 +39,21 @@ struct Status {
     static Status ok() noexcept { return {}; }
 };
 
-enum class OwnerRole { gate, up, glu, down };
+// Roles are deliberately separate: a table owner is not interchangeable with
+// the handles it indexes, and activation/ID/intermediate storage must cross the
+// same terminal boundary as the weight roles.
+enum class OwnerRole {
+    gate,
+    gate_table,
+    up,
+    up_table,
+    activation,
+    ids,
+    glu,
+    intermediate,
+    down,
+    down_table,
+};
 
 class Owner {
   public:
@@ -113,13 +130,53 @@ class EmergencyToken {
 enum class DownMode { ordinary, fused };
 
 struct FusionPlan {
-    bool     gate_up_pair = false;
-    bool     gate_role    = false;
-    bool     up_role      = false;
-    bool     glu_role     = false;
-    DownMode down         = DownMode::ordinary;
-    bool     down_role    = false;
+    bool     gate_up_pair        = false;
+    bool     gate_role           = false;
+    bool     up_role             = false;
+    bool     glu_role            = false;
+    DownMode down                = DownMode::ordinary;
+    bool     down_role           = false;
+    // The prompt helper requires the complete weight/table/activation/ID/GLU/
+    // intermediate escrow profile. Legacy transaction users retain the compact
+    // gate/up/GLU[/down] profile.
+    bool     exact_prompt_escrow = false;
 };
+
+enum class OccurrenceResidency { local, secondary, host, unavailable };
+
+struct RetainedOccurrence {
+    std::int32_t        expert_id      = -1;
+    std::uint64_t       occurrence     = 0;
+    std::uint64_t       token_index    = 0;
+    std::uint64_t       slot_index     = 0;
+    std::uintptr_t      owner_identity = 0;
+    std::int64_t        layout         = 0;
+    OccurrenceResidency residency      = OccurrenceResidency::unavailable;
+};
+
+// Non-owning preflight metadata. Owners corresponding to every non-zero
+// identity are transferred separately through PromptFusionExecutor::owners().
+// Layout and table identities are role-local; only occurrence coordinates and
+// IDs must align across gate/up/down.
+struct RetainedRoleView {
+    bool                            present         = false;
+    std::uintptr_t                  handle_identity = 0;
+    std::uintptr_t                  table_identity  = 0;
+    std::uintptr_t                  ready_identity  = 0;
+    std::vector<RetainedOccurrence> occurrences;
+};
+
+struct PromptFusionBundle {
+    RetainedRoleView gate;
+    RetainedRoleView up;
+    RetainedRoleView down;
+    std::uintptr_t   activation_identity   = 0;
+    std::uintptr_t   ids_identity          = 0;
+    std::uintptr_t   glu_identity          = 0;
+    std::uintptr_t   intermediate_identity = 0;
+};
+
+Status validate_prompt_fusion_bundle(const PromptFusionBundle & bundle) noexcept;
 
 struct Publication {
     bool          skip_gate  = false;
@@ -184,6 +241,31 @@ class Submitter {
     virtual ~Submitter()                                                      = default;
     virtual Status submit(const FusionPlan & plan, SubmitRecorder & recorder) = 0;
 };
+
+// Exact deferred ggml-sycl integration boundary: the central router supplies
+// one occurrence-aligned retained bundle and an MMVQ executor. The helper owns
+// the complete preflight -> escrow -> write -> terminal -> atomic publication
+// sequence; the router may fall back only when Result::fallback_allowed is true.
+class PromptFusionExecutor {
+  public:
+    virtual ~PromptFusionExecutor()                                                                    = default;
+    virtual Status         preflight(const PromptFusionBundle & bundle)                                = 0;
+    virtual OwnerBundle    owners()                                                                    = 0;
+    virtual EmergencyToken emergency()                                                                 = 0;
+    virtual Status         submit_writes(const PromptFusionBundle & bundle, SubmitRecorder & recorder) = 0;
+};
+
+struct PromptFusionResult {
+    Status status;
+    Phase  phase            = Phase::created;
+    bool   fallback_allowed = true;
+};
+
+PromptFusionResult submit_prompt_fusion(const PromptFusionBundle & bundle,
+                                        PromptFusionExecutor &     executor,
+                                        PublicationStore &         store,
+                                        std::uint64_t              base_generation,
+                                        bool                       inject_publication_failure = false) noexcept;
 
 class Transaction {
   public:

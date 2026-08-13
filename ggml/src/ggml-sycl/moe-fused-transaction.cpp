@@ -70,31 +70,32 @@ PublicationStore::Snapshot PublicationStore::snapshot() const {
 }
 
 Status SubmitRecorder::validate_owners(const OwnerBundle & owners) const noexcept {
-    std::array<unsigned, 4> counts{};
+    std::array<unsigned, 10> counts{};
     for (const auto & entry : owners.entries_) {
         if (!entry.owner) {
             return error(ErrorCode::submitted_without_owners, "owner bundle contains a null owner");
         }
-        unsigned index = 0;
-        switch (entry.role) {
-            case OwnerRole::gate:
-                index = 0;
-                break;
-            case OwnerRole::up:
-                index = 1;
-                break;
-            case OwnerRole::glu:
-                index = 2;
-                break;
-            case OwnerRole::down:
-                index = 3;
-                break;
-            default:
-                return error(ErrorCode::invalid_owner_role, "owner bundle contains an invalid role");
+        const unsigned index = static_cast<unsigned>(entry.role);
+        if (index >= counts.size()) {
+            return error(ErrorCode::invalid_owner_role, "owner bundle contains an invalid role");
         }
         ++counts[index];
     }
-    const std::array<unsigned, 4> expected = { 1, 1, 1, plan_.down == DownMode::fused ? 1u : 0u };
+    std::array<unsigned, 10> expected{};
+    expected[static_cast<unsigned>(OwnerRole::gate)] = 1;
+    expected[static_cast<unsigned>(OwnerRole::up)]   = 1;
+    expected[static_cast<unsigned>(OwnerRole::glu)]  = 1;
+    if (plan_.down == DownMode::fused) {
+        expected[static_cast<unsigned>(OwnerRole::down)] = 1;
+    }
+    if (plan_.exact_prompt_escrow) {
+        expected[static_cast<unsigned>(OwnerRole::gate_table)]   = 1;
+        expected[static_cast<unsigned>(OwnerRole::up_table)]     = 1;
+        expected[static_cast<unsigned>(OwnerRole::activation)]   = 1;
+        expected[static_cast<unsigned>(OwnerRole::ids)]          = 1;
+        expected[static_cast<unsigned>(OwnerRole::intermediate)] = 1;
+        expected[static_cast<unsigned>(OwnerRole::down_table)]   = 1;
+    }
     return counts == expected ? Status::ok() : error(ErrorCode::owner_mismatch, "owners do not exactly match roles");
 }
 
@@ -287,6 +288,104 @@ Phase Transaction::phase() const noexcept {
 
 bool Transaction::fallback_allowed() const noexcept {
     return phase_ == Phase::created || phase_ == Phase::preflighted || phase_ == Phase::rolled_back;
+}
+
+Status validate_prompt_fusion_bundle(const PromptFusionBundle & bundle) noexcept {
+    const RetainedRoleView * roles[] = { &bundle.gate, &bundle.up, &bundle.down };
+    for (const RetainedRoleView * role : roles) {
+        if (!role->present || role->handle_identity == 0 || role->table_identity == 0 || role->ready_identity == 0 ||
+            role->occurrences.empty()) {
+            return error(ErrorCode::incomplete_bundle, "retained prompt role/handle/table/readiness is absent");
+        }
+        for (const RetainedOccurrence & occurrence : role->occurrences) {
+            if (occurrence.owner_identity == 0) {
+                return error(ErrorCode::incomplete_bundle, "retained prompt occurrence owner is absent");
+            }
+            if (occurrence.residency != OccurrenceResidency::local) {
+                return error(ErrorCode::nonlocal_role, "every retained role occurrence must execute locally");
+            }
+        }
+    }
+    if (bundle.activation_identity == 0 || bundle.ids_identity == 0 || bundle.glu_identity == 0 ||
+        bundle.intermediate_identity == 0) {
+        return error(ErrorCode::incomplete_bundle, "activation/IDs/GLU/intermediate owner is absent");
+    }
+    const auto & authority = bundle.gate.occurrences;
+    for (const RetainedRoleView * role : { &bundle.up, &bundle.down }) {
+        if (role->occurrences.size() != authority.size()) {
+            return error(ErrorCode::role_alignment_mismatch, "retained role occurrence count differs");
+        }
+        for (std::size_t i = 0; i < authority.size(); ++i) {
+            const RetainedOccurrence & expected = authority[i];
+            const RetainedOccurrence & actual   = role->occurrences[i];
+            if (actual.expert_id != expected.expert_id || actual.occurrence != expected.occurrence ||
+                actual.token_index != expected.token_index || actual.slot_index != expected.slot_index) {
+                return error(ErrorCode::role_alignment_mismatch, "retained role occurrence identity differs");
+            }
+        }
+    }
+    return Status::ok();
+}
+
+namespace {
+class PromptPreflight final : public Preflight {
+  public:
+    PromptPreflight(const PromptFusionBundle & bundle, PromptFusionExecutor & executor) :
+        bundle_(bundle),
+        executor_(executor) {}
+
+    Status run(const FusionPlan &) override {
+        const Status aligned = validate_prompt_fusion_bundle(bundle_);
+        return aligned ? executor_.preflight(bundle_) : aligned;
+    }
+
+  private:
+    const PromptFusionBundle & bundle_;
+    PromptFusionExecutor &     executor_;
+};
+
+class PromptSubmitter final : public Submitter {
+  public:
+    PromptSubmitter(const PromptFusionBundle & bundle, PromptFusionExecutor & executor) :
+        bundle_(bundle),
+        executor_(executor) {}
+
+    Status submit(const FusionPlan &, SubmitRecorder & recorder) override {
+        const Status escrowed = recorder.escrow(executor_.owners(), executor_.emergency());
+        return escrowed ? executor_.submit_writes(bundle_, recorder) : escrowed;
+    }
+
+  private:
+    const PromptFusionBundle & bundle_;
+    PromptFusionExecutor &     executor_;
+};
+}  // namespace
+
+PromptFusionResult submit_prompt_fusion(const PromptFusionBundle & bundle,
+                                        PromptFusionExecutor &     executor,
+                                        PublicationStore &         store,
+                                        std::uint64_t              base_generation,
+                                        bool                       inject_publication_failure) noexcept {
+    FusionPlan plan;
+    plan.gate_up_pair        = true;
+    plan.gate_role           = true;
+    plan.up_role             = true;
+    plan.glu_role            = true;
+    plan.down                = DownMode::fused;
+    plan.down_role           = true;
+    plan.exact_prompt_escrow = true;
+
+    Transaction     transaction(plan, base_generation);
+    PromptPreflight preflight(bundle, executor);
+    Status          status = transaction.preflight(preflight);
+    if (status) {
+        PromptSubmitter submitter(bundle, executor);
+        status = transaction.submit(submitter);
+    }
+    if (status) {
+        status = transaction.commit(store, inject_publication_failure);
+    }
+    return { status, transaction.phase(), transaction.fallback_allowed() };
 }
 
 }  // namespace ggml_sycl::moe_fused
