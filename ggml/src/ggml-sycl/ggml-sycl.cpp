@@ -50225,7 +50225,8 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
                                                  sycl::event *       out_event,
                                                  int64_t *           out_nb0,
                                                  int64_t *           out_nb1,
-                                                 bool                allow_async) {
+                                                 bool                allow_async,
+                                                 ggml_sycl::mem_handle * out_device_handle = nullptr) {
     using moe_ids_clock                         = std::chrono::high_resolution_clock;
     static const bool ids_stage_profile_enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_IDS_STAGE_PROFILE");
@@ -50250,6 +50251,9 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
     if (out_event) {
         *out_event = sycl::event{};
     }
+    if (out_device_handle) {
+        *out_device_handle = {};
+    }
     if (!ids) {
         return nullptr;
     }
@@ -50266,6 +50270,9 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
             }
             const int32_t * ids_device_ptr = reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) +
                                                                                ids_storage_handle.view_offset);
+            if (out_device_handle) {
+                *out_device_handle = ids_storage_handle.handle;
+            }
             if (ids_stage_profile) {
                 fprintf(
                     stderr,
@@ -50449,6 +50456,10 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
                     ids_stage_alloc_us, ids_stage_host_us, ids_stage_h2d_us, ids_stage_wait_us,
                     ids_stage_us(ids_stage_t0, ids_stage_now()));
         }
+        entry.device_handle.set_ready_event(copy_event);
+        if (out_device_handle) {
+            *out_device_handle = entry.device_handle;
+        }
         retain_uncached_handles();
         return static_cast<const int32_t *>(entry.device_ids);
     }
@@ -50480,10 +50491,12 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
     }
     if (!copy_events.empty()) {
         if (allow_async || g_ggml_sycl_graph_recording) {
-            const auto h2d_t0 = ids_stage_now();
+            const auto  h2d_t0     = ids_stage_now();
+            sycl::event ready_event = stream->ext_oneapi_submit_barrier(copy_events);
             if (out_event) {
-                *out_event = stream->ext_oneapi_submit_barrier(copy_events);
+                *out_event = ready_event;
             }
+            entry.device_handle.set_ready_event(ready_event);
             ids_stage_h2d_us += ids_stage_us(h2d_t0, ids_stage_now());
         } else {
             const auto wait_t0 = ids_stage_now();
@@ -50498,6 +50511,9 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
                 ids->name, ctx.device, ids_bytes, (int) ptr_type, ids_buffer_on_host ? 1 : 0, allow_async ? 1 : 0,
                 ids_stage_alloc_us, ids_stage_host_us, ids_stage_h2d_us, ids_stage_wait_us,
                 ids_stage_us(ids_stage_t0, ids_stage_now()));
+    }
+    if (out_device_handle) {
+        *out_device_handle = entry.device_handle;
     }
     retain_uncached_handles();
     return static_cast<const int32_t *>(entry.device_ids);
@@ -62768,10 +62784,35 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.down_dst, ctx.device);
-            if (topology_ok) {
-                const layout_mode gate_layout = roles.gate.batch.operands.front().actual_layout;
-                const layout_mode up_layout   = roles.up.batch.operands.front().actual_layout;
-                const layout_mode down_layout = roles.down.batch.operands.front().actual_layout;
+            const layout_mode gate_layout = roles.gate.batch.operands.front().actual_layout;
+            const layout_mode up_layout   = roles.up.batch.operands.front().actual_layout;
+            const layout_mode down_layout = roles.down.batch.operands.front().actual_layout;
+            const auto all_layout = [](const ggml_sycl::moe_retained_role_batch & role, layout_mode expected) {
+                return std::all_of(role.batch.operands.begin(), role.batch.operands.end(),
+                                   [expected](const auto & operand) { return operand.actual_layout == expected; });
+            };
+            // This is the exact production executor intersection, not the wider
+            // retained-cache capability set. Gate/up consumes SOA only; cached-Q8
+            // down consumes SOA or MXFP4_I8. XMX_TILED and MXFP4_DPAS refuse here,
+            // before table upload, ID staging, escrow, or any output write.
+            const bool executor_layouts_ok = gate_layout == GGML_LAYOUT_SOA && up_layout == gate_layout &&
+                all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
+                (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
+                all_layout(roles.down, down_layout);
+            const int64_t expected_entries = pair.ids->ne[0] * pair.ids->ne[1];
+            const bool executor_shapes_ok = expected_entries > 0 && pair.ids->ne[1] == pair.src1->ne[2] &&
+                static_cast<int64_t>(roles.gate.batch.operands.size()) == expected_entries &&
+                roles.up.batch.operands.size() == roles.gate.batch.operands.size() &&
+                roles.down.batch.operands.size() == roles.gate.batch.operands.size() &&
+                pair.gate_weight->ne[0] == pair.up_weight->ne[0] &&
+                pair.gate_weight->ne[1] == pair.up_weight->ne[1] &&
+                pair.gate_weight->ne[2] == pair.up_weight->ne[2] &&
+                pair.glu_dst->type == GGML_TYPE_F32 && pair.glu_dst->ne[0] == pair.gate_weight->ne[1] &&
+                pair.glu_dst->ne[1] == pair.ids->ne[0] && pair.glu_dst->ne[2] == pair.src1->ne[2] &&
+                pair.down_weight->ne[0] == pair.glu_dst->ne[0] &&
+                pair.down_dst->ne[0] == pair.down_weight->ne[1] &&
+                pair.down_dst->ne[1] == pair.ids->ne[0] && pair.down_dst->ne[2] == pair.glu_dst->ne[2];
+            if (topology_ok && executor_layouts_ok && executor_shapes_ok) {
                 auto gate_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
                     ctx, pair.gate_weight, roles.gate.batch, moe_cache_layer_id(pair.gate_weight->name), gate_layout);
                 auto up_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
@@ -62780,7 +62821,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ctx, pair.down_weight, roles.down.batch, moe_cache_layer_id(pair.down_weight->name), down_layout);
 
                 ggml_sycl_tensor_storage_handle activation_storage{};
-                ggml_sycl_tensor_storage_handle ids_storage{};
                 ggml_sycl_tensor_storage_handle glu_storage{};
                 ggml_sycl_tensor_storage_handle down_storage{};
                 const bool artifacts_ok = gate_table.valid() && up_table.valid() && down_table.valid() &&
@@ -62788,18 +62828,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     down_table.resolve_abi(ctx.device) &&
                     ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &activation_storage) &&
                     activation_storage.handle.has_stable_owner_identity() &&
-                    ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &ids_storage) &&
-                    ids_storage.handle.has_stable_owner_identity() &&
                     ggml_sycl_find_tensor_storage_handle(pair.glu_dst, ctx.device, &glu_storage) &&
                     glu_storage.handle.has_stable_owner_identity() &&
                     ggml_sycl_find_tensor_storage_handle(pair.down_dst, ctx.device, &down_storage) &&
                     down_storage.handle.has_stable_owner_identity();
                 if (artifacts_ok) {
-                    sycl::event     ids_device_event;
-                    int64_t         ids_device_nb0 = ids->nb[0];
-                    int64_t         ids_device_nb1 = ids->nb[1];
-                    const int32_t * ids_device = ggml_sycl_get_moe_ids_device_ptr(
-                        ctx, ids, &ids_device_event, &ids_device_nb0, &ids_device_nb1, /*allow_async=*/true);
+                    sycl::event           ids_device_event;
+                    ggml_sycl::mem_handle ids_device_handle;
+                    int64_t               ids_device_nb0 = ids->nb[0];
+                    int64_t               ids_device_nb1 = ids->nb[1];
+                    const int32_t *       ids_device = ggml_sycl_get_moe_ids_device_ptr(
+                        ctx, ids, &ids_device_event, &ids_device_nb0, &ids_device_nb1, /*allow_async=*/true,
+                        &ids_device_handle);
 
                     struct staged_skip_node {
                         moe_precomputed_skip_set *          set = nullptr;
@@ -62821,7 +62861,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     };
                     g_moe_precomputed_mmid_skip.reserve(g_moe_precomputed_mmid_skip.size() + 3);
                     g_moe_precomputed_node_skip.reserve(g_moe_precomputed_node_skip.size() + 1);
-                    const bool publication_preflight = ids_device &&
+                    const bool publication_preflight = ids_device && ids_device_handle.has_stable_owner_identity() &&
                         stage_skip(g_moe_precomputed_mmid_skip, pair.gate_dst) &&
                         stage_skip(g_moe_precomputed_mmid_skip, pair.up_dst) &&
                         stage_skip(g_moe_precomputed_node_skip, pair.glu_dst) &&
@@ -62863,13 +62903,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         fusion_bundle.up                    = role_view(roles.up, up_table);
                         fusion_bundle.down                  = role_view(roles.down, down_table);
                         fusion_bundle.activation_identity   = identity(activation_storage.handle);
-                        fusion_bundle.ids_identity          = identity(ids_storage.handle);
+                        // Bind metadata and escrow to the exact staged allocation
+                        // whose ABI pointer is passed to both kernels, not the host
+                        // tensor storage from which it was copied.
+                        fusion_bundle.ids_identity          = identity(ids_device_handle);
                         fusion_bundle.glu_identity          = identity(glu_storage.handle);
                         fusion_bundle.intermediate_identity = identity(down_storage.handle);
 
                         struct HandleOwner final : fused::Owner {
-                            explicit HandleOwner(std::vector<ggml_sycl::mem_handle> value) : handles(std::move(value)) {}
+                            explicit HandleOwner(std::vector<ggml_sycl::mem_handle> value,
+                                                 std::vector<sycl::event> ready = {}) :
+                                handles(std::move(value)), ready_events(std::move(ready)) {}
                             std::vector<ggml_sycl::mem_handle> handles;
+                            std::vector<sycl::event>           ready_events;
                         };
                         struct EventOwner final : fused::TerminalEvent {
                             explicit EventOwner(sycl::event value) : event(std::move(value)) {}
@@ -62893,6 +62939,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ggml_sycl::mem_handle glu;
                             ggml_sycl::mem_handle intermediate;
                             const int32_t * ids_device;
+                            sycl::event ids_ready_event;
                             int64_t ids_nb0;
                             int64_t ids_nb1;
                             layout_mode gate_layout;
@@ -62913,6 +62960,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                            ggml_sycl::mem_handle glu_arg,
                                            ggml_sycl::mem_handle intermediate_arg,
                                            const int32_t * ids_device_arg,
+                                           sycl::event ids_ready_event_arg,
                                            int64_t ids_nb0_arg,
                                            int64_t ids_nb1_arg,
                                            layout_mode gate_layout_arg,
@@ -62921,15 +62969,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 up_table(std::move(up_table_arg)), down_table(std::move(down_table_arg)),
                                 activation(std::move(activation_arg)), ids(std::move(ids_arg)), glu(std::move(glu_arg)),
                                 intermediate(std::move(intermediate_arg)), ids_device(ids_device_arg),
-                                ids_nb0(ids_nb0_arg), ids_nb1(ids_nb1_arg), gate_layout(gate_layout_arg),
+                                ids_ready_event(std::move(ids_ready_event_arg)), ids_nb0(ids_nb0_arg),
+                                ids_nb1(ids_nb1_arg), gate_layout(gate_layout_arg),
                                 down_layout(down_layout_arg) {}
 
-                            fused::Status preflight(const fused::PromptFusionBundle &) override {
-                                return gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
-                                               down_table.resolve_abi(ctx.device) && ids_device ?
+                            fused::Status preflight(const fused::PromptFusionBundle & bundle) override {
+                                const auto ids_resolved = ids.resolve(ctx.device);
+                                const bool ids_identity_exact = ids_resolved && ids_resolved.ptr == ids_device &&
+                                    static_cast<std::uintptr_t>(ids.stable_identity_hash()) == bundle.ids_identity;
+                                return gate_layout == GGML_LAYOUT_SOA &&
+                                               (down_layout == GGML_LAYOUT_SOA ||
+                                                down_layout == GGML_LAYOUT_MXFP4_I8) &&
+                                               gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
+                                               down_table.resolve_abi(ctx.device) && ids_identity_exact ?
                                            fused::Status::ok() :
                                            fused::Status{ fused::ErrorCode::preflight_failed,
-                                                          "retained prompt MMVQ ABI preflight failed" };
+                                                          "retained prompt MMVQ ABI/ID ownership preflight failed" };
                             }
                             fused::OwnerBundle owners() override {
                                 auto role_handles = [](const ggml_sycl::moe_retained_role_batch & role) {
@@ -62949,7 +63004,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 out.add(fused::OwnerRole::up, std::make_unique<HandleOwner>(role_handles(roles.up)));
                                 out.add(fused::OwnerRole::up_table, std::make_unique<HandleOwner>(table_handles(up_table)));
                                 out.add(fused::OwnerRole::activation, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ activation }));
-                                out.add(fused::OwnerRole::ids, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ ids }));
+                                out.add(fused::OwnerRole::ids, std::make_unique<HandleOwner>(
+                                    std::vector<ggml_sycl::mem_handle>{ ids }, std::vector<sycl::event>{ ids_ready_event }));
                                 out.add(fused::OwnerRole::glu, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ glu }));
                                 out.add(fused::OwnerRole::intermediate, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ intermediate }));
                                 out.add(fused::OwnerRole::down, std::make_unique<HandleOwner>(role_handles(roles.down)));
@@ -62960,8 +63016,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 return fused::EmergencyToken(std::make_unique<QueueDrain>(ctx.stream()));
                             }
                             fused::Status submit_writes(const fused::PromptFusionBundle &, fused::SubmitRecorder & recorder) override {
-                                fused::Status status = recorder.mark_write_started();
-                                if (!status) return status;
+                                std::vector<sycl::event> ids_deps{ ids_ready_event };
                                 const bool gate_up_ok = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                                     ctx, pair.gate_weight, pair.up_weight, pair.src1, pair.glu_dst,
                                     gate_table.resolve_abi(ctx.device), up_table.resolve_abi(ctx.device), ids_device,
@@ -62970,10 +63025,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     ggml_get_op_params_f32(pair.glu_dst, 2), ggml_get_op_params_f32(pair.glu_dst, 3),
                                     gate_layout, &glu, false, false, nullptr, nullptr,
                                     roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
-                                    &glu_event, &glu_event_set);
+                                    &glu_event, &glu_event_set, &recorder, &ids_deps);
                                 if (!gate_up_ok || !glu_event_set) {
-                                    return { fused::ErrorCode::submitted_without_terminal,
-                                             "retained prompt gate/up GLU did not produce an event" };
+                                    return recorder.write_started() ?
+                                        fused::Status{ fused::ErrorCode::submitted_without_terminal,
+                                                       "retained prompt gate/up GLU failed after write start" } :
+                                        fused::Status{ fused::ErrorCode::submit_failed_no_write,
+                                                       "retained prompt gate/up GLU refused before write" };
                                 }
                                 std::vector<sycl::event> deps{ glu_event };
                                 const bool down_ok = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
@@ -62991,9 +63049,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     fused::TerminalToken(std::make_unique<EventOwner>(terminal_event)));
                             }
                         } executor{ ctx, pair, roles, std::move(gate_table), std::move(up_table),
-                                    std::move(down_table), activation_storage.handle, ids_storage.handle,
-                                    glu_storage.handle, down_storage.handle, ids_device, ids_device_nb0,
-                                    ids_device_nb1, gate_layout, down_layout };
+                                    std::move(down_table), activation_storage.handle, ids_device_handle,
+                                    glu_storage.handle, down_storage.handle, ids_device, ids_device_event,
+                                    ids_device_nb0, ids_device_nb1, gate_layout, down_layout };
 
                         // The store is thread-local graph publication authority.
                         // Replacing it retires the previous terminal owner only

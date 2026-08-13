@@ -210,6 +210,7 @@ class SubmitRecorder {
     // Escrow is one-shot and must succeed before mark_write_started().
     Status escrow(OwnerBundle owners, EmergencyToken emergency) noexcept;
     Status mark_write_started() noexcept;
+    bool   write_started() const noexcept { return write_started_; }
     // Terminal installation is one-shot. A rejected duplicate is waited before disposal.
     Status install_terminal(TerminalToken terminal) noexcept;
 

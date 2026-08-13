@@ -145,7 +145,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   const int32_t *               ids_host                   = nullptr,
                                                   int64_t                       ids_host_count             = 0,
                                                   sycl::event *                 completion_event           = nullptr,
-                                                  bool *                        completion_event_set       = nullptr);
+                                                  bool *                        completion_event_set       = nullptr,
+                                                  ggml_sycl::moe_fused::SubmitRecorder * write_recorder     = nullptr,
+                                                  const std::vector<sycl::event> * deps                     = nullptr);
 
 // Fast all-local decode down projection that consumes the Q8_1 GLU artifact
 // published by mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa().  When ids_device

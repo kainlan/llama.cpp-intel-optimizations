@@ -17371,7 +17371,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   const int32_t *               ids_host,
                                                   int64_t                       ids_host_count,
                                                   sycl::event *                 completion_event,
-                                                  bool *                        completion_event_set) {
+                                                  bool *                        completion_event_set,
+                                                  ggml_sycl::moe_fused::SubmitRecorder * write_recorder,
+                                                  const std::vector<sycl::event> * deps) {
     if (completion_event_set) {
         *completion_event_set = false;
     }
@@ -17546,6 +17548,15 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
+    // Exact production write boundary: argument/layout/shape checks and all
+    // fallible scratch allocations above can still refuse harmlessly. Once
+    // activation quantization is submitted, every refusal is quarantined.
+    if (write_recorder) {
+        const auto boundary = write_recorder->mark_write_started();
+        if (!boundary) {
+            return false;
+        }
+    }
     sycl::event activation_q8_event = mmvq_profile_submit_quantize_activation_q8_soa(
         *stream, src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, required_size);
     if (detail_profile) {
@@ -17569,6 +17580,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     bool                     have_kernel_event = false;
     const auto &             xmx_caps          = ggml_sycl_info().devices[ctx.device].xmx_caps;
     std::vector<sycl::event> kernel_deps;
+    if (deps) {
+        kernel_deps.insert(kernel_deps.end(), deps->begin(), deps->end());
+    }
     kernel_deps.push_back(activation_q8_event);
     double                   profile_group_host_us = 0.0;
     const char *             profile_path          = "none";

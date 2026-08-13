@@ -472,7 +472,9 @@ struct PromptExecutor final : PromptFusionExecutor {
         if (behavior == PromptBehavior::no_write) {
             return { ErrorCode::submit_failed_no_write, "refused" };
         }
+        CHECK(!recorder.write_started());
         CHECK(recorder.mark_write_started());
+        CHECK(recorder.write_started());
         if (behavior == PromptBehavior::exception_after_write) {
             throw std::runtime_error("post-write");
         }
