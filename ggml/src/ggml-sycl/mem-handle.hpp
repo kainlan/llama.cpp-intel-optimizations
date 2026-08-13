@@ -85,11 +85,20 @@ enum class mem_handle_kind : uint8_t {
 };
 
 struct arena_authority : std::enable_shared_from_this<arena_authority> {
+    struct allocation_record {
+        uint64_t allocation_id = 0;
+        int      zone_id       = -1;
+        size_t   offset        = 0;
+        size_t   extent        = 0;
+        uint64_t generation    = 0;
+    };
+
     struct admission {
         void *                ptr = nullptr;
         std::shared_ptr<void> lease;
+        allocation_record     allocation{};
 
-        explicit operator bool() const { return ptr != nullptr && lease != nullptr; }
+        explicit operator bool() const { return ptr != nullptr && lease != nullptr && allocation.allocation_id != 0; }
     };
 
     mutable std::mutex              mutex;
@@ -104,13 +113,19 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
     // chunks while still remaining separate lifecycle incarnations.
     std::vector<std::pair<size_t, size_t>> allowed_ranges;
     std::vector<uint32_t>                  lease_counts;
+    std::vector<allocation_record>         allocations;
 
-    // Validation and lease admission are one lifecycle-mutex transaction. A
-    // successful result therefore cannot race a close/invalidate and free.
-    admission acquire_offset(uint64_t expected_generation, size_t offset, size_t extent);
-    void * resolve_offset(uint64_t expected_generation, size_t offset, size_t extent) const;
+    // The allocator registers the exact allocation while holding its physical
+    // group lock. Handle admission validates the complete allocator-minted
+    // tuple; a logical sibling cannot mint authority over the same bytes.
+    bool register_allocation(int allocation_zone, uint64_t allocation_id, size_t offset, size_t extent);
+    bool unregister_allocation(int allocation_zone, size_t offset);
+    admission acquire_allocation(int allocation_zone, uint64_t expected_generation,
+                                 uint64_t expected_allocation_id, size_t offset, size_t extent);
+    void * resolve_allocation(int allocation_zone, uint64_t expected_generation,
+                              uint64_t allocation_id, size_t offset, size_t extent) const;
     void close_and_invalidate(uint64_t replacement_generation);
-    void wait_for_terminal_leases() const;
+    bool wait_for_terminal_leases(uint32_t timeout_ms = 5000) const;
     void bump_generation(uint64_t replacement_generation);
     bool accepts(uint64_t expected_generation) const;
     size_t terminal_lease_count() const;

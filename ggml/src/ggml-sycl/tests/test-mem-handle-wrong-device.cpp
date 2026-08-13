@@ -293,25 +293,51 @@ static bool test_arena_slice_generation_and_bounds(sycl::queue & q) {
     }
 
     constexpr size_t bytes = 256;
-    void * ptr = ggml_sycl::unified_cache_zone_alloc(0, ggml_sycl::vram_zone_id::RUNTIME, bytes, 64);
-    if (!ptr) {
+    ggml_sycl::alloc_request req{};
+    req.queue                                      = &q;
+    req.device                                     = 0;
+    req.size                                       = bytes;
+    req.alignment                                  = 64;
+    req.intent.role                                = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.constraints.must_device             = true;
+    req.intent.constraints.prefer_vram_zone        = ggml_sycl::vram_zone_id::RUNTIME;
+    auto arena = ggml_sycl::unified_allocate(req);
+    if (!arena.valid() || !arena.is_arena()) {
         TEST_SKIP("RUNTIME arena zone has no test capacity");
     }
-    const size_t   offset = cache->ptr_to_offset(ptr);
-    const uint64_t gen    = cache->arena_generation();
-    auto arena = ggml_sycl::mem_handle::from_arena_zone(
-        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen, 0x6ec, bytes);
+    const auto root = arena.resolve(0);
+    const auto info = arena.debug_info();
+    const size_t offset = cache->ptr_to_offset(root.ptr);
+    const uint64_t gen = cache->arena_generation(ggml_sycl::vram_zone_id::RUNTIME);
+    TEST_ASSERT(info.canonical_allocation_id != 0 && info.canonical_extent == bytes,
+                "allocator did not mint exact canonical authority");
+
     auto view = arena.slice(64, 96);
-    TEST_ASSERT(view.resolve(0).ptr == static_cast<char *>(ptr) + 64, "arena slice pointer mismatch");
-    TEST_ASSERT(view.slice(16, 32).resolve(0).ptr == static_cast<char *>(ptr) + 80,
+    TEST_ASSERT(view.resolve(0).ptr == static_cast<char *>(root.ptr) + 64, "arena slice pointer mismatch");
+    TEST_ASSERT(view.slice(16, 32).resolve(0).ptr == static_cast<char *>(root.ptr) + 80,
                 "nested arena slice must compose offsets exactly once");
     TEST_ASSERT(!view.slice(80, 32).valid(), "arena slice must enforce parent bounds");
     TEST_ASSERT(!view.resolve(1), "arena slice must preserve wrong-device rejection");
 
+    auto sibling = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::KV), offset, bytes, 0, gen,
+        info.canonical_allocation_id, bytes, cache->arena_authority_snapshot(ggml_sycl::vram_zone_id::KV));
+    TEST_ASSERT(!sibling.resolve(0), "logical sibling authority minted over another zone allocation");
+    auto wrong_id = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen,
+        info.canonical_allocation_id + 1, bytes,
+        cache->arena_authority_snapshot(ggml_sycl::vram_zone_id::RUNTIME));
+    TEST_ASSERT(!wrong_id.resolve(0), "arena authority accepted the wrong allocation id");
+    auto broad = ggml_sycl::mem_handle::from_arena_zone(
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes + 64, 0, gen,
+        info.canonical_allocation_id, bytes + 64,
+        cache->arena_authority_snapshot(ggml_sycl::vram_zone_id::RUNTIME));
+    TEST_ASSERT(!broad.resolve(0), "arena authority accepted a caller-broadened extent");
     auto stale = ggml_sycl::mem_handle::from_arena_zone(
-        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen + 1, 0x6ec, bytes).slice(64, 96);
-    TEST_ASSERT(!stale.resolve(0), "arena slice must remain stale when parent generation mismatches");
-    (void) q;
+        static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), offset, bytes, 0, gen + 1,
+        info.canonical_allocation_id, bytes,
+        cache->arena_authority_snapshot(ggml_sycl::vram_zone_id::RUNTIME));
+    TEST_ASSERT(!stale.resolve(0), "arena authority accepted the wrong generation");
     TEST_PASS();
     return true;
 }

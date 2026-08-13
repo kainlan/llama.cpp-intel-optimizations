@@ -207,31 +207,60 @@ bool arena_locate_offset(const std::vector<std::pair<void *, size_t>> & chunks,
 
 } // namespace
 
-arena_authority::admission arena_authority::acquire_offset(uint64_t expected, size_t offset, size_t extent) {
+bool arena_authority::register_allocation(int allocation_zone, uint64_t allocation_id,
+                                          size_t offset, size_t extent) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (!alive || !admission_open || generation != expected ||
-        !arena_range_contains(allowed_ranges, offset, extent)) return {};
+    if (!alive || !admission_open || allocation_id == 0 || generation == 0 ||
+        !arena_range_contains(allowed_ranges, offset, extent)) return false;
+    for (const auto & record : allocations) {
+        if (record.allocation_id == allocation_id || record.offset == offset) return false;
+    }
+    allocations.push_back({ allocation_id, allocation_zone, offset, extent, generation });
+    return true;
+}
+
+bool arena_authority::unregister_allocation(int allocation_zone, size_t offset) {
+    std::lock_guard<std::mutex> guard(mutex);
+    const auto it = std::find_if(allocations.begin(), allocations.end(), [&](const allocation_record & record) {
+        return record.zone_id == allocation_zone && record.offset == offset;
+    });
+    if (it == allocations.end()) return false;
+    allocations.erase(it);
+    return true;
+}
+
+arena_authority::admission arena_authority::acquire_allocation(int allocation_zone, uint64_t expected,
+                                                               uint64_t expected_id, size_t offset, size_t extent) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (!alive || !admission_open || generation != expected) return {};
+    const auto it = std::find_if(allocations.begin(), allocations.end(), [&](const allocation_record & record) {
+        return record.zone_id == allocation_zone && record.generation == expected && record.offset == offset &&
+               record.extent == extent && (expected_id == 0 || record.allocation_id == expected_id);
+    });
+    if (it == allocations.end()) return {};
     size_t chunk_index = 0;
     void * ptr = nullptr;
     if (!arena_locate_offset(chunks, offset, extent, chunk_index, ptr)) return {};
     if (lease_counts.size() != chunks.size()) lease_counts.resize(chunks.size(), 0);
     if (lease_counts[chunk_index] == UINT32_MAX) return {};
 
-    // Construct every potentially-throwing part of the token before publishing
-    // the count.  In particular shared_from_this() and the shared_ptr control
-    // block allocation may throw.  Incrementing first leaked a terminal lease
-    // forever on either exception, causing zone settle/destroy to deadlock.
     auto self = shared_from_this();
     std::shared_ptr<void> lease(ptr, [self = std::move(self), chunk_index](void *) {
         self->release_lease(chunk_index);
     });
     ++lease_counts[chunk_index];
-    return { ptr, std::move(lease) };
+    return { ptr, std::move(lease), *it };
 }
 
-void * arena_authority::resolve_offset(uint64_t expected, size_t offset, size_t extent) const {
+void * arena_authority::resolve_allocation(int allocation_zone, uint64_t expected, uint64_t allocation_id,
+                                           size_t offset, size_t extent) const {
     std::lock_guard<std::mutex> guard(mutex);
-    if (!alive || generation != expected || !arena_range_contains(allowed_ranges, offset, extent)) return nullptr;
+    if (!alive || generation != expected || allocation_id == 0) return nullptr;
+    const auto it = std::find_if(allocations.begin(), allocations.end(), [&](const allocation_record & record) {
+        return record.zone_id == allocation_zone && record.allocation_id == allocation_id &&
+               record.generation == expected && record.offset == offset && record.extent == extent;
+    });
+    if (it == allocations.end()) return nullptr;
     size_t chunk_index = 0;
     void * ptr = nullptr;
     return arena_locate_offset(chunks, offset, extent, chunk_index, ptr) ? ptr : nullptr;
@@ -253,9 +282,9 @@ void arena_authority::close_and_invalidate(uint64_t next) {
     generation = next;
 }
 
-void arena_authority::wait_for_terminal_leases() const {
+bool arena_authority::wait_for_terminal_leases(uint32_t timeout_ms) const {
     std::unique_lock<std::mutex> lock(mutex);
-    leases_drained.wait(lock, [this] {
+    return leases_drained.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
         return std::all_of(lease_counts.begin(), lease_counts.end(), [](uint32_t count) { return count == 0; });
     });
 }
@@ -501,13 +530,19 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
         h.arena_authority_ = cache->arena_authority_snapshot(static_cast<vram_zone_id>(zone_id));
     }
     if (h.arena_authority_) {
-        auto admitted = h.arena_authority_->acquire_offset(generation, offset, size);
+        auto admitted = h.arena_authority_->acquire_allocation(zone_id, generation, allocation_id, offset, size);
         if (!admitted) {
             h.arena_authority_.reset();
             return h;
         }
-        h.cached_      = { admitted.ptr, size, GGML_LAYOUT_AOS, true };
-        h.arena_lease_ = std::move(admitted.lease);
+        // Canonical identity always comes from the allocator record. The
+        // caller-supplied values are only exact-match filters and cannot widen
+        // the admitted extent or substitute a sibling zone.
+        h.canonical_allocation_id_ = admitted.allocation.allocation_id;
+        h.canonical_generation_    = admitted.allocation.generation;
+        h.canonical_extent_        = admitted.allocation.extent;
+        h.cached_                  = { admitted.ptr, size, GGML_LAYOUT_AOS, true };
+        h.arena_lease_             = std::move(admitted.lease);
     }
     return h;
 }
@@ -601,8 +636,21 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
     }
 
     const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
-    mem_handle h         = from_direct(handle.ptr, layout, on_device,
-                                       on_device ? handle.device : HOST_DEVICE, handle.size);
+    mem_handle h;
+    if (on_device && handle.zone_managed && handle.vram_zone != vram_zone_id::COUNT &&
+        valid_cache_device_id(handle.device)) {
+        if (unified_cache * cache = get_existing_unified_cache_for_device(handle.device)) {
+            const size_t arena_offset = cache->ptr_to_offset(handle.ptr);
+            if (arena_offset != SIZE_MAX) {
+                h = from_arena_zone(static_cast<int>(handle.vram_zone), arena_offset, handle.size, handle.device,
+                                    cache->arena_generation(handle.vram_zone), handle.alloc_id, handle.size,
+                                    cache->arena_authority_snapshot(handle.vram_zone));
+            }
+        }
+        if (!h.valid()) return {};
+    } else {
+        h = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE, handle.size);
+    }
     h.offset_                   = 0;
     h.size_                     = handle.size;
     h.backing_extent_            = handle.size;
@@ -1650,7 +1698,8 @@ resolved_ptr mem_handle::resolve_arena() const {
         }
         backing_offset = backing_offset_;
     }
-    void * ptr = authority->resolve_offset(arena_gen_, backing_offset, backing_extent_);
+    void * ptr = authority->resolve_allocation(zone_id_, arena_gen_, canonical_allocation_id_,
+                                               backing_offset, backing_extent_);
     if (!ptr) {
         return {};
     }

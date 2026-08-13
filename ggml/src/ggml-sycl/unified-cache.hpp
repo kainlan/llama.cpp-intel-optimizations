@@ -1338,6 +1338,10 @@ inline size_t cache_guard_page_size() {
 #endif
 }
 
+// Implemented in unified-cache.cpp. Kept at the allocator boundary so tests
+// exercise actual unordered-map and allocate_shared allocation failures.
+bool cache_guard_allocation_should_fail_for_test() noexcept;
+
 template <typename T> struct cache_guard_allocator {
     using value_type = T;
 
@@ -1346,6 +1350,9 @@ template <typename T> struct cache_guard_allocator {
     template <typename U> cache_guard_allocator(const cache_guard_allocator<U> &) noexcept {}
 
     T * allocate(std::size_t n) {
+        if (cache_guard_allocation_should_fail_for_test()) {
+            throw std::bad_alloc();
+        }
         if (!cache_guard_pages_enabled()) {
             return std::allocator<T>{}.allocate(n);
         }
@@ -1571,6 +1578,9 @@ enum class expert_fault_phase : uint8_t {
     SHUTDOWN_BEFORE_ARENA_DESTROY,
 };
 void unified_cache_fail_next_expert_phase_for_test(expert_fault_phase phase) noexcept;
+// Fail the Nth allocation made through cache_guard_allocator. Zero disables the seam.
+// This exercises the real node/control-block allocator used by publication preparation.
+void unified_cache_fail_expert_allocation_after_for_test(size_t nth) noexcept;
 
 enum class expert_resolve_device_policy : uint8_t {
     ANY            = 0,  // Accept any owning device or allowed host tier
@@ -2654,7 +2664,7 @@ class unified_cache {
     }
 
     void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
-    void note_model_load_abort(uint64_t load_txn_id);
+    bool note_model_load_abort(uint64_t load_txn_id) noexcept;
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
     // A model has been destroyed: drop its ownership bit, then UNPIN and reclaim
@@ -3110,8 +3120,10 @@ class unified_cache {
   private:
     std::atomic<bool> fail_next_host_registration_insert_{ false };
 
-    // Sub-allocate from a zone.
-    void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
+    // Sub-allocate from a zone. When allocation_id is non-zero, physical
+    // allocation, exact authority registration, and token identity share the
+    // same allocator-group transaction.
+    void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256, uint64_t allocation_id = 0);
 
     // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
     // ptr must have been returned by zone_alloc. No size parameter —
@@ -3257,10 +3269,16 @@ class unified_cache {
     bool                         async_evict_enabled_ = false;  // Set during init from env var
     std::atomic<int>             evictions_in_flight_{ 0 };     // Count of EVICTING entries
 
+    using id_map = std::unordered_map<
+        ggml_sycl_cache_id,
+        unified_cache_key,
+        detail::cache_id_hash,
+        detail::cache_id_equal_fn,
+        detail::cache_guard_allocator<std::pair<const ggml_sycl_cache_id, unified_cache_key>>>;
+
     // Cache storage: (identity, type, layer/expert) -> entry
     entry_map entries_;
-    std::unordered_map<ggml_sycl_cache_id, unified_cache_key, detail::cache_id_hash, detail::cache_id_equal_fn>
-        id_to_key_;
+    id_map    id_to_key_;
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
@@ -3321,13 +3339,30 @@ class unified_cache {
     std::vector<weight_chunk_alloc> weight_chunk_allocators_;
     vram_zone                       arena_zones_[static_cast<int>(vram_zone_id::COUNT)];
 
-    // Zone incarnation table. arena_zones_[i].alloc_mutex is the lifecycle
-    // serializer for allocation/reset/destroy/publication in zone i. The
+    // Physical allocator groups are distinct from logical zones. KV and
+    // WEIGHT share group 0 in both single- and N-chunk modes; every TLSF
+    // alloc/free/reset and lifecycle transition is serialized by this table.
+    enum class allocator_group_state : uint8_t { CLOSED, OPEN, CLOSING };
+    struct allocator_group {
+        std::mutex            mutex;
+        allocator_group_state state = allocator_group_state::CLOSED;
+    };
+    static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
+    std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
+    static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
+    std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
+    void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;
+
+    // Zone incarnation table. The physical-group mutex above is the lifecycle
+    // serializer for allocation/reset/destroy/publication. The
     // mirror mutex only protects lock-free handle-mint snapshots; authority
     // admission itself is checked under arena_authority::mutex.
     std::array<std::atomic<uint64_t>, static_cast<size_t>(vram_zone_id::COUNT)> arena_generations_{};
     mutable std::array<std::mutex, static_cast<size_t>(vram_zone_id::COUNT)> arena_authority_mutexes_;
     std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> arena_authorities_;
+    std::shared_ptr<arena_authority> arena_make_authority(vram_zone_id zone, uint64_t generation) const;
+    void arena_publish_prebuilt(vram_zone_id zone, std::shared_ptr<arena_authority> authority) noexcept;
     void arena_publish_authority(vram_zone_id zone);
     void arena_publish_authorities();
     std::shared_ptr<arena_authority> arena_close_authority(vram_zone_id zone);
@@ -3528,10 +3563,14 @@ class unified_cache {
     // must not be treated as independent caches or ownership roots.
     // Keyed by full ggml_sycl_cache_id (uses proven detail::cache_id_hash/equal_fn).
     // Thread-safe via direct_stage_mutex_ (shared for reads, exclusive for writes).
-    std::unordered_map<ggml_sycl_cache_id, weight_entry, detail::cache_id_hash, detail::cache_id_equal_fn>
-        direct_weight_entries_;
-    std::unordered_map<ggml_sycl_cache_id, weight_entry, detail::cache_id_hash, detail::cache_id_equal_fn>
-                              direct_expert_entries_;
+    using direct_entry_map = std::unordered_map<
+        ggml_sycl_cache_id,
+        weight_entry,
+        detail::cache_id_hash,
+        detail::cache_id_equal_fn,
+        detail::cache_guard_allocator<std::pair<const ggml_sycl_cache_id, weight_entry>>>;
+    direct_entry_map direct_weight_entries_;
+    direct_entry_map direct_expert_entries_;
     mutable std::shared_mutex direct_stage_mutex_;
 
     // Set to true when a cached weight's device allocation is released -- eviction
@@ -4655,7 +4694,7 @@ void   unified_cache_reset_model_weight_entries(int                 device_id,
                                                 weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
 // Model lifetime fan-out over every device's cache (llama.cpp-0qlw).
 void   unified_cache_set_live_model_mask(uint32_t mask);
-void   unified_cache_note_model_load_abort(uint64_t load_txn_id);
+bool   unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept;
 void   unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 size_t unified_cache_release_model_slot(uint32_t slot);
 size_t unified_cache_host_zone_used(host_zone_id zone);
