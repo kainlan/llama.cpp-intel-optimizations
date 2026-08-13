@@ -1691,7 +1691,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     #    LABELS avoid the residency/mem-handle/cache denylist substrings per
     #    rule 2 so the -j 1 throttled sweep can see it. Exits 77 on no-device.
     add_executable(test-layout-cache test-layout-cache.cpp)
-    target_link_libraries(test-layout-cache PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
+    target_link_libraries(test-layout-cache PRIVATE ggml-sycl-private-fixtures)
     target_include_directories(test-layout-cache PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-layout-cache PRIVATE

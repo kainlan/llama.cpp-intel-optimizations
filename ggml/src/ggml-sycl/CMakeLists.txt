@@ -1615,10 +1615,7 @@ target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE
     GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE
-    ggml-base ggml ggml-sycl-q1-route-test-objects ${LEVEL_ZERO_LOADER})
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+    ggml-sycl-private-fixtures ${LEVEL_ZERO_LOADER})
 foreach(_packed_k_checkpoint IN ITEMS
         sidecar-before-initial-fill
         sidecar-zero-to-update
@@ -1771,9 +1768,6 @@ target_compile_definitions(test-unified-cache-bugs PRIVATE
     GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-unified-cache-bugs PRIVATE ggml-sycl-private-fixtures)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
-endif()
 add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
 set_tests_properties(unified-cache-bugs PROPERTIES
     LABELS "sycl;unified;bugfix;tdd"
@@ -1802,10 +1796,7 @@ target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
 set_tests_properties(sycl-kv-view-resolution PROPERTIES
     LABELS "sycl;kv;view;handle;tdd"
@@ -2043,10 +2034,7 @@ target_compile_definitions(test-sycl-layout-choice PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-sycl-layout-choice PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
 set_tests_properties(sycl-layout-choice PROPERTIES
     LABELS "sycl;layout;planner;tdd"
@@ -2448,9 +2436,6 @@ target_compile_definitions(test-tensor-placement PRIVATE
     GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-tensor-placement PRIVATE ggml-sycl-private-fixtures)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-tensor-placement PRIVATE IntelSYCL::SYCL_CXX)
-endif()
 add_test(NAME test-tensor-placement COMMAND test-tensor-placement)
 set_tests_properties(test-tensor-placement PROPERTIES
     LABELS "sycl;moe;tensor-placement;tdd"
@@ -2503,9 +2488,6 @@ foreach(_residency_test
         GGML_SYCL_PRIVATE_TESTING=1
     )
     target_link_libraries(${_residency_test} PRIVATE ggml-sycl-private-fixtures)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(${_residency_test} PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
     add_test(NAME ${_residency_test} COMMAND ${_residency_test})
     # LABELS drop the old "cache;residency;mem-handle" -- see rule 2 above
     # (llama.cpp-vrko).  This loop was the LAST holdout in this file: every
@@ -2638,10 +2620,7 @@ target_compile_definitions(test-sycl-kv-planned-device-materialization PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
 # Two cards, not one: this fixture's own main() defaults the selector to
 # "level_zero:0,1" and its cases materialize across both. Narrowing it to the
@@ -3031,11 +3010,7 @@ target_compile_definitions(test-fattn-thread-local PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-fattn-thread-local PRIVATE
-    ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-fattn-thread-local PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-fattn-thread-local PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-fattn-thread-local COMMAND test-fattn-thread-local)
 set_tests_properties(test-fattn-thread-local PROPERTIES
     LABELS "sycl;fattn;tdd;0igs-batch2"
@@ -3061,10 +3036,7 @@ target_compile_definitions(test-ggml-sycl-soa PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-ggml-sycl-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-ggml-sycl-soa PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-ggml-sycl-soa PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-ggml-sycl-soa COMMAND test-ggml-sycl-soa)
 set_tests_properties(test-ggml-sycl-soa PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
@@ -3300,10 +3272,7 @@ target_compile_definitions(test-q6k-dispatch PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-q6k-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-q6k-dispatch PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-q6k-dispatch PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-q6k-dispatch COMMAND test-q6k-dispatch)
 set_tests_properties(test-q6k-dispatch PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
@@ -3503,10 +3472,7 @@ target_compile_definitions(test-sycl-orchestrator PRIVATE
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-orchestrator PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-orchestrator PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_link_libraries(test-sycl-orchestrator PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-orchestrator COMMAND test-sycl-orchestrator)
 set_tests_properties(test-sycl-orchestrator PROPERTIES
     LABELS "sycl;orchestrator;tdd;0igs-batch2"
@@ -3582,10 +3548,7 @@ if (NOT GGML_BACKEND_DL)
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         GGML_SYCL_PRIVATE_TESTING=1
     )
-    target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
+    target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE ggml-sycl-private-fixtures)
     # llama.cpp-u2mz removed a bare `add_test(NAME test-mmvq-q8-0-streaming-bench
     # COMMAND test-mmvq-q8-0-streaming-bench)` here. It carried no ENVIRONMENT, so
     # it always printed "SKIP: set GGML_SYCL_MMVQ_BENCH=1 to run" and exited 77 --
@@ -3664,10 +3627,7 @@ if (NOT GGML_BACKEND_DL)
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         GGML_SYCL_PRIVATE_TESTING=1
     )
-    target_link_libraries(test-q6k-reorder-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-q6k-reorder-dispatch PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
+    target_link_libraries(test-q6k-reorder-dispatch PRIVATE ggml-sycl-private-fixtures)
     add_test(NAME test-q6k-reorder-dispatch COMMAND test-q6k-reorder-dispatch)
     set_tests_properties(test-q6k-reorder-dispatch PROPERTIES
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
@@ -4619,9 +4579,6 @@ target_compile_definitions(test-layer-stream-owner-lifecycle PRIVATE
     GGML_SYCL_PRIVATE_TESTING=1
 )
 target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE ggml-sycl-private-fixtures)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-layer-stream-owner-lifecycle PRIVATE IntelSYCL::SYCL_CXX)
-endif()
 set_target_properties(test-layer-stream-owner-lifecycle PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-layer-stream-owner-lifecycle COMMAND test-layer-stream-owner-lifecycle)
@@ -4675,7 +4632,9 @@ endif()
 
 # The closed production-route seam is never compiled into ordinary ggml-sycl,
 # including BUILD_TESTING=ON builds. Clone its finalized private build settings
-# onto an object-library backend used by this executable only.
+# onto an object-library backend, then expose that implementation and its exact
+# usage requirements through one reusable carrier. Consumers must not link the
+# ordinary ggml-sycl target (including transitively through ggml) beside it.
 if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     get_target_property(_q1_backend_sources ggml-sycl SOURCES)
     add_library(ggml-sycl-q1-route-test-objects OBJECT ${_q1_backend_sources})
@@ -4691,7 +4650,11 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
 
     add_library(ggml-sycl-private-fixtures INTERFACE)
     target_link_libraries(ggml-sycl-private-fixtures INTERFACE
-        $<TARGET_OBJECTS:ggml-sycl-q1-route-test-objects>)
+        $<TARGET_OBJECTS:ggml-sycl-q1-route-test-objects>
+        # Use the registry library artifact without following ggml's PUBLIC
+        # backend edge back to the ordinary ggml-sycl implementation.
+        $<TARGET_FILE:ggml>)
+    add_dependencies(ggml-sycl-private-fixtures ggml)
     foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_LIBRARIES)
         get_target_property(_value ggml-sycl-q1-route-test-objects ${_property})
         if (_value AND NOT _value STREQUAL "_value-NOTFOUND")
@@ -4737,4 +4700,37 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         # is still diagnosed by the backend before CTest terminates the process.
         ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
         TIMEOUT 120)
+
+    add_custom_target(ggml-sycl-private-fixtures-build DEPENDS
+        test-sycl-lifecycle-runtime-wrapper
+        test-fattn-packed-k-lifecycle
+        test-unified-cache-bugs
+        test-sycl-kv-view-resolution
+        test-sycl-layout-choice
+        test-tensor-placement
+        test-sycl-mem-handle-lifetime
+        test-sycl-residency-reservation
+        test-sycl-descriptor-retention
+        test-sycl-moe-residency-preflight
+        test-sycl-residency-diagnostics
+        test-sycl-moe-fused-down-sum-policy
+        test-sycl-moe-direct-final-scratch-plan
+        test-sycl-moe-same-expert-grouping
+        test-sycl-moe-gateup-prepack-policy
+        test-sycl-moe-gateup-prepack-scratch
+        test-sycl-moe-xmx-tiled-single-layout-policy
+        test-sycl-moe-xmx-tiled-single-layout-planner
+        test-sycl-moe-xmx-tiled-materialization
+        test-sycl-moe-fusion-noactivation
+        test-sycl-moe-sequence-graphlet-policy
+        test-sycl-kv-planned-device-materialization
+        test-fattn-thread-local
+        test-ggml-sycl-soa
+        test-q6k-dispatch
+        test-sycl-orchestrator
+        test-mmvq-q8-0-streaming-bench
+        test-q6k-reorder-dispatch
+        test-layer-stream-owner-lifecycle
+        test-sycl-q1-nvfp4-admitted-device
+        test-layout-cache)
 endif()
