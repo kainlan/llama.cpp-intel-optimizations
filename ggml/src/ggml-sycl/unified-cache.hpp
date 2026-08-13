@@ -2579,9 +2579,9 @@ class unified_cache {
 
     // Arena generation: monotonically increasing counter, bumped when the arena
     // is destroyed/recreated.  Used by mem_handle to detect stale arena handles.
-    uint64_t arena_generation() const { return arena_generation_; }
+    uint64_t arena_generation() const { return arena_generation_.load(std::memory_order_acquire); }
 
-    void arena_generation_bump() { ++arena_generation_; }
+    void arena_generation_bump() { arena_generation_.fetch_add(1, std::memory_order_acq_rel); }
 
     // Register the compute queue so deferred frees wait for in-flight kernels.
     // Without this, evicted VRAM pointers can be freed while GPU kernels on the
@@ -3273,7 +3273,7 @@ class unified_cache {
     // Arena generation counter: incremented when the arena is destroyed/recreated.
     // mem_handle arena handles store the generation at creation time; on resolve(),
     // a mismatch means the handle is stale (arena was recycled).
-    uint64_t arena_generation_ = 0;
+    std::atomic<uint64_t> arena_generation_{ 0 };
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.

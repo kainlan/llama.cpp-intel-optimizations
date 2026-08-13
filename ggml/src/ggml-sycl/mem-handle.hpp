@@ -41,6 +41,9 @@ void cache_generation_bump();
 
 struct resolved_ptr {
     void *           ptr             = nullptr;
+    // Number of bytes this resolved view authorizes starting at ptr. Zero means
+    // unknown, never unbounded: bounded consumers must reject a non-zero access.
+    size_t           extent          = 0;
     ggml_layout_mode layout          = GGML_LAYOUT_AOS;
     bool             on_device       = false;
     bool             has_ready_event = false;
@@ -216,7 +219,11 @@ class mem_handle {
     // resolve(device_id) checks that the caller's device matches device (when device >= 0)
     //   and returns null with a diagnostic on mismatch.
     // The zero-arg resolve() always returns this pointer without any device or cache check.
-    static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device, int device = HOST_DEVICE);
+    static mem_handle from_direct(void * ptr,
+                                  ggml_layout_mode layout,
+                                  bool on_device,
+                                  int device = HOST_DEVICE,
+                                  size_t extent = 0);
 
     // Create an arena zone handle.
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
@@ -446,10 +453,11 @@ class mem_handle {
     mutable size_t size_   = 0;  // GUARDED by lock_; bounded view size
     // Derived views never cache a manufactured raw pointer. cached_ remains the
     // backing resolver's pointer and these fields are applied on every resolve.
-    mutable size_t backing_extent_ = 0;  // GUARDED by lock_; 0 means unknown (raw chunk bridge)
+    mutable size_t backing_extent_ = 0;  // GUARDED by lock_; 0 means unknown, never unbounded
+    size_t         backing_offset_ = 0;  // physical arena offset of the allocation backing pointer
     size_t         slice_offset_   = 0;  // immutable-after-construction offset from backing pointer
     bool           is_slice_       = false;
-    uint64_t arena_gen_ = 0;  // Arena generation (for invalidation)
+    uint64_t arena_gen_ = 0;  // Mint-time arena generation (checked against owner every resolve)
 
     // Exact allocator-minted retention identity. Cache WEIGHT constructors do
     // not populate these until unified-cache propagation lands; graph retention

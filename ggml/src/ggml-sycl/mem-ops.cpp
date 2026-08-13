@@ -28,6 +28,27 @@ static void mem_fill_test_profile_error_after_submit() {
     }
 }
 
+static bool resolved_range_contains(const resolved_ptr & resolved, size_t offset, size_t size) {
+    if (!resolved.ptr) {
+        return false;
+    }
+    if (size == 0) {
+        return offset == 0 || (resolved.extent != 0 && offset <= resolved.extent);
+    }
+    return resolved.extent != 0 && offset <= resolved.extent && size <= resolved.extent - offset;
+}
+
+static void require_resolved_range(const char * operation,
+                                   const char * endpoint,
+                                   const resolved_ptr & resolved,
+                                   size_t offset,
+                                   size_t size) {
+    if (!resolved_range_contains(resolved, offset, size)) {
+        GGML_ABORT("[MEM-OPS] %s %s range rejected: ptr=%p extent=%zu offset=%zu size=%zu",
+                   operation, endpoint, resolved.ptr, resolved.extent, offset, size);
+    }
+}
+
 static void add_deps(sycl::handler & cgh, const std::vector<sycl::event> & deps) {
     if (!deps.empty()) {
         cgh.depends_on(deps);
@@ -245,7 +266,8 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
     const int    queue_device = queue_device_or_host(queue);
     resolved_ptr d            = dst.resolve(queue_device);
     resolved_ptr s            = src.resolve(queue_device);
-    GGML_ASSERT(d && s && "mem_copy_async on unresolved handle");
+    require_resolved_range("mem_copy", "destination", d, dst_offset, size);
+    require_resolved_range("mem_copy", "source", s, src_offset, size);
 
     void *       dst_ptr = static_cast<char *>(d.ptr) + dst_offset;
     const void * src_ptr = static_cast<const char *>(s.ptr) + src_offset;
@@ -276,7 +298,8 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
     auto         publish_ticket = retain_until_event ? begin_retained_handle_publish() : retained_handle_publish_ticket{};
     resolved_ptr d              = dst.resolve();
     resolved_ptr s = src.resolve();
-    GGML_ASSERT(d && s && "mem_copy_async on unresolved handle");
+    require_resolved_range("mem_copy", "destination", d, dst_offset, size);
+    require_resolved_range("mem_copy", "source", s, src_offset, size);
 
     const int dst_device = d.on_device ? dst.device() : mem_handle::HOST_DEVICE;
     const int src_device = s.on_device ? src.device() : mem_handle::HOST_DEVICE;
@@ -433,7 +456,7 @@ static sycl::event mem_fill_direct_submit(const mem_handle &               h,
                                           const char *                     function = __builtin_FUNCTION()) {
     const int    queue_device = queue_device_or_host(queue);
     resolved_ptr r            = h.resolve(queue_device);
-    GGML_ASSERT(r && "mem_fill_async on unresolved handle");
+    require_resolved_range("mem_fill", "destination", r, offset, size);
 
     void * ptr = static_cast<char *>(r.ptr) + offset;
     if (!r.on_device) {
@@ -483,7 +506,7 @@ static sycl::event mem_fill_submit(const mem_handle &               h,
                                    bool                             retain_until_event) {
     auto         publish_ticket = retain_until_event ? begin_retained_handle_publish() : retained_handle_publish_ticket{};
     resolved_ptr r              = h.resolve();
-    GGML_ASSERT(r && "mem_fill_async on unresolved handle");
+    require_resolved_range("mem_fill", "destination", r, offset, size);
 
     sycl::queue * fill_queue = &queue;
     if (r.on_device && h.device() >= 0) {

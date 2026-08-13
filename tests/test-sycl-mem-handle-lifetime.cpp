@@ -27,6 +27,26 @@ static int test_direct_handle_debug_snapshot() {
     return 0;
 }
 
+static int test_bounded_direct_views_report_and_enforce_extent() {
+    alignas(64) unsigned char storage[64] = {};
+    auto bounded = ggml_sycl::mem_handle::from_direct(
+        storage, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, sizeof(storage));
+    const auto root = bounded.resolve();
+    CHECK(root.ptr == storage && root.extent == sizeof(storage), "bounded root must report minted extent");
+
+    const auto view = bounded.slice(16, 24);
+    const auto resolved_view = view.resolve();
+    CHECK(resolved_view.ptr == storage + 16 && resolved_view.extent == 24,
+          "slice must report its view extent");
+    CHECK(!bounded.slice(63, 2).valid(), "slice must reject offset+size beyond parent");
+    CHECK(!bounded.slice(SIZE_MAX, 1).valid(), "slice must reject overflowing offset");
+
+    auto unknown = ggml_sycl::mem_handle::from_direct(storage, GGML_LAYOUT_AOS, false);
+    CHECK(unknown.resolve().extent == 0, "unknown direct extent must remain unknown");
+    CHECK(!unknown.slice(0, 1).valid(), "unknown extent must not mint slicing authority");
+    return 0;
+}
+
 static int test_copy_move_preserve_stable_identity_and_owner() {
     alignas(64) float     storage[16] = {};
     ggml_sycl::mem_handle a           = ggml_sycl::mem_handle::from_direct(storage, GGML_LAYOUT_AOS, false);
@@ -55,6 +75,7 @@ static int test_arena_debug_identity_includes_generation() {
     CHECK(b.debug_info().generation == 8, "generation 8 must be visible");
     CHECK(a.debug_info().zone_id == static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), "zone must be visible");
     CHECK(a.debug_info().size == 1024, "size must be visible");
+    CHECK(a.debug_info().offset == 0, "arena canonical root offset must be allocation-relative");
     CHECK(a.has_stable_owner_identity(), "arena handles must have stable owner identity");
     CHECK(!a.stable_identity_equal(b), "different arena generations must not compare stable-equal");
     CHECK(std::strcmp(a.debug_info().owner_tag, "arena-a") == 0, "arena owner tag must round trip");
@@ -63,6 +84,9 @@ static int test_arena_debug_identity_includes_generation() {
 
 int main() {
     if (int rc = test_direct_handle_debug_snapshot()) {
+        return rc;
+    }
+    if (int rc = test_bounded_direct_views_report_and_enforce_extent()) {
         return rc;
     }
     if (int rc = test_copy_move_preserve_stable_identity_and_owner()) {

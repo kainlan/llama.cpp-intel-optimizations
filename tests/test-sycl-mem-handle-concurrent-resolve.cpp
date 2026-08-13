@@ -65,7 +65,8 @@ mem_handle test_make_owned_assignment_handle(void * ptr, uint64_t allocation_id,
     mem_handle h;
     h.kind_                    = mem_handle_kind::DIRECT;
     h.device_                  = mem_handle::HOST_DEVICE;
-    h.cached_                  = { ptr, GGML_LAYOUT_AOS, false, false, sycl::event{} };
+    h.cached_                  = { ptr, sizeof(uint64_t), GGML_LAYOUT_AOS, false, false, sycl::event{} };
+    h.backing_extent_          = sizeof(uint64_t);
     h.offset_                  = 0;
     h.size_                    = sizeof(uint64_t);
     h.canonical_allocation_id_ = allocation_id;

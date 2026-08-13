@@ -241,22 +241,29 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
     TEST_ASSERT(h.stable_identity_hash() != h_offset.stable_identity_hash(),
                 "CHUNK_LEASE stable hash must distinguish different ptrs inside the same leased chunk");
 
-    // Same-device resolve must return the pointer. A derived view takes its own
-    // chunk lease, so it remains valid after the root handle is released.
+    // Same-device resolve must return the pointer. A chunk lease protects
+    // physical lifetime, but only an exact runtime-allocation registry record
+    // may mint a range for slicing.
     ggml_sycl::resolved_ptr r0 = h.resolve(0);
     TEST_ASSERT(r0.ptr == host_ptr, "same-device CHUNK_LEASE resolve must return the ptr");
     ggml_sycl::mem_handle chunk_slice = h.slice(32, 96);
-    TEST_ASSERT(chunk_slice.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
-                "chunk slice must retain CHUNK_LEASE ownership");
-    TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
-                "chunk slice pointer mismatch");
-    auto nested_chunk_slice = chunk_slice.slice(16, 32);
-    TEST_ASSERT(nested_chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 48,
-                "nested chunk slice must compose offsets exactly once");
-    TEST_ASSERT(!chunk_slice.slice(80, 32).valid(), "nested chunk slice must enforce parent bounds");
-    h = {};
-    TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
-                "chunk slice must retain owner lifetime independently of parent");
+    if (r0.extent == 0) {
+        TEST_ASSERT(!chunk_slice.valid(), "unknown-extent CHUNK_LEASE root must reject slicing");
+        chunk_slice = h;
+    } else {
+        TEST_ASSERT(chunk_slice.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
+                    "bounded chunk slice must retain CHUNK_LEASE ownership");
+        TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
+                    "chunk slice pointer mismatch");
+        TEST_ASSERT(chunk_slice.resolve(0).extent == 96, "chunk slice must report view extent");
+        auto nested_chunk_slice = chunk_slice.slice(16, 32);
+        TEST_ASSERT(nested_chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 48,
+                    "nested chunk slice must compose offsets exactly once");
+        TEST_ASSERT(!chunk_slice.slice(80, 32).valid(), "nested chunk slice must enforce parent bounds");
+        h = {};
+        TEST_ASSERT(chunk_slice.resolve(0).ptr == static_cast<char *>(host_ptr) + 32,
+                    "chunk slice must retain owner lifetime independently of parent");
+    }
 
     if (n_gpu_devices < 2) {
         // Wrong-device resolve can only be tested when a second device exists

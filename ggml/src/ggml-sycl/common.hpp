@@ -172,28 +172,52 @@ inline ggml_sycl::mem_handle ggml_sycl_memcpy_handle_for_raw_ptr(void *         
                                                                  int              fallback_device,
                                                                  ggml_layout_mode layout             = GGML_LAYOUT_AOS,
                                                                  bool             fallback_on_device = false,
-                                                                 bool             fallback_unknown   = false) {
+                                                                 bool             fallback_unknown   = false,
+                                                                 size_t           trusted_extent     = 0) {
     ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
     if (loc.on_device()) {
         const int owner = loc.device >= 0 ? loc.device : fallback_device;
-        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, layout, true);
+        auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, layout, true);
+        if (trusted_extent == 0 || handle.resolve().extent != 0) {
+            return handle;
+        }
+        return ggml_sycl::mem_handle::from_direct(ptr, layout, true, owner, trusted_extent);
     }
     if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
-        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
+        auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
+        if (trusted_extent == 0 || handle.resolve().extent != 0) {
+            return handle;
+        }
+        return ggml_sycl::mem_handle::from_direct(
+            ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, trusted_extent);
     }
     if (fallback_device >= 0 && fallback_unknown) {
-        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, fallback_on_device);
+        auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, fallback_on_device);
+        if (trusted_extent == 0 || handle.resolve().extent != 0) {
+            return handle;
+        }
+        return ggml_sycl::mem_handle::from_direct(
+            ptr, layout, fallback_on_device,
+            fallback_on_device ? fallback_device : ggml_sycl::mem_handle::HOST_DEVICE, trusted_extent);
     }
-    return ggml_sycl::mem_handle::from_direct(ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    size_t extent = trusted_extent;
+    if (const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ptr)) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr >= info->base && addr - info->base < info->size) {
+            extent = info->size - static_cast<size_t>(addr - info->base);
+        }
+    }
+    return ggml_sycl::mem_handle::from_direct(ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 inline ggml_sycl::mem_handle ggml_sycl_memcpy_handle_for_raw_ptr(const void *     ptr,
                                                                  int              fallback_device,
                                                                  ggml_layout_mode layout             = GGML_LAYOUT_AOS,
                                                                  bool             fallback_on_device = false,
-                                                                 bool             fallback_unknown   = false) {
+                                                                 bool             fallback_unknown   = false,
+                                                                 size_t           trusted_extent     = 0) {
     return ggml_sycl_memcpy_handle_for_raw_ptr(const_cast<void *>(ptr), fallback_device, layout, fallback_on_device,
-                                               fallback_unknown);
+                                               fallback_unknown, trusted_extent);
 }
 
 inline bool ggml_sycl_mem_handle_has_identity(const ggml_sycl::mem_handle & handle) {
@@ -247,8 +271,12 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
 #endif
 
     const int             queue_device = ggml_sycl_get_device_id_from_queue(q);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device);
+    // This raw-pointer API's nbytes contract is the authority for this one
+    // operation; generic mem_handle consumers still reject unknown extents.
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device, GGML_LAYOUT_AOS, false, false, nbytes);
+    ggml_sycl::mem_handle src_handle =
+        ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device, GGML_LAYOUT_AOS, false, false, nbytes);
 
     ggml_sycl_profile_label profile_label{};
     profile_label.name       = "sycl.memcpy.graph_safe";
@@ -4336,6 +4364,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                         auto soa_ptr = cache->lookup(key, GGML_LAYOUT_SOA);
                         if (soa_ptr) {
                             result.ptr       = soa_ptr;
+                            result.extent    = ggml_nbytes(tensor);
                             result.layout    = GGML_LAYOUT_SOA;
                             result.on_device = wpr.on_device;
                             return result;
@@ -4343,6 +4372,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                         // No compatible layout — fall through to raw pointer
                     } else {
                         result.ptr       = wpr.ptr;
+                        result.extent    = ggml_nbytes(tensor);
                         result.layout    = wpr.layout;
                         result.on_device = wpr.on_device;
                         if (wpr.has_ready_event) {
@@ -4379,6 +4409,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
 
     // Non-weight tensors OR weight fallback: raw data pointer
     result.ptr    = ggml_sycl_get_data_ptr(tensor, device);
+    result.extent = result.ptr ? ggml_nbytes(tensor) : 0;
     result.layout = GGML_LAYOUT_AOS;
     if (result.ptr) {
         result.on_device = (ggml_sycl_get_alloc_type(result.ptr) == sycl::usm::alloc::device);
@@ -4405,7 +4436,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
         if (!ptr) {
             return false;
         }
-        const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+        const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ptr);
         if (!info) {
             return false;
         }
@@ -4416,7 +4447,12 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
         if (!on_device && !host_accessible) {
             return false;
         }
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr < info->base || addr - info->base > info->size || offset > info->size - (addr - info->base)) {
+            return false;
+        }
         result.ptr       = static_cast<char *>(ptr) + offset;
+        result.extent    = info->size - static_cast<size_t>(addr - info->base) - offset;
         result.layout    = layout;
         result.on_device = on_device;
         return true;
@@ -4431,8 +4467,12 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
         if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
             auto resolved = handle.resolve(device);
             if (resolved) {
-                result = resolved;
-                result.ptr = static_cast<char *>(resolved.ptr) + offset;
+                if (offset > resolved.extent) {
+                    return false;
+                }
+                result        = resolved;
+                result.ptr    = static_cast<char *>(resolved.ptr) + offset;
+                result.extent = resolved.extent - offset;
                 return true;
             }
         }
