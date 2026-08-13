@@ -53,6 +53,9 @@ parser.add_argument("--key", default=str(root / "ggml/src/ggml-sycl/unified-cach
 parser.add_argument("--sycl", default=str(root / "ggml/src/ggml-sycl/ggml-sycl.cpp"))
 parser.add_argument("--header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--loader", default=str(root / "src/llama-model-loader.cpp"))
+parser.add_argument("--mem-header", default=str(root / "ggml/src/ggml-sycl/mem-handle.hpp"))
+parser.add_argument("--mem-source", default=str(root / "ggml/src/ggml-sycl/mem-handle.cpp"))
+parser.add_argument("--sycl-cmake", default=str(root / "ggml/src/ggml-sycl/CMakeLists.txt"))
 parser.add_argument("--self-test", action="store_true",
                     help="prove the absence-based checks fire when the thing they forbid is present")
 args = parser.parse_args()
@@ -126,9 +129,10 @@ def ordered(text, *needles):
     return True
 
 
-def evaluate(key, sycl, header, loader):
+def evaluate(key, sycl, header, loader, mem_header, mem_source, sycl_cmake):
     key, sycl = squeeze(key), squeeze(sycl)
     header, loader = squeeze(header), squeeze(loader)
+    mem_header, mem_source, sycl_cmake = map(squeeze, (mem_header, mem_source, sycl_cmake))
 
     tripwire = between(key, "static_assert(sizeof(ggml_sycl_cache_id)", ");")
     equal = between(key, "static inline bool cache_id_equal(", "struct cache_id_equal_fn")
@@ -152,6 +156,15 @@ def evaluate(key, sycl, header, loader):
     erase = between(sycl, "static void ggml_sycl_erase_weight_identities_for_owner(",
                     "static void ggml_sycl_release_model_slot_resources(")
     loader_register = between(loader, "auto register_sycl_tensor_metadata = ", "auto usage_from_tensor = ")
+    exact_owner = between(sycl, "static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(", "\n}")
+    retained_fail_decl = between(mem_header, "#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING",
+                                 "void fail_next_retained_handle_publication_for_test();\n#endif")
+    retained_fail_atomic = between(mem_source, "#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING\nstd::atomic<bool>", "#endif")
+    retained_fail_branch = between(mem_source, "#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING\n if (g_fail_next_retained_handle_publication",
+                                   "#endif")
+    retained_fail_definition = between(mem_source, "#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING\nvoid fail_next_retained_handle_publication_for_test()",
+                                       "#endif")
+    retained_test_target = between(sycl_cmake, "target_compile_definitions(test-mem-handle-eviction PRIVATE", ")")
 
     anchors = {
         "ggml_sycl_cache_id size tripwire": tripwire,
@@ -166,6 +179,12 @@ def evaluate(key, sycl, header, loader):
         "weight cache key identity resolution": resolve,
         "ggml_sycl_erase_weight_identities_for_owner body": erase,
         "loader register_sycl_tensor_metadata body": loader_register,
+        "ggml_sycl_exact_wrapper_owner body": exact_owner,
+        "private retained-publication declaration": retained_fail_decl,
+        "private retained-publication atomic": retained_fail_atomic,
+        "private retained-publication branch": retained_fail_branch,
+        "private retained-publication definition": retained_fail_definition,
+        "private retained-publication test target": retained_test_target,
     }
 
     checks = {
@@ -252,12 +271,31 @@ def evaluate(key, sycl, header, loader):
         # With two models loaded the published plan names one of them; the other
         # would find no identity and drop to the fallback UUID path, losing the
         # file identity this whole change is about.
-        "the lookup resolves the owner from the tensor before the published plan": ordered(
-            resolve,
-            "if (extra && extra->model_id != 0) {",
-            "ggml_sycl::lifecycle::global_registry().find({ extra->model_id })",
-            "if (owner.model.value == 0) {",
-            "owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());"),
+        "the exact-owner helper accepts only the matching bound-load model": (
+            "if (model_id == 0) {" in exact_owner
+            and "return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());" in exact_owner
+            and ordered(exact_owner,
+                        "const auto bound = registry.bound_candidate();",
+                        "auto effect = registry.acquire_load_effect(bound);",
+                        "effect.owner.load == bound && effect.owner.model.value == model_id",
+                        "return effect.owner;")),
+
+        "the exact-owner helper accepts only an exact live registry token": ordered(
+            exact_owner,
+            "const auto state = registry.find({ model_id });",
+            "state->phase != ggml_sycl::lifecycle::model_phase::LIVE",
+            "state->token.model.value != model_id",
+            "return {};",
+            "return state->token;"),
+
+        "retained-publication failure injection is absent from the ordinary library": (
+            "GGML_SYCL_RETAINED_PUBLICATION_TESTING" in retained_fail_decl
+            and "g_fail_next_retained_handle_publication" in retained_fail_atomic
+            and "g_fail_next_retained_handle_publication.exchange" in retained_fail_branch
+            and "fail_next_retained_handle_publication_for_test" in retained_fail_definition
+            and "GGML_SYCL_RETAINED_PUBLICATION_TESTING=1" in retained_test_target
+            and not re.search(r"target_compile_definitions\(ggml-sycl[^)]*GGML_SYCL_RETAINED_PUBLICATION_TESTING",
+                              sycl_cmake, re.S)),
 
         # Published split identities carry the owner prefix and must die with the
         # owner, or a later load reusing the slot inherits this one's files.
@@ -322,20 +360,30 @@ ABSENCE_MUTANTS = {
         "loader",
         "idx < file_paths.size() &&\n !file_paths[idx].empty()",
         "idx < file_paths.size()"),
+    "the exact-owner helper accepts only the matching bound-load model": (
+        "sycl",
+        "effect.owner.load == bound && effect.owner.model.value == model_id",
+        "effect.owner.load == bound"),
+    "the exact-owner helper accepts only an exact live registry token": (
+        "sycl",
+        "state->phase != ggml_sycl::lifecycle::model_phase::LIVE ||",
+        "false ||"),
 }
 
 
-def self_test(key, sycl, header, loader):
-    """Every absence check must fail once its forbidden construct is injected."""
+def self_test(key, sycl, header, loader, mem_header, mem_source, sycl_cmake):
+    """Every mutation check must fail once its forbidden construct is injected."""
     problems = []
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
-        sources = {"key": key, "sycl": sycl, "header": header, "loader": loader}
+        sources = {"key": key, "sycl": sycl, "header": header, "loader": loader,
+                   "mem_header": mem_header, "mem_source": mem_source, "sycl_cmake": sycl_cmake}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
         if anchor not in squeeze(sources[target]):
             problems.append("mutation anchor missing for: " + name)
             continue
         sources[target] = squeeze(sources[target]).replace(anchor, replacement, 1)
-        _, failed, _ = evaluate(sources["key"], sources["sycl"], sources["header"], sources["loader"])
+        _, failed, _ = evaluate(sources["key"], sources["sycl"], sources["header"], sources["loader"],
+                                sources["mem_header"], sources["mem_source"], sources["sycl_cmake"])
         if name not in failed:
             problems.append("check did not fire on its mutant: " + name)
     return problems
@@ -347,8 +395,12 @@ def read(path):
 
 key, sycl = read(args.key), read(args.sycl)
 header, loader = read(args.header), read(args.loader)
+mem_header, mem_source = read(args.mem_header), read(args.mem_source)
+# CMake's # comments and apostrophes are not C/C++ syntax; feeding them to the
+# C++ comment stripper can consume later target declarations as character data.
+sycl_cmake = Path(args.sycl_cmake).read_text() if Path(args.sycl_cmake).exists() else ""
 
-missing_anchors, failed, n_checks = evaluate(key, sycl, header, loader)
+missing_anchors, failed, n_checks = evaluate(key, sycl, header, loader, mem_header, mem_source, sycl_cmake)
 
 for name in missing_anchors:
     print("MISSING ANCHOR: " + name)
@@ -359,7 +411,7 @@ if missing_anchors or failed:
     sys.exit(1)
 
 if args.self_test:
-    problems = self_test(key, sycl, header, loader)
+    problems = self_test(key, sycl, header, loader, mem_header, mem_source, sycl_cmake)
     for problem in problems:
         print("SELF-TEST FAIL: " + problem)
     if problems:

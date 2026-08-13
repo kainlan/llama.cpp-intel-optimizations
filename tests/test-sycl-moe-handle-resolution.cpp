@@ -33,6 +33,53 @@ int main() {
             }                                         \
         } while (0)
 
+class lifecycle_candidate_fixture {
+  public:
+    explicit lifecycle_candidate_fixture(bool stage_empty_plan = false) : registry_(ggml_sycl::lifecycle::global_registry()) {
+        const auto begin = registry_.begin_outer();
+        if (begin.code != ggml_sycl::lifecycle::error::OK) {
+            return;
+        }
+        txn_ = begin.txn;
+        registry_.bind_candidate(txn_);
+        if (stage_empty_plan) {
+            ggml_sycl::placement_plan plan{};
+            plan.build_index();
+            ggml_sycl::lifecycle_stage_placement_plan(txn_.value, std::move(plan));
+        }
+        active_ = true;
+    }
+
+    ~lifecycle_candidate_fixture() {
+        if (!active_) {
+            return;
+        }
+        registry_.unbind_candidate(txn_);
+        ggml_sycl::lifecycle_abort_placement_plan(txn_.value);
+        (void) registry_.end(txn_, false);
+    }
+
+    lifecycle_candidate_fixture(const lifecycle_candidate_fixture &) = delete;
+    lifecycle_candidate_fixture & operator=(const lifecycle_candidate_fixture &) = delete;
+
+    explicit operator bool() const { return active_; }
+    uint64_t model_id() const { return registry_.current_active_token().model.value; }
+
+    void reset_candidate_plan(bool stage_empty_plan = false) {
+        ggml_sycl::lifecycle_abort_placement_plan(txn_.value);
+        if (stage_empty_plan) {
+            ggml_sycl::placement_plan plan{};
+            plan.build_index();
+            ggml_sycl::lifecycle_stage_placement_plan(txn_.value, std::move(plan));
+        }
+    }
+
+  private:
+    ggml_sycl::lifecycle::Registry & registry_;
+    ggml_sycl::lifecycle::LoadTxnId  txn_{};
+    bool                             active_ = false;
+};
+
 static ggml_sycl::expert_resolve_request make_request(const ggml_sycl_cache_id & key,
                                                       ggml_layout_mode           layout,
                                                       int                        current_device = 0) {
@@ -200,6 +247,8 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
 
 static bool test_routed_prestage_exact_layout_receipt(sycl::queue & q) {
     printf("\n=== Test: routed prestage exact layout pin receipt ===\n");
+    lifecycle_candidate_fixture lifecycle(/*stage_empty_plan=*/true);
+    TEST_ASSERT(lifecycle, "failed to begin routed prestage fixture lifecycle");
     auto * cache = ggml_sycl::get_unified_cache_for_device(0);
     TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
     const auto token = ggml_sycl::lifecycle::global_registry().current_active_token();
@@ -288,7 +337,11 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     ggml_sycl::alloc_handle lookup{};
     TEST_ASSERT(ggml_sycl::unified_lookup(base, &lookup) && lookup.alloc_id == alloc_id,
                 "retained expert lease must delay allocation free");
-    retained = {};
+    // The admitted operand and normalized route deliberately copied the lease.
+    // Release those fixture-owned copies before asserting final reclamation.
+    admitted.batch.operands[0].lease = {};
+    route.lease                      = {};
+    retained                         = {};
     TEST_ASSERT(!ggml_sycl::unified_lookup(base, &lookup), "last retained lease must release allocation");
 
     ggml_sycl::alloc_handle replacement{};
@@ -463,9 +516,23 @@ static bool test_planner_role_specific_expert_placement() {
     return true;
 }
 
+static bool test_exact_wrapper_owner_resolution() {
+    printf("\n=== Test: exact wrapper owner resolution ===\n");
+    lifecycle_candidate_fixture lifecycle(/*stage_empty_plan=*/true);
+    TEST_ASSERT(lifecycle, "failed to begin exact-owner fixture lifecycle");
+    const uint64_t fixture_model = lifecycle.model_id();
+    TEST_ASSERT(fixture_model != 0, "exact-owner fixture did not mint a model id");
+    TEST_ASSERT(ggml_sycl::test_exact_wrapper_owner_matches(fixture_model, fixture_model),
+                "exact wrapper owner rejected the bound load-effect model");
+    TEST_ASSERT(!ggml_sycl::test_exact_wrapper_owner_matches(fixture_model + 1, fixture_model),
+                "bound-load owner resolution substituted a mismatched model");
+    TEST_ASSERT(!ggml_sycl::test_exact_wrapper_owner_matches(0x5a17, fixture_model),
+                "wrapper owner resolution substituted the active model for an unknown model");
+    return true;
+}
+
 static bool test_moe_route_preserves_ready_event_for_chaining() {
     printf("\n=== Test: MoE route ready-event chaining contract ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_route_preserves_ready_event_for_chaining(),
                 "planned MoE route resolution should preserve ready_event instead of waiting");
 
@@ -474,7 +541,6 @@ static bool test_moe_route_preserves_ready_event_for_chaining() {
 
 static bool test_moe_ptr_table_retains_route_lease_until_event() {
     printf("\n=== Test: MoE pointer-table route lease lifetime ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_retains_route_lease_until_event(),
                 "update_moe_ptr_table should retain route leases and chain ready_event into table memcpy");
 
@@ -483,7 +549,6 @@ static bool test_moe_ptr_table_retains_route_lease_until_event() {
 
 static bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
     printf("\n=== Test: MoE shared ID cache rebuilds pointer-table lease lifetime ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event(),
                 "shared ID reuse should rebuild current-role pointer tables with leases and ready_event dependencies");
 
@@ -492,7 +557,6 @@ static bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
 
 static bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
     printf("\n=== Test: MoE shared ID cache rebuilds tensor-specific pointer tables ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_cached_reuse_is_tensor_specific(),
                 "UP/DOWN pointer tables must be rebuilt from their own role handles, not GATE pointers");
 
@@ -501,7 +565,6 @@ static bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
 
 static bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     printf("\n=== Test: MoE pointer-table cache stores IDs only ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_does_not_persist_pointer_cache(),
                 "MoE block cache should retain shared IDs only, not a separate pointer-handle cache");
 
@@ -510,7 +573,6 @@ static bool test_moe_ptr_table_does_not_persist_pointer_cache() {
 
 static bool test_moe_ptr_table_lease_covers_populated_slots() {
     printf("\n=== Test: MoE pointer-table populated slots are covered by leases ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_lease_covers_populated_slots(),
                 "every populated MoE pointer-table slot should resolve from a retained mem_handle lease");
 
@@ -519,7 +581,6 @@ static bool test_moe_ptr_table_lease_covers_populated_slots() {
 
 static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
     printf("\n=== Test: MoE dispatch bundle retains table/compact/missing backing until delayed event ===\n");
-
     TEST_ASSERT(ggml_sycl::test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing(),
                 "MoE dispatch bundle must retain table, compact list, and missing flag backing independently of extra slots");
 
@@ -564,43 +625,10 @@ int main() {
         return 1;
     }
 
-    // The producer-level builder fixtures below mint load-scoped keys. Install
-    // the same exact bound lifecycle and candidate-plan authority as model load;
-    // fabricated model IDs cannot exercise owner validation correctly.
-    auto & registry = ggml_sycl::lifecycle::global_registry();
-    auto   begin    = registry.begin_outer();
-    if (begin.code != ggml_sycl::lifecycle::error::OK) {
-        fprintf(stderr, "failed to begin MoE handle fixture lifecycle\n");
-        return 1;
-    }
-    registry.bind_candidate(begin.txn);
-    ggml_sycl::placement_plan fixture_plan{};
-    fixture_plan.build_index();
-    ggml_sycl::lifecycle_stage_placement_plan(begin.txn.value, std::move(fixture_plan));
-    struct lifecycle_fixture_guard {
-        ggml_sycl::lifecycle::Registry & registry;
-        ggml_sycl::lifecycle::LoadTxnId  txn;
-        ~lifecycle_fixture_guard() {
-            registry.unbind_candidate(txn);
-            ggml_sycl::lifecycle_abort_placement_plan(txn.value);
-            (void) registry.end(txn, false);
-        }
-    } fixture_guard{ registry, begin.txn };
-
-    const uint64_t fixture_model = registry.current_active_token().model.value;
-    bool ok = fixture_model != 0;
-    auto owner_check = [&](bool condition, const char * diagnostic) {
-        if (!condition) {
-            fprintf(stderr, "  FAIL: %s\n", diagnostic);
-            ok = false;
-        }
-    };
-    owner_check(ggml_sycl::test_exact_wrapper_owner_matches(fixture_model, fixture_model),
-                "exact wrapper owner rejected the bound load-effect model");
-    owner_check(!ggml_sycl::test_exact_wrapper_owner_matches(fixture_model + 1, fixture_model),
-                "bound-load owner resolution substituted a mismatched model");
-    owner_check(!ggml_sycl::test_exact_wrapper_owner_matches(0x5a17, fixture_model),
-                "wrapper owner resolution substituted the active model for an unknown model");
+    // Lifecycle candidate authority is fixture-local. Keeping one candidate
+    // bound across unrelated cache tests makes their unowned keys look like
+    // members of that load and contaminates every later authority decision.
+    bool ok = test_exact_wrapper_owner_resolution();
     ok &= test_normal_cache_expert_resolution(*q);
     ok &= test_direct_staged_device_resolution(*q);
     // Keep the global-cache / ready-event chaining coverage ahead of the
@@ -608,13 +636,32 @@ int main() {
     // forces fallback/no-arena paths and tears down a separate cache owner,
     // which is useful coverage on its own but should not perturb the later
     // global-cache MoE staging chain assertions.
-    ok &= test_moe_route_preserves_ready_event_for_chaining();
-    ok &= test_moe_ptr_table_retains_route_lease_until_event();
-    ok &= test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
-    ok &= test_moe_ptr_table_cached_reuse_is_tensor_specific();
-    ok &= test_moe_ptr_table_does_not_persist_pointer_cache();
-    ok &= test_moe_ptr_table_lease_covers_populated_slots();
-    ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
+    {
+        // These builder helpers intentionally share one admitted model, while
+        // each owns its candidate plan. Changing model identity between helpers
+        // invalidates their model-scoped dispatch state; carrying the previous
+        // helper's plan forward gives the next helper stale placement authority.
+        lifecycle_candidate_fixture lifecycle;
+        if (!lifecycle) {
+            fprintf(stderr, "  FAIL: failed to begin MoE builder fixture lifecycle\n");
+            ok = false;
+        } else {
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_retains_route_lease_until_event();
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_cached_reuse_is_tensor_specific();
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_does_not_persist_pointer_cache();
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_lease_covers_populated_slots();
+            lifecycle.reset_candidate_plan();
+            ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
+            lifecycle.reset_candidate_plan(/*stage_empty_plan=*/true);
+            ok &= test_moe_route_preserves_ready_event_for_chaining();
+        }
+    }
     ok &= test_direct_host_and_miss_resolution(*q);
     ok &= test_routed_prestage_exact_layout_receipt(*q);
     ok &= test_canonical_owned_aos_slice_lifecycle(*q);

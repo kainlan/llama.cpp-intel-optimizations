@@ -1780,6 +1780,7 @@ target_link_options(test-mem-handle-eviction PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIO
 target_compile_definitions(test-mem-handle-eviction PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_RETAINED_PUBLICATION_TESTING=1
 )
 target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
 if (IntelSYCL_FOUND)
@@ -1794,6 +1795,22 @@ set_tests_properties(mem-handle-eviction PROPERTIES
     # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
     SKIP_RETURN_CODE 77
 )
+
+# BUILD_TESTING must not alter the ordinary backend DSO. The failure injector
+# is compiled only into the direct-source executable above; prove the library's
+# dynamic symbol table remains production-clean.
+if (CMAKE_NM AND Python3_Interpreter_FOUND)
+    add_test(NAME sycl-retained-publication-no-export
+        COMMAND ${Python3_EXECUTABLE} -c [=[
+import subprocess
+import sys
+symbols = subprocess.check_output([sys.argv[1], "-D", "--defined-only", sys.argv[2]], text=True)
+if "fail_next_retained_handle_publication_for_test" in symbols:
+    raise SystemExit("retained-publication test seam escaped into the ordinary ggml-sycl DSO")
+]=] ${CMAKE_NM} $<TARGET_FILE:ggml-sycl>)
+    set_tests_properties(sycl-retained-publication-no-export PROPERTIES
+        LABELS "sycl;host;source-contract;exports")
+endif()
 endif() # direct-source static SYCL fixture
 
 # mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11).

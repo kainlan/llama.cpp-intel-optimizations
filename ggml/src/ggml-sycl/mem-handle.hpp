@@ -605,9 +605,15 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
 
-// Fail the next retained-handle publication before it becomes visible. This is
-// a deterministic concurrency-test seam; production callers must not use it.
+#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
+// Fail the next retained-handle publication before it becomes visible. This
+// declaration exists only in the private direct-source test variant; ordinary
+// BUILD_TESTING libraries retain the exact production publication path.
+#    if defined(__GNUC__)
+__attribute__((visibility("hidden")))
+#    endif
 void fail_next_retained_handle_publication_for_test();
+#endif
 
 // During SYCL command-graph recording, events produced by recorded commands are
 // not waitable. The active backend context installs a per-thread sink so those

@@ -61,7 +61,9 @@ struct retained_handle_state {
 // static objects.  Keep the synchronization state alive until process exit.
 retained_handle_state *                g_retained_handles_state = new retained_handle_state();
 std::once_flag                         g_retained_drain_worker_once;
-std::atomic<bool>                      g_fail_next_retained_handle_publication{ false };
+#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
+std::atomic<bool> g_fail_next_retained_handle_publication{ false };
+#endif
 thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
 
 // Whether THIS thread's retained handles belong to a command graph.
@@ -1510,9 +1512,11 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
         return;
     }
 
+#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
     if (g_fail_next_retained_handle_publication.exchange(false, std::memory_order_acq_rel)) {
         throw std::bad_alloc();
     }
+#endif
 
     if (graph_lifetime_retention_active()) {
         retain_handles_for_current_graph(std::move(handles));
@@ -1545,9 +1549,11 @@ void retain_handles_until_event_transactional(std::vector<mem_handle> handles, s
     ticket.reset();
 }
 
+#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
 void fail_next_retained_handle_publication_for_test() {
     g_fail_next_retained_handle_publication.store(true, std::memory_order_release);
 }
+#endif
 
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {
     g_graph_retained_handle_sink = sink;
