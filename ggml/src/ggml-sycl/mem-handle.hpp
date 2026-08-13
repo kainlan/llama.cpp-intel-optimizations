@@ -708,6 +708,7 @@ class terminal_retention_ticket {
     // Non-null only while recording. Capturing this at prepare time makes
     // publication attempt/epoch scoped rather than context-global.
     std::vector<mem_handle> *        graph_sink_ = nullptr;
+    uint64_t                         graph_epoch_ = 0;
 };
 
 // Keep handle leases alive until submitted SYCL work completes.  This bridges
@@ -743,8 +744,8 @@ void fail_next_retained_handle_publication_for_test();
 #endif
 
 // During SYCL command-graph recording, events produced by recorded commands are
-// not waitable. The active backend context installs a per-thread sink so those
-// handles are retained for the executable graph lifetime instead.
+// not waitable. Attaching a sink starts a new monotonically numbered TLS epoch;
+// detaching invalidates it. Tickets commit only when both sink and epoch match.
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
 
 // Drain event-bound handle retainers. When wait_all is true, wait for every

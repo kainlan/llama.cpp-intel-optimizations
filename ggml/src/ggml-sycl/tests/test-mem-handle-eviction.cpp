@@ -772,6 +772,32 @@ static bool test_terminal_retention_ticket_state_machine(sycl::queue & q) {
     return true;
 }
 
+static bool test_graph_recording_epoch_reuse_rejected(sycl::queue & q) {
+    TEST_BEGIN("graph_recording_epoch_reuse_rejected");
+
+    int marker = 0;
+    std::vector<ggml_sycl::mem_handle> sink;
+    ggml_sycl::set_graph_retained_handle_sink(&sink);
+    auto ticket = ggml_sycl::terminal_retention_ticket::prepare(
+        {}, { ggml_sycl::mem_handle::from_direct(&marker, GGML_LAYOUT_AOS, false) });
+    sycl::event terminal = q.submit([&](sycl::handler & cgh) { cgh.host_task([]() {}); });
+    ticket.mark_submitted(q);
+
+    // Reuse the exact vector address for a later recording attempt. Pointer-only
+    // identity would incorrectly publish this old ticket into the new graph.
+    ggml_sycl::set_graph_retained_handle_sink(nullptr);
+    ggml_sycl::set_graph_retained_handle_sink(&sink);
+    bool rejected = false;
+    try { ticket.commit(terminal); } catch (const std::runtime_error &) { rejected = true; }
+    ggml_sycl::set_graph_retained_handle_sink(nullptr);
+    terminal.wait_and_throw();
+    TEST_ASSERT(rejected, "stale ticket committed into a reused graph sink");
+    TEST_ASSERT(sink.empty(), "stale epoch published retained handles");
+
+    TEST_PASS();
+    return true;
+}
+
 // =============================================================================
 // Test 11: failed retained publication leaves the caller's ticket active until
 // the exact submission queue has drained. A concurrent graph-boundary drain
@@ -904,6 +930,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
     all_passed &= test_terminal_retention_ticket_state_machine(q);
+    all_passed &= test_graph_recording_epoch_reuse_rejected(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");

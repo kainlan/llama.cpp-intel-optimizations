@@ -2007,8 +2007,8 @@ struct pp_pipeline_state {
     int                            device_id    = -1;
 
     ~pp_pipeline_state() {
+        cancel_graph_noexcept("destructor");
         if (dma_queue) {
-            dma_queue->wait();
             for (int b = 0; b < 2; b++) {
                 scratch_handle[b] = {};
                 scratch_buf[b]    = nullptr;
@@ -2017,7 +2017,18 @@ struct pp_pipeline_state {
         }
     }
 
-    void reset_graph() {
+    // Cancellation is a lifetime boundary: DMA may still read a schedule
+    // source or write scratch. Drain it before dropping retained resolved_ptrs.
+    void cancel_graph_noexcept(const char * reason) noexcept {
+        if (dma_queue && (prefetch_buf >= 0 || !schedule.empty())) {
+            try {
+                dma_queue->wait_and_throw();
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("[PP-PIPELINE] DMA cancellation drain failed (%s): %s\n", reason, e.what());
+            } catch (...) {
+                GGML_LOG_ERROR("[PP-PIPELINE] DMA cancellation drain failed (%s): unknown error\n", reason);
+            }
+        }
         schedule.clear();
         schedule_idx            = 0;
         prefetch_buf            = -1;
@@ -2028,6 +2039,8 @@ struct pp_pipeline_state {
         prefetch_blocks_per_row = 0;
         prefetch_nrows          = 0;
     }
+
+    void reset_graph() noexcept { cancel_graph_noexcept("reset"); }
 };
 
 static bool pp_pipeline_env_enabled() {

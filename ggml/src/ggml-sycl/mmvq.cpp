@@ -21421,7 +21421,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                     const float *           fused_add          = nullptr,
                                     int64_t                 fused_add_ne0      = 0,
                                     int64_t                 fused_add_nb0      = sizeof(float),
-                                    int64_t                 fused_add_row_base = 0) {
+                                    int64_t                 fused_add_row_base = 0,
+                                    ggml_sycl::terminal_retention_ticket * on_first_submit = nullptr) {
     const int64_t row_diff = row_high - row_low;
     const size_t  q8_1_ts  = sizeof(block_q8_1);
     const size_t  q8_1_bs  = QK8_1;
@@ -21740,6 +21741,11 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
             default:
                 GGML_ABORT("fatal error");
         }
+
+        // Every type branch above returns only after its queue submission. Move
+        // the retention ticket at the first such boundary, not after the whole
+        // multi-column launcher (a later column may throw).
+        if (on_first_submit) on_first_submit->mark_submitted(*stream);
 
         // DEBUG: Check output values for attn_output after kernel (layer 0 only)
         // Controlled by GGML_SYCL_TP_DEBUG environment variable
@@ -22586,8 +22592,8 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
     auto retention = ggml_sycl::terminal_retention_ticket::prepare({ resolved });
     ggml_sycl_mmvq_dispatch(src0, dispatch_ptr, dispatch_base, mmvq_mode, device_id, ne00, ne01, ne10, row_low,
                             row_high, src1_ncols, src1_padded_col_size, src1_ddq_i, dst_dd_i, dst_row_stride, stream,
-                            fused_add.active() ? fused_add.data : nullptr, fused_add.ne0, fused_add.nb0, row_low);
-    retention.mark_submitted(*stream);
+                            fused_add.active() ? fused_add.data : nullptr, fused_add.ne0, fused_add.nb0, row_low,
+                            &retention);
     retention.commit(ggml_sycl_submit_marker<ggml_sycl_mmvq_marker_kernel>(*stream));
     if (mmvq_inner_timing) {
         stream->wait();

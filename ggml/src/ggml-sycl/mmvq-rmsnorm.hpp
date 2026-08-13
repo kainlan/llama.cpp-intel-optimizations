@@ -406,6 +406,10 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
         return;
     }
     const void * W_data = W_resolved.ptr;
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(scales_owner));
+    auto terminal_ticket = ggml_sycl::terminal_retention_ticket::prepare(
+        { gamma_resolved, W_resolved }, std::move(retained));
 
     switch (W->type) {
         case GGML_TYPE_Q4_0:
@@ -424,10 +428,9 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
             GGML_ABORT("Fused RMSNorm+MMVQ not supported for weight type %d\n", W->type);
     }
 
+    terminal_ticket.mark_submitted(*stream);
     sycl::event done = ggml_sycl_submit_marker<class ggml_sycl_mmvq_rmsnorm_scales_release_kernel>(*stream);
-    std::vector<ggml_sycl::mem_handle> retained;
-    retained.push_back(std::move(scales_owner));
-    ggml_sycl::record_terminal_retention(std::move(done), { gamma_resolved, W_resolved }, std::move(retained));
+    terminal_ticket.commit(std::move(done));
 }
 
 #endif // GGML_SYCL_MMVQ_RMSNORM_HPP

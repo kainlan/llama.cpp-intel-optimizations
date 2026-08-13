@@ -941,6 +941,13 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     // is tracked separately: an unset event must never reach them.
     sycl::event kernel_event;
     bool        kernel_event_valid = false;
+    std::vector<ggml_sycl::mem_handle> terminal_owners;
+    if (src0_stage.valid()) terminal_owners.push_back(src0_stage);
+    if (src1_stage.valid()) terminal_owners.push_back(src1_stage);
+    if (src0_weight_stage.valid()) terminal_owners.push_back(src0_weight_stage);
+    if (src1_weight_stage.valid()) terminal_owners.push_back(src1_weight_stage);
+    auto terminal_ticket = ggml_sycl::terminal_retention_ticket::prepare(
+        { src0_resolved, src1_resolved }, std::move(terminal_owners));
 
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         kernel_event = op()((const float *) src0_d, (const float *) src1_d, (float *) dst_d, ne00, ne01, ne02, ne03,
@@ -981,6 +988,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     // the five op() branches ran and assigned `kernel_event`.  If ggml_abort ever
     // loses noreturn, move this back into the branches -- do not just reorder it.
     kernel_event_valid = true;
+    terminal_ticket.mark_submitted(*main_stream);
 
     // The ONE site that decides where the post-op completion event comes from.
     // Every consumer goes through here, so none of them can be handed a
@@ -1001,15 +1009,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         return done_event;
     };
 
-    {
-        std::vector<ggml_sycl::mem_handle> terminal_owners;
-        if (src0_stage.valid()) terminal_owners.push_back(std::move(src0_stage));
-        if (src1_stage.valid()) terminal_owners.push_back(std::move(src1_stage));
-        if (src0_weight_stage.valid()) terminal_owners.push_back(std::move(src0_weight_stage));
-        if (src1_weight_stage.valid()) terminal_owners.push_back(std::move(src1_weight_stage));
-        ggml_sycl::record_terminal_retention(ensure_done_event(), { src0_resolved, src1_resolved },
-                                             std::move(terminal_owners));
-    }
+    terminal_ticket.commit(ensure_done_event());
 
     if (dst && dst->op == GGML_OP_MUL && !g_ggml_sycl_graph_recording) {
         try {

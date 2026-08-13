@@ -2725,13 +2725,17 @@ class unified_cache {
     bool get_dma_staging_buffers(size_t slice_bytes, size_t count, dma_staging_buffers & out);
 
     struct dma_stream_result {
+        // `event` remains as the compatibility spelling for terminal_event.
         sycl::event event;
-        bool        ok                 = false;
-        bool        used_mmap_direct   = false;
-        bool        mmap_direct_failed = false;
-        size_t      slices             = 0;
-        size_t      slice_bytes        = 0;
-        size_t      buffer_count       = 0;
+        sycl::event terminal_event;
+        sycl::queue * queue             = nullptr;
+        bool        ok                  = false;
+        bool        submitted           = false;
+        bool        used_mmap_direct    = false;
+        bool        mmap_direct_failed  = false;
+        size_t      slices              = 0;
+        size_t      slice_bytes         = 0;
+        size_t      buffer_count        = 0;
     };
 
     dma_stream_result stream_dma(const cache_ptr_view &           src,
@@ -3123,11 +3127,13 @@ class unified_cache {
     // Sub-allocate from a zone. When allocation_id is non-zero, physical
     // allocation, exact authority registration, and token identity share the
     // same allocator-group transaction.
-    void * zone_alloc(vram_zone_id                       zone,
-                      size_t                             size,
-                      size_t                             align = 256,
-                      uint64_t                           allocation_id = 0,
-                      arena_authority::allocation_record * exact = nullptr);
+    void * zone_alloc(vram_zone_id                         zone,
+                      size_t                               size,
+                      size_t                               align = 256,
+                      uint64_t                             allocation_id = 0,
+                      arena_authority::allocation_record * exact = nullptr,
+                      bool (*registry_commit)(void *, const arena_authority::allocation_record &, void *) noexcept = nullptr,
+                      void *                               registry_context = nullptr);
 
     // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
     // ptr must have been returned by zone_alloc. No size parameter —
@@ -3347,16 +3353,28 @@ class unified_cache {
     // WEIGHT share group 0 in both single- and N-chunk modes; every TLSF
     // alloc/free/reset and lifecycle transition is serialized by this table.
     enum class allocator_group_state : uint8_t { CLOSED, OPEN, CLOSING };
+    struct allocator_group_record {
+        vram_zone_id zone          = vram_zone_id::COUNT;
+        uint64_t     allocation_id = 0;
+        size_t       offset        = 0;
+        size_t       extent        = 0;
+    };
     struct allocator_group {
-        std::mutex            mutex;
-        allocator_group_state state = allocator_group_state::CLOSED;
+        std::mutex                                        mutex;
+        allocator_group_state                             state = allocator_group_state::CLOSED;
+        std::unordered_map<void *, allocator_group_record> allocations;
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;
     bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
     void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;
+    bool arena_record_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id,
+                                        size_t offset, size_t extent,
+                                        zone_registry_commit_fn registry_commit, void * registry_context) noexcept;
+    void arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id = 0) noexcept;
 
     // Zone incarnation table. The physical-group mutex above is the lifecycle
     // serializer for allocation/reset/destroy/publication. The

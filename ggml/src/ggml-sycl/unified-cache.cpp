@@ -800,6 +800,54 @@ struct runtime_alloc_record {
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 
+struct arena_runtime_publication_context {
+    runtime_alloc_record record;
+    bool                 attempted = false;
+    bool                 published = false;
+};
+
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+static std::atomic<bool> g_test_fail_next_arena_registry_commit{ false };
+static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
+static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
+#endif
+
+static bool arena_runtime_registry_commit(void * ptr, const arena_authority::allocation_record & exact,
+                                          void * opaque) noexcept {
+    auto & context = *static_cast<arena_runtime_publication_context *>(opaque);
+    context.attempted = true;
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+    g_test_arena_registry_commit_reached.store(true, std::memory_order_release);
+    while (g_test_pause_arena_registry_commit.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    if (g_test_fail_next_arena_registry_commit.exchange(false, std::memory_order_acq_rel)) return false;
+#endif
+    try {
+        runtime_alloc_record & rec       = context.record;
+        rec.handle.ptr                   = ptr;
+        rec.handle.arena_generation      = exact.generation;
+        rec.handle.arena_offset          = exact.offset;
+        rec.handle.arena_extent          = exact.extent;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        // A live pointer row is authority. Never replace it with an allocation
+        // from a recycled TLSF address; failure rolls this allocation back.
+        if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) return false;
+        auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+        if (!inserted.second) return false;
+        try {
+            if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = rec.handle.tier;
+        } catch (...) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            throw;
+        }
+        context.published = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Per-zone monotonic epoch id for host SCRATCH/STAGING (iiff Option C step 2,
 // llama.cpp-lbm3). Bumped by host_zone_settle(zone) at every call -- refused
 // or clean, reached via either host_zone_boundary_check() or
@@ -10039,6 +10087,7 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                                                            const std::vector<sycl::event> & deps,
                                                            dma_stream_copy_fn               copy_fn) {
     dma_stream_result result{};
+    result.queue = &queue_;
     if (!src.ptr || !slice_fn) {
         return result;
     }
@@ -10066,9 +10115,11 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                     static_cast<int>(src.type));
 
     if (src.location == cache_location::DEVICE) {
-        result.event  = slice_fn(queue_, src.ptr, bytes, 0, ctx, deps);
-        result.ok     = true;
-        result.slices = 1;
+        result.event          = slice_fn(queue_, src.ptr, bytes, 0, ctx, deps);
+        result.terminal_event = result.event;
+        result.submitted      = true;
+        result.ok             = true;
+        result.slices         = 1;
         return result;
     }
 
@@ -10118,21 +10169,40 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                 copy_evt = copy_to_device_async(staging.buffers[slot], static_cast<const char *>(src.ptr) + offset, cur,
                                                 copy_deps);
             }
-        } catch (const sycl::exception & e) {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] DMA copy failed: %s\n", e.what());
-            if (src.location == cache_location::HOST_MMAP) {
-                result.mmap_direct_failed = true;
+            // The first successful copy is already asynchronous work. Publish
+            // that transition before attempting the paired compute submit.
+            result.submitted      = true;
+            result.terminal_event = copy_evt;
+            result.event          = copy_evt;
+
+            std::vector<sycl::event> kernel_deps{ copy_evt };
+            sycl::event kernel_evt = slice_fn(queue_, staging.buffers[slot], cur, offset, ctx, kernel_deps);
+            result.terminal_event = kernel_evt;
+            result.event          = kernel_evt;
+
+            buffer_events[slot]    = kernel_evt;
+            buffer_has_event[slot] = true;
+            all_events.push_back(kernel_evt);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] DMA stream submit failed after %zu slices: %s\n", slices, e.what());
+            if (src.location == cache_location::HOST_MMAP) result.mmap_direct_failed = true;
+            // Partial submission is terminally drained while source pinning and
+            // staging owners are still held by caller/cache and this object.
+            if (result.submitted) {
+                try { result.terminal_event.wait_and_throw(); }
+                catch (...) { try { queue_.wait_and_throw(); } catch (...) {} }
+            }
+            return result;
+        } catch (...) {
+            if (src.location == cache_location::HOST_MMAP) result.mmap_direct_failed = true;
+            if (result.submitted) {
+                try { result.terminal_event.wait_and_throw(); }
+                catch (...) { try { queue_.wait_and_throw(); } catch (...) {} }
             }
             return result;
         }
 
-        std::vector<sycl::event> kernel_deps;
-        kernel_deps.push_back(copy_evt);
-        sycl::event kernel_evt = slice_fn(queue_, staging.buffers[slot], cur, offset, ctx, kernel_deps);
-
-        buffer_events[slot]    = kernel_evt;
-        buffer_has_event[slot] = true;
-        all_events.push_back(kernel_evt);
+        buffer_events[slot]    = result.terminal_event;
 
         offset += cur;
         slices++;
@@ -10143,8 +10213,10 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         if (queue_.has_property<sycl::property::queue::in_order>()) {
             // In-order queues already serialize submissions; avoid ext_oneapi_submit_barrier.
             result.event = all_events.back();
+            result.terminal_event = result.event;
         } else {
             result.event = submit_barrier(all_events);
+            result.terminal_event = result.event;
         }
     }
     result.ok = true;

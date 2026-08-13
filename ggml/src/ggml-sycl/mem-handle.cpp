@@ -65,7 +65,14 @@ std::once_flag                         g_retained_drain_worker_once;
 #ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
 std::atomic<bool> g_fail_next_retained_handle_publication{ false };
 #endif
-thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
+struct graph_recording_sink_state {
+    std::vector<mem_handle> * sink     = nullptr;
+    uint64_t                  epoch_id = 0;
+};
+thread_local graph_recording_sink_state g_graph_recording_sink;
+// Compatibility alias used only inside this translation unit; epoch identity is
+// always checked by terminal_retention_ticket before publication.
+#define g_graph_retained_handle_sink g_graph_recording_sink.sink
 
 // Whether THIS thread's retained handles belong to a command graph.
 //
@@ -1818,7 +1825,8 @@ terminal_retention_ticket terminal_retention_ticket::prepare(std::initializer_li
     terminal_retention_ticket ticket;
     ticket.owners_     = std::move(owners);
     ticket.publication_ = ticket.owners_; // failure-cleanup escrow remains independently owned
-    ticket.graph_sink_ = g_graph_retained_handle_sink;
+    ticket.graph_sink_  = g_graph_retained_handle_sink;
+    ticket.graph_epoch_ = g_graph_recording_sink.epoch_id;
     if (ticket.graph_sink_) {
         // The later move-insert is allocation-free for this recording attempt.
         ticket.graph_sink_->reserve(ticket.graph_sink_->size() + ticket.publication_.size());
@@ -1831,7 +1839,8 @@ terminal_retention_ticket terminal_retention_ticket::prepare(std::initializer_li
 terminal_retention_ticket::terminal_retention_ticket(terminal_retention_ticket && other) noexcept :
     state_(std::exchange(other.state_, state::EMPTY)), owners_(std::move(other.owners_)),
     publication_(std::move(other.publication_)), publisher_(std::move(other.publisher_)),
-    queue_(std::exchange(other.queue_, nullptr)), graph_sink_(std::exchange(other.graph_sink_, nullptr)) {}
+    queue_(std::exchange(other.queue_, nullptr)), graph_sink_(std::exchange(other.graph_sink_, nullptr)),
+    graph_epoch_(std::exchange(other.graph_epoch_, 0)) {}
 
 terminal_retention_ticket & terminal_retention_ticket::operator=(terminal_retention_ticket && other) noexcept {
     if (this != &other) {
@@ -1842,6 +1851,7 @@ terminal_retention_ticket & terminal_retention_ticket::operator=(terminal_retent
         publisher_   = std::move(other.publisher_);
         queue_       = std::exchange(other.queue_, nullptr);
         graph_sink_  = std::exchange(other.graph_sink_, nullptr);
+        graph_epoch_ = std::exchange(other.graph_epoch_, 0);
     }
     return *this;
 }
@@ -1851,6 +1861,12 @@ terminal_retention_ticket::~terminal_retention_ticket() noexcept {
 }
 
 void terminal_retention_ticket::mark_submitted(sycl::queue & queue) noexcept {
+    // Launchers may report every successful submit; only the first transition
+    // owns the PREPARED -> SUBMITTED edge.
+    if (state_ == state::SUBMITTED) {
+        GGML_ASSERT(queue_ == &queue);
+        return;
+    }
     GGML_ASSERT(state_ == state::PREPARED);
     queue_ = &queue;
     state_ = state::SUBMITTED;
@@ -1876,7 +1892,8 @@ void terminal_retention_ticket::commit(sycl::event terminal_event) {
         }
 #endif
         if (graph_sink_) {
-            if (g_graph_retained_handle_sink != graph_sink_) {
+            if (g_graph_retained_handle_sink != graph_sink_ ||
+                g_graph_recording_sink.epoch_id != graph_epoch_) {
                 throw std::runtime_error("terminal retention graph epoch changed before commit");
             }
             graph_sink_->insert(graph_sink_->end(), std::make_move_iterator(publication_.begin()),
@@ -2027,6 +2044,11 @@ void fail_next_retained_handle_publication_for_test() {
 #endif
 
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {
+    // Increment on every attach and detach. A vector address may be reused by a
+    // later recording attempt; pointer equality alone must never admit an old
+    // ticket into that new graph lifetime.
+    ++g_graph_recording_sink.epoch_id;
+    if (g_graph_recording_sink.epoch_id == 0) ++g_graph_recording_sink.epoch_id;
     g_graph_retained_handle_sink = sink;
 }
 
