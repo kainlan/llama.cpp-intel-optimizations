@@ -24,11 +24,12 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key,
                                          std::shared_ptr<void>      storage_owner);
 bool       test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease);
 
-// Test-only layout override hooks (no env handling inside the library).
-// Use the guard in tests to temporarily force a layout during a scoped operation.
-void               test_set_layout_override(ggml_layout_mode layout);
-void               test_clear_layout_override();
-bool               test_get_layout_override(ggml_layout_mode * out);
+// Mutable controls are declared only for private direct-source fixtures.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void test_set_layout_override(ggml_layout_mode layout);
+void test_clear_layout_override();
+bool test_get_layout_override(ggml_layout_mode * out);
+#endif
 void               test_clear_host_weight_registry();
 bool               test_backend_supports_graphs(ggml_backend_t backend);
 bool               test_backend_graphs_disabled(ggml_backend_t backend);
@@ -67,14 +68,16 @@ bool               test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env(cons
                                                                             const char * phase_materialize_env);
 size_t             test_layout_bytes(const ggml_tensor * tensor, ggml_layout_mode layout, int device);
 const char *       test_layout_name(ggml_layout_mode layout);
-void               test_set_moe_planned_layout_probe_override(const ggml_tensor * tensor,
-                                                              int                 device,
-                                                              ggml_layout_mode    layout,
-                                                              size_t              local,
-                                                              size_t              secondary,
-                                                              size_t              host,
-                                                              size_t              missing);
-void               test_clear_moe_planned_layout_probe_overrides();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void test_set_moe_planned_layout_probe_override(const ggml_tensor * tensor,
+                                                int                 device,
+                                                ggml_layout_mode    layout,
+                                                size_t              local,
+                                                size_t              secondary,
+                                                size_t              host,
+                                                size_t              missing);
+void test_clear_moe_planned_layout_probe_overrides();
+#endif
 bool               test_prompt_down_specialized_layout_proven(const ggml_tensor * tensor,
                                                               int                 device,
                                                               ggml_layout_mode    layout,
@@ -470,16 +473,18 @@ struct test_moe_decode_down_layout_policy_result {
 
 test_moe_decode_down_layout_policy_result test_moe_decode_down_layout_policy(
     const test_moe_decode_down_layout_policy_input & in);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_reset_orchestrator_call_count();
 int  test_get_orchestrator_call_count();
-int  test_physical_device_count();
 bool test_plan_publication_prepare_failure_is_caught();
 bool test_provisional_placement_id_exhaustion_is_caught();
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
 void test_clear_kv_placement_plan();
-bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
+#endif
+int  test_physical_device_count();
+bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
 
 inline ggml_sycl_cache_id test_make_cache_id(const void * tag, uint64_t model_id = 1) {
     ggml_sycl_cache_id id{};
@@ -489,17 +494,17 @@ inline ggml_sycl_cache_id test_make_cache_id(const void * tag, uint64_t model_id
     return id;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 struct test_layout_override_guard {
     explicit test_layout_override_guard(ggml_layout_mode layout) { test_set_layout_override(layout); }
-
     ~test_layout_override_guard() { test_clear_layout_override(); }
 };
 
 struct test_sycl_info_override_guard {
     explicit test_sycl_info_override_guard(const ggml_sycl_device_info & info) { test_set_sycl_info_override(info); }
-
     ~test_sycl_info_override_guard() { test_clear_sycl_info_override(); }
 };
+#endif
 
 }  // namespace ggml_sycl
 

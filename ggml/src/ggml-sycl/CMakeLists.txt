@@ -1778,8 +1778,9 @@ target_link_options(test-sycl-kv-view-resolution PRIVATE ${SYCL_LINK_ONLY_TEST_O
 target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -2017,8 +2018,9 @@ target_link_options(test-sycl-layout-choice PRIVATE ${LAYOUT_CHOICE_TEST_SYCL_OP
 target_compile_definitions(test-sycl-layout-choice PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl)
+target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -2609,8 +2611,9 @@ target_link_options(test-sycl-kv-planned-device-materialization PRIVATE "-fsycl"
 target_compile_definitions(test-sycl-kv-planned-device-materialization PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -3031,8 +3034,9 @@ target_link_options(test-ggml-sycl-soa PRIVATE "-fsycl")
 target_compile_definitions(test-ggml-sycl-soa PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-ggml-sycl-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-ggml-sycl-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-ggml-sycl-soa PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -3269,8 +3273,9 @@ target_link_options(test-q6k-dispatch PRIVATE "-fsycl")
 target_compile_definitions(test-q6k-dispatch PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-q6k-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-q6k-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-q6k-dispatch PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -3471,8 +3476,9 @@ target_link_options(test-sycl-orchestrator PRIVATE "-fsycl")
 target_compile_definitions(test-sycl-orchestrator PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-orchestrator PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+target_link_libraries(test-sycl-orchestrator PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-orchestrator PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -3549,8 +3555,9 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(test-mmvq-q8-0-streaming-bench PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        GGML_SYCL_PRIVATE_TESTING=1
     )
-    target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-mmvq-q8-0-streaming-bench PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -3630,8 +3637,9 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(test-q6k-reorder-dispatch PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        GGML_SYCL_PRIVATE_TESTING=1
     )
-    target_link_libraries(test-q6k-reorder-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    target_link_libraries(test-q6k-reorder-dispatch PRIVATE ggml-base ggml ggml-cpu ggml-sycl-q1-route-test-objects)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-q6k-reorder-dispatch PRIVATE IntelSYCL::SYCL_CXX)
     endif()

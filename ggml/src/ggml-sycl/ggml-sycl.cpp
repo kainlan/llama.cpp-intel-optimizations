@@ -1107,12 +1107,14 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
 struct pp_moe_onednn_scratch_release_marker;
 struct pp_moe_prompt_down_dispatch_done_marker;
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 enum class pp_moe_onednn_claim_failpoint {
     NONE = 0,
     FAIL_AFTER_LOCAL_RESERVATION,
 };
 
 static std::atomic<int> g_pp_moe_onednn_claim_failpoint{ static_cast<int>(pp_moe_onednn_claim_failpoint::NONE) };
+#endif
 
 struct pp_moe_onednn_scratch_slot_state {
     std::mutex                                  mutex;
@@ -1158,9 +1160,13 @@ static void pp_moe_onednn_reset_slot_state_locked(pp_moe_onednn_scratch_slot_sta
 }
 
 static bool pp_moe_onednn_claim_fail_after_local_reservation() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     return g_pp_moe_onednn_claim_failpoint.exchange(static_cast<int>(pp_moe_onednn_claim_failpoint::NONE),
                                                     std::memory_order_acq_rel) ==
            static_cast<int>(pp_moe_onednn_claim_failpoint::FAIL_AFTER_LOCAL_RESERVATION);
+#else
+    return false;
+#endif
 }
 
 static void pp_moe_onednn_rollback_unbound_scratch_slot(int device, uint32_t ring_depth, uint32_t slot) {
@@ -2223,7 +2229,9 @@ static thread_local bool                                                      g_
 // Canonical ranked inventory/lifecycle publication writer lock. All cache/global
 // placement publications are serialized by this existing lock.
 static std::mutex                                                g_tensor_inventory_mutex;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };
+#endif
 
 static_assert(std::is_nothrow_move_assignable<ggml_sycl::placement_kv_info>::value,
               "prepared placement publication requires nonthrowing KV metadata commit");
@@ -8495,14 +8503,16 @@ static bool ggml_sycl_cpu_offload_active_for_compute(bool                       
                                                      const ggml_backend_sycl_context * ctx = nullptr);
 
 namespace ggml_sycl {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<int>                           g_test_layout_override_active{ 0 };
 static std::atomic<int>                           g_test_layout_override_value{ GGML_LAYOUT_AOS };
 static std::atomic<int>                           g_test_orchestrator_calls{ 0 };
 static std::atomic<int>                           g_test_orchestrator_tracking{ 0 };
-static std::atomic<uint64_t>                      g_test_moe_ptr_table_ready_event_deps{ 0 };
 static std::atomic<int>                           g_test_sycl_info_override_active{ 0 };
 static std::mutex                                 g_test_sycl_info_override_mutex;
 static ggml_sycl_device_info                      g_test_sycl_info_override;
+#endif
+static std::atomic<uint64_t>                      g_test_moe_ptr_table_ready_event_deps{ 0 };
 static std::atomic<const ggml_sycl_device_info *> g_runtime_sycl_info{ nullptr };
 
 struct test_moe_planned_layout_probe_override {
@@ -8515,8 +8525,10 @@ struct test_moe_planned_layout_probe_override {
     size_t              missing   = 0;
 };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::mutex                                          g_test_moe_probe_override_mutex;
 static std::vector<test_moe_planned_layout_probe_override> g_test_moe_probe_overrides;
+#endif
 
 static bool test_stage_soa_expert_handle(unified_cache *            cache,
                                          sycl::queue &              q,
@@ -8558,11 +8570,14 @@ static bool test_ensure_weight_zone(unified_cache * cache, sycl::queue & q, size
 }
 
 static inline void test_record_orchestrator_call() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (g_test_orchestrator_tracking.load(std::memory_order_relaxed) != 0) {
         g_test_orchestrator_calls.fetch_add(1, std::memory_order_relaxed);
     }
+#endif
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_set_layout_override(ggml_layout_mode layout) {
     g_test_layout_override_value.store(static_cast<int>(layout), std::memory_order_release);
     g_test_layout_override_active.store(1, std::memory_order_release);
@@ -8665,6 +8680,7 @@ static const ggml_sycl_device_info * test_get_sycl_info_override() {
     }
     return &g_test_sycl_info_override;
 }
+#endif
 
 void test_clear_host_weight_registry() {
     ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::registry_only);
@@ -8673,6 +8689,7 @@ void test_clear_host_weight_registry() {
     // Test isolation is maintained by the host weight extras registry being cleared.
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_reset_orchestrator_call_count() {
     g_test_orchestrator_calls.store(0, std::memory_order_relaxed);
     g_test_orchestrator_tracking.store(1, std::memory_order_relaxed);
@@ -8681,6 +8698,7 @@ void test_reset_orchestrator_call_count() {
 int test_get_orchestrator_call_count() {
     return g_test_orchestrator_calls.load(std::memory_order_relaxed);
 }
+#endif
 
 static ggml_backend_sycl_context * test_get_backend_ctx(ggml_backend_t backend) {
     if (!backend) {
@@ -9396,10 +9414,12 @@ bool ggml_sycl_reorder_enabled() {
         return false;
     }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     ggml_layout_mode override = GGML_LAYOUT_AOS;
     if (ggml_sycl::test_get_layout_override(&override) && override == GGML_LAYOUT_AOS) {
         return false;
     }
+#endif
     return true;
 }
 
@@ -10699,6 +10719,7 @@ struct ggml_sycl_control_host_alloc_batch_storage {
     uint32_t                                                                     count = 0;
 };
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 enum class ggml_sycl_execution_wrapper_failpoint {
     NONE = 0,
     NEXT_BAD_ALLOC,
@@ -10707,6 +10728,7 @@ enum class ggml_sycl_execution_wrapper_failpoint {
 };
 
 static std::atomic<int> g_execution_wrapper_failpoint{ 0 };
+#endif
 // H8 lock classes:
 //   EXECUTION_STATE  -> backend_ctx->execution_state_mutex
 //   BINDING          -> g_execution_backend_binding_mutex
@@ -10761,6 +10783,7 @@ static std::vector<ggml_sycl_execution_bound_backend_pin>
 }
 
 static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     switch (static_cast<ggml_sycl_execution_wrapper_failpoint>(
                 g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
                                                        std::memory_order_acq_rel))) {
@@ -10772,6 +10795,7 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
                                                 std::memory_order_release);
             return;
     }
+#endif
 }
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
@@ -11560,12 +11584,16 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_fail_next_abort_owner_effects_cleanup{ false };
+#endif
 
 static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (g_test_fail_next_abort_owner_effects_cleanup.exchange(false, std::memory_order_acq_rel)) {
         throw std::runtime_error("deterministic abort_owner_effects cleanup failure");
     }
+#endif
 }
 
 static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,
@@ -11661,8 +11689,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
     }
 }
 
-static std::mutex                                                g_test_live_update_mutex;
-static std::optional<ggml_sycl::lifecycle::live_update_guard>   g_test_live_update_guard;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static std::mutex                                            g_test_live_update_mutex;
+static std::optional<ggml_sycl::lifecycle::live_update_guard> g_test_live_update_guard;
 
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model) {
     sycl_module_mutation_guard module_guard;
@@ -11741,6 +11770,7 @@ extern "C" bool ggml_backend_sycl_test_seed_control_host_allocs(ggml_backend_t b
     }
     return true;
 }
+#endif
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation() {
@@ -12180,6 +12210,7 @@ struct ggml_sycl_pending_kv_layer_mask {
 static std::mutex                                  g_pending_kv_layer_masks_mutex;
 static std::deque<ggml_sycl_pending_kv_layer_mask> g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES];
 static std::atomic<uint64_t>                       g_pending_kv_handoff_seq{ 0 };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::mutex                                  g_test_kv_push_mutex;
 static std::condition_variable                     g_test_kv_push_cv;
 static bool                                        g_test_block_next_kv_push = false;
@@ -12202,6 +12233,7 @@ static void ggml_backend_sycl_test_release_kv_push() {
     g_test_kv_push_blocked = false;
     g_test_kv_push_cv.notify_all();
 }
+#endif
 
 // The identity a KV-mask handoff is correlated against. Producer and consumer
 // must resolve it through the SAME accessor: ggml_sycl_identity_plan_snapshot()
@@ -12223,6 +12255,7 @@ uint64_t ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
     // it, and stamping it with the identity that unblocked it would hand the
     // next model a mask under its own name.
     const ggml_sycl::lifecycle::ModelToken owner = ggml_sycl_kv_layer_mask_identity();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     {
         std::unique_lock<std::mutex> lock(g_test_kv_push_mutex);
         if (g_test_block_next_kv_push) {
@@ -12231,6 +12264,7 @@ uint64_t ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
             g_test_kv_push_cv.wait(lock, [] { return !g_test_block_next_kv_push; });
         }
     }
+#endif
     const int device = ggml_sycl_device_id_from_backend_dev(dev);
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || layer_mask == nullptr || layer_count == 0) {
         return 0;
@@ -12315,6 +12349,7 @@ static std::vector<uint8_t> ggml_sycl_pop_kv_layer_mask(int device) {
 // Test observation of the handoff. Deliberately routed through the very
 // function the tiered KV buffer type calls, so a test scores the real consumer
 // rather than a parallel reimplementation of it.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" uint32_t ggml_backend_sycl_test_pop_kv_layer_mask(int device, uint8_t * out, uint32_t capacity) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return 0;
@@ -12356,6 +12391,7 @@ extern "C" void ggml_backend_sycl_test_kv_layer_mask_identity(uint64_t out[4]) {
     out[2] = owner.owner.slot;
     out[3] = owner.owner.generation;
 }
+#endif
 
 // Module shutdown is the one point with no owner left for whom any staged mask
 // could be preserved, so the whole queue is dropped here rather than left to
@@ -13399,9 +13435,12 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_context_extract_control_h
         storage->serial = ticket->serial;
         storage->session_id = ticket->session_id.value;
         storage->reset_epoch = ticket->reset_epoch.value;
-        bool fail_after_first = g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
-                                                                       std::memory_order_acq_rel) ==
-                                static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC);
+        bool fail_after_first = false;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        fail_after_first = g_execution_wrapper_failpoint.exchange(static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NONE),
+                                                                  std::memory_order_acq_rel) ==
+                           static_cast<int>(ggml_sycl_execution_wrapper_failpoint::NEXT_EXTRACT_AFTER_FIRST_SWAP_BAD_ALLOC);
+#endif
         ggml_sycl::execution::error extract_rc = ggml_sycl::execution::error::OK;
         std::vector<ggml_sycl_execution_bound_backend_pin> bound_backends;
         {
@@ -13662,9 +13701,11 @@ static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan
 
 static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_locked(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (g_fail_next_plan_publication_prepare.exchange(false, std::memory_order_acq_rel)) {
         throw std::bad_alloc();
     }
+#endif
     ggml_sycl_prepared_plan_publication publication;
     publication.snapshot      = snapshot;
     publication.kv_info       = snapshot ? snapshot->kv_info : ggml_sycl::placement_kv_info{};
@@ -14406,6 +14447,7 @@ int test_physical_device_count() {
     return ggml_sycl_info().total_gpu_count;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool test_plan_publication_prepare_failure_is_caught() {
     g_fail_next_plan_publication_prepare.store(true, std::memory_order_release);
     return !ggml_sycl_restore_latest_live_plan();
@@ -14445,6 +14487,7 @@ void test_clear_kv_placement_plan() {
     g_model_n_layer     = 0;
     g_placement_kv_info = {};
 }
+#endif
 }  // namespace ggml_sycl
 
 static double ggml_sycl_dense_capability_score_for_device(int device_id) {
@@ -14879,8 +14922,10 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
     g_placement_envelope_set = true;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_fail_next_stage_inventory_plan_early_after_first_device{ false };
 static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_device{ false };
+#endif
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
@@ -14935,10 +14980,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             } else {
                 ggml_backend_sycl_set_tensor_inventory(backend, inventory);
             }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
                 (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {
                 throw std::runtime_error("deterministic stage_inventory_plan failure");
             }
+#endif
         }
         rollback.released = true;
         return ggml_backend_sycl_get_device_count() == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
@@ -21300,9 +21347,11 @@ sycl::queue * ggml_sycl_get_cpu_queue() {
 }
 
 const ggml_sycl_device_info & ggml_sycl_info() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (const ggml_sycl_device_info * test_info = ggml_sycl::test_get_sycl_info_override()) {
         return *test_info;
     }
+#endif
     static ggml_sycl_device_info info = ggml_sycl_init();
     ggml_sycl::g_runtime_sycl_info.store(&info, std::memory_order_release);
     return info;
@@ -24718,11 +24767,13 @@ static moe_planned_layout_probe ggml_sycl_probe_moe_planned_layout(const ggml_te
                                                                    int                 device,
                                                                    layout_mode         layout) {
     moe_planned_layout_probe probe{};
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (ggml_sycl::test_get_moe_planned_layout_probe_override(src0, device, layout, &probe.local, &probe.secondary,
                                                               &probe.host, &probe.missing)) {
         probe.ok = probe.missing == 0;
         return probe;
     }
+#endif
     if (!src0) {
         probe.missing = 1;
         return probe;
@@ -45359,10 +45410,12 @@ static bool ggml_sycl_simple_consumer_op(enum ggml_op op) {
 }
 
 static int ggml_sycl_routable_device_count() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (const ggml_sycl_device_info * test_info = ggml_sycl::test_get_sycl_info_override()) {
         const int count = std::max(test_info->device_count, test_info->total_gpu_count);
         return std::max(0, std::min(count, GGML_SYCL_MAX_DEVICES));
     }
+#endif
     const auto & info  = ggml_sycl_info();
     int          count = std::max(info.device_count, info.total_gpu_count);
     try {
@@ -54793,11 +54846,13 @@ static bool ggml_sycl_select_mul_mat_layout(ggml_backend_sycl_context & ctx,
 }
 
 static bool ggml_sycl_layout_override_active(layout_mode & override_layout) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     ggml_layout_mode override = GGML_LAYOUT_AOS;
     if (ggml_sycl::test_get_layout_override(&override)) {
         override_layout = override;
         return true;
     }
+#endif
 
     static std::atomic<int> env_checked{ -1 };
     static layout_mode      env_layout = GGML_LAYOUT_AOS;
@@ -94140,10 +94195,12 @@ static sycl_module_admission_state g_sycl_reactivation_previous =
     sycl_module_admission_state::COMPLETE_CLOSED;
 static bool g_sycl_reactivation_pending_finalize  = false;
 static bool g_sycl_reactivation_commit_completed  = false;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::mutex              g_sycl_finalize_reactivate_mutex;
 static std::condition_variable g_sycl_finalize_reactivate_cv;
 static bool                    g_sycl_finalize_reactivate_block   = false;
 static bool                    g_sycl_finalize_reactivate_entered = false;
+#endif
 
 bool ggml_backend_sycl_prepare_reactivate(void) {
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -94167,6 +94224,7 @@ void ggml_backend_sycl_commit_reactivate(void) {
 }
 
 void ggml_backend_sycl_finalize_reactivate(void) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     {
         std::unique_lock<std::mutex> lock(g_sycl_finalize_reactivate_mutex);
         if (g_sycl_finalize_reactivate_block) {
@@ -94175,6 +94233,7 @@ void ggml_backend_sycl_finalize_reactivate(void) {
             g_sycl_finalize_reactivate_cv.wait(lock, [] { return !g_sycl_finalize_reactivate_block; });
         }
     }
+#endif
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
     g_sycl_reactivation_pending_finalize = false;
     g_sycl_reactivation_commit_completed = false;
@@ -94265,6 +94324,7 @@ static bool ggml_backend_sycl_test_shutdown_runtime_alloc_census(uint64_t out[8]
     return ggml_sycl::unified_cache_shutdown_runtime_alloc_census_for_test(out);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static bool ggml_backend_sycl_test_seed_cpu_retained() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard || ggml_sycl_info().device_count <= 0) return false;
@@ -94345,6 +94405,8 @@ extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
     }
     return g_expert_predictors[0].test_allocate_scores(ggml_sycl_get_device(0).default_queue(), 16);
 }
+
+#endif
 
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     // Taken before the meta lock and released immediately: g_moe_bias_state_mutex
@@ -94468,6 +94530,7 @@ void ggml_backend_sycl_shutdown(void) {
 struct ggml_backend_sycl_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_fail_next_registry_stage{ false };
 
 static void ggml_backend_sycl_test_fail_next_registry_stage() {
@@ -94489,6 +94552,7 @@ extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup() {
     sycl_module_mutation_guard module_guard;
     if (module_guard) g_test_fail_next_abort_owner_effects_cleanup.store(true, std::memory_order_release);
 }
+#endif
 
 static void ggml_backend_sycl_test_admission_snapshot(uint64_t out[8]) {
     if (!out) return;
@@ -94512,9 +94576,11 @@ static const char * ggml_backend_sycl_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_sycl_reg_get_device_count(ggml_backend_reg_t reg) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (g_test_fail_next_registry_stage.exchange(false, std::memory_order_acq_rel)) {
         throw std::runtime_error("deterministic registry staging failure");
     }
+#endif
     ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *) reg->context;
     return ctx->devices.size();
 }
@@ -94525,7 +94591,9 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish();
+#endif
 
 static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -94575,6 +94643,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_shutdown_runtime_alloc_census") == 0) {
         return (void *) ggml_backend_sycl_test_shutdown_runtime_alloc_census;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_registry_stage") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_registry_stage;
     }
@@ -94587,6 +94656,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_test_admission_snapshot") == 0) {
         return (void *) ggml_backend_sycl_test_admission_snapshot;
     }
@@ -94624,6 +94694,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_cancel_kv_layer_mask_from_dev") == 0) {
         return (void *) ggml_backend_sycl_cancel_kv_layer_mask_from_dev;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_pop_kv_layer_mask") == 0) {
         return (void *) ggml_backend_sycl_test_pop_kv_layer_mask;
     }
@@ -94642,6 +94713,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_release_kv_push") == 0) {
         return (void *) ggml_backend_sycl_test_release_kv_push;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_host_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_host_compute_buffer_type;
     }
@@ -94690,6 +94762,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_model_load_end") == 0) {
         return (void *) ggml_backend_sycl_model_load_end;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_seed_cpu_retained") == 0) {
         return (void *) ggml_backend_sycl_test_seed_cpu_retained;
     }
@@ -94699,9 +94772,11 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_seed_moe_module_state") == 0) {
         return (void *) ggml_backend_sycl_test_seed_moe_module_state;
     }
+#endif
     if (strcmp(name, "ggml_backend_sycl_test_moe_module_state_clean") == 0) {
         return (void *) ggml_backend_sycl_test_moe_module_state_clean;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_hold_live_update;
     }
@@ -94729,6 +94804,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
         return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
     }
+#endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
         return (void *) ggml_backend_sycl_test_fail_next_candidate_binding_allocation;
@@ -94843,6 +94919,7 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
     return &reg;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_fail_next_backend_publish{ false };
 
 extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
@@ -94850,6 +94927,7 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
     if (!module_guard) return;
     g_test_fail_next_backend_publish.store(true, std::memory_order_release);
 }
+#endif
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
     sycl_module_mutation_guard module_guard;
@@ -94890,9 +94968,11 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
             }
         }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         if (g_test_fail_next_backend_publish.exchange(false, std::memory_order_acq_rel)) {
             throw std::bad_alloc();
         }
+#endif
         auto sycl_backend = std::make_unique<ggml_backend>(ggml_backend{
             /* .guid    = */ ggml_backend_sycl_guid(),
             /* .iface   = */ ggml_backend_sycl_interface,
