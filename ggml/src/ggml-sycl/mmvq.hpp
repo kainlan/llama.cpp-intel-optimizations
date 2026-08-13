@@ -117,6 +117,41 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
                                               int64_t                     ids_nb0,
                                               int64_t                     ids_nb1);
 
+// One-shot admission receipt for retained prompt gate/up -> GLU -> cached-Q8 down.
+// A successful receipt owns the exact cache allocation used first for activation
+// Q8 and then for the GLU Q8 artifact. All validation and allocation happens
+// before SubmitRecorder::mark_write_started(); consumers must not grow it.
+struct mxfp4_moe_prompt_q8_preflight {
+    ggml_sycl::mem_handle q8_owner;
+    size_t                activation_q8_bytes = 0;
+    size_t                glu_q8_bytes        = 0;
+    size_t                reserved_bytes      = 0;
+    int                   device              = -1;
+    int                   layer               = -1;
+    int64_t               activation_ne0      = 0;
+    int64_t               activation_rows     = 0;
+    int64_t               glu_ne0             = 0;
+    int64_t               glu_rows            = 0;
+
+    bool valid() const { return q8_owner.valid() && reserved_bytes != 0; }
+};
+
+bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
+                                  const ggml_tensor *             gate_weight,
+                                  const ggml_tensor *             up_weight,
+                                  const ggml_tensor *             src1,
+                                  const ggml_tensor *             glu_dst,
+                                  const ggml_tensor *             down_weight,
+                                  const ggml_tensor *             down_dst,
+                                  int64_t                         n_ids,
+                                  int64_t                         selected_entries,
+                                  int64_t                         ids_nb0,
+                                  int64_t                         ids_nb1,
+                                  ggml_layout_mode                gate_layout,
+                                  ggml_layout_mode                down_layout,
+                                  const ggml_sycl::mem_handle *   glu_dst_handle,
+                                  mxfp4_moe_prompt_q8_preflight * out);
+
 bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
                                                   const ggml_tensor *           gate_weight,
                                                   const ggml_tensor *           up_weight,
@@ -147,7 +182,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   sycl::event *                 completion_event           = nullptr,
                                                   bool *                        completion_event_set       = nullptr,
                                                   ggml_sycl::moe_fused::SubmitRecorder * write_recorder     = nullptr,
-                                                  const std::vector<sycl::event> * deps                     = nullptr);
+                                                  const std::vector<sycl::event> * deps                     = nullptr,
+                                                  const mxfp4_moe_prompt_q8_preflight * prompt_q8_preflight = nullptr);
 
 // Fast all-local decode down projection that consumes the Q8_1 GLU artifact
 // published by mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa().  When ids_device

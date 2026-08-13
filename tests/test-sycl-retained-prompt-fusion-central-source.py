@@ -92,3 +92,51 @@ def test_production_write_boundary_is_inside_mmvq_before_first_submit() -> None:
     first_write = body.index("mmvq_profile_submit_quantize_activation_q8_soa(")
     assert boundary < first_write
     assert "return false;" in body[:boundary]  # allocation/shape refusal remains fallback-safe
+
+
+def test_prompt_q8_preflight_covers_cold_cache_artifact_and_strides() -> None:
+    mmvq = (ROOT / "ggml/src/ggml-sycl/mmvq.cpp").read_text()
+    preflight_start = mmvq.index("bool mmvq_moe_prompt_q8_preflight(")
+    pair_start = mmvq.index("bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(", preflight_start)
+    preflight = mmvq[preflight_start:pair_start]
+    for witness in (
+        "mxfp4_moe_tg_q8_artifact_enabled()",
+        "GGML_SYCL_MOE_PROMPT_Q8_PREFLIGHT_FAIL_ALLOC",
+        "gate_layer == up_layer && gate_layer == down_layer",
+        "glu_dst->nb[0] == sizeof(float)",
+        "glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float)",
+        "glu_dst->nb[2] == static_cast<size_t>(glu_dst->ne[1]) * glu_dst->nb[1]",
+        "mxfp4_moe_prompt_q8_bytes(src1->ne[0]",
+        "mxfp4_moe_prompt_q8_bytes(glu_dst->ne[0]",
+        "std::max(activation_bytes, glu_bytes)",
+        "mxfp4_moe_tg_reuse_get_or_alloc_q8",
+        "out->q8_owner",
+    ):
+        assert witness in preflight, witness
+
+
+def test_prompt_receipt_prevents_post_boundary_q8_growth_and_retains_owner() -> None:
+    mmvq = (ROOT / "ggml/src/ggml-sycl/mmvq.cpp").read_text()
+    start = mmvq.index("bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(")
+    end = mmvq.index("// Debug A/B", start)
+    body = mmvq[start:end]
+    boundary = body.index("write_recorder->mark_write_started()")
+    receipt = body.index("prompt_q8_preflight->q8_owner.resolve", 0, boundary)
+    publish = body.index("prompt_q8_preflight ? &prompt_q8_preflight->q8_owner", boundary)
+    assert receipt < boundary < publish
+    # The reserved-owner publication arm resolves the receipt and never calls
+    # the growing allocator; the allocator is confined to the ordinary arm.
+    publish_fn_start = mmvq.index("static bool mxfp4_moe_tg_publish_q8_soa(")
+    publish_fn_end = mmvq.index("// Returns true if the tensor's weights", publish_fn_start)
+    publish_fn = mmvq[publish_fn_start:publish_fn_end]
+    reserved_arm = publish_fn[publish_fn.index("if (reserved_q8_owner)"):
+                              publish_fn.index("} else {", publish_fn.index("if (reserved_q8_owner)"))]
+    assert "mxfp4_moe_tg_reuse_get_or_alloc_q8" not in reserved_arm
+    region = prompt_region()
+    assert "activation, q8_preflight.q8_owner" in region
+    assert "&recorder, &ids_deps, &q8_preflight" in region
+    allocator_start = mmvq.index("static void * mxfp4_moe_tg_reuse_get_or_alloc_q8(")
+    allocator_end = mmvq.index("static void * mxfp4_moe_tg_reuse_get_or_alloc_device_scratch", allocator_start)
+    allocator = mmvq[allocator_start:allocator_end]
+    assert "retired_owner = cache.q8_handle" in allocator
+    assert "retain_handles_until_event" in allocator

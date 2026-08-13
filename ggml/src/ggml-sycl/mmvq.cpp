@@ -1847,10 +1847,21 @@ static void * mxfp4_moe_tg_reuse_get_or_alloc_q8(sycl::queue * stream, int devic
     if (cache.q8_handle.valid() && cache.q8_capacity >= required_size && cache.q8_device == device) {
         return mxfp4_moe_tg_reuse_q8_ptr(device);
     }
+    // Replacing a cold/undersized cache owner must not free storage still used
+    // by the previous artifact. Its exact ready event is the retirement fence;
+    // the newly allocated owner is returned to the caller's transaction escrow.
+    ggml_sycl::mem_handle retired_owner = cache.q8_handle;
+    sycl::event           retired_event = cache.ready_event;
+    const bool            retired_event_set = cache.ready_event_set;
     mxfp4_moe_tg_reuse_invalidate();
     cache.q8_handle   = {};
     cache.q8_capacity = 0;
     cache.q8_device   = -1;
+    if (retired_owner.valid() && retired_event_set) {
+        std::vector<ggml_sycl::mem_handle> retired_handles;
+        retired_handles.push_back(std::move(retired_owner));
+        ggml_sycl::retain_handles_until_event(std::move(retired_handles), std::move(retired_event));
+    }
     ggml_sycl::alloc_request req{};
     req.queue                          = stream;
     req.device                         = device;
@@ -2050,7 +2061,8 @@ static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *                    stream,
                                         const ggml_sycl::mem_handle *    src_handle_override  = nullptr,
                                         sycl::event *                    completion_event     = nullptr,
                                         bool *                           completion_event_set = nullptr,
-                                        const std::vector<sycl::event> * deps                 = nullptr) {
+                                        const std::vector<sycl::event> * deps                 = nullptr,
+                                        const ggml_sycl::mem_handle *    reserved_q8_owner    = nullptr) {
     if (completion_event_set) {
         *completion_event_set = false;
     }
@@ -2063,7 +2075,16 @@ static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *                    stream,
     const int64_t ne0_padded  = GGML_PAD(ne0, QK8_1);
     const int64_t q8_row_size = ne0_padded * sizeof(block_q8_1) / QK8_1;
     const size_t  q8_bytes    = static_cast<size_t>(total_rows) * static_cast<size_t>(q8_row_size);
-    void *        q8_buffer   = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, device, q8_bytes);
+    void * q8_buffer = nullptr;
+    if (reserved_q8_owner) {
+        auto reserved = reserved_q8_owner->resolve(device);
+        const bool exact_cache_owner = reserved_q8_owner->valid() && reserved && reserved.ptr && reserved.on_device &&
+            g_mxfp4_moe_tg_reuse.q8_handle.stable_identity_equal(*reserved_q8_owner) &&
+            g_mxfp4_moe_tg_reuse.q8_capacity >= q8_bytes;
+        q8_buffer = exact_cache_owner ? reserved.ptr : nullptr;
+    } else {
+        q8_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, device, q8_bytes);
+    }
     if (!q8_buffer) {
         mxfp4_moe_tg_reuse_invalidate();
         return false;
@@ -17343,6 +17364,112 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
     return true;
 }
 
+static bool mxfp4_moe_prompt_q8_bytes(int64_t ne0, int64_t rows, size_t * out) {
+    if (!out || ne0 <= 0 || rows <= 0 || ne0 > INT_MAX || rows > INT_MAX || ne0 > INT64_MAX - (QK8_1 - 1)) {
+        return false;
+    }
+    const int64_t padded = GGML_PAD(ne0, QK8_1);
+    if (padded <= 0 || padded > INT64_MAX / static_cast<int64_t>(sizeof(block_q8_1))) {
+        return false;
+    }
+    const int64_t row_bytes = padded * static_cast<int64_t>(sizeof(block_q8_1)) / QK8_1;
+    if (row_bytes <= 0 || static_cast<uint64_t>(rows) > SIZE_MAX / static_cast<uint64_t>(row_bytes)) {
+        return false;
+    }
+    *out = static_cast<size_t>(rows) * static_cast<size_t>(row_bytes);
+    return *out != 0;
+}
+
+bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
+                                  const ggml_tensor *             gate_weight,
+                                  const ggml_tensor *             up_weight,
+                                  const ggml_tensor *             src1,
+                                  const ggml_tensor *             glu_dst,
+                                  const ggml_tensor *             down_weight,
+                                  const ggml_tensor *             down_dst,
+                                  int64_t                         n_ids,
+                                  int64_t                         selected_entries,
+                                  int64_t                         ids_nb0,
+                                  int64_t                         ids_nb1,
+                                  ggml_layout_mode                gate_layout,
+                                  ggml_layout_mode                down_layout,
+                                  const ggml_sycl::mem_handle *   glu_dst_handle,
+                                  mxfp4_moe_prompt_q8_preflight * out) {
+    if (out) {
+        *out = {};
+    }
+    // Cached-Q8 down is not an optional optimization for this transaction: if
+    // artifact publication is disabled, prompt fusion must refuse pre-write.
+    if (!out || !mxfp4_moe_tg_q8_artifact_enabled() || !gate_weight || !up_weight || !src1 || !glu_dst ||
+        !down_weight || !down_dst || !glu_dst_handle || !glu_dst_handle->valid() ||
+        gate_weight->type != GGML_TYPE_MXFP4 || up_weight->type != GGML_TYPE_MXFP4 ||
+        down_weight->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || glu_dst->type != GGML_TYPE_F32 ||
+        down_dst->type != GGML_TYPE_F32 || gate_layout != GGML_LAYOUT_SOA ||
+        (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8) || ids_nb0 <= 0 || ids_nb1 <= 0) {
+        return false;
+    }
+    const int gate_layer = mxfp4_moe_layer_from_name(gate_weight->name);
+    const int up_layer   = mxfp4_moe_layer_from_name(up_weight->name);
+    const int down_layer = mxfp4_moe_layer_from_name(down_weight->name);
+    const bool shape_and_range_ok = gate_layer >= 0 && gate_layer == up_layer && gate_layer == down_layer &&
+        n_ids > 0 && n_ids <= INT_MAX && src1->ne[0] > 0 && src1->ne[1] > 0 && src1->ne[2] > 1 &&
+        src1->ne[0] <= INT_MAX && src1->ne[1] <= INT_MAX && src1->ne[2] <= INT_MAX &&
+        gate_weight->ne[0] > 0 && gate_weight->ne[0] <= INT_MAX &&
+        gate_weight->ne[1] > 0 && gate_weight->ne[1] <= INT_MAX &&
+        gate_weight->ne[2] > 0 && gate_weight->ne[2] <= INT_MAX &&
+        down_weight->ne[0] > 0 && down_weight->ne[0] <= INT_MAX &&
+        down_weight->ne[1] > 0 && down_weight->ne[1] <= INT_MAX &&
+        n_ids <= INT64_MAX / src1->ne[2] && selected_entries == n_ids * src1->ne[2] &&
+        selected_entries > 0 && selected_entries <= INT_MAX &&
+        gate_weight->ne[0] == up_weight->ne[0] && gate_weight->ne[1] == up_weight->ne[1] &&
+        gate_weight->ne[2] == up_weight->ne[2] && gate_weight->ne[0] == src1->ne[0] &&
+        glu_dst->ne[0] == gate_weight->ne[1] && glu_dst->ne[1] == n_ids && glu_dst->ne[2] == src1->ne[2] &&
+        down_weight->ne[0] == glu_dst->ne[0] && down_weight->ne[1] == down_dst->ne[0] &&
+        down_weight->ne[2] > 0 && down_weight->ne[2] <= INT_MAX && down_dst->ne[1] == n_ids &&
+        down_dst->ne[2] == src1->ne[2] && (down_weight->ne[0] % QK_MXFP4) == 0;
+    const bool glu_contiguous = glu_dst->nb[0] == sizeof(float) &&
+        glu_dst->ne[0] <= static_cast<int64_t>(SIZE_MAX / sizeof(float)) &&
+        glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float) &&
+        glu_dst->ne[1] <= static_cast<int64_t>(SIZE_MAX / glu_dst->nb[1]) &&
+        glu_dst->nb[2] == static_cast<size_t>(glu_dst->ne[1]) * glu_dst->nb[1];
+    auto glu_resolved = glu_dst_handle->resolve(ctx.device);
+    if (!shape_and_range_ok || !glu_contiguous || !glu_resolved || !glu_resolved.ptr || !glu_resolved.on_device ||
+        glu_resolved.layout != GGML_LAYOUT_AOS) {
+        return false;
+    }
+    if (src1->ne[1] > INT64_MAX / src1->ne[2]) {
+        return false;
+    }
+    size_t activation_bytes = 0;
+    size_t glu_bytes        = 0;
+    const int64_t activation_rows = src1->ne[1] * src1->ne[2];
+    if (!mxfp4_moe_prompt_q8_bytes(src1->ne[0], activation_rows, &activation_bytes) ||
+        !mxfp4_moe_prompt_q8_bytes(glu_dst->ne[0], selected_entries, &glu_bytes)) {
+        return false;
+    }
+    const size_t reserve_bytes = std::max(activation_bytes, glu_bytes);
+    const char * failpoint = std::getenv("GGML_SYCL_MOE_PROMPT_Q8_PREFLIGHT_FAIL_ALLOC");
+    if (failpoint && std::atoi(failpoint) != 0) {
+        return false;
+    }
+    void * q8 = mxfp4_moe_tg_reuse_get_or_alloc_q8(ctx.stream(), ctx.device, reserve_bytes);
+    if (!q8 || !g_mxfp4_moe_tg_reuse.q8_handle.valid() ||
+        g_mxfp4_moe_tg_reuse.q8_capacity < reserve_bytes) {
+        return false;
+    }
+    out->q8_owner           = g_mxfp4_moe_tg_reuse.q8_handle;
+    out->activation_q8_bytes = activation_bytes;
+    out->glu_q8_bytes        = glu_bytes;
+    out->reserved_bytes      = reserve_bytes;
+    out->device              = ctx.device;
+    out->layer               = gate_layer;
+    out->activation_ne0      = src1->ne[0];
+    out->activation_rows     = activation_rows;
+    out->glu_ne0             = glu_dst->ne[0];
+    out->glu_rows            = selected_entries;
+    return true;
+}
+
 bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
                                                   const ggml_tensor *           gate_weight,
                                                   const ggml_tensor *           up_weight,
@@ -17373,7 +17500,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   sycl::event *                 completion_event,
                                                   bool *                        completion_event_set,
                                                   ggml_sycl::moe_fused::SubmitRecorder * write_recorder,
-                                                  const std::vector<sycl::event> * deps) {
+                                                  const std::vector<sycl::event> * deps,
+                                                  const mxfp4_moe_prompt_q8_preflight * prompt_q8_preflight) {
     if (completion_event_set) {
         *completion_event_set = false;
     }
@@ -17447,8 +17575,26 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const bool fused_glu_q8_candidate   = fused_glu_q8_env_enabled && ne12 == 1 && (ne01 % QK8_1) == 0 &&
                                         total_batches > 0 && glu_row_contig && glu_dst_handle_override &&
                                         glu_dst_handle_override->valid();
+    // Publication may quantize GLU after the gate/up kernel even when the
+    // single-token fused store is unavailable. Reserve both phases up front.
+    const bool q8_artifact_candidate = mxfp4_moe_tg_q8_artifact_enabled() && total_batches > 0 && glu_row_contig &&
+                                       glu_dst_handle_override && glu_dst_handle_override->valid();
     const auto   aggressive_tg_cfg = mxfp4_moe_aggressive_tg_config_for_device(ctx.device);
-    const size_t q8_alloc_size     = fused_glu_q8_candidate ? std::max(required_size, glu_q8_bytes) : required_size;
+    const size_t q8_alloc_size     = q8_artifact_candidate ? std::max(required_size, glu_q8_bytes) : required_size;
+    if (prompt_q8_preflight) {
+        auto planned = prompt_q8_preflight->q8_owner.resolve(ctx.device);
+        if (!prompt_q8_preflight->valid() || prompt_q8_preflight->device != ctx.device ||
+            prompt_q8_preflight->layer != mxfp4_moe_layer_from_name(gate_weight->name) ||
+            prompt_q8_preflight->activation_ne0 != ne10 ||
+            prompt_q8_preflight->activation_rows != total_src1_rows ||
+            prompt_q8_preflight->glu_ne0 != ne01 || prompt_q8_preflight->glu_rows != total_batches ||
+            prompt_q8_preflight->activation_q8_bytes != required_size ||
+            prompt_q8_preflight->glu_q8_bytes != glu_q8_bytes ||
+            prompt_q8_preflight->reserved_bytes < q8_alloc_size || !planned || !planned.ptr || !planned.on_device ||
+            !g_mxfp4_moe_tg_reuse.q8_handle.stable_identity_equal(prompt_q8_preflight->q8_owner)) {
+            return false;
+        }
+    }
 
     mmvq_deferred_temp_release local_temps(stream);
     auto                       alloc_i32_scratch = [&](int32_t *& ptr, size_t count, const char * cohort) {
@@ -17468,7 +17614,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                             /*src_fallback_on_device=*/false);
     };
 
-    void *                q8_1_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, q8_alloc_size);
+    // A retained prompt receipt makes this lookup infallible and non-growing;
+    // ordinary callers still use the same pre-write allocator.
+    void * q8_1_buffer = prompt_q8_preflight ? prompt_q8_preflight->q8_owner.resolve(ctx.device).ptr :
+                                               mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, q8_alloc_size);
     ggml_sycl::mem_handle q8_1_owner;
     if (q8_1_buffer && g_mxfp4_moe_tg_reuse.q8_handle.valid() && g_mxfp4_moe_tg_reuse.q8_device == ctx.device) {
         q8_1_owner = g_mxfp4_moe_tg_reuse.q8_handle;
@@ -18568,7 +18717,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             down_q8_publish_deps.empty() ? nullptr : &down_q8_publish_deps;
         if (mxfp4_moe_tg_publish_q8_soa(stream, ctx.device, down_layer, mxfp4_moe_role::DOWN, glu_d, glu_dst->ne[0],
                                         glu_rows, &down_q8_publish_us, glu_dst_handle_override, &down_q8_event,
-                                        &down_q8_event_set, down_q8_publish_deps_ptr)) {
+                                        &down_q8_event_set, down_q8_publish_deps_ptr,
+                                        prompt_q8_preflight ? &prompt_q8_preflight->q8_owner : nullptr)) {
             quant_us += down_q8_publish_us;
             if (glu_q8_diag) {
                 static std::atomic<int> diag_publish_log{ 0 };

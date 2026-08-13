@@ -63081,6 +63081,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             bool glu_event_set = false;
                             sycl::event terminal_event;
                             bool terminal_event_set = false;
+                            mxfp4_moe_prompt_q8_preflight q8_preflight;   // populated before escrow/write
 
                             PromptExecutor(ggml_backend_sycl_context & ctx_arg,
                                            const moe_gate_up_pair & pair_arg,
@@ -63110,14 +63111,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const auto ids_resolved = ids.resolve(ctx.device);
                                 const bool ids_identity_exact = ids_resolved && ids_resolved.ptr == ids_device &&
                                     static_cast<std::uintptr_t>(ids.stable_identity_hash()) == bundle.ids_identity;
-                                return gate_layout == GGML_LAYOUT_SOA &&
-                                               (down_layout == GGML_LAYOUT_SOA ||
-                                                down_layout == GGML_LAYOUT_MXFP4_I8) &&
-                                               gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
-                                               down_table.resolve_abi(ctx.device) && ids_identity_exact ?
-                                           fused::Status::ok() :
-                                           fused::Status{ fused::ErrorCode::preflight_failed,
-                                                          "retained prompt MMVQ ABI/ID ownership preflight failed" };
+                                const bool abi_ok = gate_layout == GGML_LAYOUT_SOA &&
+                                    (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
+                                    gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
+                                    down_table.resolve_abi(ctx.device) && ids_identity_exact;
+                                const bool q8_ok = abi_ok && mmvq_moe_prompt_q8_preflight(
+                                    ctx, pair.gate_weight, pair.up_weight, pair.src1, pair.glu_dst,
+                                    pair.down_weight, pair.down_dst, pair.ids->ne[0],
+                                    static_cast<int64_t>(roles.gate.batch.operands.size()), ids_nb0, ids_nb1,
+                                    gate_layout, down_layout, &glu, &q8_preflight);
+                                return q8_ok ? fused::Status::ok() :
+                                    fused::Status{ fused::ErrorCode::preflight_failed,
+                                                   "retained prompt unified MMVQ/Q8 artifact preflight failed" };
                             }
                             fused::OwnerBundle owners() override {
                                 auto role_handles = [](const ggml_sycl::moe_retained_role_batch & role) {
@@ -63136,7 +63141,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 out.add(fused::OwnerRole::gate_table, std::make_unique<HandleOwner>(table_handles(gate_table)));
                                 out.add(fused::OwnerRole::up, std::make_unique<HandleOwner>(role_handles(roles.up)));
                                 out.add(fused::OwnerRole::up_table, std::make_unique<HandleOwner>(table_handles(up_table)));
-                                out.add(fused::OwnerRole::activation, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ activation }));
+                                // Retain both the float activation and the exact Q8 owner. The latter
+                                // changes roles in-place (activation -> GLU artifact) and must survive
+                                // escrow through the down terminal event even if the cache is replaced.
+                                out.add(fused::OwnerRole::activation, std::make_unique<HandleOwner>(
+                                    std::vector<ggml_sycl::mem_handle>{ activation, q8_preflight.q8_owner }));
                                 out.add(fused::OwnerRole::ids, std::make_unique<HandleOwner>(
                                     std::vector<ggml_sycl::mem_handle>{ ids }, std::vector<sycl::event>{ ids_ready_event }));
                                 out.add(fused::OwnerRole::glu, std::make_unique<HandleOwner>(std::vector<ggml_sycl::mem_handle>{ glu }));
@@ -63158,7 +63167,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     ggml_get_op_params_f32(pair.glu_dst, 2), ggml_get_op_params_f32(pair.glu_dst, 3),
                                     gate_layout, &glu, false, false, nullptr, nullptr,
                                     roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
-                                    &glu_event, &glu_event_set, &recorder, &ids_deps);
+                                    &glu_event, &glu_event_set, &recorder, &ids_deps, &q8_preflight);
                                 if (!gate_up_ok || !glu_event_set) {
                                     return recorder.write_started() ?
                                         fused::Status{ fused::ErrorCode::submitted_without_terminal,
