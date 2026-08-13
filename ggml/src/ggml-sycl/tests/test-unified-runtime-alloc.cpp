@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sycl/sycl.hpp>
 
@@ -660,6 +661,34 @@ static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
     return true;
 }
 
+static bool arena_owned_shutdown_and_lifecycle_serialization(sycl::queue & q) {
+    TEST_BEGIN("arena_owned_shutdown_and_lifecycle_serialization");
+    constexpr size_t mib = 1024ull * 1024ull;
+    const size_t max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_PASS();
+        return true;
+    }
+
+    // Two settlers may complete in either order, but neither may publish an
+    // older generation over the other. A subsequent allocation proves OPEN was
+    // published only after the complete reset transaction.
+    std::thread a([&] { cache.test_zone_boundary_check(vram_zone_id::ONEDNN); });
+    std::thread b([&] { cache.test_zone_boundary_check(vram_zone_id::ONEDNN); });
+    a.join();
+    b.join();
+
+    TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "real arena scratch pool reserve failed");
+    TEST_ASSERT(cache.reserve_onednn_scratch(1ull * mib, 1ull * mib), "real arena oneDNN reserve failed");
+    TEST_ASSERT(cache.reserve_persistent_scratch("shutdown-owner", 1ull * mib),
+                "real arena persistent reserve failed");
+    TEST_ASSERT(cache.shutdown_resources(), "arena shutdown did not release every self-owned allocation");
+    TEST_ASSERT(!cache.arena_active(), "arena remained active after exact owner teardown");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -761,6 +790,7 @@ int main() {
     ok &= direct_stage_host_fallback_counts_attempt(q);
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
+    ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);

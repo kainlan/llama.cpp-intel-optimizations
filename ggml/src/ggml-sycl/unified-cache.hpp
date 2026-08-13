@@ -2622,6 +2622,9 @@ class unified_cache {
 
     // Destroy arena (free all chunks).
     bool arena_destroy();
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+    void test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
+#endif
     bool resources_shutdown_ = false;
 
     // Abandon arena without freeing (for shutdown when SYCL context is invalid).
@@ -3352,7 +3355,7 @@ class unified_cache {
     // Physical allocator groups are distinct from logical zones. KV and
     // WEIGHT share group 0 in both single- and N-chunk modes; every TLSF
     // alloc/free/reset and lifecycle transition is serialized by this table.
-    enum class allocator_group_state : uint8_t { CLOSED, OPEN, CLOSING };
+    enum class allocator_group_state : uint8_t { CLOSED, OPEN, RESETTING, CLOSING };
     struct allocator_group_record {
         vram_zone_id zone          = vram_zone_id::COUNT;
         uint64_t     allocation_id = 0;
@@ -3360,12 +3363,16 @@ class unified_cache {
         size_t       extent        = 0;
     };
     struct allocator_group {
-        std::mutex                                        mutex;
-        allocator_group_state                             state = allocator_group_state::CLOSED;
+        std::mutex                                         mutex;
+        std::condition_variable                            lifecycle_cv;
+        allocator_group_state                              state = allocator_group_state::CLOSED;
+        uint64_t                                           lifecycle_epoch = 0;
+        std::vector<std::shared_ptr<arena_authority>>       draining_authorities;
         std::unordered_map<void *, allocator_group_record> allocations;
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
+    std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
     using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;

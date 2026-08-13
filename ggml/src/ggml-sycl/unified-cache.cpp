@@ -3100,6 +3100,26 @@ bool unified_cache::shutdown_resources() {
         return true;
     }
 
+    // Establish the shutdown boundary before releasing any owner. Event-bound
+    // work must be terminal before its exact zone_free/unified_free can run.
+    try {
+        queue_.wait_and_throw();
+        if (compute_queue_ && compute_queue_ != &queue_) compute_queue_->wait_and_throw();
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown queue drain failed: %s\n", e.what());
+        return false;
+    } catch (...) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown queue drain failed\n");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
+        if (onednn_scratch_refcount_ != 0) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] oneDNN scratch reservation still owned at shutdown\n");
+            return false;
+        }
+    }
+
     // Direct mirrors are leases on canonical entries.  Detach them first and
     // destroy the handles with no map lock held, while canonical entries and
     // the arena they reference are still alive.
@@ -3155,15 +3175,17 @@ bool unified_cache::shutdown_resources() {
     compute_arena_off_.store(0, std::memory_order_relaxed);
 
     // Free scratch pool BEFORE destroying the VRAM arena (which would invalidate owns check).
-    if (scratch_pool_ptr_ && !(had_arena && vram_owns(scratch_pool_ptr_))) {
+    if (scratch_pool_ptr_) {
         if (scratch_pool_owner_.valid()) {
             scratch_pool_owner_ = {};
+            if (!(had_arena && vram_owns(scratch_pool_ptr_))) saturating_sub_used(scratch_pool_size_);
+        } else if (had_arena && vram_owns(scratch_pool_ptr_)) {
+            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
         } else {
             GGML_LOG_ERROR("[UNIFIED-CACHE] direct scratch pool missing alloc_handle owner ptr=%p\n",
                            scratch_pool_ptr_);
             GGML_ASSERT(false && "direct scratch pool missing alloc_handle owner");
         }
-        saturating_sub_used(scratch_pool_size_);
     }
     scratch_pool_ptr_          = nullptr;
     scratch_pool_size_         = 0;
@@ -3173,27 +3195,27 @@ bool unified_cache::shutdown_resources() {
 
     // Free oneDNN scratch buffers BEFORE arena destroy (vram_owns() needs live arena).
     if (onednn_weights_scratch_) {
-        if (!(had_arena && vram_owns(onednn_weights_scratch_))) {
-            if (onednn_weights_scratch_owner_.valid()) {
-                onednn_weights_scratch_owner_ = {};
-            } else {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] direct oneDNN weights scratch missing alloc_handle owner ptr=%p\n",
-                               onednn_weights_scratch_);
-                GGML_ASSERT(false && "direct oneDNN weights scratch missing alloc_handle owner");
-            }
+        if (onednn_weights_scratch_owner_.valid()) {
+            onednn_weights_scratch_owner_ = {};
+        } else if (had_arena && vram_owns(onednn_weights_scratch_)) {
+            zone_free(vram_zone_id::ONEDNN, onednn_weights_scratch_);
+        } else {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] direct oneDNN weights scratch missing alloc_handle owner ptr=%p\n",
+                           onednn_weights_scratch_);
+            GGML_ASSERT(false && "direct oneDNN weights scratch missing alloc_handle owner");
         }
         onednn_weights_scratch_      = nullptr;
         onednn_weights_scratch_size_ = 0;
     }
     if (onednn_activations_scratch_) {
-        if (!(had_arena && vram_owns(onednn_activations_scratch_))) {
-            if (onednn_activations_scratch_owner_.valid()) {
-                onednn_activations_scratch_owner_ = {};
-            } else {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] direct oneDNN activations scratch missing alloc_handle owner ptr=%p\n",
-                               onednn_activations_scratch_);
-                GGML_ASSERT(false && "direct oneDNN activations scratch missing alloc_handle owner");
-            }
+        if (onednn_activations_scratch_owner_.valid()) {
+            onednn_activations_scratch_owner_ = {};
+        } else if (had_arena && vram_owns(onednn_activations_scratch_)) {
+            zone_free(vram_zone_id::ONEDNN, onednn_activations_scratch_);
+        } else {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] direct oneDNN activations scratch missing alloc_handle owner ptr=%p\n",
+                           onednn_activations_scratch_);
+            GGML_ASSERT(false && "direct oneDNN activations scratch missing alloc_handle owner");
         }
         onednn_activations_scratch_      = nullptr;
         onednn_activations_scratch_size_ = 0;
@@ -3203,7 +3225,9 @@ bool unified_cache::shutdown_resources() {
     if (reorder_temp_buffer_) {
         if (reorder_temp_owner_.valid()) {
             reorder_temp_owner_ = {};
-        } else if (!(had_arena && vram_owns(reorder_temp_buffer_))) {
+        } else if (had_arena && vram_owns(reorder_temp_buffer_)) {
+            zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
+        } else {
             GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing alloc_handle owner ptr=%p\n",
                            reorder_temp_buffer_);
             GGML_ASSERT(false && "direct reorder temp buffer missing alloc_handle owner");
@@ -3213,18 +3237,37 @@ bool unified_cache::shutdown_resources() {
         reorder_temp_owner_  = {};
     }
 
+    // PP oneDNN slots are cache-owned RUNTIME allocations. Refuse to tear
+    // down beneath a caller that still owns a claimed generation.
+    std::vector<pp_moe_onednn_scratch_slot> shutdown_pp_slots;
+    std::vector<pp_moe_onednn_scratch_slot> shutdown_pp_retired;
+    {
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        for (const auto & slot : pp_moe_onednn_scratch_slots_) if (slot.refcount != 0) return false;
+        for (const auto & slot : pp_moe_onednn_retired_slots_) if (slot.refcount != 0) return false;
+        shutdown_pp_slots.swap(pp_moe_onednn_scratch_slots_);
+        shutdown_pp_retired.swap(pp_moe_onednn_retired_slots_);
+        pp_moe_onednn_weight_slot_size_ = pp_moe_onednn_activation_slot_size_ =
+            pp_moe_onednn_output_slot_size_ = 0;
+        pp_moe_onednn_ring_depth_ = 0;
+    }
+    // mem_handle destruction invokes unified_free/zone_free; never do that
+    // while holding the PP publication mutex.
+    shutdown_pp_slots.clear();
+    shutdown_pp_retired.clear();
+
     // Free persistent scratch buffers BEFORE arena destroy.
     for (auto & pair : persistent_scratches_) {
         if (pair.second.device_ptr) {
-            if (!(had_arena && vram_owns(pair.second.device_ptr))) {
-                if (pair.second.owner.valid()) {
-                    pair.second.owner = {};
-                } else {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
-                                   pair.first.c_str(), pair.second.device_ptr);
-                    GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
-                }
-                saturating_sub_used(pair.second.size);
+            if (pair.second.owner.valid()) {
+                pair.second.owner = {};
+                if (!(had_arena && vram_owns(pair.second.device_ptr))) saturating_sub_used(pair.second.size);
+            } else if (had_arena && vram_owns(pair.second.device_ptr)) {
+                zone_free(vram_zone_id::SCRATCH, pair.second.device_ptr);
+            } else {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
+                               pair.first.c_str(), pair.second.device_ptr);
+                GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
             }
         }
     }
@@ -3240,12 +3283,6 @@ bool unified_cache::shutdown_resources() {
     id_to_key_.clear();
 
     if (fail_expert_phase(expert_fault_phase::SHUTDOWN_BEFORE_ARENA_DESTROY)) {
-        return false;
-    }
-
-    // Destroy the VRAM arena (frees the pre-allocated chunks). A failed free
-    // keeps the cache object and chunk registration intact for unload retry.
-    if (!arena_destroy()) {
         return false;
     }
 
@@ -3365,6 +3402,13 @@ bool unified_cache::shutdown_resources() {
         }
     }
     partial_cache_.clear();
+
+    // Every cache-owned allocation has now run its exact owner destructor or
+    // zone_free. Only canonical arena chunks remain, so closing the allocator
+    // groups cannot strand a registry row behind the physical free.
+    if (!arena_destroy()) {
+        return false;
+    }
     resources_shutdown_ = true;
     return true;
 }
@@ -10202,18 +10246,19 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] DMA stream submit failed after %zu slices: %s\n", slices, e.what());
             if (src.location == cache_location::HOST_MMAP) result.mmap_direct_failed = true;
-            // Partial submission is terminally drained while source pinning and
-            // staging owners are still held by caller/cache and this object.
+            // A terminal event covers only its dependency chain. On an
+            // out-of-order queue another staging slot may still own unrelated
+            // prior work, so partial failure must drain the exact DMA queue.
+            // Caller/cache owners remain live until this unconditional drain
+            // returns, including when wait_and_throw itself reports an error.
             if (result.submitted) {
-                try { result.terminal_event.wait_and_throw(); }
-                catch (...) { try { queue_.wait_and_throw(); } catch (...) {} }
+                try { queue_.wait_and_throw(); } catch (...) {}
             }
             return result;
         } catch (...) {
             if (src.location == cache_location::HOST_MMAP) result.mmap_direct_failed = true;
             if (result.submitted) {
-                try { result.terminal_event.wait_and_throw(); }
-                catch (...) { try { queue_.wait_and_throw(); } catch (...) {} }
+                try { queue_.wait_and_throw(); } catch (...) {}
             }
             return result;
         }
@@ -13537,8 +13582,10 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         if (!onednn_activations_scratch_) {
             GGML_LOG_WARN("[UNIFIED-CACHE] Arena ONEDNN zone full for activations scratch (%.1f MB)\n",
                           activations_size / (1024.0f * 1024.0f));
-            // Cleanup weights (arena-owned, just null the pointer — no sycl::free)
-            onednn_weights_scratch_      = nullptr;
+            // This attempt was never published: return its exact TLSF block.
+            void * unpublished_weights = onednn_weights_scratch_;
+            onednn_weights_scratch_ = nullptr;
+            zone_free(vram_zone_id::ONEDNN, unpublished_weights);
             onednn_weights_scratch_size_ = 0;
             return finish(false);
         }
@@ -14040,15 +14087,15 @@ bool unified_cache::reserve_persistent_scratch(const std::string & buffer_name, 
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] Persistent scratch '%s' resize: %.1f MB -> %.1f MB\n", buffer_name.c_str(),
                         entry.size / (1024.0f * 1024.0f), size_bytes / (1024.0f * 1024.0f));
         if (entry.device_ptr) {
-            if (!vram_owns(entry.device_ptr)) {
-                if (entry.owner.valid()) {
-                    entry.owner = {};
-                } else {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
-                                   buffer_name.c_str(), entry.device_ptr);
-                    GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
-                }
-                saturating_sub_used(entry.size);
+            if (entry.owner.valid()) {
+                entry.owner = {};
+                if (!vram_owns(entry.device_ptr)) saturating_sub_used(entry.size);
+            } else if (vram_owns(entry.device_ptr)) {
+                zone_free(vram_zone_id::SCRATCH, entry.device_ptr);
+            } else {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
+                               buffer_name.c_str(), entry.device_ptr);
+                GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
             }
         }
         persistent_scratches_.erase(it);
@@ -14131,15 +14178,15 @@ void unified_cache::release_persistent_scratch(const std::string & buffer_name) 
 
     auto & entry = it->second;
     if (entry.device_ptr) {
-        if (!vram_owns(entry.device_ptr)) {
-            if (entry.owner.valid()) {
-                entry.owner = {};
-            } else {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
-                               buffer_name.c_str(), entry.device_ptr);
-                GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
-            }
-            saturating_sub_used(entry.size);
+        if (entry.owner.valid()) {
+            entry.owner = {};
+            if (!vram_owns(entry.device_ptr)) saturating_sub_used(entry.size);
+        } else if (vram_owns(entry.device_ptr)) {
+            zone_free(vram_zone_id::SCRATCH, entry.device_ptr);
+        } else {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] direct persistent scratch '%s' missing alloc_handle owner ptr=%p\n",
+                           buffer_name.c_str(), entry.device_ptr);
+            GGML_ASSERT(false && "direct persistent scratch missing alloc_handle owner");
         }
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] Released persistent scratch '%s' (%.1f MB)\n", buffer_name.c_str(),
                         entry.size / (1024.0f * 1024.0f));
@@ -17933,7 +17980,8 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
     // dividend until a config actually triggers N>=2.
     if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_zone_open(zone)) return nullptr;
+        allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+        if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
         if (zone == vram_zone_id::KV && z.allocator) {
             const size_t before = z.allocator->used();
             const size_t offset = z.allocator->allocate(size, align);
@@ -18043,7 +18091,8 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
 
     // Physical group lock is common to logical sharers.
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-    if (!arena_zone_open(zone)) return nullptr;
+    allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
 
     // TLSF returns OFFSET into the managed region; convert to device pointer.
     size_t offset = alloc->allocate(size, align);
@@ -18178,6 +18227,16 @@ void unified_cache::zone_settle(vram_zone_id zone) {
 
     std::unique_lock<std::mutex> lock(arena_allocator_group_mutex(zone));
     allocator_group & physical_group = arena_allocator_groups_[arena_allocator_group_index(zone)];
+    if (physical_group.state == allocator_group_state::RESETTING) {
+        // A concurrent settler owns the complete drain/reset/publication
+        // transaction. Waiting for it is equivalent to performing this settle;
+        // importantly, a second caller can never publish an older authority.
+        physical_group.lifecycle_cv.wait(lock, [&] {
+            return physical_group.state != allocator_group_state::RESETTING;
+        });
+        return;
+    }
+    if (physical_group.state != allocator_group_state::OPEN) return;
     if (!physical_group.allocations.empty()) {
         static std::atomic<int> group_refusal_logs[ARENA_ALLOCATOR_GROUP_COUNT]{};
         std::atomic<int> & logs = group_refusal_logs[arena_allocator_group_index(zone)];
@@ -18278,19 +18337,36 @@ void unified_cache::zone_settle(vram_zone_id zone) {
                        vram_zone_name(zone));
         return;
     }
+    // Claim the whole settle transaction before authority admission is closed.
+    // Allocations, another settle, and destroy all observe RESETTING while the
+    // group mutex is released for the potentially slow terminal drain.
+    physical_group.state = allocator_group_state::RESETTING;
+    const uint64_t settle_epoch = ++physical_group.lifecycle_epoch;
     for (size_t i = 0; i < reset_zone_count; ++i) retired_authorities[i] = arena_close_authority(reset_zones[i]);
     lock.unlock();
     for (size_t i = 0; i < reset_zone_count; ++i) {
         if (retired_authorities[i] && !retired_authorities[i]->wait_for_terminal_leases()) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] timed out draining %s allocator-group authority; refusing reset\n",
                            vram_zone_name(reset_zones[i]));
-            for (size_t j = 0; j < reset_zone_count; ++j) {
-                if (retired_authorities[j]) arena_publish_prebuilt(reset_zones[j], retired_authorities[j]);
+            // Keep RESETTING fail-closed and retain the exact old authorities.
+            // Explicit shutdown can take over the drain without losing sight of
+            // a lease merely because this stack frame returned.
+            lock.lock();
+            if (physical_group.state == allocator_group_state::RESETTING &&
+                physical_group.lifecycle_epoch == settle_epoch) {
+                physical_group.draining_authorities.clear();
+                for (size_t j = 0; j < reset_zone_count; ++j) {
+                    if (retired_authorities[j]) physical_group.draining_authorities.push_back(retired_authorities[j]);
+                }
             }
             return;
         }
     }
     lock.lock();
+    if (physical_group.state != allocator_group_state::RESETTING ||
+        physical_group.lifecycle_epoch != settle_epoch) {
+        return;
+    }
     if (shared_group0) {
         if (arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator) {
             arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator->reset();
@@ -18305,6 +18381,9 @@ void unified_cache::zone_settle(vram_zone_id zone) {
     for (size_t i = 0; i < reset_zone_count; ++i) {
         arena_publish_prebuilt(reset_zones[i], std::move(next_authorities[i]));
     }
+    physical_group.state = allocator_group_state::OPEN;
+    lock.unlock();
+    physical_group.lifecycle_cv.notify_all();
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_reset_calls[idx]++;
@@ -18692,6 +18771,7 @@ bool unified_cache_test_arena_registry_commit_reached() {
 #endif
 
 bool unified_cache::arena_destroy() {
+    std::lock_guard<std::mutex> destroy_guard(arena_destroy_mutex_);
     if (!arena_queue_) return true;
 
     // Fixed-order physical-group close. KV and WEIGHT are one lock/state row,
@@ -18700,18 +18780,41 @@ bool unified_cache::arena_destroy() {
     lifecycle_locks.reserve(ARENA_ALLOCATOR_GROUP_COUNT);
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
-        if (!arena_allocator_groups_[i].allocations.empty()) {
+        allocator_group & group = arena_allocator_groups_[i];
+        if (group.state == allocator_group_state::RESETTING) {
+            // A normal settle has a bounded five-second authority drain. Give
+            // it the first chance to finish; a timed-out RESETTING group is
+            // deliberately retryable here by explicit shutdown.
+            (void) group.lifecycle_cv.wait_for(lifecycle_locks.back(), std::chrono::milliseconds(5500), [&] {
+                return group.state != allocator_group_state::RESETTING;
+            });
+        }
+        // CLOSING is retryable by this serialized explicit destroy path after
+        // a prior physical free failure. No operation can reopen the group.
+        if (!group.allocations.empty()) {
             GGML_LOG_ERROR("[VRAM-ARENA] allocator group %zu still owns %zu live TLSF allocations; refusing destroy\n",
-                           i, arena_allocator_groups_[i].allocations.size());
+                           i, group.allocations.size());
             return false;
         }
-        arena_allocator_groups_[i].state = allocator_group_state::CLOSING;
+    }
+    std::vector<std::shared_ptr<arena_authority>> inherited_drains;
+    for (auto & group : arena_allocator_groups_) {
+        group.state = allocator_group_state::CLOSING;
+        ++group.lifecycle_epoch;
+        inherited_drains.insert(inherited_drains.end(), group.draining_authorities.begin(),
+                                group.draining_authorities.end());
     }
     std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> retired{};
     for (size_t i = 0; i < retired.size(); ++i) {
         retired[i] = arena_close_authority(static_cast<vram_zone_id>(i));
     }
     lifecycle_locks.clear();
+    for (const auto & authority : inherited_drains) {
+        if (authority && !authority->wait_for_terminal_leases()) {
+            GGML_LOG_ERROR("[VRAM-ARENA] timed out draining inherited reset authority; refusing physical free\n");
+            return false;
+        }
+    }
     for (size_t i = 0; i < retired.size(); ++i) {
         const auto & authority = retired[i];
         if (authority && !authority->wait_for_terminal_leases()) {
@@ -18793,13 +18896,18 @@ bool unified_cache::arena_destroy() {
     arena_base_ = nullptr;
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
-        auto &                      z = arena_zones_[i];
-        std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(static_cast<vram_zone_id>(i)));
-        z.allocator.reset();  // unique_ptr::reset — destroys the TLSF allocator
+        auto & z = arena_zones_[i];
+        z.allocator.reset();  // lifecycle_locks still exclude alloc/free/reset
         z.start = 0;
         z.size  = 0;
         z.used.store(0, std::memory_order_relaxed);
     }
+    for (auto & group : arena_allocator_groups_) {
+        group.draining_authorities.clear();
+        group.state = allocator_group_state::CLOSED;
+    }
+    lifecycle_locks.clear();
+    for (auto & group : arena_allocator_groups_) group.lifecycle_cv.notify_all();
     return true;
 }
 
