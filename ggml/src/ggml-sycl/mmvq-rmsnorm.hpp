@@ -396,11 +396,12 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
 
     // Phase 2: Fused MMVQ with SLM-cached normalization
     const int device = ctx.device;
-    const float * f32_input  = (const float *) ggml_sycl_get_data_ptr(x, device);
-    const float * gamma_data = (const float *) ggml_sycl_resolve_tensor_ptr(gamma, device);
+    const float * f32_input = (const float *) ggml_sycl_get_data_ptr(x, device);
+    auto gamma_resolved     = ggml_sycl_resolve(gamma, device);
+    const float * gamma_data = gamma_resolved ? static_cast<const float *>(gamma_resolved.ptr) : nullptr;
     float * dst_data         = (float *) ggml_sycl_get_data_ptr(dst, device);
     auto W_resolved = ggml_sycl_resolve(W, device);
-    if (!W_resolved || W_resolved.layout != GGML_LAYOUT_AOS) {
+    if (!gamma_resolved || !W_resolved || W_resolved.layout != GGML_LAYOUT_AOS) {
         GGML_SYCL_DEBUG("[MMVQ_RMSNORM] AOS layout unavailable for %s\n", W->name ? W->name : "?");
         return;
     }
@@ -426,7 +427,7 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
     sycl::event done = ggml_sycl_submit_marker<class ggml_sycl_mmvq_rmsnorm_scales_release_kernel>(*stream);
     std::vector<ggml_sycl::mem_handle> retained;
     retained.push_back(std::move(scales_owner));
-    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+    ggml_sycl::record_terminal_retention(std::move(done), { gamma_resolved, W_resolved }, std::move(retained));
 }
 
 #endif // GGML_SYCL_MMVQ_RMSNORM_HPP

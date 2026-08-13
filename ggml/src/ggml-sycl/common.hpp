@@ -3945,10 +3945,24 @@ inline bool ggml_sycl_checked_size_mul(size_t a, size_t b, size_t & out) {
 }
 
 inline const ggml_tensor * ggml_sycl_view_root_and_offset(const ggml_tensor * tensor, size_t & view_offs) {
-    view_offs               = 0;
-    const ggml_tensor * cur = tensor;
-    size_t              next = 0;
+    constexpr size_t       max_view_depth = 64;
+    const ggml_tensor *    visited[max_view_depth]{};
+    size_t                 depth = 0;
+    view_offs                    = 0;
+    const ggml_tensor * cur      = tensor;
+    size_t              next     = 0;
     while (cur && cur->view_src) {
+        if (depth == max_view_depth) {
+            view_offs = 0;
+            return nullptr;
+        }
+        for (size_t i = 0; i < depth; ++i) {
+            if (visited[i] == cur) {
+                view_offs = 0;
+                return nullptr;
+            }
+        }
+        visited[depth++] = cur;
         if (!ggml_sycl_checked_size_add(view_offs, cur->view_offs, next)) {
             view_offs = 0;
             return nullptr;
@@ -3957,6 +3971,25 @@ inline const ggml_tensor * ggml_sycl_view_root_and_offset(const ggml_tensor * te
         cur = cur->view_src;
     }
     return cur;
+}
+
+// Compute the maximum byte reachable through tensor strides, including the
+// complete element/block at that address. False means malformed shape or
+// arithmetic overflow; callers must reject rather than treating it as empty.
+inline bool ggml_sycl_checked_tensor_span_bytes(const ggml_tensor * tensor, size_t & span) {
+    span = 0;
+    if (!tensor) return false;
+    size_t max_offset = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] <= 0) return false;
+        size_t term = 0;
+        if (!ggml_sycl_checked_size_mul(static_cast<size_t>(tensor->ne[i] - 1), tensor->nb[i], term) ||
+            !ggml_sycl_checked_size_add(max_offset, term, max_offset)) {
+            span = 0;
+            return false;
+        }
+    }
+    return ggml_sycl_checked_size_add(max_offset, ggml_type_size(tensor->type), span);
 }
 
 // Hot path: 2 dereferences + 1 null check for common case (model fits in VRAM)
@@ -4037,7 +4070,11 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         }
 
         if (base_ptr != nullptr) {
-            void * ptr = static_cast<char *>(base_ptr) + view_offs;
+            const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base_ptr);
+            if (view_offs > UINTPTR_MAX - base_addr) {
+                return nullptr;
+            }
+            void * ptr = reinterpret_cast<void *>(base_addr + view_offs);
             if (tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);

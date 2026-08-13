@@ -203,11 +203,16 @@ arena_authority::admission arena_authority::acquire_offset(uint64_t expected, si
     if (!arena_locate_offset(chunks, offset, extent, chunk_index, ptr)) return {};
     if (lease_counts.size() != chunks.size()) lease_counts.resize(chunks.size(), 0);
     if (lease_counts[chunk_index] == UINT32_MAX) return {};
-    ++lease_counts[chunk_index];
+
+    // Construct every potentially-throwing part of the token before publishing
+    // the count.  In particular shared_from_this() and the shared_ptr control
+    // block allocation may throw.  Incrementing first leaked a terminal lease
+    // forever on either exception, causing zone settle/destroy to deadlock.
     auto self = shared_from_this();
     std::shared_ptr<void> lease(ptr, [self = std::move(self), chunk_index](void *) {
         self->release_lease(chunk_index);
     });
+    ++lease_counts[chunk_index];
     return { ptr, std::move(lease) };
 }
 
@@ -1822,6 +1827,20 @@ void retain_handles_until_event_transactional(std::vector<mem_handle> handles, s
                                               retained_handle_publish_ticket & ticket) {
     publish_handles_until_event(std::move(handles), std::move(event));
     ticket.reset();
+}
+
+void record_terminal_retention(sycl::event event,
+                               std::initializer_list<resolved_ptr> resolved,
+                               std::vector<mem_handle> owners) {
+    size_t retained = owners.size();
+    for (const auto & ptr : resolved) retained += ptr.retention ? 1 : 0;
+    owners.reserve(retained);
+    for (const auto & ptr : resolved) {
+        if (ptr.retention) owners.push_back(*ptr.retention);
+    }
+    if (!owners.empty()) {
+        retain_handles_until_event(std::move(owners), std::move(event));
+    }
 }
 
 #ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING

@@ -306,34 +306,45 @@ static inline size_t ggml_sycl_max_end_bytes(int64_t ne0,
     if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) {
         return 0;
     }
-    const size_t i0         = static_cast<size_t>(ne0 - 1);
-    const size_t i1         = static_cast<size_t>(ne1 - 1);
-    const size_t i2         = static_cast<size_t>(ne2 - 1);
-    const size_t i3         = static_cast<size_t>(ne3 - 1);
-    const size_t max_offset = i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3;
-    return max_offset + nb0;
+    const int64_t ne[4] = { ne0, ne1, ne2, ne3 };
+    const size_t  nb[4] = { nb0, nb1, nb2, nb3 };
+    size_t max_offset = 0;
+    for (int i = 0; i < 4; ++i) {
+        size_t term = 0;
+        if (!ggml_sycl_checked_size_mul(static_cast<size_t>(ne[i] - 1), nb[i], term) ||
+            !ggml_sycl_checked_size_add(max_offset, term, max_offset)) {
+            return 0;
+        }
+    }
+    size_t end = 0;
+    return ggml_sycl_checked_size_add(max_offset, nb0, end) ? end : 0;
 }
 
 static inline size_t ggml_sycl_available_bytes(const ggml_tensor * t) {
     if (t == nullptr) {
         return 0;
     }
-    const void * tensor_data = ggml_sycl_host_data(t);
-    const void * base_data   = (t->view_src != nullptr) ? ggml_sycl_host_data(t->view_src) : nullptr;
-    if (t->view_src && base_data && tensor_data) {
-        const uintptr_t base = reinterpret_cast<uintptr_t>(base_data);
-        const uintptr_t cur  = reinterpret_cast<uintptr_t>(tensor_data);
-        if (cur < base) {
-            return 0;
-        }
-        const size_t offset = static_cast<size_t>(cur - base);
-        const size_t total  = ggml_nbytes(t->view_src);
-        if (offset >= total) {
-            return 0;
-        }
-        return total - offset;
+    size_t              view_offset = 0;
+    const ggml_tensor * root        = ggml_sycl_view_root_and_offset(t, view_offset);
+    if (!root) return 0;
+
+    size_t root_span = 0;
+    if (!ggml_sycl_checked_tensor_span_bytes(root, root_span)) return 0;
+
+    // Prefer the registered backing-allocation extent: arena roots are often
+    // padded beyond their logical tensor span and views may legally address
+    // that padding. Fall back to the checked logical root span.
+    const void * root_data = ggml_sycl_host_data(root);
+    ggml_sycl::alloc_handle allocation{};
+    size_t total = root_span;
+    if (root_data && ggml_sycl::unified_lookup_runtime_allocation(root_data, &allocation, nullptr) &&
+        allocation.ptr && allocation.size != 0) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(allocation.ptr);
+        const uintptr_t cur  = reinterpret_cast<uintptr_t>(root_data);
+        if (cur < base || cur - base > allocation.size) return 0;
+        total = allocation.size - static_cast<size_t>(cur - base);
     }
-    return ggml_nbytes(t);
+    return view_offset <= total ? total - view_offset : 0;
 }
 
 static void ggml_sycl_debug_dump_tensor(const char * tag, const ggml_tensor * t) {
@@ -989,6 +1000,16 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         }
         return done_event;
     };
+
+    {
+        std::vector<ggml_sycl::mem_handle> terminal_owners;
+        if (src0_stage.valid()) terminal_owners.push_back(std::move(src0_stage));
+        if (src1_stage.valid()) terminal_owners.push_back(std::move(src1_stage));
+        if (src0_weight_stage.valid()) terminal_owners.push_back(std::move(src0_weight_stage));
+        if (src1_weight_stage.valid()) terminal_owners.push_back(std::move(src1_weight_stage));
+        ggml_sycl::record_terminal_retention(ensure_done_event(), { src0_resolved, src1_resolved },
+                                             std::move(terminal_owners));
+    }
 
     if (dst && dst->op == GGML_OP_MUL && !g_ggml_sycl_graph_recording) {
         try {

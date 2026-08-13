@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <sycl/sycl.hpp>
@@ -661,6 +662,13 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 // caller can drain the exact submission queue before releasing its owners.
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
+
+// Central resolve-to-submit handoff. Copies any authority carried by resolved
+// fallback pointers, appends explicit owners (scratch/staging), and publishes
+// the complete bundle to event retention or the active command-graph sink.
+void record_terminal_retention(sycl::event event,
+                               std::initializer_list<resolved_ptr> resolved,
+                               std::vector<mem_handle> owners = {});
 
 #ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING
 // Fail the next retained-handle publication before it becomes visible. This

@@ -368,6 +368,8 @@ static bool try_fused_ffn_gate_up_swiglu(
             gate_data, up_data, input_q8, dst_data, ncols_in, nrows_out, batch_size, stream);
     }
 
+    sycl::event done = ggml_sycl_submit_marker<class ggml_sycl_fused_ffn_terminal_kernel>(*stream);
+    ggml_sycl::record_terminal_retention(std::move(done), { gate_resolved, up_resolved });
     return true;
 }
 
