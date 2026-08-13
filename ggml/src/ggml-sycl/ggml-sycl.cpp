@@ -164,10 +164,12 @@ static size_t                ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_typ
 static sycl::event           ggml_sycl_submit_queue_sync_event(sycl::queue & q);
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(void *           ptr,
                                                                ggml_layout_mode layout,
-                                                               int              fallback_device);
+                                                               int              fallback_device,
+                                                               size_t           operation_bytes = 0);
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(const void *     ptr,
                                                                ggml_layout_mode layout,
-                                                               int              fallback_device);
+                                                               int              fallback_device,
+                                                               size_t           operation_bytes = 0);
 static int                   parse_layer_id_from_name(const char * name);
 #if GGML_SYCL_DNNL
 static dnnl::memory::data_type ggml_sycl_onednn_dtype(ggml_type type);
@@ -27103,8 +27105,8 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
                 GGML_LOG_ERROR("[UNIFIED-CACHE] reorder host staging alloc failed (%zu bytes)\n", src_size);
                 throw std::runtime_error("unified-cache device-source reorder staging allocation failed");
             }
-            ggml_sycl::mem_handle host_src_handle = ggml_sycl::mem_handle::from_direct(
-                host_src, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + src_size);
+            ggml_sycl::mem_handle host_src_handle = ggml_sycl::mem_handle::from_chunk_ptr(
+                host_src, ggml_sycl_get_device_id_from_queue(queue), GGML_LAYOUT_AOS, false).slice(0, src_size);
             ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_chunk_ptr(
                 const_cast<void *>(src), ctx_source_device, GGML_LAYOUT_AOS, true);
             ggml_sycl::mem_copy(host_src_handle, 0, src_handle, 0, src_size, queue, deps);
@@ -27203,15 +27205,20 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
         reorder_buf_raw ?
             static_cast<size_t>(static_cast<uint8_t *>(reorder_buf) - static_cast<uint8_t *>(reorder_buf_raw)) :
             0;
+    size_t src_extent = 0;
+    if (!ggml_sycl_checked_size_add(src_offset, dst_size, src_extent)) {
+        throw std::overflow_error("reorder staging extent overflow");
+    }
     if (dst_is_host) {
         GGML_SYCL_DEBUG("[DEBUG-FILL] Using mem_handle copy for host->host copy\n");
         ggml_sycl::mem_handle dst_handle =
             ggml_sycl::mem_handle::from_direct(dst, ctx->layout, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + dst_size);
         ggml_sycl::mem_handle src_handle =
             reorder_buf_raw ? ggml_sycl::mem_handle::from_chunk_ptr(
-                                  reorder_buf_raw, ggml_sycl_get_device_id_from_queue(queue), GGML_LAYOUT_AOS, false) :
+                                  reorder_buf_raw, ggml_sycl_get_device_id_from_queue(queue), GGML_LAYOUT_AOS, false)
+                                  .slice(0, src_extent) :
                               ggml_sycl::mem_handle::from_direct(reorder_buf, GGML_LAYOUT_AOS, false,
-                                                                 ggml_sycl::mem_handle::HOST_DEVICE);
+                                                                 ggml_sycl::mem_handle::HOST_DEVICE, dst_size);
         ggml_sycl::mem_copy(dst_handle, 0, src_handle, src_offset, dst_size, queue, copy_deps);
         ggml_sycl_staging_pool().release(staging_ptr);
         copy_event = sycl::event{};
@@ -27221,10 +27228,10 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
         const int             dst_device = ggml_sycl_get_device_id_from_queue(queue);
         ggml_sycl::mem_handle dst_handle = ggml_sycl::mem_handle::from_chunk_ptr(dst, dst_device, ctx->layout, true);
         ggml_sycl::mem_handle src_handle =
-            reorder_buf_raw ?
-                ggml_sycl::mem_handle::from_chunk_ptr(reorder_buf_raw, dst_device, GGML_LAYOUT_AOS, false) :
-                ggml_sycl::mem_handle::from_direct(reorder_buf, GGML_LAYOUT_AOS, false,
-                                                   ggml_sycl::mem_handle::HOST_DEVICE);
+            reorder_buf_raw ? ggml_sycl::mem_handle::from_chunk_ptr(
+                                  reorder_buf_raw, dst_device, GGML_LAYOUT_AOS, false).slice(0, src_extent) :
+                              ggml_sycl::mem_handle::from_direct(reorder_buf, GGML_LAYOUT_AOS, false,
+                                                                 ggml_sycl::mem_handle::HOST_DEVICE, dst_size);
         copy_event = ggml_sycl::mem_copy_async(dst_handle, 0, src_handle, src_offset, dst_size, queue, copy_deps);
         // Release staging buffer with the pending event.  The pool defers
         // reuse until the event completes, so the H2D copy reads valid data.
@@ -27363,10 +27370,11 @@ static sycl::event ggml_sycl_fill_reordered_expert_tensor_host(sycl::queue &    
     const bool             dst_is_host = dst_type == sycl::usm::alloc::host || dst_type == sycl::usm::alloc::shared;
     const size_t bulk_src_offset = bulk_raw ? static_cast<size_t>(bulk_dst - static_cast<uint8_t *>(bulk_raw)) : 0;
     ggml_sycl::mem_handle bulk_src_handle =
-        bulk_raw ?
-            ggml_sycl::mem_handle::from_chunk_ptr(bulk_raw, ggml_sycl_get_device_id_from_queue(queue), GGML_LAYOUT_AOS,
-                                                  false) :
-            ggml_sycl::mem_handle::from_direct(bulk_dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        bulk_raw ? ggml_sycl::mem_handle::from_chunk_ptr(
+                       bulk_raw, ggml_sycl_get_device_id_from_queue(queue), GGML_LAYOUT_AOS, false)
+                       .slice(0, bulk_alloc_size) :
+                   ggml_sycl::mem_handle::from_direct(bulk_dst, GGML_LAYOUT_AOS, false,
+                                                      ggml_sycl::mem_handle::HOST_DEVICE, expected_dst);
     if (dst_is_host) {
         ggml_sycl::mem_handle dst_handle =
             ggml_sycl::mem_handle::from_direct(dst, ctx->expert.layout, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + dst_size);
@@ -27640,22 +27648,20 @@ static sycl::event ggml_sycl_fill_onednn_woq(sycl::queue &                    qu
 // Helper: Safe memcpy that handles mmap'd source memory via host staging
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(void *           ptr,
                                                                ggml_layout_mode layout,
-                                                               int              fallback_device) {
-    ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
-    if (loc.on_device()) {
-        const int owner = loc.device >= 0 ? loc.device : fallback_device;
-        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, layout, true);
-    }
-    if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
-        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
-    }
-    return ggml_sycl::mem_handle::from_direct(ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE);
+                                                               int              fallback_device,
+                                                               size_t           operation_bytes) {
+    // The common bridge retains any arena/chunk owner and mints the exact
+    // registry remainder for an interior pointer. Unknown external pointers
+    // receive authority only from the current operation's byte contract.
+    return ggml_sycl_memcpy_handle_for_raw_ptr(
+        ptr, fallback_device, layout, /*fallback_on_device=*/false, /*fallback_unknown=*/false, operation_bytes);
 }
 
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(const void *     ptr,
                                                                ggml_layout_mode layout,
-                                                               int              fallback_device) {
-    return ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr), layout, fallback_device);
+                                                               int              fallback_device,
+                                                               size_t           operation_bytes) {
+    return ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr), layout, fallback_device, operation_bytes);
 }
 
 static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
@@ -27668,9 +27674,10 @@ static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
     }
 
     const int             queue_device = ggml_sycl_get_device_id_from_queue(queue);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device);
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device, bytes);
     ggml_sycl::mem_handle src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device);
+        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device, bytes);
     return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps);
 }
 
@@ -27684,9 +27691,10 @@ static void ggml_sycl_safe_memcpy_sync(sycl::queue &                    queue,
     }
 
     const int             queue_device = ggml_sycl_get_device_id_from_queue(queue);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device);
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device, bytes);
     ggml_sycl::mem_handle src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device);
+        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device, bytes);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue, deps);
 }
 
@@ -27706,9 +27714,10 @@ static dpct::err0 ggml_sycl_submit_mem_copy(void *        dst,
     if (src_fallback_device < 0) {
         src_fallback_device = queue_device;
     }
-    ggml_sycl::mem_handle dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, dst_fallback_device);
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, dst_fallback_device, bytes);
     ggml_sycl::mem_handle src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, src_fallback_device);
+        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, src_fallback_device, bytes);
     (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue);
     return 0;
 }
@@ -27736,9 +27745,9 @@ static dpct::err0 ggml_sycl_submit_mem_copy_2d(void *        dst,
         char *                dst_row = static_cast<char *>(dst) + static_cast<size_t>(row) * dst_pitch;
         const char *          src_row = static_cast<const char *>(src) + static_cast<size_t>(row) * src_pitch;
         ggml_sycl::mem_handle dst_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(dst_row, GGML_LAYOUT_AOS, dst_fallback_device);
-        ggml_sycl::mem_handle src_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(const_cast<char *>(src_row), GGML_LAYOUT_AOS, src_fallback_device);
+            ggml_sycl_copy_handle_for_raw_ptr(dst_row, GGML_LAYOUT_AOS, dst_fallback_device, row_bytes);
+        ggml_sycl::mem_handle src_handle = ggml_sycl_copy_handle_for_raw_ptr(
+            const_cast<char *>(src_row), GGML_LAYOUT_AOS, src_fallback_device, row_bytes);
         (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, row_bytes, queue);
     }
     return 0;
@@ -40999,9 +41008,9 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     if (f32_count > 0) {
                         std::vector<float> f32_sample(f32_count);
                         try {
-                            auto dst_handle = ggml_sycl::mem_handle::from_direct(f32_sample.data(), GGML_LAYOUT_AOS,
-                                                                                 /*on_device=*/false,
-                                                                                 ggml_sycl::mem_handle::HOST_DEVICE, src1_ncols * src1_padded_row_size * q8_1_ts / q8_1_bs);
+                            auto dst_handle = ggml_sycl::mem_handle::from_direct(
+                                f32_sample.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
+                                ggml_sycl::mem_handle::HOST_DEVICE, f32_sample.size() * sizeof(float));
                             auto src_handle =
                                 ggml_sycl_copy_handle_for_raw_ptr(const_cast<float *>(src1_ddf_i), GGML_LAYOUT_AOS, i);
                             ggml_sycl::mem_copy(dst_handle, src_handle, f32_count * sizeof(float), *stream);
@@ -44822,16 +44831,8 @@ static bool ggml_sycl_mul_mat_batched_f16_fallback(ggml_backend_sycl_context & c
 }
 
 static size_t ggml_sycl_tensor_span_bytes(const ggml_tensor * t) {
-    if (!t) {
-        return 0;
-    }
-    size_t max_offset = 0;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (t->ne[i] > 0) {
-            max_offset += static_cast<size_t>(t->ne[i] - 1) * t->nb[i];
-        }
-    }
-    return max_offset + ggml_type_size(t->type);
+    size_t span = 0;
+    return ggml_sycl_checked_tensor_span_bytes(t, span) ? span : 0;
 }
 
 static bool ggml_sycl_resolved_ptr_gpu_accessible(const ggml_sycl::resolved_ptr & r, int device) {
@@ -50608,10 +50609,30 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     if (out_nb1) {
         *out_nb1 = ids->nb[1];
     }
-    const int64_t n_ids              = ids->ne[0];
-    const int64_t n_tokens           = ids->ne[1];
-    const size_t  row_bytes          = static_cast<size_t>(n_ids) * sizeof(int32_t);
-    const size_t  ids_bytes          = static_cast<size_t>(n_ids * n_tokens) * sizeof(int32_t);
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_ids <= 0 || n_tokens <= 0 || static_cast<uint64_t>(n_ids) > SIZE_MAX / sizeof(int32_t)) {
+        return nullptr;
+    }
+    const size_t row_bytes = static_cast<size_t>(n_ids) * sizeof(int32_t);
+    if (static_cast<uint64_t>(n_tokens) > SIZE_MAX / row_bytes) {
+        return nullptr;
+    }
+    const size_t ids_bytes = static_cast<size_t>(n_tokens) * row_bytes;
+    const size_t ids_stride = static_cast<size_t>(ids->nb[1]);
+    if (ids_stride < row_bytes || static_cast<size_t>(n_tokens - 1) > (SIZE_MAX - row_bytes) / ids_stride) {
+        return nullptr;
+    }
+    // A strided source's authority covers its physical span, not merely the
+    // packed destination byte count.
+    const size_t ids_physical_span = static_cast<size_t>(n_tokens - 1) * ids_stride + row_bytes;
+    if (const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ids_storage)) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ids_storage);
+        if (addr < info->base || addr - info->base >= info->size ||
+            ids_physical_span > info->size - static_cast<size_t>(addr - info->base)) {
+            return nullptr;
+        }
+    }
     // Check both buffer type AND USM accessibility
     // mmap'd data may not be in a "host" buffer but is still not device-accessible
     const bool    ids_buffer_on_host = ids->buffer && ggml_backend_buffer_is_host(ids->buffer);
@@ -50782,7 +50803,8 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     ggml_sycl::mem_handle ids_dev_handle = entry.device_handle;
     ggml_sycl::mem_handle ids_src_handle = ggml_sycl::mem_handle::from_direct(
         const_cast<char *>(ids_base), GGML_LAYOUT_AOS, ptr_type == sycl::usm::alloc::device,
-        ptr_type == sycl::usm::alloc::device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE, ids_bytes);
+        ptr_type == sycl::usm::alloc::device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE,
+        ids_physical_span);
     if (!ids_dev_handle.valid() || !ids_src_handle.valid()) {
         return nullptr;
     }

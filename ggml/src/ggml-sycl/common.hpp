@@ -174,40 +174,50 @@ inline ggml_sycl::mem_handle ggml_sycl_memcpy_handle_for_raw_ptr(void *         
                                                                  bool             fallback_on_device = false,
                                                                  bool             fallback_unknown   = false,
                                                                  size_t           trusted_extent     = 0) {
+    size_t registered_remaining = 0;
+    if (const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ptr)) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        // Subtraction form is overflow-safe even for malformed registry input.
+        if (addr >= info->base && addr - info->base < info->size) {
+            registered_remaining = info->size - static_cast<size_t>(addr - info->base);
+        }
+    }
+    const size_t authority_extent = registered_remaining != 0 ? registered_remaining : trusted_extent;
+
     ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
     if (loc.on_device()) {
         const int owner = loc.device >= 0 ? loc.device : fallback_device;
         auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, layout, true);
-        if (trusted_extent == 0 || handle.resolve().extent != 0) {
-            return handle;
+        if (authority_extent != 0) {
+            auto exact = handle.slice(0, authority_extent);
+            if (exact.valid()) return exact;
         }
-        return ggml_sycl::mem_handle::from_direct(ptr, layout, true, owner, trusted_extent);
+        if (handle.resolve().extent != 0) return handle;
+        return ggml_sycl::mem_handle::from_direct(ptr, layout, true, owner, authority_extent);
     }
     if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
         auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
-        if (trusted_extent == 0 || handle.resolve().extent != 0) {
-            return handle;
+        if (authority_extent != 0) {
+            auto exact = handle.slice(0, authority_extent);
+            if (exact.valid()) return exact;
         }
+        if (handle.resolve().extent != 0) return handle;
         return ggml_sycl::mem_handle::from_direct(
-            ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, trusted_extent);
+            ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, authority_extent);
     }
     if (fallback_device >= 0 && fallback_unknown) {
         auto handle = ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, fallback_on_device);
-        if (trusted_extent == 0 || handle.resolve().extent != 0) {
-            return handle;
+        if (authority_extent != 0) {
+            auto exact = handle.slice(0, authority_extent);
+            if (exact.valid()) return exact;
         }
+        if (handle.resolve().extent != 0) return handle;
         return ggml_sycl::mem_handle::from_direct(
             ptr, layout, fallback_on_device,
-            fallback_on_device ? fallback_device : ggml_sycl::mem_handle::HOST_DEVICE, trusted_extent);
+            fallback_on_device ? fallback_device : ggml_sycl::mem_handle::HOST_DEVICE, authority_extent);
     }
-    size_t extent = trusted_extent;
-    if (const auto info = ggml_sycl::alloc_registry::instance().lookup_copy(ptr)) {
-        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        if (addr >= info->base && addr - info->base < info->size) {
-            extent = info->size - static_cast<size_t>(addr - info->base);
-        }
-    }
-    return ggml_sycl::mem_handle::from_direct(ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, layout, false, ggml_sycl::mem_handle::HOST_DEVICE, authority_extent);
 }
 
 inline ggml_sycl::mem_handle ggml_sycl_memcpy_handle_for_raw_ptr(const void *     ptr,

@@ -5,8 +5,29 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <sycl/sycl.hpp>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
+
+static bool expect_fatal(const char * label, const std::function<void()> & operation) {
+    const pid_t child = fork();
+    if (child == 0) {
+        operation();
+        _exit(0);
+    }
+    if (child < 0) {
+        std::fprintf(stderr, "FAIL: %s fork failed\n", label);
+        return false;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || (WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        std::fprintf(stderr, "FAIL: %s did not terminate fatally\n", label);
+        return false;
+    }
+    return true;
+}
 
 static bool check_bytes(const uint8_t * data, size_t size, uint8_t expected, const char * label) {
     for (size_t i = 0; i < size; ++i) {
@@ -55,10 +76,12 @@ int main() {
     }
 
     int  failed   = 0;
-    auto host_a_h = ggml_sycl::mem_handle::from_direct(host_a, GGML_LAYOUT_AOS, false);
-    auto host_b_h = ggml_sycl::mem_handle::from_direct(host_b, GGML_LAYOUT_AOS, false);
-    auto dev_a_h  = ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0);
-    auto dev_b_h  = ggml_sycl::mem_handle::from_direct(dev_b, GGML_LAYOUT_AOS, true, 0);
+    auto host_a_h = ggml_sycl::mem_handle::from_direct(
+        host_a, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, size);
+    auto host_b_h = ggml_sycl::mem_handle::from_direct(
+        host_b, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, size);
+    auto dev_a_h = ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0, size);
+    auto dev_b_h = ggml_sycl::mem_handle::from_direct(dev_b, GGML_LAYOUT_AOS, true, 0, size);
 
     std::memset(host_a, 0x11, size);
     std::memset(host_b, 0x00, size);
@@ -79,13 +102,24 @@ int main() {
 
     // Temporary handles may die immediately after submission.  mem_ops must
     // keep any handle-owned lease alive until the returned event completes.
-    auto temp_fill =
-        ggml_sycl::mem_fill_async(ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0), 0x44, size, q);
-    auto temp_copy = ggml_sycl::mem_copy_async(ggml_sycl::mem_handle::from_direct(host_b, GGML_LAYOUT_AOS, false),
-                                               ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0),
-                                               size, q, { temp_fill });
+    auto temp_fill = ggml_sycl::mem_fill_async(
+        ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0, size), 0x44, size, q);
+    auto temp_copy = ggml_sycl::mem_copy_async(
+        ggml_sycl::mem_handle::from_direct(
+            host_b, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, size),
+        ggml_sycl::mem_handle::from_direct(dev_a, GGML_LAYOUT_AOS, true, 0, size), size, q, { temp_fill });
     temp_copy.wait_and_throw();
     failed += !check_bytes(host_b, size, 0x44, "temporary handle event lifetime");
+
+    // Exact boundary succeeds; one-byte offset and SIZE_MAX offset arithmetic
+    // are rejected before any queue submission.
+    ggml_sycl::mem_copy(host_b_h, size - 1, host_a_h, size - 1, 1, q);
+    failed += !expect_fatal("source extent overflow", [&] {
+        ggml_sycl::mem_copy(host_b_h, host_a_h, size - 1, 2, q);
+    });
+    failed += !expect_fatal("destination offset overflow", [&] {
+        ggml_sycl::mem_fill(host_b_h, SIZE_MAX, 0, 1, q);
+    });
 
     ggml_sycl::alloc_request req{};
     req.queue                               = &q;
