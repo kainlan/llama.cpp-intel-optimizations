@@ -102,6 +102,18 @@ if (GGML_SYCL_QUANTIZER_DEBUG)
 endif()
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+# Gate the ordinary module in both BUILD_TESTING=ON and OFF configurations.
+# Eager loading catches unresolved private calls that a lazy load can conceal;
+# the same audit also denies private fixture imports/exports.
+if (GGML_BACKEND_DL)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_custom_command(TARGET ggml-sycl POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dependencies.py
+                $<TARGET_FILE:ggml-sycl>
+        COMMENT "RTLD_NOW loading and auditing ordinary SYCL module seams"
+        VERBATIM)
+endif()
 # BUILD_TESTING must never change the ordinary backend object code. Mutable
 # controls are enabled only on direct-source/private object fixtures below.
 

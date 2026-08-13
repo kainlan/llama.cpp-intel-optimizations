@@ -1303,9 +1303,11 @@ size_t                        ggml_sycl_get_host_max_alloc_size();
 const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
 void                          ggml_sycl_dump_peer_link_info();
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 namespace ggml_sycl {
 bool test_sycl_info_override_active();
 }
+#endif
 
 // Access a device by logical GPU index using the full (pre-scheduler-hiding) map.
 // ggml_sycl_get_device() uses the same full map for GPU logical IDs; this helper
@@ -2505,9 +2507,11 @@ inline sycl::usm::alloc ggml_sycl_probe_alloc_type_any_context(const void * ptr)
     if (alloc_type != sycl::usm::alloc::unknown || ptr == nullptr) {
         return alloc_type;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (ggml_sycl::test_sycl_info_override_active()) {
         return sycl::usm::alloc::unknown;
     }
+#endif
 
     const auto & info         = ggml_sycl_info();
     const int    device_count = std::min(std::max(info.device_count, info.total_gpu_count), GGML_SYCL_MAX_DEVICES);

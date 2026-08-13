@@ -23,15 +23,6 @@
 #include <vector>
 #include <sycl/sycl.hpp>
 
-// This direct-source fixture does not compile ggml-sycl.cpp, where the private
-// sycl-info override normally lives. The linked backend references the query
-// when private testing is enabled; this fixture never installs an override.
-namespace ggml_sycl {
-bool test_sycl_info_override_active() {
-    return false;
-}
-}  // namespace ggml_sycl
-
 static int g_tests_run    = 0;
 static int g_tests_passed = 0;
 
