@@ -1719,7 +1719,9 @@ endif()
 add_test(NAME expert-prefetch-runtime COMMAND test-expert-prefetch-runtime)
 set_tests_properties(expert-prefetch-runtime PROPERTIES
     LABELS "sycl;expert;prefetch;handle;tdd"
-    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Do not pin this lifecycle-only fixture to the second Level Zero GPU: it
+    # needs any SYCL device and does not exercise B70 staging or certification.
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
     SKIP_RETURN_CODE 77
 )
