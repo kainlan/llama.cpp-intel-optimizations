@@ -458,6 +458,19 @@ endif()
 if (NOT WIN32)
     llama_test_cmd(
         bash
+        NAME test-sycl-build-oneccl-discovery
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-build-oneccl-discovery.sh
+    )
+    set_tests_properties(test-sycl-build-oneccl-discovery PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 30
+    )
+endif()
+
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
         NAME test-sycl-handle-policy
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-handle-policy.sh

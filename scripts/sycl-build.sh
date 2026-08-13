@@ -67,14 +67,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ ! -f /opt/intel/oneapi/setvars.sh ]]; then
-    echo "error: /opt/intel/oneapi/setvars.sh not found" >&2
+ONEAPI_SETVARS="${ONEAPI_SETVARS:-/opt/intel/oneapi/setvars.sh}"
+if [[ ! -f "${ONEAPI_SETVARS}" ]]; then
+    echo "error: ${ONEAPI_SETVARS} not found" >&2
     exit 1
 fi
 
-# shellcheck disable=SC1091
 set +u
-source /opt/intel/oneapi/setvars.sh --force >/dev/null
+# shellcheck disable=SC1090
+source "${ONEAPI_SETVARS}" --force >/dev/null
 set -u
 
 if ! command -v cmake >/dev/null 2>&1; then
@@ -91,6 +92,32 @@ if ! command -v icx >/dev/null 2>&1 || ! command -v icpx >/dev/null 2>&1; then
     echo "error: icx/icpx not found after sourcing oneAPI" >&2
     exit 1
 fi
+
+if [[ -z "${CCL_ROOT:-}" || ! -d "${CCL_ROOT}" ]]; then
+    echo "error: CCL_ROOT is not a directory after sourcing oneAPI: ${CCL_ROOT:-<unset>}" >&2
+    exit 1
+fi
+
+# Resolve a possible `latest` symlink once so both CMake and diagnostics identify
+# the exact oneCCL installation selected by setvars.sh.
+CCL_ROOT="$(cd -P "${CCL_ROOT}" && pwd)"
+ONECCL_DIR="${CCL_ROOT}/lib/cmake/oneCCL"
+
+if [[ ! -f "${CCL_ROOT}/include/oneapi/ccl.hpp" ]]; then
+    echo "error: oneCCL header not found: ${CCL_ROOT}/include/oneapi/ccl.hpp" >&2
+    exit 1
+fi
+
+if [[ ! -f "${ONECCL_DIR}/oneCCLConfig.cmake" ]]; then
+    echo "error: oneCCL CMake config not found: ${ONECCL_DIR}/oneCCLConfig.cmake" >&2
+    exit 1
+fi
+
+C_COMPILER="$(command -v icx)"
+CXX_COMPILER="$(command -v icpx)"
+echo "[sycl-build] C compiler: ${C_COMPILER}"
+echo "[sycl-build] C++ compiler: ${CXX_COMPILER}"
+echo "[sycl-build] oneCCL: ${ONECCL_DIR}"
 
 if (( clean_build )); then
     rm -rf "${BUILD_DIR}"
@@ -138,6 +165,14 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && {
     needs_configure=1
 fi
 
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    cached_oneccl_dir="$(grep '^oneCCL_DIR:' "${BUILD_DIR}/CMakeCache.txt" | tail -n 1 | cut -d= -f2- || true)"
+    if [[ "${cached_oneccl_dir}" != "${ONECCL_DIR}" ]]; then
+        echo "[sycl-build] refreshing cached oneCCL_DIR: ${cached_oneccl_dir:-<unset>} -> ${ONECCL_DIR}"
+        needs_configure=1
+    fi
+fi
+
 if (( force_reconfigure )) || cmake_input_changed; then
     needs_configure=1
 fi
@@ -152,6 +187,8 @@ configure_args=(
     -DGGML_SYCL=ON
     -DGGML_SYCL_TARGET=INTEL
     -DGGML_SYCL_ONECCL=ON
+    -UoneCCL_DIR
+    "-DoneCCL_DIR=${ONECCL_DIR}"
     -DGGML_SYCL_F16=ON
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     '-DCMAKE_INSTALL_RPATH=$ORIGIN'
