@@ -26750,6 +26750,15 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
         GGML_SYCL_DEBUG("[DEBUG-FILL] ctx is NULL, fallback to memcpy\n");
         return ggml_sycl_safe_memcpy(queue, dst, src, std::min(dst_size, src_size), deps);
     }
+
+    // CPU reorder reads the source synchronously. Establish every publication
+    // dependency before any host read, irrespective of USM kind or context.
+    // wait_and_throw deliberately propagates asynchronous/cross-context errors
+    // so a failed source can never be published as a reordered cache entry.
+    for (const auto & ev : deps) {
+        const_cast<sycl::event &>(ev).wait_and_throw();
+    }
+
     // Determine pointer type to choose correct copy strategy
     // CRITICAL: unknown (mmap'd) memory is NOT USM-accessible - do NOT include in usm_accessible check!
     // Only host/shared/device are safe for SYCL memcpy operations.
@@ -26765,7 +26774,7 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
 
     const void *          reorder_src   = src;
     void *                host_src      = nullptr;
-    bool                  deps_consumed = false;  // Track if deps were already used
+    bool                  deps_consumed = !deps.empty();
     ggml_sycl::mem_handle owner_host_src;
 
     if (src_is_device) {
@@ -26777,12 +26786,6 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
             ctx->source_device_id >= 0 ? ctx->source_device_id : ggml_sycl_device_owner_for_ptr(src, true);
         sycl::queue * source_queue = ggml_sycl_owner_queue_for_ptr(src, ctx_source_device, queue);
         if (source_queue != &queue) {
-            for (const auto & ev : deps) {
-                try {
-                    const_cast<sycl::event &>(ev).wait();
-                } catch (...) {
-                }
-            }
             try {
                 ggml_sycl::alloc_request src_stage_req{};
                 src_stage_req.queue                               = source_queue;
@@ -50901,7 +50904,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                 const int pt_lid_skip       = moe_cache_layer_id(src0->name);
                 for (int d = 0; d < n_devs && !found_in_prefetch; d++) {
                     auto & pf = g_expert_prefetchers[d];
-                    if (pf.is_initialized() && pf.get_cached_ptr(pt_lid_skip, static_cast<int>(e))) {
+                    if (pf.is_initialized() && pf.is_cached(pt_lid_skip, static_cast<int>(e))) {
                         found_in_prefetch = true;
                     }
                 }
@@ -65244,8 +65247,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 if (!pf.is_initialized()) {
                                     continue;
                                 }
-                                void * ptr = pf.await(layer_id, eid);
-                                if (ptr) {
+                                if (pf.await_ready(layer_id, eid)) {
                                     n_prefetch_awaited++;
                                     break;  // found on this device, no need to check others
                                 }

@@ -26,41 +26,54 @@ namespace ggml_sycl {
 // ============================================================================
 
 ExpertPrefetcher::~ExpertPrefetcher() {
-    // Source and destination leases may only be released after their terminal
-    // DMA. This remains true during module shutdown; leaking the queue while
-    // dropping leases would turn orderly teardown into a use-after-free.
-    if (initialized_) {
-        shutdown();
+    if (ggml_sycl_is_shutting_down()) {
+        // atexit can run after the SYCL runtime. Keep queue/event/lease
+        // destructors from re-entering an invalid runtime; explicit module
+        // shutdown takes the normal draining path before setting this flag.
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto * late_state = new decltype(inflight_);
+        late_state->swap(inflight_);
+        auto * late_queue = new std::shared_ptr<sycl::queue>(std::move(dma_queue_));
+        (void) late_state;
+        (void) late_queue;
+        initialized_.store(false, std::memory_order_release);
+        return;
     }
+    if (is_initialized()) {
+        shutdown();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    dma_queue_.reset();
 }
 
 void ExpertPrefetcher::init(sycl::queue & compute_q) {
-    if (initialized_) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initialized_.load(std::memory_order_relaxed)) {
         return;
     }
 
     // Create an out-of-order queue on the same device/context for DMA.
-    // OOQ allows multiple H2D transfers to overlap and run concurrently.
-    dma_queue_ = std::make_unique<sycl::queue>(compute_q.get_context(), compute_q.get_device());
-
-    // Derive device ID from the compute queue for VRAM budget tracking.
+    dma_queue_ = std::make_shared<sycl::queue>(compute_q.get_context(), compute_q.get_device());
     device_id_ = ggml_sycl_get_device_id_from_queue(compute_q);
-
-    // GGML_SYCL_EXPERT_PREFETCH_DEPTH env var removed — unified cache
-    // manages prefetch depth automatically.
-
-    initialized_ = true;
+    initialized_.store(true, std::memory_order_release);
     GGML_LOG_INFO("[SYCL] Expert prefetcher initialized (depth=%d, dynamic pool)\n", prefetch_depth_);
 }
 
 void ExpertPrefetcher::shutdown() {
-    if (!initialized_) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (!initialized_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
     cancel_all();
-    initialized_ = false;
-    GGML_LOG_INFO("[SYCL] Expert prefetcher shut down (prefetched=%d)\n", completed_count_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Destroy the queue while explicit shutdown still guarantees SYCL is valid.
+        dma_queue_.reset();
+    }
+    GGML_LOG_INFO("[SYCL] Expert prefetcher shut down (prefetched=%d)\n", completed_count());
 
     // Print final MoE dispatch statistics
     if (MoeDispatchStats::enabled()) {
@@ -78,11 +91,14 @@ void ExpertPrefetcher::shutdown() {
 // ============================================================================
 
 bool ExpertPrefetcher::hint(int layer_idx, int expert_idx) {
-    if (!initialized_ || !dma_queue_ || prefetch_disabled_) {
+    if (!is_initialized() || prefetch_disabled_) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_relaxed) || !dma_queue_) {
+        return false;
+    }
     return hint_locked(layer_idx, expert_idx);
 }
 
@@ -97,6 +113,9 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     // Garbage-collect completed in-flight entries before acquiring another pair
     // of source/destination leases.
     gc_completed();
+    if (inflight_.size() >= max_concurrent_dma_) {
+        return false;
+    }
 
     // Step 1: atomically acquire model identity, source owner and ready deps.
     expert_stage_descriptor info;
@@ -119,11 +138,18 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
         return false;
     }
 
-    void * cached_ptr = cache->lookup(info.cache_key, info.layout);
-    if (cached_ptr) {
+    expert_resolve_request cached_req{};
+    cached_req.key              = info.cache_key;
+    cached_req.requested_layout = info.layout;
+    cached_req.layer_id         = info.layer_id;
+    cached_req.expert_id        = info.expert_id;
+    cached_req.current_device   = device_id_;
+    cached_req.device_policy    = expert_resolve_device_policy::CURRENT_ONLY;
+    cached_req.allow_host       = false;
+    auto cached = cache->resolve_expert(cached_req);
+    if (cached && cached.lifetime && cached.lifetime->valid()) {
         completed_count_++;
-        GGML_SYCL_DEBUG("[PREFETCH] hint L%d E%d: already cached in unified cache, ptr=%p\n", layer_idx, expert_idx,
-                        cached_ptr);
+        GGML_SYCL_DEBUG("[PREFETCH] hint L%d E%d: already cached in unified cache\n", layer_idx, expert_idx);
         return true;
     }
 
@@ -172,7 +198,6 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     req.device_ptr        = sr.ptr;
     req.source_owner      = std::move(info.source_owner);
     req.destination_owner = std::move(destination_owner);
-    req.completed  = false;
     req.cache_key  = info.cache_key;
     req.layout     = info.layout;
     req.size       = info.dst_size;
@@ -191,11 +216,14 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
 }
 
 void ExpertPrefetcher::hint_batch(int layer_idx, const std::vector<int> & expert_indices) {
-    if (!initialized_ || !dma_queue_ || prefetch_disabled_) {
+    if (!is_initialized() || prefetch_disabled_) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_relaxed) || !dma_queue_) {
+        return;
+    }
     for (int eid : expert_indices) {
         hint_locked(layer_idx, eid);
     }
@@ -210,13 +238,16 @@ std::vector<int> ExpertPrefetcher::hint_batch_adaptive(int                      
                                                        int                      n_miss_total) {
     std::vector<int> cpu_dispatch;
 
-    if (!initialized_ || !dma_queue_ || prefetch_disabled_) {
+    if (!is_initialized() || prefetch_disabled_) {
         return cpu_dispatch;
     }
 
     // Hold the lock across the entire function to prevent TOCTOU races:
     // budget is computed and consumed atomically within a single critical section.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_relaxed) || !dma_queue_) {
+        return cpu_dispatch;
+    }
 
     gc_completed();
     int max_dma = max_concurrent_dma_;
@@ -246,7 +277,7 @@ std::vector<int> ExpertPrefetcher::hint_batch_adaptive(int                      
 
 ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned(int layer_idx, int expert_idx) {
     owned_result result{};
-    if (!initialized_) {
+    if (!is_initialized()) {
         return result;
     }
 
@@ -280,6 +311,37 @@ ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned(int layer_idx, int 
         }
         auto it = inflight_.find(key);
         if (it == inflight_.end()) {
+            // A speculative request may already have been collected. Resolve
+            // the cache through an owned result rather than returning its raw view.
+            if (!have_descriptor) {
+                return result;
+            }
+            unified_cache * cache = get_existing_unified_cache_for_device(device_id_);
+            if (!cache) {
+                return result;
+            }
+            expert_resolve_request req{};
+            req.key              = descriptor.cache_key;
+            req.requested_layout = descriptor.layout;
+            req.layer_id         = descriptor.layer_id;
+            req.expert_id        = descriptor.expert_id;
+            req.current_device   = device_id_;
+            req.device_policy    = expert_resolve_device_policy::CURRENT_ONLY;
+            req.allow_host       = false;
+            auto cached = cache->resolve_expert(req);
+            if (!cached || !cached.lifetime || !cached.lifetime->valid()) {
+                return result;
+            }
+            try {
+                if (cached.has_ready_event) {
+                    cached.ready_event.wait_and_throw();
+                }
+            } catch (...) {
+                return result;
+            }
+            result.ptr   = cached.ptr;
+            result.owner = std::move(*cached.lifetime);
+            result.ready = cached.has_ready_event ? cached.ready_event : sycl::event{};
             return result;
         }
         ev_copy = it->second.event;
@@ -307,14 +369,8 @@ ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned(int layer_idx, int 
     return result;
 }
 
-void * ExpertPrefetcher::await(int layer_idx, int expert_idx) {
-    owned_result result = await_owned(layer_idx, expert_idx);
-    if (!result) {
-        return nullptr;
-    }
-    void * ptr = result.ptr;
-    retain_handles_until_event({ std::move(result.owner) }, result.ready);
-    return ptr;
+bool ExpertPrefetcher::await_ready(int layer_idx, int expert_idx) {
+    return static_cast<bool>(await_owned(layer_idx, expert_idx));
 }
 
 // ============================================================================
@@ -322,78 +378,60 @@ void * ExpertPrefetcher::await(int layer_idx, int expert_idx) {
 // ============================================================================
 
 void ExpertPrefetcher::cancel_all() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Wait for all in-flight DMAs.
-    // First: wait on individual per-expert events (handles unified cache queue DMA).
-    for (auto & [key, req] : inflight_) {
-        if (!req.completed) {
-            try {
-                req.event.wait();
-            } catch (const sycl::exception &) {
-                // Best effort during shutdown.
-            }
-        }
+    decltype(inflight_)          cancelled;
+    std::shared_ptr<sycl::queue> queue;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled.swap(inflight_);
+        queue = dma_queue_;
     }
-    // Also drain the prefetcher's own OOQ for any legacy DMA.
-    if (dma_queue_) {
+
+    // Never wait while holding mutex_: await/hint/shutdown remain able to
+    // observe cancellation and make forward progress.
+    for (auto & [key, req] : cancelled) {
         try {
-            dma_queue_->wait();
-        } catch (const sycl::exception &) {
-            // Best effort during shutdown.
+            req.event.wait_and_throw();
+        } catch (...) {
+            // Cancellation is fail-closed; owners below still remain alive
+            // until the terminal wait has returned or failed.
         }
     }
-
-    // Clear in-flight tracking. All VRAM is owned by the unified cache.
-    inflight_.clear();
+    if (queue) {
+        try {
+            queue->wait_and_throw();
+        } catch (...) {
+        }
+    }
+    // `cancelled` releases source/destination owners only after all waits.
 }
 
 // ============================================================================
 // Non-blocking cache query
 // ============================================================================
 
-void * ExpertPrefetcher::get_cached_ptr(int layer_idx, int expert_idx) const {
-    if (!initialized_) {
-        return nullptr;
+bool ExpertPrefetcher::is_cached(int layer_idx, int expert_idx) const {
+    if (!is_initialized()) {
+        return false;
     }
 
-    // Query the unified cache for this expert's device pointer.
-    // The prefetcher no longer maintains a private pool.
     expert_stage_descriptor info;
     if (!moe_acquire_expert_stage_descriptor(layer_idx, expert_idx, device_id_, info)) {
-        return nullptr;
+        return false;
     }
-
-    unified_cache * cache = get_unified_cache_for_device(device_id_);
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id_);
     if (!cache) {
-        return nullptr;
+        return false;
     }
-
-    return cache->lookup(info.cache_key, info.layout);
-}
-
-// ============================================================================
-// Demand load: synchronous hint + await for cache-miss experts
-// ============================================================================
-
-void * ExpertPrefetcher::demand_load(int layer_idx, int expert_idx) {
-    if (!initialized_ || !dma_queue_) {
-        return nullptr;
-    }
-
-    if (unified_cache * cache = get_unified_cache_for_device(device_id_);
-        !coherent_placement_plan_owner(cache)->entries.empty()) {
-        return get_cached_ptr(layer_idx, expert_idx);
-    }
-
-    // Submit DMA via unified cache (hint_locked checks cache first).
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hint_locked(layer_idx, expert_idx);
-    }
-
-    // Wait for DMA completion and return VRAM pointer.
-    return await(layer_idx, expert_idx);
+    expert_resolve_request req{};
+    req.key              = info.cache_key;
+    req.requested_layout = info.layout;
+    req.layer_id         = info.layer_id;
+    req.expert_id        = info.expert_id;
+    req.current_device   = device_id_;
+    req.device_policy    = expert_resolve_device_policy::CURRENT_ONLY;
+    req.allow_host       = false;
+    auto resolved = cache->resolve_expert(req);
+    return resolved && resolved.lifetime && resolved.lifetime->valid();
 }
 
 // ============================================================================
@@ -402,13 +440,7 @@ void * ExpertPrefetcher::demand_load(int layer_idx, int expert_idx) {
 
 int ExpertPrefetcher::pending_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    int                         pending = 0;
-    for (const auto & [key, req] : inflight_) {
-        if (!req.completed) {
-            pending++;
-        }
-    }
-    return pending;
+    return static_cast<int>(inflight_.size());
 }
 
 int ExpertPrefetcher::completed_count() const {
@@ -421,29 +453,30 @@ int ExpertPrefetcher::completed_count() const {
 // ============================================================================
 
 void ExpertPrefetcher::gc_completed() {
-    // Called with mutex_ held.
-    // Remove completed entries from in-flight map. The unified cache tracks
-    // all cached expert data — the prefetcher only needs to track active DMA.
+    // Called with mutex_ held. Poll only: active requests remain non-blocking,
+    // while terminal speculative requests release both leases and capacity.
     auto it = inflight_.begin();
     while (it != inflight_.end()) {
-        if (it->second.completed) {
-            it = inflight_.erase(it);
-        } else {
+        bool complete = false;
+        try {
+            complete = it->second.event.get_info<sycl::info::event::command_execution_status>() ==
+                       sycl::info::event_command_status::complete;
+        } catch (...) {
             ++it;
+            continue;
         }
-    }
-}
-
-bool ExpertPrefetcher::has_capacity() const {
-    // Called with mutex_ held.
-    // Count only active (non-completed) in-flight entries.
-    int active = 0;
-    for (const auto & [k, req] : inflight_) {
-        if (!req.completed) {
-            active++;
+        if (!complete) {
+            ++it;
+            continue;
         }
+        try {
+            it->second.event.wait_and_throw();
+            ++completed_count_;
+        } catch (...) {
+            // Failed speculative publication is discarded and never handed off.
+        }
+        it = inflight_.erase(it);
     }
-    return active < max_concurrent_dma_;
 }
 
 // ============================================================================
@@ -451,11 +484,14 @@ bool ExpertPrefetcher::has_capacity() const {
 // ============================================================================
 
 void ExpertPrefetcher::preload_experts(int layer_idx, const std::vector<int> & expert_ids) {
-    if (!initialized_ || !dma_queue_ || prefetch_disabled_) {
+    if (!is_initialized() || prefetch_disabled_) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_relaxed) || !dma_queue_) {
+        return;
+    }
 
     int preloaded = 0;
     for (int eid : expert_ids) {

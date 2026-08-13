@@ -5,6 +5,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+PREFETCH_HEADER = ROOT / "ggml/src/ggml-sycl/expert-prefetch.hpp"
+PREFETCH_SOURCE = ROOT / "ggml/src/ggml-sycl/expert-prefetch.cpp"
 LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
 
 
@@ -152,6 +154,71 @@ def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> N
         "out.valid = out.source_owner.valid()",
     ):
         assert witness in stage, witness
+
+
+def test_expert_prefetch_api_never_returns_an_unleased_pointer() -> None:
+    header = PREFETCH_HEADER.read_text()
+    impl = PREFETCH_SOURCE.read_text()
+    production = SOURCE.read_text()
+
+    assert "owned_result await_owned" in header
+    assert "bool await_ready" in header
+    assert "bool is_cached" in header
+    for legacy in ("void * await(", "void * get_cached_ptr(", "void * demand_load("):
+        assert legacy not in header and legacy not in impl, legacy
+    assert ".await(" not in production
+    assert ".get_cached_ptr(" not in production
+    assert "pf.await_ready(layer_id, eid)" in production
+    assert "pf.is_cached(pt_lid_skip" in production
+
+    owned = function(impl, "ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned")
+    cached = function(impl, "bool ExpertPrefetcher::is_cached")
+    assert "result.owner = std::move(it->second.destination_owner)" in owned
+    assert "result.owner = std::move(*cached.lifetime)" in owned
+    assert "resolved.lifetime->valid()" in cached
+
+
+def test_expert_prefetch_model_switch_and_speculative_gc_are_identity_safe() -> None:
+    impl = PREFETCH_SOURCE.read_text()
+    hint = function(impl, "bool ExpertPrefetcher::hint_locked")
+    owned = function(impl, "ExpertPrefetcher::owned_result ExpertPrefetcher::await_owned")
+    gc = function(impl, "void ExpertPrefetcher::gc_completed")
+
+    assert "expert_prefetch_cache_key key{ info.cache_key, info.layout }" in hint
+    assert "inflight_.count(key)" in hint
+    assert "ambiguous across model identities: fail closed" in owned
+    assert "inflight_.find(key)" in owned
+    assert "command_execution_status" in gc
+    assert "wait_and_throw()" in gc
+    assert "inflight_.erase(it)" in gc
+
+
+def test_expert_prefetch_cancel_and_shutdown_release_outside_lock() -> None:
+    impl = PREFETCH_SOURCE.read_text()
+    cancel = function(impl, "void ExpertPrefetcher::cancel_all")
+    shutdown = function(impl, "void ExpertPrefetcher::shutdown")
+    destructor = function(impl, "ExpertPrefetcher::~ExpertPrefetcher")
+
+    swap = cancel.index("cancelled.swap(inflight_)")
+    wait = cancel.index("req.event.wait_and_throw()")
+    assert swap < wait
+    assert cancel.rfind("}", 0, wait) > swap  # lock scope ended before wait
+    assert "queue = dma_queue_" in cancel
+    assert "dma_queue_.reset()" in shutdown
+    assert shutdown.index("cancel_all()") < shutdown.index("dma_queue_.reset()")
+    assert "ggml_sycl_is_shutting_down()" in destructor
+    assert "late_state->swap(inflight_)" in destructor
+
+
+def test_host_reorder_establishes_source_dependencies_before_cpu_read() -> None:
+    source = SOURCE.read_text()
+    signature = "static sycl::event ggml_sycl_fill_reordered_host"
+    reorder = function(source[source.rindex(signature):], signature)
+    wait = reorder.index("wait_and_throw()")
+    cpu_read = reorder.index("ggml_sycl_reorder_weight_cpu")
+    assert wait < cpu_read
+    assert "catch (...)" not in reorder[reorder.index("for (const auto & ev : deps)"):wait]
+    assert "deps_consumed = !deps.empty()" in reorder
 
 
 def test_private_production_route_has_graph_churn_regression() -> None:

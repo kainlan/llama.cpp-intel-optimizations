@@ -125,7 +125,6 @@ struct prefetch_request {
     void *             device_ptr = nullptr;  // ABI view, valid while destination_owner lives
     mem_handle         source_owner{};        // Pins source through terminal DMA
     mem_handle         destination_owner{};   // Pins destination through handoff/await
-    bool               completed  = false;
     // Unified cache tracking for async finalization in await().
     ggml_sycl_cache_id cache_key  = {};               // Cache key for register_ready
     ggml_layout_mode   layout     = GGML_LAYOUT_AOS;  // Layout used for cache entry
@@ -147,7 +146,7 @@ struct prefetch_request {
 //   ExpertPrefetcher prefetcher;
 //   prefetcher.init(compute_queue, &cache);
 //   prefetcher.hint(layer + 2, expert_id);    // non-blocking H2D on OOQ
-//   void * ptr = prefetcher.await(layer, id); // waits on per-expert event
+//   auto result = prefetcher.await_owned(layer, id); // waits and transfers a lease
 //
 class ExpertPrefetcher {
   public:
@@ -203,9 +202,9 @@ class ExpertPrefetcher {
     // Preferred API: transfers the destination lease to the caller.
     owned_result await_owned(int layer_idx, int expert_idx);
 
-    // Compatibility ABI. The transferred lease is published to graph/event
-    // retention before the pointer is returned.
-    void * await(int layer_idx, int expert_idx);
+    // Boolean-only convenience for callers that only need synchronization.
+    // No unowned device pointer escapes.
+    bool await_ready(int layer_idx, int expert_idx);
 
     // Cancel all pending prefetches and wait for in-flight DMAs to complete.
     void cancel_all();
@@ -213,23 +212,17 @@ class ExpertPrefetcher {
     // Return the configured prefetch depth (layers ahead to look).
     int prefetch_depth() const { return prefetch_depth_; }
 
-    // Non-blocking query: is this expert currently cached in VRAM?
-    // Returns the cached VRAM pointer if found via unified cache, nullptr otherwise.
-    void * get_cached_ptr(int layer_idx, int expert_idx) const;
-
-    // Synchronous demand-load: hint + await in one call.
-    // Used when an expert is needed NOW but not in cache.
-    // Bypasses prefetch_disabled_ check (demand loads are not speculative).
-    void * demand_load(int layer_idx, int expert_idx);
+    // Non-blocking ownership-safe residency query. No cache pointer escapes.
+    bool is_cached(int layer_idx, int expert_idx) const;
 
     // Is this prefetcher initialized (has a valid DMA queue)?
-    bool is_initialized() const { return initialized_; }
+    bool is_initialized() const { return initialized_.load(std::memory_order_acquire); }
 
     // Statistics
     int pending_count() const;
     int completed_count() const;
 
-    bool is_active() const { return initialized_; }
+    bool is_active() const { return is_initialized(); }
 
     // Pre-fill the cache with popular experts at model init time.
     // Called from moe_hybrid_init_once() after Phase 2.
@@ -237,11 +230,11 @@ class ExpertPrefetcher {
     void preload_experts(int layer_idx, const std::vector<int> & expert_ids);
 
   private:
-    std::unique_ptr<sycl::queue>
-         dma_queue_;           // OOQ for async H2D DMA (unique_ptr to avoid static init + enable leak-on-exit)
-    int  device_id_      = 0;  // Device index for VRAM budget tracking
-    int  prefetch_depth_ = 2;  // Default: 2 layers ahead
-    bool initialized_    = false;
+    std::shared_ptr<sycl::queue>
+         dma_queue_;           // Shared snapshot lets cancel wait after releasing mutex_
+    int               device_id_      = 0;  // Device index for VRAM budget tracking
+    int               prefetch_depth_ = 2;  // Default: 2 layers ahead
+    std::atomic<bool> initialized_{ false };
 
     // Max concurrent in-flight DMA operations. Limits PCIe bandwidth
     // saturation to avoid starving the compute engine.
@@ -253,16 +246,13 @@ class ExpertPrefetcher {
     std::unordered_map<expert_prefetch_cache_key, prefetch_request, expert_prefetch_cache_key_hash> inflight_;
 
     mutable std::mutex mutex_;
+    std::mutex         lifecycle_mutex_;
 
     // Stats
     int completed_count_ = 0;
 
     // Garbage-collect completed in-flight requests (remove from inflight_ map).
     void gc_completed();
-
-    // Check if we have room for more in-flight requests.
-    // Counts only active (non-completed) entries in inflight_.
-    bool has_capacity() const;
 
     // Internal locked implementation of hint(). Caller must hold mutex_.
     bool hint_locked(int layer_idx, int expert_idx);
