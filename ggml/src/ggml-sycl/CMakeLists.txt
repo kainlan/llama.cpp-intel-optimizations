@@ -4653,10 +4653,10 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     add_library(ggml-sycl-private-fixtures INTERFACE)
     target_link_libraries(ggml-sycl-private-fixtures INTERFACE
         $<TARGET_OBJECTS:ggml-sycl-q1-route-test-objects>
-        # Use the registry library artifact without following ggml's PUBLIC
-        # backend edge back to the ordinary ggml-sycl implementation.
-        $<TARGET_FILE:ggml>)
-    add_dependencies(ggml-sycl-private-fixtures ggml)
+        # This private registry is a static ggml-base/CPU closure.  Linking the
+        # ordinary libggml artifact here would follow its DT_NEEDED edge to the
+        # ordinary libggml-sycl and duplicate every backend global at teardown.
+        ggml-private-test-registry)
     foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_LIBRARIES)
         get_target_property(_value ggml-sycl-q1-route-test-objects ${_property})
         if (_value AND NOT _value STREQUAL "_value-NOTFOUND")
@@ -4714,7 +4714,7 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
 
-    add_custom_target(ggml-sycl-private-fixtures-build DEPENDS
+    set(_ggml_sycl_private_fixture_consumers
         test-sycl-intrusive-allocation-owner
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle
@@ -4747,4 +4747,27 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         test-layer-stream-owner-lifecycle
         test-sycl-q1-nvfp4-admitted-device
         test-layout-cache)
+    set(_ggml_sycl_private_fixture_binaries)
+    foreach(_consumer IN LISTS _ggml_sycl_private_fixture_consumers)
+        list(APPEND _ggml_sycl_private_fixture_binaries $<TARGET_FILE:${_consumer}>)
+    endforeach()
+
+    # Audit every carrier consumer, not only the intrusive-owner reproducer:
+    # ldd must not find ordinary libggml-sycl and the embedded backend's process
+    # global must have exactly one definition.  The aggregate build target runs
+    # the same gate immediately after all consumers have linked.
+    add_custom_target(ggml-sycl-private-fixtures-build
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-carrier-linkage.py
+            ${_ggml_sycl_private_fixture_binaries}
+        DEPENDS ${_ggml_sycl_private_fixture_consumers}
+        COMMENT "Auditing private SYCL carrier dependency and global-symbol closure"
+        VERBATIM)
+    add_test(NAME sycl-private-carrier-linkage
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-carrier-linkage.py
+            ${_ggml_sycl_private_fixture_binaries})
+    set_tests_properties(sycl-private-carrier-linkage PROPERTIES
+        LABELS "sycl;private-carrier;artifact;host"
+        TIMEOUT 120)
 endif()

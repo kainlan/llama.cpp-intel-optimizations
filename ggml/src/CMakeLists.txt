@@ -267,6 +267,30 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
+# Private full-backend test executables embed the SYCL backend object code and
+# therefore must not link libggml: in a non-DL shared build libggml has a
+# DT_NEEDED edge to the ordinary libggml-sycl, loading a second copy of every
+# backend global into the same process.  Give those fixtures their own static
+# registry closure instead.  It registers only the embedded SYCL backend and
+# the CPU fallback, and depends on ggml-base rather than the production ggml
+# dispatcher DSO.
+if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
+    add_library(ggml-private-test-registry STATIC
+        ggml-backend-dl.cpp
+        ggml-backend-reg.cpp)
+    target_compile_definitions(ggml-private-test-registry PRIVATE
+        GGML_USE_CPU
+        GGML_USE_SYCL)
+    target_include_directories(ggml-private-test-registry PRIVATE
+        .
+        ../include)
+    target_compile_features(ggml-private-test-registry PRIVATE cxx_std_17)
+    target_link_libraries(ggml-private-test-registry PUBLIC ggml-base)
+    if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        target_link_libraries(ggml-private-test-registry PRIVATE dl)
+    endif()
+endif()
+
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
