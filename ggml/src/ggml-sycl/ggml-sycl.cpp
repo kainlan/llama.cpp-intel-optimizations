@@ -9297,9 +9297,9 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
     }
 
     std::vector<void *> up_payload;
-    up_extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(up_tensor.ne[2]), up_payload,
-                                                /*require_all=*/true, /*require_device=*/true,
-                                                /*require_layout=*/true, GGML_LAYOUT_SOA, up_data.size());
+    ggml_sycl_build_moe_layout_ptr_payload(&up_tensor, &up_extra, 0, static_cast<size_t>(up_tensor.ne[2]),
+                                            up_payload, GGML_LAYOUT_SOA,
+                                            /*require_all=*/true, /*require_device=*/true);
     const void * uploaded_up_ptr =
         static_cast<size_t>(expert_id) < up_payload.size() ? up_payload[static_cast<size_t>(expert_id)] : nullptr;
     const bool up_dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
@@ -9319,9 +9319,9 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
         return false;
     }
     std::vector<void *> down_payload;
-    down_extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(down_tensor.ne[2]), down_payload,
-                                                  /*require_all=*/true, /*require_device=*/true,
-                                                  /*require_layout=*/true, GGML_LAYOUT_SOA, down_data.size());
+    ggml_sycl_build_moe_layout_ptr_payload(&down_tensor, &down_extra, 0, static_cast<size_t>(down_tensor.ne[2]),
+                                            down_payload, GGML_LAYOUT_SOA,
+                                            /*require_all=*/true, /*require_device=*/true);
     const void * uploaded_down_ptr = static_cast<size_t>(expert_id) < down_payload.size() ?
         down_payload[static_cast<size_t>(expert_id)] : nullptr;
     const bool down_dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
@@ -15595,6 +15595,18 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
         return false;
     }
 
+    // Optional payload construction is still a miss when experts are expected
+    // but every canonical layout record is absent.
+    extra.moe_expert_handles[0].resize(static_cast<size_t>(tensor.ne[2]));
+    std::vector<void *> empty_payload;
+    if (ggml_sycl_build_moe_layout_ptr_payload(&tensor, &extra, 0, static_cast<size_t>(tensor.ne[2]), empty_payload,
+                                               GGML_LAYOUT_SOA,
+                                               /*require_all=*/false, /*require_device=*/false) ||
+        empty_payload.size() != static_cast<size_t>(tensor.ne[2]) ||
+        std::any_of(empty_payload.begin(), empty_payload.end(), [](const void * ptr) { return ptr != nullptr; })) {
+        return false;
+    }
+
     ggml_sycl::placement_plan plan{};
     for (int e = 0; e < tensor.ne[2]; ++e) {
         plan.entries.push_back({ "blk.13.ffn_gate_exps.weight", data.size(), data.size(), 0,
@@ -15675,9 +15687,9 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     sycl::event::wait(stage_events);
 
     std::vector<void *> table_payload;
-    extra.build_moe_ptr_payload_from_handles(0, static_cast<size_t>(tensor.ne[2]), table_payload,
-                                             /*require_all=*/true, /*require_device=*/true,
-                                             /*require_layout=*/true, GGML_LAYOUT_SOA, data.size());
+    ggml_sycl_build_moe_layout_ptr_payload(&tensor, &extra, 0, static_cast<size_t>(tensor.ne[2]), table_payload,
+                                            GGML_LAYOUT_SOA,
+                                            /*require_all=*/true, /*require_device=*/true);
     const void * uploaded_ptr =
         static_cast<size_t>(expert_id) < table_payload.size() ? table_payload[static_cast<size_t>(expert_id)] : nullptr;
     return table != nullptr && uploaded_ptr == expected_ptr && dep_chained && lease_covers_uploaded_ptr;
@@ -15732,8 +15744,7 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
     auto coverage_ok = [&extra, &data](const char * phase, int expected_populated, int expected_min_leases) {
         std::vector<void *> ptr_payload;
         extra.build_moe_ptr_payload_from_handles(0, extra.moe_expert_handles[0].size(), ptr_payload,
-                                                 /*require_all=*/false, /*require_device=*/false,
-                                                 /*require_layout=*/false, GGML_LAYOUT_AOS, data.size());
+                                                 /*require_all=*/false, /*require_device=*/false);
         int populated = 0;
         int covered   = 0;
         for (void * ptr : ptr_payload) {
@@ -48995,20 +49006,18 @@ static void ggml_sycl_invalidate_moe_layout_caches(ggml_tensor_extra_gpu * extra
     }
 }
 
-static bool ggml_sycl_build_moe_ptr_payload_from_handles(const ggml_tensor * tensor,
-                                                         const ggml_tensor_extra_gpu * extra,
-                                                         int                           device,
-                                                         size_t                        count,
-                                                         std::vector<void *> &         payload,
-                                                         bool                          require_all    = false,
-                                                         bool                          require_device = false,
-                                                         bool                          require_layout = false,
-                                                         ggml_layout_mode required_layout = GGML_LAYOUT_AOS) {
-    const size_t expected_expert_bytes =
-        require_layout ? ggml_sycl_moe_expert_layout_bytes(tensor, required_layout, device) : 0;
-    return extra && (!require_layout || expected_expert_bytes != 0) &&
-           extra->build_moe_ptr_payload_from_handles(device, count, payload, require_all, require_device,
-                                                     require_layout, required_layout, expected_expert_bytes);
+bool ggml_sycl_build_moe_layout_ptr_payload(const ggml_tensor *           tensor,
+                                             const ggml_tensor_extra_gpu * extra,
+                                             int                           device,
+                                             size_t                        count,
+                                             std::vector<void *> &         payload,
+                                             ggml_layout_mode              required_layout,
+                                             bool                          require_all,
+                                             bool                          require_device) {
+    const size_t expected_expert_bytes = ggml_sycl_moe_expert_layout_bytes(tensor, required_layout, device);
+    return extra && expected_expert_bytes != 0 &&
+           extra->build_moe_layout_ptr_payload_from_handles(device, count, payload, require_all, require_device,
+                                                            required_layout, expected_expert_bytes);
 }
 
 static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
@@ -59225,11 +59234,11 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
             has_table_event = table_event_set;
         }
         if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES &&
-            ggml_sycl_build_moe_ptr_payload_from_handles(
-                src0, src0_extra, ctx.device, static_cast<size_t>(src0->ne[2] > 0 ? src0->ne[2] : 1), expert_ptrs_payload,
+            ggml_sycl_build_moe_layout_ptr_payload(
+                src0, src0_extra, ctx.device, static_cast<size_t>(src0->ne[2] > 0 ? src0->ne[2] : 1),
+                expert_ptrs_payload, layout,
                 /*require_all=*/false,
-                /*require_device=*/false,
-                /*require_layout=*/true, layout)) {
+                /*require_device=*/false)) {
             expert_ptrs_host = reinterpret_cast<const void * const *>(expert_ptrs_payload.data());
         }
         if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
@@ -64657,10 +64666,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             return false;
         }
         const size_t count = static_cast<size_t>(n_as > 0 ? n_as : 0);
-        if (!ggml_sycl_build_moe_ptr_payload_from_handles(src0, src0_extra, ctx.device, count, expert_ptrs_payload_host,
-                                                          /*require_all=*/false,
-                                                          /*require_device=*/false,
-                                                          /*require_layout=*/true, route_layout)) {
+        if (!ggml_sycl_build_moe_layout_ptr_payload(src0, src0_extra, ctx.device, count, expert_ptrs_payload_host,
+                                                    route_layout,
+                                                    /*require_all=*/false,
+                                                    /*require_device=*/false)) {
             return false;
         }
         expert_ptrs_host = reinterpret_cast<const void * const *>(expert_ptrs_payload_host.data());

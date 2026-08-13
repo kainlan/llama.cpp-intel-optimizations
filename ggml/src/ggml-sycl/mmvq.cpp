@@ -20480,10 +20480,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
             if (src0_extra) {
                 const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
-                if (!src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
-                                                                    /*require_all=*/false,
-                                                                    /*require_device=*/false,
-                                                                    /*require_layout=*/true, layout)) {
+                if (!ggml_sycl_build_moe_layout_ptr_payload(src0, src0_extra, ctx.device, count,
+                                                            expert_ptr_payload, layout,
+                                                            /*require_all=*/false,
+                                                            /*require_device=*/false)) {
                     GGML_SYCL_DEBUG("[MMVQ] Empty expert pointer table during graph recording for %s\n", src0->name);
                     ctx.moe_graphs_disabled_once = true;
                     mmvq_moe_trace(src0, "graph_empty_ptr_table", ctx.device, (int) layout, forced_layout != nullptr,
@@ -20528,11 +20528,11 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 expert_ptrs = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
                 if (coverage == moe_ptr_table_coverage::AUTO_RESOLVED_VIEW) {
                     const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
-                    src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
-                                                                   /*require_all=*/true,
-                                                                   /*require_device=*/true,
-                                                                   /*require_layout=*/true, layout);
-                    ptr_table_full_device_view =
+                    const bool full_payload = ggml_sycl_build_moe_layout_ptr_payload(
+                        src0, src0_extra, ctx.device, count, expert_ptr_payload, layout,
+                        /*require_all=*/true,
+                        /*require_device=*/true);
+                    ptr_table_full_device_view = full_payload &&
                         expert_ptr_payload.size() == static_cast<size_t>(ne02) &&
                         std::all_of(expert_ptr_payload.begin(), expert_ptr_payload.end(), [](const void * ptr) {
                             return ptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
@@ -20545,10 +20545,14 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 // pointer table is mixed, regardless of planner state.
                 if (placement_plan_active || host_weights) {
                     const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
-                    src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
-                                                                   /*require_all=*/false,
-                                                                   /*require_device=*/false,
-                                                                   /*require_layout=*/true, layout);
+                    if (!ggml_sycl_build_moe_layout_ptr_payload(src0, src0_extra, ctx.device, count,
+                                                                expert_ptr_payload, layout,
+                                                                /*require_all=*/false,
+                                                                /*require_device=*/false)) {
+                        GGML_SYCL_DEBUG("[MMVQ] No valid expert pointer payload for %s, falling back\n",
+                                        src0->name ? src0->name : "?");
+                        return false;
+                    }
                     bool   mixed_ptrs      = false;
                     size_t ptr_count       = 0;
                     size_t non_device_ptrs = 0;
@@ -20822,10 +20826,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     // or AOS host pointers.  Fall back to AOS dispatch in that case.
                     if (use_ptr_table && host_weights && src0_extra) {
                         const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
-                        src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
-                                                                       /*require_all=*/false,
-                                                                       /*require_device=*/false,
-                                                                       /*require_layout=*/true, layout);
+                        if (!ggml_sycl_build_moe_layout_ptr_payload(src0, src0_extra, ctx.device, count,
+                                                                    expert_ptr_payload, layout,
+                                                                    /*require_all=*/false,
+                                                                    /*require_device=*/false)) {
+                            GGML_SYCL_DEBUG("[MMVQ-MXFP4] SOA dispatch rejected: empty expert payload\n");
+                            return false;
+                        }
                         bool ptrs_ok = true;
                         for (size_t ep = 0; ep < expert_ptr_payload.size() && ptrs_ok; ep++) {
                             if (!expert_ptr_payload[ep]) {
@@ -20954,10 +20961,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                             // Check expert pointers inside the table (first few)
                             if (dispatch_ptrs && src0_extra) {
                                 const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
-                                src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
-                                                                               /*require_all=*/false,
-                                                                               /*require_device=*/false,
-                                                                               /*require_layout=*/true, layout);
+                                const bool debug_payload_ok = ggml_sycl_build_moe_layout_ptr_payload(
+                                    src0, src0_extra, ctx.device, count, expert_ptr_payload, layout,
+                                    /*require_all=*/false,
+                                    /*require_device=*/false);
+                                if (!debug_payload_ok) {
+                                    GGML_SYCL_DEBUG("[MMVQ-USM-CHECK] no valid logical expert payload\n");
+                                }
                                 for (size_t e = 0; e < std::min(expert_ptr_payload.size(), (size_t) 4); ++e) {
                                     void * eptr   = expert_ptr_payload[e];
                                     auto   ealloc = eptr ? ggml_sycl_get_alloc_type(eptr) : sycl::usm::alloc::unknown;

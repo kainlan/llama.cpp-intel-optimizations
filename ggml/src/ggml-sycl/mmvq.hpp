@@ -55,6 +55,17 @@ struct ggml_sycl_mmvq_fused_add {
 void ggml_sycl_mmvq_set_fused_add(const ggml_sycl_mmvq_fused_add & add);
 void ggml_sycl_mmvq_clear_fused_add();
 
+// Builds a layout-qualified transient expert-pointer payload using the tensor's
+// authoritative logical per-expert extent. Missing layout byte authority fails closed.
+bool ggml_sycl_build_moe_layout_ptr_payload(const ggml_tensor *             tensor,
+                                             const ggml_tensor_extra_gpu *   extra,
+                                             int                             device,
+                                             size_t                          count,
+                                             std::vector<void *> &           payload,
+                                             ggml_layout_mode                required_layout,
+                                             bool                            require_all,
+                                             bool                            require_device);
+
 // MoE-aware MUL_MAT_ID dispatch: GPU-side expert routing without host sync
 // This is compatible with SYCL command graph recording
 // Returns true if the operation was handled, false to fall back to host-side routing

@@ -3321,10 +3321,7 @@ struct ggml_tensor_extra_gpu {
                                             size_t                count,
                                             std::vector<void *> & payload,
                                             bool                  require_all    = false,
-                                            bool                  require_device = false,
-                                            bool                  require_layout = false,
-                                            ggml_layout_mode      layout         = GGML_LAYOUT_AOS,
-                                            size_t                expected_expert_bytes = 0) const {
+                                            bool                  require_device = false) const {
         payload.clear();
         if (!ggml_sycl_valid_device_index(dev)) {
             return false;
@@ -3334,21 +3331,9 @@ struct ggml_tensor_extra_gpu {
             return false;
         }
         payload.assign(count, nullptr);
+        size_t populated = 0;
         for (size_t i = 0; i < count; ++i) {
-            ggml_sycl::mem_handle handle = handles[i];
-            void *                logical_ptr = nullptr;
-            if (require_layout) {
-                resolved_moe_expert_storage_record logical{};
-                if (expected_expert_bytes != 0 &&
-                    resolve_moe_storage_record(static_cast<int>(i), layout, dev, expected_expert_bytes, &logical)) {
-                    handle      = logical.logical_handle;
-                    logical_ptr = logical.ptr;
-                } else if (require_all) {
-                    return false;
-                } else {
-                    continue;
-                }
-            }
+            const ggml_sycl::mem_handle & handle = handles[i];
             if (!ggml_sycl_mem_handle_has_identity(handle)) {
                 if (require_all) {
                     return false;
@@ -3365,15 +3350,53 @@ struct ggml_tensor_extra_gpu {
             if (require_device && !resolved.on_device) {
                 return false;
             }
-            if (require_layout && resolved.layout != layout) {
+            payload[i] = resolved.ptr;
+            ++populated;
+        }
+        return count == 0 || populated != 0;
+    }
+
+    // Layout-qualified payloads require an explicit logical extent. Keeping this
+    // as a separate API makes layout validation without byte authority impossible.
+    bool build_moe_layout_ptr_payload_from_handles(int                   dev,
+                                                   size_t                count,
+                                                   std::vector<void *> & payload,
+                                                   bool                  require_all,
+                                                   bool                  require_device,
+                                                   ggml_layout_mode      layout,
+                                                   size_t                expected_expert_bytes) const {
+        payload.clear();
+        if (!ggml_sycl_valid_device_index(dev) || expected_expert_bytes == 0) {
+            return false;
+        }
+        const auto & handles = moe_expert_handles[dev];
+        if (handles.size() < count) {
+            return false;
+        }
+        payload.assign(count, nullptr);
+        size_t populated = 0;
+        for (size_t i = 0; i < count; ++i) {
+            resolved_moe_expert_storage_record logical{};
+            if (!resolve_moe_storage_record(static_cast<int>(i), layout, dev, expected_expert_bytes, &logical)) {
                 if (require_all) {
                     return false;
                 }
                 continue;
             }
-            payload[i] = logical_ptr ? logical_ptr : resolved.ptr;
+            auto resolved = logical.logical_handle.resolve(dev);
+            if (!resolved.ptr || resolved.layout != layout) {
+                if (require_all) {
+                    return false;
+                }
+                continue;
+            }
+            if (require_device && !resolved.on_device) {
+                return false;
+            }
+            payload[i] = logical.ptr;
+            ++populated;
         }
-        return true;
+        return count == 0 || populated != 0;
     }
 
     // Cached layout pointer resolution — avoids repeated string hashing, mutex

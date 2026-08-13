@@ -6,6 +6,8 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
+MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
+MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
 PREFETCH_HEADER = ROOT / "ggml/src/ggml-sycl/expert-prefetch.hpp"
 PREFETCH_SOURCE = ROOT / "ggml/src/ggml-sycl/expert-prefetch.cpp"
 LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
@@ -295,11 +297,28 @@ def test_logical_consumers_and_publishers_fail_closed() -> None:
     source = SOURCE.read_text()
     common = COMMON.read_text()
 
-    payload = function(common, "bool build_moe_ptr_payload_from_handles")
-    assert "size_t                expected_expert_bytes = 0" in payload
-    assert "layout_record->logical_bytes" not in payload
-    assert "expected_expert_bytes != 0" in payload
-    assert "resolve_moe_storage_record" in payload
+    raw_payload = function(common, "bool build_moe_ptr_payload_from_handles")
+    layout_payload = function(common, "bool build_moe_layout_ptr_payload_from_handles")
+    assert "require_layout" not in raw_payload
+    assert "expected_expert_bytes" not in raw_payload
+    assert "size_t                expected_expert_bytes)" in layout_payload
+    assert "expected_expert_bytes == 0" in layout_payload
+    assert "resolve_moe_storage_record" in layout_payload
+    assert "return count == 0 || populated != 0;" in raw_payload
+    assert "return count == 0 || populated != 0;" in layout_payload
+
+    wrapper = function(source, "bool ggml_sycl_build_moe_layout_ptr_payload")
+    assert "ggml_sycl_moe_expert_layout_bytes(tensor, required_layout, device)" in wrapper
+    assert "build_moe_layout_ptr_payload_from_handles" in wrapper
+
+    mmvq = MMVQ.read_text()
+    assert mmvq.count("ggml_sycl_build_moe_layout_ptr_payload(") == 5
+    assert "build_moe_ptr_payload_from_handles" not in mmvq
+    declaration = MMVQ_HEADER.read_text()
+    declaration = declaration[declaration.index("bool ggml_sycl_build_moe_layout_ptr_payload"):]
+    declaration = declaration[:declaration.index(";")]
+    assert "required_layout" in declaration
+    assert "=" not in declaration
 
     for signature in (
         "static void moe_layer_executor_abi_add_full_role_storage",
