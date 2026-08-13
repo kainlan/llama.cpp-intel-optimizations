@@ -103,8 +103,12 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
     key.aux_id               = 0x70004;
 
     ggml_sycl::mem_handle stage_handle;
-    auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
-                                            nullptr, &q, &stage_handle);
+    ggml_sycl::direct_stage_result stage;
+    {
+        ggml_sycl::scoped_planned_materialization producer(cache, "test/direct staged device expert");
+        stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
+                                           nullptr, &q, &stage_handle);
+    }
     TEST_ASSERT(stage.ok && stage.ptr != nullptr, "direct_stage_expert failed");
     TEST_ASSERT(stage_handle.resolve(0).ptr == stage.ptr, "direct_stage_expert should return allocation-time handle");
 
@@ -206,8 +210,12 @@ static bool test_routed_prestage_exact_layout_receipt(sycl::queue & q) {
     base.model_slot      = token.owner.slot;
     base.slot_generation = token.owner.generation;
     const auto soa_key = ggml_sycl::detail::layout_specific_moe_expert_cache_key(base, GGML_LAYOUT_SOA);
-    auto stage = cache->direct_stage_expert(soa_key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA,
-                                            nullptr, nullptr, &q);
+    ggml_sycl::direct_stage_result stage;
+    {
+        ggml_sycl::scoped_planned_materialization producer(cache, "test/routed prestage SOA writer");
+        stage = cache->direct_stage_expert(soa_key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA,
+                                           nullptr, nullptr, &q);
+    }
     TEST_ASSERT(stage.ok, "SOA routed fixture staging failed");
     stage.event.wait_and_throw();
 
@@ -257,8 +265,16 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     route.residency = ggml_sycl::moe_batch_residency::PRIMARY_DEVICE;
     route.transient_ptr = resolved.ptr;
     route.owning_device = 0;
-    route.actual_layout = GGML_LAYOUT_AOS;
-    route.lease = expert;
+    route.actual_layout            = GGML_LAYOUT_AOS;
+    route.lease                    = expert;
+    route.recipe.valid             = true;
+    route.recipe.request           = { ggml_sycl::moe_route_phase::DECODE, 32, 32, 1, GGML_TYPE_Q8_0, 0 };
+    route.recipe.kind              = ggml_sycl::moe_batch_executor::PRIMARY_DEVICE;
+    route.recipe.kernel            = ggml_sycl::moe_route_kernel::MMVQ_COMPAT;
+    route.recipe.queue             = ggml_sycl::moe_recipe_queue::SUBMIT;
+    route.recipe.transfer          = ggml_sycl::moe_recipe_transfer::NONE;
+    route.recipe.layout            = GGML_LAYOUT_AOS;
+    route.recipe.owner_device      = 0;
     const int32_t selected[] = { 1 };
     auto admitted = ggml_sycl::build_moe_resolved_batch(selected, 1, 1, 0, [&](int32_t) { return route; });
     TEST_ASSERT(admitted, "owned DIRECT slice with stable identity must pass retained route validation");
@@ -573,9 +589,18 @@ int main() {
 
     const uint64_t fixture_model = registry.current_active_token().model.value;
     bool ok = fixture_model != 0;
-    ok &= ggml_sycl::test_exact_wrapper_owner_matches(fixture_model, fixture_model);
-    ok &= !ggml_sycl::test_exact_wrapper_owner_matches(fixture_model + 1, fixture_model);
-    ok &= !ggml_sycl::test_exact_wrapper_owner_matches(0x5a17, fixture_model);
+    auto owner_check = [&](bool condition, const char * diagnostic) {
+        if (!condition) {
+            fprintf(stderr, "  FAIL: %s\n", diagnostic);
+            ok = false;
+        }
+    };
+    owner_check(ggml_sycl::test_exact_wrapper_owner_matches(fixture_model, fixture_model),
+                "exact wrapper owner rejected the bound load-effect model");
+    owner_check(!ggml_sycl::test_exact_wrapper_owner_matches(fixture_model + 1, fixture_model),
+                "bound-load owner resolution substituted a mismatched model");
+    owner_check(!ggml_sycl::test_exact_wrapper_owner_matches(0x5a17, fixture_model),
+                "wrapper owner resolution substituted the active model for an unknown model");
     ok &= test_normal_cache_expert_resolution(*q);
     ok &= test_direct_staged_device_resolution(*q);
     // Keep the global-cache / ready-event chaining coverage ahead of the

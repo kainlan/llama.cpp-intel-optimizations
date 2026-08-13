@@ -2271,12 +2271,27 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t m
     if (model_id == 0) {
         return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
     }
-    const auto candidate = ggml_sycl_bound_load_candidate();
-    if (candidate && candidate->model_id == model_id) {
-        return { { candidate->model_id }, { candidate->load_txn_id },
-                 { candidate->slot, candidate->slot_generation } };
+
+    auto &     registry = ggml_sycl::lifecycle::global_registry();
+    const auto bound    = registry.bound_candidate();
+    if (bound.value != 0) {
+        try {
+            auto effect = registry.acquire_load_effect(bound);
+            if (effect && effect.owner.load == bound && effect.owner.model.value == model_id) {
+                return effect.owner;
+            }
+            if (effect) {
+                GGML_LOG_WARN("[SYCL] rejecting wrapper model=%llu for bound load=%llu owned by model=%llu\n",
+                              (unsigned long long) model_id, (unsigned long long) bound.value,
+                              (unsigned long long) effect.owner.model.value);
+            }
+        } catch (...) {
+            GGML_LOG_WARN("[SYCL] failed to acquire bound load effect while resolving wrapper model=%llu\n",
+                          (unsigned long long) model_id);
+        }
     }
-    const auto state = ggml_sycl::lifecycle::global_registry().find({ model_id });
+
+    const auto state = registry.find({ model_id });
     if (!state || state->phase != ggml_sycl::lifecycle::model_phase::LIVE || state->token.model.value != model_id) {
         return {};
     }
@@ -15301,9 +15316,10 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
     if (!test_ensure_weight_zone(cache, q, size)) {
         return false;
     }
-    mem_handle storage_handle;
-    auto       stage =
-        cache->direct_stage_expert(key, data, size, size, GGML_LAYOUT_SOA, nullptr, nullptr, &q, &storage_handle);
+    mem_handle                     storage_handle;
+    scoped_planned_materialization planned_materialization(cache, "test/MoE SOA expert producer");
+    auto stage = cache->direct_stage_expert(key, data, size, size, GGML_LAYOUT_SOA, nullptr, nullptr, &q,
+                                            &storage_handle);
     if (!stage.ok || !stage.ptr || storage_handle.resolve(0).ptr != stage.ptr) {
         return false;
     }

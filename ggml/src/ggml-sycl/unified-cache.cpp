@@ -5585,6 +5585,11 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         if (old != entries_.end()) {
             if (old->second.device_ptr == ptr && old->second.size == size && old->second.layout == layout &&
                 !old->second.retired) {
+                if (old->second.owner_device != dev) {
+                    GGML_LOG_WARN("[UNIFIED-CACHE] repairing host expert owner_device: old=%d logical=%d\n",
+                                  old->second.owner_device, dev);
+                    old->second.owner_device = dev;
+                }
                 stamp_pending_owner(old->second, load_effect_guard);
                 if (allocation_owner && !old->second.storage_owner) {
                     old->second.storage_owner = allocation_owner;
@@ -5626,6 +5631,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.has_ready_event  = false;
         cache_entry.host_resident    = cache_loc != cache_location::DEVICE;
         cache_entry.location         = cache_loc;
+        cache_entry.owner_device     = dev;
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
@@ -12530,7 +12536,7 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         bool device_resolved = false;
         for (ggml_layout_mode layout : pin_layouts) {
             const ggml_sycl_cache_id layout_key = detail::layout_specific_moe_expert_cache_key(key, layout);
-            if (cache->lookup(layout_key, layout)) {
+            if (cache->get(layout_key, layout)) {
                 cache->pin(layout_key, layout);
                 result.pins.push_back({ layout_key, layout });
                 device_resolved = true;
