@@ -77,6 +77,14 @@ try:
         base_candidates = sorted(module.parent.glob("libggml-base.*"))
         if base_candidates:
             ctypes.CDLL(str(base_candidates[0]), mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+        # IntelLLVM normally adds SVML to an executable's link line. Python is
+        # not such an executable, so make that compiler runtime global when it
+        # is available before applying RTLD_NOW to the backend.
+        for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+            svml = pathlib.Path(directory) / "libsvml.so"
+            if svml.is_file():
+                ctypes.CDLL(str(svml), mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+                break
         ctypes.CDLL(str(module), mode=os.RTLD_NOW | os.RTLD_LOCAL)
 except OSError as exc:
     raise SystemExit(f"eager dynamic load failed for {module}: {exc}") from exc
